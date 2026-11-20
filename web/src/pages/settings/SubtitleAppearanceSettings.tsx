@@ -21,9 +21,7 @@ import { SUBTITLE_SYNC_MAX_MS, useSubtitleSyncSetting } from "@/hooks/queries/su
 import { useEffectiveSettings } from "@/hooks/queries/settingValues";
 import { useProfileDefaultWriter } from "@/hooks/queries/profileDefaults";
 import { SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
-import { numberText, useT } from "@/i18n";
 import { optionsFor } from "@/lib/settingsDisplay";
-import { settingLabel, settingUnsetLabel } from "@/lib/settingsText";
 import { namedLanguageOptionsFor } from "@/lib/languageOptions";
 import {
   normalizeMetadataLanguageOverrides,
@@ -43,9 +41,13 @@ import type { SubtitleAppearance } from "@/lib/subtitleAppearance";
 import { toast } from "sonner";
 
 import { ResetButton } from "./ResetButton";
-import { isImeComposing } from "@/lib/imeComposition";
 
 /* Languages, subtitle behavior and subtitle appearance are profile preferences. */
+/**
+ * The behavior modes come from the contract rather than a literal list, so a
+ * member added to the manifest appears here without a matching edit.
+ */
+const SUBTITLE_MODES = optionsFor(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_SUBTITLE_MODE]);
 
 /** Read in one batch: the language and subtitle rows want every key at once. */
 const PROFILE_KEYS: SettingKey[] = [
@@ -120,7 +122,6 @@ function PercentInput({
   id?: string;
   descriptionId?: string;
 }) {
-  const t = useT();
   const { draft, setDraft, commit } = usePercentDraft(value, min, onChange);
 
   return (
@@ -137,13 +138,11 @@ function PercentInput({
         onChange={(e) => setDraft(e.target.value)}
         onBlur={(e) => commit(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && !isImeComposing(e)) e.currentTarget.blur();
+          if (e.key === "Enter") e.currentTarget.blur();
         }}
-        className="w-20 [appearance:textfield] text-end [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+        className="w-20 [appearance:textfield] text-right [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
       />
-      <span className="text-muted-foreground text-sm">
-        {t("web.settings.subtitleAppearance.percentSign")}
-      </span>
+      <span className="text-muted-foreground text-sm">%</span>
     </div>
   );
 }
@@ -184,7 +183,6 @@ function SettingRow({ label, description, labelForControl = true, children }: Se
 }
 
 export default function SubtitleAppearanceSettings() {
-  const t = useT();
   const {
     appearance: effectiveSettings,
     isCustomized,
@@ -228,17 +226,6 @@ export default function SubtitleAppearanceSettings() {
   );
   const subtitleMode =
     (profileValues?.[SETTING_KEYS.PLAYBACK_SUBTITLE_MODE]?.value as string | undefined) ?? "auto";
-  /**
-   * The behavior modes come from the contract rather than a literal list, so a
-   * member added to the manifest appears here without a matching edit.
-   */
-  const subtitleModes = optionsFor(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_SUBTITLE_MODE]);
-  const noAudioLanguage = settingUnsetLabel(
-    SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_AUDIO_LANGUAGE],
-  );
-  const noSubtitleLanguage = settingUnsetLabel(
-    SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_SUBTITLE_LANGUAGE],
-  );
   const showForcedSubtitles =
     (profileValues?.[SETTING_KEYS.PLAYBACK_SHOW_FORCED_SUBTITLES]?.value as boolean | undefined) ??
     true;
@@ -274,9 +261,9 @@ export default function SubtitleAppearanceSettings() {
   async function handleSave() {
     try {
       await saveAppearance(settings);
-      toast.success(t("web.settings.subtitleAppearance.saved"));
+      toast.success("Subtitle appearance saved");
     } catch {
-      toast.error(t("web.settings.subtitleAppearance.saveFailed"));
+      toast.error("Failed to save subtitle appearance");
     }
   }
 
@@ -286,9 +273,9 @@ export default function SubtitleAppearanceSettings() {
     try {
       await resetAppearance();
       discardLocalChanges();
-      toast.success(t("web.settings.subtitleAppearance.resetDone"));
+      toast.success("Subtitle appearance reset to the default");
     } catch {
-      toast.error(t("web.settings.subtitleAppearance.resetFailed"));
+      toast.error("Failed to reset subtitle appearance");
     }
   }
 
@@ -301,15 +288,11 @@ export default function SubtitleAppearanceSettings() {
    * are edited where the content is and stay deliberately untouched here.
    */
   function saveBehavior(key: SettingKey, value: unknown) {
-    saveProfileDefault(key, value).catch(() =>
-      toast.error(t("web.settings.subtitleAppearance.subtitleSettingSaveFailed")),
-    );
+    saveProfileDefault(key, value).catch(() => toast.error("Failed to save subtitle setting"));
   }
 
   function saveLanguage(key: SettingKey, value: unknown) {
-    saveProfileDefault(key, value).catch(() =>
-      toast.error(t("web.settings.subtitleAppearance.languageSaveFailed")),
-    );
+    saveProfileDefault(key, value).catch(() => toast.error("Failed to save language setting"));
   }
 
   function saveMetadataOverrides(overrides: MetadataLanguageOverrides) {
@@ -318,7 +301,7 @@ export default function SubtitleAppearanceSettings() {
         ? resetProfileDefault(SETTING_KEYS.CATALOG_METADATA_LANGUAGE_OVERRIDES)
         : saveProfileDefault(SETTING_KEYS.CATALOG_METADATA_LANGUAGE_OVERRIDES, overrides);
     return request.catch((error) => {
-      toast.error(t("web.settings.subtitleAppearance.metadataOverridesSaveFailed"));
+      toast.error("Failed to save metadata language exceptions");
       throw error;
     });
   }
@@ -331,14 +314,14 @@ export default function SubtitleAppearanceSettings() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.subtitleAppearance.title")}
-        subtitle={t("web.settings.subtitleAppearance.subtitle")}
+        title="Language & Subtitles"
+        subtitle="The languages this profile prefers, when subtitles appear, and how they look."
       />
 
-      <SettingsGroup title={t("web.settings.subtitleAppearance.language.title")}>
+      <SettingsGroup title="Language">
         <SettingRow
-          label={t("web.settings.subtitleAppearance.language.spokenLabel")}
-          description={t("web.settings.subtitleAppearance.language.spokenDescription")}
+          label="Spoken language"
+          description="Prefer a spoken language for this profile when multiple tracks are available."
         >
           {({ id, descriptionId }) => (
             <div className="w-full sm:w-[220px]">
@@ -348,7 +331,7 @@ export default function SubtitleAppearanceSettings() {
                 value={audioLanguage ?? "none"}
                 options={audioLanguageOptions}
                 disabled={profilePending}
-                placeholder={noAudioLanguage}
+                placeholder="No preference"
                 className="w-full"
                 onValueChange={(value) =>
                   // The contract spells "no preference" as null, where the
@@ -359,7 +342,7 @@ export default function SubtitleAppearanceSettings() {
                   )
                 }
               >
-                <SelectItem value="none">{noAudioLanguage}</SelectItem>
+                <SelectItem value="none">No preference</SelectItem>
               </LanguageSelect>
             </div>
           )}
@@ -379,13 +362,10 @@ export default function SubtitleAppearanceSettings() {
         />
       </SettingsGroup>
 
-      <SettingsGroup
-        title={t("web.settings.subtitleAppearance.subtitles.title")}
-        description={t("web.settings.subtitleAppearance.subtitles.description")}
-      >
+      <SettingsGroup title="Subtitles" description="Which subtitles Silo picks for this profile.">
         <SettingRow
-          label={t("web.settings.subtitleAppearance.subtitles.languageLabel")}
-          description={t("web.settings.subtitleAppearance.subtitles.languageDescription")}
+          label="Subtitle language"
+          description="Pick a subtitle language or leave subtitles off by default."
         >
           {({ id, descriptionId }) => (
             <div className="w-full sm:w-[220px]">
@@ -395,7 +375,7 @@ export default function SubtitleAppearanceSettings() {
                 value={subtitleLanguage || "none"}
                 options={subtitleLanguageOptions}
                 disabled={profilePending}
-                placeholder={noSubtitleLanguage}
+                placeholder="None"
                 className="w-full"
                 onValueChange={(value) =>
                   // The contract spells "no preference" as null, not the empty
@@ -406,16 +386,13 @@ export default function SubtitleAppearanceSettings() {
                   )
                 }
               >
-                <SelectItem value="none">{noSubtitleLanguage}</SelectItem>
+                <SelectItem value="none">None</SelectItem>
               </LanguageSelect>
             </div>
           )}
         </SettingRow>
 
-        <SettingRow
-          label={t("web.settings.subtitleAppearance.subtitles.behaviorLabel")}
-          description={t("web.settings.subtitleAppearance.subtitles.behaviorDescription")}
-        >
+        <SettingRow label="Subtitle behavior" description="Decide when subtitles should appear.">
           {({ id, descriptionId }) => (
             <Select
               value={subtitleMode}
@@ -430,7 +407,7 @@ export default function SubtitleAppearanceSettings() {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {subtitleModes.map((mode) => (
+                {SUBTITLE_MODES.map((mode) => (
                   <SelectItem key={mode.value} value={mode.value}>
                     {mode.label}
                   </SelectItem>
@@ -441,8 +418,8 @@ export default function SubtitleAppearanceSettings() {
         </SettingRow>
 
         <SettingRow
-          label={settingLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_SHOW_FORCED_SUBTITLES])}
-          description={t("web.settings.subtitleAppearance.subtitles.forcedDescription")}
+          label="Show forced subtitles"
+          description="Display forced subtitles for foreign-language dialogue."
         >
           {({ id, descriptionId }) => (
             <Switch
@@ -459,12 +436,12 @@ export default function SubtitleAppearanceSettings() {
       </SettingsGroup>
 
       <SettingsGroup
-        title={t("web.settings.subtitleAppearance.preview.title")}
-        description={t("web.settings.subtitleAppearance.preview.description")}
+        title="Preview"
+        description="How subtitles look for this profile on every device."
         actions={
           isCustomized ? (
             <ResetButton
-              label={t("web.settings.subtitleAppearance.preview.reset")}
+              label="Reset subtitle appearance to the default"
               disabled={isSaving}
               onClick={() => void handleResetAppearance()}
             />
@@ -483,35 +460,32 @@ export default function SubtitleAppearanceSettings() {
               className="inline-block rounded px-3 py-1 text-center leading-snug"
               style={{ ...cueStyle, whiteSpace: "pre-line" }}
             >
-              {t("web.settings.subtitleAppearance.preview.sampleLine1")}
+              Sample subtitle text
             </span>
             <span
               className="inline-block rounded px-3 py-1 text-center leading-snug"
               style={{ ...cueStyle, whiteSpace: "pre-line" }}
             >
-              {t("web.settings.subtitleAppearance.preview.sampleLine2")}
+              tuned for readability
             </span>
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button onClick={handleSave} disabled={!hasUnsavedChanges || isSaving}>
-            {t("web.settings.subtitleAppearance.preview.save")}
+            Save Appearance
           </Button>
           <Button
             variant="outline"
             onClick={discardLocalChanges}
             disabled={!hasUnsavedChanges || isSaving}
           >
-            {t("web.settings.subtitleAppearance.preview.discard")}
+            Discard Changes
           </Button>
         </div>
       </SettingsGroup>
 
-      <SettingsGroup
-        title={t("web.settings.subtitleAppearance.text.title")}
-        description={t("web.settings.subtitleAppearance.text.description")}
-      >
-        <SettingRow label={t("web.settings.subtitleAppearance.text.fontSize")}>
+      <SettingsGroup title="Text" description="Adjust the look and readability of subtitle text.">
+        <SettingRow label="Font size">
           {({ id, descriptionId }) => (
             <Select
               value={settings.fontSize}
@@ -531,7 +505,7 @@ export default function SubtitleAppearanceSettings() {
           )}
         </SettingRow>
 
-        <SettingRow label={t("web.settings.subtitleAppearance.text.fontFamily")}>
+        <SettingRow label="Font family">
           {({ id, descriptionId }) => (
             <Select
               value={settings.fontFamily}
@@ -553,10 +527,7 @@ export default function SubtitleAppearanceSettings() {
           )}
         </SettingRow>
 
-        <SettingRow
-          label={t("web.settings.subtitleAppearance.text.fontColor")}
-          labelForControl={false}
-        >
+        <SettingRow label="Font color" labelForControl={false}>
           {({ labelId, descriptionId }) => (
             <ColorPalette
               colors={FONT_COLOR_PALETTE}
@@ -568,10 +539,7 @@ export default function SubtitleAppearanceSettings() {
           )}
         </SettingRow>
 
-        <SettingRow
-          label={t("web.settings.subtitleAppearance.text.opacity")}
-          description={t("web.settings.subtitleAppearance.text.opacityDescription")}
-        >
+        <SettingRow label="Text opacity" description="How transparent the subtitle text itself is.">
           {({ id, descriptionId }) => (
             <PercentInput
               id={id}
@@ -582,7 +550,7 @@ export default function SubtitleAppearanceSettings() {
           )}
         </SettingRow>
 
-        <SettingRow label={t("web.settings.subtitleAppearance.text.outline")}>
+        <SettingRow label="Text outline">
           {({ id, descriptionId }) => (
             <Switch
               id={id}
@@ -594,9 +562,9 @@ export default function SubtitleAppearanceSettings() {
         </SettingRow>
 
         <SettingRow
-          label={t("web.settings.subtitleAppearance.text.outlineColor")}
+          label="Outline color"
           labelForControl={false}
-          description={t("web.settings.subtitleAppearance.text.outlineColorDescription")}
+          description="Only used when text outline is enabled."
         >
           {({ labelId, descriptionId }) => (
             <ColorPalette
@@ -612,10 +580,10 @@ export default function SubtitleAppearanceSettings() {
       </SettingsGroup>
 
       <SettingsGroup
-        title={t("web.settings.subtitleAppearance.background.title")}
-        description={t("web.settings.subtitleAppearance.background.description")}
+        title="Background & Position"
+        description="Tune subtitle placement and contrast."
       >
-        <SettingRow label={t("web.settings.subtitleAppearance.background.style")}>
+        <SettingRow label="Background style">
           {({ id, descriptionId }) => (
             <Select
               value={settings.backgroundStyle}
@@ -637,10 +605,7 @@ export default function SubtitleAppearanceSettings() {
           )}
         </SettingRow>
 
-        <SettingRow
-          label={t("web.settings.subtitleAppearance.background.opacity")}
-          description={t("web.settings.subtitleAppearance.background.opacityDescription")}
-        >
+        <SettingRow label="Background opacity" description="Only used for boxed subtitles.">
           {({ id, descriptionId }) => (
             <PercentInput
               id={id}
@@ -653,10 +618,7 @@ export default function SubtitleAppearanceSettings() {
           )}
         </SettingRow>
 
-        <SettingRow
-          label={t("web.settings.subtitleAppearance.background.color")}
-          labelForControl={false}
-        >
+        <SettingRow label="Background color" labelForControl={false}>
           {({ labelId, descriptionId }) => (
             <ColorPalette
               colors={BG_COLOR_PALETTE}
@@ -669,7 +631,7 @@ export default function SubtitleAppearanceSettings() {
           )}
         </SettingRow>
 
-        <SettingRow label={t("web.settings.subtitleAppearance.background.position")}>
+        <SettingRow label="Subtitle position">
           {({ id, descriptionId }) => (
             <Select
               value={settings.position}
@@ -691,13 +653,13 @@ export default function SubtitleAppearanceSettings() {
       </SettingsGroup>
 
       <SettingsGroup
-        title={t("web.settings.subtitleAppearance.timing.title")}
-        description={t("web.settings.subtitleAppearance.timing.description")}
+        title="Timing"
+        description="Shift every subtitle earlier or later. Applies to this profile on every device."
       >
         <SettingRow
-          label={t("web.settings.subtitleAppearance.timing.offset")}
+          label="Subtitle offset"
           labelForControl={false}
-          description={t("web.settings.subtitleAppearance.timing.offsetDescription")}
+          description="Negative values show subtitles earlier, positive values later."
         >
           {({ labelId, descriptionId }) => (
             <SubtitleOffsetControl
@@ -706,9 +668,7 @@ export default function SubtitleAppearanceSettings() {
               valueMs={subtitleSync.offsetMs}
               disabled={!subtitleSync.isLoaded || subtitleSync.isSaving}
               onChange={(ms) =>
-                subtitleSync
-                  .save(ms)
-                  .catch(() => toast.error(t("web.settings.subtitleAppearance.timing.saveFailed")))
+                subtitleSync.save(ms).catch(() => toast.error("Failed to save subtitle offset"))
               }
             />
           )}
@@ -720,10 +680,9 @@ export default function SubtitleAppearanceSettings() {
 
 const SUBTITLE_OFFSET_STEP_MS = 100;
 
-/** The signed offset number ("+100", "−100", "0") the offset message wraps with its unit. */
 function formatSubtitleOffset(ms: number): string {
-  if (ms === 0) return numberText(0);
-  return `${ms > 0 ? "+" : "−"}${numberText(Math.abs(ms))}`;
+  if (ms === 0) return "0 ms";
+  return `${ms > 0 ? "+" : "−"}${Math.abs(ms)} ms`;
 }
 
 function SubtitleOffsetControl({
@@ -739,7 +698,6 @@ function SubtitleOffsetControl({
   disabled: boolean;
   onChange: (ms: number) => void;
 }) {
-  const t = useT();
   return (
     <div
       role="group"
@@ -750,9 +708,7 @@ function SubtitleOffsetControl({
       <Button
         variant="outline"
         size="icon"
-        aria-label={t("web.settings.subtitleAppearance.timing.earlier", {
-          ms: SUBTITLE_OFFSET_STEP_MS,
-        })}
+        aria-label={`Show subtitles ${SUBTITLE_OFFSET_STEP_MS} ms earlier`}
         disabled={disabled || valueMs <= -SUBTITLE_SYNC_MAX_MS}
         onClick={() => onChange(valueMs - SUBTITLE_OFFSET_STEP_MS)}
       >
@@ -762,16 +718,12 @@ function SubtitleOffsetControl({
         aria-live="polite"
         className="min-w-[5.5rem] text-center font-mono text-sm tabular-nums"
       >
-        {t("web.settings.subtitleAppearance.timing.offsetValue", {
-          offset: formatSubtitleOffset(valueMs),
-        })}
+        {formatSubtitleOffset(valueMs)}
       </output>
       <Button
         variant="outline"
         size="icon"
-        aria-label={t("web.settings.subtitleAppearance.timing.later", {
-          ms: SUBTITLE_OFFSET_STEP_MS,
-        })}
+        aria-label={`Show subtitles ${SUBTITLE_OFFSET_STEP_MS} ms later`}
         disabled={disabled || valueMs >= SUBTITLE_SYNC_MAX_MS}
         onClick={() => onChange(valueMs + SUBTITLE_OFFSET_STEP_MS)}
       >
@@ -783,7 +735,7 @@ function SubtitleOffsetControl({
         disabled={disabled || valueMs === 0}
         onClick={() => onChange(0)}
       >
-        {t("web.settings.subtitleAppearance.timing.reset")}
+        Reset
       </Button>
     </div>
   );

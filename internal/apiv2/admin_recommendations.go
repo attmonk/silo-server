@@ -17,7 +17,7 @@ type AdminRecommendationsService interface {
 	StatusCounts(context.Context) (int, int, int, int, int, error)
 	IsRunning(recommendations.JobName) bool
 	LastRuns(context.Context) (map[recommendations.JobName]recommendations.JobRuns, error)
-	EmbeddingLockConflict(context.Context) (text, key string, args map[string]string, err error)
+	EmbeddingLockConflict(context.Context) (string, error)
 	CacheRefreshedAt(context.Context) (*time.Time, error)
 	StaleSweep(context.Context) (recommendations.StaleSweepStatus, error)
 	TriggerEmbeddings() error
@@ -48,8 +48,6 @@ type AdminRecommendationsStatus struct {
 	Cowatch          AdminRecommendationJobStatus  `json:"cowatch"`
 	Recommendations  AdminRecommendationJobStatus  `json:"recommendations"`
 	LockConflict     string                        `json:"lock_conflict" doc:"Why the stored embedding lock rejects the embedding settings this server runs with; empty when it does not."`
-	LockConflictKey  string                        `json:"lock_conflict_key,omitempty" doc:"Translation catalog key of lock_conflict, which clients show in a non-English interface. Absent when lock_conflict is empty."`
-	LockConflictArgs map[string]string             `json:"lock_conflict_args,omitempty" doc:"Values for lock_conflict_key's placeholders, by name. Absent when lock_conflict is empty."`
 	StaleSweep       AdminRecommendationStaleSweep `json:"stale_sweep" doc:"The stale profile sweep, which rebuilds profiles after their signals or access change."`
 	CacheRefreshedAt *Instant                      `json:"cache_refreshed_at,omitempty" doc:"When the newest cached recommendation row was written, by the cache job or a profile refresh. It is not job health: profile refreshes keep it recent while the cache job fails; read recommendations.last_run for that. Absent when nothing is cached."`
 }
@@ -90,10 +88,7 @@ func registerAdminRecommendations(reg *Registry) {
 		{"cowatch", "triggerAdminRecommendationCowatch", AdminRecommendationsService.TriggerCowatch},
 		{"recommendations", "triggerAdminRecommendationRefresh", AdminRecommendationsService.TriggerRecommendations},
 	} {
-		trigger := op(http.MethodPost, "/trigger/"+action.path, action.id, "Start process-local recommendation work without a durable job receipt.")
-		// A job already running on this process or another server is 409.
-		trigger.Errors = append(trigger.Errors, http.StatusConflict)
-		Register(reg, trigger, func(ctx context.Context, _ *struct{}) (*AdminRecommendationStartedOutput, error) {
+		Register(reg, op(http.MethodPost, "/trigger/"+action.path, action.id, "Start process-local recommendation work without a durable job receipt."), func(ctx context.Context, _ *struct{}) (*AdminRecommendationStartedOutput, error) {
 			if reg.deps.AdminRecommendations == nil {
 				return nil, unavailable("recommendations")
 			}
@@ -113,7 +108,7 @@ func registerAdminRecommendations(reg *Registry) {
 	reset := op(http.MethodPost, "/embeddings/reset", "resetAdminRecommendationEmbeddings", "Delete the embedding lock, every item embedding, taste clusters and per-profile cached rows, and clear taste profile vectors, in one transaction.")
 	reset.Description = "Recovers a server whose embedding lock pins a model it can no longer use, or switches embedding models. " +
 		"It refuses with 409 while the embedding, taste profile or recommendation job, or a stale profile sweep, runs on any server, " +
-		"while a catalog import with embeddings runs, and while a saved embedding model or base URL waits for a server restart. " +
+		"while a catalog import with embeddings runs, and while saved embedding settings wait for a server restart. " +
 		"Run the embedding job afterwards to build the new embedding space."
 	reset.Errors = append(reset.Errors, http.StatusConflict)
 	Register(reg, reset, reg.resetAdminRecommendationEmbeddings)
@@ -133,7 +128,7 @@ func (reg *Registry) resetAdminRecommendationEmbeddings(ctx context.Context, _ *
 			return nil, NewProblem(TypeConflict, "A catalog import with embeddings is running. Reset embeddings after it finishes.")
 		}
 		if errors.Is(err, recommendations.ErrEmbeddingSettingsPendingRestart) {
-			return nil, NewProblem(TypeConflict, "The saved embedding model or base URL takes effect after a server restart. Restart the server, then reset embeddings.")
+			return nil, NewProblem(TypeConflict, "The saved embedding settings take effect after a server restart. Restart the server, then reset embeddings.")
 		}
 		return nil, serviceProblem(err)
 	}
@@ -155,7 +150,7 @@ func (reg *Registry) getAdminRecommendationsStatus(ctx context.Context, _ *struc
 	if err != nil {
 		return nil, serviceProblem(err)
 	}
-	conflict, conflictKey, conflictArgs, err := w.EmbeddingLockConflict(ctx)
+	conflict, err := w.EmbeddingLockConflict(ctx)
 	if err != nil {
 		return nil, serviceProblem(err)
 	}
@@ -184,8 +179,6 @@ func (reg *Registry) getAdminRecommendationsStatus(ctx context.Context, _ *struc
 		Cowatch:          jobStatus(recommendations.JobCowatch, cowatch),
 		Recommendations:  jobStatus(recommendations.JobRecommendations, cache),
 		LockConflict:     conflict,
-		LockConflictKey:  conflictKey,
-		LockConflictArgs: conflictArgs,
 		StaleSweep:       AdminRecommendationStaleSweep{Pending: sweep.Pending},
 		CacheRefreshedAt: instantPtr(refreshedAt),
 	}}

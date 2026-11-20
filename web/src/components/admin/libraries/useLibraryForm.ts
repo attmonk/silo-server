@@ -8,10 +8,9 @@ import {
   useSetLibraryProviders,
   useUpdateLibrary,
 } from "@/hooks/queries/admin/libraries";
-import { t as translate, useT, type MessageKey } from "@/i18n";
 import { PROVIDER_TRAILER_KINDS } from "@/lib/extraKinds";
 
-import { DEFAULT_BOX_SET_MIN_MOVIES, librarySettingSupport } from "./libraryTypes";
+import { librarySettingSupport } from "./libraryTypes";
 
 export type LevelChainItem = {
   plugin_installation_id: number;
@@ -28,7 +27,7 @@ export type LevelChainItem = {
 // plugin" empty state. Built-in host providers (NFO) appear in the server
 // response without any plugin installation, so this gate must not depend on
 // installed plugins.
-function hasChainProviders(chains: Record<string, LevelChainItem[]>): boolean {
+export function hasChainProviders(chains: Record<string, LevelChainItem[]>): boolean {
   return Object.values(chains).some((items) => items.length > 0);
 }
 
@@ -44,7 +43,7 @@ export interface UseLibraryFormOptions {
   resetAfterCreate?: boolean;
 }
 
-function contentLevelsForType(libraryType: string): string[] {
+export function contentLevelsForType(libraryType: string): string[] {
   switch (libraryType) {
     case "series":
       return ["series", "season", "episode"];
@@ -66,22 +65,7 @@ function contentLevelsForType(libraryType: string): string[] {
   }
 }
 
-const CONTENT_LEVEL_LABELS: Readonly<Record<string, MessageKey>> = {
-  movie: "web.admin.common.libraryEditor.contentLevel.movie",
-  series: "web.admin.common.libraryEditor.contentLevel.series",
-  season: "web.admin.common.libraryEditor.contentLevel.season",
-  episode: "web.admin.common.libraryEditor.contentLevel.episode",
-  audiobook: "web.admin.common.libraryEditor.contentLevel.audiobook",
-  ebook: "web.admin.common.libraryEditor.contentLevel.ebook",
-  manga: "web.admin.common.libraryEditor.contentLevel.manga",
-  podcast: "web.admin.common.libraryEditor.contentLevel.podcast",
-  podcast_episode: "web.admin.common.libraryEditor.contentLevel.podcastEpisode",
-};
-
-/** A content level's name; a level this build does not know is spelled from its id. */
 export function contentLevelLabel(level: string): string {
-  const key = CONTENT_LEVEL_LABELS[level];
-  if (key) return translate(key);
   return level
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
@@ -92,7 +76,7 @@ export function contentLevelLabel(level: string): string {
 // saved chain, or the server-computed defaults for a library type) into the
 // editor's per-level item lists, preserving server priority order with the
 // local metadata entry first, where the server always runs it.
-function levelChainsFromResponse(
+export function levelChainsFromResponse(
   response: LibraryProviderChainResponse | null | undefined,
 ): Record<string, LevelChainItem[]> {
   const mapped: Record<string, LevelChainItem[]> = {};
@@ -146,7 +130,7 @@ function withLocalFirst(items: LevelChainItem[], remote: LevelChainItem[]): Leve
 // mergeChainWithDefaults fills content levels the saved chain doesn't cover
 // (e.g. a library created before a level existed) with the server-computed
 // defaults, without touching levels the chain already defines.
-function mergeChainWithDefaults(
+export function mergeChainWithDefaults(
   chain: Record<string, LevelChainItem[]>,
   defaults: Record<string, LevelChainItem[]>,
   libraryType: string,
@@ -182,7 +166,6 @@ export function useLibraryForm({
   onSaved,
   resetAfterCreate = false,
 }: UseLibraryFormOptions) {
-  const t = useT();
   const [name, setName] = useState(library?.name ?? "");
   const [paths, setPaths] = useState<string[]>(library?.paths?.length ? library.paths : [""]);
   const [type, setType] = useState(library?.type ?? "movies");
@@ -197,12 +180,6 @@ export function useLibraryForm({
   );
   const savedTrickplay = library?.trickplay_enabled ?? false;
   const [trickplayEnabled, setTrickplayEnabled] = useState(savedTrickplay);
-  const savedBoxSets = library?.box_sets_enabled ?? false;
-  const savedBoxSetMinMovies = library?.box_set_min_movies ?? DEFAULT_BOX_SET_MIN_MOVIES;
-  const savedBoxSetsInSearch = library?.box_sets_in_search ?? true;
-  const [boxSetsEnabled, setBoxSetsEnabled] = useState(savedBoxSets);
-  const [boxSetMinMovies, setBoxSetMinMovies] = useState(savedBoxSetMinMovies);
-  const [boxSetsInSearch, setBoxSetsInSearch] = useState(savedBoxSetsInSearch);
   // A new library follows its type's default until the switch is set:
   // detection is on for series and mixed libraries and off for movies.
   const [introDetectionChoice, setIntroDetectionEnabled] = useState<boolean | null>(
@@ -252,11 +229,10 @@ export function useLibraryForm({
 
   const allErrors = useMemo<LibraryFormErrors>(() => {
     const next: LibraryFormErrors = {};
-    if (!name.trim()) next.name = t("web.admin.common.libraryEditor.errors.nameRequired");
-    if (!paths.some((p) => p.trim()))
-      next.paths = t("web.admin.common.libraryEditor.errors.pathsRequired");
+    if (!name.trim()) next.name = "Give this library a name.";
+    if (!paths.some((p) => p.trim())) next.paths = "Add at least one folder to scan.";
     return next;
-  }, [name, paths, t]);
+  }, [name, paths]);
   const errors: LibraryFormErrors = submitAttempted ? allErrors : {};
 
   function updatePath(index: number, value: string) {
@@ -361,17 +337,6 @@ export function useLibraryForm({
     if (trickplay !== savedTrickplay) {
       body.trickplay_enabled = trickplay;
     }
-    // Sent only when they change, for the same reason.
-    const boxSets = settingSupport.boxSets && boxSetsEnabled;
-    if (boxSets !== savedBoxSets) {
-      body.box_sets_enabled = boxSets;
-    }
-    if (boxSets && boxSetMinMovies !== savedBoxSetMinMovies) {
-      body.box_set_min_movies = boxSetMinMovies;
-    }
-    if (boxSets && boxSetsInSearch !== savedBoxSetsInSearch) {
-      body.box_sets_in_search = boxSetsInSearch;
-    }
 
     if (library) {
       updateMutation.mutate(
@@ -435,12 +400,6 @@ export function useLibraryForm({
     setChapterThumbnailsEnabled,
     trickplayEnabled,
     setTrickplayEnabled,
-    boxSetsEnabled,
-    setBoxSetsEnabled,
-    boxSetMinMovies,
-    setBoxSetMinMovies,
-    boxSetsInSearch,
-    setBoxSetsInSearch,
     introDetectionEnabled,
     setIntroDetectionEnabled,
     trailerKinds,

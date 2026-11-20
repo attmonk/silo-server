@@ -29,9 +29,7 @@ var ErrPlanIneligible = llm.ErrPlanIneligible
 // ErrUsageLimited is local admission state, not a fresh provider quota response.
 var ErrUsageLimited = errors.New("ChatGPT plan usage is paused; use Test text model to recheck usage")
 
-// selectionKeys are read in one snapshot so a text request's authentication
-// mode, registration, and API-key provider always belong together.
-var selectionKeys = []string{CredentialsKey, authModeSetting, chatModelSetting, legacyChatModelSetting, reasoningEffortSetting, config.AIServiceTierSettingKey, config.AIProvidersSettingKey, config.AITextProviderSettingKey}
+var selectionKeys = []string{CredentialsKey, authModeSetting, chatModelSetting, legacyChatModelSetting, reasoningEffortSetting, "ai.base_url", "subtitle_ai.base_url", "ai.api_key", "subtitle_ai.api_key"}
 
 type selectionReader interface {
 	GetMany(context.Context, ...string) (map[string]string, error)
@@ -193,9 +191,7 @@ func (s *Service) textConfig(ctx context.Context, recheckUsage bool) (llm.Config
 		return llm.Config{}, err
 	}
 	effective := config.EffectiveAdminSettings(values)
-	baseURL, apiKey := config.ResolveAIEndpoint(effective, config.AITextProviderSettingKey, config.AICapabilityChat)
-	cfg := llm.Config{AuthMode: effective[authModeSetting], BaseURL: baseURL, APIKey: apiKey, ChatModel: effective[chatModelSetting], ReasoningEffort: effective[reasoningEffortSetting]}
-	cfg.ServiceTier = config.ResolveAIServiceTier(effective)
+	cfg := llm.Config{AuthMode: effective[authModeSetting], BaseURL: effective["ai.base_url"], APIKey: effective["ai.api_key"], ChatModel: effective[chatModelSetting], ReasoningEffort: effective[reasoningEffortSetting]}
 	if recheckUsage {
 		cfg.AuthMode = authModeChatGPT
 	}

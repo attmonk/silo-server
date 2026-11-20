@@ -43,19 +43,11 @@ Existing installations retain their configured marker mode, which accepts `off`,
   background synchronization. Request leases, failures, and quota cooldowns are
   still shared through the database. Previously stored markers remain available.
 
-Both paths honor provider selection, manual edits and deletions, and provider quota limits.
-
-When several providers return a marker of the same kind, Silo uses the
-provider whose best marker of that kind has the highest confidence, then the
-lower `fetch_priority`, then the higher submission count, then the provider ID,
-and keeps every range that provider returned for the kind. A marker without a
-confidence, or with a non-finite one or one outside 0 to 1, counts as 0, so it
-loses to any rated marker. Selection runs over cached answers, so a
-priority change applies without fetching again.
+Both paths honor provider priority, manual edits and deletions, and provider quota limits.
 
 Each provider has a minimum confidence for lookups, `fetch_min_confidence` on
 the v2 provider configuration, default 0. A marker the provider rates below it is
-left out, so another provider or local detection fills its kind,
+left out, so the next provider by priority or local detection fills its kind,
 and a stored marker of that provider for the kind is withdrawn, even when the
 provider's answer comes from the cache. A marker without a confidence counts as
 0. The minimum is applied when results are selected, so a change reaches cached
@@ -91,58 +83,6 @@ every external ID the provider requires, and the provider has not already
 claimed the episode. A file that every provider declines is not selected again
 until one of those inputs changes, for example when the series gains a TMDB ID.
 
-A provider whose marker capability declares `supports_amend` replaces its
-earlier submission instead. It holds one submission per file, and a file is
-selected again whenever the marker's content hash changes: new bounds, source,
-detection version, or confidence (to the thousandth), a re-probed duration, a
-new file hash or size, or a change to the series or episode IDs or the episode
-numbering. The daily task
-also resends to such a provider a manual correction that the save did not
-deliver, when the provider already holds a submission for that file and kind.
-
-The daily **Share detected markers** task is scheduled at 04:00 in server-local
-time by default, after local detection at 03:30. Each scheduled run starts at a
-random point in the four hours after its configured time, so servers in one
-time zone do not reach a shared provider together; a manual run starts at once.
-A run waits out a provider's short rate limit and ends at a longer one. When
-every submission for a file fails, the run waits 30 seconds before the next
-file, doubling for each further failed file in a row up to 10 minutes. Any
-provider answer, a refusal included, resets the wait. After the ninth failed
-file in a row the run ends, and the next scheduled run tries again.
-
-Contribution is off for a new provider unless its plugin manifest asks
-otherwise. The capability metadata keys `default_contribute_enabled`,
-`default_contribute_auto_local`, and `default_contribute_min_confidence` set the
-provider's contribution settings when its config row is first created; later
-admin changes stick, and a reinstall starts from the defaults again.
-`default_contribute_enabled` on the v2 provider configuration reports a provider
-whose manifest turns sharing on. The server setting `markers.share_by_default`
-(`true` or `false`) decides whether those defaults apply; they apply only when
-it is `true`. A new server leaves it unset until the admin saves the setup
-wizard's Features step, which shows sharing as on, so a server whose admin
-never saves that step starts every provider with sharing off. A migration
-stored `true` on servers set up before the wizard saved the choice. Changing it
-to `false` also turns contribution and automatic sharing off for existing
-providers whose manifest turns sharing on. That change commits
-with the setting: if it fails, the save fails and the setting keeps its old
-value. Changing it back to `true` changes no existing provider. Every
-contribution, whether from the automatic run, a manual marker save, or an admin
-request, reads the stored provider config first, so a node that missed the
-change event still stops; if that read fails, nothing is shared. The admin
-provider list reads the stored rows too, and an admin edit writes only the
-fields its request sends; the web provider tile sends only the fields the admin
-changed, so editing another setting cannot turn sharing back on from a stale
-copy.
-
-A manual save is never shared for a kind it may copy from a provider: both
-bounds within 1 s of any occurrence of an online or plugin marker stored on
-the file, or of an earlier save withheld this way. With
-`markers.online_storage` set to `on_demand`, provider markers are not stored,
-so every kind a save sets is withheld unless the file already held that kind
-as a `manual:v1` marker. A withheld kind is
-stored with algorithm `manual:withheld:v1` and otherwise acts as a manual
-marker.
-
 A manual deletion removes every occurrence of that kind for the selected file.
 The empty range retains manual provenance: provider lookups, local detection,
 rescans, and file-identity changes cannot restore it. An explicit manual set
@@ -151,12 +91,6 @@ adds the kind again. Other marker kinds are unchanged.
 Manual writes require a Movie or Series library, including their mixed-library
 variants. Unsupported library kinds return `422 validation_failed` without
 changing markers, contributing them, or emitting a playback update.
-
-An enabled administrator bypasses the `marker_edit` grant only while acting as
-administrator: on the primary profile, or with no profile declared on a
-household that does not require one. Otherwise the admin needs an explicitly
-assigned grant. Non-admin accounts require the effective grant, including the
-access group mask.
 
 Local detection finds episode intros and end credits, and movie end credits on
 a best-effort basis: from chapters and the picture near the end, never intros.
@@ -204,7 +138,8 @@ settings leave on.
 the same capabilities document reports, reruns local detection of an episode's
 intro, credits, or both, or of a movie's credits; see
 [admin-catalog-api.md](admin-catalog-api.md#episode-and-movie-marker-analysis).
-`POST /api/v2/admin/items/{id}/redetect-intro` analyzes episode intros only,
+The v1 refresh endpoint retains its local-only behavior, and it, the v1
+re-detect endpoint, and v2 `redetect-intro` analyze episode intros only,
 whatever the detection settings say.
 
 ## Operations
@@ -222,9 +157,8 @@ content files. Every success returns HTTP 200 with a string `file_id` and four
 objects: `intro`, `credits`, `recap`, and `preview`. A segment with no marker is an
 empty object. Present boundaries are `start_seconds` and `end_seconds`, measured
 in source-file seconds. Provenance fields (`source`, `provider`, `confidence`,
-`algorithm`, `detected_at`) are omitted when absent. A manual save stores
-algorithm `manual:v1`, or `manual:withheld:v1` for a kind withheld from
-sharing. Timestamps use the shared v2 instant format.
+`algorithm`, `detected_at`) are omitted when absent. Timestamps use the shared v2
+instant format.
 
 Responses also include `marker_segments`, an array of every effective marker
 occurrence in source-time order. Each entry has `kind` (`intro`, `credits`,
@@ -282,6 +216,7 @@ and a provider can accept a contribution before its response or local receipt is
 lost. A failed response can therefore follow a successful save. Read the current
 markers before deciding whether another user-directed update is needed.
 
+The legacy v1 adapter shares the manual writer path and retains its wire format.
 Jellyfin does not expose these manual editing routes. Its MediaSegments response
 returns each occurrence separately, with credits represented as `Outro`.
 The generated OpenAPI document is the authoritative v2 schema and error contract.
@@ -300,7 +235,7 @@ manual, provider and legacy ranges, including repeated kinds. Extraction uses
 the existing hardware, execution-mode, HDR, width and retry policies. A failed
 preview never prevents marker navigation or playback. Internal image metadata
 is bound to the file identity and exact occurrence; concurrent edits cannot
-publish a stale frame.
+publish a stale frame. The frozen v1 responses do not gain preview fields.
 
 On-demand provider ranges remain ephemeral. When the library enables previews,
 lookup queues thumbnails from the effective ranges and stores only opaque

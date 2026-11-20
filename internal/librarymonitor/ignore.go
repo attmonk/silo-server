@@ -26,6 +26,18 @@ var ignoredNamePatterns = []string{
 	"lost+found",
 }
 
+// ignoredDirNames holds the rest of the scanner's skipped directory names
+// (the others are in ignoredNamePatterns), so the monitor records no
+// directory the scanner never enters.
+var ignoredDirNames = map[string]bool{
+	"@recycle":     true,
+	".trash":       true,
+	"$recycle.bin": true,
+	".deleted":     true,
+	".inbound":     true,
+	".downloads":   true,
+}
+
 // Ignore-file names honored by the walk. See
 // docs/architecture/scanner-ignore-files.md.
 const (
@@ -55,12 +67,9 @@ func ignoredName(name string) bool {
 	return false
 }
 
-// ignoredDir reports whether a directory with this name is never recorded:
-// the fixed ignore list plus every directory name the scanner skips
-// (scanner.SkippedDirName), so the monitor records no directory the scanner
-// never enters.
+// ignoredDir reports whether a directory with this name is never recorded.
 func ignoredDir(name string) bool {
-	return ignoredName(name) || scanner.SkippedDirName(name)
+	return ignoredName(name) || ignoredDirNames[strings.ToLower(name)]
 }
 
 // dirSkipped reports whether dir's own ignore files exclude it and
@@ -68,10 +77,7 @@ func ignoredDir(name string) bool {
 //
 // Pattern rules inside .ignore and .siloignore are not applied: watching a
 // pattern-ignored folder only costs a watch; a change there resolves to a
-// scan the scanner then filters. An ignore file that cannot be read does not
-// skip dir either: the watch stays, and the scan records a walk failure there
-// instead of importing what the file excludes.
+// scan the scanner then filters.
 func dirSkipped(dir string, entries []fs.DirEntry) bool {
-	skipped, err := scanner.DirSkipped(dir, entries)
-	return err == nil && skipped
+	return scanner.DirSkipped(dir, entries)
 }

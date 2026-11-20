@@ -8,7 +8,6 @@
 package subsync
 
 import (
-	"cmp"
 	"errors"
 	"math"
 	"slices"
@@ -49,23 +48,6 @@ const (
 	// in their search range. Right subtitles averaged 4.1 and more on real
 	// files; the rare chance agreement of a wrong one, about 3.
 	minProminence = 3.75
-	// minJointProminence is the least prominence the joint search's summed
-	// evidence needs, and minJointProminenceFew the least for a file with
-	// fewer than jointFewWindows windows, whose sums have heavier tails.
-	// Measured on 2,708 production sidecars: right subtitles the window
-	// search missed reached 6 and more; another episode of the same series
-	// (shared music and credits, short episodes) reached 6.97 with seven
-	// windows and under 6 with eight or more.
-	minJointProminence    = 6.0
-	minJointProminenceFew = 7.0
-	jointFewWindows       = 8
-	// minJointAgreement of the windows (of at least jointFewWindows) lining
-	// up within inlierSeconds is evidence of its own, enough with a joint
-	// prominence of minJointProminenceAgreed: right subtitles under a laugh
-	// track or score reached 11 or 12 of 12 windows at a prominence of 4 to
-	// 5; another episode at most 10 of 12.
-	minJointAgreement        = 0.9
-	minJointProminenceAgreed = 4.0
 	// prominenceExclusionSeconds around a lag is left out when measuring its
 	// prominence: a cue map's correlation peak is about that wide.
 	prominenceExclusionSeconds = 2.0
@@ -74,15 +56,6 @@ const (
 	// is known, alignment of real audio lands within about this much: cues
 	// are spotted a little ahead of speech and linger after it.
 	alreadySyncedSeconds = 0.15
-	// jointPoolSeconds is how far each window's lag curve is widened (a
-	// running maximum) before the joint search sums the curves, so a drift
-	// between two points of its drift grid still lines the windows up.
-	jointPoolSeconds = 0.12
-	// localSearchSeconds around the joint line is searched again, frame by
-	// frame, for each window's own lag.
-	localSearchSeconds = 1.0
-	// maxJointDriftSteps bounds the joint search's drift grid each way.
-	maxJointDriftSteps = 100
 	// maxDrift bounds the residual drift fitted on top of a framerate ratio,
 	// in seconds of offset per second of media. Releases cut from different
 	// masters can drift by a few hundredths of a percent without any
@@ -134,27 +107,11 @@ type Alignment struct {
 	Confidence float64
 	// Prominence is the agreeing windows' mean prominence.
 	Prominence float64
-	// JointProminence is set when the joint search found Timing: how far,
-	// in standard deviations, the windows' summed lag curves stand above
-	// their sums at other offsets along the best line.
-	JointProminence float64
 }
 
-// Matched reports whether the audio supports Timing: enough windows agree
-// on their own; or, from the joint search, enough agree and the summed
-// evidence stands out, or nearly every window agrees.
+// Matched reports whether the audio supports Timing.
 func (a Alignment) Matched() bool {
-	if a.Inliers < minInliers {
-		return false
-	}
-	if a.JointProminence > 0 {
-		if a.Windows < jointFewWindows {
-			return a.JointProminence >= minJointProminenceFew
-		}
-		return a.JointProminence >= minJointProminence ||
-			(a.Confidence >= minJointAgreement && a.JointProminence >= minJointProminenceAgreed)
-	}
-	return a.Confidence >= minInlierShare && a.Prominence >= minProminence
+	return a.Inliers >= minInliers && a.Confidence >= minInlierShare && a.Prominence >= minProminence
 }
 
 // Decide returns the status of a against the subtitle's current correction,
@@ -185,30 +142,10 @@ type windowLag struct {
 }
 
 // Align finds the correction that lines cues (original subtitle timing) up
-// with the speech in windows. Each window's own best lag is tried first;
-// when too few agree, the joint search sums every window's evidence before
-// choosing a lag, which finds subtitles whose windows are each too weak to
-// stand out (dialog under a laugh track or a score).
+// with the speech in windows.
 func Align(windows []mediasample.SpeechLevels, cues []subtitles.SubtitleCue) (Alignment, error) {
-	signals, cues, search, err := prepare(windows, cues)
-	if err != nil {
-		return Alignment{}, err
-	}
-	best := alignWindows(signals, cues, search)
-	if best.Matched() {
-		return best, nil
-	}
-	if joint, ok := alignJoint(signals, cues, search); ok && joint.Matched() {
-		return joint, nil
-	}
-	return best, nil
-}
-
-// prepare turns windows into speech signals and drops the cues none of
-// them can reach, with a searcher sized for the longest window.
-func prepare(windows []mediasample.SpeechLevels, cues []subtitles.SubtitleCue) ([]*speechSignal, []subtitles.SubtitleCue, *searcher, error) {
 	if len(cues) == 0 {
-		return nil, nil, nil, ErrNoCues
+		return Alignment{}, ErrNoCues
 	}
 	signals := make([]*speechSignal, 0, len(windows))
 	longest := 0
@@ -219,17 +156,14 @@ func prepare(windows []mediasample.SpeechLevels, cues []subtitles.SubtitleCue) (
 		}
 	}
 	if len(signals) == 0 {
-		return nil, nil, nil, ErrNoSpeech
+		return Alignment{}, ErrNoSpeech
 	}
 	cues = cuesInReach(cues, signals)
 	if len(cues) == 0 {
-		return nil, nil, nil, ErrNoCues
+		return Alignment{}, ErrNoCues
 	}
-	return signals, cues, newSearcher(longest), nil
-}
+	search := newSearcher(longest)
 
-// alignWindows fits a line through the windows' own best lags.
-func alignWindows(signals []*speechSignal, cues []subtitles.SubtitleCue, search *searcher) Alignment {
 	var best Alignment
 	var bestFit lineFit
 	var bestMap cueMap
@@ -250,29 +184,23 @@ func alignWindows(signals []*speechSignal, cues []subtitles.SubtitleCue, search 
 			bestFit, bestMap, bestScale = fit, cues, scale
 		}
 	}
-	best.finish(bestFit, bestMap, bestScale)
-	return best
-}
-
-// finish sets a's timing from fit, found on the cue map m of scale, and the
-// agreeing windows' mean prominence and share. a carries Windows and Inliers.
-func (a *Alignment) finish(fit lineFit, m cueMap, scale float64) {
-	if len(fit.Group) > 0 {
-		for _, lag := range fit.Group {
-			a.Prominence += lag.Prominence / float64(len(fit.Group))
+	if len(bestFit.Group) > 0 {
+		for _, lag := range bestFit.Group {
+			best.Prominence += lag.Prominence / float64(len(bestFit.Group))
 		}
-		fit.Offset += refine(fit, m)
+		bestFit.Offset += refine(bestFit, bestMap)
 		// On the scaled clock, media = scale*t + offset + drift*media.
-		k := 1 / (1 - fit.Drift)
-		scale, offset := snapScale(scale*k, fit.Offset*k, fit.Group)
-		a.Timing = subtitles.Timing{Scale: scale, OffsetMS: int(math.Round(offset * 1000))}
+		k := 1 / (1 - bestFit.Drift)
+		scale, offset := snapScale(bestScale*k, bestFit.Offset*k, bestFit.Group)
+		best.Timing = subtitles.Timing{Scale: scale, OffsetMS: int(math.Round(offset * 1000))}
 	}
-	if a.Windows > 0 {
-		a.Confidence = float64(a.Inliers) / float64(a.Windows)
+	if best.Windows > 0 {
+		best.Confidence = float64(best.Inliers) / float64(best.Windows)
 	}
-	if a.Timing.Scale == 1 {
-		a.Timing.Scale = 0
+	if best.Timing.Scale == 1 {
+		best.Timing.Scale = 0
 	}
+	return best, nil
 }
 
 // cuesInReach drops cues no window can pair with: those starting past the
@@ -441,25 +369,12 @@ func newCueMap(cues []subtitles.SubtitleCue, scale float64) cueMap {
 	for _, c := range cues {
 		end = max(end, toFrame(c.End.Seconds()*scale)+1)
 	}
-	// Each frame is written at most once however long or overlapping the
-	// cues are: the cue spans are sorted and only their union is filled,
-	// so a subtitle of many long overlapping cues costs no more than the
-	// map's length.
-	spans := make([][2]int, 0, len(cues))
-	for _, c := range cues {
-		from, to := max(toFrame(c.Start.Seconds()*scale), 0), min(toFrame(c.End.Seconds()*scale), end)
-		if from < to {
-			spans = append(spans, [2]int{from, to})
-		}
-	}
-	slices.SortFunc(spans, func(a, b [2]int) int { return cmp.Compare(a[0], b[0]) })
 	fine := make([]byte, end)
-	filled := 0 // every frame before filled is written
-	for _, span := range spans {
-		for i := max(span[0], filled); i < span[1]; i++ {
+	for _, c := range cues {
+		from, to := toFrame(c.Start.Seconds()*scale), toFrame(c.End.Seconds()*scale)
+		for i := max(from, 0); i < to && i < len(fine); i++ {
 			fine[i] = 1
 		}
-		filled = max(filled, span[1])
 	}
 	coarse := make([]float64, (end+coarseFactor-1)/coarseFactor)
 	for i, v := range fine {
@@ -497,11 +412,6 @@ type speechSignal struct {
 	fine       []float64
 	coarse     []float64
 	corr       *correlator
-}
-
-// middle is the media time at the middle of the window.
-func (s *speechSignal) middle() float64 {
-	return (float64(s.startFrame) + float64(len(s.fine))/2) * frameSeconds
 }
 
 func newSpeechSignal(w mediasample.SpeechLevels) (*speechSignal, bool) {
@@ -595,7 +505,8 @@ func (r *searcher) bestLag(s *speechSignal, m cueMap) (windowLag, bool) {
 	lagFrames := coarseLag - coarseFactor + best
 	// Subtitle frame start+i+lag shows the speech at media frame start+i, so
 	// media time = subtitle time - lag.
-	return windowLag{At: s.middle(), OffsetSeconds: -float64(lagFrames) * frameSeconds, Score: fine[best], Prominence: prom, signal: s}, true
+	at := (float64(s.startFrame) + float64(len(s.fine))/2) * frameSeconds
+	return windowLag{At: at, OffsetSeconds: -float64(lagFrames) * frameSeconds, Score: fine[best], Prominence: prom, signal: s}, true
 }
 
 func (r *searcher) normalize(x, y, raw []float64) []float64 {

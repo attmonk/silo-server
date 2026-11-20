@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useId, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -16,7 +16,6 @@ import {
   type SeasonalTheme,
   type SeasonalVibe,
 } from "@/hooks/queries/seasonalThemes";
-import { useT, type MessageKey } from "@/i18n";
 import {
   customHolidayProblem,
   customHolidaysOf,
@@ -59,14 +58,10 @@ function chosenVibe(theme: SeasonalTheme, vibes: Record<string, string>): Season
   return theme.vibes.find((vibe) => vibe.key === vibes[theme.key]) ?? theme.vibes[0]!;
 }
 
-/** A word between date boxes, muted. */
-const mutedWord = (chunks: ReactNode[]) => <span className="text-muted-foreground">{chunks}</span>;
-
 function CatalogStatus({ isError }: { isError: boolean }) {
-  const t = useT();
   return (
     <p role="status" className="text-muted-foreground text-[13px]">
-      {isError ? t("web.home.addRow.seasonal.failed") : t("web.home.addRow.seasonal.loading")}
+      {isError ? "Couldn't load the holidays. Close and try again." : "Loading holidays…"}
     </p>
   );
 }
@@ -80,14 +75,10 @@ function VibeSelect({
   value: SeasonalVibe;
   onChange: (key: string) => void;
 }) {
-  const t = useT();
   return (
     <div className="grid gap-1">
       <Select value={value.key} onValueChange={onChange}>
-        <SelectTrigger
-          aria-label={t("web.home.addRow.seasonal.vibeFor", { holiday: theme.name })}
-          className="h-8 w-full text-[13px]"
-        >
+        <SelectTrigger aria-label={`Vibe for ${theme.name}`} className="h-8 w-full text-[13px]">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -137,7 +128,6 @@ function HolidayDatesFields({
   dates: HolidayDates | undefined;
   onChange: (next: HolidayDates | undefined) => void;
 }) {
-  const t = useT();
   const value = dates ?? { start: "", end: "" };
   const set = (patch: Partial<HolidayDates>) => {
     const next = { ...value, ...patch };
@@ -148,61 +138,56 @@ function HolidayDatesFields({
     <div className="grid gap-1">
       {/* On the narrowest phones the dates wrap under "In season", kept together. */}
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[13px]">
-        {t("web.home.addRow.seasonal.inSeason", {
-          w: mutedWord,
-          dates: (chunks) => <span className="flex items-center gap-2">{chunks}</span>,
-          start: () => (
-            <MonthDayInput
-              label={t("web.home.addRow.seasonal.starts", { holiday: theme.name })}
-              placeholder={t("web.home.addRow.seasonal.datePlaceholder")}
-              value={value.start}
-              onChange={(start) => set({ start })}
-            />
-          ),
-          end: () => (
-            <MonthDayInput
-              label={t("web.home.addRow.seasonal.ends", { holiday: theme.name })}
-              placeholder={t("web.home.addRow.seasonal.datePlaceholder")}
-              value={value.end}
-              onChange={(end) => set({ end })}
-            />
-          ),
-        })}
+        <span className="text-muted-foreground">In season</span>
+        <span className="flex items-center gap-2">
+          <MonthDayInput
+            label={`${theme.name} starts (MM-DD)`}
+            placeholder="MM-DD"
+            value={value.start}
+            onChange={(start) => set({ start })}
+          />
+          <span className="text-muted-foreground">to</span>
+          <MonthDayInput
+            label={`${theme.name} ends (MM-DD)`}
+            placeholder="MM-DD"
+            value={value.end}
+            onChange={(end) => set({ end })}
+          />
+        </span>
       </div>
       {problem ? (
         <p className="text-destructive text-xs">{problem}</p>
       ) : (
         <p className="text-muted-foreground text-xs">
           {dates
-            ? t("web.home.addRow.seasonal.everyYear")
-            : t("web.home.addRow.seasonal.usualDates", { when: theme.when })}
+            ? "Every year on these dates."
+            : `Leave empty for the usual dates (${theme.when}).`}
         </p>
       )}
     </div>
   );
 }
 
-const SOURCES: ReadonlyArray<{ value: string; label: MessageKey; hint: MessageKey }> = [
+const SOURCES = [
   {
     value: "recommendations",
-    label: "web.home.addRow.seasonal.sourceRecommendations",
-    hint: "web.home.addRow.seasonal.sourceRecommendationsHint",
+    label: "Silo recommendations",
+    hint: "The list's titles you have, most popular first, then similar titles from your library.",
   },
   {
     value: "lists",
-    label: "web.home.addRow.seasonal.sourceLists",
-    hint: "web.home.addRow.seasonal.sourceListsHint",
+    label: "The lists only",
+    hint: "Only the list's titles you have, most popular first.",
   },
 ];
 
 function SourceField({ config, onChange }: FieldProps) {
-  const t = useT();
   const id = useId();
   const value = config.source === "lists" ? "lists" : "recommendations";
   const hint = SOURCES.find((source) => source.value === value)!.hint;
   return (
     <div className="grid gap-1.5">
-      <Label htmlFor={`${id}-source`}>{t("web.home.addRow.seasonal.picksFrom")}</Label>
+      <Label htmlFor={`${id}-source`}>Picks from</Label>
       <Select
         value={value}
         onValueChange={(next) =>
@@ -215,18 +200,17 @@ function SourceField({ config, onChange }: FieldProps) {
         <SelectContent>
           {SOURCES.map((source) => (
             <SelectItem key={source.value} value={source.value}>
-              {t(source.label)}
+              {source.label}
             </SelectItem>
           ))}
         </SelectContent>
       </Select>
-      <p className="text-muted-foreground text-[13px]">{t(hint)}</p>
+      <p className="text-muted-foreground text-[13px]">{hint}</p>
     </div>
   );
 }
 
 function CustomHolidays({ config, onChange, max }: FieldProps & { max: number }) {
-  const t = useT();
   const holidays = customHolidaysOf(config);
   const commit = (next: CustomHoliday[]) =>
     onChange({ ...config, custom_holidays: next.length > 0 ? next : undefined });
@@ -235,24 +219,20 @@ function CustomHolidays({ config, onChange, max }: FieldProps & { max: number })
 
   return (
     <fieldset className="grid gap-2">
-      <legend className="mb-1 text-sm font-medium">
-        {t("web.home.addRow.seasonal.yourHolidays")}
-      </legend>
+      <legend className="mb-1 text-sm font-medium">Your holidays</legend>
       <p className="text-muted-foreground text-[13px]">
-        {t("web.home.addRow.seasonal.yourHolidaysIntro")}
+        Add a holiday of your own with any public MDBList list. It shows ahead of the built-in
+        holidays while it's in season.
       </p>
       {holidays.map((holiday, index) => {
-        const label =
-          holiday.name.trim() || t("web.home.addRow.seasonal.holidayNumber", { number: index + 1 });
+        const label = holiday.name.trim() || `Holiday ${index + 1}`;
         const problem = customHolidayProblem(holiday);
         return (
           <div key={index} className="border-border grid gap-2 rounded-xl border px-3.5 py-3">
             <div className="flex items-center gap-2">
               <Input
-                aria-label={t("web.home.addRow.seasonal.holidayName", {
-                  number: index + 1,
-                })}
-                placeholder={t("web.home.addRow.seasonal.holidayNamePlaceholder")}
+                aria-label={`Name of holiday ${index + 1}`}
+                placeholder="Name, e.g. Fourth of July"
                 className="h-8 text-[13px]"
                 value={holiday.name}
                 onChange={(event) => update(index, { name: event.target.value })}
@@ -261,36 +241,29 @@ function CustomHolidays({ config, onChange, max }: FieldProps & { max: number })
                 type="button"
                 variant="ghost"
                 size="icon"
-                aria-label={t("web.home.addRow.seasonal.removeHoliday", { holiday: label })}
+                aria-label={`Remove ${label}`}
                 onClick={() => commit(holidays.filter((_, i) => i !== index))}
               >
                 <Trash2 className="size-4" />
               </Button>
             </div>
             <div className="flex items-center gap-2 text-[13px]">
-              {t("web.home.addRow.seasonal.dateRange", {
-                w: mutedWord,
-                start: () => (
-                  <MonthDayInput
-                    label={t("web.home.addRow.seasonal.starts", { holiday: label })}
-                    placeholder={t("web.home.addRow.seasonal.datePlaceholder")}
-                    value={holiday.start}
-                    onChange={(start) => update(index, { start })}
-                  />
-                ),
-                end: () => (
-                  <MonthDayInput
-                    label={t("web.home.addRow.seasonal.ends", { holiday: label })}
-                    placeholder={t("web.home.addRow.seasonal.datePlaceholder")}
-                    value={holiday.end}
-                    onChange={(end) => update(index, { end })}
-                  />
-                ),
-              })}
+              <MonthDayInput
+                label={`${label} starts (MM-DD)`}
+                placeholder="MM-DD"
+                value={holiday.start}
+                onChange={(start) => update(index, { start })}
+              />
+              <span className="text-muted-foreground">to</span>
+              <MonthDayInput
+                label={`${label} ends (MM-DD)`}
+                placeholder="MM-DD"
+                value={holiday.end}
+                onChange={(end) => update(index, { end })}
+              />
             </div>
             <Input
-              aria-label={t("web.home.addRow.seasonal.listLabel", { holiday: label })}
-              // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- a URL, not text
+              aria-label={`${label} MDBList list`}
               placeholder="https://mdblist.com/lists/…"
               className="h-8 text-[13px]"
               value={holiday.list_url}
@@ -308,7 +281,7 @@ function CustomHolidays({ config, onChange, max }: FieldProps & { max: number })
           className="justify-self-start"
           onClick={() => commit([...holidays, { name: "", start: "", end: "", list_url: "" }])}
         >
-          <Plus className="size-4" /> {t("web.home.addRow.seasonal.addHoliday")}
+          <Plus className="size-4" /> Add a holiday
         </Button>
       ) : null}
     </fieldset>
@@ -317,7 +290,6 @@ function CustomHolidays({ config, onChange, max }: FieldProps & { max: number })
 
 /** The Holidays variant: which holidays, a vibe and name for each, and your own holidays. */
 export function HolidayFields({ config, onChange }: FieldProps) {
-  const t = useT();
   const id = useId();
   const catalog = useSeasonalThemes();
   // The name box being typed in, as typed: the draft gets it trimmed, so a
@@ -362,9 +334,7 @@ export function HolidayFields({ config, onChange }: FieldProps) {
   return (
     <div className="grid gap-5">
       <fieldset className="grid gap-2">
-        <legend className="mb-2 text-sm font-medium">
-          {t("web.home.addRow.seasonal.holidays")}
-        </legend>
+        <legend className="mb-2 text-sm font-medium">Holidays</legend>
         <div className="border-border divide-border/70 divide-y rounded-xl border">
           {themes.map((theme) => {
             const on = enabled.has(theme.key);
@@ -388,10 +358,10 @@ export function HolidayFields({ config, onChange }: FieldProps) {
                   <Label htmlFor={checkboxId} className="font-normal">
                     {theme.name}
                   </Label>
-                  <span className="text-muted-foreground ms-auto text-xs">{when}</span>
+                  <span className="text-muted-foreground ml-auto text-xs">{when}</span>
                 </div>
                 {on ? (
-                  <div className="grid gap-2 ps-7">
+                  <div className="grid gap-2 pl-7">
                     {theme.vibes.length > 1 ? (
                       <VibeSelect
                         theme={theme}
@@ -400,12 +370,8 @@ export function HolidayFields({ config, onChange }: FieldProps) {
                       />
                     ) : null}
                     <Input
-                      aria-label={t("web.home.addRow.seasonal.rowNameDuring", {
-                        holiday: theme.name,
-                      })}
-                      placeholder={t("web.home.addRow.seasonal.nameInSeason", {
-                        title: vibe.title,
-                      })}
+                      aria-label={`Row name during ${theme.name}`}
+                      placeholder={`Name in season (defaults to "${vibe.title}")`}
                       className="h-8 text-[13px]"
                       value={typed?.key === theme.key ? typed.text : (titles[theme.key] ?? "")}
                       onChange={(event) => {
@@ -437,11 +403,11 @@ export function HolidayFields({ config, onChange }: FieldProps) {
         </div>
         {themes.some((theme) => enabled.has(theme.key)) || hasCustom ? (
           <p className="text-muted-foreground text-[13px]">
-            {t("web.home.addRow.seasonal.inSeasonNote")}
+            The row shows whichever holiday is in season and hides itself when none is.
           </p>
         ) : (
           <p role="status" className="text-destructive text-[13px]">
-            {t("web.home.addRow.seasonal.pickOne")}
+            Pick at least one holiday or add your own.
           </p>
         )}
       </fieldset>
@@ -453,7 +419,6 @@ export function HolidayFields({ config, onChange }: FieldProps) {
 
 /** The Family movie night variant: its vibe and where its picks come from. */
 export function FamilyNightFields({ config, onChange }: FieldProps) {
-  const t = useT();
   const catalog = useSeasonalThemes();
   if (!catalog.data) return <CatalogStatus isError={catalog.isError} />;
   const theme = catalog.data.themes.find((entry) => entry.key === FAMILY_NIGHT);
@@ -462,7 +427,7 @@ export function FamilyNightFields({ config, onChange }: FieldProps) {
     <div className="grid gap-5">
       {theme && theme.vibes.length > 1 ? (
         <div className="grid gap-1.5">
-          <Label>{t("web.home.addRow.seasonal.vibe")}</Label>
+          <Label>Vibe</Label>
           <VibeSelect
             theme={theme}
             value={chosenVibe(theme, vibes)}

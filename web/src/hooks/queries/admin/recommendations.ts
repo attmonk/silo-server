@@ -1,6 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { v2 } from "@/api/v2/request";
-import { t } from "@/i18n";
 import { adminKeys } from "../keys";
 import { toast } from "sonner";
 
@@ -22,11 +21,7 @@ export function useTriggerEmbeddings() {
       queryClient.invalidateQueries({ queryKey: adminKeys.recommendationsStatus() });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error
-          ? err.message
-          : t("web.admin.recommendations.jobs.triggerEmbeddingsFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to trigger embeddings");
     },
   });
 }
@@ -43,11 +38,7 @@ export function useTriggerTasteProfiles() {
       queryClient.invalidateQueries({ queryKey: adminKeys.recommendationsStatus() });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error
-          ? err.message
-          : t("web.admin.recommendations.jobs.triggerTasteProfilesFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to trigger taste profiles");
     },
   });
 }
@@ -62,11 +53,7 @@ export function useTriggerCowatch() {
       queryClient.invalidateQueries({ queryKey: adminKeys.recommendationsStatus() });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error
-          ? err.message
-          : t("web.admin.recommendations.jobs.triggerCowatchFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to trigger co-watch computation");
     },
   });
 }
@@ -83,11 +70,7 @@ export function useTriggerRecommendations() {
       queryClient.invalidateQueries({ queryKey: adminKeys.recommendationsStatus() });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error
-          ? err.message
-          : t("web.admin.recommendations.jobs.triggerRecommendationsFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to trigger recommendations");
     },
   });
 }

@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 var errBackendClosed = errors.New("librarymonitor: backend closed")
@@ -273,13 +271,12 @@ func reportFolder(emit func(Event), dir string, isRoot bool) {
 }
 
 // eventName returns an entry name from a kernel event without the NUL
-// padding the kernel appends, in fspath encoding like every other path the
-// monitor handles.
+// padding the kernel appends.
 func eventName(raw []byte) string {
 	if i := bytes.IndexByte(raw, 0); i >= 0 {
 		raw = raw[:i]
 	}
-	return fspath.Encode(string(raw))
+	return string(raw)
 }
 
 // WatchLimitError reports that the kernel ran out of inotify watches while

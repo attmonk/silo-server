@@ -4,16 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"mime"
 	"net/http"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 
@@ -55,9 +51,6 @@ func classGate(deps Dependencies) func(huma.Context, func(huma.Context)) {
 		}
 		if link, _ := op.Metadata[metaDirectDownloadLink].(bool); link && missing == "" {
 			chain = directDownloadGateChain(deps, chain)
-		}
-		if streamReferenceOperations[op.OperationID] && missing == "" {
-			chain = streamReferenceGateChain(deps, chain)
 		}
 		if attach, _ := op.Metadata[metaAttachSession].(bool); attach && class == ClassPublic && deps.Auth != nil {
 			chain = append(chain, deps.Auth.AttachSession)
@@ -301,10 +294,6 @@ func (d *denialWriter) problem() *Problem {
 		} else {
 			p = p.WithRetryAfter(apimw.CredentialCheckRetryAfterSeconds)
 		}
-	case apimw.CodePlaybackSessionEnded:
-		// A stream reference whose session was stopped: the same answer the
-		// delivery handlers give that session, not a sign-in problem.
-		p = NewProblem(TypePlaybackSessionEnded, "The playback session has ended.")
 	case legacyBadRequestCode:
 		p = badRequestProblem(d.reason)
 	case TypeInternalError.ID:
@@ -457,17 +446,6 @@ func mediaTypeGuard(ctx huma.Context, next func(huma.Context)) {
 		next(ctx)
 		return
 	}
-	if blankOK, _ := op.Metadata[metaBlankBodyAbsent].(bool); blankOK && !op.RequestBody.Required {
-		blank, problem := readBlankBody(ctx, r, op)
-		if problem != nil {
-			writeProblem(w, r, problem)
-			return
-		}
-		if blank {
-			next(ctx)
-			return
-		}
-	}
 	if op.RequestBody.Content[mediaTypeBinary] != nil && len(op.RequestBody.Content) == 1 {
 		media, _, err := mime.ParseMediaType(ct)
 		if err != nil || media != mediaTypeBinary {
@@ -517,53 +495,6 @@ func mediaTypeGuard(ctx huma.Context, next func(huma.Context)) {
 	// everything the accepted header said.
 	r.Header.Set("Content-Type", mediaTypeJSON)
 	next(ctx)
-}
-
-// readBlankBody applies dropBlankBody under the operation's body-read
-// deadline, turning a failed read into its problem.
-func readBlankBody(ctx huma.Context, r *http.Request, op *huma.Operation) (bool, *Problem) {
-	if op.BodyReadTimeout > 0 {
-		_ = ctx.SetReadDeadline(time.Now().Add(op.BodyReadTimeout))
-	}
-	blank, err := dropBlankBody(r, operationBodyLimit(op))
-	switch {
-	case errors.Is(err, os.ErrDeadlineExceeded):
-		return false, NewProblem(TypeRequestTimeout, "The request body was not received in time.")
-	case err != nil:
-		return false, NewProblem(TypeMalformedRequest, "The request body could not be read.")
-	}
-	return blank, nil
-}
-
-// dropBlankBody reads up to limit+1 bytes of r's body. A body that is empty
-// or only JSON whitespace is replaced by no body at all, Content-Type
-// included, and dropBlankBody reports true. Any other body is put back
-// unchanged for the usual media-type and size rules.
-func dropBlankBody(r *http.Request, limit int64) (bool, error) {
-	if r.Body == nil || r.Body == http.NoBody {
-		r.Header.Del("Content-Type")
-		return true, nil
-	}
-	if r.ContentLength > limit {
-		// Too large to be blank: leave it to the size check unread.
-		return false, nil
-	}
-	head, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
-	if err != nil {
-		return false, err
-	}
-	if len(bytes.Trim(head, " \t\r\n")) == 0 && int64(len(head)) <= limit {
-		_ = r.Body.Close()
-		r.Body = http.NoBody
-		r.ContentLength = 0
-		r.Header.Del("Content-Type")
-		return true, nil
-	}
-	r.Body = struct {
-		io.Reader
-		io.Closer
-	}{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}
-	return false, nil
 }
 
 // mediaTypeMultipart is accepted only on operations that declare a multipart

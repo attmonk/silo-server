@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -110,9 +109,6 @@ type TitleKey struct {
 	TMDBID    int
 }
 
-// Key returns the snapshot's TMDB identity.
-func (s Snapshot) Key() TitleKey { return TitleKey{MediaType: s.MediaType, TMDBID: s.TMDBID} }
-
 // Snapshot is what a TMDB detail says about a title: its current IDs and the
 // fields a watchlist page displays.
 type Snapshot struct {
@@ -201,7 +197,6 @@ type TitleTMDB interface {
 type promotionStore interface {
 	AddToWatchlistAt(ctx context.Context, profileID, mediaItemID string, addedAt time.Time) (bool, error)
 	GetWatchlistEntry(ctx context.Context, profileID, mediaItemID string) (*userstore.WatchlistEntry, error)
-	ListWatchlistByMediaItems(ctx context.Context, profileID string, mediaItemIDs []string) (map[string]bool, error)
 }
 
 const (
@@ -366,46 +361,16 @@ func (s *Titles) PurgeProfile(ctx context.Context, userID int, profileID string)
 // LibraryMatches returns every library item (enabled folders, same media
 // type) that carries or once carried any of the IDs. The add path uses it to
 // send a title the library already has to the library watchlist instead.
-// The IDs a stored title holding one of the TMDB IDs has kept count too, so
-// add and remove find the item promotion would move the title onto.
 func (s *Titles) LibraryMatches(ctx context.Context, mediaType string, tmdbIDs []int, imdbID string, tvdbID int) ([]string, error) {
-	ids := make([]string, 0, len(tmdbIDs)+2)
+	aliases := make([]catalog.ProviderAlias, 0, len(tmdbIDs)+2)
 	for _, id := range tmdbIDs {
-		ids = append(ids, contentid.ProviderTMDB+":"+strconv.Itoa(id))
+		aliases = append(aliases, catalog.ProviderAlias{MediaType: mediaType, Provider: contentid.ProviderTMDB, ProviderID: strconv.Itoa(id)})
 	}
 	if imdbID != "" {
-		ids = append(ids, contentid.ProviderIMDB+":"+imdbID)
+		aliases = append(aliases, catalog.ProviderAlias{MediaType: mediaType, Provider: contentid.ProviderIMDB, ProviderID: imdbID})
 	}
 	if tvdbID > 0 {
-		ids = append(ids, contentid.ProviderTVDB+":"+strconv.Itoa(tvdbID))
-	}
-	return s.libraryMatchesIDs(ctx, mediaType, ids)
-}
-
-// libraryMatchesIDs is LibraryMatches for prefixed provider IDs ("tmdb:550",
-// "imdb:tt0137523", "tvdb:121361"), any number of each.
-func (s *Titles) libraryMatchesIDs(ctx context.Context, mediaType string, ids []string) ([]string, error) {
-	aliases := make([]catalog.ProviderAlias, 0, len(ids))
-	var tmdbAliases []string
-	for _, id := range ids {
-		// ResolveProviderAliases skips empty IDs and other providers.
-		provider, providerID, _ := strings.Cut(id, ":")
-		if provider == contentid.ProviderTMDB && providerID != "" {
-			tmdbAliases = append(tmdbAliases, providerID)
-		}
-		aliases = append(aliases, catalog.ProviderAlias{MediaType: mediaType, Provider: provider, ProviderID: providerID})
-	}
-	if len(tmdbAliases) > 0 {
-		stored, err := s.repo.aliasesOfTMDBOwners(ctx, mediaType, tmdbAliases)
-		if err != nil {
-			return nil, err
-		}
-		for _, a := range stored {
-			aliases = append(aliases, catalog.ProviderAlias{MediaType: a.MediaType, Provider: a.Provider, ProviderID: a.ProviderID})
-		}
-	}
-	if len(aliases) == 0 {
-		return nil, nil
+		aliases = append(aliases, catalog.ProviderAlias{MediaType: mediaType, Provider: contentid.ProviderTVDB, ProviderID: strconv.Itoa(tvdbID)})
 	}
 	matches, err := s.catalog.ResolveProviderAliases(ctx, aliases)
 	if err != nil {
@@ -537,21 +502,21 @@ func (s *Titles) promoteOne(ctx context.Context, store promotionStore, v Viewer,
 		return false, false, ctx.Err()
 	}
 	defer func() { <-s.promoteSlots }()
-	// addedAt is the moved entry's time: the caller's read before the title
-	// lock, or the entry as it is under the lock.
-	addToLibrary := func(ctx context.Context, addedAt time.Time) (bool, error) {
-		inserted, err := store.AddToWatchlistAt(ctx, v.ProfileID, contentID, addedAt)
+	addToLibrary := func(ctx context.Context) error {
+		inserted, err := store.AddToWatchlistAt(ctx, v.ProfileID, contentID, entryAddedAt)
 		if err != nil {
-			return false, fmt.Errorf("adding promoted watchlist item: %w", err)
+			return fmt.Errorf("adding promoted watchlist item: %w", err)
 		}
 		if inserted {
-			return true, nil
+			newToUser = true
+			return nil
 		}
 		existing, err := store.GetWatchlistEntry(ctx, v.ProfileID, contentID)
 		if err != nil {
-			return false, fmt.Errorf("reading promoted watchlist item: %w", err)
+			return fmt.Errorf("reading promoted watchlist item: %w", err)
 		}
-		return existing != nil && sameStoredTime(existing.AddedAt, addedAt), nil
+		newToUser = existing != nil && sameStoredTime(existing.AddedAt, entryAddedAt)
+		return nil
 	}
 	if !s.addUnderLock {
 		// Skip an entry a remove already took, so the window in which a
@@ -559,13 +524,14 @@ func (s *Titles) promoteOne(ctx context.Context, store promotionStore, v Viewer,
 		if present, err := s.repo.entryExists(ctx, v.UserID, v.ProfileID, titleID); err != nil || !present {
 			return false, false, err
 		}
-		added, err := addToLibrary(ctx, entryAddedAt)
-		if err != nil {
+		if err := addToLibrary(ctx); err != nil {
 			return false, false, err
 		}
-		return s.repo.promoteEntry(ctx, v.UserID, v.ProfileID, titleID, contentID, func(context.Context, time.Time) (bool, error) { return added, nil })
+		moved, err = s.repo.promoteEntry(ctx, v.UserID, v.ProfileID, titleID, func(context.Context) error { return nil })
+		return moved, newToUser, err
 	}
-	return s.repo.promoteEntry(ctx, v.UserID, v.ProfileID, titleID, contentID, addToLibrary)
+	moved, err = s.repo.promoteEntry(ctx, v.UserID, v.ProfileID, titleID, addToLibrary)
+	return moved, newToUser, err
 }
 
 // sameStoredTime reports whether a user store timestamp is t. Stores keep
@@ -605,20 +571,6 @@ func (s *Titles) PromoteWatchlistItem(ctx context.Context, access catalog.Access
 		slog.WarnContext(ctx, "watchlist promotion failed; the read continues without it",
 			"component", "watchlist", "user_id", v.UserID, "profile_id", v.ProfileID, "content_id", contentID, "error", err)
 	}
-}
-
-// QueuePromotable queues on b whether the access filter's profile has any
-// watchlist title entry. PromoteWatchlistItem can only promote one it has,
-// so a caller batching this with its own reads can skip the promotion's
-// queries for the many profiles without any. Closing the sent batch's results
-// without error sets *promotable.
-func (s *Titles) QueuePromotable(b *pgx.Batch, access catalog.AccessFilter, promotable *bool) {
-	*promotable = false
-	v, ok := viewerFromAccess(access)
-	if s == nil || !ok {
-		return
-	}
-	b.Queue(profileHasEntriesSQL, v.UserID, v.ProfileID).QueryRow(func(row pgx.Row) error { return row.Scan(promotable) })
 }
 
 func viewerFromAccess(access catalog.AccessFilter) (Viewer, bool) {

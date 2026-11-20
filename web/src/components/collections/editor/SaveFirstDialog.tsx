@@ -10,8 +10,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { saveFirstTitle } from "@/lib/collections/copy";
-import { useT } from "@/i18n";
+import { SAVE_FIRST_TITLE } from "@/lib/collections/copy";
 
 /**
  * Asks before leaving the editor for Home rows with unsaved changes: save
@@ -39,7 +38,6 @@ export function SaveFirstDialog({
   onDiscard: () => void;
   onSave: () => void;
 }) {
-  const t = useT();
   const reasonId = useId();
   const saveReasonId = useId();
   return (
@@ -51,7 +49,7 @@ export function SaveFirstDialog({
     >
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>{saveFirstTitle()}</AlertDialogTitle>
+          <AlertDialogTitle>{SAVE_FIRST_TITLE}</AlertDialogTitle>
           <AlertDialogDescription>{description}</AlertDialogDescription>
           {discardBlockedReason ? (
             <p id={reasonId} className="text-muted-foreground text-sm">
@@ -66,7 +64,7 @@ export function SaveFirstDialog({
         </AlertDialogHeader>
         <AlertDialogFooter className="sm:justify-between">
           <AlertDialogCancel variant="ghost" disabled={isSaving}>
-            {t("common.cancel")}
+            Cancel
           </AlertDialogCancel>
           <div className="flex flex-col-reverse gap-2 sm:flex-row">
             <Button
@@ -75,7 +73,7 @@ export function SaveFirstDialog({
               aria-describedby={discardBlockedReason ? reasonId : undefined}
               onClick={onDiscard}
             >
-              {t("web.collections.saveFirst.discardChanges")}
+              Discard changes
             </Button>
             <Button
               disabled={isSaving || Boolean(saveBlockedReason)}
@@ -85,10 +83,10 @@ export function SaveFirstDialog({
               {isSaving ? (
                 <span
                   aria-hidden
-                  className="me-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent"
+                  className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent"
                 />
               ) : null}
-              {t("web.collections.saveFirst.saveAndContinue")}
+              Save and continue
             </Button>
           </div>
         </AlertDialogFooter>

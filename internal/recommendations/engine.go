@@ -3,7 +3,6 @@ package recommendations
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -40,13 +39,10 @@ type Engine struct {
 	storeProvider userstore.UserStoreProvider
 	signals       *SignalReader
 	embClient     embedder
-	// embKeys swaps the embedding client's key on a config reload; nil when
-	// the client cannot change keys (test fakes).
-	embKeys interface{ SetAPIKey(string) }
-	cfg     config.RecommendationsConfig
-	pool    *pgxpool.Pool
-	unrated access.UnratedContentPolicy
-	scopes  ScopeResolver
+	cfg           config.RecommendationsConfig
+	pool          *pgxpool.Pool
+	unrated       access.UnratedContentPolicy
+	scopes        ScopeResolver
 	// refusedEmbeds are the inputs the embedding provider refused; see
 	// refusedEmbedInputs.
 	refusedEmbeds *refusedEmbedInputs
@@ -102,7 +98,6 @@ func NewEngine(
 		APIKey:  cfg.EmbeddingAuthToken,
 	}
 
-	embClient := embeddings.NewClient(embCfg)
 	return &Engine{
 		repo:          repo,
 		ratingsRepo:   ratingsRepo,
@@ -110,33 +105,11 @@ func NewEngine(
 		personRepo:    personRepo,
 		storeProvider: storeProvider,
 		signals:       NewSignalReader(repo, storeProvider),
-		embClient:     embClient,
-		embKeys:       embClient,
+		embClient:     embeddings.NewClient(embCfg),
 		cfg:           cfg,
 		pool:          pool,
 		refusedEmbeds: newRefusedEmbedInputs(),
 	}
-}
-
-// ApplyEmbeddingCredential installs the key a reloaded configuration resolves
-// for the endpoint and model this engine runs, so rotating the provider's key
-// needs no restart. A configuration that moved embeddings to another endpoint
-// or model waits for the restart that applies it, so its key never reaches the
-// endpoint this engine still calls.
-func (e *Engine) ApplyEmbeddingCredential(cfg config.RecommendationsConfig) {
-	if e == nil || e.embKeys == nil {
-		return
-	}
-	if cfg.EmbeddingBaseURL != e.cfg.EmbeddingBaseURL || cfg.EmbeddingModel != e.cfg.EmbeddingModel {
-		return
-	}
-	e.embKeys.SetAPIKey(cfg.EmbeddingAuthToken)
-}
-
-// embeddingConfigured reports whether an embedding provider and model are
-// chosen. Without them every embedding run would fail at the first request.
-func (e *Engine) embeddingConfigured() bool {
-	return strings.TrimSpace(e.cfg.EmbeddingBaseURL) != "" && strings.TrimSpace(e.cfg.EmbeddingModel) != ""
 }
 
 // ActiveEmbeddingModel returns the embedding model currently locked for this
@@ -237,9 +210,8 @@ func (e *Engine) profileAccessFilter(ctx context.Context, userID int, profileID 
 		// show those titles.
 		filter.AllowUnratedContent = e.unrated.AllowUnratedContent(ctx)
 	}
-	filter.MaturityLimits = filter.WithAllowedTitles(profile.AllowedTitleIDs)
-	if libraryIDs, limited := access.ProfileLibraryLimit(profile); limited {
-		filter.AllowedLibraryIDs = append([]int{}, libraryIDs...)
+	if profile.LibraryRestrictionsEnabled {
+		filter.AllowedLibraryIDs = append([]int{}, profile.AllowedLibraryIDs...)
 	}
 	return filter, nil
 }

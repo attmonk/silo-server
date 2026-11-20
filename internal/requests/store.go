@@ -12,9 +12,6 @@ type Store interface {
 	UpsertUserLimit(ctx context.Context, limit UserLimit) (*UserLimit, error)
 	CountUserRequestsSince(ctx context.Context, userID int, since time.Time) (int, error)
 	ListActiveByTMDB(ctx context.Context, mediaType MediaType, tmdbIDs []int) (map[int]*Request, error)
-	// ListRequestedTMDB reports which of the TMDB IDs the viewer's profile
-	// made a request under for the media type, in any outcome.
-	ListRequestedTMDB(ctx context.Context, viewer Viewer, mediaType MediaType, tmdbIDs []int) (map[int]bool, error)
 	// ListProfileWatchlistRequests returns the active requests a profile's
 	// watchlist made.
 	ListProfileWatchlistRequests(ctx context.Context, userID int, profileID string) ([]*Request, error)
@@ -50,9 +47,6 @@ type Store interface {
 	// ReopenFailed moves a failed request back to active + approved with a
 	// fresh submission budget, in one guarded write.
 	ReopenFailed(ctx context.Context, id string, actor Viewer) (*Request, error)
-	// DeleteFailed removes a failed request that delivered nothing, in one
-	// guarded write; otherwise it returns ErrInvalidState.
-	DeleteFailed(ctx context.Context, id string) error
 	// ClaimSubmission takes the right to submit an approved request: it
 	// succeeds for one caller at a time, only while the request is active,
 	// approved, not leased, and past its backoff, and it counts the attempt.
@@ -71,9 +65,8 @@ type Store interface {
 	// cannot fail a newer claim's attempt.
 	FailSubmission(ctx context.Context, id string, leaseUntil time.Time, actor Viewer, message string) (*Request, error)
 	// RecordSubmission stores the targets a claimed submission created,
-	// replacing any failed target of the same quality, releases the claim,
-	// and re-derives the request's status from its targets, in one
-	// transaction. It is fenced on leaseUntil the same way as
+	// releases the claim, and re-derives the request's status from its
+	// targets, in one transaction. It is fenced on leaseUntil the same way as
 	// DeferSubmission: an attempt that outlived its lease while the request
 	// was withdrawn, completed or claimed again gets ErrInvalidState and
 	// writes nothing.
@@ -89,9 +82,8 @@ type Store interface {
 	// that is creating targets.
 	MarkAvailable(ctx context.Context, id string, actor Viewer) (*Request, error)
 	// RecomputeStatus re-derives an approved request's status and outcome from
-	// its targets, for a submission that found nothing left to send. It
-	// answers ErrInvalidState once the claim no longer holds leaseUntil.
-	RecomputeStatus(ctx context.Context, id string, leaseUntil time.Time, actor Viewer) (*Request, error)
+	// its targets, for a submission that found nothing left to send.
+	RecomputeStatus(ctx context.Context, id string, actor Viewer) (*Request, error)
 	// FollowTitle, UnfollowTitle and FollowedRequests manage a profile's
 	// follows, keyed by account, profile and request; ListRequestFollowers and
 	// ClearRequestFollowers serve a request's fulfilled notification. All are
@@ -106,18 +98,8 @@ type Store interface {
 	// decideRoutes orders them.
 	ListRoutes(ctx context.Context) ([]Route, error)
 	// SetRoutingFacts stores facts fetched after the request was created (and
-	// the anime flag they imply), unless another API server stored captured
-	// facts first; it returns the request as stored either way.
+	// the anime flag they imply).
 	SetRoutingFacts(ctx context.Context, id string, facts RoutingFacts) (*Request, error)
-	// UpdateRoutingFacts writes the facts set in facts over the stored ones,
-	// key by key, and keeps the rest: a fact read again (the rating) replaces
-	// only itself.
-	UpdateRoutingFacts(ctx context.Context, id string, facts RoutingFacts) (*Request, error)
-	// FillRoutingFacts stores the facts set in facts that the stored ones
-	// lack and keeps every one already stored, so a fact read once (series
-	// status) keeps the first value any API server wrote. It returns the
-	// request as stored.
-	FillRoutingFacts(ctx context.Context, id string, facts RoutingFacts) (*Request, error)
 	// SetExternalIDs records a TVDB ID resolved after the request was created,
 	// and fills the IMDb ID when the row has none. An existing positive TVDB ID
 	// is kept; the TVDB ID the row holds afterwards is returned.
@@ -125,13 +107,9 @@ type Store interface {
 	ListTargets(ctx context.Context, requestID string) ([]Target, error)
 	ListTargetsForRequests(ctx context.Context, requestIDs []string) (map[string][]Target, error)
 	CreateTarget(ctx context.Context, target Target) (Target, error)
-	// DeleteTarget removes a claimed request's target while the claim still
-	// holds leaseUntil. It answers ErrInvalidState when the claim was lost
-	// and ErrNotFound when only the target is gone.
-	DeleteTarget(ctx context.Context, requestID string, id int64, leaseUntil time.Time) error
-	// UpdateTargetStatus writes only a queued or downloading target, and
-	// answers ErrInvalidState for one that already completed or failed. It
-	// also clears the target's download progress when it completes or fails.
+	DeleteTarget(ctx context.Context, id int64) error
+	// UpdateTargetStatus also clears the target's download progress when it
+	// completes or fails.
 	UpdateTargetStatus(ctx context.Context, targetID int64, status Status, externalID, externalStatus, lastErr string, actor Viewer) (*Request, error)
 	// UpdateTargetDownload stores a target's download progress, or clears it
 	// when progress is nil, only while the target is queued or downloading. It

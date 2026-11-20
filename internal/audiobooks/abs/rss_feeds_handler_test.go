@@ -1,13 +1,16 @@
 package abs
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -84,33 +87,30 @@ func (m *memRSSFeedStore) CloseFeed(_ context.Context, id string) error {
 	return nil
 }
 
+func newFeedsHarness(t *testing.T, knownItems ...string) (*Handler, *memRSSFeedStore) {
+	t.Helper()
+	known := map[string]*models.MediaItem{}
+	for _, id := range knownItems {
+		known[id] = nil
+	}
+	store := newMemRSSFeedStore()
+	resolver := newFakeOwnerResolver().
+		set("1", "", catalog.AccessFilter{UserID: 1}).
+		set("2", "", catalog.AccessFilter{UserID: 2})
+	h := New(Dependencies{MediaStore: &stubMediaStore{known: known}, RSSFeedStore: store, AccessResolver: resolver})
+	return h, store
+}
+
 // fakeOwnerResolver hands out a fixed access filter per (user, profile). A
 // principal it does not know is unavailable, as a disabled or deleted owner
-// is. Every account is a server administrator, and every principal its
-// account's primary profile, until the test says otherwise.
+// is.
 type fakeOwnerResolver struct {
-	mu         sync.Mutex
-	access     map[string]catalog.AccessFilter
-	nonAdmin   map[string]bool
-	nonPrimary map[string]bool
+	mu     sync.Mutex
+	access map[string]catalog.AccessFilter
 }
 
 func newFakeOwnerResolver() *fakeOwnerResolver {
-	return &fakeOwnerResolver{access: map[string]catalog.AccessFilter{}, nonAdmin: map[string]bool{}, nonPrimary: map[string]bool{}}
-}
-
-// demote takes the server admin role from the account.
-func (f *fakeOwnerResolver) demote(userID string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.nonAdmin[userID] = true
-}
-
-// notPrimary makes the principal a profile other than its account's primary.
-func (f *fakeOwnerResolver) notPrimary(userID, profileID string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.nonPrimary[userID+"/"+profileID] = true
+	return &fakeOwnerResolver{access: map[string]catalog.AccessFilter{}}
 }
 
 func (f *fakeOwnerResolver) set(userID, profileID string, filter catalog.AccessFilter) *fakeOwnerResolver {
@@ -127,18 +127,17 @@ func (f *fakeOwnerResolver) remove(userID, profileID string) {
 }
 
 func (f *fakeOwnerResolver) ResolveABSAccess(ctx context.Context, userID, profileID string) (catalog.AccessFilter, error) {
-	filter, _, err := f.ResolveABSOwnerAccess(ctx, userID, profileID)
-	return filter, err
+	return f.ResolveABSOwnerAccess(ctx, userID, profileID)
 }
 
-func (f *fakeOwnerResolver) ResolveABSOwnerAccess(_ context.Context, userID, profileID string) (catalog.AccessFilter, bool, error) {
+func (f *fakeOwnerResolver) ResolveABSOwnerAccess(_ context.Context, userID, profileID string) (catalog.AccessFilter, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	filter, ok := f.access[userID+"/"+profileID]
 	if !ok {
-		return catalog.AccessFilter{}, false, ErrOwnerUnavailable
+		return catalog.AccessFilter{}, ErrOwnerUnavailable
 	}
-	return filter, !f.nonAdmin[userID] && !f.nonPrimary[userID+"/"+profileID], nil
+	return filter, nil
 }
 
 // accessMediaStore applies an access filter the way ABSMediaStore does: the
@@ -181,7 +180,6 @@ func (s *accessMediaStore) GetMediaFiles(_ context.Context, id string, filter ca
 type ownerFeedFixture struct {
 	h        *Handler
 	resolver *fakeOwnerResolver
-	accounts *downloadAccounts
 	owner    catalog.AccessFilter
 	body     []byte
 }
@@ -211,9 +209,7 @@ func newOwnerFeedFixture(t *testing.T) ownerFeedFixture {
 		t.Fatal(err)
 	}
 	h := New(Dependencies{MediaStore: media, RSSFeedStore: feeds, AccessResolver: resolver})
-	accounts := &downloadAccounts{denied: map[int]bool{}}
-	h.SetDownloads(newDownloadService(true, accounts))
-	return ownerFeedFixture{h: h, resolver: resolver, accounts: accounts, owner: owner, body: body}
+	return ownerFeedFixture{h: h, resolver: resolver, owner: owner, body: body}
 }
 
 func (fx ownerFeedFixture) getFeed() *httptest.ResponseRecorder {
@@ -226,14 +222,115 @@ func (fx ownerFeedFixture) getFile(ino string) *httptest.ResponseRecorder {
 		map[string]string{"slug": "owner-feed", "ino": ino}, nil, "", "", fx.h.handlePublicFeedFile)
 }
 
+func TestFeed_Open_InvalidSlug_400(t *testing.T) {
+	h, _ := newFeedsHarness(t, "book-1")
+	rec := dispatchABSWithParams(http.MethodPost, "/api/feeds/item/book-1/open",
+		map[string]string{"itemId": "book-1"}, []byte(`{"slug":"BAD!"}`), "1", "", h.handleOpenItemFeed)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestFeed_Open_Collision_409(t *testing.T) {
+	h, _ := newFeedsHarness(t, "book-1")
+	body := []byte(`{"slug":"taken-slug"}`)
+	_ = dispatchABSWithParams(http.MethodPost, "/api/feeds/item/book-1/open", map[string]string{"itemId": "book-1"}, body, "1", "", h.handleOpenItemFeed)
+	rec := dispatchABSWithParams(http.MethodPost, "/api/feeds/item/book-1/open", map[string]string{"itemId": "book-1"}, body, "1", "", h.handleOpenItemFeed)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", rec.Code)
+	}
+}
+
+func TestFeed_Close_NonOwner_404(t *testing.T) {
+	h, _ := newFeedsHarness(t, "book-1")
+	openRec := dispatchABSWithParams(http.MethodPost, "/api/feeds/item/book-1/open", map[string]string{"itemId": "book-1"}, []byte(`{}`), "1", "", h.handleOpenItemFeed)
+	var open map[string]any
+	_ = json.Unmarshal(openRec.Body.Bytes(), &open)
+	id, _ := open["id"].(string)
+
+	rec := dispatchABSWithParams(http.MethodPost, "/api/feeds/"+id+"/close", map[string]string{"id": id}, nil, "2", "", h.handleCloseFeed)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+// The feed lists and serves only the versions its owner can access, not every
+// version of the item.
+func TestPublicFeed_OnlyOwnerAccessibleVersions(t *testing.T) {
+	fx := newOwnerFeedFixture(t)
+
+	rec := fx.getFeed()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("feed status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if xml := rec.Body.String(); !strings.Contains(xml, "/feed/owner-feed/file/11") || strings.Contains(xml, "/file/22") {
+		t.Fatalf("feed should list only file 11; got %s", xml)
+	}
+
+	if rec := fx.getFile("11"); rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), fx.body) {
+		t.Fatalf("accessible file: status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if rec := fx.getFile("22"); rec.Code != http.StatusNotFound {
+		t.Fatalf("file in a library the owner cannot access: status = %d, want 404", rec.Code)
+	}
+}
+
+// A feed applies its owner's access at request time, so it stops working once
+// the owner can no longer see the item, and answers exactly like a closed feed.
+func TestPublicFeed_FollowsOwnerCurrentAccess(t *testing.T) {
+	cases := map[string]func(fx ownerFeedFixture){
+		"library access revoked": func(fx ownerFeedFixture) {
+			revoked := fx.owner
+			revoked.AllowedLibraryIDs = []int{}
+			fx.resolver.set("1", "kid", revoked)
+		},
+		"maturity limit tightened": func(fx ownerFeedFixture) {
+			tightened := fx.owner
+			tightened.MaxContentRating = "PG"
+			fx.resolver.set("1", "kid", tightened)
+		},
+		"owner disabled": func(fx ownerFeedFixture) {
+			fx.resolver.remove("1", "kid")
+		},
+	}
+	closed := newOwnerFeedFixture(t)
+	if err := closed.h.deps.RSSFeedStore.CloseFeed(context.Background(), "feed-1"); err != nil {
+		t.Fatal(err)
+	}
+	closedFeed, closedFile := closed.getFeed(), closed.getFile("11")
+
+	for name, revoke := range cases {
+		t.Run(name, func(t *testing.T) {
+			fx := newOwnerFeedFixture(t)
+			if rec := fx.getFile("11"); rec.Code != http.StatusOK {
+				t.Fatalf("before the change: file status = %d, want 200", rec.Code)
+			}
+			revoke(fx)
+
+			for _, got := range []struct {
+				route    string
+				rec, ref *httptest.ResponseRecorder
+			}{
+				{"feed", fx.getFeed(), closedFeed},
+				{"file", fx.getFile("11"), closedFile},
+			} {
+				if got.rec.Code != http.StatusNotFound || got.rec.Body.String() != got.ref.Body.String() {
+					t.Errorf("%s: status = %d, body = %q; want the closed-feed answer %d, %q",
+						got.route, got.rec.Code, got.rec.Body.String(), got.ref.Code, got.ref.Body.String())
+				}
+			}
+		})
+	}
+}
+
 type failingOwnerResolver struct{}
 
 func (failingOwnerResolver) ResolveABSAccess(context.Context, string, string) (catalog.AccessFilter, error) {
 	return catalog.AccessFilter{}, errors.New("database unavailable")
 }
 
-func (failingOwnerResolver) ResolveABSOwnerAccess(context.Context, string, string) (catalog.AccessFilter, bool, error) {
-	return catalog.AccessFilter{}, false, errors.New("database unavailable")
+func (failingOwnerResolver) ResolveABSOwnerAccess(context.Context, string, string) (catalog.AccessFilter, error) {
+	return catalog.AccessFilter{}, errors.New("database unavailable")
 }
 
 // Without an owner to resolve, the feed fails closed. A failed owner lookup is
@@ -258,5 +355,17 @@ func TestPublicFeed_OwnerResolutionFailures(t *testing.T) {
 				t.Errorf("file status = %d, want %d", rec.Code, tc.want)
 			}
 		})
+	}
+}
+
+func TestFeed_List_OwnerOnly(t *testing.T) {
+	h, _ := newFeedsHarness(t, "book-1")
+	_ = dispatchABSWithParams(http.MethodPost, "/api/feeds/item/book-1/open", map[string]string{"itemId": "book-1"}, []byte(`{}`), "1", "", h.handleOpenItemFeed)
+	rec := dispatchABSWithParams(http.MethodGet, "/api/feeds", nil, nil, "2", "", h.handleListRSSFeeds)
+	var env map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	feeds, _ := env["feeds"].([]any)
+	if len(feeds) != 0 {
+		t.Errorf("user 2 sees %d feeds, want 0", len(feeds))
 	}
 }

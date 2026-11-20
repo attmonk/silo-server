@@ -34,7 +34,6 @@ func NewRouter(deps Dependencies) chi.Router {
 	deps = withDefaults(deps)
 
 	r := chi.NewRouter()
-	r.Use(httpstream.NoSniff)
 	r.Use(stripSlashesExceptWeb)
 	r.Use(middleware.RequestID)
 	r.Use(observeCompatRequest)
@@ -60,7 +59,7 @@ func NewRouter(deps Dependencies) chi.Router {
 		MaxAge:           86400,
 	}))
 	r.Use(normalizeCompatPathMiddleware)
-	r.Use(httpstream.CompressExcept(skipCompatMediaCompression, "application/json"))
+	r.Use(httpstream.CompressExcept(5, skipCompatMediaCompression, "application/json"))
 	if debugPath := os.Getenv("JELLYCOMPAT_DEBUG_LOG"); debugPath != "" {
 		rotator := &lumberjack.Logger{
 			Filename:   debugPath,
@@ -98,8 +97,6 @@ func NewRouter(deps Dependencies) chi.Router {
 		subtitleRepo = subtitles.NewPgRepository(deps.DB, deps.SecretCipher)
 	}
 	itemsHandler := NewItemsHandler(deps.ContentService, deps.UserDataService, deps.IDCodec, deps.Config, deps.ImageCache, nextUpRepo, deps.BrowseRepo, deps.PersonRepo, deps.DetailSvc, deps.ItemRepo, deps.EpisodeRepo, deps.SeasonRepo, deps.AccessFilterFn, subtitleRepo)
-	shownRatings := newShownRatings(deps.RatingSources)
-	itemsHandler.mapper.ratings = shownRatings
 	itemsHandler.storeProvider = deps.UserStoreProvider
 	itemsHandler.adminDefaults = deps.AdminDefaults
 	itemsHandler.MarkerPopulation = deps.MarkerPopulation
@@ -133,9 +130,8 @@ func NewRouter(deps Dependencies) chi.Router {
 	// Rate limiting mirrors the native API: credential endpoints spend their
 	// per-endpoint budget, and authenticated routes, media included, run the
 	// generic limiter after auth, as the native authenticated group does.
-	// Anonymous artwork, web assets, and public server info stay unlimited
-	// like native public artwork and server reads. User avatars spend the
-	// per-IP budget: each one reads the session, profile, and blob stores.
+	// Anonymous artwork, avatars, web assets, and public server info stay
+	// unlimited like native public artwork and server reads.
 	rateLimit := compatRateLimit(deps.RateLimit)
 	autoscanVirtualFoldersRegistered := false
 	if deps.Authenticator != nil && adminAPIKeyAuth != nil && autoscanHandler != nil {
@@ -146,7 +142,6 @@ func NewRouter(deps Dependencies) chi.Router {
 		autoscanVirtualFoldersRegistered = true
 	}
 	userDataHandler := NewUserDataHandler(deps.ContentService, deps.UserDataService, deps.IDCodec, deps.Config)
-	userDataHandler.mapper.ratings = shownRatings
 	if store, ok := deps.PlaybackStore.(*DurableCompatPlaybackStore); ok && store.pool != nil {
 		if manager, ok := deps.SessionMgr.(interface {
 			SetCompatActivityReader(playback.SessionActivityReader)
@@ -175,10 +170,6 @@ func NewRouter(deps Dependencies) chi.Router {
 	}
 	playbackHandler.NodePlanner = deps.NodePlanner
 	playbackHandler.JWTSecret = deps.JWTSecret
-	playbackHandler.NodeKeys = deps.NodeKeys
-	if deps.SourceGrants != nil {
-		playbackHandler.SourceGrants = deps.SourceGrants
-	}
 	// Compat transcode reconstruct is driven by the recipe carried in the durable
 	// compat playback store (jellycompat_playback_sessions); no separate native
 	// recipe table is needed.
@@ -195,9 +186,7 @@ func NewRouter(deps Dependencies) chi.Router {
 		playbackHandler.signalsNotifier = deps.RecWorker
 	}
 	playbackHandler.SettingsRepo = deps.SettingsRepo
-	playbackHandler.ratings = shownRatings
 	playbackHandler.RecipeNodeStore = deps.RecipeNodeStore
-	playbackHandler.StreamDeny = deps.StreamDeny
 	itemsHandler.themeRouter = compatThemeRouter(deps, playbackHandler)
 	itemsHandler.themeFFmpegPath = func() string { return playback.ResolveFFmpegPath(playbackHandler.FFmpegPath) }
 	playbackHandler.SessionSyncer = deps.SessionSyncer
@@ -205,11 +194,6 @@ func NewRouter(deps Dependencies) chi.Router {
 	playbackHandler.StableIdentityResolver = deps.StableIdentityResolver
 	playbackHandler.Trickplay = deps.Trickplay
 	playbackHandler.PlaySync = deps.SubtitlePlaySync
-	if deps.KeptSubtitles != nil {
-		playbackHandler.SubtitleCache.SetEmbeddedSource(deps.KeptSubtitles)
-	}
-	playbackHandler.AudioPreferences = deps.AudioPreferences
-	playbackHandler.SubtitlePreferences = deps.SubtitlePreferences
 	if subtitleRepo != nil {
 		playbackHandler.SubtitleRepo = subtitleRepo
 		playbackHandler.SubtitleBlobs = deps.SubtitleBlobs
@@ -218,9 +202,6 @@ func NewRouter(deps Dependencies) chi.Router {
 			playbackHandler.ExternalTimings = timings
 		}
 	}
-	// Last: move requests run on the event bus's goroutine and read the
-	// handler's fields.
-	subscribeTranscodeMoveRequests(deps, playbackHandler)
 	imagesHandler := NewImagesHandler(deps.ContentService, deps.IDCodec, deps.SessionStore, deps.ImageCache, deps.PersonRepo, deps.DetailSvc, deps.ItemRepo, deps.FolderRepo, deps.SeasonRepo, deps.EpisodeRepo, deps.AccessFilterFn, deps.PosterPresigner, deps.PresignTTL, deps.JWTSecret, deps.HTTPClient)
 	if deps.DB != nil {
 		imagesHandler.extraRepo = catalog.NewExtraRepository(deps.DB)
@@ -230,9 +211,6 @@ func NewRouter(deps Dependencies) chi.Router {
 	imagesHandler.keyAuth = adminAPIKeyAuth
 	imagesHandler.frontendFS = deps.FrontendFS
 	imagesHandler.artworkStore = deps.ArtworkStore
-	userAvatars := newCompatUserAvatars(deps.SessionStore, deps.UserStoreProvider, deps.AvatarStore)
-	imagesHandler.userAvatars = userAvatars
-	authHandler.avatars = userAvatars
 	displayPrefsHandler := NewDisplayPreferencesHandler(deps.UserStoreProvider)
 	// attmonk fork: Live TV listings, view, favorites, logos and policy flag; all nil when Live TV is off.
 	liveTV := newLiveTVHandlers(deps.LiveTV, itemsHandler.mapper.serverID, itemsHandler, userDataHandler, playbackHandler)
@@ -242,7 +220,6 @@ func NewRouter(deps Dependencies) chi.Router {
 	}
 	authHandler.liveTV = deps.LiveTV
 	recsHandler := NewRecommendationsHandler(deps.RecommendationReader, deps.ItemRepo, deps.DetailSvc, deps.UserDataService, deps.IDCodec, deps.Config, deps.AccessFilterFn)
-	recsHandler.mapper.ratings = shownRatings
 
 	r.Get("/System/Info/Public", systemHandler.HandlePublicInfo)
 	r.Get("/System/Info", systemHandler.HandleInfo)
@@ -258,19 +235,15 @@ func NewRouter(deps Dependencies) chi.Router {
 	registerQuickConnectRoutes(r, deps, authHandler)
 	r.Get(compatItemImageRoute, imagesHandler.HandleItemImage)
 	r.Get(compatItemImageIndexRoute, imagesHandler.HandleItemImage)
-	// Roku clients probe for artwork with HEAD before showing it.
-	r.Head(compatItemImageRoute, imagesHandler.HandleItemImage)
-	r.Head(compatItemImageIndexRoute, imagesHandler.HandleItemImage)
 	// Jellyfin user-avatar images are anonymous: clients fetch them via plain
 	// <img> tags that carry no auth, so the route is registered top-level rather
 	// than inside the session-auth group.
-	userImage := r.With(rateLimit)
-	userImage.Get(compatUserImageRoute, imagesHandler.HandleUserImage)
-	userImage.Method(http.MethodHead, compatUserImageRoute, http.HandlerFunc(imagesHandler.HandleUserImage))
+	r.Get(compatUserImageRoute, imagesHandler.HandleUserImage)
+	r.Method(http.MethodHead, compatUserImageRoute, http.HandlerFunc(imagesHandler.HandleUserImage))
 	// Modern Jellyfin clients fetch the current user's avatar via /UserImage?userId=
-	// (the path form above is [Obsolete] upstream). Same anonymous handler.
-	userImage.Get(compatUserImageQueryRoute, imagesHandler.HandleUserImage)
-	userImage.Method(http.MethodHead, compatUserImageQueryRoute, http.HandlerFunc(imagesHandler.HandleUserImage))
+	// (the path form above is [Obsolete] upstream). Same anonymous palette handler.
+	r.Get(compatUserImageQueryRoute, imagesHandler.HandleUserImage)
+	r.Method(http.MethodHead, compatUserImageQueryRoute, http.HandlerFunc(imagesHandler.HandleUserImage))
 	webHandler := http.StripPrefix("/web", newDynamicCompatWebHandler(deps))
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/web/", http.StatusFound)
@@ -300,7 +273,6 @@ func NewRouter(deps Dependencies) chi.Router {
 			r.Get("/Items/Latest", liveTV.wrapLatest(itemsHandler.HandleLatest))   // attmonk fork: Live TV views have no latest items
 			r.Get("/Items/Filters", itemsHandler.HandleFiltersStub)
 			r.Get("/Items/Filters2", itemsHandler.HandleFilters2Stub)
-			r.Get("/Items/Counts", itemsHandler.HandleItemCounts)
 			r.Get("/Items/Suggestions", itemsHandler.HandleSuggestions)
 			r.Get("/Users/{id}/Items/Latest", liveTV.wrapLatest(itemsHandler.HandleLatest)) // attmonk fork: Live TV views have no latest items
 			r.Get("/Items/{id}/Similar", itemsHandler.HandleSimilar)
@@ -322,7 +294,6 @@ func NewRouter(deps Dependencies) chi.Router {
 			r.Get("/Users/{userId}/Items/{id}/Intros", itemsHandler.HandleItemStub)
 			r.Get("/Users/{userId}/Items/{id}/LocalTrailers", itemsHandler.HandleLocalTrailers)
 			r.Get("/Items/{id}", liveTV.wrapItem(itemsHandler.HandleItem)) // attmonk fork: Live TV view and channels
-			r.Get("/Items/{id}/Images", itemsHandler.HandleItemImageInfos)
 			r.Get("/Users/{userId}/Items/Resume", itemsHandler.HandleResume)
 			r.Get("/Users/{userId}/Items/{id}", liveTV.wrapItem(itemsHandler.HandleItem)) // attmonk fork: Live TV view and channels
 			r.Get("/Studios", itemsHandler.HandleStudios)
@@ -333,6 +304,7 @@ func NewRouter(deps Dependencies) chi.Router {
 			r.Get("/Shows/NextUp", itemsHandler.HandleNextUp)
 			r.Get("/Shows/Upcoming", itemsHandler.HandleUpcoming)
 			r.Get("/MediaSegments/{id}", itemsHandler.HandleMediaSegments)
+			r.Get(compatTrickplaySheetRoute, playbackHandler.HandleTrickplaySheet)
 			r.Get(compatTrickplayPlaylistRoute, playbackHandler.HandleTrickplayPlaylist)
 			r.Get("/Episode/{id}/Timestamps", itemsHandler.HandleItemStub)
 			r.Get("/Episode/{id}/IntroTimestamps", itemsHandler.HandleItemStub)
@@ -405,7 +377,7 @@ func NewRouter(deps Dependencies) chi.Router {
 
 	// Media requests require a token or a PlaySessionId scoped to the negotiated source.
 	r.Group(func(r chi.Router) {
-		r.Use(PlaybackSessionAuth(deps.SessionStore, deps.PlaybackStore, adminAPIKeyAuth, deps.SettingsRepo))
+		r.Use(PlaybackSessionAuth(deps.SessionStore, deps.PlaybackStore, adminAPIKeyAuth))
 		r.Use(rateLimit)
 		r.Method(http.MethodHead, "/Items/{id}/Download", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Items/{id}/Download", playbackHandler.HandleDownload))
 		r.Get("/Items/{id}/Download", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Items/{id}/Download", playbackHandler.HandleDownload))
@@ -423,33 +395,25 @@ func NewRouter(deps Dependencies) chi.Router {
 		r.Get("/Videos/{id}/audio-v2/stream", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/audio-v2/stream", playbackHandler.HandleAudioV2VideoStream))
 		r.Method(http.MethodHead, "/Videos/{id}/audio-v2/stream.{container}", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Videos/{id}/audio-v2/stream.{container}", playbackHandler.HandleAudioV2VideoStream))
 		r.Get("/Videos/{id}/audio-v2/stream.{container}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/audio-v2/stream.{container}", playbackHandler.HandleAudioV2VideoStream))
-		r.Method(http.MethodHead, "/Videos/{id}/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Videos/{id}/master.m3u8", playbackHandler.HandleMasterManifest))
 		r.Get("/Videos/{id}/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/master.m3u8", playbackHandler.HandleMasterManifest))
 		r.Get("/Videos/{id}/hls/{playlistId}/stream.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/hls/{playlistId}/stream.m3u8", playbackHandler.HandleHLSManifest))
 		r.Get("/Videos/{id}/hls/{playlistId}/{segmentId}.{segmentContainer}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/hls/{playlistId}/{segmentId}.{segmentContainer}", playbackHandler.HandleHLSSegment))
-		r.Method(http.MethodHead, "/Videos/{id}/audio-v2/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Videos/{id}/audio-v2/master.m3u8", playbackHandler.HandleAudioV2MasterManifest))
 		r.Get("/Videos/{id}/audio-v2/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/audio-v2/master.m3u8", playbackHandler.HandleAudioV2MasterManifest))
 		r.Get("/Videos/{id}/audio-v2/hls/{playlistId}/stream.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/audio-v2/hls/{playlistId}/stream.m3u8", playbackHandler.HandleAudioV2HLSManifest))
 		r.Get("/Videos/{id}/audio-v2/hls/{playlistId}/{segmentId}.{segmentContainer}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/audio-v2/hls/{playlistId}/{segmentId}.{segmentContainer}", playbackHandler.HandleAudioV2HLSSegment))
-		r.Method(http.MethodHead, "/Videos/{id}/hevc-v1/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Videos/{id}/hevc-v1/master.m3u8", playbackHandler.HandleHEVCV1MasterManifest))
 		r.Get("/Videos/{id}/hevc-v1/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/hevc-v1/master.m3u8", playbackHandler.HandleHEVCV1MasterManifest))
 		r.Get("/Videos/{id}/hevc-v1/hls/{playlistId}/stream.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/hevc-v1/hls/{playlistId}/stream.m3u8", playbackHandler.HandleHEVCV1HLSManifest))
 		r.Get("/Videos/{id}/hevc-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/hevc-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", playbackHandler.HandleHEVCV1HLSSegment))
-		r.Method(http.MethodHead, "/Videos/{id}/remux-v1/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Videos/{id}/remux-v1/master.m3u8", playbackHandler.HandleRemuxV1MasterManifest))
 		r.Get("/Videos/{id}/remux-v1/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-v1/master.m3u8", playbackHandler.HandleRemuxV1MasterManifest))
 		r.Get("/Videos/{id}/remux-v1/hls/{playlistId}/stream.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-v1/hls/{playlistId}/stream.m3u8", playbackHandler.HandleRemuxV1HLSManifest))
 		r.Get("/Videos/{id}/remux-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", playbackHandler.HandleRemuxV1HLSSegment))
-		r.Method(http.MethodHead, "/Videos/{id}/remux-ts-v1/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Videos/{id}/remux-ts-v1/master.m3u8", playbackHandler.HandleRemuxTSV1MasterManifest))
 		r.Get("/Videos/{id}/remux-ts-v1/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-ts-v1/master.m3u8", playbackHandler.HandleRemuxTSV1MasterManifest))
 		r.Get("/Videos/{id}/remux-ts-v1/hls/{playlistId}/stream.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-ts-v1/hls/{playlistId}/stream.m3u8", playbackHandler.HandleRemuxTSV1HLSManifest))
 		r.Get("/Videos/{id}/remux-ts-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-ts-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", playbackHandler.HandleRemuxTSV1HLSSegment))
-		r.Method(http.MethodHead, "/Videos/{id}/remux-dv-v1/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Videos/{id}/remux-dv-v1/master.m3u8", playbackHandler.HandleRemuxDVV1MasterManifest))
 		r.Get("/Videos/{id}/remux-dv-v1/master.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-dv-v1/master.m3u8", playbackHandler.HandleRemuxDVV1MasterManifest))
 		r.Get("/Videos/{id}/remux-dv-v1/hls/{playlistId}/stream.m3u8", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-dv-v1/hls/{playlistId}/stream.m3u8", playbackHandler.HandleRemuxDVV1HLSManifest))
 		r.Get("/Videos/{id}/remux-dv-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-dv-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", playbackHandler.HandleRemuxDVV1HLSSegment))
 		r.Get("/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/stream.{routeFormat}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/stream.{routeFormat}", playbackHandler.HandleSubtitleStream))
-		// Sheet URLs in a trickplay playlist carry a PlaySessionId, not a token.
-		r.Get(compatTrickplaySheetRoute, playbackHandler.HandleTrickplaySheet)
 		r.Get("/Videos/{id}/{routeMediaSourceId}/Attachments/{routeIndex}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/{routeMediaSourceId}/Attachments/{routeIndex}", playbackHandler.HandleAttachment))
 		// Jellyfin subtitle routes encode the start position in ticks in this component.
 		r.Get("/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/stream.{routeFormat}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/stream.{routeFormat}", playbackHandler.HandleSubtitleStream))
@@ -489,10 +453,7 @@ func skipCompatActivityLog(pattern string) bool {
 		compatTrickplaySheetRoute, compatTrickplayPlaylistRoute:
 		return true
 	}
-	// A request the router refused on an HLS path, such as a HEAD, arrives here
-	// as the path the client sent, which carries the play session ID. Matching
-	// the path shape skips it along with the HLS route patterns.
-	return redactHLSPlaySessionID(pattern) != pattern
+	return strings.HasPrefix(pattern, "/Videos/") && strings.Contains(pattern, "/hls/{playlistId}/")
 }
 
 func skipCompatMediaCompression(r *http.Request) bool {

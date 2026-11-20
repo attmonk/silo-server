@@ -14,7 +14,6 @@ import {
 } from "@/hooks/queries/admin/settings";
 import { useRestartKeys } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
-import { useT } from "@/i18n";
 import { SaveBar } from "@/components/SaveBar";
 import { FieldGroup } from "./FieldGroup";
 import { SearchStatusPanel, SearchStatusSummary } from "./SearchStatusPanel";
@@ -49,11 +48,7 @@ const MEILI_KEYS = [...MEILI_SHOWN_KEYS, ...MEILI_ADVANCED_KEYS];
 // rebuild_task_queue_depth,index_types,embedder,binary_quantized}.
 const KEYS = [PROVIDER_KEY, ...MEILI_KEYS];
 
-const MEILISEARCH = "Meilisearch";
-const MEILI_URL_EXAMPLE = "http://localhost:7700";
-
 export default function SearchSettings() {
-  const t = useT();
   const form = useSettingsForm({ keys: KEYS });
   const restartKeys = useRestartKeys();
   const checkConnection = useCheckAdminSettingsConnection();
@@ -61,9 +56,6 @@ export default function SearchSettings() {
 
   const provider = form.getValue(PROVIDER_KEY) || "postgres";
   const meiliEnabled = provider === "meilisearch";
-  // Without the protected-credential status the page cannot tell which of
-  // these fields the environment sets, so they wait for a reload.
-  const connectionUnknown = form.sensitiveStatusError;
   const { data: searchStatus } = useCatalogSearchStatus(meiliEnabled);
   const anyDirty = (keys: string[]) => keys.some((key) => form.isDirty(key));
   // Staged Meilisearch edits stay reachable after switching the provider back,
@@ -85,81 +77,62 @@ export default function SearchSettings() {
     } catch (error) {
       setConnectionResult({
         success: false,
-        message:
-          error instanceof Error
-            ? error.message
-            : t("web.admin.settings.fields.connectionCheckFailed"),
+        message: error instanceof Error ? error.message : "Connection check failed.",
       });
     }
   }
 
-  // Which fields the environment sets comes from the protected-credential
-  // status, so the page waits for it rather than take an edit it must refuse.
-  if (form.isLoading || (!form.sensitiveStatusReady && !form.sensitiveStatusError)) {
+  if (form.isLoading) {
     return (
-      <div
-        className="space-y-6"
-        role="status"
-        aria-label={t("web.admin.settings.fields.loadingSettings")}
-      >
+      <div className="space-y-6" role="status" aria-label="Loading settings">
         <Skeleton className="h-8 w-48" />
         <Skeleton className="h-32 w-full" />
-        <span className="sr-only">{t("web.admin.settings.fields.loadingSettings")}</span>
+        <span className="sr-only">Loading settings</span>
       </div>
     );
   }
 
   return (
     <div className="flex h-full flex-col">
-      <SettingsPageHeader title={t("web.admin.settings.search.title")} />
+      <SettingsPageHeader title="Search" />
 
       <div className="flex-1 space-y-5">
         <FieldGroup
-          label={t("web.admin.settings.search.group")}
-          description={t("web.admin.settings.search.description")}
+          label="Search"
+          description="Built-in Postgres search needs no setup. Meilisearch is optional."
           restartAll={KEYS.every((key) => restartKeys.has(key))}
           dirty={anyDirty(KEYS)}
         >
           <SettingField
-            label={t("web.admin.settings.search.provider.label")}
+            label="Search engine"
             type="select"
-            description={t("web.admin.settings.search.provider.description")}
+            description="Meilisearch tolerates typos but runs as its own service. If it goes down, search falls back to the built-in engine automatically."
             value={provider}
             onChange={(value) => form.setValue(PROVIDER_KEY, value)}
             options={[
-              { value: "postgres", label: t("web.admin.settings.search.provider.postgres") },
-              { value: "meilisearch", label: MEILISEARCH },
+              { value: "postgres", label: "Built-in (Postgres)" },
+              { value: "meilisearch", label: "Meilisearch" },
             ]}
             status={meiliEnabled && !searchStatus?.degraded ? <SearchStatusSummary /> : undefined}
-            disabled={connectionUnknown}
-            managedByEnv={form.envVar(PROVIDER_KEY)}
             restartRequired={restartKeys.has(PROVIDER_KEY)}
           />
-          {connectionUnknown && (
-            <div className="py-3.5">
-              <SettingFieldStatus tone="warn">
-                {t("web.admin.settings.search.credentialStatusError")}
-              </SettingFieldStatus>
-            </div>
-          )}
           {meiliEnabled && searchStatus?.degraded && (
             <div className="py-3.5">
               <SettingFieldStatus tone="warn">
                 <span>
-                  {searchStatus.degraded_reason ?? t("web.admin.settings.search.degradedFallback")}
+                  {searchStatus.degraded_reason ?? "Search is running in a degraded mode."}
                   {searchStatus.index.rebuild_required && (
                     <>
                       {" "}
-                      {t("web.admin.settings.search.rebuildInBackground", {
-                        link: (chunks) => (
-                          <Link
-                            className="font-medium underline underline-offset-2"
-                            to="/admin/tasks/sync_catalog_search_index"
-                          >
-                            {chunks}
-                          </Link>
-                        ),
-                      })}
+                      Automatic search maintenance rebuilds the index in the background and retries
+                      if needed.{" "}
+                      <Link
+                        className="font-medium underline underline-offset-2"
+                        to="/admin/tasks/sync_catalog_search_index"
+                      >
+                        Open maintenance task
+                      </Link>
+                      .
                     </>
                   )}
                 </span>
@@ -170,16 +143,15 @@ export default function SearchSettings() {
           {showMeili && (
             <>
               <SettingField
-                label={t("web.admin.settings.search.meili.url.label")}
+                label="Meilisearch URL"
                 value={form.getValue(MEILI_URL_KEY)}
                 onChange={(value) => form.setValue(MEILI_URL_KEY, value)}
-                hint={MEILI_URL_EXAMPLE}
-                disabled={!meiliEnabled || connectionUnknown}
-                managedByEnv={form.envVar(MEILI_URL_KEY)}
+                hint="http://localhost:7700"
+                disabled={!meiliEnabled}
                 restartRequired={restartKeys.has(MEILI_URL_KEY)}
               />
               <SecretField
-                label={t("web.admin.settings.search.meili.apiKey.label")}
+                label="Meilisearch API key"
                 value={form.getValue(MEILI_API_KEY)}
                 configured={form.sensitiveConfigured.includes(MEILI_API_KEY)}
                 onChange={(value) => form.setValue(MEILI_API_KEY, value)}
@@ -188,9 +160,8 @@ export default function SearchSettings() {
                 // Meilisearch instance without a master key needs it empty.
                 onClear={() => form.setValue(MEILI_API_KEY, "")}
                 cleared={form.isClearStaged(MEILI_API_KEY)}
-                hint={t("web.admin.settings.search.meili.apiKey.hint")}
-                disabled={!meiliEnabled || connectionUnknown}
-                managedByEnv={form.envVar(MEILI_API_KEY)}
+                hint="Master key, or one that can read and write the index."
+                disabled={!meiliEnabled}
                 restartRequired={restartKeys.has(MEILI_API_KEY)}
               />
               <ConnectionCheckAction
@@ -200,31 +171,33 @@ export default function SearchSettings() {
                 disabled={!meiliEnabled}
               />
               <SettingField
-                label={t("web.admin.settings.search.meili.matching.label")}
+                label="When a search has several words"
                 type="select"
                 value={form.getValue("catalog.search.meilisearch.matching_strategy") || "last"}
                 onChange={(value) =>
                   form.setValue("catalog.search.meilisearch.matching_strategy", value)
                 }
                 options={[
-                  { value: "last", label: t("web.admin.settings.search.meili.matching.last") },
-                  { value: "all", label: t("web.admin.settings.search.meili.matching.all") },
+                  { value: "last", label: "Drop trailing words until something matches" },
+                  { value: "all", label: "Require every word" },
                 ]}
                 disabled={!meiliEnabled}
                 restartRequired={restartKeys.has("catalog.search.meilisearch.matching_strategy")}
               />
               <SettingField
-                label={t("web.admin.settings.search.meili.semantic.label")}
+                label="Match by meaning as well as words"
                 type="toggle"
                 value={form.getValue("catalog.search.meilisearch.semantic_enabled") || "false"}
                 onChange={(value) =>
                   form.setValue("catalog.search.meilisearch.semantic_enabled", value)
                 }
-                description={t("web.admin.settings.search.meili.semantic.description")}
+                description="Also matches items whose description means something similar."
                 status={
                   enablingSemanticSearch ? (
                     <SettingFieldStatus tone="warn">
-                      {t("web.admin.settings.search.meili.semantic.enablingWarning")}
+                      Enabling this changes the index format. After you save and restart, Silo
+                      rebuilds the index automatically. Keyword search stays available while it
+                      rebuilds.
                     </SettingFieldStatus>
                   ) : undefined
                 }
@@ -244,51 +217,51 @@ export default function SearchSettings() {
             {showMeili && (
               <>
                 <SettingField
-                  label={t("web.admin.settings.search.meili.index.label")}
+                  label="Index name prefix"
                   value={form.getValue("catalog.search.meilisearch.index") || "silo_media_items"}
                   onChange={(value) => form.setValue("catalog.search.meilisearch.index", value)}
-                  description={t("web.admin.settings.search.meili.index.description")}
+                  description="Only needed when Silo servers share one Meilisearch."
                   disabled={!meiliEnabled}
                   restartRequired={restartKeys.has("catalog.search.meilisearch.index")}
                 />
                 <SettingField
-                  label={t("web.admin.settings.search.meili.timeout.label")}
+                  label="Query timeout"
                   type="number"
-                  unit={t("web.admin.common.units.milliseconds")}
+                  unit="ms"
                   value={form.getValue("catalog.search.meilisearch.timeout_ms") || "800"}
                   onChange={(value) =>
                     form.setValue("catalog.search.meilisearch.timeout_ms", value)
                   }
-                  description={t("web.admin.settings.search.meili.timeout.description")}
+                  description="Searches that take longer fall back to the built-in engine."
                   disabled={!meiliEnabled}
                   restartRequired={restartKeys.has("catalog.search.meilisearch.timeout_ms")}
                 />
                 <SettingField
-                  label={t("web.admin.settings.search.meili.batch.label")}
+                  label="Items sent to the index per batch"
                   type="number"
                   value={form.getValue("catalog.search.meilisearch.sync_batch_size") || "500"}
                   onChange={(value) =>
                     form.setValue("catalog.search.meilisearch.sync_batch_size", value)
                   }
-                  description={t("web.admin.settings.search.meili.batch.description")}
+                  description="Larger batches index faster and use more memory."
                   disabled={!meiliEnabled}
                   restartRequired={restartKeys.has("catalog.search.meilisearch.sync_batch_size")}
                 />
                 <SettingField
-                  label={t("web.admin.settings.search.meili.ratio.label")}
+                  label="Meaning-based share of results"
                   type="number"
                   value={form.getValue("catalog.search.meilisearch.semantic_ratio") || "0.50"}
                   onChange={(value) =>
                     form.setValue("catalog.search.meilisearch.semantic_ratio", value)
                   }
-                  description={t("web.admin.settings.search.meili.ratio.description")}
+                  description="0 ranks by words, 1 by meaning."
                   disabled={!meiliEnabled}
                   restartRequired={restartKeys.has("catalog.search.meilisearch.semantic_ratio")}
                 />
               </>
             )}
 
-            <SettingsSubheading>{t("web.admin.settings.search.status.heading")}</SettingsSubheading>
+            <SettingsSubheading>Search status</SettingsSubheading>
             <SearchStatusPanel />
           </AdvancedSection>
         </FieldGroup>

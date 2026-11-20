@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net/url"
 	"slices"
 	"testing"
@@ -16,6 +15,67 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
+
+func TestMediaItemToListItemUsesMovieReleaseDateForPremiereDate(t *testing.T) {
+	releaseDate := "2026-02-13"
+	item := mediaItemToListItem(&models.MediaItem{
+		ContentID:   "movie-1",
+		Type:        "movie",
+		Title:       "Future Movie",
+		Year:        2026,
+		ReleaseDate: &releaseDate,
+	})
+
+	if item.AirDate != releaseDate {
+		t.Fatalf("got AirDate %q, want %q", item.AirDate, releaseDate)
+	}
+}
+
+func TestItemDetailToUpstreamUsesMovieReleaseDateForPremiereDate(t *testing.T) {
+	releaseDate := "2026-02-13"
+	detail := itemDetailToUpstream(&catalog.ItemDetail{
+		ContentID:   "movie-1",
+		Type:        "movie",
+		Title:       "Future Movie",
+		Year:        2026,
+		ReleaseDate: &releaseDate,
+	})
+
+	if detail.AirDate == nil || *detail.AirDate != releaseDate {
+		t.Fatalf("got AirDate %v, want %q", detail.AirDate, releaseDate)
+	}
+}
+
+func TestItemDetailToUpstreamOrdersVideoVersionsLikeJellyfin(t *testing.T) {
+	input := &catalog.ItemDetail{Versions: []catalog.FileVersion{
+		{FileID: 1080, VideoTracks: []models.VideoTrack{{Width: 1920, Height: 1080}}},
+		{FileID: 2160, VideoTracks: []models.VideoTrack{{Width: 3840, Height: 2160}}},
+	}}
+
+	detail := itemDetailToUpstream(input)
+
+	if got := []int{detail.Versions[0].FileID, detail.Versions[1].FileID}; !slices.Equal(got, []int{2160, 1080}) {
+		t.Fatalf("Jellyfin version order = %v, want highest width first", got)
+	}
+	if input.Versions[0].FileID != 1080 {
+		t.Fatal("compat conversion mutated the native catalog version order")
+	}
+}
+
+func TestItemEtagIncludesPremiereDate(t *testing.T) {
+	base := upstreamListItem{
+		ContentID: "movie-1",
+		Title:     "Future Movie",
+		Year:      2026,
+		AirDate:   "2026-02-13",
+	}
+	updated := base
+	updated.AirDate = "2026-03-01"
+
+	if itemEtag(base) == itemEtag(updated) {
+		t.Fatal("expected date changes to alter the compat item etag")
+	}
+}
 
 type countingCompatImageResolver struct {
 	singleCalls int
@@ -52,6 +112,57 @@ func (r *countingCompatImageResolver) ResolveImageURLsWithExpiry(_ context.Conte
 		resolved[path] = catalog.ResolvedImageURL{URL: "batch:" + variant + ":" + path}
 	}
 	return resolved
+}
+
+func TestPresignListItemsBatchResolvesImages(t *testing.T) {
+	resolver := &countingCompatImageResolver{}
+	detailSvc := &catalog.DetailService{}
+	detailSvc.SetImageResolver(resolver)
+
+	items := []upstreamListItem{
+		{
+			ContentID:   "movie-1",
+			PosterURL:   "plug://poster-1",
+			BackdropURL: "plug://backdrop-1",
+			LogoURL:     "plug://logo-1",
+		},
+		{
+			ContentID: "movie-2",
+			PosterURL: "plug://poster-2",
+			StillURL:  "plug://still-2",
+		},
+	}
+
+	presignCompatListItems(context.Background(), detailSvc, items)
+
+	if resolver.singleCalls != 0 {
+		t.Fatalf("single image resolver calls = %d, want 0", resolver.singleCalls)
+	}
+	if resolver.batchCalls != 4 {
+		t.Fatalf("batch image resolver calls = %d, want 4", resolver.batchCalls)
+	}
+	for _, variant := range resolver.variants {
+		if variant != "card" {
+			t.Fatalf("batch variant = %q, want card", variant)
+		}
+	}
+	for _, path := range []string{"plug://poster-1", "plug://poster-2", "plug://backdrop-1", "plug://logo-1", "plug://still-2"} {
+		if !slices.Contains(resolver.paths, path) {
+			t.Fatalf("batch paths %v missing %q", resolver.paths, path)
+		}
+	}
+	if items[0].PosterPath != "plug://poster-1" {
+		t.Fatalf("PosterPath = %q, want original path", items[0].PosterPath)
+	}
+	if got := items[0].PosterURL; got != "batch:card:plug://poster-1" {
+		t.Fatalf("PosterURL = %q", got)
+	}
+	if got := items[0].BackdropURL; got != "batch:card:plug://backdrop-1" {
+		t.Fatalf("BackdropURL = %q", got)
+	}
+	if got := items[1].StillURL; got != "batch:card:plug://still-2" {
+		t.Fatalf("StillURL = %q", got)
+	}
 }
 
 // progressCountingStoreProvider is a test double that records calls to
@@ -129,6 +240,33 @@ func (s *stubBrowseSource) BrowsePage(_ context.Context, filters catalog.BrowseF
 	}, nil
 }
 
+func TestBrowseItems_RecentlyAddedWithOffsetFallsBackToBrowsePage(t *testing.T) {
+	browse := &stubBrowseSource{items: makeBrowseTestMediaItems(40), total: 40}
+	svc := newDirectContentServiceForTest(browse, nil)
+	svc.folderRepo = &stubFolderSource{
+		enabled: []*models.MediaFolder{
+			{ID: 1, Name: "Movies", Type: "movie"},
+			{ID: 3, Name: "TV", Type: "series"},
+		},
+	}
+
+	session := &Session{StreamAppUserID: 1, ProfileID: "p1"}
+	params := url.Values{}
+	params.Set("limit", "5")
+	params.Set("offset", "5")
+	params.Set("sort", "recently_added")
+
+	if _, err := svc.BrowseItems(context.Background(), session, params); err != nil {
+		t.Fatalf("BrowseItems: %v", err)
+	}
+	if got := len(browse.crossLibraryCall); got != 0 {
+		t.Fatalf("cross-library calls = %d, want 0 for offset>0", got)
+	}
+	if got := len(browse.calls); got == 0 {
+		t.Fatal("BrowsePage calls = 0, want offset>0 to fall back to BrowsePage")
+	}
+}
+
 func (s *stubBrowseSource) BrowseRecentlyAddedAcrossLibraries(_ context.Context, base catalog.BrowseFilters, libraryIDs []int) (*catalog.BrowseResult, error) {
 	s.crossLibraryCall = append(s.crossLibraryCall, stubCrossLibraryCall{base: base, libraryIDs: libraryIDs})
 	end := min(max(base.Limit, 0), len(s.items))
@@ -154,6 +292,31 @@ func (p *recordingCatalogSearchProvider) Search(_ context.Context, req catalog.C
 		return p.result, nil
 	}
 	return &catalog.CatalogSearchResult{}, nil
+}
+
+type recordingItemAccessSource struct {
+	searchQueries []string
+	searchTypes   [][]string
+	searchLimits  []int
+	searchOffsets []int
+	items         []*models.MediaItem
+	total         int
+}
+
+func (s *recordingItemAccessSource) EnsureAccessible(context.Context, string, catalog.AccessFilter) error {
+	return nil
+}
+
+func (s *recordingItemAccessSource) Search(_ context.Context, query string, itemTypes []string, limit, offset int, _ catalog.AccessFilter) ([]*models.MediaItem, int, error) {
+	s.searchQueries = append(s.searchQueries, query)
+	s.searchTypes = append(s.searchTypes, append([]string(nil), itemTypes...))
+	s.searchLimits = append(s.searchLimits, limit)
+	s.searchOffsets = append(s.searchOffsets, offset)
+	return append([]*models.MediaItem(nil), s.items...), s.total, nil
+}
+
+func (s *recordingItemAccessSource) GetByIDs(context.Context, []string) ([]*models.MediaItem, error) {
+	return nil, nil
 }
 
 // newDirectContentServiceForTest builds a directContentService with stubbed
@@ -226,6 +389,37 @@ func TestSearchItemsUsesCatalogSearchProviderWithCompatScope(t *testing.T) {
 	}
 }
 
+func TestSearchItemsFallsBackToItemRepoWhenProviderMissing(t *testing.T) {
+	itemRepo := &recordingItemAccessSource{
+		items: []*models.MediaItem{{
+			ContentID: "movie-1",
+			Type:      "movie",
+			Title:     "Fallback",
+		}},
+		total: 3,
+	}
+	svc := &directContentService{itemRepo: itemRepo}
+
+	result, err := svc.SearchItems(context.Background(), &Session{}, SearchItemsOptions{
+		Query:     "fallback",
+		ItemTypes: []string{"MusicAlbum"},
+		Limit:     2,
+		Offset:    1,
+	})
+	if err != nil {
+		t.Fatalf("SearchItems error: %v", err)
+	}
+	if len(itemRepo.searchQueries) != 1 || itemRepo.searchQueries[0] != "fallback" {
+		t.Fatalf("search queries = %#v", itemRepo.searchQueries)
+	}
+	if want := []string{compatNoMatchType}; !slices.Equal(itemRepo.searchTypes[0], want) {
+		t.Fatalf("search types = %#v, want %#v", itemRepo.searchTypes[0], want)
+	}
+	if result.Total != 3 || !result.HasMore || len(result.Items) != 1 || result.Items[0].Title != "Fallback" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestBrowseItems_FillsLargeJellyfinLimitInSingleCatalogPage(t *testing.T) {
 	provider := newProgressCountingStoreProvider()
 	browse := &stubBrowseSource{
@@ -272,6 +466,38 @@ func TestBrowseItems_FillsLargeJellyfinLimitInSingleCatalogPage(t *testing.T) {
 	}
 }
 
+func TestBrowseItems_HonorsIncludeTotalFalse(t *testing.T) {
+	browse := &stubBrowseSource{
+		items: makeBrowseTestMediaItems(300),
+		total: 300,
+	}
+	svc := newDirectContentServiceForTest(browse, nil)
+
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	params := url.Values{}
+	params.Set("limit", "150")
+	params.Set("include_total", "false")
+
+	result, err := svc.BrowseItems(context.Background(), session, params)
+	if err != nil {
+		t.Fatalf("BrowseItems returned error: %v", err)
+	}
+	if got, want := len(result.Items), 150; got != want {
+		t.Fatalf("items length = %d, want %d", got, want)
+	}
+	if result.Total != 0 {
+		t.Fatalf("Total = %d, want 0 when include_total=false", result.Total)
+	}
+	if got, want := len(browse.calls), 1; got != want {
+		t.Fatalf("BrowsePage calls = %d, want %d", got, want)
+	}
+	for i, call := range browse.calls {
+		if call.includeTotal {
+			t.Fatalf("call %d includeTotal = true, want false", i)
+		}
+	}
+}
+
 func makeBrowseTestMediaItems(count int) []*models.MediaItem {
 	items := make([]*models.MediaItem, 0, count)
 	for i := range count {
@@ -289,11 +515,9 @@ func makeBrowseTestMediaItems(count int) []*models.MediaItem {
 // chunked ListProgressByMediaItems path must not run at all.
 type seriesRollupCountingStore struct {
 	*progressCountingStore
-	counts            map[string]userstore.SeriesWatchCounts
-	seasonCounts      map[int]userstore.SeriesWatchCounts
-	err               error
-	rollupCalls       int
-	seasonRollupCalls int
+	counts      map[string]userstore.SeriesWatchCounts
+	err         error
+	rollupCalls int
 }
 
 func (s *seriesRollupCountingStore) SeriesEpisodeWatchCounts(_ context.Context, _ string, seriesIDs []string) (map[string]userstore.SeriesWatchCounts, error) {
@@ -311,15 +535,57 @@ func (s *seriesRollupCountingStore) SeriesEpisodeWatchCounts(_ context.Context, 
 }
 
 func (s *seriesRollupCountingStore) SeriesSeasonWatchCounts(context.Context, string, string) (map[int]userstore.SeriesWatchCounts, error) {
-	s.seasonRollupCalls++
-	if s.err != nil {
-		return nil, s.err
-	}
-	return maps.Clone(s.seasonCounts), nil
+	return map[int]userstore.SeriesWatchCounts{}, nil
 }
 
 func (s *seriesRollupCountingStore) SeasonEpisodeWatchCounts(context.Context, string, []string) (map[string]userstore.SeriesWatchCounts, error) {
 	return map[string]userstore.SeriesWatchCounts{}, nil
+}
+
+// TestEnrichSeriesUserDataUsesSQLRollup: a store exposing the SQL rollup
+// capability serves the series watch-state badge from one aggregate call —
+// no episode-list materialization, no chunked per-episode progress queries —
+// and produces the same SeasonUserData shape as the chunked path.
+func TestEnrichSeriesUserDataUsesSQLRollup(t *testing.T) {
+	store := &seriesRollupCountingStore{
+		progressCountingStore: &progressCountingStore{},
+		counts: map[string]userstore.SeriesWatchCounts{
+			"series-1": {TotalEpisodes: 3, WatchedCount: 2, InProgressCount: 1},
+		},
+	}
+	// The episode source panics on use: the rollup path must never list
+	// episodes.
+	svc := &directContentService{
+		episodeRepo:   &seriesEpisodeSource{},
+		storeProvider: &completedProgressStoreProvider{store: store},
+	}
+
+	items := []upstreamListItem{
+		{ContentID: "series-1", Type: "series", Title: "Show"},
+		{ContentID: "series-2", Type: "series", Title: "No Episodes"},
+		{ContentID: "movie-1", Type: "movie", Title: "Film"},
+	}
+	svc.EnrichSeriesUserData(context.Background(), &Session{StreamAppUserID: 1, ProfileID: "profile-1"}, items)
+
+	if store.rollupCalls != 1 {
+		t.Fatalf("expected exactly one rollup call, got %d", store.rollupCalls)
+	}
+	if store.listProgressCalls != 0 {
+		t.Fatalf("chunked progress path must not run when the SQL rollup is available, got %d calls", store.listProgressCalls)
+	}
+
+	want := &catalog.SeasonUserData{WatchedCount: 2, UnplayedCount: 1, InProgressCount: 1, Played: false}
+	if got := items[0].UserData; got == nil || *got != *want {
+		t.Fatalf("series-1 UserData = %+v, want %+v", got, want)
+	}
+	// A series absent from the rollup result (no available episodes) keeps a
+	// nil UserData — the same shape the episode-list path gave it.
+	if items[1].UserData != nil {
+		t.Fatalf("series-2 UserData = %+v, want nil", items[1].UserData)
+	}
+	if items[2].UserData != nil {
+		t.Fatalf("movie UserData = %+v, want nil", items[2].UserData)
+	}
 }
 
 // TestEnrichSeriesUserDataRollupFailure: a failed rollup query falls back to
@@ -369,6 +635,32 @@ func TestEnrichSeriesUserDataRollupFailure(t *testing.T) {
 				t.Fatalf("logged at warning or above = %v, want %v: %s", warned, tc.wantWarn, logs.String())
 			}
 		})
+	}
+}
+
+// TestSeasonUserDataFromCountsMatchesEpisodeRollup pins the SQL-side counts
+// mapping to the in-memory EpisodeRollupUserData it replaces.
+func TestSeasonUserDataFromCountsMatchesEpisodeRollup(t *testing.T) {
+	episodes := []*models.Episode{
+		{ContentID: "ep-1"},
+		{ContentID: "ep-2"},
+		{ContentID: "ep-3"},
+	}
+	progress := map[string]userstore.WatchProgress{
+		"ep-1": {MediaItemID: "ep-1", Completed: true},
+		"ep-2": {MediaItemID: "ep-2", PositionSeconds: 42},
+	}
+
+	fromEpisodes := catalog.EpisodeRollupUserData(episodes, progress)
+	fromCounts := catalog.SeasonUserDataFromCounts(userstore.SeriesWatchCounts{
+		TotalEpisodes: 3, WatchedCount: 1, InProgressCount: 1,
+	})
+	if *fromEpisodes != *fromCounts {
+		t.Fatalf("counts mapping diverged: episodes=%+v counts=%+v", fromEpisodes, fromCounts)
+	}
+
+	if empty := catalog.SeasonUserDataFromCounts(userstore.SeriesWatchCounts{}); *empty != (catalog.SeasonUserData{}) {
+		t.Fatalf("zero counts must produce the empty rollup, got %+v", empty)
 	}
 }
 

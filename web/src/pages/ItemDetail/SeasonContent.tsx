@@ -22,29 +22,16 @@ import DetailBreadcrumb from "./components/DetailBreadcrumb";
 import SeasonEpisodeGrid from "./components/SeasonEpisodeGrid";
 import type { EpisodeNavigationState } from "./itemDetailLayout";
 import { canCurateMetadata as canCurateMetadataForUser } from "@/lib/permissions";
-import { buildItemHref } from "@/lib/mediaNavigation";
 import { hasMachineTranslation } from "./components/machineTranslation";
 import EpisodesTranslationAction from "./components/EpisodesTranslationAction";
-import { useEpisodePlaybackList } from "./useEpisodePlaybackList";
-import { useT, type Translate } from "@/i18n";
 
-function seasonLabel(t: Translate, seasonNumber: number, title?: string) {
-  // A server title that is only the default English name gets the translated
-  // default, as getSeasonDisplayTitle does, so it matches the season indicator.
-  if (title && (seasonNumber === 0 || title !== `Season ${seasonNumber}`)) return title;
-  if (seasonNumber === 0) return t("web.detail.seasons.specials");
-  return t("web.detail.seasons.numbered", { season: seasonNumber });
+function seasonLabel(seasonNumber: number, title?: string) {
+  if (title) return title;
+  if (seasonNumber === 0) return "Specials";
+  return `Season ${seasonNumber}`;
 }
 
-export default function SeasonContent({
-  item,
-  libraryId,
-}: {
-  item: ItemDetail & { type: "season" };
-  /** The page's ?libraryId= scope; series and episode links keep it. */
-  libraryId?: number;
-}) {
-  const t = useT();
+export default function SeasonContent({ item }: { item: ItemDetail & { type: "season" } }) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
     useOnViewTranslation(item);
   const navigate = useNavigate();
@@ -61,7 +48,7 @@ export default function SeasonContent({
     data: episodesData,
     isLoading: episodesLoading,
     error: episodesError,
-  } = useItemEpisodes(item.content_id, libraryId);
+  } = useItemEpisodes(item.content_id);
 
   const episodes = episodesData?.episodes ?? [];
   // The season's pending language also covers its episodes. While an episode
@@ -72,28 +59,13 @@ export default function SeasonContent({
   const translationWithEpisodes = !item.overview || episodesPending;
   const translationInHero = !translationWithEpisodes && !episodesLoading;
   const seasonNumber = item.season_number ?? 0;
-  const label = item.is_specials
-    ? t("web.detail.seasons.specials")
-    : seasonLabel(t, seasonNumber, item.title);
-  const seriesTitle = item.series_title ?? t("web.detail.hero.typeSeries");
+  const label = item.is_specials ? "Specials" : seasonLabel(seasonNumber, item.title);
+  const seriesTitle = item.series_title ?? "Series";
   const seriesId = item.series_id;
-  const seriesHref = seriesId ? buildItemHref({ contentId: seriesId, libraryId }) : "/";
   const firstEpisode = episodes[0];
-  const { episodes: playbackEpisodes, pending: unscopedPending } = useEpisodePlaybackList(
-    item.content_id,
-    libraryId,
-    episodes,
-  );
-  const playableEpisodes = playbackEpisodes.filter((episode) => (episode.files?.length ?? 0) > 0);
-  // Until the unscoped list arrives (or if it fails), an episode with no file
-  // here may still play from another library, so the season's episode count
-  // stands in.
-  const canShuffle = playableEpisodes.length > 1 || (unscopedPending && episodes.length > 1);
-  // The scoped list can't name the first unwatched playable episode, so Watch
-  // Party gets no target (its sheet asks for one) until the unscoped list does.
-  const firstUnwatched = unscopedPending
-    ? undefined
-    : (playableEpisodes.find((episode) => !episode.user_data?.played) ?? playableEpisodes[0]);
+  const playableEpisodes = episodes.filter((episode) => (episode.files?.length ?? 0) > 0);
+  const firstUnwatched =
+    playableEpisodes.find((episode) => !episode.user_data?.played) ?? playableEpisodes[0];
   const watchTogether = useDetailWatchTogether({
     item,
     target: firstUnwatched
@@ -109,18 +81,19 @@ export default function SeasonContent({
     initialSeasonNumber: item.season_number ?? undefined,
   });
   const episodeLinkState: EpisodeNavigationState = {
-    parentSeasonHref: buildItemHref({ contentId: item.content_id, libraryId }),
+    parentSeasonHref: `/item/${item.content_id}`,
     parentSeasonLabel: label,
   };
 
   const seasonIndicator =
-    item.is_specials || seasonNumber === 0
-      ? t("web.detail.seasons.specials")
-      : t("web.detail.seasons.numbered", { season: seasonNumber });
+    item.is_specials || seasonNumber === 0 ? "Specials" : `Season ${seasonNumber}`;
 
   const breadcrumb = (
     <DetailBreadcrumb
-      segments={[{ label: seriesTitle, href: seriesHref }, { label: seasonIndicator }]}
+      segments={[
+        { label: seriesTitle, href: seriesId ? `/item/${seriesId}` : "/" },
+        { label: seasonIndicator },
+      ]}
     />
   );
 
@@ -130,16 +103,14 @@ export default function SeasonContent({
     return (
       <div className="px-4 py-6 sm:px-6 sm:py-10 lg:px-12">
         <ViewTransitionLink
-          to={seriesHref}
+          to={seriesId ? `/item/${seriesId}` : "/"}
           up
           className="text-muted-foreground hover:text-foreground text-sm"
         >
-          {t("web.detail.seasons.backToSeries", { title: seriesTitle })}
+          &larr; Back to {seriesTitle}
         </ViewTransitionLink>
         <p className="text-muted-foreground mt-6 text-sm">
-          {episodesError instanceof Error
-            ? episodesError.message
-            : t("web.detail.seasons.notFound")}
+          {episodesError instanceof Error ? episodesError.message : "Season not found"}
         </p>
       </div>
     );
@@ -178,7 +149,7 @@ export default function SeasonContent({
               canAddToCollection={false}
               watchTogether={watchTogether.menu}
               playHref={firstEpisode ? `/watch/${firstEpisode.content_id}` : undefined}
-              playLabel={t("web.detail.actions.playFirstEpisode")}
+              playLabel="Play First Episode"
               onRefresh={
                 canCurateMetadata
                   ? (mode) =>
@@ -186,9 +157,7 @@ export default function SeasonContent({
                         item,
                         mode,
                         onReplaced: (contentID) =>
-                          navigate(buildItemHref({ contentId: contentID, libraryId }), {
-                            replace: true,
-                          }),
+                          navigate(`/item/${contentID}`, { replace: true }),
                       })
                   : undefined
               }
@@ -197,7 +166,9 @@ export default function SeasonContent({
               canCurateMetadata={canCurateMetadata}
               onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
               onShuffle={
-                canShuffle ? () => startShuffle({ kind: "season", id: item.content_id }) : undefined
+                playableEpisodes.length > 1
+                  ? () => startShuffle({ kind: "season", id: item.content_id })
+                  : undefined
               }
             />
           }
@@ -206,13 +177,11 @@ export default function SeasonContent({
         <div
           className="page-shell series-detail-navigation"
           role="region"
-          aria-label={t("web.detail.seasons.episodesRegion")}
+          aria-label="Season episodes"
         >
           <section>
             <div className="mb-5 flex items-center justify-between gap-3">
-              <h2 className="text-xl font-semibold tracking-tight">
-                {t("web.detail.episodes.heading")}
-              </h2>
+              <h2 className="text-xl font-semibold tracking-tight">Episodes</h2>
               <div className="flex items-center gap-3">
                 {translationWithEpisodes && (
                   <EpisodesTranslationAction
@@ -221,19 +190,15 @@ export default function SeasonContent({
                   />
                 )}
                 <span className="text-muted-foreground text-sm">
-                  {t("web.detail.seasons.totalCount", {
-                    count: item.episode_count ?? episodes.length,
-                  })}
+                  {item.episode_count ?? episodes.length} total
                 </span>
               </div>
             </div>
 
             <SeasonEpisodeGrid
               episodes={episodes}
-              playbackEpisodes={playbackEpisodes}
               isLoading={episodesLoading}
               episodeLinkState={episodeLinkState}
-              libraryId={libraryId}
             />
           </section>
         </div>
@@ -241,9 +206,7 @@ export default function SeasonContent({
       <div className="page-shell detail-supporting-content space-y-10 py-8 sm:py-10">
         {item.cast && item.cast.length > 0 && (
           <div>
-            <h2 className="mb-4 text-xl font-semibold tracking-tight">
-              {t("web.detail.sections.cast")}
-            </h2>
+            <h2 className="mb-4 text-xl font-semibold tracking-tight">Cast</h2>
             <CastCarousel cast={item.cast} prefetchPeople />
           </div>
         )}

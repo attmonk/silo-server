@@ -78,11 +78,7 @@ func (t *LLMTranslator) Translate(ctx context.Context, req TranslateRequest, onB
 			{Role: "system", Content: system},
 			{Role: "user", Content: user},
 		}
-		content, err := t.client.Chat(ctx, messages, true)
-		if err != nil {
-			return "", &providerError{err: err}
-		}
-		return content, nil
+		return t.client.Chat(ctx, messages, true)
 	}
 
 	translated, err := aitranslate.Translate(ctx, chat, aitranslate.Request{

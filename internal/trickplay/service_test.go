@@ -3,7 +3,10 @@ package trickplay
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -209,69 +212,45 @@ func TestGeneratePublishesDecodedGeometryAndRejectsMixedChunks(t *testing.T) {
 	}
 }
 
-// fakeChecker serves every key except those in missing, through an endpoint
-// that fails with err.
-type fakeChecker struct {
-	missing map[string]bool
-	err     error
-}
-
-func (c fakeChecker) ObjectAvailable(_ context.Context, key string) (bool, error) {
-	return !c.missing[key], c.err
-}
-
-// fakeDeliveryRecords holds claimable checks and records confirmations.
-type fakeDeliveryRecords struct {
-	due       [][]DeliveryCheck
-	confirmed []int
-}
-
-func (r *fakeDeliveryRecords) ClaimDeliveryChecks(context.Context, string, string, time.Duration, int) ([]DeliveryCheck, error) {
-	if len(r.due) == 0 {
-		return nil, nil
-	}
-	batch := r.due[0]
-	r.due = r.due[1:]
-	return batch, nil
-}
-
-func (r *fakeDeliveryRecords) RecordDelivery(_ context.Context, fileID int, _ int64, _, _ string) error {
-	r.confirmed = append(r.confirmed, fileID)
-	return nil
-}
-
-func TestConfirmDeliveryPassStopsOnEndpointTrouble(t *testing.T) {
-	full := func(first int) []DeliveryCheck {
-		batch := make([]DeliveryCheck, deliveryBatch)
-		for i := range batch {
-			batch[i] = DeliveryCheck{FileID: first + i, Revision: 1, SheetCount: 1}
-		}
-		return batch
-	}
-	lagging := map[string]bool{SheetKey(1, 1, 0): true}
-	everything := map[string]bool{}
-	for _, check := range full(1) {
-		everything[SheetKey(check.FileID, 1, 0)] = true
-	}
+func TestProcessOutcomes(t *testing.T) {
+	unreadable := errors.New("stat: no such file")
 	tests := map[string]struct {
-		checker fakeChecker
-		want    int
-		wantErr bool
+		setup func(*fakeQueue, *fakeStore, *fakeExtractor, *Service)
+		want  *finishCall
 	}{
-		// One lagging revision waits its recheck; the pass goes on.
-		"one revision lags": {fakeChecker{missing: lagging}, 2*deliveryBatch - 1, false},
-		// A batch that confirms nothing ends the pass before the backlog.
-		"nothing served": {fakeChecker{missing: everything}, 0, false},
-		// So does a probe error.
-		"endpoint fails": {fakeChecker{err: errors.New("status 403")}, 0, true},
+		"permanent": {func(_ *fakeQueue, _ *fakeStore, e *fakeExtractor, _ *Service) {
+			e.err = &mediasample.Error{Reason: mediasample.ReasonExit, Attempts: []mediasample.AttemptError{{Reason: mediasample.ReasonExit, Err: errors.New("exit 1"), StderrTail: "Invalid data found when processing input"}}}
+		}, &finishCall{Unusable, 0}},
+		"transient": {func(_ *fakeQueue, _ *fakeStore, e *fakeExtractor, _ *Service) {
+			e.err = &mediasample.Error{Reason: mediasample.ReasonTimeout, Attempts: []mediasample.AttemptError{{Reason: mediasample.ReasonTimeout}}}
+		}, &finishCall{Failed, 0}},
+		"storage": {func(_ *fakeQueue, st *fakeStore, _ *fakeExtractor, _ *Service) {
+			st.err = errors.New("s3 down")
+		}, &finishCall{Failed, 0}},
+		"unreadable input": {func(_ *fakeQueue, _ *fakeStore, e *fakeExtractor, _ *Service) {
+			e.err = &inputError{err: fmt.Errorf("%w: %w", unreadable, fs.ErrNotExist)}
+		}, &finishCall{Released, releaseDelay}},
+		"no node": {func(_ *fakeQueue, _ *fakeStore, e *fakeExtractor, _ *Service) {
+			e.err = errNoNode
+		}, &finishCall{Released, time.Minute}},
+		"lease lost at upload": {func(q *fakeQueue, _ *fakeStore, _ *fakeExtractor, _ *Service) {
+			q.beginOK = false
+		}, nil},
+		"lease lost at publish": {func(q *fakeQueue, _ *fakeStore, _ *fakeExtractor, _ *Service) {
+			q.publishOK = false
+		}, nil},
 	}
 	for name, tt := range tests {
-		records := &fakeDeliveryRecords{due: [][]DeliveryCheck{full(1), full(1000)}}
-		s := testService(newFakeQueue(), &fakeStore{}, &fakeExtractor{}, fakeSettings{})
-		s.delivery = &externalDelivery{scope: "scope-a", checker: tt.checker, records: records}
-		err := s.confirmDeliveryPass(t.Context())
-		if len(records.confirmed) != tt.want || (err != nil) != tt.wantErr {
-			t.Errorf("%s: confirmed %d with error %v, want %d", name, len(records.confirmed), err, tt.want)
+		q, store, extractor := newFakeQueue(), &fakeStore{}, &fakeExtractor{}
+		s := testService(q, store, extractor, fakeSettings{})
+		tt.setup(q, store, extractor, s)
+		s.process(t.Context(), testJob(1, 600))
+		got, finished := q.finished[1]
+		switch {
+		case tt.want == nil && finished:
+			t.Errorf("%s: finished %+v after losing the lease", name, got)
+		case tt.want != nil && (!finished || got != *tt.want):
+			t.Errorf("%s: finished %+v (%t), want %+v", name, got, finished, *tt.want)
 		}
 	}
 }
@@ -312,6 +291,71 @@ func TestHeartbeatLossCancelsWork(t *testing.T) {
 	}
 	if _, finished := q.finished[5]; finished || len(q.published) != 0 {
 		t.Fatalf("recorded an outcome after losing the lease: %+v", q.finished)
+	}
+}
+
+func TestDispatchRunsQueuedJobs(t *testing.T) {
+	jobs := []*Job{testJob(10, 600), testJob(11, 600), testJob(12, 600)}
+	q := newFakeQueue(jobs...)
+	s := testService(q, &fakeStore{}, &fakeExtractor{}, fakeSettings{WorkersSetting: "2"})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.dispatch(ctx)
+	}()
+	deadline := time.After(5 * time.Second)
+	for {
+		q.mu.Lock()
+		n := len(q.published)
+		q.mu.Unlock()
+		if n == 3 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("published %d of 3", n)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	var ids []int
+	for id := range q.published {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	if !slices.Equal(ids, []int{10, 11, 12}) {
+		t.Fatalf("published %v", ids)
+	}
+}
+
+func TestReadThroughAVI(t *testing.T) {
+	for container, want := range map[string]bool{"avi": true, "AVI": true, "mkv": false, "mp4": false, "ts": false, "": false} {
+		if got := readThrough(&Job{Container: container}); got != want {
+			t.Errorf("%q: %t", container, got)
+		}
+	}
+	q, extractor := newFakeQueue(), &fakeExtractor{}
+	s := testService(q, &fakeStore{}, extractor, fakeSettings{})
+	job := testJob(9, 600)
+	job.Container = "avi"
+	s.process(t.Context(), job)
+	if len(extractor.requests) != 1 || !extractor.requests[0].Samples.ReadThrough {
+		t.Fatalf("an AVI was not read through: %+v", extractor.requests)
+	}
+}
+
+func TestAttemptPlan(t *testing.T) {
+	if plan := AttemptPlan(false, 720); len(plan) != 1 || plan[0].Hardware || plan[0].TimeoutSeconds != 120+2*720 {
+		t.Fatalf("software plan %+v", plan)
+	}
+	plan := AttemptPlan(true, 1600)
+	if len(plan) != 2 || !plan[0].Hardware || plan[0].TimeoutSeconds != 120+0.5*1600 || plan[1].Hardware {
+		t.Fatalf("hardware plan %+v", plan)
+	}
+	if long := AttemptPlan(false, 1_000_000); long[0].TimeoutSeconds != maxAttemptTimeoutSeconds {
+		t.Fatalf("timeout not capped: %+v", long)
 	}
 }
 
@@ -367,6 +411,50 @@ func (l *lockedSettings) set(key, value string) {
 	l.values[key] = value
 }
 
+// TestNewWidthReconcilesRightAway reconciles once the width changes, not at
+// the first reading and not while it stays the same.
+func TestNewWidthReconcilesRightAway(t *testing.T) {
+	settings := &lockedSettings{values: map[string]string{WidthSetting: "300"}, reads: make(chan string, 32)}
+	s := newService(newFakeQueue(), &fakeStore{}, settings, &fakeExtractor{}, "node-a")
+	s.settingsEvery = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.followSettings(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// A second width read proves the first recipe became the baseline.
+	reads := 0
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for reads < 2 {
+		select {
+		case key := <-settings.reads:
+			if key == WidthSetting {
+				reads++
+			}
+		case <-deadline.C:
+			t.Fatal("initial recipe was not read")
+		}
+	}
+	select {
+	case <-s.reconcile:
+		t.Fatal("reconciled without a settings change")
+	default:
+	}
+	settings.set(WidthSetting, "320")
+	select {
+	case <-s.reconcile:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a new width did not reconcile")
+	}
+}
+
 // TestRequestedReconcileRetriesAfterLockContention keeps a requested pass
 // that another server's lock skipped: the server tries again.
 func TestRequestedReconcileRetriesAfterLockContention(t *testing.T) {
@@ -413,6 +501,35 @@ type settingExtractor struct {
 func (e *settingExtractor) Extract(ctx context.Context, job *Job, req mediasample.Request) (mediasample.Result, error) {
 	e.settings.set(WidthSetting, "320")
 	return e.fakeExtractor.Extract(ctx, job, req)
+}
+
+// TestPublishAtOldRecipeRequestsReconcile requeues sheets made to settings
+// that changed while the run held its lease, since that run's reconcile
+// skipped the row.
+func TestPublishAtOldRecipeRequestsReconcile(t *testing.T) {
+	settings := &lockedSettings{values: map[string]string{WidthSetting: "300"}}
+	q := newFakeQueue()
+	s := newService(q, &fakeStore{}, settings, &settingExtractor{settings: settings}, "node-a")
+	s.logger = slog.New(slog.DiscardHandler)
+
+	s.process(t.Context(), testJob(9, 600))
+
+	if q.published[9].Recipe.Width != 300 {
+		t.Fatalf("published %+v, want the recipe in force at the start", q.published[9].Recipe)
+	}
+	select {
+	case <-s.reconcile:
+	default:
+		t.Fatal("publishing an outdated recipe did not request a reconcile")
+	}
+
+	// Unchanged settings request nothing.
+	s.process(t.Context(), testJob(10, 600))
+	select {
+	case <-s.reconcile:
+		t.Fatal("a current recipe requested a reconcile")
+	default:
+	}
 }
 
 // TestSheetsToneMapNamesTheSourceSignal hands sheets the base signal playback

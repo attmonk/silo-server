@@ -2,20 +2,14 @@ package catalog
 
 import (
 	"slices"
-	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
-// These match metadata.FieldName and its siblings. Catalog cannot import
+// fieldImagesLocked matches metadata.FieldImages. Catalog cannot import
 // metadata because metadata already depends on catalog.
-const (
-	fieldOverviewLocked     = 1
-	fieldRuntimeLocked      = 7
-	fieldImagesLocked       = 10
-	fieldReleaseDatesLocked = 13
-)
+const fieldImagesLocked = 10
 
 // Machine-translated field names, as MachineTranslatedFields reports them.
 const (
@@ -29,8 +23,7 @@ const (
 // provider row may lack a tagline or logo), and an empty field must fall back
 // to the base value rather than blank it. Base artwork served from a cached
 // copy of a local sidecar is language-neutral and outranks provider artwork,
-// so a localized image never replaces it. A poster taken from the video
-// (libraryPoster) is not library artwork and gives way.
+// so a localized image never replaces it.
 func applyItemLocalization(item *models.MediaItem, loc *models.MediaItemLocalization) *models.MediaItem {
 	localized := cloneMediaItem(item)
 	if localized == nil || loc == nil {
@@ -57,7 +50,7 @@ func applyItemLocalization(item *models.MediaItem, loc *models.MediaItemLocaliza
 		}
 	}
 	imagesLocked := slices.Contains(item.LockedFields, fieldImagesLocked)
-	if !imagesLocked && loc.PosterPath != "" && !libraryPoster(item) {
+	if !imagesLocked && loc.PosterPath != "" && !artworkkey.IsLocal(item.PosterPath) {
 		localized.PosterPath = loc.PosterPath
 		localized.PosterSourcePath = loc.PosterSourcePath
 		localized.PosterThumbhash = loc.PosterThumbhash
@@ -74,14 +67,6 @@ func applyItemLocalization(item *models.MediaItem, loc *models.MediaItemLocaliza
 	return localized
 }
 
-// libraryPoster reports whether item's poster is a cached copy of library
-// artwork. A frame the extras frame task took from the movie's own video
-// (StillSourceFramePrefix) is stored under the same local keys, but it only
-// stands in for a missing poster.
-func libraryPoster(item *models.MediaItem) bool {
-	return artworkkey.IsLocal(item.PosterPath) && !strings.HasPrefix(item.PosterSourcePath, StillSourceFramePrefix)
-}
-
 // applySeasonLocalization merges a localization onto a clone of season; see
 // applyItemLocalization for the empty-field semantics.
 func applySeasonLocalization(season *models.Season, loc *models.SeasonLocalization, imagesLocked bool) *models.Season {
@@ -91,10 +76,10 @@ func applySeasonLocalization(season *models.Season, loc *models.SeasonLocalizati
 	}
 	// The markers describe this localization only, never a previous one.
 	localized.MachineTranslatedFields = nil
-	if loc.Title != "" && !slices.Contains(season.LockedFields, fieldNameLocked) {
+	if loc.Title != "" {
 		localized.Title = loc.Title
 	}
-	if loc.Overview != "" && childOverviewApplies(season.LockedFields, loc.OverviewSource) {
+	if loc.Overview != "" {
 		localized.Overview = loc.Overview
 		if loc.OverviewSource == models.LocalizationSourceAI {
 			localized.MachineTranslatedFields = append(localized.MachineTranslatedFields, MachineTranslatedOverview)
@@ -117,10 +102,10 @@ func applyEpisodeLocalization(episode *models.Episode, loc *models.EpisodeLocali
 	}
 	// The markers describe this localization only, never a previous one.
 	localized.MachineTranslatedFields = nil
-	if loc.Title != "" && !slices.Contains(episode.LockedFields, fieldNameLocked) {
+	if loc.Title != "" {
 		localized.Title = loc.Title
 	}
-	if loc.Overview != "" && childOverviewApplies(episode.LockedFields, loc.OverviewSource) {
+	if loc.Overview != "" {
 		localized.Overview = loc.Overview
 		if loc.OverviewSource == models.LocalizationSourceAI {
 			localized.MachineTranslatedFields = append(localized.MachineTranslatedFields, MachineTranslatedOverview)

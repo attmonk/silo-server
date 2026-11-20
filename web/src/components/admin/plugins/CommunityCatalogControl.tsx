@@ -14,14 +14,12 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Switch } from "@/components/ui/switch";
 import { useUpdatePluginCatalogSettings } from "@/hooks/queries/admin/plugins";
-import { useT } from "@/i18n";
 
 export function CommunityCatalogControl({
   settings,
 }: {
   settings: PluginCatalogSettings & { etag: string };
 }) {
-  const t = useT();
   const updateSettings = useUpdatePluginCatalogSettings();
   const [confirmDisable, setConfirmDisable] = useState(false);
 
@@ -44,17 +42,17 @@ export function CommunityCatalogControl({
         <Shield aria-hidden="true" className="text-muted-foreground size-4 shrink-0" />
         <div className="min-w-0 flex-1 space-y-0.5">
           <label htmlFor="approved-community-plugins" className="block text-sm font-semibold">
-            {t("web.admin.plugins.communityCatalog.includeLabel")}
+            Include approved community plugins
           </label>
           <p className="text-muted-foreground text-[13px] leading-relaxed">
-            {t("web.admin.plugins.communityCatalog.description")}
+            Reviewed by Silo maintainers to work as described and be safe for their documented use.
+            These plugins remain maintained and supported by community contributors.
           </p>
           {settings.migrated_plugin_count > 0 ? (
             <p className="text-muted-foreground text-[13px]">
-              {t("web.admin.plugins.communityCatalog.migrated", {
-                count: settings.migrated_plugin_count,
-                count_text: settings.migrated_plugin_count,
-              })}
+              {settings.migrated_plugin_count} existing{" "}
+              {settings.migrated_plugin_count === 1 ? "installation was" : "installations were"}{" "}
+              moved here without changing configuration.
             </p>
           ) : null}
         </div>
@@ -63,28 +61,29 @@ export function CommunityCatalogControl({
           checked={settings.include_approved_community_plugins}
           disabled={updateSettings.isPending}
           onCheckedChange={setIncluded}
-          aria-label={t("web.admin.plugins.communityCatalog.includeLabel")}
+          aria-label="Include approved community plugins"
         />
       </div>
 
       <AlertDialog open={confirmDisable} onOpenChange={setConfirmDisable}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t("web.admin.plugins.communityCatalog.hideTitle")}</AlertDialogTitle>
+            <AlertDialogTitle>Hide approved community plugins?</AlertDialogTitle>
             <AlertDialogDescription>
-              {t("web.admin.plugins.communityCatalog.hideDescription", {
-                count: settings.installed_community_plugin_count,
-                count_text: settings.installed_community_plugin_count,
-              })}
+              {settings.installed_community_plugin_count}{" "}
+              {settings.installed_community_plugin_count === 1
+                ? "installed plugin will"
+                : "installed plugins will"}{" "}
+              keep running, but update discovery will pause until this catalog is included again.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               onClick={disableCommunityCatalog}
               disabled={updateSettings.isPending}
             >
-              {t("web.admin.plugins.communityCatalog.hideConfirm")}
+              Hide and pause updates
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

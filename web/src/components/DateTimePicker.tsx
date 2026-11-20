@@ -5,7 +5,6 @@ import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { useT } from "@/i18n";
 import { formatDateTime } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
 
@@ -18,7 +17,7 @@ export function DateTimePicker({
   id,
   value,
   onChange,
-  placeholder,
+  placeholder = "Any time",
   className,
 }: {
   id?: string;
@@ -27,7 +26,6 @@ export function DateTimePicker({
   placeholder?: string;
   className?: string;
 }) {
-  const t = useT();
   const [open, setOpen] = useState(false);
   const selected = parseLocalDateTime(value);
   const time = selected ? value.slice(11, 16) : "";
@@ -60,9 +58,7 @@ export function DateTimePicker({
         >
           <CalendarIcon className="size-4 opacity-60" aria-hidden="true" />
           <span className="truncate">
-            {selected
-              ? formatDateTime(selected, { seconds: false })
-              : (placeholder ?? t("web.common.ui.dateTimePicker.anyTime"))}
+            {selected ? formatDateTime(selected, { seconds: false }) : placeholder}
           </span>
         </Button>
       </PopoverTrigger>
@@ -76,7 +72,7 @@ export function DateTimePicker({
         <div className="flex items-center gap-2 border-t p-3">
           <Input
             type="time"
-            aria-label={t("web.common.ui.dateTimePicker.timeOfDay")}
+            aria-label="Time of day"
             value={time}
             onChange={(event) => handleTimeChange(event.target.value)}
             className="h-8"
@@ -88,7 +84,7 @@ export function DateTimePicker({
             disabled={!selected}
             onClick={() => onChange("")}
           >
-            {t("web.common.ui.dateTimePicker.clear")}
+            Clear
           </Button>
         </div>
       </PopoverContent>

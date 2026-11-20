@@ -188,7 +188,6 @@ describe("Profiles", () => {
     mocks.useProfiles.mockReturnValue({
       data: [makeProfile(), makeProfile({ id: "profile-2", name: "Guest" })],
       isLoading: false,
-      maxProfiles: null,
     });
     mocks.useAvailableUserLibraries.mockReturnValue({
       data: libraries,
@@ -218,7 +217,6 @@ describe("Profiles", () => {
     mocks.useProfiles.mockReturnValue({
       data: [],
       isLoading: false,
-      maxProfiles: null,
     });
 
     await render(<Profiles />);
@@ -236,7 +234,6 @@ describe("Profiles", () => {
     mocks.useProfiles.mockReturnValue({
       data: [],
       isLoading: false,
-      maxProfiles: null,
     });
     mocks.editorPin = "1234";
 
@@ -262,7 +259,6 @@ describe("Profiles", () => {
     mocks.useProfiles.mockReturnValue({
       data: [makeProfile(), lockedProfile],
       isLoading: false,
-      maxProfiles: null,
     });
 
     await render(<Profiles />);
@@ -271,30 +267,6 @@ describe("Profiles", () => {
     await click(findButton(container, "confirm-pin"));
 
     expect(selectProfile).toHaveBeenCalledWith(lockedProfile, "verified-token");
-    expect(mocks.navigate).toHaveBeenCalledWith("/");
-  });
-
-  it("opens a locked profile without its PIN while an administrator views as the account", async () => {
-    const lockedProfile = makeProfile({ id: "profile-2", name: "Kids", has_pin: true });
-    mocks.useProfiles.mockReturnValue({
-      data: [makeProfile(), lockedProfile],
-      isLoading: false,
-      maxProfiles: null,
-    });
-    mocks.useAuth.mockReturnValue({
-      selectProfile,
-      verifyProfilePin,
-      logout,
-      isImpersonating: true,
-    });
-
-    await render(<Profiles />);
-
-    await click(findButton(container, "Kids"));
-
-    expect(container.textContent).not.toContain("confirm-pin");
-    expect(verifyProfilePin).not.toHaveBeenCalled();
-    expect(selectProfile).toHaveBeenCalledWith(lockedProfile);
     expect(mocks.navigate).toHaveBeenCalledWith("/");
   });
 
@@ -330,11 +302,7 @@ describe("Profiles", () => {
         is_primary: true,
         has_pin: hasPin,
       });
-      mocks.useProfiles.mockReturnValue({
-        data: [primary, makeProfile()],
-        isLoading: false,
-        maxProfiles: null,
-      });
+      mocks.useProfiles.mockReturnValue({ data: [primary, makeProfile()], isLoading: false });
 
       await render(<Profiles />);
       await click(findButton(container, "Add profile"));
@@ -343,7 +311,7 @@ describe("Profiles", () => {
       }
 
       const profileContext = { profileId: "primary", profileToken: token };
-      expect(mocks.listUserLibraries).toHaveBeenCalledWith({ profileContext, includeHidden: true });
+      expect(mocks.listUserLibraries).toHaveBeenCalledWith({ profileContext });
       expect(mocks.editorProps).toMatchObject({ profileContext, libraries: primaryLibraries });
 
       await click(findButton(container, "save-editor"));
@@ -354,11 +322,7 @@ describe("Profiles", () => {
 
   it("manages profiles by selecting the verified primary profile", async () => {
     const primary = makeProfile({ id: "primary", name: "Parent", is_primary: true, has_pin: true });
-    mocks.useProfiles.mockReturnValue({
-      data: [primary, makeProfile()],
-      isLoading: false,
-      maxProfiles: null,
-    });
+    mocks.useProfiles.mockReturnValue({ data: [primary, makeProfile()], isLoading: false });
     mocks.searchParams = new URLSearchParams("redirect=%2Fmovies");
 
     await render(<Profiles />);
@@ -373,7 +337,6 @@ describe("Profiles", () => {
     mocks.useProfiles.mockReturnValue({
       data: [makeProfile({ id: "primary", is_primary: true }), makeProfile({ id: "p2" })],
       isLoading: false,
-      maxProfiles: null,
     });
     mocks.listUserLibraries.mockRejectedValue(new TypeError("Failed to fetch"));
 

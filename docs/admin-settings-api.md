@@ -9,43 +9,9 @@ no-store responses:
   defaults applied, using the same redaction policy as stored settings.
 - `GET /api/v2/admin/settings/restart-keys`: the compiled `keys` and `prefixes`
   whose changes need a server restart.
-- `GET /api/v2/admin/settings/sensitive-status`: configured secret key names,
-  `managed_by_env` names, and `managed_by_env_vars`. Values are never returned.
-  `configured` and `managed_by_env` are arrays and `managed_by_env_vars` is an
-  object, all present when empty. `configured` leaves out machine-managed
-  keys, such as the JWT signing keys the server generates itself.
-
-`managed_by_env` lists the keys the server's environment sets on every start,
-and `managed_by_env_vars` maps each of them to the variable that sets it, such
-as `{"server.public_url": "SILO_PUBLIC_URL", "redis.db": "REDIS_URL"}`. The web
-settings pages show that name on a read-only field instead of keeping their own
-list. The variables are `REDIS_URL` (for `redis.url` and `redis.db`) and the
-table in `internal/config/env_settings.go`, which gives each variable a scope:
-
-- Stored: an API server that starts with the variable set checks the value the
-  way an admin save does (per-key normalization, the cross-field validation
-  over the settings it will run on, the artwork root check, and the recorded
-  storage location guard), writes the values that differ to `server_settings`
-  in one batch, and publishes a settings-changed event for each. Stored
-  and effective settings then show the value; secrets are stored encrypted and,
-  like every secret, only appear in `configured`. An invalid value stops
-  startup with an error naming the variable.
-- Process: the value overlays this server's settings at startup and on every
-  reload and is never stored, so effective settings show it on this server
-  only.
-
-The environment variables are read by the server answering the request, so the
-lists can differ between API servers that were started differently. A write of
-one of these keys is refused with the detail `<key> is managed by an
-environment variable`; `redis.db` has one exception, described below.
-`REDIS_URL` is never stored. While any storage key (`artwork.*`, `s3.public_*`,
-`s3.private_*`) is set by the environment, `POST /api/v2/admin/storage-transitions`
-is refused with a validation problem naming the variables, because the
-environment would put its values back on the next start. A transition staged
-before a restart that added such a variable fails when its job runs, for the
-same reason. Both checks look at the environment of the API server that
-handles the request or runs the job, so every API server has to be restarted
-without the storage variables before a transition.
+- `GET /api/v2/admin/settings/sensitive-status`: configured secret key names and
+  `managed_by_env` names. Values are never returned. Both fields are arrays,
+  including when empty.
 
 Stored and effective settings are string dictionaries keyed by the server
 settings registry. An empty dictionary is `{}`. Inspection copies stored values
@@ -55,9 +21,8 @@ problem without database error details. Restart metadata is available without
 settings storage.
 
 The web settings pages use the v2 effective settings, restart metadata, and
-sensitive-status operations, and write through `PUT /api/v2/admin/settings` and
-`PUT /api/v2/admin/settings/{key}` (see
-[general settings writes in v2](admin-api.md#general-settings-writes-in-v2)). The migration inventory lists
+sensitive-status operations. Writes remain on their existing bridge operations
+until the corresponding mutation contracts migrate. The migration inventory lists
 no Apple or Android consumers for these inspection operations. Jellyfin
 compatibility does not expose these administrator settings contracts.
 
@@ -77,83 +42,9 @@ remain clears under each provider's existing fallback rules. Connection checks d
 not persist draft values. Credentialed Meilisearch checks follow redirects only
 within the same scheme, exact host and effective port; any other redirect fails the check with a
 message asking for the final address. Checks without a key retain the HTTP
-client's ordinary redirect behavior. Because Meilisearch answers `/health`
-without a key, the check then lists one index, which needs the `indexes.get`
-action, and searches a nonexistent index under the configured index name,
-which needs the `search` action and an index scope covering Silo's indexes.
-A key Meilisearch refuses for either request, or a missing one on a secured
-instance, fails with a message asking for another key. The check does not
-prove the key can write documents.
+client's ordinary redirect behavior.
 Provider failures return `success: false` with a generic message that excludes
 provider error bodies and credentials. Invalid kinds/configuration return `422`.
-The result's `message` is English. `message_key` names its entry in the shared
-translation catalog (`web.admin.common.connectionCheck.result.*`) and
-`message_args` fills that entry's placeholders by name, as decimal strings for
-counts. A client shows the catalog's translation when its language has the key
-and every argument, and `message` otherwise. Both fields are absent when
-`message` has no catalog entry.
-
-## AI providers
-
-An administrator connects each AI provider once, and each AI job selects a
-provider from that list: `ai.text_provider_id` for text translation (used while
-`ai.auth_mode` is `api_key`), `ai.speech_provider_id` for speech-to-text, and
-`recommendations.embedding_provider_id` for recommendation embeddings (applied
-at restart, like every `recommendations.*` setting). The model settings
-(`ai.chat_model`, `ai.asr_model`, `recommendations.embedding_model`) are
-unchanged, except that `recommendations.embedding_model` no longer has a
-default. A binding must
-name a stored provider that serves the job's capability; settings writes that
-break this rule return `400`. The ChatGPT plan is not a stored provider; it is
-selected with `ai.auth_mode: chatgpt` and serves text only.
-
-The registry is the encrypted, internal setting `ai.providers`. Generic settings
-reads, writes, secret-status lists, revision validators, and connection-check
-drafts exclude it; the operations below are its only administrative boundary.
-`ai.base_url`, `ai.api_key`, `ai.asr_base_url`, `ai.asr_api_key`,
-`subtitle_ai.base_url`, `subtitle_ai.api_key`,
-`recommendations.embedding_base_url`, `recommendations.embedding_auth_token`,
-`recommendations.openai_model`, `recommendations.openai_api_key`, and
-`recommendations.embedding_provider` are retired: the server no longer reads
-them and rejects writes to them. On first start, a server moves the
-endpoints those keys held into providers and binds each job to the provider that
-serves the endpoint and key it used, then leaves the old rows in place.
-Transcription no longer falls back to the text endpoint. A stored endpoint
-whose URL carries credentials (`https://user:password@host`) or a query is not
-converted, because provider addresses are shown to administrators and the AI
-clients never handled a query; that job stays unconfigured and startup logs a
-warning naming the legacy setting. HTTP Basic authentication through the URL
-is not supported; such a proxy needs to accept the provider's API key.
-
-The following operations require an acting administrator:
-
-- `GET /api/v2/admin/ai/providers` lists providers without keys (`has_api_key`
-  reports a saved key) and the provider `types` that can be connected, with each
-  type's default address, fixed capabilities, and whether it needs a key. A
-  custom type has no fixed capabilities; the administrator declares them.
-  `used_by` lists the jobs sending requests to a provider; the text binding is
-  idle while the ChatGPT plan serves text.
-- `POST /api/v2/admin/ai/providers` connects a provider and returns `201`.
-- `PATCH /api/v2/admin/ai/providers/{id}` edits a provider. Every job using it
-  switches at once. The type is fixed. An omitted `api_key` keeps the stored
-  key and an empty one clears it. A `base_url` on another host needs `api_key`
-  in the same request, so a stored key never follows a provider elsewhere
-  unasked. Removing a capability a job uses returns `409`. Moving the
-  embedding provider to another address marks a restart as required; the
-  embedding lock follows the model, so the move needs no reset.
-- `DELETE /api/v2/admin/ai/providers/{id}` discards a provider and its key. A
-  provider a job uses returns `409`; an idle text binding to it is cleared.
-- `POST /api/v2/admin/ai/providers/check` lists a draft provider's models
-  without saving it. With `id` and no `api_key`, the stored key is sent only to
-  the stored address's scheme, host, and port. A provider that does not list
-  models answers `success: true` with no models. Failures return
-  `success: false` with a message that excludes provider text and credentials.
-- `GET /api/v2/admin/ai/providers/{id}/models` lists a stored provider's models.
-  Each model's `kind` (`chat`, `embeddings`, `speech`) comes from the provider
-  where it reports one (Gemini) and from the model name otherwise; clients use
-  it for suggestions and still accept any typed model name.
-
-Model listing never follows redirects, because the request carries the key.
 
 ## AI reasoning and ChatGPT accounts
 
@@ -162,28 +53,13 @@ Model listing never follows redirects, because the request carries the key.
 uses the model's default. Explicit values come from the model's capability
 response. The server validates known model families against their supported
 levels; an unknown custom model is validated by the provider connection check.
-Text requests read the persisted authentication mode, text provider, model,
-effort, service tier, and active registration together at request start.
-
-`ai.service_tier` applies only to a text provider whose registry type is `openai`
-while `ai.auth_mode` is `api_key`. Its default, an empty string, omits OpenAI's
-`service_tier` parameter and inherits the OpenAI project's setting. `priority`
-requests Fast/Priority processing through Chat Completions; `ultrafast` uses
-API-key-authenticated Responses with storage disabled. Only completed text
-output is accepted; incomplete responses and refusals never replace source text.
-OpenAI decides whether the account and model support the requested tier. Silo
-does not silently fall back after a provider rejection. Switching to another
-provider or a ChatGPT plan keeps the setting but omits it from requests. Speech
-and embedding requests do not use this setting.
+Text requests read the persisted authentication mode, endpoint, API key, model,
+effort, and active registration together at request start.
 
 The following operations require an acting administrator:
 
 - `GET /api/v2/admin/ai/capabilities?model=...` discovers supported reasoning
-  levels and whether the ChatGPT connection service is available. The optional
-  `openai_service_tiers` list advertises `default`, `priority`, and `ultrafast`
-  as configuration choices for OpenAI API-key text providers; it does not
-  guarantee availability for an individual model or account. Clients must not
-  offer the tier control when this capability is absent.
+  levels and whether the ChatGPT connection service is available.
 - `GET /api/v2/admin/ai/chatgpt` returns saved registrations, active account,
   connection status, and the latest login outcome without credentials.
   `attempt_id` identifies the attempt that produced that outcome.
@@ -265,8 +141,8 @@ account operations are the only administrative credential boundary. See
 [AI provider authentication](architecture/ai-provider-authentication.md) for
 identity, refresh, and inference invariants.
 
-ChatGPT plan credentials authorize text translation. Speech-to-text uses the
-provider `ai.speech_provider_id` selects. These operations belong
+ChatGPT plan credentials authorize text translation. Speech-to-text continues to
+use the configured Whisper-compatible URL and API key. These operations belong
 to the web administrator UI; Apple, Android, and Jellyfin clients continue to
 consume the existing translated subtitle and metadata contracts and require no
 account or settings changes.
@@ -371,14 +247,15 @@ after 10 seconds, even for a URL that turns the socket timeouts off.
 
 - The connection changes when the write leaves a different `redis.url`, or a
   different database number in use, than the stored settings. Both
-  writes apply the check. A write that leaves the
+  writes and both API versions apply the check. A write that leaves the
   connection as it is, clears `redis.url`, or runs in a process started with
   `REDIS_URL` connects to nothing.
 - Connecting selects the database number, so a number the Redis server does
   not have (16 or more on a Redis with the default 16 databases) fails the
   same way an unreachable host does. So does a Redis user whose ACL does not
   grant the channels (the pattern `&silo:*`).
-- A failed connection answers a `422` validation problem. The detail says whether Redis refused
+- A failed connection answers a `422` validation problem on `/api/v2` and
+  `400 invalid_settings` on `/api/v1`. The detail says whether Redis refused
   the connection, refused the channels, or could not be reached, or that
   `redis.url` is not a URL the Redis clients can read (a bare `host:port` an
   older build saved). It does not quote the client error, which can name hosts
@@ -386,19 +263,6 @@ after 10 seconds, even for a URL that turns the socket timeouts off.
 - The connection is made before the settings transaction. If another write
   changes the stored Redis settings in the meantime, the write is refused the
   same way and can be sent again.
-
-### Lower-version transcoding
-
-`playback.prefer_lower_version_transcode` is a boolean setting, default
-`true`. It applies when `allow_4k_transcode` is `true` and a 4K title has a
-lower-resolution version. A quality at or below that version's resolution
-class, such as Auto under a bandwidth estimate, is transcoded from the lower
-version. Qualities above it, such as **4K Medium**, still transcode the 4K
-version. When `false`, every lower quality transcodes the 4K version. With
-`allow_4k_transcode` set to `false`, the lower version serves lower qualities
-whatever this setting says. Changes apply to new playback decisions. The
-Playback settings page shows this policy as **Prefer 1080p
-versions** while 4K transcoding is allowed.
 
 ### HEVC encoding
 

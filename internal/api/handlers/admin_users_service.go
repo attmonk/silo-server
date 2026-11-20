@@ -33,12 +33,9 @@ type AdminAccountView struct {
 
 // AdminProfileView is one household profile on an account. LastSeenAt is the
 // latest time any device registration reported the profile; nil when none has.
-// The avatar fields match ProfileView's.
 type AdminProfileView struct {
-	ID, Name                        string
-	Avatar, AvatarURL, AvatarSource string
-	HasPIN, IsPrimary, IsChild      bool
-	LastSeenAt                      *time.Time
+	ID, Name   string
+	LastSeenAt *time.Time
 }
 
 func (h *AdminHandler) AdminAccountCapabilities() (bool, bool) {
@@ -135,7 +132,7 @@ func (h *AdminHandler) CreateAdminAccount(ctx context.Context, input auth.Create
 	if err := validateAdminPassword(input.User.Password); err != nil {
 		return 0, err
 	}
-	if apimw.IsScopedAPIKey(ctx) && input.User.Role == roleAdmin {
+	if actorIsScopedAPIKey(ctx) && input.User.Role == roleAdmin {
 		return 0, apiError(403, "insufficient_scope", "A scoped API key may not create an admin account")
 	}
 	if input.User.Role == roleAdmin {
@@ -298,7 +295,6 @@ func (h *AdminHandler) DeleteAdminAccount(ctx context.Context, id int, revision,
 	if err != nil {
 		return err
 	}
-	var collections []string
 	_, err = repo.MutateAdminAccount(ctx, id, revision, nil, func(current *models.User, tx pgx.Tx) (bool, error) {
 		if revision != -1 {
 			_, actual, err := adminAccountTransactionGroup(ctx, tx, current)
@@ -315,9 +311,7 @@ func (h *AdminHandler) DeleteAdminAccount(ctx context.Context, id int, revision,
 		if err := auth.EnsureBreakGlassAfterAdminChange(ctx, tx, current, nil); err != nil {
 			return false, breakGlassError(err)
 		}
-		ids, err := h.deletedAccountCollections(ctx, tx, id)
-		collections = ids
-		return true, err
+		return true, nil
 	})
 	if err != nil {
 		return err
@@ -325,7 +319,6 @@ func (h *AdminHandler) DeleteAdminAccount(ctx context.Context, id int, revision,
 	if h.OnUserSessionsRevoked != nil {
 		h.OnUserSessionsRevoked(ctx, id)
 	}
-	removeDeletedCollectionArtwork(ctx, h.ArtworkStore, userCollectionImagePrefix, collections...)
 	h.sweepWatchlistTitles(ctx, id)
 	h.invalidateStats(ctx, cache.ChannelAdmin, cache.EventAdminStatsInvalidated, strconv.Itoa(id))
 	return nil
@@ -361,7 +354,7 @@ func (h *AdminHandler) ImpersonateAdminAccount(ctx context.Context, id int, devi
 	if err != nil {
 		return TokenPairView{}, err
 	}
-	return TokenPairView(buildLoginResponse(pair, user, effectiveAccountPolicy(ctx, user, h.groupPolicyProvider()), actor)), nil
+	return TokenPairView(buildLoginResponse(pair, user, effectiveDownloadAllowed(ctx, user, h.groupPolicyProvider()), actor)), nil
 }
 
 // ownershipTransferrer moves the server Owner role. *auth.UserRepository
@@ -412,21 +405,13 @@ func (h *AdminHandler) ListAdminAccountProfiles(ctx context.Context, id int) ([]
 	lastSeen := profileLastSeen(devices)
 	result := make([]AdminProfileView, 0, len(rows))
 	for _, row := range rows {
-		view := AdminProfileView{ID: row.ID, Name: strings.TrimSpace(row.Name), Avatar: row.Avatar, HasPIN: row.PINHash != "", IsPrimary: row.IsPrimary, IsChild: row.IsChild}
-		view.AvatarSource, view.AvatarURL = h.resolveProfileAvatar(ctx, row.Avatar)
+		view := AdminProfileView{ID: row.ID, Name: strings.TrimSpace(row.Name)}
 		if at, ok := lastSeen[row.ID]; ok {
 			view.LastSeenAt = &at
 		}
 		result = append(result, view)
 	}
 	return result, nil
-}
-
-func (h *AdminHandler) resolveProfileAvatar(ctx context.Context, ref string) (source, url string) {
-	if h.ProfileAvatars == nil {
-		return resolveProfileAvatar(ctx, nil, 0, ref)
-	}
-	return h.ProfileAvatars.ResolveAvatar(ctx, ref)
 }
 
 // profileLastSeen is the latest device registration time per profile. A

@@ -34,11 +34,10 @@ import {
   useAdminDownloadStorage,
   useRevokeAdminDownloads,
 } from "@/hooks/queries/admin/downloadStorage";
-import { useT, type Translate } from "@/i18n";
 import { formatRelativeTime } from "@/lib/date";
 import { cn } from "@/lib/utils";
 import { CHECKBOX, LoadMoreButton, SearchField } from "./controls";
-import { countValues, formatStorageBytes } from "./downloadStoragePresentation";
+import { formatStorageBytes } from "./downloadStoragePresentation";
 
 type Sort = "last_seen" | "size";
 
@@ -52,7 +51,6 @@ function deviceKey(device: AdminDownloadDevice) {
 }
 
 export default function DeviceCopiesTab({ initialStale = false }: { initialStale?: boolean }) {
-  const t = useT();
   const storage = useAdminDownloadStorage();
   const staleDays = storage.data?.stale_device_days ?? 14;
   const [query, setQuery] = useState("");
@@ -73,11 +71,7 @@ export default function DeviceCopiesTab({ initialStale = false }: { initialStale
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
-        <SearchField
-          label={t("web.admin.downloads.deviceCopies.search")}
-          className="w-56"
-          onSearch={setQuery}
-        />
+        <SearchField label="Search people or devices" className="w-56" onSearch={setQuery} />
         <Button
           variant="outline"
           size="sm"
@@ -85,24 +79,15 @@ export default function DeviceCopiesTab({ initialStale = false }: { initialStale
           className={cn(stale && "border-warning/50 bg-warning/10 text-warning hover:text-warning")}
           onClick={() => setStale((value) => !value)}
         >
-          {t("web.admin.downloads.deviceCopies.staleFilter", {
-            days: staleDays,
-            days_text: staleDays,
-          })}
+          Not seen in {staleDays}+ days
         </Button>
         <Select value={sort} onValueChange={(value) => setSort(value as Sort)}>
-          <SelectTrigger
-            size="sm"
-            className="w-52"
-            aria-label={t("web.admin.downloads.deviceCopies.sort")}
-          >
+          <SelectTrigger size="sm" className="w-52" aria-label="Sort">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="last_seen">
-              {t("web.admin.downloads.deviceCopies.sortLastSeen")}
-            </SelectItem>
-            <SelectItem value="size">{t("web.admin.downloads.deviceCopies.sortSize")}</SelectItem>
+            <SelectItem value="last_seen">Longest unseen first</SelectItem>
+            <SelectItem value="size">Most on the device first</SelectItem>
           </SelectContent>
         </Select>
       </div>
@@ -112,15 +97,11 @@ export default function DeviceCopiesTab({ initialStale = false }: { initialStale
           <TableHeader>
             <TableRow>
               <TableHead className="w-8" />
-              <TableHead>{t("web.admin.downloads.deviceCopies.column.device")}</TableHead>
-              <TableHead>{t("web.admin.downloads.deviceCopies.column.person")}</TableHead>
-              <TableHead>{t("web.admin.downloads.deviceCopies.column.lastSeen")}</TableHead>
-              <TableHead className="hidden sm:table-cell">
-                {t("web.admin.downloads.deviceCopies.column.copies")}
-              </TableHead>
-              <TableHead className="text-end">
-                {t("web.admin.downloads.deviceCopies.column.onDevice")}
-              </TableHead>
+              <TableHead>Device</TableHead>
+              <TableHead>Person</TableHead>
+              <TableHead>Last seen</TableHead>
+              <TableHead className="hidden sm:table-cell">Copies</TableHead>
+              <TableHead className="text-right">On device</TableHead>
               <TableHead className="w-0" />
             </TableRow>
           </TableHeader>
@@ -137,10 +118,10 @@ export default function DeviceCopiesTab({ initialStale = false }: { initialStale
               <TableRow>
                 <TableCell colSpan={7} className="text-muted-foreground py-10 text-center">
                   {devices.isError
-                    ? t("web.admin.downloads.deviceCopies.loadError")
+                    ? "Devices could not be read."
                     : stale
-                      ? t("web.admin.downloads.deviceCopies.emptyStale")
-                      : t("web.admin.downloads.deviceCopies.empty")}
+                      ? "No stale devices hold downloads."
+                      : "No device holds downloads."}
                 </TableCell>
               </TableRow>
             ) : (
@@ -156,12 +137,8 @@ export default function DeviceCopiesTab({ initialStale = false }: { initialStale
                           aria-expanded={open}
                           aria-label={
                             open
-                              ? t("web.admin.downloads.deviceCopies.hideEntries", {
-                                  device: device.device_name,
-                                })
-                              : t("web.admin.downloads.deviceCopies.showEntries", {
-                                  device: device.device_name,
-                                })
+                              ? `Hide downloads on ${device.device_name}`
+                              : `Show downloads on ${device.device_name}`
                           }
                           className="text-muted-foreground hover:text-foreground"
                           onClick={() => setExpanded(open ? null : key)}
@@ -176,7 +153,7 @@ export default function DeviceCopiesTab({ initialStale = false }: { initialStale
                       <TableCell>
                         <div className="font-medium">{device.device_name || device.device_id}</div>
                         <div className="text-muted-foreground text-xs">
-                          {device.platform || t("web.admin.downloads.deviceCopies.unknownPlatform")}
+                          {device.platform || "Unknown platform"}
                         </div>
                       </TableCell>
                       <TableCell>
@@ -186,68 +163,44 @@ export default function DeviceCopiesTab({ initialStale = false }: { initialStale
                       <TableCell
                         className={cn("whitespace-nowrap", device.stale && "text-warning")}
                       >
-                        {formatRelativeTime(device.last_seen_at) ??
-                          t("web.admin.downloads.deviceCopies.neverSeen")}
+                        {formatRelativeTime(device.last_seen_at) ?? "Never"}
                       </TableCell>
                       <TableCell className="hidden sm:table-cell">
                         <div>
-                          {t("web.admin.downloads.deviceCopies.copiesSummary", {
-                            copies: device.copies,
-                            summary:
-                              [
-                                device.finished &&
-                                  t(
-                                    "web.admin.downloads.deviceCopies.finished",
-                                    countValues(device.finished),
-                                  ),
-                                device.waiting &&
-                                  t(
-                                    "web.admin.downloads.deviceCopies.waiting",
-                                    countValues(device.waiting),
-                                  ),
-                                device.failed &&
-                                  t(
-                                    "web.admin.downloads.deviceCopies.failed",
-                                    countValues(device.failed),
-                                  ),
-                              ]
-                                .filter(Boolean)
-                                .join(", ") || t("web.admin.downloads.deviceCopies.noneActive"),
-                            muted: (chunks) => (
-                              <span className="text-muted-foreground">{chunks}</span>
-                            ),
-                          })}
+                          {device.copies}{" "}
+                          <span className="text-muted-foreground">
+                            ·{" "}
+                            {[
+                              device.finished && `${device.finished} finished`,
+                              device.waiting && `${device.waiting} waiting`,
+                              device.failed && `${device.failed} failed`,
+                            ]
+                              .filter(Boolean)
+                              .join(", ") || "none active"}
+                          </span>
                         </div>
                         {device.revoked > 0 ? (
                           <div className="text-warning text-xs">
-                            {t(
-                              "web.admin.downloads.deviceCopies.revokedPending",
-                              countValues(device.revoked),
-                            )}
+                            {device.revoked} revoked, waiting for device
                           </div>
                         ) : device.monitors > 0 ? (
                           <div className="text-muted-foreground text-xs">
-                            {t(
-                              "web.admin.downloads.deviceCopies.monitors",
-                              countValues(device.monitors),
-                            )}
+                            {device.monitors} series monitored
                           </div>
                         ) : null}
                       </TableCell>
-                      <TableCell className="text-end whitespace-nowrap tabular-nums">
+                      <TableCell className="text-right whitespace-nowrap tabular-nums">
                         {formatStorageBytes(device.bytes_on_device)}
                       </TableCell>
-                      <TableCell className="text-end">
+                      <TableCell className="text-right">
                         <Button
                           variant="outline"
                           size="sm"
                           disabled={device.copies === 0}
-                          aria-label={t("web.admin.downloads.deviceCopies.revokeAllLabel", {
-                            device: device.device_name || device.device_id,
-                          })}
+                          aria-label={`Revoke all downloads on ${device.device_name || device.device_id}`}
                           onClick={() => setRevoking({ kind: "device", device })}
                         >
-                          {t("web.admin.downloads.deviceCopies.revokeAll")}
+                          Revoke all…
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -281,58 +234,36 @@ export default function DeviceCopiesTab({ initialStale = false }: { initialStale
   );
 }
 
-function entryTitle(t: Translate, entry: AdminDownloadEntry) {
+function entryTitle(entry: AdminDownloadEntry) {
   if (entry.episode) {
-    return t("web.admin.downloads.deviceCopies.episodeTitle", {
-      series: entry.title || t("web.admin.downloads.deviceCopies.unknownSeries"),
-      season: entry.episode.season_number,
-      episode: entry.episode.episode_number,
-    });
+    return `${entry.title || "Unknown series"} · S${entry.episode.season_number} E${entry.episode.episode_number}`;
   }
-  return entry.title || t("web.admin.downloads.deviceCopies.unknownTitle");
+  return entry.title || "Unknown title";
 }
 
 /** "Original", or a bitrate preset such as "10mbps" as "10 Mbps". */
-function qualityLabel(t: Translate, quality: string) {
-  if (quality === "original") return t("web.admin.downloads.deviceCopies.qualityOriginal");
+function qualityLabel(quality: string) {
+  if (quality === "original") return "Original";
   const mbps = /^(\d+)mbps$/.exec(quality);
-  return mbps ? t("web.admin.downloads.deviceCopies.qualityBitrate", { mbps: mbps[1] }) : quality;
+  return mbps ? `${mbps[1]} Mbps` : quality;
 }
 
-function entryStatus(t: Translate, entry: AdminDownloadEntry) {
+function entryStatus(entry: AdminDownloadEntry) {
   switch (entry.status) {
     case "completed":
-      return {
-        label: t("web.admin.downloads.deviceCopies.status.finished"),
-        className: "bg-muted text-foreground",
-      };
+      return { label: "Finished", className: "bg-muted text-foreground" };
     case "queued":
     case "preparing":
     case "ready":
-      return {
-        label: t("web.admin.downloads.deviceCopies.status.waiting"),
-        className: "text-foreground bg-chart-1/30",
-      };
+      return { label: "Waiting", className: "text-foreground bg-chart-1/30" };
     case "downloading":
-      return {
-        label: t("web.admin.downloads.deviceCopies.status.downloading"),
-        className: "text-foreground bg-chart-1/30",
-      };
+      return { label: "Downloading", className: "text-foreground bg-chart-1/30" };
     case "revoked":
-      return {
-        label: t("web.admin.downloads.deviceCopies.status.revoked"),
-        className: "text-warning bg-warning/10",
-      };
+      return { label: "Revoked", className: "text-warning bg-warning/10" };
     case "failed":
-      return {
-        label: t("web.admin.downloads.deviceCopies.status.failed"),
-        className: "text-destructive bg-destructive/10",
-      };
+      return { label: "Failed", className: "text-destructive bg-destructive/10" };
     case "cancelled":
-      return {
-        label: t("web.admin.downloads.deviceCopies.status.cancelled"),
-        className: "bg-muted text-muted-foreground",
-      };
+      return { label: "Cancelled", className: "bg-muted text-muted-foreground" };
     default:
       return { label: entry.status, className: "bg-muted text-muted-foreground" };
   }
@@ -345,7 +276,6 @@ function DeviceEntries({
   device: AdminDownloadDevice;
   onRevoke: (entries: AdminDownloadEntry[]) => void;
 }) {
-  const t = useT();
   const entries = useAdminDownloadDeviceEntries({
     userId: device.user_id,
     profileId: device.profile_id,
@@ -357,30 +287,29 @@ function DeviceEntries({
   const chosen = revocable.filter((row) => selected.has(row.id));
   if (entries.isLoading) return <Skeleton className="m-3 h-16" />;
   return (
-    <div className="space-y-2 px-3 py-3 sm:ps-12">
+    <div className="space-y-2 px-3 py-3 sm:pl-12">
       {chosen.length > 0 ? (
         <div className="flex items-center gap-2 text-xs">
-          <span>{t("web.admin.downloads.deviceCopies.selected", countValues(chosen.length))}</span>
+          <span>{chosen.length} selected</span>
           <Button
             size="sm"
             variant="outline"
             className="h-7 text-xs"
             onClick={() => onRevoke(chosen)}
           >
-            {t("web.admin.downloads.deviceCopies.revokeSelected", countValues(chosen.length))}
+            Revoke {chosen.length}…
           </Button>
         </div>
       ) : null}
       <ul className="divide-border/60 divide-y text-sm">
         {rows.map((row) => {
-          const status = entryStatus(t, row);
-          const title = entryTitle(t, row);
+          const status = entryStatus(row);
           return (
             <li key={row.id} className="flex flex-wrap items-center gap-3 py-2">
               <input
                 type="checkbox"
                 className={CHECKBOX}
-                aria-label={t("web.admin.downloads.deviceCopies.selectEntry", { title })}
+                aria-label={`Select ${entryTitle(row)}`}
                 disabled={row.status === "revoked"}
                 checked={row.status !== "revoked" && selected.has(row.id)}
                 onChange={() =>
@@ -393,15 +322,12 @@ function DeviceEntries({
                 }
               />
               <div className="min-w-0 flex-1">
-                <div className="truncate font-medium">{title}</div>
+                <div className="truncate font-medium">{entryTitle(row)}</div>
                 <div className="text-muted-foreground text-xs">
                   {[
                     row.episode?.title,
-                    qualityLabel(t, row.effective_quality),
-                    row.location_name &&
-                      t("web.admin.downloads.deviceCopies.preparedOn", {
-                        location: row.location_name,
-                      }),
+                    qualityLabel(row.effective_quality),
+                    row.location_name && `prepared on ${row.location_name}`,
                   ]
                     .filter(Boolean)
                     .join(" · ")}
@@ -412,22 +338,20 @@ function DeviceEntries({
               >
                 {status.label}
               </span>
-              <span className="w-20 text-end tabular-nums">
+              <span className="w-20 text-right tabular-nums">
                 {formatStorageBytes(row.file_size)}
               </span>
               {row.status !== "revoked" ? (
                 <button
                   type="button"
                   className="text-xs underline underline-offset-3"
-                  aria-label={t("web.admin.downloads.deviceCopies.revokeEntry", { title })}
+                  aria-label={`Revoke ${entryTitle(row)}`}
                   onClick={() => onRevoke([row])}
                 >
-                  {t("web.admin.downloads.deviceCopies.revoke")}
+                  Revoke
                 </button>
               ) : (
-                <span className="text-muted-foreground w-12 text-xs">
-                  {t("web.admin.downloads.deviceCopies.sent")}
-                </span>
+                <span className="text-muted-foreground w-12 text-xs">sent</span>
               )}
             </li>
           );
@@ -440,9 +364,7 @@ function DeviceEntries({
           onClick={() => void entries.fetchNextPage()}
           disabled={entries.isFetchingNextPage}
         >
-          {entries.isFetchingNextPage
-            ? t("web.admin.downloads.deviceCopies.loadingMore")
-            : t("web.admin.downloads.deviceCopies.showMore")}
+          {entries.isFetchingNextPage ? "Loading…" : "Show more"}
         </Button>
       ) : null}
     </div>
@@ -473,7 +395,6 @@ function RevokeDialog({
   cacheHours: number | undefined;
   onClose: () => void;
 }) {
-  const t = useT();
   const revoke = useRevokeAdminDownloads();
   const [pauseMonitors, setPauseMonitors] = useState(true);
   const [reason, setReason] = useState("");
@@ -491,20 +412,9 @@ function RevokeDialog({
   const seen = device ? formatRelativeTime(device.last_seen_at) : null;
   const only =
     shown?.kind === "entries" && shown.entries.length === 1 ? shown.entries[0] : undefined;
-  const titleDevice =
-    device?.device_name || t("web.admin.downloads.deviceCopies.revokeDialog.thisDevice");
-  const textDevice =
-    device?.device_name || t("web.admin.downloads.deviceCopies.revokeDialog.deviceFallback");
-  const description = device?.profile_name
-    ? t("web.admin.downloads.deviceCopies.revokeDialog.descriptionProfile", {
-        count,
-        profile: device.profile_name,
-        device: textDevice,
-      })
-    : t("web.admin.downloads.deviceCopies.revokeDialog.description", {
-        count,
-        device: textDevice,
-      });
+  const subject = only
+    ? `“${entryTitle(only)}”`
+    : `${count} ${count === 1 ? "download" : "downloads"}`;
 
   function confirm() {
     if (!shown) return;
@@ -523,17 +433,12 @@ function RevokeDialog({
         onSuccess: (result) => {
           toast.success(
             result.revoked > 0
-              ? t("web.admin.downloads.deviceCopies.revokeDialog.revoked", {
-                  ...countValues(result.revoked),
-                  device:
-                    shown.device.device_name ||
-                    t("web.admin.downloads.deviceCopies.revokeDialog.toastDevice"),
-                })
-              : t("web.admin.downloads.deviceCopies.revokeDialog.alreadyRevoked"),
+              ? `Revoked ${result.revoked} ${result.revoked === 1 ? "download" : "downloads"} on ${shown.device.device_name || "the device"}`
+              : "Those downloads were already revoked",
           );
           onClose();
         },
-        onError: () => toast.error(t("web.admin.downloads.deviceCopies.revokeDialog.failed")),
+        onError: () => toast.error("The downloads could not be revoked."),
       },
     );
   }
@@ -548,40 +453,23 @@ function RevokeDialog({
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>
-            {only
-              ? t("web.admin.downloads.deviceCopies.revokeDialog.titleEntry", {
-                  title: entryTitle(t, only),
-                  device: titleDevice,
-                })
-              : t("web.admin.downloads.deviceCopies.revokeDialog.titleCount", {
-                  ...countValues(count),
-                  device: titleDevice,
-                })}
+            Revoke {subject} on {device?.device_name || "this device"}?
           </AlertDialogTitle>
           <AlertDialogDescription>
+            The Silo app on {device?.profile_name ? `${device.profile_name}'s ` : "the "}
+            {device?.device_name || "device"} deletes {count === 1 ? "it" : "them"} the next time it
+            connects.
             {device?.stale
-              ? t("web.admin.downloads.deviceCopies.revokeDialog.withStale", {
-                  description,
-                  stale: seen
-                    ? t("web.admin.downloads.deviceCopies.revokeDialog.staleSeen", { when: seen })
-                    : t("web.admin.downloads.deviceCopies.revokeDialog.staleUnknown"),
-                })
-              : description}
+              ? ` It was last seen ${seen ?? "a long time ago"}, so this may take a while.`
+              : ""}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="bg-card rounded-xl border p-3 text-sm">
-          <div className="font-medium">
-            {t("web.admin.downloads.deviceCopies.revokeDialog.frees", {
-              size: formatStorageBytes(bytes),
-            })}
-          </div>
+          <div className="font-medium">Frees {formatStorageBytes(bytes)} on the device.</div>
           <div className="text-muted-foreground text-xs">
-            {cacheHours === undefined
-              ? t("web.admin.downloads.deviceCopies.revokeDialog.cacheUnknown")
-              : t(
-                  "web.admin.downloads.deviceCopies.revokeDialog.cacheHours",
-                  countValues(cacheHours),
-                )}
+            Prepared files on the server that only these downloads were waiting on become cached and
+            expire after {cacheHours === undefined ? "the cache period" : `${cacheHours} hours`}.
+            Preparations nothing else needs are canceled.
           </div>
         </div>
         {shown?.kind === "device" && shown.device.monitors > 0 ? (
@@ -594,36 +482,36 @@ function RevokeDialog({
               onChange={(event) => setPauseMonitors(event.target.checked)}
             />
             <span>
-              {t(
-                "web.admin.downloads.deviceCopies.revokeDialog.pauseMonitors",
-                countValues(shown.device.monitors),
-              )}
+              Also pause the{" "}
+              {shown.device.monitors === 1
+                ? "series monitor"
+                : `${shown.device.monitors} series monitors`}{" "}
+              on this device
               <span className="text-muted-foreground block text-xs">
-                {t("web.admin.downloads.deviceCopies.revokeDialog.pauseHint")}
+                Otherwise new episodes download again.
               </span>
             </span>
           </label>
         ) : null}
         <div className="space-y-1.5">
           <label htmlFor={reasonId} className="text-sm font-medium">
-            {t("web.admin.downloads.deviceCopies.revokeDialog.reason", {
-              hint: (chunks) => <span className="text-muted-foreground font-normal">{chunks}</span>,
-            })}
+            Reason{" "}
+            <span className="text-muted-foreground font-normal">(optional, kept in History)</span>
           </label>
           <Input
             id={reasonId}
             value={reason}
             maxLength={500}
             onChange={(event) => setReason(event.target.value)}
-            placeholder={t("web.admin.downloads.deviceCopies.revokeDialog.reasonPlaceholder")}
+            placeholder="e.g. Device lost"
           />
         </div>
         <p className="text-muted-foreground text-xs">
-          {t("web.admin.downloads.deviceCopies.revokeDialog.oldApps")}
+          Apps released before revocation support keep files they already downloaded.
         </p>
         <AlertDialogFooter>
           <Button variant="outline" onClick={onClose}>
-            {t("common.cancel")}
+            Cancel
           </Button>
           <Button
             variant="destructive"
@@ -631,8 +519,8 @@ function RevokeDialog({
             onClick={confirm}
           >
             {revoke.isPending
-              ? t("web.admin.downloads.deviceCopies.revokeDialog.revoking")
-              : t("web.admin.downloads.deviceCopies.revokeDialog.confirm", countValues(count))}
+              ? "Revoking…"
+              : `Revoke ${count === 1 ? "download" : `${count} downloads`}`}
           </Button>
         </AlertDialogFooter>
       </AlertDialogContent>

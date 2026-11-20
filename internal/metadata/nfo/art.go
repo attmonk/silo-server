@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/netguard"
@@ -193,7 +192,7 @@ func (r artResolver) contains(path string) bool {
 	if !slices.ContainsFunc(r.folders, func(folder string) bool { return pathWithin(path, folder) }) {
 		return false
 	}
-	resolved, err := fspath.EvalSymlinks(path)
+	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return false
 	}
@@ -209,7 +208,7 @@ func (r artResolver) contains(path string) bool {
 func (f *sidecarFinder) realDir(dir string) (string, bool) {
 	real, seen := f.realDirs[dir]
 	if !seen {
-		if resolved, err := fspath.EvalSymlinks(dir); err == nil {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
 			real = resolved
 		}
 		if f.realDirs == nil {

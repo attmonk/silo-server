@@ -44,29 +44,16 @@ func (s *PostgresUserStore) SetSeriesPlaybackPreference(ctx context.Context, pre
 }
 
 func (s *PostgresUserStore) GetSeriesPlaybackPreference(ctx context.Context, profileID, seriesID string) (*userstore.SeriesPlaybackPreference, error) {
-	pref, err := scanSeriesPlaybackPreference(s.pool.QueryRow(ctx, seriesPlaybackPreferenceSQL, s.userID, profileID, seriesID))
-	if err != nil {
-		return nil, fmt.Errorf("getting series playback preference for profile %q series %q: %w",
-			profileID, seriesID, err)
-	}
-	return pref, nil
-}
-
-// seriesPlaybackPreferenceSQL reads one preference row: $1 user, $2 profile,
-// $3 series (or a movie's own content ID).
-const seriesPlaybackPreferenceSQL = `
-		SELECT profile_id, series_id, resolution, hdr, codec_video, file_id, edition_key, updated_at
-		FROM user_series_playback_preferences
-		WHERE user_id = $1 AND profile_id = $2 AND series_id = $3`
-
-// scanSeriesPlaybackPreference reads the row seriesPlaybackPreferenceSQL
-// selects, nil when there is none.
-func scanSeriesPlaybackPreference(row pgx.Row) (*userstore.SeriesPlaybackPreference, error) {
 	var pref userstore.SeriesPlaybackPreference
 	var updatedAt time.Time
 	var fileID *int
 	var editionKey *string
-	err := row.Scan(
+	err := s.pool.QueryRow(ctx, `
+		SELECT profile_id, series_id, resolution, hdr, codec_video, file_id, edition_key, updated_at
+		FROM user_series_playback_preferences
+		WHERE user_id = $1 AND profile_id = $2 AND series_id = $3`,
+		s.userID, profileID, seriesID,
+	).Scan(
 		&pref.ProfileID,
 		&pref.SeriesID,
 		&pref.Resolution,
@@ -80,7 +67,8 @@ func scanSeriesPlaybackPreference(row pgx.Row) (*userstore.SeriesPlaybackPrefere
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getting series playback preference for profile %q series %q: %w",
+			profileID, seriesID, err)
 	}
 	if fileID != nil {
 		pref.FileID = *fileID

@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // walkVisitor receives the directories of a walk. Both backends record
@@ -49,7 +47,7 @@ type walkVisitor struct {
 // Unreadable directories stay recorded but are not descended into; a
 // canceled ctx aborts the walk.
 func walkTree(ctx context.Context, dir string, v walkVisitor) error {
-	physical, err := fspath.EvalSymlinks(dir)
+	physical, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		physical = dir
 	}
@@ -65,7 +63,7 @@ func walkTree(ctx context.Context, dir string, v walkVisitor) error {
 		w.skipped.addNetwork(dir)
 		return nil
 	}
-	info, err := fspath.Lstat(dir)
+	info, err := os.Lstat(dir)
 	link := err == nil && info.Mode()&os.ModeSymlink != 0
 	return w.dir(ctx, dir, filepath.Clean(physical), link)
 }
@@ -156,7 +154,7 @@ func (w *treeWalk) dir(ctx context.Context, logical, physical string, link bool)
 	if !ok {
 		return nil
 	}
-	entries, err := fspath.ReadDir(logical)
+	entries, err := os.ReadDir(logical)
 	if err != nil {
 		// Unreadable: nothing below it can be recorded. Not a walk failure.
 		return nil //nolint:nilerr // an unreadable directory must not abort the walk.
@@ -170,8 +168,7 @@ func (w *treeWalk) dir(ctx context.Context, logical, physical string, link bool)
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		// Hidden files stay: an ignore marker is one, and the scanner reads them.
-		if ignoredName(name) || (entry.IsDir() && ignoredDir(name)) {
+		if ignoredDir(name) {
 			continue
 		}
 		childLogical := filepath.Join(logical, name)
@@ -187,19 +184,16 @@ func (w *treeWalk) dir(ctx context.Context, logical, physical string, link bool)
 				w.skipped.addNetwork(childLogical)
 				continue
 			}
-			resolved, err := fspath.EvalSymlinks(childLogical)
+			resolved, err := filepath.EvalSymlinks(childLogical)
 			if err != nil {
 				continue
 			}
-			info, err := fspath.Stat(resolved)
+			info, err := os.Stat(resolved)
 			if err != nil {
 				continue
 			}
 			if !info.IsDir() {
 				w.foundFile(childLogical)
-				continue
-			}
-			if ignoredDir(name) {
 				continue
 			}
 			childPhysical = filepath.Clean(resolved)
@@ -239,22 +233,22 @@ func (w *treeWalk) foundFile(path string) {
 // network mount cannot block the backend's read loop, and the change is
 // reported like a file for a scoped scan instead of being walked.
 func symlinkToDir(path string) bool {
-	info, err := fspath.Lstat(path)
+	info, err := os.Lstat(path)
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
 		return false
 	}
 	mounts := unsupportedMountPoints()
-	parent, err := fspath.EvalSymlinks(filepath.Dir(path))
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
 	if err != nil {
 		parent = filepath.Dir(path)
 	}
 	if linkOntoUnsupportedMount(mounts, path, parent) {
 		return false
 	}
-	resolved, err := fspath.EvalSymlinks(path)
+	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil || onUnsupportedMount(mounts, resolved) {
 		return false
 	}
-	target, err := fspath.Stat(resolved)
+	target, err := os.Stat(resolved)
 	return err == nil && target.IsDir()
 }

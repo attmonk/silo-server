@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -180,13 +179,4 @@ func (tx *preferenceSettingsTx) UpsertSettingValue(
 
 func (tx *preferenceSettingsTx) DeleteSettingValue(_ context.Context, id userstore.SettingIdentity) (bool, error) {
 	return deleteSettingValue(tx.exec, id)
-}
-
-func (tx *preferenceSettingsTx) CheckProfilePINRevision(ctx context.Context, id string, revision int64) (bool, error) {
-	var matches bool
-	err := tx.exec.QueryRowContext(ctx, "SELECT pin_revision = ? FROM profiles WHERE id = ?", revision, id).Scan(&matches)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	return matches, err
 }

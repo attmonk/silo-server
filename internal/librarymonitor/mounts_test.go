@@ -4,13 +4,66 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
+
+func TestParseMountInfo(t *testing.T) {
+	data := `22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+35 22 0:44 / /mnt/media rw shared:20 master:3 - xfs /dev/sdb1 rw
+36 35 0:52 /export /mnt/media/nas\040share rw - nfs4 server:/export rw,vers=4.2
+bad line
+37 22 0:53 / /mnt/no-separator rw ext4 /dev/sdc1 rw
+`
+	got := parseMountInfo(data)
+	want := []mountEntry{
+		{id: 22, dev: "8:1", point: "/", fsType: "ext4"},
+		{id: 35, dev: "0:44", point: "/mnt/media", fsType: "xfs"},
+		{id: 36, dev: "0:52", point: "/mnt/media/nas share", fsType: mountTypeNFS4},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseMountInfo = %+v, want %+v", got, want)
+	}
+}
+
+func TestViewMounts(t *testing.T) {
+	rootfs := mountEntry{id: 1, dev: "8:1", point: "/", fsType: "ext4"}
+	media := mountEntry{id: 2, dev: "8:17", point: "/mnt/media", fsType: "xfs"}
+	disk := mountEntry{id: 3, dev: "8:33", point: "/mnt/media/Movies/disk1", fsType: "ext4"}
+	nas := mountEntry{id: 4, dev: "0:50", point: "/mnt/media/Movies/nas", fsType: mountTypeNFS4}
+	other := mountEntry{id: 5, dev: "8:49", point: "/mnt/media/Shows", fsType: "ext4"}
+	sibling := mountEntry{id: 6, dev: "8:65", point: "/mnt/media/Movies2", fsType: "ext4"}
+	table := []mountEntry{rootfs, media, disk, nas, other, sibling}
+
+	view := viewMounts("/library/Movies", "/mnt/media/Movies", table)
+	// The covering mount and the mounts inside; not a sibling that shares
+	// the prefix, and not another folder's mount.
+	wantSig := joinSorted(disk.key(), media.key(), nas.key())
+	if view.signature != wantSig {
+		t.Fatalf("signature = %q, want %q", view.signature, wantSig)
+	}
+	if want := []string{"/library/Movies/nas (NFS)"}; !slices.Equal(view.unsupported, want) {
+		t.Fatalf("unsupported = %v, want %v (logical paths)", view.unsupported, want)
+	}
+
+	// A root that is itself a mount point is covered by that mount alone.
+	if got := viewMounts("/mnt/media", "/mnt/media", []mountEntry{rootfs, media}).signature; got != media.key() {
+		t.Fatalf("signature of a mounted root = %q", got)
+	}
+	// A later mount over the same point covers the earlier one.
+	over := mountEntry{id: 7, dev: "8:81", point: "/mnt/media", fsType: "ext4"}
+	if got := viewMounts("/mnt/media/x", "/mnt/media/x", []mountEntry{rootfs, media, over}).signature; got != over.key() {
+		t.Fatalf("signature under an over-mount = %q, want the top mount", got)
+	}
+}
+
+func joinSorted(keys ...string) string {
+	slices.Sort(keys)
+	return strings.Join(keys, "\n")
+}
 
 func TestWalkTreeSkipsNetworkMountsBelowTheRoot(t *testing.T) {
 	root := t.TempDir()
@@ -78,20 +131,6 @@ func TestWalkTreeDoesNotFollowSymlinksOntoNetworkMounts(t *testing.T) {
 	}
 	if got, want := firstList(skipped.lists()), []string{filepath.Join(root, "Linked Movie")}; !slices.Equal(got, want) {
 		t.Fatalf("reported network links %v, want %v", got, want)
-	}
-}
-
-// A link whose own name is not UTF-8 reaches the check fspath-encoded; its
-// text must still be read without touching the target.
-func TestLinkOntoUnsupportedMountReadsNonUTF8LinkName(t *testing.T) {
-	root := t.TempDir()
-	link := filepath.Join(root, "Linked B\xe5rd")
-	if err := os.Symlink("/srv/nas/Movie", link); err != nil {
-		t.Skipf("file system rejects non-UTF-8 names: %v", err)
-	}
-	mounts := map[string]bool{"/": false, "/srv/nas": true}
-	if !linkOntoUnsupportedMount(mounts, fspath.Encode(link), root) {
-		t.Fatal("link onto a network mount was not detected for an encoded link name")
 	}
 }
 

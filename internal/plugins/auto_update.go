@@ -1,7 +1,6 @@
 package plugins
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -9,52 +8,24 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
-
-	"golang.org/x/mod/semver"
 
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
 )
 
-// compareVersions orders two plugin versions, returning -1 if a < b, 0 if
-// a == b, and 1 if a > b. Versions are Semantic Versioning strings with an
-// optional leading "v": a pre-release sorts below its release and build
-// metadata is ignored. Manifests are not validated, so a version that is not
-// valid semver sorts below every valid one, which lets a catalog release
-// replace a hand-installed build with a free-form version. Two invalid
-// versions compare dot segment by dot segment (see compareVersionSegments).
+// compareVersions compares two dot-separated version strings numerically.
+// Returns -1 if a < b, 0 if a == b, 1 if a > b.
+// Non-numeric segments fall back to lexicographic comparison.
 func compareVersions(a, b string) int {
-	semA, semB := semverString(a), semverString(b)
-	validA, validB := semver.IsValid(semA), semver.IsValid(semB)
-	switch {
-	case validA && validB:
-		return semver.Compare(semA, semB)
-	case validA:
-		return 1
-	case validB:
-		return -1
-	}
-	return compareVersionSegments(a, b)
-}
-
-// semverString adds the "v" prefix golang.org/x/mod/semver requires.
-func semverString(version string) string {
-	if strings.HasPrefix(version, "v") {
-		return version
-	}
-	return "v" + version
-}
-
-// compareVersionSegments orders two versions dot segment by dot segment. A
-// missing segment sorts first, then integers by value, then other text
-// lexicographically. Ranking the kinds before comparing keeps the order
-// transitive, which the catalog sort needs.
-func compareVersionSegments(a, b string) int {
 	partsA := strings.Split(a, ".")
 	partsB := strings.Split(b, ".")
 
-	for i := 0; i < max(len(partsA), len(partsB)); i++ {
+	maxLen := len(partsA)
+	if len(partsB) > maxLen {
+		maxLen = len(partsB)
+	}
+
+	for i := 0; i < maxLen; i++ {
 		var segA, segB string
 		if i < len(partsA) {
 			segA = partsA[i]
@@ -62,39 +33,27 @@ func compareVersionSegments(a, b string) int {
 		if i < len(partsB) {
 			segB = partsB[i]
 		}
-		if c := compareVersionSegment(segA, segB); c != 0 {
-			return c
+
+		numA, errA := strconv.Atoi(segA)
+		numB, errB := strconv.Atoi(segB)
+
+		if errA == nil && errB == nil {
+			if numA < numB {
+				return -1
+			}
+			if numA > numB {
+				return 1
+			}
+		} else {
+			if segA < segB {
+				return -1
+			}
+			if segA > segB {
+				return 1
+			}
 		}
 	}
 	return 0
-}
-
-func compareVersionSegment(a, b string) int {
-	rankA, numA := versionSegmentRank(a)
-	rankB, numB := versionSegmentRank(b)
-	if c := cmp.Compare(rankA, rankB); c != 0 {
-		return c
-	}
-	if rankA == segmentNumeric {
-		return cmp.Compare(numA, numB)
-	}
-	return strings.Compare(a, b)
-}
-
-const (
-	segmentMissing = iota
-	segmentNumeric
-	segmentText
-)
-
-func versionSegmentRank(segment string) (rank, value int) {
-	if segment == "" {
-		return segmentMissing, 0
-	}
-	if n, err := strconv.Atoi(segment); err == nil {
-		return segmentNumeric, n
-	}
-	return segmentText, 0
 }
 
 const pluginIDTMDB = "silo.tmdb"
@@ -112,7 +71,6 @@ type managedRepositoryReconciler interface {
 
 type autoUpdateInstallationStore interface {
 	List(ctx context.Context) ([]*Installation, error)
-	GetByID(ctx context.Context, id int) (*Installation, error)
 	Update(ctx context.Context, id int, input UpdateInstallationInput) error
 	Delete(ctx context.Context, id int) error
 }
@@ -125,7 +83,8 @@ type autoUpdateCatalog interface {
 type autoUpdateInstaller interface {
 	InstallRemote(ctx context.Context, req InstallArchiveRequest) (*InstallResult, error)
 	InstallBinary(ctx context.Context, req InstallBinaryRequest) (*InstallResult, error)
-	PrepareCatalogReplacement(ctx context.Context, existing *Installation, target *ResolvedCatalogInstall) (*PreparedReplacement, error)
+	ReplaceRemote(ctx context.Context, existing *Installation, req InstallArchiveRequest) (*InstallResult, error)
+	ReplaceBinary(ctx context.Context, existing *Installation, req InstallBinaryRequest) (*InstallResult, error)
 }
 
 type autoUpdateHost interface {
@@ -242,13 +201,7 @@ func (s *AutoUpdateService) Check(ctx context.Context, opts AutoUpdateOptions) (
 
 	latestByRepositoryPlugin := latestCatalogEntriesByRepository(entries)
 	for _, existing := range installed {
-		if existing == nil {
-			continue
-		}
-		if existing.RepositoryID == nil {
-			// An uploaded plugin, or one whose repository was deleted, has no
-			// automatic update left to fail, so drop any refusal it kept.
-			s.recordUpdateFailure(ctx, existing, CatalogEntry{}, autoUpdateOutcomeNone, nil, &summary)
+		if existing == nil || existing.RepositoryID == nil {
 			continue
 		}
 		// The reserved builtin row must never be matched against catalog
@@ -267,7 +220,6 @@ func (s *AutoUpdateService) Check(ctx context.Context, opts AutoUpdateOptions) (
 			continue
 		}
 		outcome, err := s.handleExistingPlugin(ctx, existing, entry)
-		s.recordUpdateFailure(ctx, existing, entry, outcome, err, &summary)
 		if err != nil {
 			summary.recordFailuref("process plugin update %s: %v", existing.PluginID, err)
 			continue
@@ -441,19 +393,7 @@ func (s *AutoUpdateService) handleExistingPlugin(ctx context.Context, existing *
 
 	switch existing.UpdatePolicy {
 	case "auto":
-		err := s.autoUpdatePlugin(ctx, existing, entry)
-		if errors.Is(err, ErrInstallationChanged) {
-			// Another install or update replaced the plugin while this one
-			// downloaded; it is skipped, not refused, and the next pass
-			// compares the catalog against what is installed now.
-			s.logger.InfoContext(ctx, "skipped plugin auto-update: the plugin was replaced while it downloaded",
-				"plugin_id", existing.PluginID,
-				"from_version", existing.Version,
-				"to_version", entry.Manifest.GetVersion(),
-			)
-			return autoUpdateOutcomeNone, nil
-		}
-		return autoUpdateOutcomeUpdated, err
+		return autoUpdateOutcomeUpdated, s.autoUpdatePlugin(ctx, existing, entry)
 	case "notify":
 		return autoUpdateOutcomeNotified, s.notifyPluginUpdate(ctx, existing, entry)
 	default:
@@ -462,37 +402,34 @@ func (s *AutoUpdateService) handleExistingPlugin(ctx context.Context, existing *
 	}
 }
 
-// autoUpdatePlugin replaces the plugin in-place so the installation ID and
-// dependent configuration rows remain stable. The new package is downloaded
-// and checked first; the running plugin is stopped only once it passed and
-// the installation still holds the package it was checked against.
+// autoUpdatePlugin stops the running plugin and replaces it in-place so the
+// installation ID and dependent configuration rows remain stable.
 func (s *AutoUpdateService) autoUpdatePlugin(ctx context.Context, existing *Installation, entry CatalogEntry) error {
 	pluginID := existing.PluginID
 	oldVersion := existing.Version
 	newVersion := entry.Manifest.GetVersion()
 
-	target, err := s.catalog.ResolveInstall(ctx, InstallCatalogRequest{
-		RepositoryID: entry.RepositoryID,
-		PluginID:     pluginID,
-		Version:      newVersion,
-	})
-	var prepared *PreparedReplacement
-	if err == nil {
-		prepared, err = s.installer.PrepareCatalogReplacement(ctx, existing, target)
-	}
-	if err != nil {
-		return fmt.Errorf("install updated plugin %s from %s to %s: %w", pluginID, oldVersion, newVersion, err)
-	}
-
-	if err := checkUnchanged(ctx, s.installations.GetByID, existing); err != nil {
-		return fmt.Errorf("install updated plugin %s from %s to %s: %w", pluginID, oldVersion, newVersion, err)
-	}
+	// Stop the running plugin if a host is available.
 	if s.host != nil {
 		if err := s.host.Stop(existing.ID); err != nil && !errors.Is(err, pluginhost.ErrClientNotFound) {
 			return fmt.Errorf("stop plugin %s: %w", pluginID, err)
 		}
 	}
-	if _, err := prepared.Apply(ctx); err != nil {
+
+	// Install the new version.
+	target, err := s.catalog.ResolveInstall(ctx, InstallCatalogRequest{
+		RepositoryID: entry.RepositoryID,
+		PluginID:     pluginID,
+		Version:      newVersion,
+	})
+	if err == nil {
+		if target.LegacyArchive {
+			_, err = s.installer.ReplaceRemote(ctx, existing, target.ArchiveRequest())
+		} else {
+			_, err = s.installer.ReplaceBinary(ctx, existing, target.BinaryRequest())
+		}
+	}
+	if err != nil {
 		// The old process was stopped above and the row still names the old
 		// release. A lazily started plugin comes back on its next RPC, but a
 		// resident only restarts on a lifecycle reconcile, and the run's
@@ -527,66 +464,6 @@ func (s *AutoUpdateService) notifyPluginUpdate(ctx context.Context, existing *In
 		"available_version", newVersion,
 	)
 	return nil
-}
-
-// updateFailureGenericReason is shown for a refused automatic update whose
-// error was not written for the admin; the server log has the detail.
-const updateFailureGenericReason = "Silo couldn't install it. The server log has the details."
-
-// maxUpdateFailureReasonRunes bounds the stored reason shown in web admin.
-const maxUpdateFailureReasonRunes = 500
-
-// recordUpdateFailure keeps the installation's refused-update record in step
-// with this pass: a failed automatic update records the version and an
-// admin-facing reason, and a pass that handled the plugin without failing
-// clears an earlier record. A plugin missing from this pass's catalog (its
-// repository may be unreachable for now) keeps its record. A write failure
-// is counted in the summary and does not stop the pass; a plugin uninstalled
-// since the pass listed it has nothing left to record.
-func (s *AutoUpdateService) recordUpdateFailure(
-	ctx context.Context,
-	existing *Installation,
-	entry CatalogEntry,
-	outcome autoUpdateOutcome,
-	updateErr error,
-	summary *AutoUpdateSummary,
-) {
-	var input UpdateInstallationInput
-	switch {
-	case updateErr != nil && outcome == autoUpdateOutcomeUpdated:
-		input.UpdateFailure = &UpdateFailure{
-			Version:  entry.Manifest.GetVersion(),
-			Reason:   updateFailureReason(updateErr),
-			FailedAt: time.Now().UTC(),
-		}
-		input.IfVersion = &existing.Version
-	case updateErr == nil && existing.UpdateFailure != nil:
-		// Guarded too: once another install replaced the package this pass
-		// read, the record (if any) is about updating that install and is not
-		// this pass's to clear.
-		input.ClearUpdateFailure = true
-		input.IfInstallPath = &existing.InstallPath
-	default:
-		return
-	}
-	err := s.installations.Update(ctx, existing.ID, input)
-	if err != nil && !errors.Is(err, ErrInstallationNotFound) && !errors.Is(err, ErrInstallationChanged) {
-		summary.recordFailuref("record update result for plugin %s: %v", existing.PluginID, err)
-	}
-}
-
-// updateFailureReason is the admin-facing reason for a refused update: a
-// PackageError's message, which names no URL or checksum, or a generic line.
-func updateFailureReason(err error) string {
-	packageErr, ok := AsPackageError(err)
-	if !ok || strings.TrimSpace(packageErr.Message) == "" {
-		return updateFailureGenericReason
-	}
-	reason := logredact.SanitizeText(packageErr.Message)
-	if runes := []rune(reason); len(runes) > maxUpdateFailureReasonRunes {
-		reason = string(runes[:maxUpdateFailureReasonRunes-1]) + "…"
-	}
-	return reason
 }
 
 type repositoryPluginKey struct {

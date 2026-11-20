@@ -3,6 +3,7 @@ package watchstate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -23,40 +24,6 @@ func (p testStoreProvider) ForUser(context.Context, int) (userstore.UserStore, e
 
 func (p testStoreProvider) Close() error {
 	return nil
-}
-
-// TestJellycompatDatedMarkPlayedBoundsFutureDate covers the datePlayed path;
-// jellycompat's TestUserDataDateBounds covers LastPlayedDate.
-func TestJellycompatDatedMarkPlayedBoundsFutureDate(t *testing.T) {
-	store, db := newTestUserStore(t)
-	t.Cleanup(func() { _ = db.Close() })
-	createWatchstateProfile(t, store)
-
-	before := time.Now().UTC().Add(-time.Second)
-	service := NewService(testStoreProvider{store: store})
-	if err := service.RecordJellycompatMarkPlayedBatch(t.Context(), 1, "profile-1", []string{"movie-1"}, before.Add(24*time.Hour), false); err != nil {
-		t.Fatal(err)
-	}
-	after := time.Now().UTC().Add(time.Second)
-
-	reader := store.(interface {
-		ListJellycompatProgressDates(context.Context, string, []string) (map[string]string, error)
-	})
-	dates, err := reader.ListJellycompatProgressDates(t.Context(), "profile-1", []string{"movie-1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	eventAt, err := time.Parse(time.RFC3339Nano, dates["movie-1"])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if eventAt.Before(before) || eventAt.After(after) {
-		t.Fatalf("future event time was not bounded to server time: %s", eventAt)
-	}
-	history, err := store.ListHistory(t.Context(), "profile-1", 10, 0)
-	if err != nil || len(history) != 1 || history[0].WatchedAt != eventAt.Truncate(time.Second).Format(time.RFC3339) {
-		t.Fatalf("history and progress dates disagree: %+v %v", history, err)
-	}
 }
 
 type testItemRepo struct {
@@ -116,6 +83,314 @@ func (r testProviderIDRepo) FindContentIDByProviderIDs(_ context.Context, provid
 		}
 	}
 	return "", nil
+}
+
+func TestRecordPlaybackStopAddsMovieIdentity(t *testing.T) {
+	store, db := newTestUserStore(t)
+	defer db.Close()
+
+	service := NewService(testStoreProvider{store: store}).WithStableIdentityResolver(NewStableIdentityResolver(
+		testItemRepo{items: map[string]*models.MediaItem{
+			"movie-1": {ContentID: "movie-1", Type: "movie"},
+		}},
+		testEpisodeRepo{},
+		testProviderIDRepo{ids: map[string][]*models.MediaItemProviderID{
+			"movie-1": {
+				{ContentID: "movie-1", ItemType: "movie", Provider: "tmdb", ProviderID: "603"},
+			},
+		}},
+	))
+
+	result, err := service.RecordPlaybackStop(
+		context.Background(),
+		1,
+		"profile-1",
+		"movie-1",
+		7200,
+		7200,
+		time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC),
+		userstore.VersionHints{},
+		userstore.ProgressThresholds{},
+	)
+	if err != nil {
+		t.Fatalf("RecordPlaybackStop: %v", err)
+	}
+	if !result.Completed || result.HistoryID == "" {
+		t.Fatalf("RecordPlaybackStop result = %+v", result)
+	}
+
+	entry := onlyHistoryEntry(t, store)
+	if entry.Identity.StableType != "movie" {
+		t.Fatalf("Identity.StableType = %q, want movie", entry.Identity.StableType)
+	}
+	if got := entry.Identity.ProviderIDs["tmdb"]; got != "603" {
+		t.Fatalf("Identity.ProviderIDs[tmdb] = %q, want 603", got)
+	}
+}
+
+func TestManualMarkWatchedAddsEpisodeIdentity(t *testing.T) {
+	store, db := newTestUserStore(t)
+	defer db.Close()
+
+	episode := &models.Episode{
+		ContentID:     "episode-1",
+		SeriesID:      "series-1",
+		SeasonNumber:  2,
+		EpisodeNumber: 7,
+	}
+	service := NewService(testStoreProvider{store: store}).WithStableIdentityResolver(NewStableIdentityResolver(
+		testItemRepo{},
+		testEpisodeRepo{episodes: map[string]*models.Episode{"episode-1": episode}},
+		testProviderIDRepo{ids: map[string][]*models.MediaItemProviderID{
+			"series-1": {
+				{ContentID: "series-1", ItemType: "series", Provider: "tvdb", ProviderID: "765"},
+			},
+		}},
+	))
+
+	err := service.RecordManualMarkWatched(
+		context.Background(),
+		1,
+		"profile-1",
+		[]LeafWatchTarget{{MediaItemID: "episode-1", DurationSeconds: 1800}},
+		time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("RecordManualMarkWatched: %v", err)
+	}
+
+	entry := onlyHistoryEntry(t, store)
+	if entry.Identity.StableType != "episode" {
+		t.Fatalf("Identity.StableType = %q, want episode", entry.Identity.StableType)
+	}
+	if len(entry.Identity.ProviderIDs) != 0 {
+		t.Fatalf("Identity.ProviderIDs = %#v, want empty", entry.Identity.ProviderIDs)
+	}
+	if got := entry.Identity.SeriesProviderIDs["tvdb"]; got != "765" {
+		t.Fatalf("Identity.SeriesProviderIDs[tvdb] = %q, want 765", got)
+	}
+	if entry.Identity.Season == nil || *entry.Identity.Season != 2 {
+		t.Fatalf("Identity.Season = %v, want 2", entry.Identity.Season)
+	}
+	if entry.Identity.Episode == nil || *entry.Identity.Episode != 7 {
+		t.Fatalf("Identity.Episode = %v, want 7", entry.Identity.Episode)
+	}
+}
+
+func TestManualMarkWatchedPreservesVisibleWatchedAt(t *testing.T) {
+	store, db := newTestUserStore(t)
+	defer db.Close()
+
+	watchedAt := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	service := NewService(testStoreProvider{store: store})
+	err := service.RecordManualMarkWatched(
+		context.Background(),
+		1,
+		"profile-1",
+		[]LeafWatchTarget{{MediaItemID: "movie-1", DurationSeconds: 7200}},
+		watchedAt,
+	)
+	if err != nil {
+		t.Fatalf("RecordManualMarkWatched: %v", err)
+	}
+
+	entry := onlyHistoryEntry(t, store)
+	if entry.WatchedAt != "2026-04-25T12:00:00Z" {
+		t.Fatalf("history watched_at = %q, want caller watchedAt", entry.WatchedAt)
+	}
+}
+
+func TestIdentityLookupFailureDoesNotBlockHistory(t *testing.T) {
+	store, db := newTestUserStore(t)
+	defer db.Close()
+
+	service := NewService(testStoreProvider{store: store}).WithStableIdentityResolver(NewStableIdentityResolver(
+		testItemRepo{items: map[string]*models.MediaItem{
+			"movie-1": {ContentID: "movie-1", Type: "movie"},
+		}},
+		testEpisodeRepo{},
+		testProviderIDRepo{err: errors.New("catalog unavailable")},
+	))
+
+	err := service.RecordManualMarkWatched(
+		context.Background(),
+		1,
+		"profile-1",
+		[]LeafWatchTarget{{MediaItemID: "movie-1", DurationSeconds: 7200}},
+		time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("RecordManualMarkWatched: %v", err)
+	}
+
+	entry := onlyHistoryEntry(t, store)
+	if entry.Identity.StableType != "" ||
+		len(entry.Identity.ProviderIDs) != 0 ||
+		len(entry.Identity.SeriesProviderIDs) != 0 {
+		t.Fatalf("identity = %+v, want empty", entry.Identity)
+	}
+}
+
+func TestStableIdentityResolverWithoutItemRepoDoesNotAssumeMovie(t *testing.T) {
+	resolver := NewStableIdentityResolver(
+		nil,
+		testEpisodeRepo{},
+		testProviderIDRepo{ids: map[string][]*models.MediaItemProviderID{
+			"unknown-1": {
+				{ContentID: "unknown-1", ItemType: "movie", Provider: "tmdb", ProviderID: "603"},
+			},
+		}},
+	)
+
+	identity := resolver.ResolveHistoryIdentity(context.Background(), "unknown-1")
+	if identity.StableType != "" ||
+		len(identity.ProviderIDs) != 0 ||
+		len(identity.SeriesProviderIDs) != 0 {
+		t.Fatalf("identity = %+v, want empty", identity)
+	}
+}
+
+func TestManualMarkUnwatchedSuppressesImportedHistoryButReturnsManualHistory(t *testing.T) {
+	store, db := newTestUserStore(t)
+	defer db.Close()
+
+	if err := store.CreateProfile(context.Background(), userstore.Profile{ID: "profile-1", Name: "Profile"}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if err := store.SetProgressAt(
+		context.Background(),
+		"profile-1",
+		"movie-1",
+		0,
+		7200,
+		true,
+		time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC),
+	); err != nil {
+		t.Fatalf("SetProgressAt: %v", err)
+	}
+	if err := store.AddHistory(context.Background(), userstore.WatchHistoryEntry{
+		ID:              "trakt-history-1",
+		ProfileID:       "profile-1",
+		MediaItemID:     "movie-1",
+		WatchedAt:       "2026-05-04T12:00:00Z",
+		DurationSeconds: 7200,
+		Completed:       true,
+		Source:          userstore.WatchHistorySourceTrakt,
+		Identity: userstore.WatchIdentity{
+			StableType:  "movie",
+			ProviderIDs: map[string]string{"tmdb": "603"},
+		},
+	}); err != nil {
+		t.Fatalf("AddHistory: %v", err)
+	}
+	if err := store.AddHistory(context.Background(), userstore.WatchHistoryEntry{
+		ID:              "simkl-history-1",
+		ProfileID:       "profile-1",
+		MediaItemID:     "movie-1",
+		WatchedAt:       "2026-05-04T13:00:00Z",
+		DurationSeconds: 7200,
+		Completed:       true,
+		Source:          userstore.WatchHistorySourceSimkl,
+		Identity: userstore.WatchIdentity{
+			StableType:  "movie",
+			ProviderIDs: map[string]string{"tmdb": "603"},
+		},
+	}); err != nil {
+		t.Fatalf("AddHistory: %v", err)
+	}
+	if err := store.AddHistory(context.Background(), userstore.WatchHistoryEntry{
+		ID:              "manual-history-1",
+		ProfileID:       "profile-1",
+		MediaItemID:     "movie-1",
+		WatchedAt:       "2026-05-04T14:00:00Z",
+		DurationSeconds: 7200,
+		Completed:       true,
+		Source:          userstore.WatchHistorySourceManual,
+		Identity: userstore.WatchIdentity{
+			StableType:  "movie",
+			ProviderIDs: map[string]string{"tmdb": "603"},
+		},
+	}); err != nil {
+		t.Fatalf("AddHistory: %v", err)
+	}
+
+	service := NewService(testStoreProvider{store: store})
+	result, err := service.RecordManualMarkUnwatchedWithResult(context.Background(), 1, "profile-1", []string{"movie-1"})
+	if err != nil {
+		t.Fatalf("RecordManualMarkUnwatchedWithResult: %v", err)
+	}
+	if len(result.Entries) != 1 || result.Entries[0].Source != userstore.WatchHistorySourceManual {
+		t.Fatalf("unwatch result entries = %+v, want only manual history for outbound sync", result.Entries)
+	}
+
+	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
+	if err != nil {
+		t.Fatalf("GetProgress: %v", err)
+	}
+	if progress != nil {
+		t.Fatalf("progress after unwatch = %+v, want nil", progress)
+	}
+	completedItems, err := store.ListCompletedHistoryItems(context.Background(), userstore.CompletedHistoryItemQuery{
+		ProfileID:    "profile-1",
+		MediaItemIDs: []string{"movie-1"},
+	})
+	if err != nil {
+		t.Fatalf("ListCompletedHistoryItems: %v", err)
+	}
+	if len(completedItems) != 0 {
+		t.Fatalf("completed items after unwatch = %v, want empty", completedItems)
+	}
+}
+
+func TestManualMarkUnwatchedReturnsOneOutboundEntryPerTarget(t *testing.T) {
+	store, db := newTestUserStore(t)
+	defer db.Close()
+	createWatchstateProfile(t, store)
+
+	for _, entry := range []userstore.WatchHistoryEntry{
+		{
+			ID:              "manual-history-older",
+			ProfileID:       "profile-1",
+			MediaItemID:     "movie-1",
+			WatchedAt:       "2026-05-04T12:00:00Z",
+			DurationSeconds: 7200,
+			Completed:       true,
+			Source:          userstore.WatchHistorySourceManual,
+			Identity: userstore.WatchIdentity{
+				StableType:  "movie",
+				ProviderIDs: map[string]string{"tmdb": "603"},
+			},
+		},
+		{
+			ID:              "manual-history-newer",
+			ProfileID:       "profile-1",
+			MediaItemID:     "movie-1",
+			WatchedAt:       "2026-05-04T13:00:00Z",
+			DurationSeconds: 7200,
+			Completed:       true,
+			Source:          userstore.WatchHistorySourceManual,
+			Identity: userstore.WatchIdentity{
+				StableType:  "movie",
+				ProviderIDs: map[string]string{"tmdb": "603"},
+			},
+		},
+	} {
+		if err := store.AddHistory(context.Background(), entry); err != nil {
+			t.Fatalf("AddHistory(%s): %v", entry.ID, err)
+		}
+	}
+
+	service := NewService(testStoreProvider{store: store})
+	result, err := service.RecordManualMarkUnwatchedWithResult(context.Background(), 1, "profile-1", []string{"movie-1"})
+	if err != nil {
+		t.Fatalf("RecordManualMarkUnwatchedWithResult: %v", err)
+	}
+	if len(result.Entries) != 1 {
+		t.Fatalf("unwatch result entries = %+v, want one representative entry", result.Entries)
+	}
+	if result.Entries[0].ID != "manual-history-newer" {
+		t.Fatalf("representative history id = %q, want newest manual history", result.Entries[0].ID)
+	}
 }
 
 func TestManualMarkWatchedAfterHiddenWatermarkIsVisible(t *testing.T) {
@@ -270,6 +545,76 @@ func TestImportedWatchIfNewerSuppressesHiddenOlderWatch(t *testing.T) {
 	}
 }
 
+// TestClearResumePositionKeepsHistoryAndWatchedState pins issue #2134: a
+// resume position reset leaves every earlier watch in history (unlike mark
+// unwatched, which hides it) and keeps a rewatched item watched.
+func TestClearResumePositionKeepsHistoryAndWatchedState(t *testing.T) {
+	ctx := context.Background()
+	store, db := newTestUserStore(t)
+	t.Cleanup(func() { _ = db.Close() })
+	createWatchstateProfile(t, store)
+	service := NewService(testStoreProvider{store: store})
+
+	// movie-1 was watched to the end two days ago and is now partly rewatched;
+	// movie-2 was only ever skimmed to the middle.
+	if err := service.RecordManualMarkWatched(ctx, 1, "profile-1", []LeafWatchTarget{{MediaItemID: "movie-1", DurationSeconds: 7200}}, time.Now().UTC().Add(-48*time.Hour)); err != nil {
+		t.Fatalf("RecordManualMarkWatched: %v", err)
+	}
+	for _, play := range []struct {
+		id       string
+		position float64
+	}{{"movie-1", 1800}, {"movie-2", 2700}} {
+		if _, err := service.RecordPlaybackStop(ctx, 1, "profile-1", play.id, 7200, play.position, time.Now().UTC().Add(-time.Hour), userstore.VersionHints{}, userstore.ProgressThresholds{}); err != nil {
+			t.Fatalf("RecordPlaybackStop(%s): %v", play.id, err)
+		}
+	}
+	before, err := store.ListHistory(ctx, "profile-1", 10, 0)
+	if err != nil || len(before) != 3 {
+		t.Fatalf("history before = %+v, %v; want the mark and two partial plays", before, err)
+	}
+
+	for _, id := range []string{"movie-1", "movie-2"} {
+		cleared, err := service.ClearResumePosition(ctx, 1, "profile-1", id)
+		if err != nil || !cleared {
+			t.Fatalf("ClearResumePosition(%s) = %v, %v; want cleared", id, cleared, err)
+		}
+	}
+
+	for _, want := range []struct {
+		id        string
+		completed bool
+	}{{"movie-1", true}, {"movie-2", false}} {
+		progress, err := store.GetProgress(ctx, "profile-1", want.id)
+		if err != nil || progress == nil {
+			t.Fatalf("GetProgress(%s) = %+v, %v", want.id, progress, err)
+		}
+		if progress.PositionSeconds != 0 || progress.Completed != want.completed || progress.DurationSeconds != 7200 {
+			t.Fatalf("%s progress = %+v, want position 0, completed %v, duration kept", want.id, progress, want.completed)
+		}
+	}
+	inProgress, err := store.ListProgress(ctx, "profile-1", "in_progress", 10, 0)
+	if err != nil || len(inProgress) != 0 {
+		t.Fatalf("in-progress rows = %+v, %v; want none", inProgress, err)
+	}
+	after, err := store.ListHistory(ctx, "profile-1", 10, 0)
+	if err != nil {
+		t.Fatalf("ListHistory: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("history after = %+v, want all %d earlier watches kept", after, len(before))
+	}
+	for i := range before {
+		if after[i].ID != before[i].ID || after[i].Completed != before[i].Completed {
+			t.Fatalf("history row %d = %+v, want %+v", i, after[i], before[i])
+		}
+	}
+
+	// Nothing left to clear: a no-op that reports so.
+	if cleared, err := service.ClearResumePosition(ctx, 1, "profile-1", "movie-2"); err != nil || cleared {
+		t.Fatalf("second ClearResumePosition = %v, %v; want a no-op", cleared, err)
+	}
+}
+
 // A live write under a hidden-history watermark that lies ahead of the clock
 // (a mark unwatched after a future-dated imported watch) is stamped just past
 // the watermark and stays visible. Clearing that resume position must still
@@ -300,6 +645,21 @@ func TestClearResumePositionUnderFutureHiddenWatermark(t *testing.T) {
 	progress, err := store.GetProgress(ctx, "profile-1", "movie-1")
 	if err != nil || progress == nil || progress.PositionSeconds != 0 {
 		t.Fatalf("progress after = %+v, %v; want visible with position 0", progress, err)
+	}
+}
+
+func TestClearResumePositionWithoutProgressWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	store, db := newTestUserStore(t)
+	t.Cleanup(func() { _ = db.Close() })
+	createWatchstateProfile(t, store)
+
+	cleared, err := NewService(testStoreProvider{store: store}).ClearResumePosition(ctx, 1, "profile-1", "movie-1")
+	if err != nil || cleared {
+		t.Fatalf("ClearResumePosition = %v, %v; want a no-op", cleared, err)
+	}
+	if progress, err := store.GetProgress(ctx, "profile-1", "movie-1"); err != nil || progress != nil {
+		t.Fatalf("progress = %+v, %v; want no row", progress, err)
 	}
 }
 
@@ -374,6 +734,81 @@ func (r *batchTestProviderIDRepo) GetByContentIDs(_ context.Context, contentIDs 
 	return out, nil
 }
 
+// TestManualMarkWatchedSeriesResolvesIdentitiesInBulk marks a whole series and
+// pins both halves of the fix: every episode gets its own history row with a
+// resolved identity, and the catalog lookups are batched rather than repeated
+// per episode.
+func TestManualMarkWatchedSeriesResolvesIdentitiesInBulk(t *testing.T) {
+	store, db := newTestUserStore(t)
+	t.Cleanup(func() { _ = db.Close() })
+
+	const episodeCount = 25
+	episodes := make(map[string]*models.Episode, episodeCount)
+	targets := make([]LeafWatchTarget, 0, episodeCount)
+	for i := 1; i <= episodeCount; i++ {
+		contentID := fmt.Sprintf("episode-%d", i)
+		episodes[contentID] = &models.Episode{
+			ContentID:     contentID,
+			SeriesID:      "series-1",
+			SeasonNumber:  1,
+			EpisodeNumber: i,
+		}
+		targets = append(targets, LeafWatchTarget{MediaItemID: contentID, DurationSeconds: 1800})
+	}
+
+	episodeRepo := &batchTestEpisodeRepo{testEpisodeRepo: testEpisodeRepo{episodes: episodes}}
+	providerRepo := &batchTestProviderIDRepo{testProviderIDRepo: testProviderIDRepo{
+		ids: map[string][]*models.MediaItemProviderID{
+			"series-1": {{ContentID: "series-1", ItemType: "series", Provider: "tvdb", ProviderID: "765"}},
+		},
+	}}
+	service := NewService(testStoreProvider{store: store}).WithStableIdentityResolver(
+		NewStableIdentityResolver(testItemRepo{}, episodeRepo, providerRepo),
+	)
+
+	result, err := service.RecordManualMarkWatchedWithResult(
+		context.Background(), 1, "profile-1", targets,
+		time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("RecordManualMarkWatchedWithResult: %v", err)
+	}
+	if len(result.Entries) != episodeCount {
+		t.Fatalf("result entries = %d, want %d; watch-provider dispatch reads these",
+			len(result.Entries), episodeCount)
+	}
+
+	history, err := store.ListHistory(context.Background(), "profile-1", episodeCount*2, 0)
+	if err != nil {
+		t.Fatalf("ListHistory: %v", err)
+	}
+	if len(history) != episodeCount {
+		t.Fatalf("history len = %d, want %d", len(history), episodeCount)
+	}
+	for _, entry := range history {
+		if entry.Identity.StableType != "episode" {
+			t.Fatalf("%s identity = %q, want episode", entry.MediaItemID, entry.Identity.StableType)
+		}
+		if got := entry.Identity.SeriesProviderIDs["tvdb"]; got != "765" {
+			t.Fatalf("%s SeriesProviderIDs[tvdb] = %q, want 765", entry.MediaItemID, got)
+		}
+	}
+	for _, target := range targets {
+		progress, err := store.GetProgress(context.Background(), "profile-1", target.MediaItemID)
+		if err != nil || progress == nil || !progress.Completed {
+			t.Fatalf("GetProgress(%s) = %+v (%v), want completed", target.MediaItemID, progress, err)
+		}
+	}
+
+	// The whole point of the bulk path: constant lookups, not O(episodes).
+	if episodeRepo.batchCalls != 1 {
+		t.Fatalf("episode batch lookups = %d, want 1", episodeRepo.batchCalls)
+	}
+	if providerRepo.batchCalls != 1 {
+		t.Fatalf("provider-ID batch lookups = %d, want 1", providerRepo.batchCalls)
+	}
+}
+
 // TestManualMarkWatchedSeriesIsAtomicOnCancel is the regression test for the
 // reported bug: marking a large series while the client disconnects used to
 // leave the series partially watched, because each episode committed on its
@@ -415,5 +850,36 @@ func TestManualMarkWatchedSeriesIsAtomicOnCancel(t *testing.T) {
 		if progress != nil && progress.Completed {
 			t.Fatalf("%s is completed after a canceled mark; the write must be all-or-nothing", target.MediaItemID)
 		}
+	}
+}
+
+func TestManualMarkWatchedSkipsAlreadyCompletedTargets(t *testing.T) {
+	store, db := newTestUserStore(t)
+	t.Cleanup(func() { _ = db.Close() })
+	createWatchstateProfile(t, store)
+	service := NewService(testStoreProvider{store: store})
+	targets := []LeafWatchTarget{{MediaItemID: "movie-1", DurationSeconds: 7200}, {MediaItemID: "movie-2", DurationSeconds: 5400}}
+
+	first, err := service.RecordManualMarkWatchedWithResult(context.Background(), 1, "profile-1", targets[:1], time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("first mark: %v", err)
+	}
+	if len(first.Entries) != 1 {
+		t.Fatalf("first mark entries = %+v, want one", first.Entries)
+	}
+	// A series-style retry over both: only the unwatched leaf records.
+	second, err := service.RecordManualMarkWatchedWithResult(context.Background(), 1, "profile-1", targets, time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("second mark: %v", err)
+	}
+	if len(second.Entries) != 1 || second.Entries[0].MediaItemID != "movie-2" {
+		t.Fatalf("second mark entries = %+v, want only movie-2", second.Entries)
+	}
+	history, err := store.ListHistory(context.Background(), "profile-1", 10, 0)
+	if err != nil {
+		t.Fatalf("ListHistory: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history = %+v, want one row per leaf", history)
 	}
 }

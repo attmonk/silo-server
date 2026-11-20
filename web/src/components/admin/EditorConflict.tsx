@@ -1,7 +1,6 @@
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 
 /**
  * Shown when a save answered 412: someone else changed the record since this
@@ -9,11 +8,13 @@ import { useT } from "@/i18n";
  * replaces them with the latest version and its validator.
  */
 export function EditorConflict({ onReload }: { onReload: () => Promise<void> }) {
-  const t = useT();
   const [loading, setLoading] = useState(false);
   return (
     <div role="alert" className="space-y-2 text-sm">
-      <p>{t("web.admin.common.editorConflict.message")}</p>
+      <p>
+        This was changed by another administrator. Your edits have been kept. Reload to review the
+        latest version before saving again.
+      </p>
       <Button
         type="button"
         variant="outline"
@@ -28,7 +29,7 @@ export function EditorConflict({ onReload }: { onReload: () => Promise<void> }) 
           }
         }}
       >
-        {t("web.admin.common.editorConflict.reload")}
+        Reload latest version
       </Button>
     </div>
   );

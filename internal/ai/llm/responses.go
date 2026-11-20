@@ -16,10 +16,6 @@ const subscriptionUsageLimitExceeded = "subscription_sharing_usage_limit_exceede
 const subscriptionUserNotEligible = "subscription_sharing_user_not_eligible"
 const subscriptionInvalidUser = "subscription_sharing_invalid_user"
 const responseFailedEvent = "response.failed"
-const (
-	responseServerError       = "server_error"
-	responseRateLimitExceeded = "rate_limit_exceeded"
-)
 
 var ErrPlanIneligible = errors.New("this account cannot share ChatGPT plan usage; check ChatGPT usage settings")
 
@@ -60,14 +56,12 @@ type responseTextFormat struct {
 }
 
 type responseRequest struct {
-	Model       string              `json:"model"`
-	Input       []Message           `json:"input"`
-	Store       bool                `json:"store"`
-	Stream      bool                `json:"stream"`
-	Reasoning   *responseReasoning  `json:"reasoning,omitempty"`
-	Text        *responseTextFormat `json:"text,omitempty"`
-	ServiceTier string              `json:"service_tier,omitempty"`
-	Temperature *float32            `json:"temperature,omitempty"`
+	Model     string              `json:"model"`
+	Input     []Message           `json:"input"`
+	Store     bool                `json:"store"`
+	Stream    bool                `json:"stream"`
+	Reasoning *responseReasoning  `json:"reasoning,omitempty"`
+	Text      *responseTextFormat `json:"text,omitempty"`
 }
 
 func (c *Client) chatGPT(ctx context.Context, cfg Config, messages []Message, jsonObject bool) (string, error) {
@@ -198,16 +192,13 @@ func readResponseStream(data io.Reader) (string, error) {
 				code = event.Response.Error.Code
 			}
 			if code == "subscription_sharing_usage_unavailable" {
-				return &HTTPError{StatusCode: http.StatusServiceUnavailable, message: "ChatGPT usage is temporarily unavailable"}
+				return errors.New("ChatGPT usage is temporarily unavailable")
 			}
 			if code == "subscription_sharing_user_unavailable" {
-				return &HTTPError{StatusCode: http.StatusServiceUnavailable, message: "ChatGPT subscriber information is temporarily unavailable"}
+				return errors.New("ChatGPT subscriber information is temporarily unavailable")
 			}
-			if code == responseServerError {
-				return &HTTPError{StatusCode: http.StatusServiceUnavailable, message: "ChatGPT is temporarily unavailable"}
-			}
-			if code == responseRateLimitExceeded {
-				return &HTTPError{StatusCode: http.StatusTooManyRequests, Code: code, message: "ChatGPT is rate limiting requests"}
+			if code == "server_error" {
+				return errors.New("ChatGPT is temporarily unavailable")
 			}
 			if code == subscriptionUsageLimitExceeded {
 				return &permanentError{ErrQuotaExhausted}
@@ -220,9 +211,9 @@ func readResponseStream(data io.Reader) (string, error) {
 				// as an HTTP 401, without retrying the rejected token first.
 				return &permanentError{&HTTPError{StatusCode: http.StatusUnauthorized, Code: code, message: "ChatGPT subscriber credentials were rejected"}}
 			}
-			return &permanentError{&HTTPError{StatusCode: http.StatusBadRequest, Code: code, message: "ChatGPT request failed; check the account and ChatGPT usage settings"}}
+			return &permanentError{errors.New("ChatGPT request failed; check the account and ChatGPT usage settings")}
 		case "response.incomplete":
-			return &permanentError{unusable("ChatGPT returned an incomplete response")}
+			return &permanentError{errors.New("ChatGPT returned an incomplete response")}
 		}
 		return nil
 	}
@@ -250,7 +241,7 @@ func readResponseStream(data io.Reader) (string, error) {
 		return "", err
 	}
 	if !completed || text.Len() == 0 {
-		return "", unusable("ChatGPT stream ended before a complete text response")
+		return "", errors.New("ChatGPT stream ended before a complete text response")
 	}
 	return text.String(), nil
 }

@@ -5,11 +5,11 @@ import {
   ADMIN_SETTINGS_NAV,
   adminSettingsHref,
   resolveAdminSettingsPageID,
+  type AdminSettingsSearchItem,
 } from "@/lib/adminSettingsSearch";
 import { PageColumn } from "@/components/page/PageHeader";
 import { SettingsPageDescriptionContext } from "@/components/settings/settingsPageDescription";
 import { UnsavedChangesGuard } from "@/components/UnsavedChangesGuard";
-import { useT } from "@/i18n";
 
 import GeneralSettings from "./GeneralSettings";
 import AppearanceSettings from "./AppearanceSettings";
@@ -29,8 +29,11 @@ import StorageSettings from "./StorageSettings";
 import SearchSettings from "./SearchSettings";
 import LoggingSettings from "./LoggingSettings";
 import EmailSettings from "./EmailSettings";
-import { isRestorePending } from "@/lib/scrollRestoration";
 import "@/styles/admin-settings.css";
+
+interface SettingsNav extends AdminSettingsSearchItem {
+  component: ComponentType;
+}
 
 const SETTINGS_COMPONENTS: Record<string, ComponentType> = {
   general: GeneralSettings,
@@ -61,10 +64,10 @@ function settingsComponent(id: string) {
   return component;
 }
 
-// Fail at load, not on first visit, when a nav page has no component. The nav
-// items themselves are read live: their label and description getters return
-// text in the current language, so they must not be copied.
-for (const item of ADMIN_SETTINGS_NAV) settingsComponent(item.id);
+const SETTINGS_NAV: SettingsNav[] = ADMIN_SETTINGS_NAV.map((item) => ({
+  ...item,
+  component: settingsComponent(item.id),
+}));
 
 /**
  * Server settings pages. The admin sidebar lists each one under the topic it
@@ -72,7 +75,6 @@ for (const item of ADMIN_SETTINGS_NAV) settingsComponent(item.id);
  * /admin/settings, where the old Settings entry led, opens the first page.
  */
 export default function AdminSettingsLayout() {
-  const t = useT();
   const params = useParams();
   const [searchParams] = useSearchParams();
   const activeContentRef = useRef<HTMLDivElement>(null);
@@ -81,14 +83,13 @@ export default function AdminSettingsLayout() {
   const requestedId = rawPageId ?? legacyTabId;
   const activeId = resolveAdminSettingsPageID(requestedId);
 
-  const active = activeId ? ADMIN_SETTINGS_NAV.find((item) => item.id === activeId) : undefined;
-  const ActiveComponent = active ? SETTINGS_COMPONENTS[active.id] : undefined;
+  const active = activeId ? SETTINGS_NAV.find((item) => item.id === activeId) : undefined;
+  const ActiveComponent = active?.component;
 
   useEffect(() => {
     if (!activeId) return;
 
-    // Back or Forward returns to where the page was left instead.
-    if (!isRestorePending()) window.scrollTo(0, 0);
+    window.scrollTo(0, 0);
     if (activeContentRef.current) {
       activeContentRef.current.scrollTop = 0;
     }
@@ -98,7 +99,7 @@ export default function AdminSettingsLayout() {
   // Old query-string tabs and retired page ids become canonical page URLs; an
   // unknown or missing id opens the first page.
   if (!active || !ActiveComponent) {
-    const fallback = ADMIN_SETTINGS_NAV[0];
+    const fallback = SETTINGS_NAV[0];
     return fallback ? <Navigate to={adminSettingsHref(fallback.id)} replace /> : null;
   }
   if (rawPageId !== activeId || legacyTabId !== null || searchParams.toString() !== "") {
@@ -115,7 +116,7 @@ export default function AdminSettingsLayout() {
       <div
         ref={activeContentRef}
         role="region"
-        aria-label={t("web.admin.settings.layout.regionLabel", { label: active.label })}
+        aria-label={`${active.label} settings`}
         tabIndex={-1}
         className="min-w-0 focus:outline-none"
       >

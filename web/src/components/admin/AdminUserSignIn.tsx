@@ -45,12 +45,8 @@ import {
   identityCheckStatusText,
   isNetworkSignIn,
 } from "@/lib/externalSignInAdmin";
-import { useT } from "@/i18n";
-import { TOUCH_HIT_AREA, TOUCH_TARGETS } from "@/lib/touchTargets";
 import { cn } from "@/lib/utils";
 import { FeedbackLine, type Feedback } from "@/components/admin/FeedbackLine";
-
-const SEPARATOR = " · ";
 
 function Panel({
   title,
@@ -101,38 +97,25 @@ function IdentityRow({
   canUnlink: boolean;
   onUnlink: () => void;
 }) {
-  const t = useT();
-  const provider =
-    identity.provider_name || t("web.admin.common.adminUserSignIn.provider.notEnabled");
+  const provider = identity.provider_name || "Provider not enabled";
   const who = [identity.username, identity.email].filter(Boolean).join(" · ");
   const signedOut = ["not_found", "disabled", "not_permitted"].includes(identity.last_check_status);
   return (
     <li className="flex flex-wrap items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
       <div className="min-w-0 flex-1 space-y-1">
-        <p className="text-sm font-medium break-words">
+        <p className="text-sm font-medium">
           {provider}
-          {who ? (
-            <span className="text-muted-foreground font-normal">
-              {SEPARATOR}
-              {who}
-            </span>
-          ) : null}
+          {who ? <span className="text-muted-foreground font-normal"> · {who}</span> : null}
         </p>
         {identity.display_name ? (
-          <p className="text-muted-foreground text-xs break-words">{identity.display_name}</p>
+          <p className="text-muted-foreground text-xs">{identity.display_name}</p>
         ) : null}
         <p className="text-muted-foreground text-xs break-all">
-          {t("web.admin.common.adminUserSignIn.identity.subject", {
-            subject: identity.external_subject,
-            code: (chunks) => <code className="font-mono">{chunks}</code>,
-          })}
+          Subject: <code className="font-mono">{identity.external_subject}</code>
         </p>
         <p className="text-muted-foreground text-xs">
-          {t("web.admin.common.adminUserSignIn.identity.connected", {
-            linked: when(identity.linked_at, ""),
-            signed_in: identity.last_sign_in_at ? "yes" : "no",
-            last_sign_in: when(identity.last_sign_in_at, ""),
-          })}
+          Connected {when(identity.linked_at, "")} · Last sign-in{" "}
+          {when(identity.last_sign_in_at, "never")}
         </p>
         {showCheck ? (
           <p
@@ -141,11 +124,8 @@ function IdentityRow({
               signedOut ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground",
             )}
           >
-            {t("web.admin.common.adminUserSignIn.identity.lastCheck", {
-              checked: identity.last_checked_at ? "yes" : "no",
-              status: identityCheckStatusText(identity.last_check_status),
-              checked_at: when(identity.last_checked_at, ""),
-            })}
+            Last provider check: {identityCheckStatusText(identity.last_check_status)}
+            {identity.last_checked_at ? ` · ${when(identity.last_checked_at, "")}` : ""}
           </p>
         ) : null}
       </div>
@@ -155,17 +135,10 @@ function IdentityRow({
           size="sm"
           variant="outline"
           onClick={onUnlink}
-          aria-label={
-            identity.username
-              ? t("web.admin.common.adminUserSignIn.identity.unlinkLabelWithUser", {
-                  provider,
-                  username: identity.username,
-                })
-              : t("web.admin.common.adminUserSignIn.identity.unlinkLabel", { provider })
-          }
+          aria-label={`Unlink ${provider}${identity.username ? ` (${identity.username})` : ""}`}
         >
           <Unlink aria-hidden="true" />
-          {t("web.admin.common.adminUserSignIn.unlink")}
+          Unlink
         </Button>
       ) : null}
     </li>
@@ -176,17 +149,17 @@ function IdentityRow({
  * What linking does to the account's Silo password, as the dialog says it:
  * break-glass accounts and network sign-ins (such as Tailscale) keep it, and
  * other providers turn it off. Nothing is said about a password the account
- * doesn't have. The value selects the note in the dialog's description.
+ * doesn't have.
  */
 function connectPasswordNote(
   user: AdminUser,
   installation: PluginInstallation | undefined,
-): "breakGlass" | "keeps" | "turnsOff" | "none" {
-  if (user.break_glass) return "breakGlass";
+): string {
+  if (user.break_glass) return " As a break-glass account it keeps its Silo password.";
   if (installation && isNetworkSignIn(installation)) {
-    return user.password_login ? "keeps" : "none";
+    return user.password_login ? " It keeps its Silo password too." : "";
   }
-  return "turnsOff";
+  return " Connecting turns off password sign-in for this account.";
 }
 
 /** Connects an account to a provider identity by the provider's exact subject. */
@@ -199,7 +172,6 @@ function LinkIdentityDialog({
   onClose: () => void;
   onLinked: (message: string) => void;
 }) {
-  const t = useT();
   const installations = useAdminPluginInstallations();
   const link = useLinkAdminUserIdentity();
   const candidates = useMemo(
@@ -231,11 +203,11 @@ function LinkIdentityDialog({
   function submit(event: FormEvent) {
     event.preventDefault();
     if (!selected) {
-      setError(t("web.admin.common.adminUserSignIn.link.chooseProvider"));
+      setError("Choose a sign-in provider.");
       return;
     }
     if (subject.trim() === "") {
-      setError(t("web.admin.common.adminUserSignIn.link.enterSubject"));
+      setError("Enter the provider's subject for this person.");
       return;
     }
     setError(null);
@@ -255,24 +227,15 @@ function LinkIdentityDialog({
       {
         onSuccess: () => {
           onLinked(
-            selectedInstallation
-              ? t("web.admin.common.adminUserSignIn.link.connected", {
-                  username: user.username,
-                  provider: authProviderName(selectedInstallation),
-                })
-              : t("web.admin.common.adminUserSignIn.link.connectedUnknownProvider", {
-                  username: user.username,
-                }),
+            `${user.username} is connected to ${selectedInstallation ? authProviderName(selectedInstallation) : "the provider"}.`,
           );
           onClose();
         },
         onError: (err) => {
           const text =
             err instanceof V2ProblemError && err.problemType === "conflict"
-              ? t("web.admin.common.adminUserSignIn.link.alreadyConnected", {
-                  username: user.username,
-                })
-              : adminSignInErrorText(err, t("web.admin.common.adminUserSignIn.link.failed"));
+              ? `${user.username} is already connected to this provider. Unlink that identity first.`
+              : adminSignInErrorText(err, "Couldn't connect the identity.");
           setError(text);
         },
       },
@@ -286,15 +249,13 @@ function LinkIdentityDialog({
         if (!open && !link.isPending) onClose();
       }}
     >
-      <DialogContent className={cn("sm:max-w-lg", TOUCH_TARGETS)}>
+      <DialogContent className="sm:max-w-lg">
         <form onSubmit={submit} className="space-y-4" noValidate>
           <DialogHeader>
-            <DialogTitle>{t("web.admin.common.adminUserSignIn.link.title")}</DialogTitle>
+            <DialogTitle>Connect a sign-in identity</DialogTitle>
             <DialogDescription>
-              {t("web.admin.common.adminUserSignIn.link.description", {
-                username: user.username,
-                note: connectPasswordNote(user, selectedInstallation),
-              })}
+              {user.username} will sign in with this provider account.
+              {connectPasswordNote(user, selectedInstallation)}
             </DialogDescription>
           </DialogHeader>
           {error ? (
@@ -306,34 +267,24 @@ function LinkIdentityDialog({
             <Skeleton className="h-9 w-full" />
           ) : candidates.length === 0 ? (
             <p className="text-muted-foreground text-sm">
-              {t("web.admin.common.adminUserSignIn.link.noProviders", {
-                link: (chunks) => (
-                  <Link
-                    to="/admin/settings/sign-in"
-                    className={cn("text-foreground underline", TOUCH_HIT_AREA)}
-                  >
-                    {chunks}
-                  </Link>
-                ),
-              })}
+              No sign-in provider is set up. Set one up in{" "}
+              <Link to="/admin/settings/sign-in" className="text-foreground underline">
+                Settings → Sign-in
+              </Link>{" "}
+              first.
             </p>
           ) : (
             <div className="space-y-2">
-              <Label htmlFor={providerId}>
-                {t("web.admin.common.adminUserSignIn.link.provider")}
-              </Label>
+              <Label htmlFor={providerId}>Provider</Label>
               <Select value={selected} onValueChange={setInstallationId}>
                 <SelectTrigger id={providerId} className="w-full">
                   <SelectValue />
                 </SelectTrigger>
-                <SelectContent className={TOUCH_TARGETS}>
+                <SelectContent>
                   {candidates.map((installation) => (
                     <SelectItem key={installation.id} value={String(installation.id)}>
-                      {installation.auth_bindings?.some((b) => b.enabled)
-                        ? authProviderName(installation)
-                        : t("web.admin.common.adminUserSignIn.link.providerOff", {
-                            provider: authProviderName(installation),
-                          })}
+                      {authProviderName(installation)}
+                      {installation.auth_bindings?.some((b) => b.enabled) ? "" : " (off)"}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -341,7 +292,7 @@ function LinkIdentityDialog({
             </div>
           )}
           <div className="space-y-2">
-            <Label htmlFor={subjectId}>{t("web.admin.common.adminUserSignIn.link.subject")}</Label>
+            <Label htmlFor={subjectId}>Subject</Label>
             <Input
               id={subjectId}
               required
@@ -353,17 +304,17 @@ function LinkIdentityDialog({
               aria-invalid={error !== null && subject.trim() === ""}
               onChange={(event) => setSubject(event.target.value)}
               className="font-mono text-xs"
-              placeholder={t("web.admin.common.adminUserSignIn.link.subjectPlaceholder")}
+              placeholder="https://id.example.com|8f14e45f"
             />
             <p id={subjectHintId} className="text-muted-foreground text-xs">
-              {t("web.admin.common.adminUserSignIn.link.subjectHint")}
+              The provider's exact ID for the person, as Silo stores it. OpenID Connect: the issuer
+              and subject joined by | (Entra ID: tenant ID and object ID). LDAP: the directory's
+              unique ID, such as entryUUID or objectGUID. Silo never matches on a name or email.
             </p>
           </div>
           <div className="grid gap-3 sm:grid-cols-3">
             <div className="space-y-1.5">
-              <Label htmlFor={usernameId}>
-                {t("web.admin.common.adminUserSignIn.link.username")}
-              </Label>
+              <Label htmlFor={usernameId}>Username</Label>
               <Input
                 id={usernameId}
                 value={username}
@@ -371,7 +322,7 @@ function LinkIdentityDialog({
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor={emailId}>{t("web.admin.common.adminUserSignIn.link.email")}</Label>
+              <Label htmlFor={emailId}>Email</Label>
               <Input
                 id={emailId}
                 type="email"
@@ -380,9 +331,7 @@ function LinkIdentityDialog({
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor={displayNameId}>
-                {t("web.admin.common.adminUserSignIn.link.name")}
-              </Label>
+              <Label htmlFor={displayNameId}>Name</Label>
               <Input
                 id={displayNameId}
                 value={displayName}
@@ -391,15 +340,16 @@ function LinkIdentityDialog({
             </div>
           </div>
           <p className="text-muted-foreground text-xs">
-            {t("web.admin.common.adminUserSignIn.link.optionalHint")}
+            Optional. Shown until the person's first sign-in replaces them with what the provider
+            says.
           </p>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={onClose} disabled={link.isPending}>
-              {t("common.cancel")}
+              Cancel
             </Button>
             <Button type="submit" disabled={link.isPending || candidates.length === 0}>
               {link.isPending ? <Loader2 className="animate-spin" aria-hidden="true" /> : null}
-              {t("web.admin.common.adminUserSignIn.link.connect")}
+              Connect
             </Button>
           </DialogFooter>
         </form>
@@ -431,7 +381,6 @@ export function AdminUserSignIn({
   passwordOpen?: boolean;
   onPasswordOpenChange?: (open: boolean) => void;
 }) {
-  const t = useT();
   const capabilities = useExternalSignInCapabilities();
   const caps = capabilities.data;
   const identitiesServed = caps?.admin_identities === true;
@@ -474,22 +423,12 @@ export function AdminUserSignIn({
           report(
             {
               tone: "ok",
-              text: identity.provider_name
-                ? t("web.admin.common.adminUserSignIn.unlinked", {
-                    provider: identity.provider_name,
-                    username: user.username,
-                  })
-                : t("web.admin.common.adminUserSignIn.unlinkedUnknownProvider", {
-                    username: user.username,
-                  }),
+              text: `Unlinked ${identity.provider_name || "the identity"} from ${user.username}.`,
             },
             "identities",
           ),
         onError: (error) =>
-          report({
-            tone: "error",
-            text: adminSignInErrorText(error, t("web.admin.common.adminUserSignIn.unlinkFailed")),
-          }),
+          report({ tone: "error", text: adminSignInErrorText(error, "Couldn't unlink.") }),
       },
     );
   }
@@ -502,60 +441,54 @@ export function AdminUserSignIn({
           report({
             tone: "ok",
             text: next
-              ? t("web.admin.common.adminUserSignIn.breakGlass.on", { username: user.username })
-              : t("web.admin.common.adminUserSignIn.breakGlass.off", { username: user.username }),
+              ? `${user.username} is a break-glass account.`
+              : `${user.username} is no longer a break-glass account.`,
           }),
         onError: (error) =>
           report({
             tone: "error",
-            text: adminSignInErrorText(
-              error,
-              t("web.admin.common.adminUserSignIn.breakGlass.failed"),
-            ),
+            text: adminSignInErrorText(error, "Couldn't change break-glass."),
           }),
       },
     );
   }
 
-  const lastWay = !user.password_login && !breakGlass && linked.length === 1;
+  const lastWay =
+    !user.password_login && !breakGlass && linked.length === 1
+      ? ` ${user.username} won't be able to sign in until you set a password or connect a provider again.`
+      : "";
 
   return (
     <div className="space-y-6">
       <FeedbackLine feedback={feedback} focusRef={statusRef} />
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <Panel title={t("web.admin.common.adminUserSignIn.password.title")}>
+        <Panel title="Password sign-in">
           <p className="text-sm">
             {!user.password_login
-              ? t("web.admin.common.adminUserSignIn.password.off", { username: user.username })
+              ? `Off: ${user.username} can't sign in with a Silo password.`
               : passwordWaitsForServer
-                ? t("web.admin.common.adminUserSignIn.password.waitsForServer", {
-                    username: user.username,
-                  })
-                : t("web.admin.common.adminUserSignIn.password.on", { username: user.username })}
+                ? `On for this account, but password sign-in is off for the server, so ${user.username} can't sign in with a Silo password until it's back on.`
+                : `On: ${user.username} can sign in with a Silo password.`}
           </p>
           {passwordWaitsForServer ? (
             <p className="text-muted-foreground text-xs">
-              {t("web.admin.common.adminUserSignIn.password.turnBackOn", {
-                link: (chunks) => (
-                  <Link
-                    to="/admin/settings/sign-in"
-                    className={cn("text-foreground underline", TOUCH_HIT_AREA)}
-                  >
-                    {chunks}
-                  </Link>
-                ),
-              })}
+              Turn it back on in{" "}
+              <Link to="/admin/settings/sign-in" className="text-foreground underline">
+                Settings → Sign-in
+              </Link>
+              , or make the account break-glass.
             </p>
           ) : null}
           {user.password_login ? (
             <p className="text-muted-foreground text-xs">
-              {t("web.admin.common.adminUserSignIn.password.connectingTurnsOff")}
+              Connecting a sign-in provider turns this off, unless the account is break-glass.
             </p>
           ) : (
             <>
               <p className="text-muted-foreground text-xs">
-                {t("web.admin.common.adminUserSignIn.password.settingTurnsOn")}
+                Setting a password turns it back on, for example when the account's provider is
+                gone.
               </p>
               {manageable ? (
                 <Button
@@ -566,7 +499,7 @@ export function AdminUserSignIn({
                   disabled={!user.enabled}
                 >
                   <KeyRound aria-hidden="true" />
-                  {t("web.admin.common.adminUserSignIn.password.set")}
+                  Set a password
                 </Button>
               ) : null}
             </>
@@ -574,14 +507,14 @@ export function AdminUserSignIn({
         </Panel>
 
         {caps?.break_glass === true && isAdmin ? (
-          <Panel title={t("web.admin.common.adminUserSignIn.breakGlass.title")}>
+          <Panel title="Break-glass">
             <div className="flex items-start justify-between gap-4">
               <div className="min-w-0 space-y-1">
-                <Label htmlFor={breakGlassId}>
-                  {t("web.admin.common.adminUserSignIn.breakGlass.label")}
-                </Label>
+                <Label htmlFor={breakGlassId}>Break-glass account</Label>
                 <p id={breakGlassHint} className="text-muted-foreground text-xs">
-                  {t("web.admin.common.adminUserSignIn.breakGlass.hint")}
+                  Keeps password sign-in when it's turned off for the server, so this admin can
+                  still get in if the provider is down. Connecting a provider leaves its password
+                  on, and the provider never demotes it.
                 </p>
               </div>
               <Switch
@@ -594,17 +527,19 @@ export function AdminUserSignIn({
             </div>
             {user.is_owner ? (
               <p className="text-muted-foreground text-xs">
-                {t("web.admin.common.adminUserSignIn.breakGlass.ownerDefault")}
+                The server owner is break-glass by default. Turn this off only if your sign-in
+                provider can recover the account.
               </p>
             ) : null}
             {!viewerIsOwner ? (
               <p className="text-muted-foreground text-xs">
-                {t("web.admin.common.adminUserSignIn.breakGlass.ownerOnly")}
+                Only the server owner can change this.
               </p>
             ) : null}
             {breakGlass && !user.password_login ? (
               <p className="text-xs text-amber-600 dark:text-amber-400">
-                {t("web.admin.common.adminUserSignIn.breakGlass.noPassword")}
+                This account can't sign in with a password, so it can't act as break-glass. Set a
+                password for it.
               </p>
             ) : null}
           </Panel>
@@ -613,13 +548,13 @@ export function AdminUserSignIn({
 
       {identitiesServed ? (
         <Panel
-          title={t("web.admin.common.adminUserSignIn.identities.title")}
+          title="Sign-in provider identities"
           headingRef={identitiesHeadingRef}
           actions={
             manageable ? (
               <Button type="button" size="sm" variant="outline" onClick={() => setLinkOpen(true)}>
                 <Link2 aria-hidden="true" />
-                {t("web.admin.common.adminUserSignIn.identities.connect")}
+                Connect identity
               </Button>
             ) : null
           }
@@ -628,20 +563,12 @@ export function AdminUserSignIn({
             <Skeleton className="h-12 w-full" />
           ) : identities.isError ? (
             <p role="alert" className="text-destructive text-sm">
-              {adminSignInErrorText(
-                identities.error,
-                t("web.admin.common.adminUserSignIn.identities.loadFailed"),
-              )}
+              {adminSignInErrorText(identities.error, "Couldn't load the identities.")}
             </p>
           ) : linked.length === 0 ? (
-            <p className="text-muted-foreground text-sm">
-              {t("web.admin.common.adminUserSignIn.identities.empty")}
-            </p>
+            <p className="text-muted-foreground text-sm">Not connected to a sign-in provider.</p>
           ) : (
-            <ul
-              className="divide-border divide-y"
-              aria-label={t("web.admin.common.adminUserSignIn.identities.listLabel")}
-            >
+            <ul className="divide-border divide-y" aria-label="Connected identities">
               {linked.map((identity) => (
                 <IdentityRow
                   key={identity.id}
@@ -655,7 +582,7 @@ export function AdminUserSignIn({
           )}
           {!manageable ? (
             <p className="text-muted-foreground text-xs">
-              {t("web.admin.common.adminUserSignIn.identities.ownerOnly")}
+              Only the server owner can change another admin's sign-in.
             </p>
           ) : null}
         </Panel>
@@ -666,19 +593,9 @@ export function AdminUserSignIn({
         onOpenChange={(open) => {
           if (!open) setUnlinking(null);
         }}
-        title={
-          unlinking?.provider_name
-            ? t("web.admin.common.adminUserSignIn.unlinkConfirm.title", {
-                provider: unlinking.provider_name,
-              })
-            : t("web.admin.common.adminUserSignIn.unlinkConfirm.titleUnknownProvider")
-        }
-        description={t("web.admin.common.adminUserSignIn.unlinkConfirm.description", {
-          username: user.username,
-          last_way: lastWay ? "yes" : "no",
-        })}
-        confirmLabel={t("web.admin.common.adminUserSignIn.unlink")}
-        className={TOUCH_TARGETS}
+        title={`Unlink ${unlinking?.provider_name || "this identity"}?`}
+        description={`${user.username} can no longer sign in with this provider account.${lastWay}`}
+        confirmLabel="Unlink"
         variant="destructive"
         onConfirm={confirmUnlink}
         isPending={unlink.isPending}

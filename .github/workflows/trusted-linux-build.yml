@@ -17,7 +17,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository == 'attmonk/silo-server' && 'attmonk/attmonk-server' || github.repository }}
+  IMAGE_NAME: ${{ github.repository }}
   GOPROXY: https://proxy.golang.org,direct
   GOPRIVATE: github.com/Silo-Server/*
   GONOSUMDB: github.com/Silo-Server/*
@@ -29,12 +29,12 @@ jobs:
       contains(fromJSON('["Silo-Server/silo-server","attmonk/silo-server"]'), github.repository) &&
       contains(fromJSON('["linux/amd64","linux/arm64"]'), inputs.platform) &&
       ((github.event_name == 'workflow_dispatch' &&
-        contains(fromJSON('["refs/heads/main","refs/heads/apiv2","refs/heads/feat/web-premiere-deploy"]'), github.ref)) ||
+        contains(fromJSON('["refs/heads/main","refs/heads/apiv2"]'), github.ref)) ||
        (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_repository.full_name == github.repository &&
-        contains(fromJSON('["main","apiv2","feat/web-premiere-deploy"]'), github.event.workflow_run.head_branch)))
+        contains(fromJSON('["main","apiv2"]'), github.event.workflow_run.head_branch)))
     runs-on: ${{ inputs.platform == 'linux/amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     timeout-minutes: 90
     permissions:
@@ -100,12 +100,6 @@ jobs:
             BUILD_DIRTY=false
             BUILD_NUMBER=${{ inputs.build_number }}
             BUILD_DATE=${{ inputs.built_at }}
-          # Pull fresh base images and rebuild the runtime stage on every build
-          # so a cached apt layer cannot hold back Debian security updates. The
-          # frontend and Go stages still use the cache until their base images
-          # change.
-          pull: true
-          no-cache-filters: runtime
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_LC }}:buildcache-${{ env.PLATFORM_PAIR }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_LC }}:buildcache-${{ env.PLATFORM_PAIR }},mode=max,image-manifest=true,oci-mediatypes=true
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_LC }},push-by-digest=true,name-canonical=true,push=true

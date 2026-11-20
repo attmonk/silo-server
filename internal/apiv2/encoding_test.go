@@ -1,7 +1,6 @@
 package apiv2
 
 import (
-	"bytes"
 	"compress/gzip"
 	"io"
 	"net/http"
@@ -19,7 +18,7 @@ import (
 func TestValidatorBearingResponsesStayIdentityEncodedUnderCompression(t *testing.T) {
 	// registerProbes includes the guarded probe over a fresh store ("a" at
 	// version 1) and the unvalidated list probe.
-	h := httpstream.CompressWithExclusions(nil, IdentityEncoded)(
+	h := httpstream.CompressWithExclusions(5, nil, IdentityEncoded)(
 		NewHandler(Dependencies{testRegister: registerProbes}))
 	gz := map[string]string{"Accept-Encoding": "gzip"}
 
@@ -54,16 +53,19 @@ func TestValidatorBearingResponsesStayIdentityEncodedUnderCompression(t *testing
 		t.Fatalf("write body is not the identity JSON: %q", rec.Body.String())
 	}
 
-	// A v2 JSON response without a validator is not pinned to identity: the
-	// exclusion is per response, not per subtree. This list is shorter than
-	// the compressor's minimum, so it goes out unlabelled rather than gzip;
-	// the identity;q=0 case below shows the same response compressing.
+	// A v2 JSON response without a validator still compresses: the
+	// exclusion is per response, not per subtree.
 	rec = do(t, h, http.MethodGet, "/api/v2/probe/list", "", gz)
-	if rec.Code != http.StatusOK || rec.Header().Get("Content-Encoding") != "" || strings.Contains(rec.Header().Get("Cache-Control"), "no-transform") {
-		t.Fatalf("unvalidated list: %d enc %q cache %q", rec.Code, rec.Header().Get("Content-Encoding"), rec.Header().Get("Cache-Control"))
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("unvalidated list: %d enc %q", rec.Code, rec.Header().Get("Content-Encoding"))
 	}
-	if !strings.Contains(rec.Body.String(), `"items"`) {
-		t.Fatalf("list body invalid: %q", rec.Body.String())
+	zr, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	body, err := io.ReadAll(zr)
+	if err != nil || !strings.Contains(string(body), `"items"`) {
+		t.Fatalf("compressed list body invalid: body=%q err=%v", body, err)
 	}
 }
 
@@ -92,18 +94,18 @@ func TestIdentityEncoded(t *testing.T) {
 // 406 before the operation runs; a client that merely prefers gzip receives
 // the identity body with the same tag it would get without compression.
 func TestValidatorBearingResponsesRefuseAcceptEncodingThatForbidsIdentity(t *testing.T) {
-	h := httpstream.CompressWithExclusions(nil, IdentityEncoded)(
+	h := httpstream.CompressWithExclusions(5, nil, IdentityEncoded)(
 		NewHandler(Dependencies{testRegister: registerProbes}))
 	forbid := map[string]string{"Accept-Encoding": "gzip, identity;q=0"}
 
 	for _, path := range []string{"/api/v2/probe/guarded/a", "/api/v2/openapi.json"} {
-		rec := gunzipped(t, do(t, h, http.MethodGet, path, "", forbid))
+		rec := do(t, h, http.MethodGet, path, "", forbid)
 		requireProblem(t, rec, TypeNotAcceptable)
-		if rec.Header().Get("ETag") != "" {
-			t.Fatalf("%s: 406 carries ETag %q", path, rec.Header().Get("ETag"))
+		if rec.Header().Get("ETag") != "" || rec.Header().Get("Content-Encoding") != "" {
+			t.Fatalf("%s: 406 carries ETag %q Content-Encoding %q", path, rec.Header().Get("ETag"), rec.Header().Get("Content-Encoding"))
 		}
 	}
-	rec := gunzipped(t, do(t, h, http.MethodPut, "/api/v2/probe/guarded/a", `{"name":"beta"}`, map[string]string{"Accept-Encoding": "gzip, identity;q=0", "If-Match": RenderETag(guardedProbeScope, "a", 1).String()}))
+	rec := do(t, h, http.MethodPut, "/api/v2/probe/guarded/a", `{"name":"beta"}`, map[string]string{"Accept-Encoding": "gzip, identity;q=0", "If-Match": RenderETag(guardedProbeScope, "a", 1).String()})
 	requireProblem(t, rec, TypeNotAcceptable)
 	if got := do(t, h, http.MethodGet, "/api/v2/probe/guarded/a", "", nil); got.Header().Get("ETag") != RenderETag(guardedProbeScope, "a", 1).String() {
 		t.Fatalf("refused guarded write still changed the resource: etag %q", got.Header().Get("ETag"))
@@ -126,25 +128,6 @@ func TestValidatorBearingResponsesRefuseAcceptEncodingThatForbidsIdentity(t *tes
 	if rec.Code != http.StatusOK || rec.Header().Get("Content-Encoding") != "gzip" {
 		t.Fatalf("unvalidated list under identity;q=0: %d enc %q", rec.Code, rec.Header().Get("Content-Encoding"))
 	}
-}
-
-// gunzipped decodes a 406 problem, which carries no validator and so goes out
-// in the gzip coding the request accepted, for the envelope checks.
-func gunzipped(t *testing.T, rec *httptest.ResponseRecorder) *httptest.ResponseRecorder {
-	t.Helper()
-	if enc := rec.Header().Get("Content-Encoding"); enc != "gzip" {
-		t.Fatalf("406 Content-Encoding = %q, want the gzip coding the request accepted", enc)
-	}
-	zr, err := gzip.NewReader(rec.Body)
-	if err != nil {
-		t.Fatalf("gzip.NewReader: %v", err)
-	}
-	body, err := io.ReadAll(zr)
-	if err != nil {
-		t.Fatalf("decode 406 body: %v", err)
-	}
-	rec.Body = bytes.NewBuffer(body)
-	return rec
 }
 
 func TestIdentityForbidden(t *testing.T) {

@@ -4,43 +4,38 @@ import { Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useT, type MessageKey } from "@/i18n";
 
 import { expandedRootsFor, newMapping, type MappingDraft } from "./webhookSetup";
 
-const COPY: Record<
-  "webhook" | "poll",
-  {
-    heading: MessageKey;
-    description: MessageKey;
-    fromLabel: MessageKey;
-    fromPlaceholder: string;
-    empty: MessageKey;
-    emptyNoLibraries: MessageKey;
-  }
-> = {
+const COPY = {
   webhook: {
-    heading: "web.admin.autoscan.pathMapping.webhook.heading",
-    description: "web.admin.autoscan.pathMapping.webhook.description",
-    fromLabel: "web.admin.autoscan.pathMapping.webhook.fromLabel",
+    heading: "Match its paths to yours",
+    description: (
+      <>
+        Sonarr/Radarr report the path of the <em>imported library file</em> — their root folder, not
+        the download client&apos;s working directory. If that root differs from the path Silo sees,
+        map it here. Same path on both sides? Enter it twice.
+      </>
+    ),
+    fromLabel: "Sonarr/Radarr root folder",
     fromPlaceholder: "/tv",
-    empty: "web.admin.autoscan.pathMapping.webhook.empty",
-    emptyNoLibraries: "web.admin.autoscan.pathMapping.webhook.emptyNoLibraries",
+    empty: "No path mappings yet. Add one so deliveries reach a library.",
+    emptyNoLibraries: "No libraries found to map. Add a library first, or add a row manually.",
   },
   poll: {
-    heading: "web.admin.autoscan.pathMapping.poll.heading",
-    description: "web.admin.autoscan.pathMapping.poll.description",
-    fromLabel: "web.admin.autoscan.pathMapping.poll.fromLabel",
+    heading: "Match paths",
+    description: (
+      <>
+        Only needed when this source reports paths that differ from the ones Silo sees, for example
+        when Sonarr runs in another container. Leave empty when both sides match.
+      </>
+    ),
+    fromLabel: "Path the source reports",
     fromPlaceholder: "/data/media",
-    empty: "web.admin.autoscan.pathMapping.poll.empty",
-    emptyNoLibraries: "web.admin.autoscan.pathMapping.poll.empty",
+    empty: "No path mappings. Paths are used exactly as the source reports them.",
+    emptyNoLibraries: "No path mappings. Paths are used exactly as the source reports them.",
   },
-};
-
-/** Example Silo-side path; a path, not text. */
-const TO_PLACEHOLDER = "/mnt/media/tv";
-/** Points from the source's path to Silo's; a symbol, not text. */
-const ARROW = "→";
+} as const;
 
 /**
  * Path rewrite rows for any source: the path the provider reports (`from`) and
@@ -73,7 +68,6 @@ export function PathMappingEditor({
   /** Extra buttons beside "Add a mapping", e.g. Sync from server. */
   actions?: ReactNode;
 }) {
-  const t = useT();
   const copy = COPY[variant];
 
   function update(index: number, patch: Partial<MappingDraft>) {
@@ -98,15 +92,13 @@ export function PathMappingEditor({
   return (
     <div className="space-y-3">
       <div className="space-y-1">
-        <Label>{t(copy.heading)}</Label>
-        <p className="text-muted-foreground text-xs">
-          {t(copy.description, { em: (chunks) => <em>{chunks}</em> })}
-        </p>
+        <Label>{copy.heading}</Label>
+        <p className="text-muted-foreground text-xs">{copy.description}</p>
       </div>
 
       {mappings.length === 0 ? (
         <p className="text-muted-foreground text-xs">
-          {t(libraryPaths.length > 0 ? copy.empty : copy.emptyNoLibraries)}
+          {libraryPaths.length > 0 ? copy.empty : copy.emptyNoLibraries}
         </p>
       ) : (
         <div className="space-y-2">
@@ -123,7 +115,7 @@ export function PathMappingEditor({
                       htmlFor={`${idPrefix}-from-${index}`}
                       className="text-muted-foreground text-xs"
                     >
-                      {t(copy.fromLabel)}
+                      {copy.fromLabel}
                     </Label>
                     <Input
                       id={`${idPrefix}-from-${index}`}
@@ -135,18 +127,18 @@ export function PathMappingEditor({
                     />
                   </div>
                   <span className="text-muted-foreground hidden pb-2 text-xs sm:block" aria-hidden>
-                    {ARROW}
+                    →
                   </span>
                   <div className="min-w-0 flex-1 space-y-1">
                     <Label
                       htmlFor={`${idPrefix}-to-${index}`}
                       className="text-muted-foreground text-xs"
                     >
-                      {t("web.admin.autoscan.pathMapping.toLabel")}
+                      Path Silo uses
                     </Label>
                     <Input
                       id={`${idPrefix}-to-${index}`}
-                      placeholder={TO_PLACEHOLDER}
+                      placeholder="/mnt/media/tv"
                       className="font-mono text-xs"
                       value={row.to}
                       aria-invalid={invalid && row.to.trim() === ""}
@@ -157,9 +149,7 @@ export function PathMappingEditor({
                     type="button"
                     variant="ghost"
                     size="icon-sm"
-                    aria-label={t("web.admin.autoscan.pathMapping.removeAria", {
-                      index: index + 1,
-                    })}
+                    aria-label={`Remove mapping ${index + 1}`}
                     className="self-end sm:mb-1"
                     onClick={() => onChange(mappings.filter((_, i) => i !== index))}
                   >
@@ -172,7 +162,8 @@ export function PathMappingEditor({
                     className="text-muted-foreground hover:text-foreground text-xs underline-offset-4 hover:underline"
                     onClick={() => expand(index, children)}
                   >
-                    {t("web.admin.autoscan.pathMapping.split", { count: children.length })}
+                    Does your download manager use a different folder per type? Split into{" "}
+                    {children.length} rows
                   </button>
                 )}
               </div>
@@ -182,7 +173,9 @@ export function PathMappingEditor({
       )}
 
       {invalidIds && invalidIds.size > 0 && (
-        <p className="text-destructive text-xs">{t("web.admin.autoscan.pathMapping.incomplete")}</p>
+        <p className="text-destructive text-xs">
+          Each mapping needs both paths. Fill in the highlighted fields or remove the row.
+        </p>
       )}
 
       <div className="flex flex-wrap items-center gap-2">
@@ -193,7 +186,7 @@ export function PathMappingEditor({
           onClick={() => onChange([...mappings, newMapping()])}
         >
           <Plus />
-          {t("web.admin.autoscan.pathMapping.add")}
+          Add a mapping
         </Button>
         {actions}
       </div>

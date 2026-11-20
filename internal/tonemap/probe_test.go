@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,6 +99,90 @@ func TestDecodeProbeFixtureIsMain10(t *testing.T) {
 		return
 	}
 	t.Fatal("fixture has no SPS NAL unit")
+}
+
+// TestHardwareSmokeFilterNVENCPreservesSourceBitDepth verifies that the CUDA
+// fallback graph downloads SDR base layers using their actual source bit depth.
+func TestHardwareSmokeFilterNVENCPreservesSourceBitDepth(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		bitDepth int
+		want     string
+		reject   string
+	}{
+		{name: "8-bit", bitDepth: 8, want: "hwdownload,format=nv12", reject: "hwdownload,format=p010le"},
+		{name: "10-bit", bitDepth: 10, want: "hwdownload,format=p010le", reject: "hwdownload,format=nv12"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			filter := hardwareSmokeFilter(BackendNVENC, "", SourceSDRBT2020, test.bitDepth)
+			if !strings.Contains(filter, test.want) || strings.Contains(filter, test.reject) {
+				t.Fatalf("hardwareSmokeFilter() = %q, want %q without %q", filter, test.want, test.reject)
+			}
+		})
+	}
+}
+
+func TestVideoToolboxSmokeDeclaresEverySourceSignal(t *testing.T) {
+	for _, kind := range AllSourceKinds() {
+		t.Run(string(kind), func(t *testing.T) {
+			filter := hardwareSmokeFilter(BackendVideoToolbox, "", kind, decodeProbeFixtureBitDepth)
+			if !strings.HasPrefix(filter, SourceParameters(kind)+",") {
+				t.Fatalf("hardwareSmokeFilter() = %q, want source declaration %q first", filter, SourceParameters(kind))
+			}
+		})
+	}
+}
+
+func TestVideoToolboxListingGateRequiresCompletePipeline(t *testing.T) {
+	filters := []byte("scale_vt hwdownload sidedata")
+	encoders := []byte("h264_videotoolbox")
+	if !hardwareProbeAvailable(BackendVideoToolbox, HardwareFilterVideoToolbox, filters, encoders) {
+		t.Fatal("complete VideoToolbox pipeline was not accepted")
+	}
+	if hardwareProbeAvailable(BackendVideoToolbox, HardwareFilterVideoToolbox, []byte("scale_vt hwdownload"), encoders) {
+		t.Fatal("VideoToolbox pipeline without metadata removal was accepted")
+	}
+}
+
+func TestQSVListingGateRequiresOpenCLBitmapSubtitleFilters(t *testing.T) {
+	filters := "tonemap_opencl hwmap scale_vaapi"
+	encoders := []byte("h264_qsv")
+	if !hardwareProbeAvailable(BackendQSV, HardwareFilterOpenCL, []byte(filters+" overlay_opencl scale_opencl"), encoders) {
+		t.Fatal("complete QSV pipeline was not accepted")
+	}
+	for _, missing := range []string{" scale_opencl", " overlay_opencl"} {
+		if hardwareProbeAvailable(BackendQSV, HardwareFilterOpenCL, []byte(filters+missing), encoders) {
+			t.Fatalf("QSV pipeline with only%s was accepted", missing)
+		}
+	}
+}
+
+// TestProbeEmptyCapabilitiesExpire verifies failed discovery is retried after a short interval.
+func TestProbeEmptyCapabilitiesExpire(t *testing.T) {
+	resetProbeCache(t)
+	now := time.Unix(100, 0)
+	calls := 0
+	runner := func(context.Context, string, ...string) ([]byte, error) {
+		calls++
+		return nil, errors.New("temporarily unavailable")
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		got, err := probeCached(context.Background(), "/ffmpeg-empty", BackendSoftware, "", runner, func() time.Time { return now })
+		if err != nil {
+			t.Fatalf("empty probe error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("empty probe = %#v", got)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("listing calls = %d, want two from one cached empty probe", calls)
+	}
+	now = now.Add(probeNegativeTTL + time.Second)
+	_, _ = probeCached(context.Background(), "/ffmpeg-empty", BackendSoftware, "", runner, func() time.Time { return now })
+	if calls != 4 {
+		t.Fatalf("listing calls = %d, want a fresh probe after expiry", calls)
+	}
 }
 
 func TestProbePartialHardwareCapabilitiesExpire(t *testing.T) {
@@ -398,11 +484,43 @@ func awaitNoProbesInFlight(t *testing.T) {
 	}
 }
 
-// TestProbeSmokesOptionalKindsOnlyOnCapableExecutors verifies the Dolby Vision
-// kind is tried and advertised only where the filter can apply an RPU, and the
-// full-range PQ kind only on the software executor, whose filters read each
-// frame's range.
-func TestProbeSmokesOptionalKindsOnlyOnCapableExecutors(t *testing.T) {
+// The advertised budget every caller clamps to assumes a largest device set. If
+// the worker probed past it, it would advertise a budget those callers then cut
+// below what it actually needs, and cold capability requests would be canceled
+// short forever. The probe set is capped so the two ends agree.
+func TestProbeDevicesCapsTheConfiguredSet(t *testing.T) {
+	configured := make([]string, 0, MaxProbedDevices+4)
+	for i := range MaxProbedDevices + 4 {
+		configured = append(configured, defaultDRIRenderDevice+strconv.Itoa(i))
+	}
+
+	got := probeDevices(strings.Join(configured, ","), BackendQSV)
+	if len(got) != MaxProbedDevices {
+		t.Fatalf("probed %d devices, want the %d cap", len(got), MaxProbedDevices)
+	}
+	if !slices.Equal(got, configured[:MaxProbedDevices]) {
+		t.Fatalf("probed %v, want the first %d configured", got, MaxProbedDevices)
+	}
+
+	// The budget a node advertises for that capped set is therefore never above
+	// what its callers allow — which is the property the cap exists for.
+	for _, backend := range []string{BackendQSV, BackendVAAPI, BackendNVENC, BackendVideoToolbox} {
+		if advertised, ceiling := ProbeRequestTimeout(backend, strings.Join(configured, ",")),
+			MaxProbeRequestTimeout(); advertised > ceiling {
+			t.Fatalf("%s advertised %v exceeds the %v callers allow", backend, advertised, ceiling)
+		}
+	}
+
+	// A set inside the cap is untouched.
+	small := configured[:3]
+	if got := probeDevices(strings.Join(small, ","), BackendQSV); !slices.Equal(got, small) {
+		t.Fatalf("probed %v, want the configured %v unchanged", got, small)
+	}
+}
+
+// TestProbeSmokesDolbyVisionOnlyOnRPUExecutors verifies the Dolby Vision kind
+// is tried and advertised only where the filter can apply an RPU.
+func TestProbeSmokesDolbyVisionOnlyOnRPUExecutors(t *testing.T) {
 	tests := []struct {
 		name         string
 		backend      string
@@ -433,9 +551,6 @@ func TestProbeSmokesOptionalKindsOnlyOnCapableExecutors(t *testing.T) {
 				if !got.Supports(ModeSoftware, kind) || !got.Supports(ModeHardware, kind) {
 					t.Fatalf("capabilities = %#v, lost standard kind %q", got, kind)
 				}
-			}
-			if !got.Supports(ModeSoftware, SourcePQFullRange) || got.Supports(ModeHardware, SourcePQFullRange) {
-				t.Fatalf("capabilities = %#v, want full-range PQ on software only", got)
 			}
 			wantSmokes := 0
 			if tt.wantSoftware {

@@ -1,7 +1,6 @@
 import type { AdminPlaybackActivityBucket } from "@/api/types";
 import { timeBuckets } from "../charts";
 import type { StackedColumnBucket } from "../charts";
-import type { MessageKey } from "@/i18n";
 
 const HOUR_MS = 3_600_000;
 
@@ -13,11 +12,7 @@ export const DEFAULT_PLAYBACK_BUCKET_SECONDS = 3600;
  * baseline in `--chart-1`, direct stream above it, transcode on top. "Remux" is
  * the server's word for a direct stream; the dashboard uses the operator's.
  */
-export const PLAYBACK_SERIES_LABEL_KEYS: readonly MessageKey[] = [
-  "web.admin.dashboard.widgets.playbackActivity.series.directPlay",
-  "web.admin.dashboard.widgets.playbackActivity.series.directStream",
-  "web.admin.dashboard.widgets.playbackActivity.series.transcode",
-];
+export const PLAYBACK_SERIES_LABELS = ["Direct play", "Direct stream", "Transcode"] as const;
 
 const EMPTY_SEGMENTS: readonly number[] = [0, 0, 0];
 

@@ -2,7 +2,6 @@ import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tansta
 import { toast } from "sonner";
 
 import { v2, type V2Result } from "@/api/v2/request";
-import { t } from "@/i18n";
 
 export type LibraryTranslationJob =
   V2Result<"GET /api/v2/admin/libraries/{library_id}/metadata-translation/jobs">["jobs"][number];
@@ -60,7 +59,7 @@ export function useTranslateLibraryMetadata(libraryId: number) {
       return queryClient.invalidateQueries({ queryKey: libraryTranslationJobsKey(libraryId) });
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : t("web.item.toast.translateFailed"));
+      toast.error(err instanceof Error ? err.message : "Failed to start translation");
     },
   });
 }
@@ -77,9 +76,7 @@ export function useCancelLibraryTranslation(libraryId: number) {
     onSettled: () =>
       queryClient.invalidateQueries({ queryKey: libraryTranslationJobsKey(libraryId) }),
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.admin.errors.translationCancelFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to cancel translation");
     },
   });
 }

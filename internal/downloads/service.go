@@ -21,14 +21,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/downloadprepare"
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/idgen"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/nodeauth"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
-	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
@@ -60,8 +57,6 @@ type UserResolver interface {
 // ItemAccessChecker checks library/content-rating access.
 type ItemAccessChecker interface {
 	EnsureAccessible(ctx context.Context, contentID string, filter catalog.AccessFilter) error
-	// EnsureAccessibleIDs is the batch form: the IDs the filter admits map to true.
-	EnsureAccessibleIDs(ctx context.Context, contentIDs []string, filter catalog.AccessFilter) (map[string]bool, error)
 }
 
 // SettingsReader loads all server settings as a flat map.
@@ -420,11 +415,6 @@ type CreateRequest struct {
 	// resolved per episode. Native requests set it; the frozen v1 bridge keeps
 	// batches original-only.
 	BulkQuality bool
-	// VersionTemplateFileID names an episode file of the series whose version
-	// every episode of a season/series batch follows (see templatePreference).
-	// Only native requests set it; the v1 bridge's FileID stays ignored on
-	// batches.
-	VersionTemplateFileID int
 }
 
 // Create creates a download for a single item (movie or episode). When the
@@ -441,11 +431,7 @@ func (s *Service) Create(ctx context.Context, userID int, req CreateRequest, fil
 	if err != nil {
 		return nil, err
 	}
-	// A lookup by episode also returns a multi-episode file linked to an
-	// earlier episode of its range. That file serves the requested episode,
-	// and its download is registered under the file's first episode, as a
-	// season download registers it.
-	if req.StrictIdentity && (file.ContentID != req.ContentID || (req.EpisodeID != "" && req.FileID > 0 && file.EpisodeID != req.EpisodeID)) {
+	if req.StrictIdentity && (file.ContentID != req.ContentID || (req.EpisodeID != "" && file.EpisodeID != req.EpisodeID)) {
 		return nil, catalog.ErrItemNotFound
 	}
 	if err := s.itemAccess.EnsureAccessible(ctx, file.ContentID, filter); err != nil {
@@ -518,8 +504,8 @@ func (s *Service) createArtifactDownload(ctx context.Context, userID int, req Cr
 		return nil, ErrProfileRequired
 	}
 
-	// Resolve any existing managed entry first: replacing one updates it in
-	// place instead of creating a download.
+	// Resolve any existing managed entry first: replacing one doesn't add a
+	// row, so it stays quota-exempt and needs no quota lock.
 	var existing *Download
 	if managed {
 		ex, err := s.repo.GetManagedEntry(ctx, userID, req.ProfileID, req.DeviceID, file.ContentID, file.EpisodeID)
@@ -536,46 +522,13 @@ func (s *Service) createArtifactDownload(ctx context.Context, userID int, req Cr
 		}
 	}
 	if existing != nil {
-		// Capability discovery can probe remote nodes, so it runs before the
-		// quota lock.
-		target, err := s.artifacts.resolveToneMapTarget(ctx, file, decision.PrepareTarget)
+		artifact, err := s.artifacts.Ensure(ctx, file, decision.DeliveryFormat, decision.PrepareTarget)
 		if err != nil {
 			return nil, err
 		}
-		var d *Download
-		err = s.repo.WithUserQuotaLock(ctx, userID, func(ctx context.Context) error {
-			// Another request may have replaced the entry while this one
-			// waited. Check the guard against the entry as it is now, before
-			// anything is counted or an encode is queued.
-			current, err := s.repo.GetManagedEntry(ctx, userID, req.ProfileID, req.DeviceID, file.ContentID, file.EpisodeID)
-			if err != nil && !errors.Is(err, ErrNotFound) {
-				return err
-			}
-			if err := checkManagedCreateRevision(current, req.ExpectedRevision, req.ExpectedDownloadID); err != nil {
-				return err
-			}
-			if current == nil {
-				return ErrNotFound
-			}
-			// A replacement whose prepared file is not ready leaves the entry
-			// preparing, whatever its status is now, so it takes a concurrent
-			// slot and the entry is left out of the active count, as on a
-			// season page. It creates no download, so the period quota does
-			// not apply.
-			if !s.artifacts.readyArtifact(ctx, file, decision.DeliveryFormat, target) {
-				if err := s.limiter.CheckCounts(ctx, userID, 1, 0, current.ID); err != nil {
-					return err
-				}
-			}
-			artifact, err := s.artifacts.ensureResolved(ctx, file, decision.DeliveryFormat, target)
-			if err != nil {
-				return err
-			}
-			status, size := artifactRowStatus(artifact, file)
-			replacement := buildManagedDownload(userID, req.ProfileID, req.DeviceID, managedItem{file: file, contentID: file.ContentID, episodeID: file.EpisodeID}, decision, "", status, size, artifact.ID)
-			d, err = s.reuseOrReplaceManaged(ctx, current, replacement, req.ExpectedRevision, req.ExpectedDownloadID)
-			return err
-		})
+		status, size := artifactRowStatus(artifact, file)
+		replacement := buildManagedDownload(userID, req.ProfileID, req.DeviceID, managedItem{file: file, contentID: file.ContentID, episodeID: file.EpisodeID}, decision, "", status, size, artifact.ID)
+		d, err := s.reuseOrReplaceManaged(ctx, existing, replacement, req.ExpectedRevision, req.ExpectedDownloadID)
 		if err != nil {
 			return nil, err
 		}
@@ -585,11 +538,10 @@ func (s *Service) createArtifactDownload(ctx context.Context, userID int, req Cr
 	resolvedTarget := decision.PrepareTarget
 	toneMapPreResolved := preparedTargetRequiresToneMap(file, resolvedTarget)
 	if toneMapPreResolved {
-		// A quick, non-authoritative period check avoids expensive capability
-		// work for requests that are already over quota. Whether the entry
-		// takes a concurrent slot depends on the resolved target, so that is
-		// checked under the advisory lock below.
-		if err := s.limiter.CheckCounts(ctx, userID, 0, 1); err != nil {
+		// A quick, non-authoritative quota check avoids expensive capability work
+		// for requests that are already over quota. The check is repeated under the
+		// advisory lock below to retain the concurrency guarantee.
+		if err := s.limiter.Check(ctx, userID, 1); err != nil {
 			return nil, err
 		}
 		var err error
@@ -605,14 +557,7 @@ func (s *Service) createArtifactDownload(ctx context.Context, userID int, req Cr
 	// creation so a rejected request cannot leave an encode job behind.
 	var d *Download
 	err := s.repo.WithUserQuotaLock(ctx, userID, func(ctx context.Context) error {
-		// The new entry takes a concurrent slot only when it starts
-		// preparing; one whose prepared file is already ready registers
-		// ready and counts only toward the period quota.
-		activating := 1
-		if s.artifacts.readyArtifact(ctx, file, decision.DeliveryFormat, resolvedTarget) {
-			activating = 0
-		}
-		if err := s.limiter.CheckCounts(ctx, userID, activating, 1); err != nil {
+		if err := s.limiter.Check(ctx, userID, 1); err != nil {
 			return err
 		}
 		var artifact *Artifact
@@ -661,7 +606,7 @@ func (s *Service) createArtifactDownload(ctx context.Context, userID int, req Cr
 			d.DeviceID = req.DeviceID
 		}
 		if err := s.repo.Create(ctx, d); err != nil {
-			if managed && !errors.Is(err, errFileNotRegistrable) {
+			if managed {
 				if existing, gerr := s.repo.GetManagedEntry(ctx, userID, req.ProfileID, req.DeviceID, file.ContentID, file.EpisodeID); gerr == nil {
 					replacement := buildManagedDownload(userID, req.ProfileID, req.DeviceID, managedItem{file: file, contentID: file.ContentID, episodeID: file.EpisodeID}, decision, "", status, size, artifact.ID)
 					row, rerr := s.reuseOrReplaceManaged(ctx, existing, replacement, req.ExpectedRevision, req.ExpectedDownloadID)
@@ -689,13 +634,10 @@ func (s *Service) createArtifactDownload(ctx context.Context, userID int, req Cr
 // and the caller's row returned: reporting an error would invite a retry
 // that duplicates the download or conflicts on its revision.
 func (s *Service) confirmArtifactLink(ctx context.Context, d *Download) *Download {
-	confirmed, requeued, err := s.repo.ConfirmArtifactLink(ctx, d)
+	confirmed, err := s.repo.ConfirmArtifactLink(ctx, d)
 	if err != nil {
 		slog.WarnContext(ctx, "confirming download artifact link failed", "component", "downloads", "download_id", d.ID, "artifact_id", d.ArtifactID, "error", err)
 		confirmed = d
-	}
-	if requeued {
-		s.artifacts.triggerDrain()
 	}
 	// A new download joining a job still being prepared changes that job's
 	// requester list; the job itself emits nothing when it is only reused.
@@ -770,28 +712,13 @@ func (s *Service) createSeriesScoped(ctx context.Context, userID int, req Create
 	if err := s.itemAccess.EnsureAccessible(ctx, req.ContentID, filter); err != nil {
 		return nil, "", nil, err
 	}
-	var template *models.MediaFile
-	if req.VersionTemplateFileID > 0 {
-		template, err = s.resolveFile(ctx, userID, CreateRequest{FileID: req.VersionTemplateFileID}, filter)
-		if err != nil {
-			return nil, "", nil, err
-		}
-		// The template must be a file of this series in a library the viewer
-		// can open. The quality ceiling is left out: a preset can still bring
-		// a larger version under it.
-		libraries := filter
-		libraries.MaxPlaybackQuality = ""
-		if template.ContentID != req.ContentID || template.EpisodeID == "" || !catalog.FileAllowedByAccess(template, libraries) {
-			return nil, "", nil, catalog.ErrItemNotFound
-		}
-	}
 
 	episodes, err := listEpisodes(ctx)
 	if err != nil {
 		return nil, "", nil, fmt.Errorf("listing episodes: %w", err)
 	}
 
-	items, skipped, err := s.episodeItemsWithSkipped(ctx, userID, req.historyProfile(), req.ContentID, episodes, template, filter)
+	items, skipped, err := s.episodeItemsWithSkipped(ctx, userID, req.historyProfile(), req.ContentID, episodes, filter)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -874,13 +801,11 @@ func (s *Service) createSeriesScoped(ctx context.Context, userID int, req Create
 // preserves episode order. Shared by series/season downloads and subscription
 // backfill so file selection stays identical.
 func (s *Service) episodeItems(ctx context.Context, userID int, profileID, seriesID string, episodes []*models.Episode, filter catalog.AccessFilter) ([]managedItem, error) {
-	items, _, err := s.episodeItemsWithSkipped(ctx, userID, profileID, seriesID, episodes, nil, filter)
+	items, _, err := s.episodeItemsWithSkipped(ctx, userID, profileID, seriesID, episodes, filter)
 	return items, err
 }
 
-// episodeItemsWithSkipped picks a file per episode: the version closest to
-// template when one is set, otherwise the profile's watch-history preference.
-func (s *Service) episodeItemsWithSkipped(ctx context.Context, userID int, profileID, seriesID string, episodes []*models.Episode, template *models.MediaFile, filter catalog.AccessFilter) ([]managedItem, []SkippedDownload, error) {
+func (s *Service) episodeItemsWithSkipped(ctx context.Context, userID int, profileID, seriesID string, episodes []*models.Episode, filter catalog.AccessFilter) ([]managedItem, []SkippedDownload, error) {
 	if len(episodes) == 0 {
 		return nil, nil, nil
 	}
@@ -893,38 +818,21 @@ func (s *Service) episodeItemsWithSkipped(ctx context.Context, userID int, profi
 		return nil, nil, fmt.Errorf("resolving files for %d episodes: %w", len(episodes), err)
 	}
 	var pref versionPreference
-	if template != nil {
-		pref = templatePreference(template)
-	} else {
-		for _, files := range filesByEpisode {
-			if len(files) > 1 {
-				pref = s.loadVersionPreference(ctx, userID, profileID, seriesID, episodeIDs)
-				break
-			}
+	for _, files := range filesByEpisode {
+		if len(files) > 1 {
+			pref = s.loadVersionPreference(ctx, userID, profileID, seriesID, episodeIDs)
+			break
 		}
 	}
 	items := make([]managedItem, 0, len(episodes))
 	skipped := make([]SkippedDownload, 0)
-	queued := make(map[int]bool, len(episodes))
 	for _, ep := range episodes {
 		files := filesByEpisode[ep.ContentID]
 		if len(files) == 0 {
 			skipped = append(skipped, SkippedDownload{EpisodeID: ep.ContentID, Reason: "no_file"})
 			continue
 		}
-		file := pref.pick(ep.ContentID, allowedCandidates(files, filter))
-		episodeID := ep.ContentID
-		// A multi-episode file serves each episode it spans; download it once,
-		// keyed on its first episode, so a later page of the same batch finds
-		// the entry an earlier page registered.
-		if file != nil && file.MultiEpisodeEnd > file.MultiEpisodeStart {
-			if queued[file.ID] {
-				continue
-			}
-			queued[file.ID] = true
-			episodeID = file.EpisodeID
-		}
-		items = append(items, managedItem{file: file, contentID: seriesID, episodeID: episodeID})
+		items = append(items, managedItem{file: pref.pick(ep.ContentID, allowedCandidates(files, filter)), contentID: seriesID, episodeID: ep.ContentID})
 	}
 	return items, skipped, nil
 }
@@ -1060,43 +968,16 @@ func (s *Service) ensureManagedDecisions(ctx context.Context, userID int, req Cr
 				activating++
 			}
 		}
-		// Another request may have replaced an entry while this one waited.
-		// Check each guard against the entry as it is now, before anything
-		// is counted or an encode is queued, and replace that row.
-		preparedKeys := make([]ManagedEntryKey, len(prepared))
-		for k, r := range prepared {
-			preparedKeys[k] = keys[r.i]
-		}
-		current, err := s.repo.GetManagedEntriesByKeys(ctx, userID, req.ProfileID, req.DeviceID, preparedKeys)
-		if err != nil {
-			return err
-		}
-		for k, r := range prepared {
-			cur := current[keys[r.i]]
-			if err := checkManagedCreateRevision(cur, r.expected, r.expectedID); err != nil {
-				return err
-			}
-			if cur == nil {
-				return ErrNotFound
-			}
-			prepared[k].existing = cur
-		}
-		// A replacement whose prepared file is not ready leaves its entry
-		// preparing, whatever the entry's status is now. Count it as activating
-		// and leave the entry out of the active count, so a conversion that
-		// finishes meanwhile, which takes no lock, cannot hide its slot. A
-		// replacement to a ready file registers ready and takes no slot.
-		var startsPreparing []string
 		for _, r := range prepared {
 			d := decisions[r.i]
-			if !s.artifacts.readyArtifact(ctx, items[r.i].file, d.DeliveryFormat, d.PrepareTarget) {
+			ready := s.artifacts.readyArtifact(ctx, items[r.i].file, d.DeliveryFormat, d.PrepareTarget)
+			if replacementAddsActive(r.existing, ready) {
 				activating++
-				startsPreparing = append(startsPreparing, r.existing.ID)
 			}
 		}
 		// A replacement updates its entry in place: it can become active but
 		// creates no download, so only new entries count toward the period.
-		if err := s.limiter.CheckCounts(ctx, userID, activating, len(newIdx), startsPreparing...); err != nil {
+		if err := s.limiter.CheckCounts(ctx, userID, activating, len(newIdx)); err != nil {
 			return err
 		}
 		for _, r := range prepared {
@@ -1119,10 +1000,7 @@ func (s *Service) ensureManagedDecisions(ctx context.Context, userID int, req Cr
 			}
 			toInsert = append(toInsert, d)
 		}
-		// One request registers its entries together: a file that left its
-		// title since it was resolved fails the request without registering
-		// the others, as a file deleted meanwhile failed the insert.
-		rows, err := s.repo.CreateManagedEntriesAllOrNothing(ctx, toInsert)
+		rows, err := s.repo.CreateManagedEntriesBatch(ctx, toInsert)
 		if err != nil {
 			return err
 		}
@@ -1144,13 +1022,8 @@ func (s *Service) ensureManagedDecisions(ctx context.Context, userID int, req Cr
 			continue
 		}
 		// A concurrent create won this identity between the fetch and the
-		// batch insert (ON CONFLICT skipped it); return the winning row. With
-		// no winner, the insert wrote nothing because a file of the request
-		// went missing or left its title.
+		// batch insert (ON CONFLICT skipped it); return the winning row.
 		row, err := s.repo.GetManagedEntry(ctx, userID, req.ProfileID, req.DeviceID, items[i].contentID, items[i].episodeID)
-		if errors.Is(err, ErrNotFound) {
-			return nil, errFileNotRegistrable
-		}
 		if err != nil {
 			return nil, err
 		}
@@ -1240,10 +1113,6 @@ func (s *Service) reuseOrReplaceManaged(ctx context.Context, existing, replaceme
 		return existing, nil
 	}
 	row, err := s.repo.ReplaceManagedEntry(ctx, existing, replacement)
-	if err == nil && row.ArtifactID != existing.ArtifactID {
-		// A new quality leaves the old job without this download.
-		s.artifacts.stopAbandonedPreparations(ctx, existing)
-	}
 	// The shared CAS returns a concurrent winner after losing the update. Native
 	// creation must not report that winner as successful replacement of our target.
 	if err == nil && expected != nil && (row.ID != existing.ID || row.Revision != existing.Revision+1 || !sameManagedTarget(row, replacement)) {
@@ -1261,6 +1130,18 @@ func reusableManagedStatus(status string) bool {
 	}
 }
 
+// replacementAddsActive reports whether replacing existing with a prepared
+// entry adds an active download: existing is not already active, and the
+// target's prepared file is not ready, so the entry would start preparing. A
+// ready target, or one existing already holds, registers ready.
+func replacementAddsActive(existing *Download, targetReady bool) bool {
+	switch existing.Status {
+	case StatusQueued, StatusDownloading, StatusPreparing:
+		return false
+	}
+	return !targetReady
+}
+
 func sameManagedTarget(a, b *Download) bool {
 	return a.MediaFileID == b.MediaFileID &&
 		a.Format == b.Format &&
@@ -1272,29 +1153,15 @@ func sameManagedTarget(a, b *Download) bool {
 }
 
 // List returns the calling device's managed entries, or the user's
-// ephemeral/account-level rows when no device header is present, leaving out
-// the account-level rows whose item the requesting profile may not open.
-func (s *Service) List(ctx context.Context, userID int, profileID, deviceID string, filter catalog.AccessFilter) ([]*Download, error) {
+// ephemeral/account-level rows when no device header is present.
+func (s *Service) List(ctx context.Context, userID int, profileID, deviceID string) ([]*Download, error) {
 	if deviceID != "" {
 		if profileID == "" {
 			return nil, ErrProfileRequired
 		}
 		return s.repo.ListManaged(ctx, userID, profileID, deviceID)
 	}
-	rows, err := s.repo.ListEphemeral(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-	return s.accessibleRows(ctx, rows, filter)
-}
-
-// CheckDownloadAllowed reports whether userID may download originals now,
-// before any file is chosen: ErrFeatureDisabled or ErrDownloadNotAllowed when
-// not. It is the check ResolveDirectFile starts with, for surfaces that
-// advertise or hand out downloads without serving one themselves.
-func (s *Service) CheckDownloadAllowed(ctx context.Context, userID int) error {
-	_, _, err := s.downloadConfigForUser(ctx, userID, "")
-	return err
+	return s.repo.ListEphemeral(ctx, userID)
 }
 
 // ServeDirect validates permissions and serves a file directly for browser
@@ -1305,7 +1172,7 @@ func (s *Service) ServeDirect(ctx context.Context, w http.ResponseWriter, r *htt
 		return err
 	}
 	notifyServeAuthorized(ctx, *target)
-	return s.serveLocalFile(ctx, w, r, target.Path, s.AttachmentName(ctx, target), userID)
+	return s.serveLocalFile(ctx, w, r, target.Path, userID)
 }
 
 // ResolveDirectFile authorizes a browser-style original download without
@@ -1345,10 +1212,9 @@ func (s *Service) ResolveDirectFile(ctx context.Context, userID, fileID int, for
 }
 
 // ServeFile serves a download's file. Managed entries (device header present)
-// authorize on (user, profile, device); ephemeral rows authorize on the
-// account and keep the queued→downloading→completed lifecycle. Both re-check
-// the requesting profile's content access before serving. The ephemeral path
-// never serves a managed row, and vice versa.
+// authorize on (user, profile, device) and re-check per-profile content access
+// before serving; ephemeral rows keep today's queued→downloading→completed
+// behavior. The ephemeral path never serves a managed row, and vice versa.
 func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.Request, userID int, profileID, deviceID, downloadID string, filter catalog.AccessFilter) error {
 	if deviceID != "" {
 		target, err := s.ResolveManagedFile(ctx, userID, profileID, deviceID, downloadID, filter)
@@ -1371,12 +1237,6 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 	if dl.UserID != userID || dl.IsManaged() {
 		return ErrNotFound // don't reveal existence; ephemeral path never serves managed rows
 	}
-	// Account-level rows are shared by every profile on the account, so the
-	// requesting profile's content scope (library and maturity) must admit
-	// the item before any status change or bytes.
-	if err := s.itemAccess.EnsureAccessible(ctx, dl.ContentID, filter); err != nil {
-		return err
-	}
 	if dl.Status == StatusCancelled || dl.Status == StatusFailed {
 		return fmt.Errorf("download is %s: %w", dl.Status, ErrDownloadNotActive)
 	}
@@ -1384,12 +1244,9 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 	if dl.Status == StatusPreparing {
 		return fmt.Errorf("download is preparing: %w", ErrDownloadNotActive)
 	}
-	// A HEAD probe sends no bytes, so it leaves the row alone: it neither
-	// starts a transfer nor renews or fails one.
-	probe := r.Method == http.MethodHead
 	// Atomically transition queued → downloading for original rows. Artifact
 	// (remux/transcode) rows are already ready by the time bytes are served.
-	if dl.Format == FormatOriginal && dl.Status == StatusQueued && !probe {
+	if dl.Format == FormatOriginal && dl.Status == StatusQueued {
 		if err := s.repo.TransitionStatus(ctx, dl.ID, StatusQueued, StatusDownloading, 0, nil); err != nil {
 			if errors.Is(err, ErrStatusConflict) {
 				return fmt.Errorf("download already in progress: %w", ErrDownloadNotActive)
@@ -1397,21 +1254,9 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 			slog.WarnContext(ctx, "failed to transition download to downloading", "component", "downloads", "download_id", dl.ID, "error", err)
 		}
 	}
-	if dl.Format == FormatOriginal && dl.Status == StatusDownloading && !probe {
-		if err := s.continueTransfer(ctx, dl.ID); err != nil {
-			return err
-		}
-	}
 
-	stopRenewing := func() {}
-	if !probe {
-		stopRenewing = s.renewTransferLease(ctx, dl)
-	}
-	response := &observedDownloadResponse{ResponseWriter: w}
-	err = s.serveDownloadBytes(ctx, response, r, dl, userID, filter)
-	stopRenewing()
-	if err != nil {
-		if dl.Format == FormatOriginal && !probe {
+	if err := s.serveDownloadBytes(ctx, w, r, dl, userID, filter); err != nil {
+		if dl.Format == FormatOriginal {
 			failureCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			updateErr := s.repo.TransitionStatus(failureCtx, dl.ID, StatusDownloading, StatusFailed, 0, nil)
 			cancel()
@@ -1421,70 +1266,12 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 		}
 		return err
 	}
-	// A HEAD, a partial range or a bodyless answer (304, 416) proves nothing
-	// was downloaded; the row stays as it is until a response delivers the
-	// whole file.
-	if !response.deliveredWholeFile(r) {
-		return nil
-	}
 
-	// The client may hang up as soon as it has the last byte; the file was
-	// still delivered, so the row is finalized after the request ends.
-	completionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
 	now := time.Now()
-	if err := s.repo.UpdateStatus(completionCtx, dl.ID, StatusCompleted, dl.FileSize, &now); err != nil {
+	if err := s.repo.UpdateStatus(ctx, dl.ID, StatusCompleted, dl.FileSize, &now); err != nil {
 		slog.ErrorContext(ctx, "failed to mark download as completed", "component", "downloads", "download_id", dl.ID, "error", err)
 	}
 	return nil
-}
-
-// continueTransfer admits another request for an account-level row that is
-// already transferring only while its lease holds. Renewing the lease is the
-// check, so two requests racing on a lapsed row both see it lapse. A transfer
-// whose lease lapsed died with the process serving it; like a transfer that
-// stops in-process, it fails and isn't served again, and the client starts a
-// new download, which the concurrent limit admits.
-func (s *Service) continueTransfer(ctx context.Context, id string) error {
-	live, err := s.repo.RenewTransferLease(ctx, id)
-	if err != nil || live {
-		return err
-	}
-	if _, err := s.repo.FailLapsedTransfer(ctx, id); err != nil {
-		return err
-	}
-	return fmt.Errorf("download transfer is no longer active: %w", ErrDownloadNotActive)
-}
-
-// renewTransferLease keeps an account-level original row's concurrent slot
-// while this process serves its bytes (see transferLease), and returns the
-// function that stops renewing. A transfer that dies with the process stops
-// renewing with it, so its slot frees on every node without a startup reset.
-func (s *Service) renewTransferLease(ctx context.Context, dl *Download) (stop func()) {
-	if dl.Format != FormatOriginal {
-		return func() {}
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(transferLeaseRenewal)
-		defer ticker.Stop()
-		for {
-			if _, err := s.repo.RenewTransferLease(ctx, dl.ID); err != nil && ctx.Err() == nil {
-				slog.WarnContext(ctx, "failed to renew download transfer lease", "component", "downloads", "download_id", dl.ID, "error", err)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
-	return func() {
-		cancel()
-		<-done
-	}
 }
 
 // ResolveManagedFile authorizes a managed entry on (user, profile, device),
@@ -1534,9 +1321,9 @@ func (s *Service) PatchStatus(ctx context.Context, userID int, profileID, device
 }
 
 // Delete removes a managed entry (authorized on user, profile, device) or
-// cancels/deletes an ephemeral row the requesting profile may open. Each path
-// is scoped to its own row mode so neither can touch the other's rows.
-func (s *Service) Delete(ctx context.Context, userID int, profileID, deviceID, downloadID string, filter catalog.AccessFilter) error {
+// cancels/deletes an ephemeral row. Each path is scoped to its own row mode so
+// neither can touch the other's rows.
+func (s *Service) Delete(ctx context.Context, userID int, profileID, deviceID, downloadID string) error {
 	if deviceID != "" {
 		if profileID == "" {
 			return ErrProfileRequired
@@ -1548,7 +1335,6 @@ func (s *Service) Delete(ctx context.Context, userID int, profileID, deviceID, d
 			return err
 		}
 		s.notifyPreparationRequesters(ctx, before)
-		s.artifacts.stopAbandonedPreparations(ctx, before)
 		return nil
 	}
 
@@ -1559,15 +1345,6 @@ func (s *Service) Delete(ctx context.Context, userID int, profileID, deviceID, d
 	if dl.UserID != userID || dl.IsManaged() {
 		return ErrNotFound
 	}
-	// Account-level rows are shared by every profile on the account, so only
-	// a profile whose content scope admits the item may cancel or remove one.
-	// A refusal answers as a missing row does.
-	if err := s.itemAccess.EnsureAccessible(ctx, dl.ContentID, filter); err != nil {
-		if errors.Is(err, catalog.ErrItemNotFound) {
-			return ErrNotFound
-		}
-		return err
-	}
 	switch dl.Status {
 	case StatusQueued, StatusDownloading:
 		err = s.repo.CancelByID(ctx, downloadID, userID)
@@ -1576,7 +1353,6 @@ func (s *Service) Delete(ctx context.Context, userID int, profileID, deviceID, d
 	}
 	if err == nil {
 		s.notifyPreparationRequesters(ctx, dl)
-		s.artifacts.stopAbandonedPreparations(ctx, dl)
 	}
 	return err
 }
@@ -1689,12 +1465,6 @@ func (s *Service) resolveDownloadBytesTarget(ctx context.Context, dl *Download, 
 		if err != nil {
 			return nil, err
 		}
-		// An artifact is prepared from one file row. A download the scanner
-		// parked on a retitle's stand-in still names the artifact of the row
-		// it left, which now belongs to another title, so it is not served.
-		if artifact.MediaFileID != dl.MediaFileID {
-			return nil, catalog.ErrItemNotFound
-		}
 		// The quality ceiling applies to what is actually served — the prepared
 		// artifact's resolution, not the source's (a 720p transcode of a 4K
 		// source must stay downloadable under a 1080p ceiling).
@@ -1732,17 +1502,15 @@ func (s *Service) resolveDownloadBytesTarget(ctx context.Context, dl *Download, 
 	return &FileTarget{Path: file.FilePath, DownloadID: dl.ID, MediaFileID: file.ID, ProxyEligible: sourceProxyEligible}, nil
 }
 
-// Capped transfers remain on the API egress path until proxy capability
-// negotiation can prove every selected worker shares the cluster byte budget.
-// This preserves correctness during rolling upgrades with older workers.
+// Download bandwidth settings are aggregate guarantees enforced by the API
+// process. Until proxy nodes share a distributed limiter, keep capped transfers
+// local rather than silently multiplying the configured limit per proxy node.
 func proxyDeliveryAllowed(cfg config.DownloadConfig) bool {
 	return cfg.ServerBandwidthBPS <= 0 && cfg.UserBandwidthBPS <= 0
 }
 
-// serveLocalFile serves the file at path, saved as name (the file's own name
-// when name is empty).
-func (s *Service) serveLocalFile(ctx context.Context, w http.ResponseWriter, r *http.Request, path, name string, userID int) error {
-	f, err := fspath.Open(path)
+func (s *Service) serveLocalFile(ctx context.Context, w http.ResponseWriter, r *http.Request, path string, userID int) error {
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return catalog.ErrItemNotFound
@@ -1756,10 +1524,7 @@ func (s *Service) serveLocalFile(ctx context.Context, w http.ResponseWriter, r *
 		return fmt.Errorf("stat file: %w", err)
 	}
 
-	if name == "" {
-		name = path
-	}
-	w.Header().Set("Content-Disposition", attachmentDisposition(name))
+	w.Header().Set("Content-Disposition", attachmentDisposition(path))
 	w.Header().Set("Content-Type", playback.MimeFromExtension(path))
 	if etag := serveEntityTag(ctx, f, stat); etag != "" {
 		w.Header().Set("ETag", etag)
@@ -1844,30 +1609,11 @@ func (w *observedDownloadResponse) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// deliveredWholeFile reports whether a GET's response carried the entire file:
-// a complete 200 body, or a 206 whose single range spans every byte.
-func (w *observedDownloadResponse) deliveredWholeFile(r *http.Request) bool {
-	if r.Method != http.MethodGet || w.err != nil {
-		return false
-	}
-	switch w.status {
-	case http.StatusOK:
-		return w.expected < 0 || w.written == w.expected
-	case http.StatusPartialContent:
-		var first, last, size int64
-		if _, err := fmt.Sscanf(w.Header().Get("Content-Range"), "bytes %d-%d/%d", &first, &last, &size); err != nil {
-			return false
-		}
-		return first == 0 && last == size-1 && w.written == size
-	}
-	return false
-}
-
 // attachmentDisposition names the saved file in the header form proxy nodes
 // use. A non-ASCII name goes out in the RFC 2231 filename* form rather than
 // as raw UTF-8 in filename, which clients may misread.
 func attachmentDisposition(path string) string {
-	return mime.FormatMediaType("attachment", map[string]string{"filename": sanitizeFilename(fspath.Display(filepath.Base(path)))})
+	return mime.FormatMediaType("attachment", map[string]string{"filename": sanitizeFilename(filepath.Base(path))})
 }
 
 func (s *Service) serveFileTarget(ctx context.Context, w http.ResponseWriter, r *http.Request, target *FileTarget, userID int) error {
@@ -1875,33 +1621,23 @@ func (s *Service) serveFileTarget(ctx context.Context, w http.ResponseWriter, r 
 		return catalog.ErrItemNotFound
 	}
 	if target.OriginArtifactID == "" {
-		return s.serveLocalFile(ctx, w, r, target.Path, s.AttachmentName(ctx, target), userID)
+		return s.serveLocalFile(ctx, w, r, target.Path, userID)
 	}
-	var keys nodeauth.Keyring
-	if s.artifacts != nil {
-		keys = s.artifacts.nodeKeys
+	secret := ""
+	if s.artifacts != nil && s.artifacts.liveCfg != nil {
+		if cfg := s.artifacts.liveCfg(); cfg != nil {
+			secret = strings.TrimSpace(cfg.Auth.JWTSecret)
+		}
 	}
-	if keys == nil {
+	if secret == "" {
 		return errors.New("remote artifact credentials unavailable")
 	}
 	client := downloadprepare.HTTPPreparer{}
-	resp, err := client.Open(ctx, target.OriginNodeURL, keys, target.OriginArtifactID, r.Method, r.Header)
+	resp, err := client.Open(ctx, target.OriginNodeURL, secret, target.OriginArtifactID, r.Method, r.Header)
 	if err != nil {
-		if transcodeproxy.NodeUnsignable(err) {
-			// The node that holds the artifact has no key, or is no longer
-			// registered at its URL: it is unavailable, not this server.
-			transcodeproxy.WarnNodeUnsignable(ctx, "downloads", target.OriginNodeURL, err)
-			return fmt.Errorf("%w: %w", ErrAssetUnavailable, err)
-		}
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if transcodeproxy.NodeRefusedRelay(resp.StatusCode) {
-		// The client authenticated with this server; the node refused this
-		// server's signature.
-		transcodeproxy.WarnNodeRefusedRelay(ctx, "downloads", target.OriginNodeURL, resp.StatusCode, keys)
-		return fmt.Errorf("%w: remote artifact node refused the relay", ErrAssetUnavailable)
-	}
 	if resp.StatusCode == http.StatusNotFound {
 		artifact := &Artifact{
 			ID:               target.ArtifactID,
@@ -1931,7 +1667,7 @@ func (s *Service) serveFileTarget(ctx context.Context, w http.ResponseWriter, r 
 	// Preserve an origin-provided disposition, but supply the same sanitized
 	// attachment filename as local delivery when the node omits one.
 	if strings.TrimSpace(target.Path) != "" {
-		w.Header().Set("Content-Disposition", attachmentDisposition(s.AttachmentName(ctx, target)))
+		w.Header().Set("Content-Disposition", attachmentDisposition(target.Path))
 	}
 	downloadprepare.CopyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)

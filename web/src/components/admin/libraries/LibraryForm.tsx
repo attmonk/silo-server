@@ -2,7 +2,6 @@ import type { FormEvent, ReactNode } from "react";
 
 import type { Library } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 
 import { AdvancedFields, FolderFields, GeneralFields, MetadataFields } from "./LibraryFormSections";
 import { useLibraryForm } from "./useLibraryForm";
@@ -31,7 +30,7 @@ function FormSection({ title, children }: { title: string; children: ReactNode }
 /**
  * Inline (non-dialog) library form used by the setup wizard. The admin
  * Libraries page uses LibraryEditorDialog, which renders the same sections
- * behind section tabs (a side rail from sm up, a top strip on a phone).
+ * behind a left-hand navigation rail.
  */
 export function LibraryForm({
   library,
@@ -39,10 +38,9 @@ export function LibraryForm({
   onClose,
   onSaved,
   resetAfterCreate = false,
-  submitLabel,
-  savingLabel,
+  submitLabel = "Save",
+  savingLabel = "Saving...",
 }: LibraryFormProps) {
-  const t = useT();
   const form = useLibraryForm({ library, onClose, onSaved, resetAfterCreate });
 
   function handleSubmit(e: FormEvent) {
@@ -52,24 +50,22 @@ export function LibraryForm({
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
-      <FormSection title={t("web.admin.common.libraryEditor.section.general")}>
+      <FormSection title="General">
         <GeneralFields form={form} />
       </FormSection>
-      <FormSection title={t("web.admin.common.libraryEditor.section.folders")}>
+      <FormSection title="Folders">
         <FolderFields form={form} />
       </FormSection>
-      <FormSection title={t("web.admin.common.libraryEditor.section.metadata")}>
+      <FormSection title="Metadata">
         <MetadataFields form={form} />
       </FormSection>
       {(form.settingSupport.chapterThumbnails || form.settingSupport.introDetection) && (
-        <FormSection title={t("web.admin.common.libraryEditor.section.advanced")}>
+        <FormSection title="Advanced">
           <AdvancedFields form={form} chapterThumbnailsSupported={chapterThumbnailsSupported} />
         </FormSection>
       )}
       <Button type="submit" className="w-full" disabled={form.isPending}>
-        {form.isPending
-          ? (savingLabel ?? t("web.admin.common.libraryEditor.form.saving"))
-          : (submitLabel ?? t("common.save"))}
+        {form.isPending ? savingLabel : submitLabel}
       </Button>
     </form>
   );

@@ -1,6 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 import {
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
@@ -34,20 +33,14 @@ function useScanCommand(cancel: boolean) {
           }),
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success(
-        cancel ? t("web.common.scans.cancelRequested") : t("web.common.scans.fullIngestStarted"),
-      );
+      toast.success(cancel ? "Scan cancellation requested" : "Full ingest scan started");
       if (cancel)
         void queryClient.invalidateQueries({ queryKey: adminKeys.libraryMatchQueueStatuses() });
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       toast.error(
-        error instanceof Error
-          ? error.message
-          : cancel
-            ? t("web.common.scans.cancelFailed")
-            : t("web.common.scans.scanFailed"),
+        error instanceof Error ? error.message : cancel ? "Failed to cancel scans" : "Scan failed",
       );
     },
   });
@@ -59,7 +52,7 @@ function useScanCommand(cancel: boolean) {
       try {
         intent = captureIntent(id);
       } catch {
-        toast.error(t("web.common.scans.selectAdminProfile"));
+        toast.error("Select an administrator profile before scanning.");
         return;
       }
       mutation.mutate(intent);

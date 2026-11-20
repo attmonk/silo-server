@@ -131,7 +131,6 @@ func logRunFailure(ctx context.Context, logger *slog.Logger, claim RunClaim, cau
 		"run_id", claim.RunID,
 		"dispatch_kind", claim.DispatchKind,
 		"error", runFailureCause(cause),
-		"limit", exceededLimit(cause),
 	)
 }
 
@@ -185,7 +184,7 @@ func (s *Service) providerForClaim(ctx context.Context, run *Run, claim RunClaim
 	if source.Revision != claim.SourceRevision {
 		return nil, ErrRunConfigurationChanged
 	}
-	provider, err := s.buildAdminProvider(source, token, claim.ExternalUserID, run.PlayedSince)
+	provider, err := s.buildAdminProvider(source, token, claim.ExternalUserID)
 	if err != nil {
 		return nil, err
 	}

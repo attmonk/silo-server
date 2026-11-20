@@ -8,10 +8,8 @@ import type { AdminUser } from "@/api/types";
 import { getAdminUser, type AdminPasswordReset } from "@/api/v2/adminUsers";
 import { V2ProblemError } from "@/api/v2/request";
 import { useIssuePasswordReset, useUpdateUser } from "@/hooks/queries/admin/users";
-import { useT } from "@/i18n";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { formatDateTime } from "@/lib/datetime";
-import { TOUCH_HIT_AREA, TOUCH_TARGETS } from "@/lib/touchTargets";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -57,7 +55,6 @@ export function AdminUserPasswordResetDialog({
   profileContext: ProfileRequestContextSnapshot;
   onClose: () => void;
 }) {
-  const t = useT();
   const issue = useIssuePasswordReset();
   const updateUser = useUpdateUser();
   const busy = useRef(false);
@@ -85,9 +82,7 @@ export function AdminUserPasswordResetDialog({
     try {
       setResult(await issue.mutateAsync({ id: user.id, delivery }));
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : t("web.admin.users.passwordResetDialog.issueFailed"),
-      );
+      setError(err instanceof Error ? err.message : "Could not create a reset link.");
     } finally {
       busy.current = false;
       setPending(false);
@@ -110,11 +105,9 @@ export function AdminUserPasswordResetDialog({
       setPasswordSet({ mustChange });
     } catch (err) {
       if (err instanceof V2ProblemError && err.status === 412) {
-        setError(t("web.admin.users.page.accountChanged"));
+        setError("The account changed. Try again.");
       } else {
-        setError(
-          err instanceof Error ? err.message : t("web.admin.users.passwordResetDialog.setFailed"),
-        );
+        setError(err instanceof Error ? err.message : "Could not set the password.");
       }
     } finally {
       busy.current = false;
@@ -125,9 +118,9 @@ export function AdminUserPasswordResetDialog({
   async function copy(url: string) {
     try {
       await copyTextToClipboard(url);
-      toast.success(t("web.admin.users.passwordResetDialog.linkCopied"));
+      toast.success("Link copied");
     } catch {
-      setError(t("web.admin.users.passwordResetDialog.copyFailed"));
+      setError("Could not copy the link. Select it and copy it manually.");
     }
   }
 
@@ -137,50 +130,39 @@ export function AdminUserPasswordResetDialog({
   const done = passwordSet !== null || (result !== null && !unconfirmed);
   const resetURL = result?.reset_url;
   const passwordValid = passwordFits(password);
-  const copyLabel = t("web.admin.users.passwordResetDialog.copyLink");
 
   const primary = {
-    email: {
-      label: t("web.admin.users.passwordResetDialog.emailAction"),
-      disabled: !canEmail,
-      run: () => void send("email"),
-    },
-    link: {
-      label: t("web.admin.users.passwordResetDialog.linkAction"),
-      disabled: !canLink,
-      run: () => void send("link"),
-    },
+    email: { label: "Email link", disabled: !canEmail, run: () => void send("email") },
+    link: { label: "Create link", disabled: !canLink, run: () => void send("link") },
     password: {
-      label: t("web.admin.users.passwordResetDialog.passwordAction"),
+      label: "Set password",
       disabled: !passwordValid,
       run: () => void setTemporaryPassword(),
     },
   }[method];
 
   function emailHint(): string {
-    if (canEmail) return t("web.admin.users.passwordResetDialog.emailHint", { email: user.email });
-    if (!user.enabled) return t("web.admin.users.passwordResetDialog.emailHintDisabled");
-    if (user.email === "") return t("web.admin.users.passwordResetDialog.emailHintNoAddress");
-    return t("web.admin.users.passwordResetDialog.emailHintNoMail");
+    if (canEmail) return `Sent to ${user.email}. Works once and expires in 24 hours.`;
+    if (!user.enabled) return "Enable the account to send it a reset link.";
+    if (user.email === "") return "This account has no email address, so share a link instead.";
+    return "Set up email in Settings to send reset links.";
   }
 
   function linkHint(): ReactNode {
-    if (canLink) return t("web.admin.users.passwordResetDialog.linkHint");
-    if (!user.enabled) return t("web.admin.users.passwordResetDialog.linkHintDisabled");
-    return t("web.admin.users.passwordResetDialog.linkHintNoUrl", {
-      link: (chunks) => (
+    if (canLink) return "Copy it and send it yourself.";
+    if (!user.enabled) return "Enable the account to create a reset link.";
+    return (
+      <>
+        Set the Silo public URL to create reset links.{" "}
         <Link
           to="/admin/settings/general"
-          className={cn(
-            "text-foreground inline-flex items-center gap-1 font-medium hover:underline",
-            TOUCH_HIT_AREA,
-          )}
+          className="text-foreground inline-flex items-center gap-1 font-medium hover:underline"
         >
-          {chunks}
+          General settings
           <ArrowRight className="h-3 w-3" aria-hidden="true" />
         </Link>
-      ),
-    });
+      </>
+    );
   }
 
   return (
@@ -190,13 +172,11 @@ export function AdminUserPasswordResetDialog({
         if (!open && !busy.current) onClose();
       }}
     >
-      <DialogContent className={cn("min-w-0 sm:max-w-lg", TOUCH_TARGETS)}>
+      <DialogContent className="min-w-0 sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>
-            {t("web.admin.users.passwordResetDialog.title", { username: user.username })}
-          </DialogTitle>
+          <DialogTitle>Reset password for {user.username}</DialogTitle>
           <DialogDescription>
-            {t("web.admin.users.passwordResetDialog.description")}
+            Pick how they get back in. Every option signs them out on all devices.
           </DialogDescription>
         </DialogHeader>
 
@@ -208,58 +188,43 @@ export function AdminUserPasswordResetDialog({
 
         {passwordSet ? (
           <p role="status" className="text-sm">
-            {passwordSet.mustChange
-              ? t("web.admin.users.passwordResetDialog.passwordSetMustChange", {
-                  username: user.username,
-                })
-              : t("web.admin.users.passwordResetDialog.passwordSet", { username: user.username })}
+            Password set. {user.username} is signed out everywhere.
+            {passwordSet.mustChange ? " They must choose a new one at next sign-in." : ""}
           </p>
         ) : null}
         {result?.delivery === "email" && result.delivery_status === "sent" && (
           <p role="status" className="text-sm">
-            {t("web.admin.users.passwordResetDialog.emailSent", { email: user.email, expires })}
+            Sent a reset link to {user.email}. It expires {expires}.
           </p>
         )}
         {unconfirmed && (
           <p role="alert" className="text-sm">
-            {t("web.admin.users.passwordResetDialog.emailUnconfirmed")}
+            The mail server did not confirm delivery. Send it again, or create a link to share.
           </p>
         )}
         {resetURL && (
           <div className="min-w-0 space-y-2">
             <div className="bg-muted min-w-0 overflow-hidden rounded-md p-2.5">
-              {/* On a phone the whole link shows, wrapped; wider screens truncate it. */}
-              <code className="block text-xs max-lg:wrap-anywhere lg:truncate">{resetURL}</code>
+              <code className="block truncate text-xs">{resetURL}</code>
             </div>
             <p className="text-muted-foreground text-xs">
-              {t("web.admin.users.passwordResetDialog.linkShare", {
-                username: user.username,
-                expires,
-              })}
+              Share this link only with {user.username}. Anyone who has it can set the account's
+              password until it expires {expires}.
             </p>
-            <Button
-              variant="outline"
-              size="sm"
-              className="max-sm:w-full"
-              onClick={() => void copy(resetURL)}
-            >
-              <Copy className="me-1.5 h-4 w-4" /> {copyLabel}
+            <Button variant="outline" size="sm" onClick={() => void copy(resetURL)}>
+              <Copy className="mr-1.5 h-4 w-4" /> Copy link
             </Button>
           </div>
         )}
 
         {!done ? (
-          <div
-            role="radiogroup"
-            aria-label={t("web.admin.users.passwordResetDialog.methodGroup")}
-            className="space-y-2"
-          >
+          <div role="radiogroup" aria-label="How they get back in" className="space-y-2">
             <ChoiceOption
               name={groupName}
               value="email"
               selected={method === "email"}
               disabled={!canEmail || pending}
-              title={t("web.admin.users.passwordResetDialog.emailOption")}
+              title="Email a reset link"
               onSelect={setMethod}
             >
               {emailHint()}
@@ -269,7 +234,7 @@ export function AdminUserPasswordResetDialog({
               value="link"
               selected={method === "link"}
               disabled={!canLink || pending}
-              title={t("web.admin.users.passwordResetDialog.linkOption")}
+              title="Create a link to share"
               onSelect={setMethod}
             >
               {linkHint()}
@@ -279,10 +244,10 @@ export function AdminUserPasswordResetDialog({
               value="password"
               selected={method === "password"}
               disabled={pending}
-              title={t("web.admin.users.passwordResetDialog.passwordOption")}
+              title="Set a temporary password"
               onSelect={setMethod}
             >
-              <span>{t("web.admin.users.passwordResetDialog.passwordOptionHint")}</span>
+              <span>Type one now and tell them.</span>
               <div
                 className={cn(
                   "mt-2.5 space-y-2",
@@ -290,7 +255,7 @@ export function AdminUserPasswordResetDialog({
                 )}
               >
                 <label htmlFor={passwordId} className="sr-only">
-                  {t("web.admin.users.passwordResetDialog.passwordLabel")}
+                  Temporary password
                 </label>
                 <Input
                   id={passwordId}
@@ -301,10 +266,8 @@ export function AdminUserPasswordResetDialog({
                   onChange={(event) => setPassword(event.target.value)}
                 />
                 <p className="text-muted-foreground text-xs">
-                  {t("web.admin.users.passwordResetDialog.passwordRules", {
-                    min: MIN_PASSWORD_CHARS,
-                    max: MAX_PASSWORD_BYTES,
-                  })}
+                  At least {MIN_PASSWORD_CHARS} characters and no more than {MAX_PASSWORD_BYTES}{" "}
+                  UTF-8 bytes.
                 </p>
                 <div className="flex items-center gap-2">
                   <input
@@ -315,12 +278,8 @@ export function AdminUserPasswordResetDialog({
                     disabled={method !== "password" || pending}
                     onChange={(event) => setMustChange(event.target.checked)}
                   />
-                  {/* Below `lg` the label fills a 44px-tall strip without moving anything. */}
-                  <label
-                    htmlFor={mustChangeId}
-                    className="text-foreground text-xs max-lg:-my-3.5 max-lg:flex-1 max-lg:py-3.5"
-                  >
-                    {t("web.admin.users.passwordResetDialog.mustChange")}
+                  <label htmlFor={mustChangeId} className="text-foreground text-xs">
+                    They must choose a new one at next sign-in
                   </label>
                 </div>
               </div>
@@ -330,11 +289,11 @@ export function AdminUserPasswordResetDialog({
 
         <DialogFooter>
           {done ? (
-            <Button onClick={onClose}>{t("common.done")}</Button>
+            <Button onClick={onClose}>Done</Button>
           ) : (
             <>
               <Button variant="ghost" disabled={pending} onClick={onClose}>
-                {t("common.cancel")}
+                Cancel
               </Button>
               <Button disabled={primary.disabled || pending} onClick={primary.run}>
                 {primary.label}

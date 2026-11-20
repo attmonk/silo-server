@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,15 +50,6 @@ const (
 // keys both travel in `Authorization: Bearer`; the v1 gate decides which one
 // it holds.
 const securitySchemeBearer = "bearerAuth"
-
-// bearerAuthDescription says how each credential is sent and, for an API
-// key, which profile it acts as: what a script needs before its first call.
-const bearerAuthDescription = "A session token or an API key in the Authorization header. The server decides which it holds. " +
-	"An API key is sent as `Authorization: Bearer sa_…`. " +
-	"A profile key (created with profile_id) always acts as its profile: the server supplies X-Profile-Id, and a request naming another profile is 403 permission_denied. " +
-	"An account key chooses the profile per request with X-Profile-Id and needs no X-Profile-Token, even for a PIN-protected profile; GET /api/v2/profiles lists the IDs. " +
-	"Most profile operations require the header and answer 422 validation_failed without it. The few that accept its absence, such as GET /api/v2/profiles and GET /api/v2/user/libraries, then answer for the account as a whole. " +
-	"A key carrying scopes reaches only the operations those scopes admit and is 403 permission_denied everywhere else; GET /api/v2/api-keys/scopes lists them."
 
 // profileHeader is the header every profile-resolving class reads;
 // profileTokenHeader is the proof it reads alongside it for a PIN-locked
@@ -129,7 +119,7 @@ func documentDeclaration(op *Operation, input reflect.Type) {
 	}
 	hasBody := declaresBody(input)
 	hasPath := strings.Contains(op.Path, "{")
-	for _, status := range ImpliedStatuses(op.Class, op.DemoRestricted, op.ServiceBacked, hasBody, hasPath, op.Guarded, op.Conditional, op.CreateOnly, op.RateLimitBucket != "") {
+	for _, status := range ImpliedStatuses(op.Class, op.DemoRestricted, op.ServiceBacked, hasBody, hasPath, op.Guarded, op.Conditional, op.CreateOnly) {
 		if status < http.StatusBadRequest {
 			// 304 is a success shape, documented with its headers by
 			// documentConcurrencyResponses, not a problem.
@@ -183,7 +173,7 @@ func profileTokenHeaderParam() *huma.Param {
 // householdProfileHeaderDescription documents X-Profile-Id on an operation
 // that runs the household profile gate (Operation.HouseholdProfileGate): the
 // header is optional only while no profile on the account is limited.
-const householdProfileHeaderDescription = "Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account."
+const householdProfileHeaderDescription = "Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account."
 
 // profileHeaderParam documents X-Profile-Id the way the class's gate chain
 // really reads it. Only ClassProfileScoped runs RequireProfile, so only it
@@ -448,14 +438,12 @@ func resolvesProfile(class Class) bool {
 // as does a profile-resolving class (viewer access answers 404 for an unknown
 // X-Profile-Id before the handler runs); a service-backed handler adds 503
 // (its service is not wired); every gated class adds 401, 429 and 503 (a
-// gate the wiring lacks fails closed); an operation naming a rate-limit
-// bucket adds 429 on any class, public included (gateChain runs its
-// limiter); a class that resolves a profile or a demo-restricted mutation
-// adds 403; a guarded mutation adds 412 and 428; a conditional read adds
-// 304; a create-only PUT adds 412. Statuses an operation produces on its own
-// (409 for a name conflict, say) are declared on that operation's Errors,
-// not here.
-func ImpliedStatuses(class Class, demoRestricted, serviceBacked, hasBody, hasPath, guarded, conditional, createOnly, rateLimited bool) []int {
+// gate the wiring lacks fails closed); a class that resolves a profile or a
+// demo-restricted mutation adds 403; a guarded mutation adds 412 and 428; a
+// conditional read adds 304; a create-only PUT adds 412. Statuses an
+// operation produces on its own (409 for a name conflict, say) are declared
+// on that operation's Errors, not here.
+func ImpliedStatuses(class Class, demoRestricted, serviceBacked, hasBody, hasPath, guarded, conditional, createOnly bool) []int {
 	set := map[int]bool{
 		http.StatusBadRequest: true, http.StatusNotAcceptable: true,
 		http.StatusUnprocessableEntity: true, http.StatusInternalServerError: true,
@@ -481,9 +469,6 @@ func ImpliedStatuses(class Class, demoRestricted, serviceBacked, hasBody, hasPat
 	}
 	if serviceBacked {
 		set[http.StatusServiceUnavailable] = true
-	}
-	if rateLimited {
-		set[http.StatusTooManyRequests] = true
 	}
 	if class != ClassPublic {
 		set[http.StatusUnauthorized] = true
@@ -588,7 +573,6 @@ func registerAll(reg *Registry) {
 	registerNotificationEmailLinks(reg)
 	registerNotificationDiscordLinks(reg)
 	registerNotificationDestinations(reg)
-	registerNotificationPluginDestinations(reg)
 	registerNotificationDestinationTests(reg)
 	registerNotificationDestinationCreate(reg)
 	registerAdminUserAPIKeys(reg)
@@ -598,13 +582,11 @@ func registerAll(reg *Registry) {
 	registerAdminRequestUsage(reg)
 	registerAdminAccountSettings(reg)
 	registerAdminProfileSections(reg)
-	registerAdminProfiles(reg)
 	registerAdminAccessGroups(reg)
 	registerPreferences(reg)
 	registerHome(reg)
 	registerFavorites(reg)
 	registerNotInterested(reg)
-	registerTitleAllowances(reg)
 	registerHistory(reg)
 	registerDeviceSettings(reg)
 	registerLibraries(reg)
@@ -631,18 +613,14 @@ func registerAll(reg *Registry) {
 	registerAdminSettingsWrite(reg)
 	registerAdminSettingsChecks(reg)
 	registerChatGPT(reg)
-	registerAdminAIProviders(reg)
 	registerAdminStorageTransition(reg)
 	registerAdminPluginCatalogSettings(reg)
 	registerAdminDiagnosticDownload(reg)
 	registerAdminJobArtifactDownload(reg)
 	registerAdminJobArtifactCapabilities(reg)
-	registerAdminBackups(reg)
-	registerProfileTransfer(reg)
 	registerAdminDiagnosticReads(reg)
 	registerAdminDiagnosticDelete(reg)
 	registerAdminDashboardInsights(reg)
-	registerAdminAPIClients(reg)
 	registerAdminDashboardCapabilities(reg)
 	registerAdminDashboardLayout(reg)
 	registerAdminDashboardLayoutReset(reg)
@@ -654,11 +632,9 @@ func registerAll(reg *Registry) {
 	registerAdminNodeCommands(reg)
 	registerAdminNodeDrain(reg)
 	registerAdminNodeReload(reg)
-	registerAdminNodeKey(reg)
 	registerAdminNodeConfiguration(reg)
 	registerAdminServerStatus(reg)
 	registerAdminBrandingAssets(reg)
-	registerOverlayImages(reg)
 	registerAdminJellyfinCompatWeb(reg)
 	registerAdminServerRestart(reg)
 	registerAdminEmailTest(reg)
@@ -701,7 +677,6 @@ func registerAll(reg *Registry) {
 	registerAdminCatalogSplit(reg)
 	registerAdminCatalogMatch(reg)
 	registerAdminCatalogUnmatched(reg)
-	registerAdminCatalogItems(reg)
 	registerAdminCatalogImages(reg)
 	registerProfileSections(reg)
 	registerCatalogItems(reg)
@@ -741,7 +716,6 @@ func registerAll(reg *Registry) {
 	registerRequests(reg)
 	registerAdminRequests(reg)
 	registerAdminRequestRoutes(reg)
-	registerAdminRequestDiscover(reg)
 	registerAdminRequestQueue(reg)
 	registerAdminRequestGroups(reg)
 	registerRequestLifecycle(reg, reg.deps.RequestLifecycle, reg.deps.WatchProviders)
@@ -804,7 +778,6 @@ func GenerateOpenAPI() ([]byte, error) {
 	reg := &Registry{api: api}
 	registerAll(reg)
 	api.OpenAPI().Extensions = map[string]any{workerProtocolsExtension: describeWorkerProtocols(), pluginContentExtension: describePluginContent()}
-	admitNullInNullableEnums(api.OpenAPI().Components.Schemas.Map())
 	raw, err := api.OpenAPI().MarshalJSON()
 	if err != nil {
 		return nil, err
@@ -815,37 +788,6 @@ func GenerateOpenAPI() ([]byte, error) {
 	}
 	buf.WriteByte('\n')
 	return buf.Bytes(), nil
-}
-
-// admitNullInNullableEnums adds null to the enum of every nullable schema in
-// the components. JSON Schema applies type and enum separately, so
-// ["string", "null"] with an enum of strings alone still refuses null. The
-// pass runs on the document only: Huma's request validator accepts null on
-// a nullable schema before it checks the enum, and leaving the registered
-// enum alone keeps null out of its 422 message.
-func admitNullInNullableEnums(components map[string]*huma.Schema) {
-	var walk func(s *huma.Schema)
-	walk = func(s *huma.Schema) {
-		if s == nil {
-			return
-		}
-		if s.Nullable && len(s.Enum) > 0 && !slices.Contains(s.Enum, nil) {
-			s.Enum = append(slices.Clip(s.Enum), nil)
-		}
-		for _, property := range s.Properties {
-			walk(property)
-		}
-		walk(s.Items)
-		if value, ok := s.AdditionalProperties.(*huma.Schema); ok {
-			walk(value)
-		}
-		for _, sub := range slices.Concat(s.OneOf, s.AnyOf, s.AllOf) {
-			walk(sub)
-		}
-	}
-	for _, s := range components {
-		walk(s)
-	}
 }
 
 // noopAdapter lets the generator register operations without a router: the

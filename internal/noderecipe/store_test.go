@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"reflect"
 	"testing"
 	"time"
 
@@ -14,6 +13,65 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
+
+// A nil-backed store (single integrated box, no Redis) must be safe: writes
+// no-op and reads miss, so callers need no nil-guarding.
+func TestNilStore_PutNoopGetMiss(t *testing.T) {
+	var s *Store // nil receiver
+	if err := s.Put(context.Background(), "sid", playback.RecipeCard{}); err != nil {
+		t.Fatalf("nil store Put returned error: %v", err)
+	}
+	if card, ok := s.Get(context.Background(), "sid"); ok || card != nil {
+		t.Fatalf("nil store Get = (%v, %v), want (nil, false)", card, ok)
+	}
+
+	disabled := NewStore(nil, 0)
+	if err := disabled.Put(context.Background(), "sid", playback.RecipeCard{}); err != nil {
+		t.Fatalf("disabled store Put returned error: %v", err)
+	}
+	if _, ok := disabled.Get(context.Background(), "sid"); ok {
+		t.Fatalf("disabled store Get returned a hit, want miss")
+	}
+}
+
+// Delete on a nil/disabled store must be a safe no-op (callers in teardown
+// paths need no nil-guarding), and on either store a subsequent Get still
+// misses, matching the delete-then-get-not-found and delete-missing-is-no-op
+// contract.
+func TestNilStore_DeleteNoop(t *testing.T) {
+	var s *Store // nil receiver
+	if err := s.Delete(context.Background(), "sid"); err != nil {
+		t.Fatalf("nil store Delete returned error: %v", err)
+	}
+	if card, ok := s.Get(context.Background(), "sid"); ok || card != nil {
+		t.Fatalf("nil store Get after Delete = (%v, %v), want (nil, false)", card, ok)
+	}
+
+	disabled := NewStore(nil, 0)
+	// Delete of a missing key is a no-op success.
+	if err := disabled.Delete(context.Background(), "sid"); err != nil {
+		t.Fatalf("disabled store Delete returned error: %v", err)
+	}
+	if _, ok := disabled.Get(context.Background(), "sid"); ok {
+		t.Fatalf("disabled store Get after Delete returned a hit, want miss")
+	}
+}
+
+func TestNilStore_RevokeNodeNoop(t *testing.T) {
+	var s *Store
+	if err := s.RevokeNode(t.Context(), "http://node"); err != nil {
+		t.Fatalf("nil store RevokeNode returned error: %v", err)
+	}
+	if err := NewStore(nil, 0).RevokeNode(t.Context(), "http://node"); err != nil {
+		t.Fatalf("disabled store RevokeNode returned error: %v", err)
+	}
+	if err := s.RevokeNodeID(t.Context(), 42); err != nil {
+		t.Fatalf("nil store RevokeNodeID returned error: %v", err)
+	}
+	if err := NewStore(nil, 0).RevokeNodeID(t.Context(), 42); err != nil {
+		t.Fatalf("disabled store RevokeNodeID returned error: %v", err)
+	}
+}
 
 func TestKeyNamespacing(t *testing.T) {
 	if got := NewStore(nil, 0).key("abc"); got != "silo:noderecipe:abc" {
@@ -140,7 +198,7 @@ func TestToneMapRecipeEnvelopeFailsClosedOnLegacyReader(t *testing.T) {
 		t.Fatalf("legacy flat decode = %+v, want incomplete recipe", legacy)
 	}
 	decoded, ok := unmarshalCard(data)
-	if !ok || !reflect.DeepEqual(decoded, card) {
+	if !ok || decoded != card {
 		t.Fatalf("current decode = (%+v, %v), want original card", decoded, ok)
 	}
 }
@@ -171,7 +229,7 @@ func TestStereoDownmixRecipeEnvelopeFailsClosedOnLegacyReader(t *testing.T) {
 			t.Fatalf("legacy flat decode = %+v, want incomplete recipe", legacy)
 		}
 		decoded, ok := unmarshalCard(data)
-		if !ok || !reflect.DeepEqual(decoded, card) {
+		if !ok || decoded != card {
 			t.Fatalf("current decode = (%+v, %v), want original card", decoded, ok)
 		}
 	}
@@ -197,11 +255,11 @@ func TestOrdinaryRecipeRemainsLegacyFlatJSON(t *testing.T) {
 		}
 		want := card
 		want.SourceAudioChannels = 0
-		if !reflect.DeepEqual(legacy, want) {
+		if legacy != want {
 			t.Fatalf("legacy flat decode = %+v, want sanitized %+v", legacy, want)
 		}
 		decoded, ok := unmarshalCard(data)
-		if !ok || !reflect.DeepEqual(decoded, want) {
+		if !ok || decoded != want {
 			t.Fatalf("current decode = (%+v, %v), want sanitized %+v", decoded, ok, want)
 		}
 	}

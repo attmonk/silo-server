@@ -22,7 +22,6 @@ export { ChartLegend, ChartTooltip, ChartTooltipRow, type ChartLegendEntry } fro
 export {
   CHART_SERIES_SLOTS,
   buildAreaPath,
-  buildBandPath,
   buildLinePath,
   chartSeriesColor,
   niceTicks,
@@ -39,7 +38,6 @@ export {
   type LineChartOverlay,
   type LineChartPoint,
   type LineChartProps,
-  type LineChartStack,
 } from "./LineChart";
 export { Sparkline, type SparklineProps } from "./Sparkline";
 export { useMeasuredSize, type MeasuredSize } from "./useMeasuredSize";

@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -151,6 +149,31 @@ type fakeProgress struct {
 func (f *fakeProgress) Report(_ float64, message string)   { f.lastMessage = message }
 func (f *fakeProgress) SetResultData(data json.RawMessage) { f.resultData = data }
 
+func TestReconcileArtworkCacheShouldRun(t *testing.T) {
+	runner := &fakeReconcileRunner{}
+	store := &fakeSettingsStore{values: map[string]string{}}
+	task := NewReconcileArtworkCacheTask(runner, store, nil, "endpoint|bucket|prefix")
+
+	// No stored fingerprint: first boot, seeding happens at wiring time; the
+	// scheduled run must not sweep a catalog it has no baseline for.
+	if run, err := task.ShouldRun(context.Background()); err != nil || run {
+		t.Fatalf("ShouldRun with empty fingerprint = %v, %v; want false, nil", run, err)
+	}
+
+	store.values[ArtworkStorageIdentityKey] = "endpoint|bucket|prefix"
+	if run, err := task.ShouldRun(context.Background()); err != nil || run {
+		t.Fatalf("ShouldRun with matching fingerprint = %v, %v; want false, nil", run, err)
+	}
+
+	store.values[ArtworkStorageIdentityKey] = "old-endpoint|bucket|prefix"
+	if run, err := task.ShouldRun(context.Background()); run || !errors.Is(err, ErrArtworkReconcileManualRunRequired) {
+		t.Fatalf("ShouldRun with changed fingerprint = %v, %v; want false, manual-run-required", run, err)
+	}
+	if runner.runs != 0 {
+		t.Fatalf("scheduled preflight ran reconciler %d times, want 0", runner.runs)
+	}
+}
+
 func TestReconcileArtworkCacheRefusesManagedTransitionWithoutChangingCheckpoint(t *testing.T) {
 	runner := &fakeReconcileRunner{}
 	checkpoint := `{"baseline_identity":"old","target_identity":"new","checkpoint":{"done":25}}`
@@ -229,47 +252,6 @@ func TestReconcileArtworkCacheRejectsOldProcessAfterTransitionReceiptClears(t *t
 	}
 }
 
-func TestReconcileArtworkCacheComparesSettingsWithTheOpenedDirectory(t *testing.T) {
-	base := t.TempDir()
-	state := filepath.Join(base, "config", "silo")
-	other := filepath.Join(base, "other")
-	for _, dir := range []string{filepath.Join(state, "artwork"), filepath.Join(other, "artwork")} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	linked := filepath.Join(base, "var-lib-silo")
-	if err := os.Symlink(state, linked); err != nil {
-		t.Fatal(err)
-	}
-	recorded := blobstore.BackendLocal + "|" + filepath.Join(linked, "artwork")
-	opened, err := blobstore.LocalIdentity(filepath.Join(state, "artwork"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The link moved after the store opened: settings now name the directory
-	// it leads to, while the runner's store still reads the one it opened.
-	if err := os.Remove(linked); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(other, linked); err != nil {
-		t.Fatal(err)
-	}
-	store := &fakeSettingsStore{values: map[string]string{
-		ArtworkStorageIdentityKey: recorded,
-		"artwork.storage_backend": blobstore.BackendLocal,
-		"artwork.local_path":      filepath.Join(other, "artwork"),
-	}}
-	runner := &fakeReconcileRunner{}
-	err = NewReconcileArtworkCacheTask(runner, store, nil, recorded).WithLocation(opened).Execute(t.Context(), &fakeProgress{})
-	if !errors.Is(err, ErrArtworkReconcileStaleStore) {
-		t.Fatalf("reconcile after the link moved = %v, want stale store", err)
-	}
-	if runner.runs != 0 {
-		t.Fatalf("runner ran %d times against the directory the store opened", runner.runs)
-	}
-}
-
 func TestReconcileArtworkCacheRejectsConfiguredMoveDuringSweep(t *testing.T) {
 	oldRoot := t.TempDir()
 	newRoot := t.TempDir()
@@ -308,6 +290,21 @@ func TestReconcileArtworkCacheRejectsConfiguredMoveDuringSweep(t *testing.T) {
 	}
 	if got := store.values[ArtworkStorageIdentityKey]; got != oldIdentity {
 		t.Fatalf("storage identity = %q, want unchanged %q", got, oldIdentity)
+	}
+}
+
+func TestConfiguredArtworkIdentityMatchesS3Location(t *testing.T) {
+	identity, known, err := configuredArtworkIdentity(map[string]string{
+		"artwork.storage_backend":   config.ArtworkBackendAuto,
+		"s3.operational_endpoint":   "HTTPS://example.invalid/Tenant",
+		"s3.operational_bucket":     "Artwork",
+		"s3.operational_key_prefix": " /silo/dev/ ",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "s3|https://example.invalid/Tenant|artwork|silo/dev"; !known || identity != want {
+		t.Fatalf("configured S3 identity = %q, known=%t; want %q", identity, known, want)
 	}
 }
 
@@ -461,6 +458,30 @@ func TestReconcileArtworkCacheCheckpointIsScopedToStorageMove(t *testing.T) {
 	}
 	if runner.received != nil {
 		t.Fatalf("received checkpoint from a different storage move: %#v", runner.received)
+	}
+}
+
+func TestReconcileArtworkCacheIgnoresMalformedCheckpoint(t *testing.T) {
+	store := &fakeSettingsStore{values: map[string]string{
+		ArtworkStorageIdentityKey:            "old",
+		ArtworkStorageReconcileCheckpointKey: "{not-json",
+	}}
+	runner := &fakeResumableReconcileRunner{stats: metadata.ArtworkReconcileStats{Mode: metadata.ArtworkReconcileModeVerify}}
+
+	if err := NewReconcileArtworkCacheTask(runner, store, nil, "new").Execute(context.Background(), &fakeProgress{}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if runner.received != nil {
+		t.Fatalf("received malformed checkpoint: %#v", runner.received)
+	}
+	if !runner.saveProvided {
+		t.Fatal("fresh storage-move sweep did not receive a checkpoint saver")
+	}
+	if got := store.values[ArtworkStorageIdentityKey]; got != "new" {
+		t.Fatalf("fingerprint after completion = %q, want new", got)
+	}
+	if got := store.values[ArtworkStorageReconcileCheckpointKey]; got != "" {
+		t.Fatalf("checkpoint after completion = %q, want empty", got)
 	}
 }
 

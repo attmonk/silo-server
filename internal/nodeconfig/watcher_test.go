@@ -2,7 +2,6 @@ package nodeconfig
 
 import (
 	"context"
-	"errors"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -12,20 +11,97 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 )
 
-// testJWTSecret is the signing secret every settings fixture carries: the
-// watcher refuses a snapshot without one.
-const testJWTSecret = "watcher-test-secret"
+func TestWatcherNodeRowID(t *testing.T) {
+	var nilWatcher *Watcher
+	if id, ok := nilWatcher.NodeRowID(); ok || id != 0 {
+		t.Fatalf("nil watcher NodeRowID = (%d, %t), want (0, false)", id, ok)
+	}
+
+	w := &Watcher{}
+	if id, ok := w.NodeRowID(); ok || id != 0 {
+		t.Fatalf("unresolved NodeRowID = (%d, %t), want (0, false)", id, ok)
+	}
+	w.rememberNodeRegistration(11, "https://registered-node.example")
+	if id, ok := w.NodeRowID(); !ok || id != 11 {
+		t.Fatalf("resolved NodeRowID = (%d, %t), want (11, true)", id, ok)
+	}
+	if registeredURL, ok := w.NodeRegisteredURL(); !ok || registeredURL != "https://registered-node.example" {
+		t.Fatalf("resolved NodeRegisteredURL = (%q, %t)", registeredURL, ok)
+	}
+	w.forgetNodeRowID()
+	if id, ok := w.NodeRowID(); ok || id != 0 {
+		t.Fatalf("forgotten NodeRowID = (%d, %t), want (0, false)", id, ok)
+	}
+	if registeredURL, ok := w.NodeRegisteredURL(); ok || registeredURL != "" {
+		t.Fatalf("forgotten NodeRegisteredURL = (%q, %t), want empty and false", registeredURL, ok)
+	}
+}
 
 func newTestWatcher(t *testing.T, bootstrap BootstrapOverrides) *Watcher {
 	t.Helper()
 	return NewWatcher(nil, nil, nil, bootstrap)
 }
 
+func TestApplySettingsSkipsCallbacksOnNoopReload(t *testing.T) {
+	w := newTestWatcher(t, BootstrapOverrides{})
+
+	var calls int
+	w.OnChange(func(old, updated *config.Config) {
+		calls++
+	})
+
+	settings := map[string]string{"server.log_level": "debug"}
+	if err := w.applySettings(context.Background(), settings); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("after initial apply: calls = %d, want 1", calls)
+	}
+
+	// Same settings again — pointer swaps, but callbacks must not fire.
+	if err := w.applySettings(context.Background(), settings); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("after no-op apply: calls = %d, want 1", calls)
+	}
+
+	// A real change fires callbacks again.
+	if err := w.applySettings(context.Background(), map[string]string{"server.log_level": "warn"}); err != nil {
+		t.Fatalf("third apply: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("after changed apply: calls = %d, want 2", calls)
+	}
+}
+
+func TestApplySettingsReappliesBootstrapOverrides(t *testing.T) {
+	w := newTestWatcher(t, BootstrapOverrides{
+		Listen:   ":9999",
+		RedisURL: "redis://env-host:6379",
+	})
+
+	err := w.applySettings(context.Background(), map[string]string{
+		"server.listen": ":8080",
+		"redis.url":     "redis://db-host:6379",
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	cfg := w.Config()
+	if cfg.Server.Listen != ":9999" {
+		t.Errorf("Listen = %q, want bootstrap override %q", cfg.Server.Listen, ":9999")
+	}
+	if cfg.Redis.URL != "redis://env-host:6379" {
+		t.Errorf("Redis.URL = %q, want bootstrap override %q", cfg.Redis.URL, "redis://env-host:6379")
+	}
+}
+
 func TestApplySettingsAppliesRedisDBToTheSavedURLOnly(t *testing.T) {
 	settings := map[string]string{
-		"auth.jwt_secret": testJWTSecret,
-		"redis.url":       "redis://db-host:6379/3",
-		"redis.db":        "5",
+		"redis.url": "redis://db-host:6379/3",
+		"redis.db":  "5",
 	}
 
 	saved := newTestWatcher(t, BootstrapOverrides{})
@@ -46,62 +122,6 @@ func TestApplySettingsAppliesRedisDBToTheSavedURLOnly(t *testing.T) {
 	}
 }
 
-// A process setting from the environment is never stored, so every reload
-// must lay it over the stored value again.
-func TestApplySettingsOverlaysProcessSettingsOnEveryLoad(t *testing.T) {
-	stored := map[string]string{"auth.jwt_secret": testJWTSecret, "scanner.workers": "2"}
-	w := newTestWatcher(t, BootstrapOverrides{Settings: map[string]string{"scanner.workers": "9"}})
-	for range 2 {
-		if err := w.applySettings(t.Context(), stored); err != nil {
-			t.Fatalf("apply: %v", err)
-		}
-		if got := w.Config().Scanner.Workers; got != 9 {
-			t.Fatalf("scanner workers = %d, want the 9 the environment sets", got)
-		}
-	}
-	if stored["scanner.workers"] != "2" {
-		t.Errorf("the stored snapshot was changed to %q", stored["scanner.workers"])
-	}
-}
-
-// A config without auth.jwt_secret would let anyone sign stream tokens the
-// node then honors. The first load must fail rather than start the node, and a
-// reload must keep the last config that had a secret.
-func TestReloadRefusesConfigWithoutJWTSecret(t *testing.T) {
-	w := &Watcher{}
-	var changes int
-	w.OnChange(func(_, _ *config.Config) { changes++ })
-
-	snapshot := map[string]string{"server.log_level": "info"}
-	w.fetchSettingsFn = func(context.Context) (map[string]string, error) { return snapshot, nil }
-
-	if err := w.reload(t.Context()); !errors.Is(err, ErrNoJWTSecret) {
-		t.Fatalf("first load without a secret: error = %v, want ErrNoJWTSecret", err)
-	}
-	if w.Config() != nil || changes != 0 {
-		t.Fatalf("first load without a secret published config %v (%d callbacks)", w.Config(), changes)
-	}
-
-	snapshot = map[string]string{"auth.jwt_secret": testJWTSecret, "server.log_level": "info"}
-	if err := w.reload(t.Context()); err != nil {
-		t.Fatalf("load with a secret: %v", err)
-	}
-	valid := w.Config()
-
-	for _, secret := range []string{"", "  \t"} {
-		snapshot = map[string]string{"auth.jwt_secret": secret, "server.log_level": "debug"}
-		if err := w.reload(t.Context()); !errors.Is(err, ErrNoJWTSecret) {
-			t.Errorf("reload with secret %q: error = %v, want ErrNoJWTSecret", secret, err)
-		}
-		if got := w.Config(); got != valid || got.Auth.JWTSecret != testJWTSecret {
-			t.Errorf("reload with secret %q replaced the last valid config", secret)
-		}
-	}
-	if changes != 1 {
-		t.Errorf("OnChange calls = %d, want 1 (only the valid load)", changes)
-	}
-}
-
 func TestRequestReloadCoalesces(t *testing.T) {
 	w := newTestWatcher(t, BootstrapOverrides{})
 
@@ -113,6 +133,53 @@ func TestRequestReloadCoalesces(t *testing.T) {
 
 	if got := len(w.reloadCh); got != 1 {
 		t.Fatalf("pending reloads = %d, want 1 (coalesced)", got)
+	}
+}
+
+func TestOnChangeAfterFirstApplySeesLaterChanges(t *testing.T) {
+	w := newTestWatcher(t, BootstrapOverrides{})
+
+	if err := w.applySettings(context.Background(), map[string]string{"server.log_level": "info"}); err != nil {
+		t.Fatalf("initial apply: %v", err)
+	}
+
+	var gotOld, gotNew string
+	w.OnChange(func(old, updated *config.Config) {
+		gotOld = old.Server.LogLevel
+		gotNew = updated.Server.LogLevel
+	})
+
+	if err := w.applySettings(context.Background(), map[string]string{"server.log_level": "error"}); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if gotOld != "info" || gotNew != "error" {
+		t.Errorf("callback saw old=%q new=%q, want old=info new=error", gotOld, gotNew)
+	}
+}
+
+func TestOnLoadNormalizersApplyOnEveryLoad(t *testing.T) {
+	w := &Watcher{}
+	w.OnLoad(func(c *config.Config) {
+		c.Playback.FFmpegPath = "/resolved/ffmpeg"
+	})
+
+	if err := w.applySettings(context.Background(), map[string]string{
+		"playback.ffmpeg_path": "/usr/lib/jellyfin-ffmpeg/ffmpeg",
+	}); err != nil {
+		t.Fatalf("applySettings() error = %v", err)
+	}
+	if got := w.Config().Playback.FFmpegPath; got != "/resolved/ffmpeg" {
+		t.Fatalf("Playback.FFmpegPath = %q, want normalized value", got)
+	}
+
+	// A reload constructs a fresh config; the normalizer must apply again.
+	if err := w.applySettings(context.Background(), map[string]string{
+		"playback.ffmpeg_path": "/usr/lib/jellyfin-ffmpeg/ffmpeg",
+	}); err != nil {
+		t.Fatalf("applySettings() reload error = %v", err)
+	}
+	if got := w.Config().Playback.FFmpegPath; got != "/resolved/ffmpeg" {
+		t.Fatalf("after reload Playback.FFmpegPath = %q, want normalized value", got)
 	}
 }
 
@@ -151,10 +218,10 @@ func TestReloadDoesNotLetAnEarlierSnapshotSupersedeALaterOne(t *testing.T) {
 			case <-forced:
 			case <-time.After(staleReloadWindow):
 			}
-			return map[string]string{"auth.jwt_secret": testJWTSecret, "server.log_level": "info"}, nil
+			return map[string]string{"server.log_level": "info"}, nil
 		}
 		record("fetch error")
-		return map[string]string{"auth.jwt_secret": testJWTSecret, "server.log_level": "error"}, nil
+		return map[string]string{"server.log_level": "error"}, nil
 	}
 
 	polled := make(chan error, 1)

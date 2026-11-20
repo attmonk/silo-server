@@ -57,7 +57,7 @@ func (r *Resolver) resolve(req *http.Request) (net.IP, bool) {
 
 	// If the connecting IP is not a trusted proxy, ignore forwarding headers.
 	if !r.isTrusted(remoteIP) {
-		return remoteIP, HasForwardingHeaders(req.Header)
+		return remoteIP, hasForwardingHeaders(req.Header)
 	}
 
 	if ip, forwarded := r.forwardedFor(req.Header.Values("X-Forwarded-For")); ip != nil {
@@ -70,7 +70,7 @@ func (r *Resolver) resolve(req *http.Request) (net.IP, bool) {
 		}
 	}
 
-	return remoteIP, HasForwardingHeaders(req.Header)
+	return remoteIP, hasForwardingHeaders(req.Header)
 }
 
 // forwardedFor walks the X-Forwarded-For lines right to left and returns the
@@ -112,10 +112,10 @@ func hasForwardedEntry(values []string) bool {
 	return false
 }
 
-// HasForwardingHeaders reports whether the request names a forwarded client
+// hasForwardingHeaders reports whether the request names a forwarded client
 // in any header the resolver knows of. Forwarded (RFC 7239) is never parsed
 // for an address, but its presence still shows the peer is a forwarder.
-func HasForwardingHeaders(h http.Header) bool {
+func hasForwardingHeaders(h http.Header) bool {
 	return hasForwardedEntry(h.Values("X-Forwarded-For")) ||
 		hasForwardedEntry(h.Values("X-Real-IP")) ||
 		hasForwardedEntry(h.Values("Forwarded"))
@@ -239,21 +239,21 @@ func (r *Resolver) requestScheme(req *http.Request) string {
 	return ""
 }
 
-// forwardedHost is the single X-Forwarded-Host value a trusted proxy sent, or
-// "" when there is none to accept. A list, several headers or a value that is
-// not a bare host[:port] is ambiguous and counts as none. Like requestScheme
-// it must run before Middleware replaces the transport peer address.
-func (r *Resolver) forwardedHost(req *http.Request) string {
+// requestHost is the single X-Forwarded-Host value a trusted proxy sent, or
+// the Host header. A list, several headers or a value that is not a bare
+// host[:port] is ambiguous and falls back to Host. Like requestScheme it must
+// run before Middleware replaces the transport peer address.
+func (r *Resolver) requestHost(req *http.Request) string {
 	if !r.peerTrusted(req) {
-		return ""
+		return req.Host
 	}
 	values := req.Header.Values("X-Forwarded-Host")
 	if len(values) != 1 {
-		return ""
+		return req.Host
 	}
 	host := strings.TrimSpace(values[0])
-	if strings.ContainsAny(host, ",/?#@ \t") {
-		return ""
+	if host == "" || strings.ContainsAny(host, ",/?#@ \t") {
+		return req.Host
 	}
 	return host
 }

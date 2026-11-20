@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
 
 import type {
@@ -17,7 +17,6 @@ import {
   seasonFromV2,
 } from "@/api/v2/catalog";
 import { v2 } from "@/api/v2/request";
-import { artworkQuery, type ArtworkSurface } from "@/lib/artworkWidths";
 import { catalogKeys } from "./keys";
 
 type ReadOptions = Pick<RequestInit, "signal"> | undefined;
@@ -34,11 +33,10 @@ export async function fetchCatalogItemDetail(
   id: string,
   libraryId?: number,
   options?: ReadOptions,
-  surface: Extract<ArtworkSurface, "detail" | "onDeck"> = "detail",
 ): Promise<ItemDetail> {
   const detail = await v2("GET /api/v2/catalog/items/{id}", {
     path: { id },
-    query: { ...libraryQuery(libraryId), ...artworkQuery(surface) },
+    query: libraryQuery(libraryId),
     signal: signalOf(options),
   });
   return catalogItemDetailFromV2(detail);
@@ -62,7 +60,7 @@ export async function fetchCatalogItemEpisodes(
 ): Promise<EpisodesResponse> {
   const episodes = await v2("GET /api/v2/catalog/items/{id}/episodes", {
     path: { id },
-    query: { ...libraryQuery(libraryId), ...artworkQuery("episodes") },
+    query: libraryQuery(libraryId),
     signal: signalOf(options),
   });
   return { episodes: episodes.items.map(episodeFromV2) };
@@ -75,7 +73,7 @@ export async function fetchCatalogSeriesSeasons(
 ): Promise<SeasonsResponse> {
   const seasons = await v2("GET /api/v2/catalog/series/{id}/seasons", {
     path: { id: seriesId },
-    query: { ...libraryQuery(libraryId), ...artworkQuery("seasons") },
+    query: libraryQuery(libraryId),
     signal: signalOf(options),
   });
   return { seasons: seasons.items.map(seasonFromV2) };
@@ -89,7 +87,7 @@ export async function fetchCatalogSeasonDetail(
 ): Promise<SeasonDetailResponse> {
   const season = await v2("GET /api/v2/catalog/series/{id}/seasons/{num}", {
     path: { id: seriesId, num: seasonNum },
-    query: { ...libraryQuery(libraryId), ...artworkQuery("detail") },
+    query: libraryQuery(libraryId),
     signal: signalOf(options),
   });
   return { season: seasonFromV2(season) };
@@ -100,11 +98,10 @@ export async function fetchCatalogSeasonEpisodes(
   seasonNum: number,
   libraryId?: number,
   options?: ReadOptions,
-  surface: Extract<ArtworkSurface, "episodes" | "upNext"> = "episodes",
 ): Promise<EpisodesResponse> {
   const episodes = await v2("GET /api/v2/catalog/series/{id}/seasons/{num}/episodes", {
     path: { id: seriesId, num: seasonNum },
-    query: { ...libraryQuery(libraryId), ...artworkQuery(surface) },
+    query: libraryQuery(libraryId),
     signal: signalOf(options),
   });
   return { episodes: episodes.items.map(episodeFromV2) };
@@ -156,36 +153,37 @@ export function useCatalogItemEpisodes(id: string | undefined, libraryId?: numbe
 }
 
 /**
- * Warms an item's detail query ahead of opening it. It keeps the app's retry
- * policy: an item page opened while this is still running joins this request.
- */
-export function prefetchCatalogItemDetail(
-  queryClient: QueryClient,
-  id: string,
-  libraryId?: number,
-): Promise<void> {
-  return queryClient.prefetchQuery({
-    queryKey: catalogKeys.itemDetail(id, libraryId),
-    queryFn: ({ signal }) => fetchCatalogItemDetail(id, libraryId, { signal }),
-  });
-}
-
-/**
- * Returns a callback that warms a season detail page (item detail + episodes),
- * so opening it from a series page renders without a request waterfall.
- * Prefetches are no-ops while the cached data is fresh.
+ * Returns a callback that warms the cache for a season detail page (item
+ * detail + episodes), so navigating there from a series page renders without
+ * a request waterfall. Prefetches are no-ops while the cached data is fresh.
  */
 export function usePrefetchCatalogSeason(libraryId?: number) {
   const queryClient = useQueryClient();
   return useCallback(
-    (seasonId: string) =>
-      Promise.all([
-        prefetchCatalogItemDetail(queryClient, seasonId, libraryId),
-        queryClient.prefetchQuery({
-          queryKey: catalogKeys.itemEpisodes(seasonId, libraryId),
-          queryFn: ({ signal }) => fetchCatalogItemEpisodes(seasonId, libraryId, { signal }),
-        }),
-      ]),
+    (seasonId: string) => {
+      void queryClient.prefetchQuery({
+        queryKey: catalogKeys.itemDetail(seasonId, libraryId),
+        queryFn: ({ signal }) => fetchCatalogItemDetail(seasonId, libraryId, { signal }),
+      });
+      void queryClient.prefetchQuery({
+        queryKey: catalogKeys.itemEpisodes(seasonId, libraryId),
+        queryFn: ({ signal }) => fetchCatalogItemEpisodes(seasonId, libraryId, { signal }),
+      });
+    },
+    [queryClient, libraryId],
+  );
+}
+
+/** Warms an episode's detail query when the user shows intent to open it. */
+export function usePrefetchCatalogItemDetail(libraryId?: number) {
+  const queryClient = useQueryClient();
+  return useCallback(
+    (itemId: string) => {
+      void queryClient.prefetchQuery({
+        queryKey: catalogKeys.itemDetail(itemId, libraryId),
+        queryFn: ({ signal }) => fetchCatalogItemDetail(itemId, libraryId, { signal }),
+      });
+    },
     [queryClient, libraryId],
   );
 }

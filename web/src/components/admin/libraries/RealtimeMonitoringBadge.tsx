@@ -2,7 +2,6 @@ import { AlertTriangle } from "lucide-react";
 
 import type { LibraryRealtimeMonitoringEntry } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
-import { useT } from "@/i18n";
 
 import {
   realtimeMonitoringNeedsAttention,
@@ -15,7 +14,6 @@ export function RealtimeMonitoringBadge({
 }: {
   entry: LibraryRealtimeMonitoringEntry | undefined;
 }) {
-  const t = useT();
   if (!realtimeMonitoringNeedsAttention(entry)) return null;
   const label = realtimeMonitoringStateLabel(entry.state);
   const detail = entry.detail.trim();
@@ -23,15 +21,11 @@ export function RealtimeMonitoringBadge({
     <Badge
       variant="outline"
       className="border-warning/40 text-warning"
-      title={detail || t("web.admin.common.libraryEditor.monitoringBadge.title", { state: label })}
+      title={detail || `Real-time monitoring: ${label}`}
     >
       <AlertTriangle aria-hidden="true" />
-      {t("web.admin.common.libraryEditor.monitoringBadge.label", { state: label })}
-      {detail ? (
-        <span className="sr-only">
-          {t("web.admin.common.libraryEditor.monitoringBadge.srDetail", { detail })}
-        </span>
-      ) : null}
+      Monitoring: {label}
+      {detail ? <span className="sr-only">. {detail}</span> : null}
     </Badge>
   );
 }

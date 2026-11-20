@@ -64,9 +64,6 @@ type MarkWatchedTarget struct {
 	// EventAt preserves an explicitly supplied progress date while the write
 	// timestamp advances independently. Nil retains normal manual-mark timing.
 	EventAt *time.Time
-	// RecordRewatch marks a completed target that has a resume position again,
-	// recording its play; otherwise a completed target is left as it is.
-	RecordRewatch bool
 }
 
 // WatchedBatchWriter is an optional store capability: mark every target
@@ -238,16 +235,8 @@ func GetProgressWithCompletedHistory(ctx context.Context, store UserStore, profi
 		ProfileID:    profileID,
 		MediaItemIDs: []string{mediaItemID},
 	})[mediaItemID]
-	return WithCompletedHistory(progress, completed, profileID, mediaItemID), nil
-}
-
-// WithCompletedHistory overlays one item's latest completed history entry on
-// its progress row the way GetProgressWithCompletedHistory presents it. A
-// completed row is returned as it is, and a zero entry (no completed watch)
-// leaves progress unchanged.
-func WithCompletedHistory(progress *WatchProgress, completed CompletedHistoryItem, profileID, mediaItemID string) *WatchProgress {
-	if (progress != nil && progress.Completed) || completed.MediaItemID == "" {
-		return progress
+	if completed.MediaItemID == "" {
+		return progress, nil
 	}
 	if progress == nil {
 		return &WatchProgress{
@@ -255,13 +244,13 @@ func WithCompletedHistory(progress *WatchProgress, completed CompletedHistoryIte
 			MediaItemID: mediaItemID,
 			Completed:   true,
 			UpdatedAt:   completed.WatchedAt,
-		}
+		}, nil
 	}
 	progress.Completed = true
 	if timestampAfter(completed.WatchedAt, progress.UpdatedAt) {
 		progress.UpdatedAt = completed.WatchedAt
 	}
-	return progress
+	return progress, nil
 }
 
 // ListProgressWithCompletedHistory returns progress for mediaItemIDs with

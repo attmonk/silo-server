@@ -84,9 +84,7 @@ func ebookFlagPredicate(settings catalog.SettingsStore, key string) func(context
 }
 
 // ebookConversionCacheDir derives the converted-EPUB cache directory, a sibling
-// of the transcode dir so it lives alongside other derived media. That is often
-// the shared temp dir, so NewCache refuses a directory another local account
-// could control and the feature stays off with a warning.
+// of the transcode dir so it lives alongside other derived media.
 func ebookConversionCacheDir(cfg *config.Config) string {
 	base := os.TempDir()
 	if cfg != nil && strings.TrimSpace(cfg.Playback.TranscodeDir) != "" {

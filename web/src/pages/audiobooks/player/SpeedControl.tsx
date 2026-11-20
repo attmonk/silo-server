@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Minus, Plus } from "lucide-react";
-import { useT, type Translate } from "@/i18n";
 import {
   AUDIOBOOK_RATE_MAX,
   AUDIOBOOK_RATE_MIN,
@@ -8,13 +7,12 @@ import {
   AUDIOBOOK_RATE_STEP,
   clampAudiobookRate,
 } from "./useAudiobookPrefs";
-import { formatDecimal } from "@/lib/numberFormat";
 
 const HOLD_DELAY_MS = 250;
 const HOLD_REPEAT_MS = 80;
 
-export function formatRate(t: Translate, rate: number): string {
-  return t("web.audiobooks.player.rate", { rate: formatDecimal(rate, 2, 0) });
+export function formatRate(rate: number): string {
+  return `${rate}×`;
 }
 
 interface SpeedControlProps {
@@ -28,7 +26,6 @@ interface SpeedControlProps {
  * playback engine.
  */
 export function SpeedControl({ value, onChange }: SpeedControlProps) {
-  const t = useT();
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const valueRef = useRef(value);
@@ -95,19 +92,19 @@ export function SpeedControl({ value, onChange }: SpeedControlProps) {
         type="button"
         className="player-utility-btn min-w-[3.25rem] px-2 text-xs tabular-nums"
         onClick={() => setOpen((v) => !v)}
-        aria-label={t("web.audiobooks.player.speed")}
+        aria-label="Playback speed"
         aria-expanded={open}
         aria-haspopup="dialog"
-        title={t("web.audiobooks.player.speedTitle")}
+        title="Playback speed (shift+. / shift+,)"
       >
-        {formatRate(t, value)}
+        {formatRate(value)}
       </button>
 
       {open && (
         <div
           role="dialog"
-          aria-label={t("web.audiobooks.player.speed")}
-          className="absolute end-0 bottom-full mb-2 flex w-[230px] flex-col gap-3 rounded-lg bg-black/90 px-4 py-3 shadow-xl backdrop-blur-sm"
+          aria-label="Playback speed"
+          className="absolute right-0 bottom-full mb-2 flex w-[230px] flex-col gap-3 rounded-lg bg-black/90 px-4 py-3 shadow-xl backdrop-blur-sm"
           onKeyDown={handlePopoverKeyDown}
         >
           <div className="flex items-center justify-between">
@@ -118,7 +115,7 @@ export function SpeedControl({ value, onChange }: SpeedControlProps) {
               onHoldStop={stopHold}
             />
             <span className="min-w-[4.5rem] text-center font-mono text-lg text-white tabular-nums">
-              {formatRate(t, value)}
+              {formatRate(value)}
             </span>
             <StepperButton
               direction={1}
@@ -139,14 +136,12 @@ export function SpeedControl({ value, onChange }: SpeedControlProps) {
                 }`}
                 onClick={() => onChange(preset)}
               >
-                {formatRate(t, preset)}
+                {formatRate(preset)}
               </button>
             ))}
           </div>
 
-          <p className="text-center text-[11px] text-white/40">
-            {t("web.audiobooks.player.speedRemembered")}
-          </p>
+          <p className="text-center text-[11px] text-white/40">Remembered for this book</p>
         </div>
       )}
     </div>
@@ -164,14 +159,11 @@ function StepperButton({
   onHoldStart: (direction: 1 | -1) => void;
   onHoldStop: () => void;
 }) {
-  const t = useT();
   const Icon = direction === 1 ? Plus : Minus;
   return (
     <button
       type="button"
-      aria-label={
-        direction === 1 ? t("web.audiobooks.player.faster") : t("web.audiobooks.player.slower")
-      }
+      aria-label={direction === 1 ? "Faster" : "Slower"}
       disabled={disabled}
       className="flex h-8 w-8 items-center justify-center rounded-full text-white/75 transition-colors hover:bg-white/10 hover:text-white focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
       onPointerDown={(e) => {

@@ -91,8 +91,22 @@ func (h *LibraryHandler) ListLibraries(ctx context.Context) ([]LibraryView, erro
 // CreateLibrary creates a library, seeds its sections and provider chain,
 // and queues its first scan.
 func (h *LibraryHandler) CreateLibrary(ctx context.Context, req LibraryCreateRequest) (LibraryView, error) {
-	if err := h.normalizeNewLibrary(&req); err != nil {
+	if len(req.Paths) == 0 || req.Type == "" || req.Name == "" {
+		return LibraryView{}, apiError(http.StatusBadRequest, "bad_request", "Paths, type, and name are required")
+	}
+	paths, err := normalizeLibraryPaths(req.Paths)
+	if err != nil {
 		return LibraryView{}, err
+	}
+	req.Paths = paths
+	if req.MetadataLanguage != "" && !validMetadataLanguages[req.MetadataLanguage] {
+		return LibraryView{}, fieldError("metadata_language", "Invalid metadata_language; must be a valid ISO 639-1 code")
+	}
+	if req.ChapterThumbnailsEnabled && h.ArtworkStore == nil {
+		return LibraryView{}, fieldError("chapter_thumbnails_enabled", "Chapter thumbnails require configured artwork storage")
+	}
+	if req.TrickplayEnabled && h.ArtworkStore == nil {
+		return LibraryView{}, fieldError("trickplay_enabled", "Seek previews require configured artwork storage")
 	}
 
 	folder, err := h.folderRepo.Create(ctx, catalog.CreateFolderInput{
@@ -105,9 +119,6 @@ func (h *LibraryHandler) CreateLibrary(ctx context.Context, req LibraryCreateReq
 		TrailerKinds:             req.TrailerKinds,
 		RealtimeMonitoring:       req.RealtimeMonitoring,
 		TrickplayEnabled:         req.TrickplayEnabled,
-		BoxSetsEnabled:           req.BoxSetsEnabled,
-		BoxSetMinMovies:          req.BoxSetMinMovies,
-		BoxSetsInSearch:          req.BoxSetsInSearch,
 	})
 	if err != nil {
 		if errors.Is(err, catalog.ErrDuplicatePath) {
@@ -116,48 +127,9 @@ func (h *LibraryHandler) CreateLibrary(ctx context.Context, req LibraryCreateReq
 		slog.ErrorContext(ctx, "creating library", "component", "api", "error", err)
 		return LibraryView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to create library")
 	}
-	h.afterLibraryCreated(ctx, folder, req.Type)
-	return h.toLibraryResponseWithPoster(ctx, folder), nil
-}
-
-// LibraryRestored runs the library editor's follow-ups for a library a
-// backup restore created and committed: real-time monitoring, seek
-// previews, box sets, default sections, the provider chain, and the first
-// scan. It returns an error when any of them failed, so the restore keeps
-// its follow-up row and runs them again; every step is safe to repeat.
-// Sections are seeded only where none exist, and a provider chain already
-// set is left alone.
-func (h *LibraryHandler) LibraryRestored(ctx context.Context, id int) error {
-	folder, err := h.folderRepo.GetByID(ctx, id)
-	if err != nil {
-		return err
-	}
-	return h.setUpNewLibrary(ctx, folder)
-}
-
-// LibrarySectionsRestored seeds a restored library's default and home
-// sections where none exist. A restore runs it after it wrote the saved
-// sections it carries, so a default renamed before the backup is not
-// seeded again beside it.
-func (h *LibraryHandler) LibrarySectionsRestored(ctx context.Context, id int) error {
-	folder, err := h.folderRepo.GetByID(ctx, id)
-	if err != nil {
-		return err
-	}
-	return errors.Join(h.seedSections(ctx, folder)...)
-}
-
-// afterLibraryCreated is the work that follows a new library in the editor,
-// as it always was: each step is best effort and its failure is logged. A
-// restore uses setUpNewLibrary instead, which returns failures so they are
-// retried.
-func (h *LibraryHandler) afterLibraryCreated(ctx context.Context, folder *models.MediaFolder, libraryType string) {
 	h.pokeRealtimeMonitor()
-	if folder.TrickplayEnabled {
+	if req.TrickplayEnabled {
 		h.reconcileTrickplay()
-	}
-	if folder.BoxSetsEnabled {
-		h.syncBoxSets()
 	}
 
 	// Seed default sections for the new library.
@@ -177,7 +149,7 @@ func (h *LibraryHandler) afterLibraryCreated(ctx context.Context, folder *models
 
 	// Seed default provider chain from plugin manifest defaults.
 	if h.ChainRepo != nil {
-		entries := h.seedDefaultChain(ctx, libraryType)
+		entries := h.seedDefaultChain(ctx, req.Type)
 		if len(entries) > 0 {
 			if seedErr := h.ChainRepo.SetChain(ctx, folder.ID, entries); seedErr != nil {
 				slog.WarnContext(ctx, "seed default chain failed", "component", "api", "folder_id", folder.ID, "error", seedErr)
@@ -186,97 +158,21 @@ func (h *LibraryHandler) afterLibraryCreated(ctx context.Context, folder *models
 	}
 
 	// Kick off an initial scan so content appears immediately.
-	_ = h.queueInitialScan(ctx, folder) // logged; the editor treats it as best effort
-}
-
-// queueInitialScan queues a new library's first scan, or runs it here when
-// this node has no scan queue.
-func (h *LibraryHandler) queueInitialScan(ctx context.Context, folder *models.MediaFolder) error {
 	if h.ScanQueue != nil {
 		if _, err := h.ScanQueue.EnqueueLibraryScan(ctx, folder.ID, "library_created"); err != nil {
 			slog.WarnContext(ctx, "queue initial library scan failed", "component", "api", "library_id", folder.ID, "error", err)
-			return fmt.Errorf("queue initial library scan: %w", err)
 		}
-		return nil
-	}
-	initialScanID := ulid.Make().String()
-	h.recordAcceptedScan(initialScanID, &scantrigger.Target{
-		Folder:  folder,
-		Mode:    scantrigger.ModeLibrary,
-		Trigger: "library_created",
-	})
-	h.runFolderScanAsync(initialScanID, folder, "library_created")
-	return nil
-}
-
-// setUpNewLibrary runs every step that follows a restored library but its
-// sections (LibrarySectionsRestored) and returns the steps that failed,
-// joined. A failed step does not stop the others. A provider chain already
-// set is left alone.
-func (h *LibraryHandler) setUpNewLibrary(ctx context.Context, folder *models.MediaFolder) error {
-	var errs []error
-	h.pokeRealtimeMonitor()
-	if folder.TrickplayEnabled {
-		h.reconcileTrickplay()
-	}
-	if folder.BoxSetsEnabled {
-		h.syncBoxSets()
+	} else {
+		initialScanID := ulid.Make().String()
+		h.recordAcceptedScan(initialScanID, &scantrigger.Target{
+			Folder:  folder,
+			Mode:    scantrigger.ModeLibrary,
+			Trigger: "library_created",
+		})
+		h.runFolderScanAsync(initialScanID, folder, "library_created")
 	}
 
-	if err := h.seedChain(ctx, folder.ID, folder.Type); err != nil {
-		errs = append(errs, err)
-	}
-	if err := h.queueInitialScan(ctx, folder); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
-}
-
-// seedSections seeds a restored library's default and home sections where
-// none exist, returning the steps that failed.
-func (h *LibraryHandler) seedSections(ctx context.Context, folder *models.MediaFolder) []error {
-	if h.SectionRepo == nil {
-		return nil
-	}
-	var errs []error
-	if err := h.SectionRepo.SeedDefaults(ctx, "library", &folder.ID, sections.DefaultLibrarySectionsForType(&folder.ID, folder.Type)); err != nil {
-		errs = append(errs, fmt.Errorf("seed default sections: %w", err))
-	}
-	if sections.IsAudiobookLibraryType(folder.Type) {
-		if _, err := h.SectionRepo.EnsureHomeContinueListeningSection(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("ensure home continue listening section: %w", err))
-		}
-	}
-	if _, err := h.SectionRepo.CreateGeneratedHomeLibraryRecentSections(ctx, folder.ID, folder.Name, folder.Type); err != nil {
-		errs = append(errs, fmt.Errorf("seed generated home sections: %w", err))
-	}
-	return errs
-}
-
-// seedChain sets a restored library's default provider chain, unless a
-// chain is already set.
-func (h *LibraryHandler) seedChain(ctx context.Context, folderID int, libraryType string) error {
-	if h.ChainRepo == nil {
-		return nil
-	}
-	existing, err := h.ChainRepo.GetAllChainEntries(ctx, folderID)
-	if err != nil {
-		return fmt.Errorf("read provider chain: %w", err)
-	}
-	if len(existing) > 0 {
-		return nil
-	}
-	entries, err := h.defaultChain(ctx, libraryType)
-	if err != nil {
-		return fmt.Errorf("build default provider chain: %w", err)
-	}
-	if len(entries) == 0 {
-		return nil
-	}
-	if err := h.ChainRepo.SetChain(ctx, folderID, entries); err != nil {
-		return fmt.Errorf("seed default chain: %w", err)
-	}
-	return nil
+	return h.toLibraryResponseWithPoster(ctx, folder), nil
 }
 
 // UpdateLibrary applies a partial update and triggers the follow-up work a
@@ -310,14 +206,6 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 		return LibraryView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to fetch library")
 	}
 
-	libraryType := oldFolder.Type
-	if req.Type != nil {
-		libraryType = *req.Type
-	}
-	if err := validateBoxSetUpdate(libraryType, oldFolder.BoxSetsEnabled, &req); err != nil {
-		return LibraryView{}, err
-	}
-
 	err = h.folderRepo.Update(ctx, id, catalog.UpdateFolderInput{
 		Paths:                    req.Paths,
 		Type:                     req.Type,
@@ -330,9 +218,6 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 		TrailerKinds:             req.TrailerKinds,
 		RealtimeMonitoring:       req.RealtimeMonitoring,
 		TrickplayEnabled:         req.TrickplayEnabled,
-		BoxSetsEnabled:           req.BoxSetsEnabled,
-		BoxSetMinMovies:          req.BoxSetMinMovies,
-		BoxSetsInSearch:          req.BoxSetsInSearch,
 	})
 	if err != nil {
 		if errors.Is(err, catalog.ErrFolderNotFound) {
@@ -354,9 +239,6 @@ func (h *LibraryHandler) UpdateLibrary(ctx context.Context, id, userID int, req 
 	if err != nil {
 		slog.ErrorContext(ctx, "fetching updated library", "component", "api", "error", err)
 		return LibraryView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to fetch updated library")
-	}
-	if folder.BoxSetsEnabled && (!oldFolder.BoxSetsEnabled || req.Paths != nil || req.Enabled != nil) {
-		h.syncBoxSets()
 	}
 
 	if h.SectionRepo != nil && oldFolder.Name != folder.Name {
@@ -978,10 +860,6 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 		return nil, 0, apiError(http.StatusInternalServerError, "internal_error", "Database not configured")
 	}
 	search = strings.TrimSpace(search)
-	// Audiobooks keep media_items.status empty; one with no provider match
-	// after enrichment lists as unmatched.
-	unmatchedWhere := `(mi.status IN ('unmatched', 'pending', 'ambiguous') OR (` + catalog.AudiobookUnmatchedWhere("mi") + `))`
-	const unmatchedStatusSQL = `CASE WHEN mi.status IN ('unmatched', 'pending', 'ambiguous') THEN mi.status ELSE 'unmatched' END`
 	filter := ""
 	filterArgs := []any{}
 	if search != "" {
@@ -989,7 +867,7 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 		filter = ` AND (
 			mi.title ILIKE $1
 			OR mi.type ILIKE $1
-			OR ` + unmatchedStatusSQL + ` ILIKE $1
+			OR mi.status ILIKE $1
 			OR EXISTS (
 				SELECT 1
 				FROM media_item_libraries search_mil
@@ -1000,18 +878,15 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 		)`
 	}
 
-	// An item in no library has no file left to match.
-	guards := ` AND ` + catalog.MangaChapterExclusionWhere("mi") + ` AND ` + catalog.InSomeLibraryWhere("mi.content_id")
+	guards := ` AND ` + catalog.MangaChapterExclusionWhere("mi") + ` AND mi.match_ignored_at IS NULL`
 	if ignored {
-		guards += ` AND mi.match_ignored_at IS NOT NULL`
-	} else {
-		guards += ` AND mi.match_ignored_at IS NULL`
+		guards = ` AND ` + catalog.MangaChapterExclusionWhere("mi") + ` AND mi.match_ignored_at IS NOT NULL`
 	}
 
 	countSQL := `
 		SELECT COUNT(*)
 		FROM media_items mi
-		WHERE ` + unmatchedWhere + guards
+		WHERE mi.status IN ('unmatched', 'pending', 'ambiguous')` + guards
 	countSQL += filter
 
 	var total int
@@ -1022,7 +897,7 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 
 	listArgs := append(append([]any{}, filterArgs...), limit, offset)
 	listSQL := fmt.Sprintf(`
-		SELECT mi.content_id, mi.title, mi.year, mi.type, %s,
+		SELECT mi.content_id, mi.title, mi.year, mi.type, mi.status,
 		       COALESCE(lib.folder_id, 0),
 		       COALESCE(lib.folder_name, ''),
 		       mi.match_ignored_at
@@ -1034,10 +909,10 @@ func (h *LibraryHandler) ListUnmatchedItems(ctx context.Context, search string, 
 			WHERE mil.content_id = mi.content_id
 			LIMIT 1
 		) lib ON true
-		WHERE %s%s%s
+		WHERE mi.status IN ('unmatched', 'pending', 'ambiguous')%s%s
 		ORDER BY mi.title ASC, mi.content_id ASC
 		LIMIT $%d OFFSET $%d
-	`, unmatchedStatusSQL, unmatchedWhere, guards, filter, len(filterArgs)+1, len(filterArgs)+2)
+	`, guards, filter, len(filterArgs)+1, len(filterArgs)+2)
 
 	rows, err := h.pool.Query(ctx, listSQL, listArgs...)
 	if err != nil {
@@ -1222,42 +1097,6 @@ type RawMatchBacklogEntryView = libraryRawMatchBacklogEntryResponse
 
 // ProviderChainEntryInput is one entry of a set-chain command.
 type ProviderChainEntryInput = chainEntryInput
-
-// normalizeNewLibrary validates and normalizes a library the create command
-// takes: its required fields, folders, metadata language, the features that
-// need artwork storage, and box set settings.
-func (h *LibraryHandler) normalizeNewLibrary(req *LibraryCreateRequest) error {
-	if len(req.Paths) == 0 || req.Type == "" || req.Name == "" {
-		return apiError(http.StatusBadRequest, "bad_request", "Paths, type, and name are required")
-	}
-	paths, err := normalizeLibraryPaths(req.Paths)
-	if err != nil {
-		return err
-	}
-	req.Paths = paths
-	if req.MetadataLanguage != "" && !validMetadataLanguages[req.MetadataLanguage] {
-		return fieldError("metadata_language", "Invalid metadata_language; must be a valid ISO 639-1 code")
-	}
-	if req.ChapterThumbnailsEnabled && h.ArtworkStore == nil {
-		return fieldError("chapter_thumbnails_enabled", "Chapter thumbnails require configured artwork storage")
-	}
-	if req.TrickplayEnabled && h.ArtworkStore == nil {
-		return fieldError("trickplay_enabled", "Seek previews require configured artwork storage")
-	}
-	return validateBoxSetSettings(req.Type, &req.BoxSetsEnabled, &req.BoxSetMinMovies)
-}
-
-// CheckRestoredLibrary applies the library create command's checks
-// (normalizeNewLibrary) to a library a backup restore creates, so a restore
-// stores nothing the editor would refuse.
-func (h *LibraryHandler) CheckRestoredLibrary(in catalog.CreateFolderInput) error {
-	return restoreCheckError(h.normalizeNewLibrary(&LibraryCreateRequest{
-		Paths: in.Paths, Type: in.Type, Name: in.Name, MetadataLanguage: in.MetadataLanguage,
-		ChapterThumbnailsEnabled: in.ChapterThumbnailsEnabled, IntroDetectionEnabled: in.IntroDetectionEnabled,
-		TrailerKinds: in.TrailerKinds, RealtimeMonitoring: in.RealtimeMonitoring, TrickplayEnabled: in.TrickplayEnabled,
-		BoxSetsEnabled: in.BoxSetsEnabled, BoxSetMinMovies: in.BoxSetMinMovies, BoxSetsInSearch: in.BoxSetsInSearch,
-	}))
-}
 
 // maxLibraryPosterBytes caps a poster upload.
 const maxLibraryPosterBytes = 10 << 20
@@ -1641,35 +1480,4 @@ func normalizeLibraryPaths(paths []string) ([]string, error) {
 		normalized[i] = filepath.Clean(path)
 	}
 	return normalized, nil
-}
-
-// validateBoxSetSettings checks the box set settings of a new library. Box
-// sets group movies, so a library that holds none cannot turn them on.
-func validateBoxSetSettings(libraryType string, enabled *bool, minMovies *int) error {
-	if *enabled && !catalog.LibraryTypeSupportsBoxSets(libraryType) {
-		return fieldError("box_sets_enabled", "Box sets are available for movie and mixed libraries only")
-	}
-	if *minMovies != 0 && (*minMovies < catalog.MinBoxSetMinMovies || *minMovies > catalog.MaxBoxSetMinMovies) {
-		return fieldError("box_set_min_movies", fmt.Sprintf("box_set_min_movies must be between %d and %d", catalog.MinBoxSetMinMovies, catalog.MaxBoxSetMinMovies))
-	}
-	return nil
-}
-
-// validateBoxSetUpdate checks a library update's box set settings against the
-// library's resulting type. Changing a library to a type without movies turns
-// its box sets off rather than keeping a setting that no longer applies.
-func validateBoxSetUpdate(libraryType string, wasEnabled bool, req *LibraryUpdateRequest) error {
-	if req.BoxSetMinMovies != nil && (*req.BoxSetMinMovies < catalog.MinBoxSetMinMovies || *req.BoxSetMinMovies > catalog.MaxBoxSetMinMovies) {
-		return fieldError("box_set_min_movies", fmt.Sprintf("box_set_min_movies must be between %d and %d", catalog.MinBoxSetMinMovies, catalog.MaxBoxSetMinMovies))
-	}
-	if catalog.LibraryTypeSupportsBoxSets(libraryType) {
-		return nil
-	}
-	if req.BoxSetsEnabled != nil && *req.BoxSetsEnabled {
-		return fieldError("box_sets_enabled", "Box sets are available for movie and mixed libraries only")
-	}
-	if wasEnabled {
-		req.BoxSetsEnabled = new(false)
-	}
-	return nil
 }

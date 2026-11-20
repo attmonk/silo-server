@@ -22,7 +22,6 @@ import type {
   PageRef,
 } from "@/lib/homeRows/types";
 import { fetchRecipeCatalog, type RecipeCatalogResponse } from "@/lib/recipes";
-import { useT } from "@/i18n";
 import { useProfileHomeRows } from "./useProfileHomeRows";
 import { useProfileRowCollections } from "./useRowCollectionOptions";
 
@@ -58,13 +57,6 @@ function toHomeRow(section: SettingsSectionEntry): HomeRow {
     shown: !section.hidden,
     own: section.is_custom,
     renamedFrom: renamed ? section.default_title : undefined,
-    renamedFromKey:
-      renamed && section.default_title_key
-        ? { key: section.default_title_key, args: section.default_title_args }
-        : undefined,
-    titleKey: section.title_key
-      ? { title: section.title, key: section.title_key, args: section.title_args }
-      : undefined,
   };
 }
 
@@ -121,16 +113,15 @@ export function useProfileHomeRowsAdapter(): ProfileHomeRowsAdapter {
     [setHookPage, setSearchParams],
   );
 
-  const t = useT();
   const pages = useMemo<HomeRowsPageOption[]>(
     () => [
-      { ref: { kind: "home" }, label: t("web.home.rows.pages.home") },
+      { ref: { kind: "home" }, label: "Home" },
       ...(libraries ?? []).map((library) => ({
         ref: { kind: "library" as const, libraryId: library.id },
         label: library.name,
       })),
     ],
-    [libraries, t],
+    [libraries],
   );
 
   const catalogQuery = useQuery({
@@ -156,8 +147,8 @@ export function useProfileHomeRowsAdapter(): ProfileHomeRowsAdapter {
   );
 
   const assertEditable = useCallback(() => {
-    if (!canEdit) throw new Error(t("web.home.rows.links.pageLocked"));
-  }, [canEdit, t]);
+    if (!canEdit) throw new Error("This page can't change right now.");
+  }, [canEdit]);
 
   const { saveSection, setHidden, move, lastWriteAt } = homeRows;
 
@@ -178,11 +169,11 @@ export function useProfileHomeRowsAdapter(): ProfileHomeRowsAdapter {
   const openEdit = useCallback(
     async (id: string): Promise<EditSession> => {
       const section = sectionFor(id);
-      if (!section) throw new Error(t("web.home.rows.links.rowMissing"));
+      if (!section) throw new Error("This row is no longer on this page.");
       // A profile changes how a server row looks, never what it shows.
       return { row: toHomeRow(section), token: section, kindLocked: !section.is_custom };
     },
-    [sectionFor, t],
+    [sectionFor],
   );
 
   const save = useCallback(

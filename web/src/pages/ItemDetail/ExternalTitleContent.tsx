@@ -13,9 +13,14 @@ import { tmdbRating } from "@/components/ratings/ratings";
 import { MoreLikeThisRow } from "@/components/RecommendationGrid";
 import RequestPosterCard from "@/components/RequestPosterCard";
 import { SeasonStatus } from "@/components/RequestSeasonsDialog";
+import { useCreateMediaRequest } from "@/hooks/queries/useRequests";
 import { useWatchlistTitleToggle } from "@/hooks/useWatchlistTitleToggle";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
-import { formatRequestSeasonMeta, tmdbImageURL } from "@/lib/mediaRequests";
+import {
+  formatRequestSeasonMeta,
+  requestInputFromMediaResult,
+  tmdbImageURL,
+} from "@/lib/mediaRequests";
 import DetailHero from "./DetailHero";
 import DetailLayout, { DetailSection } from "./DetailLayout";
 import HeroCrewLine from "./components/HeroCrewLine";
@@ -23,7 +28,6 @@ import MetadataBadges from "./components/MetadataBadges";
 import RequestActionBar from "./components/RequestActionBar";
 import ScoreRow from "./components/ScoreRow";
 import { SeasonRail } from "./SeasonCarousel";
-import { useT } from "@/i18n";
 
 interface ExternalTitleContentProps {
   item: RequestMediaDetail;
@@ -37,7 +41,6 @@ interface ExternalTitleContentProps {
  * page keeps the default ambient tint.
  */
 export default function ExternalTitleContent({ item, libraryHref }: ExternalTitleContentProps) {
-  const t = useT();
   const isSeries = item.media_type === "series";
   const cast = useMemo(() => castFromTMDB(item.cast ?? []), [item.cast]);
   const crew = useMemo(
@@ -54,7 +57,7 @@ export default function ExternalTitleContent({ item, libraryHref }: ExternalTitl
         <DetailHero
           title={item.title}
           topNav={<PageBack to="/requests" />}
-          context={isSeries ? t("web.detail.hero.typeSeries") : t("web.detail.hero.typeMovie")}
+          context={isSeries ? "Series" : "Movie"}
           studioLabel={pickStudioLabel(item)}
           backdropUrl={tmdbImageURL(item.backdrop_path, "original") ?? undefined}
           posterUrl={tmdbImageURL(item.poster_path, "w500") ?? undefined}
@@ -75,7 +78,7 @@ export default function ExternalTitleContent({ item, libraryHref }: ExternalTitl
             <HeroCrewLine
               crew={crew}
               genres={item.genres}
-              jobLabel={isSeries ? t("web.detail.overview.createdBy") : undefined}
+              jobLabel={isSeries ? "Created by" : undefined}
             />
           }
           actions={<RequestActionBar item={item} libraryHref={libraryHref} />}
@@ -85,7 +88,7 @@ export default function ExternalTitleContent({ item, libraryHref }: ExternalTitl
       {isSeries && (item.seasons?.length ?? 0) > 0 && <TitleSeasons seasons={item.seasons!} />}
 
       {cast.length > 0 && (
-        <DetailSection title={t("web.detail.sections.cast")}>
+        <DetailSection title="Cast">
           <CastCarousel cast={cast} />
         </DetailSection>
       )}
@@ -97,11 +100,10 @@ export default function ExternalTitleContent({ item, libraryHref }: ExternalTitl
 
 /** A series' seasons with what the library has and what is requested, like the library's season row. */
 function TitleSeasons({ seasons }: { seasons: RequestMediaSeason[] }) {
-  const t = useT();
   return (
     <SeasonRail count={seasons.length}>
       {seasons.map((season) => {
-        const name = t("web.detail.seasons.numbered", { season: season.season_number });
+        const name = `Season ${season.season_number}`;
         const poster = tmdbImageURL(season.poster_path);
         return (
           <li key={season.season_number} className="embla__slide w-[160px] shrink-0 sm:w-[170px]">
@@ -134,8 +136,9 @@ function TitleSeasons({ seasons }: { seasons: RequestMediaSeason[] }) {
   );
 }
 
-/** "More Like This" for a TMDB title: request cards linking to each title's page. */
+/** "More Like This" for a TMDB title: request cards, each able to request its title. */
 function TitleRecommendations({ items }: { items: RequestMediaResult[] }) {
+  const createRequest = useCreateMediaRequest();
   const watchlist = useWatchlistTitleToggle();
   return (
     <MoreLikeThisRow
@@ -146,6 +149,12 @@ function TitleRecommendations({ items }: { items: RequestMediaResult[] }) {
           variant="discover"
           fluid
           item={item}
+          isSubmitting={
+            createRequest.isPending &&
+            createRequest.variables?.media_type === item.media_type &&
+            createRequest.variables?.tmdb_id === item.tmdb_id
+          }
+          onRequest={() => createRequest.mutate(requestInputFromMediaResult(item))}
           onToggleWatchlist={watchlist.enabled ? () => watchlist.toggle(item) : undefined}
           isWatchlistPending={watchlist.isPending(item)}
         />

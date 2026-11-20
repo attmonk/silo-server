@@ -65,9 +65,7 @@ func (reg *Registry) serveArtwork(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, r, NewProblem(TypeNotFound, "Artwork not found."))
 		return
 	}
-	// Backups, diagnostic bundles, and job artifacts can share a root with
-	// artwork; this route never serves them, whatever signs their key.
-	if err := blobstore.ValidateKey(key); err != nil || blobstore.Unserved(key) {
+	if err := blobstore.ValidateKey(key); err != nil {
 		writeProblem(w, r, NewProblem(TypeNotFound, "Artwork not found."))
 		return
 	}

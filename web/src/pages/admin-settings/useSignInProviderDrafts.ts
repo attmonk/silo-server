@@ -1,7 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 
 import type { PluginInstallation } from "@/api/types";
-import { t } from "@/i18n";
 import {
   useSaveSignInPluginConfig,
   useUpdateSignInBinding,
@@ -237,13 +236,10 @@ export function useSignInProviderDrafts(installations: PluginInstallation[] | un
         } catch (error) {
           return {
             ok: false,
-            text: t("web.admin.settings.signIn.drafts.saveFailed", {
-              provider: authProviderName(installation),
-              error: adminSignInErrorText(
-                error,
-                t("web.admin.settings.signIn.drafts.saveFallback"),
-              ),
-            }),
+            text: `${authProviderName(installation)}: ${adminSignInErrorText(
+              error,
+              "Couldn't save the changes.",
+            )}`,
           };
         }
       }

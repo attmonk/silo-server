@@ -1,9 +1,8 @@
-import {
-  defineDashboardWidget,
-  type DashboardLayoutEntry,
-  type DashboardWidgetDefinition,
-  type WidgetId,
-  type WidgetRangeOptions,
+import type {
+  DashboardLayoutEntry,
+  DashboardWidgetDefinition,
+  WidgetId,
+  WidgetRangeOptions,
 } from "./types";
 import {
   ActiveStreamsStatWidget,
@@ -34,7 +33,6 @@ import { DownloadsWidget } from "./widgets/DownloadsWidget";
 import { ScanActivityWidget } from "./widgets/ScanActivityWidget";
 import { RecentErrorsWidget } from "./widgets/RecentErrorsWidget";
 import { RecentActivityWidget } from "./widgets/RecentActivityWidget";
-import { ApiClientsWidget } from "./widgets/ApiClientsWidget";
 
 /**
  * Sampled charts read `dashboard_metric_samples`, which the sampler keeps for a
@@ -55,10 +53,10 @@ const LEADERBOARD_RANGES: WidgetRangeOptions = {
 };
 
 export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
-  defineDashboardWidget({
+  {
     id: "stat-active-streams",
-    titleKey: "web.admin.dashboard.widgetCatalog.statActiveStreams.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.statActiveStreams.description",
+    title: "Active streams",
+    description: "Live count of playback sessions",
     minSpan: 2,
     maxSpan: 4,
     defaultSpan: 2,
@@ -66,11 +64,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: ActiveStreamsStatWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "stat-egress-now",
-    titleKey: "web.admin.dashboard.widgetCatalog.statEgressNow.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.statEgressNow.description",
+    title: "Egress now",
+    description: "Egress the deployment is serving this minute",
     minSpan: 2,
     maxSpan: 4,
     defaultSpan: 2,
@@ -78,11 +76,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: EgressNowStatWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "stat-transcode-share",
-    titleKey: "web.admin.dashboard.widgetCatalog.statTranscodeShare.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.statTranscodeShare.description",
+    title: "Transcode share",
+    description: "Share of live streams being transcoded",
     minSpan: 2,
     maxSpan: 4,
     defaultSpan: 2,
@@ -90,11 +88,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: TranscodeShareStatWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "stat-profiles-active",
-    titleKey: "web.admin.dashboard.widgetCatalog.statProfilesActive.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.statProfilesActive.description",
+    title: "Profiles · 24h",
+    description: "Profiles that watched something in the last 24 hours",
     minSpan: 2,
     maxSpan: 4,
     defaultSpan: 2,
@@ -102,11 +100,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: ProfilesActiveStatWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "stat-movies",
-    titleKey: "web.admin.dashboard.widgetCatalog.statMovies.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.statMovies.description",
+    title: "Movies",
+    description: "Total movies and movie files",
     minSpan: 2,
     maxSpan: 4,
     defaultSpan: 2,
@@ -114,11 +112,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: MoviesStatWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "stat-shows",
-    titleKey: "web.admin.dashboard.widgetCatalog.statShows.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.statShows.description",
+    title: "Shows",
+    description: "Total series and episode files",
     minSpan: 2,
     maxSpan: 4,
     defaultSpan: 2,
@@ -126,11 +124,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: ShowsStatWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "stat-advisory-coverage",
-    titleKey: "web.admin.dashboard.widgetCatalog.statAdvisoryCoverage.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.statAdvisoryCoverage.description",
+    title: "Advisory ages",
+    description: "Movies and series with an advisory age, which profile advisory-age limits act on",
     minSpan: 2,
     maxSpan: 4,
     defaultSpan: 2,
@@ -138,11 +136,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: AdvisoryCoverageStatWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "stat-users",
-    titleKey: "web.admin.dashboard.widgetCatalog.statUsers.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.statUsers.description",
+    title: "User count",
+    description: "Registered accounts on the server",
     minSpan: 2,
     maxSpan: 4,
     defaultSpan: 2,
@@ -150,11 +148,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: UsersStatWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "stat-storage",
-    titleKey: "web.admin.dashboard.widgetCatalog.statStorage.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.statStorage.description",
+    title: "Storage",
+    description: "Used space across all libraries",
     minSpan: 2,
     maxSpan: 4,
     defaultSpan: 2,
@@ -162,11 +160,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: StorageStatWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "health-strip",
-    titleKey: "web.admin.dashboard.widgetCatalog.healthStrip.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.healthStrip.description",
+    title: "Server health",
+    description: "Version, uptime, dependencies, nodes, and 24h error count",
     minSpan: 6,
     maxSpan: 12,
     defaultSpan: 12,
@@ -174,23 +172,23 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 2,
     defaultRows: 1,
     Component: HealthStripWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "server-resources",
-    titleKey: "web.admin.dashboard.widgetCatalog.serverResources.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.serverResources.description",
+    title: "Server resources",
+    description: "CPU, memory, disk, network, and GPU usage on the API host",
     minSpan: 6,
     maxSpan: 12,
     defaultSpan: 6,
     minRows: 2,
     maxRows: 4,
-    defaultRows: 2,
+    defaultRows: 3,
     Component: ServerResourcesWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "playback-24h",
-    titleKey: "web.admin.dashboard.widgetCatalog.playback24h.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.playback24h.description",
+    title: "Playback activity",
+    description: "Playback starts stacked by play method",
     minSpan: 6,
     maxSpan: 12,
     defaultSpan: 6,
@@ -199,11 +197,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     defaultRows: 3,
     ranges: SAMPLED_RANGES,
     Component: PlaybackActivityWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "concurrent-streams-24h",
-    titleKey: "web.admin.dashboard.widgetCatalog.concurrentStreams24h.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.concurrentStreams24h.description",
+    title: "Concurrent streams",
+    description: "Sampled concurrent playback sessions",
     minSpan: 4,
     maxSpan: 12,
     defaultSpan: 6,
@@ -211,13 +209,12 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 5,
     defaultRows: 3,
     ranges: SAMPLED_RANGES,
-    views: { allowed: ["lines", "stacked", "total"], default: "lines" },
     Component: ConcurrentStreamsWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "egress-24h",
-    titleKey: "web.admin.dashboard.widgetCatalog.egress24h.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.egress24h.description",
+    title: "Egress",
+    description: "Sampled egress in Mbps",
     minSpan: 4,
     maxSpan: 12,
     defaultSpan: 6,
@@ -225,13 +222,12 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 5,
     defaultRows: 3,
     ranges: SAMPLED_RANGES,
-    views: { allowed: ["total", "nodes"], default: "total" },
     Component: EgressWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "playback-reliability",
-    titleKey: "web.admin.dashboard.widgetCatalog.playbackReliability.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.playbackReliability.description",
+    title: "Playback reliability",
+    description: "Sessions started, transcode starts, completion rate, profiles",
     minSpan: 4,
     maxSpan: 8,
     defaultSpan: 6,
@@ -240,11 +236,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     defaultRows: 3,
     ranges: SAMPLED_RANGES,
     Component: PlaybackReliabilityWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "top-titles",
-    titleKey: "web.admin.dashboard.widgetCatalog.topTitles.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.topTitles.description",
+    title: "Top titles",
+    description: "Most-played titles over the chosen window",
     minSpan: 4,
     maxSpan: 8,
     defaultSpan: 6,
@@ -253,11 +249,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     defaultRows: 3,
     ranges: LEADERBOARD_RANGES,
     Component: TopTitlesWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "top-profiles",
-    titleKey: "web.admin.dashboard.widgetCatalog.topProfiles.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.topProfiles.description",
+    title: "Most active profiles",
+    description: "Profiles with the most plays over the chosen window",
     minSpan: 4,
     maxSpan: 8,
     defaultSpan: 6,
@@ -266,11 +262,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     defaultRows: 3,
     ranges: LEADERBOARD_RANGES,
     Component: TopProfilesWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "watch-providers",
-    titleKey: "web.admin.dashboard.widgetCatalog.watchProviders.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.watchProviders.description",
+    title: "Watch providers",
+    description: "Per-provider connection and 24h sync status",
     minSpan: 6,
     maxSpan: 12,
     defaultSpan: 12,
@@ -281,11 +277,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 3,
     defaultRows: 1,
     Component: WatchProvidersWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "now-playing",
-    titleKey: "web.admin.dashboard.widgetCatalog.nowPlaying.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.nowPlaying.description",
+    title: "Now playing",
+    description: "Active streams with client, method, and progress",
     minSpan: 6,
     maxSpan: 12,
     defaultSpan: 12,
@@ -296,11 +292,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     // back and shows a one-line strip until a stream starts.
     collapsedRows: 1,
     Component: NowPlayingWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "transcode-nodes",
-    titleKey: "web.admin.dashboard.widgetCatalog.transcodeNodes.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.transcodeNodes.description",
+    title: "Nodes",
+    description: "Stream node health, job load, and egress",
     minSpan: 4,
     maxSpan: 12,
     defaultSpan: 6,
@@ -308,11 +304,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 6,
     defaultRows: 3,
     Component: TranscodeNodesWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "scanner",
-    titleKey: "web.admin.dashboard.widgetCatalog.scanner.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.scanner.description",
+    title: "Scanner",
+    description: "Live scan progress, queue depth, and autoscan state",
     minSpan: 4,
     maxSpan: 12,
     defaultSpan: 4,
@@ -320,11 +316,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 6,
     defaultRows: 3,
     Component: ScannerWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "libraries",
-    titleKey: "web.admin.dashboard.widgetCatalog.libraries.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.libraries.description",
+    title: "Libraries",
+    description: "Library list with scan controls and progress",
     minSpan: 6,
     maxSpan: 12,
     defaultSpan: 7,
@@ -332,11 +328,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 8,
     defaultRows: 4,
     Component: LibrariesWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "users",
-    titleKey: "web.admin.dashboard.widgetCatalog.users.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.users.description",
+    title: "Users",
+    description: "Recent user accounts with role and status",
     minSpan: 4,
     maxSpan: 8,
     defaultSpan: 5,
@@ -344,11 +340,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 8,
     defaultRows: 4,
     Component: UsersWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "downloads",
-    titleKey: "web.admin.dashboard.widgetCatalog.downloads.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.downloads.description",
+    title: "Offline downloads",
+    description: "Who has media downloaded to devices, and how much",
     minSpan: 3,
     maxSpan: 8,
     defaultSpan: 4,
@@ -356,11 +352,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 5,
     defaultRows: 3,
     Component: DownloadsWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "scan-activity",
-    titleKey: "web.admin.dashboard.widgetCatalog.scanActivity.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.scanActivity.description",
+    title: "Scan activity",
+    description: "Recent scan runs with trigger, status, and duration",
     minSpan: 6,
     maxSpan: 12,
     defaultSpan: 8,
@@ -368,11 +364,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 6,
     defaultRows: 3,
     Component: ScanActivityWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "recent-errors",
-    titleKey: "web.admin.dashboard.widgetCatalog.recentErrors.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.recentErrors.description",
+    title: "Recent errors",
+    description: "Latest error and warning lines from the operational log",
     minSpan: 6,
     maxSpan: 12,
     defaultSpan: 12,
@@ -380,11 +376,11 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 6,
     defaultRows: 3,
     Component: RecentErrorsWidget,
-  }),
-  defineDashboardWidget({
+  },
+  {
     id: "recent-activity",
-    titleKey: "web.admin.dashboard.widgetCatalog.recentActivity.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.recentActivity.description",
+    title: "Recent activity",
+    description: "Feed of recently started playback sessions",
     minSpan: 6,
     maxSpan: 12,
     defaultSpan: 12,
@@ -392,22 +388,7 @@ export const DASHBOARD_WIDGETS: DashboardWidgetDefinition[] = [
     maxRows: 8,
     defaultRows: 4,
     Component: RecentActivityWidget,
-  }),
-  defineDashboardWidget({
-    id: "api-clients",
-    titleKey: "web.admin.dashboard.widgetCatalog.apiClients.title",
-    descriptionKey: "web.admin.dashboard.widgetCatalog.apiClients.description",
-    minSpan: 6,
-    maxSpan: 12,
-    defaultSpan: 6,
-    minRows: 2,
-    maxRows: 6,
-    defaultRows: 3,
-    // API usage is summarized per hour and kept for 30 days: the same spread
-    // as the sampled charts.
-    ranges: SAMPLED_RANGES,
-    Component: ApiClientsWidget,
-  }),
+  },
 ];
 
 const WIDGETS_BY_ID = new Map(DASHBOARD_WIDGETS.map((widget) => [widget.id, widget]));

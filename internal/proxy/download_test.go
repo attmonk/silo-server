@@ -31,9 +31,7 @@ func (r *recordingArtifactMissReporter) ReportRemoteArtifactMissing(_ context.Co
 
 func newDownloadProxyServer(t *testing.T, secret string) *Server {
 	t.Helper()
-	srv := NewServer(testWatcher(secret), nil)
-	srv.SetNodeKeys(nodeauthtest.NodeKey(secret))
-	return srv
+	return NewServer(testWatcher(secret), nil)
 }
 
 func TestProxyDownloadServesAuthorizedRange(t *testing.T) {
@@ -44,13 +42,12 @@ func TestProxyDownloadServesAuthorizedRange(t *testing.T) {
 		t.Fatal(err)
 	}
 	token := signToken(t, streamtoken.Claims{
-		SessionID:        "download-1",
-		MediaPath:        path,
-		PlayMethod:       streamtoken.PlayMethodDownload,
-		UserID:           7,
-		ProfileID:        "profile-1",
-		MediaFileID:      42,
-		DownloadFilename: "Heat (1995).mp4",
+		SessionID:   "download-1",
+		MediaPath:   path,
+		PlayMethod:  streamtoken.PlayMethodDownload,
+		UserID:      7,
+		ProfileID:   "profile-1",
+		MediaFileID: 42,
 	}, secret, time.Minute)
 
 	req := httptest.NewRequest(http.MethodGet, "/downloads/file/"+token, nil)
@@ -64,8 +61,7 @@ func TestProxyDownloadServesAuthorizedRange(t *testing.T) {
 	if rr.Body.String() != "2345" {
 		t.Fatalf("body = %q, want %q", rr.Body.String(), "2345")
 	}
-	// The API names the download; the file's own name stays on the server.
-	if got := rr.Header().Get("Content-Disposition"); !strings.Contains(got, "Heat") || strings.Contains(got, "prepared movie") {
+	if got := rr.Header().Get("Content-Disposition"); !strings.Contains(got, "prepared movie.mp4") {
 		t.Fatalf("Content-Disposition = %q", got)
 	}
 }
@@ -121,6 +117,49 @@ func TestProxyDownloadRelaysNodeLocalArtifactRange(t *testing.T) {
 	}
 }
 
+func TestProxyDownloadCORSAllowsConditionalHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodOptions, "/downloads/file/token", nil)
+	req.Header.Set("Origin", "https://web.example")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	req.Header.Set("Access-Control-Request-Headers", "Range, If-Range, If-None-Match, If-Modified-Since, If-Match, If-Unmodified-Since")
+	rr := httptest.NewRecorder()
+	newDownloadProxyServer(t, "download-proxy-secret").Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	allowed := strings.ToLower(rr.Header().Get("Access-Control-Allow-Headers"))
+	for _, name := range []string{"range", "if-range", "if-none-match", "if-modified-since", "if-match", "if-unmodified-since"} {
+		if !strings.Contains(allowed, name) {
+			t.Errorf("Access-Control-Allow-Headers = %q, missing %s", allowed, name)
+		}
+	}
+}
+
+func TestProxyDownloadReportsNodeLocalArtifactMissing(t *testing.T) {
+	const secret = "download-proxy-secret"
+	origin := httptest.NewServer(http.NotFoundHandler())
+	defer origin.Close()
+	token := signToken(t, streamtoken.Claims{
+		SessionID:             "download-remote-missing",
+		PlayMethod:            streamtoken.PlayMethodDownload,
+		TranscodeNode:         origin.URL,
+		DownloadArtifactID:    "artifact-opaque",
+		DownloadArtifactRowID: "artifact-row",
+	}, secret, time.Minute)
+	reporter := &recordingArtifactMissReporter{}
+	server := newDownloadProxyServer(t, secret)
+	server.SetRemoteArtifactMissReporter(reporter)
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/downloads/file/"+token, nil))
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if reporter.artifactID != "artifact-row" || reporter.originNodeURL != origin.URL || reporter.originArtifactID != "artifact-opaque" {
+		t.Fatalf("missing report = %+v", reporter)
+	}
+}
+
 func TestProxyDownloadToneMapTokenRequiresCompleteAttestation(t *testing.T) {
 	const secret = "download-proxy-secret"
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -169,6 +208,22 @@ func TestProxyDownloadRejectsExpiredToken(t *testing.T) {
 	rr := httptest.NewRecorder()
 	newDownloadProxyServer(t, secret).Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestProxyDownloadReturnsNotFoundForMissingFile(t *testing.T) {
+	const secret = "download-proxy-secret"
+	token := signToken(t, streamtoken.Claims{
+		SessionID:  "download-missing",
+		MediaPath:  filepath.Join(t.TempDir(), "gone.mp4"),
+		PlayMethod: streamtoken.PlayMethodDownload,
+	}, secret, time.Minute)
+
+	req := httptest.NewRequest(http.MethodGet, "/downloads/file/"+token, nil)
+	rr := httptest.NewRecorder()
+	newDownloadProxyServer(t, secret).Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 }

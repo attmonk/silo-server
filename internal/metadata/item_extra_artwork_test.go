@@ -2,7 +2,7 @@ package metadata
 
 import (
 	"context"
-
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -79,6 +79,31 @@ func writeSidecars(t *testing.T, dir string, names ...string) string {
 	return dir
 }
 
+func TestApplyBestImagesFillsExtraSlots(t *testing.T) {
+	item := &models.MediaItem{}
+	applyBestImages(item, []RemoteImage{
+		{ProviderID: "tmdb", URL: "https://img.example/banner.jpg", Type: ImageBanner, Rating: 9},
+		{ProviderID: "nfo", URL: "file:///m/Film/banner.jpg", Type: ImageBanner},
+		{ProviderID: "nfo", URL: "file:///m/Film/landscape.jpg", Type: ImageThumb},
+		{ProviderID: "nfo", URL: "file:///m/Film/clearart.png", Type: ImageClearArt},
+		{ProviderID: "tvdb", URL: "https://img.example/disc.png", Type: ImageDisc, Language: "en"},
+	}, MergeFillEmpty, "en")
+
+	want := map[string]string{
+		"banner":   "file:///m/Film/banner.jpg",
+		"thumb":    "file:///m/Film/landscape.jpg",
+		"clearart": "file:///m/Film/clearart.png",
+		// No local disc: a provider's fills the empty slot.
+		"disc": "https://img.example/disc.png",
+	}
+	got := map[string]string{"banner": item.BannerPath, "thumb": item.ThumbPath, "clearart": item.ClearArtPath, "disc": item.DiscPath}
+	for slot, path := range want {
+		if got[slot] != path {
+			t.Errorf("%s = %q, want %q", slot, got[slot], path)
+		}
+	}
+}
+
 // A banner, thumb, clear art or disc slot whose cache job has not finished
 // holds a source but no served path yet; the job only writes while the slot
 // still holds that source.
@@ -88,8 +113,8 @@ func TestPendingItemOnlyArtworkKeepsItsSource(t *testing.T) {
 		existing := &models.MediaItem{BannerSourcePath: pending}
 		item := &models.MediaItem{}
 		carryItemOnlyArtwork(item, existing)
-		applyBestImages(item, nil, MergeFillEmpty, "en", "")
-		prepareItemImagesForQueue(item, existing, true, false)
+		applyBestImages(item, nil, MergeFillEmpty, "en")
+		prepareItemImagesForQueue(item, existing, true)
 		if item.BannerSourcePath != pending || item.BannerPath != "" {
 			t.Fatalf("banner = %q from %q, want the pending source kept", item.BannerPath, item.BannerSourcePath)
 		}
@@ -101,14 +126,14 @@ func TestPendingItemOnlyArtworkKeepsItsSource(t *testing.T) {
 		const remote = "https://img.example/de-poster.jpg"
 		existing := &models.MediaItem{PosterSourcePath: remote}
 		item := &models.MediaItem{PosterSourcePath: remote}
-		prepareItemImagesForQueue(item, existing, true, false)
+		prepareItemImagesForQueue(item, existing, true)
 		if item.PosterSourcePath != "" {
 			t.Fatalf("poster source = %q, want it cleared", item.PosterSourcePath)
 		}
 	})
 	t.Run("locked artwork", func(t *testing.T) {
 		item := &models.MediaItem{BannerSourcePath: pending, LockedFields: []int{int(FieldImages)}}
-		applyBestImages(item, []RemoteImage{{ProviderID: "tmdb", URL: "https://img.example/banner.jpg", Type: ImageBanner, Rating: 9}}, MergeFillEmpty, "en", "")
+		applyBestImages(item, []RemoteImage{{ProviderID: "tmdb", URL: "https://img.example/banner.jpg", Type: ImageBanner, Rating: 9}}, MergeFillEmpty, "en")
 		if item.BannerPath != "" {
 			t.Fatalf("a locked pending banner was replaced by %q", item.BannerPath)
 		}
@@ -217,6 +242,170 @@ func TestMergeAndPersistDropsRemovedSidecarArtwork(t *testing.T) {
 	}
 }
 
+func TestPlanExtraBackdrops(t *testing.T) {
+	ctx := context.Background()
+	searched := withLocalArtworkSearched(ctx, localArtworkItem)
+	item := &models.MediaItem{ContentID: "movie-1", BackdropSourcePath: "file:///m/fanart.jpg"}
+	backdrop := func(url string) RemoteImage { return RemoteImage{ProviderID: "nfo", URL: url, Type: ImageBackdrop} }
+
+	t.Run("backdrops after the primary, keeping cached copies of unchanged sources", func(t *testing.T) {
+		existing := []models.ItemBackdrop{
+			{ID: 1, Ordinal: 1, Path: "local/movies/movie-1/aa-1/backdrop/original.r.webp", SourcePath: "file:///m/fanart-2.jpg", Thumbhash: "t2"},
+			// Its folder answers and the file is missing, so it goes.
+			{ID: 2, Ordinal: 2, Path: "", SourcePath: localSource(filepath.Join(writeSidecars(t, t.TempDir(), "other.jpg"), "gone.jpg"))},
+		}
+		got := planExtraBackdrops(itemRetention(searched), item, existing, []RemoteImage{
+			{ProviderID: "tmdb", URL: "https://img.example/b.jpg", Type: ImageBackdrop, Rating: 9},
+			backdrop("file:///m/fanart.jpg"),
+			backdrop("file:///m/fanart-1.jpg"),
+			backdrop("file:///m/fanart-1.jpg"),
+			backdrop("file:///m/fanart-2.jpg"),
+		})
+		want := []models.ItemBackdrop{
+			{SourcePath: "file:///m/fanart-1.jpg"},
+			{Path: "local/movies/movie-1/aa-1/backdrop/original.r.webp", SourcePath: "file:///m/fanart-2.jpg", Thumbhash: "t2"},
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("planned = %+v, want %+v", got, want)
+		}
+	})
+	dir := writeSidecars(t, t.TempDir(), "fanart-1.jpg")
+	existing := []models.ItemBackdrop{
+		{ID: 1, Ordinal: 1, Path: "local/a", SourcePath: localSource(filepath.Join(dir, "fanart-1.jpg")), Thumbhash: "t1"},
+		{ID: 2, Ordinal: 2, Path: "local/b", SourcePath: localSource(filepath.Join(dir, "fanart-2.jpg"))},
+		{ID: 3, Ordinal: 3, Path: "local/c", SourcePath: localSource(filepath.Join(dir, "unmounted", "x.jpg"))},
+	}
+	t.Run("a searched refresh that found no backdrop drops rows whose folder answers", func(t *testing.T) {
+		got := planExtraBackdrops(itemRetention(searched), item, existing, []RemoteImage{{URL: "https://img.example/b.jpg", Type: ImageBackdrop, Rating: 2}})
+		want := []models.ItemBackdrop{{Path: "local/c", SourcePath: existing[2].SourcePath}}
+		if !slices.Equal(got, want) {
+			t.Fatalf("planned = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("a stored backdrop the search did not return stays while its folder does not answer", func(t *testing.T) {
+		root := writeSidecars(t, t.TempDir(), "fanart.jpg", "fanart-1.jpg")
+		unreadable := filepath.Join(t.TempDir(), "share", "extrafanart", "x.jpg")
+		stored := []models.ItemBackdrop{
+			{ID: 1, Ordinal: 1, Path: "local/a", SourcePath: localSource(filepath.Join(root, "fanart-1.jpg")), Thumbhash: "t1"},
+			{ID: 2, Ordinal: 2, Path: "local/x", SourcePath: localSource(unreadable)},
+			{ID: 3, Ordinal: 3, Path: "local/gone", SourcePath: localSource(filepath.Join(root, "fanart-2.jpg"))},
+		}
+		primary := &models.MediaItem{ContentID: "movie-1", BackdropSourcePath: localSource(filepath.Join(root, "fanart.jpg"))}
+		got := planExtraBackdrops(itemRetention(searched), primary, stored, []RemoteImage{
+			backdrop(primary.BackdropSourcePath), backdrop(stored[0].SourcePath),
+		})
+		want := []models.ItemBackdrop{
+			{Path: "local/a", SourcePath: stored[0].SourcePath, Thumbhash: "t1"},
+			{Path: "local/x", SourcePath: stored[1].SourcePath},
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("planned = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("a removed extrafanart folder drops its backdrops", func(t *testing.T) {
+		root := writeSidecars(t, t.TempDir(), "fanart.jpg", "movie.mkv")
+		stored := []models.ItemBackdrop{{ID: 1, Ordinal: 1, Path: "local/x", SourcePath: localSource(filepath.Join(root, "ExtraFanart", "x.jpg"))}}
+		primary := &models.MediaItem{ContentID: "movie-1", BackdropSourcePath: localSource(filepath.Join(root, "fanart.jpg"))}
+		if got := planExtraBackdrops(itemRetention(searched), primary, stored, []RemoteImage{backdrop(primary.BackdropSourcePath)}); len(got) != 0 {
+			t.Fatalf("planned = %+v, want none", got)
+		}
+		// While the extrafanart folder exists, a missing file inside it is
+		// gone as before, and a present one the search returned stays.
+		extra := filepath.Join(root, "ExtraFanart")
+		if err := os.Mkdir(extra, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeSidecars(t, extra, "y.jpg")
+		kept := localSource(filepath.Join(extra, "y.jpg"))
+		got := planExtraBackdrops(itemRetention(searched), primary, append(stored, models.ItemBackdrop{ID: 2, Ordinal: 2, Path: "local/y", SourcePath: kept}),
+			[]RemoteImage{backdrop(primary.BackdropSourcePath), backdrop(kept)})
+		if want := []models.ItemBackdrop{{Path: "local/y", SourcePath: kept}}; !slices.Equal(got, want) {
+			t.Fatalf("planned = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("an emptied extrafanart folder drops its backdrops", func(t *testing.T) {
+		root := writeSidecars(t, t.TempDir(), "fanart.jpg")
+		if err := os.Mkdir(filepath.Join(root, "extrafanart"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		stored := []models.ItemBackdrop{{ID: 1, Ordinal: 1, Path: "local/x", SourcePath: localSource(filepath.Join(root, "extrafanart", "x.jpg"))}}
+		primary := &models.MediaItem{ContentID: "movie-1", BackdropSourcePath: localSource(filepath.Join(root, "fanart.jpg"))}
+		if got := planExtraBackdrops(itemRetention(searched), primary, stored, []RemoteImage{backdrop(primary.BackdropSourcePath)}); len(got) != 0 {
+			t.Fatalf("planned = %+v, want none", got)
+		}
+	})
+	t.Run("a replaced sidecar keeps its cached copy until the new one is cached", func(t *testing.T) {
+		root := writeSidecars(t, t.TempDir(), "fanart.jpg", "fanart-1.jpg")
+		oldSource := "file://" + filepath.Join(root, "fanart-1.jpg") + "?v=10-1"
+		newSource := "file://" + filepath.Join(root, "fanart-1.jpg") + "?v=20-2"
+		stored := []models.ItemBackdrop{{ID: 1, Ordinal: 1, Path: "local/old", SourcePath: oldSource, Thumbhash: "t"}}
+		primary := &models.MediaItem{ContentID: "movie-1", BackdropSourcePath: localSource(filepath.Join(root, "fanart.jpg"))}
+		got := planExtraBackdrops(itemRetention(searched), primary, stored, []RemoteImage{backdrop(primary.BackdropSourcePath), backdrop(newSource)})
+		if want := []models.ItemBackdrop{{Path: "local/old", SourcePath: newSource, Thumbhash: "t"}}; !slices.Equal(got, want) {
+			t.Fatalf("planned = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("a stored row without a local source goes", func(t *testing.T) {
+		stored := []models.ItemBackdrop{{ID: 1, Ordinal: 1, Path: "tmdb/x", SourcePath: "tmdb://backdrop/x.jpg"}}
+		if got := planExtraBackdrops(itemRetention(context.Background()), item, stored, nil); len(got) != 0 {
+			t.Fatalf("planned = %+v, want none", got)
+		}
+	})
+	t.Run("the stored order holds while a folder is unreadable", func(t *testing.T) {
+		root := writeSidecars(t, t.TempDir(), "fanart.jpg", "fanart-1.jpg", "fanart-2.jpg")
+		unreadable := filepath.Join(t.TempDir(), "share", "extrafanart")
+		a, f1, f2 := localSource(filepath.Join(unreadable, "a.jpg")), localSource(filepath.Join(root, "fanart-1.jpg")), localSource(filepath.Join(root, "fanart-2.jpg"))
+		stored := []models.ItemBackdrop{
+			{ID: 1, Ordinal: 1, Path: "local/a", SourcePath: a},
+			{ID: 2, Ordinal: 2, Path: "local/f1", SourcePath: f1},
+		}
+		primary := &models.MediaItem{ContentID: "movie-1", BackdropSourcePath: localSource(filepath.Join(root, "fanart.jpg"))}
+		got := planExtraBackdrops(itemRetention(searched), primary, stored, []RemoteImage{backdrop(primary.BackdropSourcePath), backdrop(f1), backdrop(f2)})
+		want := []models.ItemBackdrop{{Path: "local/a", SourcePath: a}, {Path: "local/f1", SourcePath: f1}, {SourcePath: f2}}
+		if !slices.Equal(got, want) {
+			t.Fatalf("planned = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("a refresh that did not search keeps every row", func(t *testing.T) {
+		got := planExtraBackdrops(itemRetention(ctx), item, existing, nil)
+		if len(got) != len(existing) {
+			t.Fatalf("planned = %+v, want the stored rows", got)
+		}
+	})
+	t.Run("a locked provider primary leaves every local backdrop to follow it", func(t *testing.T) {
+		locked := &models.MediaItem{ContentID: "movie-1", LockedFields: []int{int(FieldImages)}, BackdropSourcePath: "tmdb://backdrop/x.jpg"}
+		got := planExtraBackdrops(itemRetention(searched), locked, nil, []RemoteImage{backdrop("file:///m/fanart.jpg"), backdrop("file:///m/fanart-1.jpg")})
+		want := []models.ItemBackdrop{{SourcePath: "file:///m/fanart.jpg"}, {SourcePath: "file:///m/fanart-1.jpg"}}
+		if !slices.Equal(got, want) {
+			t.Fatalf("planned = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("a primary that is not the first local backdrop is not repeated", func(t *testing.T) {
+		pinned := &models.MediaItem{ContentID: "movie-1", BackdropSourcePath: "file:///m/fanart-1.jpg"}
+		got := planExtraBackdrops(itemRetention(searched), pinned, nil, []RemoteImage{backdrop("file:///m/fanart.jpg"), backdrop("file:///m/fanart-1.jpg")})
+		if want := []models.ItemBackdrop{{SourcePath: "file:///m/fanart.jpg"}}; !slices.Equal(got, want) {
+			t.Fatalf("planned = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("locked artwork keeps stored rows", func(t *testing.T) {
+		locked := &models.MediaItem{ContentID: "movie-1", LockedFields: []int{int(FieldImages)}}
+		stored := []models.ItemBackdrop{{ID: 1, Ordinal: 1, Path: "local/a", SourcePath: "file:///m/a.jpg"}}
+		got := planExtraBackdrops(itemRetention(searched), locked, stored, []RemoteImage{backdrop("file:///m/fanart.jpg"), backdrop("file:///m/b.jpg")})
+		if !slices.Equal(got, stored) {
+			t.Fatalf("planned = %+v, want stored rows", got)
+		}
+	})
+	t.Run("capped with the primary", func(t *testing.T) {
+		var images []RemoteImage
+		for i := range MaxItemBackdrops + 5 {
+			images = append(images, backdrop(fmt.Sprintf("file:///m/extrafanart/%02d.jpg", i)))
+		}
+		if got := planExtraBackdrops(itemRetention(searched), item, nil, images); len(got) != MaxItemBackdrops-1 {
+			t.Fatalf("planned %d extra backdrops, want %d", len(got), MaxItemBackdrops-1)
+		}
+	})
+}
+
 // A primary backdrop can come from extrafanart when the item has no named or
 // numbered one. Once that folder is removed and the item folder answers, a
 // searched refresh lets the provider backdrop replace it; while the item
@@ -240,6 +429,86 @@ func TestPrimaryBackdropFromRemovedExtraFanartIsNotKept(t *testing.T) {
 	}
 	if !itemRetention(searched).keep(ImageBackdrop, remote, localSource(filepath.Join(root, "ExtraFanart", "x.jpg"))) {
 		t.Fatal("dropped a primary backdrop while its extrafanart link's target is unreachable")
+	}
+}
+
+// Only backdrops come from extrafanart folders. A poster in a folder that
+// happens to be named extrafanart, such as an empty mount point, keeps the
+// plain rule and stays while that folder is empty.
+func TestPosterInFolderNamedExtraFanartKeepsPlainRule(t *testing.T) {
+	searched := withLocalArtworkSearched(context.Background(), localArtworkItem)
+	mount := filepath.Join(t.TempDir(), "extrafanart")
+	if err := os.Mkdir(mount, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const remote = "https://image.tmdb.org/t/p/original/p.jpg"
+	if !itemRetention(searched).keep(ImagePoster, remote, localSource(filepath.Join(mount, "Movie (2008)-poster.jpg"))) {
+		t.Fatal("dropped a poster while its folder, named extrafanart, is an empty mount point")
+	}
+}
+
+func TestSyncItemExtraBackdropsStoresRowsAndQueuesJobs(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeItemBackdropRepo()
+	enqueuer := &recordingImageCacheJobEnqueuer{}
+	service := &MetadataService{itemBackdropRepo: repo}
+	service.SetAutoCacheImages(true)
+	service.SetImageCacheJobEnqueuer(enqueuer)
+	item := &models.MediaItem{ContentID: "movie-1", Type: "movie", BackdropSourcePath: "file:///m/fanart.jpg"}
+	images := []RemoteImage{
+		{ProviderID: "nfo", URL: "file:///m/fanart.jpg", Type: ImageBackdrop},
+		{ProviderID: "nfo", URL: "file:///m/fanart-1.jpg", Type: ImageBackdrop},
+		{ProviderID: "nfo", URL: "file:///m/extrafanart/a.jpg", Type: ImageBackdrop},
+	}
+
+	if err := service.syncItemExtraBackdrops(ctx, itemRetention(ctx), item, nil, images); err != nil {
+		t.Fatal(err)
+	}
+	rows := repo.rows["movie-1"]
+	if len(rows) != 2 || rows[0].SourcePath != "file:///m/fanart-1.jpg" || rows[1].SourcePath != "file:///m/extrafanart/a.jpg" {
+		t.Fatalf("stored rows = %+v", rows)
+	}
+	if len(enqueuer.inputs) != 2 {
+		t.Fatalf("queued %d jobs, want 2", len(enqueuer.inputs))
+	}
+	for i, in := range enqueuer.inputs {
+		if in.TargetType != ImageCacheTargetItemBackdrop || in.TargetContentID != fmt.Sprint(rows[i].ID) ||
+			in.SeriesID != "movie-1" || in.ImageType != ImageCacheImageBackdrop ||
+			in.ProviderID != "local" || in.ProviderContentID != "movie-1" || in.ContentType != "movies" ||
+			in.SourcePath != rows[i].SourcePath || !in.RequeueSucceeded {
+			t.Fatalf("job %d = %+v", i, in)
+		}
+	}
+
+	// Once cached, an unchanged refresh writes nothing and queues without a
+	// forced requeue.
+	repo.rows["movie-1"][0].Path = "local/movies/movie-1/aa-101/backdrop/original.r.webp"
+	repo.rows["movie-1"][1].Path = "local/movies/movie-1/bb-102/backdrop/original.r.webp"
+	enqueuer.inputs = nil
+	if err := service.syncItemExtraBackdrops(ctx, itemRetention(ctx), item, nil, images); err != nil {
+		t.Fatal(err)
+	}
+	if repo.replaces != 1 {
+		t.Fatalf("Replace calls = %d, want 1", repo.replaces)
+	}
+	for _, in := range enqueuer.inputs {
+		if in.RequeueSucceeded {
+			t.Fatalf("cached row requeued: %+v", in)
+		}
+	}
+
+	// Extra backdrops are local art only: with caching off the item keeps
+	// none, unless its artwork is locked.
+	service.SetAutoCacheImages(false)
+	locked := *item
+	locked.LockedFields = []int{int(FieldImages)}
+	_ = service.syncItemExtraBackdrops(ctx, itemRetention(ctx), &locked, nil, nil)
+	if len(repo.rows["movie-1"]) != 2 {
+		t.Fatalf("locked item rows with caching off = %+v, want both kept", repo.rows["movie-1"])
+	}
+	_ = service.syncItemExtraBackdrops(ctx, itemRetention(ctx), item, nil, images)
+	if len(repo.rows["movie-1"]) != 0 {
+		t.Fatalf("rows with caching off = %+v, want none", repo.rows["movie-1"])
 	}
 }
 
@@ -292,8 +561,8 @@ func (f *fakeItemBackdropUpdater) UpdateArtworkIfSourceMatches(_ context.Context
 
 // An item's backdrops share its key folder, and two sidecars can hold the same
 // bytes, so each backdrop's key carries a hash of its sidecar's path. Two rows
-// with identical images get different keys, and a backdrop that moves to
-// another row keeps its key.
+// with identical images get different keys, re-caching one deletes only its
+// own stale prefix, and a backdrop that moves to another row keeps its key.
 func TestProcessLocalItemBackdropKeysBySidecarPath(t *testing.T) {
 	root := t.TempDir()
 	first := writeLocalPoster(t, root)
@@ -301,17 +570,22 @@ func TestProcessLocalItemBackdropKeysBySidecarPath(t *testing.T) {
 	if err := os.WriteFile(second, []byte("poster-bytes"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	run := func(path, rowID string) (*fakeByteImageCacher, *fakeItemBackdropUpdater) {
+	run := func(path, rowID, previous string) (*fakeByteImageCacher, *fakeItemBackdropUpdater, *fakePrefixDeleter) {
 		t.Helper()
 		job := localArtworkJob("file://" + path)
 		job.TargetType = ImageCacheTargetItemBackdrop
 		job.TargetContentID = rowID
 		job.ImageType = ImageCacheImageBackdrop
-		jobs := &fakeImageCacheJobs{claimed: []*models.MetadataImageCacheJob{job}}
+		jobs := &fakeLocalImageCacheJobs{
+			fakeImageCacheJobs: fakeImageCacheJobs{claimed: []*models.MetadataImageCacheJob{job}},
+			currentCached:      previous,
+		}
 		cacher := &fakeByteImageCacher{thumbhash: "th"}
 		backdrops := &fakeItemBackdropUpdater{}
+		deleter := &fakePrefixDeleter{bucket: "images"}
 		p := NewImageCacheProcessorWithTargets(jobs, cacher, nil, ImageCacheProcessorTargets{ItemBackdrops: backdrops})
 		p.SetLibraryRootResolver(&fakeLibraryRootResolver{roots: []string{root}})
+		p.SetImagePrefixDeleter(deleter)
 		stats, err := p.RunOnce(context.Background(), "w1", 10, 1)
 		if err != nil {
 			t.Fatal(err)
@@ -319,10 +593,11 @@ func TestProcessLocalItemBackdropKeysBySidecarPath(t *testing.T) {
 		if stats.Succeeded != 1 {
 			t.Fatalf("stats = %+v, failed text %q", stats, jobs.failedText)
 		}
-		return cacher, backdrops
+		return cacher, backdrops, deleter
 	}
 
-	cacher, backdrops := run(first, "42")
+	const previous = "local/movies/movie-1/0badf00d-0badf00d/backdrop/original.old.webp"
+	cacher, backdrops, deleter := run(first, "42", previous)
 	key := cacher.bytesReq[0].KeyDiscriminator
 	if len(key) != len("00000000-00000000") || key[8] != '-' {
 		t.Fatalf("KeyDiscriminator = %q, want <content hash>-<path hash>", key)
@@ -331,15 +606,54 @@ func TestProcessLocalItemBackdropKeysBySidecarPath(t *testing.T) {
 	if backdrops.id != 42 || backdrops.cached != want || backdrops.hash != "th" {
 		t.Fatalf("backdrop update = %+v, want row 42 at %q", backdrops, want)
 	}
+	if !slices.Equal(deleter.prefixes, []string{"local/movies/movie-1/0badf00d-0badf00d/backdrop/"}) {
+		t.Fatalf("deleted prefixes = %q", deleter.prefixes)
+	}
 
-	// Same bytes in another sidecar: another key.
-	other, _ := run(second, "43")
+	// Same bytes in another sidecar: another key, so neither re-cache can
+	// delete the other's files.
+	other, _, _ := run(second, "43", "")
 	if other.bytesReq[0].KeyDiscriminator == key || other.bytesReq[0].KeyDiscriminator[:8] != key[:8] {
 		t.Fatalf("keys %q and %q, want the same content hash and different path hashes", key, other.bytesReq[0].KeyDiscriminator)
 	}
-	// The same sidecar on another row keeps its key.
-	moved, _ := run(first, "44")
-	if moved.bytesReq[0].KeyDiscriminator != key {
-		t.Fatalf("moved backdrop key %q, want %q", moved.bytesReq[0].KeyDiscriminator, key)
+	// The same sidecar on another row keeps its key, and its current copy is
+	// not deleted.
+	moved, _, movedDeleter := run(first, "44", want)
+	if moved.bytesReq[0].KeyDiscriminator != key || len(movedDeleter.prefixes) != 0 {
+		t.Fatalf("moved backdrop key %q (want %q), deleted %q", moved.bytesReq[0].KeyDiscriminator, key, movedDeleter.prefixes)
+	}
+}
+
+func TestProcessItemJobForExtraSlotUpdatesItem(t *testing.T) {
+	root := t.TempDir()
+	path := writeLocalPoster(t, root)
+	job := localArtworkJob("file://" + path)
+	job.ImageType = ImageCacheImageDisc
+	p, jobs, cacher, items, _ := newLocalProcessorForTest(job, []string{root}, "")
+	if _, err := p.RunOnce(context.Background(), "w1", 10, 1); err != nil {
+		t.Fatal(err)
+	}
+	if jobs.failedText != "" || items.imageType != ImageCacheImageDisc {
+		t.Fatalf("failed %q, updated image type %q", jobs.failedText, items.imageType)
+	}
+	if got := ImageTypeToString(cacher.bytesReq[0].ImageType); got != "disc" {
+		t.Fatalf("cached as %q, want disc", got)
+	}
+}
+
+// The storage sweep and the revision GC delete any object no sweep surface
+// references, so every item artwork slot must be one.
+func TestArtworkSweepSurfacesCoverEveryItemArtworkSlot(t *testing.T) {
+	covered := make(map[string]bool)
+	for _, surface := range artworkSweepSurfaces() {
+		covered[surface.table+"."+surface.pathCol] = true
+	}
+	for _, field := range itemArtworkFields(&models.MediaItem{}) {
+		if column := "media_items." + ImageTypeToString(field.imageType) + "_path"; !covered[column] {
+			t.Errorf("no artwork sweep surface for %s", column)
+		}
+	}
+	if !covered["media_item_backdrops.path"] {
+		t.Error("no artwork sweep surface for media_item_backdrops.path")
 	}
 }

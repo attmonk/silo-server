@@ -1,8 +1,6 @@
 import { useId, type ReactNode } from "react";
 
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { useT, type MessageKey } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 /**
@@ -43,18 +41,14 @@ export function DetailCard({
     >
       <div className="border-border/70 flex flex-wrap items-start justify-between gap-x-3 gap-y-2 border-b px-4 py-3.5 sm:px-5">
         <div className="min-w-0 flex-1 basis-48 space-y-0.5">
-          <h3 id={titleId} className="text-sm leading-snug font-semibold wrap-anywhere">
+          <h3 id={titleId} className="text-sm leading-snug font-semibold">
             {title}
           </h3>
           {description ? (
-            <div className="text-muted-foreground text-[13px] leading-relaxed wrap-anywhere">
-              {description}
-            </div>
+            <div className="text-muted-foreground text-[13px] leading-relaxed">{description}</div>
           ) : null}
         </div>
-        {actions ? (
-          <div className="flex max-w-full shrink-0 flex-wrap items-center gap-1.5">{actions}</div>
-        ) : null}
+        {actions ? <div className="flex shrink-0 items-center gap-1.5">{actions}</div> : null}
       </div>
       {children}
       {footer ? (
@@ -98,18 +92,13 @@ export function StatTile({
   /** 0..1; shows a bar under the value. */
   progress?: number;
 }) {
-  const t = useT();
   return (
     <div className="bg-card/60 min-w-0 space-y-1.5 px-4 py-3.5">
       <div className="text-muted-foreground truncate text-xs">{label}</div>
       <div className="text-xl font-semibold tabular-nums">
         {value}
         {total !== undefined ? (
-          <span className="text-muted-foreground ms-1 text-sm font-normal">
-            {t("web.admin.users.detail.common.statTotal", {
-              total: typeof total === "number" ? String(total) : total,
-            })}
-          </span>
+          <span className="text-muted-foreground ml-1 text-sm font-normal">of {total}</span>
         ) : null}
       </div>
       {progress !== undefined ? <ProgressBar value={progress} label={label} /> : null}
@@ -152,13 +141,10 @@ export function KeyValueRow({
           <div className="text-muted-foreground/80 text-xs leading-relaxed">{description}</div>
         ) : null}
       </div>
-      <div className="ms-auto flex max-w-full min-w-0 items-center justify-end gap-2.5">
-        <div className="flex min-w-0 flex-col items-end text-end">
-          {/* A long unbroken value (an email, an ID) wraps rather than overflowing the card. */}
-          <div className="max-w-full text-sm font-medium wrap-anywhere">{value}</div>
-          {below ? (
-            <div className="text-muted-foreground max-w-full text-xs wrap-anywhere">{below}</div>
-          ) : null}
+      <div className="ml-auto flex max-w-full min-w-0 items-center justify-end gap-2.5">
+        <div className="flex min-w-0 flex-col items-end text-right">
+          <div className="text-sm font-medium break-words">{value}</div>
+          {below ? <div className="text-muted-foreground text-xs">{below}</div> : null}
         </div>
         {tag}
       </div>
@@ -166,15 +152,10 @@ export function KeyValueRow({
   );
 }
 
-const SOURCE_LABELS: Record<"default" | "group" | "custom", MessageKey> = {
-  default: "web.admin.users.detail.common.source.default",
-  group: "web.admin.users.detail.common.source.group",
-  custom: "web.admin.users.detail.common.source.custom",
-};
+const SOURCE_LABELS = { default: "DEFAULT", group: "GROUP", custom: "CUSTOM" } as const;
 
 /** Where a value comes from: the server default, the account's group, or this account. */
 export function SourceTag({ source }: { source: "default" | "group" | "custom" }) {
-  const t = useT();
   return (
     <span
       data-source={source}
@@ -185,7 +166,7 @@ export function SourceTag({ source }: { source: "default" | "group" | "custom" }
           : "text-muted-foreground/80",
       )}
     >
-      {t(SOURCE_LABELS[source])}
+      {SOURCE_LABELS[source]}
     </span>
   );
 }
@@ -212,7 +193,7 @@ export function SubTabs<T extends string>({
           <TabsTrigger
             key={item.value}
             value={item.value}
-            className="flex-none rounded-lg px-3 py-1.5 text-[13px] max-lg:min-h-11"
+            className="flex-none rounded-lg px-3 py-1.5 text-[13px]"
           >
             {item.label}
           </TabsTrigger>
@@ -237,14 +218,11 @@ export function ListRow({
     <div className="border-border/50 flex items-center gap-3 border-t px-4 py-3 first:border-t-0 sm:px-5">
       {leading ? <div className="shrink-0">{leading}</div> : null}
       <div className="min-w-0 flex-1">
-        {/* On a phone a long title (a device name) wraps rather than being cut off. */}
-        <div className="truncate text-sm font-medium max-lg:wrap-anywhere max-lg:whitespace-normal">
-          {title}
-        </div>
-        {meta ? <div className="text-muted-foreground text-xs wrap-anywhere">{meta}</div> : null}
+        <div className="truncate text-sm font-medium">{title}</div>
+        {meta ? <div className="text-muted-foreground text-xs">{meta}</div> : null}
       </div>
       {trailing ? (
-        <div className="text-muted-foreground shrink-0 text-end text-xs">{trailing}</div>
+        <div className="text-muted-foreground shrink-0 text-right text-xs">{trailing}</div>
       ) : null}
     </div>
   );
@@ -288,35 +266,27 @@ const AVATAR_GRADIENTS = [
   "from-sky-500 to-blue-600",
 ] as const;
 
-/** Shown when a name has no first character; a symbol, not text to translate. */
-const NO_INITIAL = "?";
-
-/** A round avatar image, or an initial on one of five gradients (picked by `seed`)
- * when there is no image or it fails to load. */
+/** A round initial on one of five gradients, picked by `seed`. */
 export function InitialAvatar({
   name,
   seed,
-  src,
   size = "sm",
 }: {
   name: string;
   seed: number;
-  src?: string;
   size?: "sm" | "lg";
 }) {
   const gradient = AVATAR_GRADIENTS[Math.abs(Math.trunc(seed)) % AVATAR_GRADIENTS.length];
   return (
-    <Avatar aria-hidden="true" className={size === "lg" ? "size-14 sm:size-16" : "size-8"}>
-      {src ? <AvatarImage src={src} alt="" /> : null}
-      <AvatarFallback
-        className={cn(
-          "bg-gradient-to-br font-semibold text-white uppercase",
-          gradient,
-          size === "lg" ? "text-2xl sm:text-3xl" : "text-sm",
-        )}
-      >
-        {name.trim().charAt(0) || NO_INITIAL}
-      </AvatarFallback>
-    </Avatar>
+    <span
+      aria-hidden="true"
+      className={cn(
+        "inline-flex shrink-0 items-center justify-center rounded-full bg-gradient-to-br font-semibold text-white uppercase",
+        gradient,
+        size === "lg" ? "size-14 text-2xl sm:size-16 sm:text-3xl" : "size-8 text-sm",
+      )}
+    >
+      {name.trim().charAt(0) || "?"}
+    </span>
   );
 }

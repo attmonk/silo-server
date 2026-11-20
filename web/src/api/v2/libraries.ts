@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import type {
   AdminJob,
   CreateLibraryRequest,
@@ -49,9 +48,6 @@ export function libraryFromV2(library: LibraryV2): Library {
     intro_detection_enabled: library.intro_detection_enabled,
     trickplay_enabled: library.trickplay_enabled,
     trickplay_supported: library.trickplay_supported,
-    box_sets_enabled: library.box_sets_enabled,
-    box_set_min_movies: library.box_set_min_movies,
-    box_sets_in_search: library.box_sets_in_search,
     trailer_kinds: library.trailer_kinds,
     realtime_monitoring: library.realtime_monitoring,
     sort_order: library.sort_order,
@@ -81,13 +77,6 @@ export function libraryCreateToV2(body: CreateLibraryRequest): V2Body<"POST /api
       ? {}
       : { intro_detection_enabled: body.intro_detection_enabled }),
     ...(body.trickplay_enabled === undefined ? {} : { trickplay_enabled: body.trickplay_enabled }),
-    ...(body.box_sets_enabled === undefined ? {} : { box_sets_enabled: body.box_sets_enabled }),
-    ...(body.box_set_min_movies === undefined
-      ? {}
-      : { box_set_min_movies: body.box_set_min_movies }),
-    ...(body.box_sets_in_search === undefined
-      ? {}
-      : { box_sets_in_search: body.box_sets_in_search }),
     ...(body.trailer_kinds === undefined ? {} : { trailer_kinds: body.trailer_kinds }),
     ...(body.realtime_monitoring === undefined
       ? {}
@@ -224,7 +213,7 @@ export function adminJobFromV2(job: AdminJobV2): AdminJob {
     created_by_user_id: 0,
     request_payload: {},
     result_payload: job.refresh_result ?? job.deletion_result ?? {},
-    message: job.state === "canceling" ? t("web.common.job.cancellationRequested") : "",
+    message: job.state === "canceling" ? "Cancellation requested" : "",
     error_message: job.failure?.detail,
     progress_current: job.progress?.current ?? 0,
     progress_total: job.progress?.total ?? 0,

@@ -20,7 +20,6 @@ import {
 } from "@/hooks/queries/settingValues";
 import { useProfileDefaultWriter } from "@/hooks/queries/profileDefaults";
 import { useOptionalAuth } from "@/hooks/useAuth";
-import { useAppLanguage, useT } from "@/i18n";
 import { collectionKind, profilePageName, type CollectionSummary } from "@/lib/homeRows/describe";
 import { pageLabel } from "@/lib/homeRows/pages";
 import type { HomeRow } from "@/lib/homeRows/types";
@@ -38,7 +37,6 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import { holdsCollections } from "@/lib/sectionTypes";
 
 const PROFILE_SCOPE: SettingIdentity = { scope: "profile" };
 const HOME_PREFERENCE_KEYS = [
@@ -54,11 +52,11 @@ const HOME_PREFERENCE_KEYS = [
  */
 /** Something the page needs didn't load, so it can't change until a retry. */
 function LoadFailedNote({
-  message,
+  what,
   retryLabel,
   onRetry,
 }: {
-  message: string;
+  what: string;
   retryLabel: string;
   onRetry: () => void;
 }) {
@@ -67,7 +65,9 @@ function LoadFailedNote({
       role="alert"
       className="border-warning/40 bg-warning/10 flex flex-wrap items-center gap-3 rounded-2xl border px-4 py-3 text-sm"
     >
-      <p className="min-w-0 flex-1">{message}</p>
+      <p className="min-w-0 flex-1">
+        {what} didn&apos;t load, so this page can&apos;t change right now.
+      </p>
       <Button size="sm" variant="outline" onClick={onRetry}>
         {retryLabel}
       </Button>
@@ -76,12 +76,11 @@ function LoadFailedNote({
 }
 
 export default function HomeScreenSettings() {
-  const t = useT();
   const adapter = useProfileHomeRowsAdapter();
   const { data: libraries } = useUserLibraries();
   const focus = useRowFocus(adapter.rows, adapter.pending);
   const label = pageLabel(adapter.page, adapter.pages);
-  const pageName = profilePageName(adapter.page, label);
+  const pageName = profilePageName(label);
   const layoutExport = useHomeLayoutExport();
   const [importOpen, setImportOpen] = useState(false);
   const [rowDialog, setRowDialog] = useRowDialog();
@@ -108,8 +107,6 @@ export default function HomeScreenSettings() {
 
   const profileId = useOptionalAuth()?.profile?.id;
   const collectionOptions = adapter.collections?.options;
-  // Each summary's collection type is translated text; rebuild it on a language change.
-  const language = useAppLanguage();
   const collectionSummaries = useMemo(
     () =>
       new Map<string, CollectionSummary>(
@@ -123,8 +120,7 @@ export default function HomeScreenSettings() {
           },
         ]),
       ),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- language: the kinds' language
-    [collectionOptions, profileId, language],
+    [collectionOptions, profileId],
   );
 
   function openRow(row: HomeRow) {
@@ -133,9 +129,7 @@ export default function HomeScreenSettings() {
       .openEdit(row.id)
       .then((session) => setRowDialog({ session }))
       .catch((error: unknown) =>
-        toast.error(
-          error instanceof Error ? error.message : t("web.settings.homeScreen.openRowFailed"),
-        ),
+        toast.error(error instanceof Error ? error.message : "Could not open this row"),
       );
   }
 
@@ -185,7 +179,7 @@ export default function HomeScreenSettings() {
     return [
       {
         key: "edit",
-        label: t("web.settings.homeScreen.editRow"),
+        label: "Edit row…",
         icon: Pencil,
         disabled: busy,
         onSelect: () => openRow(row),
@@ -194,7 +188,7 @@ export default function HomeScreenSettings() {
         ? [
             {
               key: "original-name",
-              label: t("web.settings.homeScreen.useOriginalName"),
+              label: "Use the original name",
               icon: Undo2,
               disabled: busy,
               onSelect: () => adapter.restoreOriginalName(row.id),
@@ -203,21 +197,16 @@ export default function HomeScreenSettings() {
         : []),
       {
         key: "hero",
-        label: row.hero
-          ? t("web.settings.homeScreen.stopHero")
-          : t("web.settings.homeScreen.useHero"),
+        label: row.hero ? "Stop using as hero banner" : "Use as hero banner",
         icon: row.hero ? StarOff : Star,
-        // A row of collections has no title to show as the hero.
-        disabled: busy || (!row.hero && holdsCollections(row.sectionType)),
+        disabled: busy,
         onSelect: () => void adapter.setHero(row.id, !row.hero),
       },
       shared.moveToTop,
       shared.moveToBottom,
       {
         key: "remove",
-        label: row.own
-          ? t("web.settings.homeScreen.deleteRow")
-          : t("web.settings.homeScreen.removeFromPage", { page: pageName }),
+        label: row.own ? "Delete row…" : `Remove from my ${pageName}…`,
         icon: row.own ? Trash2 : CircleMinus,
         destructive: true,
         group: true,
@@ -227,21 +216,20 @@ export default function HomeScreenSettings() {
     ];
   }
 
+  const resetTarget = adapter.page.kind === "home" ? "Home" : `the ${label} page`;
   const moreItems: PageMoreMenuItem[] = [
     {
       key: "export",
-      label: layoutExport.running
-        ? t("web.settings.homeScreen.exporting")
-        : t("web.settings.homeScreen.export"),
-      help: t("web.settings.homeScreen.exportHelp"),
+      label: layoutExport.running ? "Exporting layout…" : "Export layout",
+      help: "Save your rows for every page to a file.",
       icon: Download,
       disabled: !layoutExport.ready || layoutExport.running,
       onSelect: () => void layoutExport.run(),
     },
     {
       key: "import",
-      label: t("web.settings.homeScreen.import"),
-      help: t("web.settings.homeScreen.importHelp"),
+      label: "Import layout…",
+      help: "Load a layout saved here or on another server.",
       icon: Upload,
       disabled: !layoutExport.libraries,
       opensDialog: true,
@@ -249,11 +237,8 @@ export default function HomeScreenSettings() {
     },
     {
       key: "reset",
-      label:
-        adapter.page.kind === "home"
-          ? t("web.settings.homeScreen.resetHome")
-          : t("web.settings.homeScreen.resetLibrary", { page: label }),
-      help: t("web.settings.homeScreen.resetHelp"),
+      label: `Reset ${resetTarget} to the server's rows…`,
+      help: "Brings back hidden rows and original names, and removes rows you added.",
       icon: RotateCcw,
       group: true,
       disabled: !adapter.canEdit,
@@ -265,14 +250,12 @@ export default function HomeScreenSettings() {
   function handleNextUpModeChange(mode: string) {
     nextUpWriter
       .save(SETTING_KEYS.UI_NEXT_UP_MODE, mode)
-      .catch(() => toast.error(t("web.settings.homeScreen.saveFailed")));
+      .catch(() => toast.error("Failed to save Home preference"));
   }
 
   function resetToServerDefault(key: SettingKey) {
     // Deletes the profile row so the setting inherits the server default again.
-    nextUpWriter
-      .reset(key)
-      .catch(() => toast.error(t("web.settings.homeScreen.resetPreferenceFailed")));
+    nextUpWriter.reset(key).catch(() => toast.error("Failed to reset the Home preference"));
   }
 
   function handleNewReleasesFirstChange(enabled: boolean) {
@@ -282,14 +265,14 @@ export default function HomeScreenSettings() {
         value: enabled,
         identity: PROFILE_SCOPE,
       },
-      { onError: () => toast.error(t("web.settings.homeScreen.saveFailed")) },
+      { onError: () => toast.error("Failed to save Home preference") },
     );
   }
 
   function handleHideWatchedItemsChange(enabled: boolean) {
     saveHomePreference.mutate(
       { key: SETTING_KEYS.HOME_HIDE_WATCHED_ITEMS, value: enabled, identity: PROFILE_SCOPE },
-      { onError: () => toast.error(t("web.settings.homeScreen.saveFailed")) },
+      { onError: () => toast.error("Failed to save Home preference") },
     );
   }
 
@@ -297,15 +280,15 @@ export default function HomeScreenSettings() {
   if (adapter.overridesFailed) {
     notice = (
       <LoadFailedNote
-        message={t("web.settings.homeScreen.overridesFailed")}
-        retryLabel={t("web.settings.homeScreen.reloadRows")}
+        what="Your saved changes"
+        retryLabel="Reload rows"
         onRetry={() => void adapter.reload()}
       />
     );
   } else if (adapter.overridesLoading) {
     notice = (
       <p role="status" className="text-muted-foreground text-sm">
-        {t("web.settings.homeScreen.overridesLoading")}
+        Loading your saved changes…
       </p>
     );
   }
@@ -314,8 +297,8 @@ export default function HomeScreenSettings() {
   return (
     <HomeRowsPage
       adapter={adapter}
-      title={t("web.settings.homeScreen.title")}
-      subtitle={t("web.settings.homeScreen.subtitle")}
+      title="Home Screen"
+      subtitle="Choose the rows you see and their order. Only this profile changes, and it saves as you go."
       focus={focus}
       collection={(id) => collectionSummaries.get(id)}
       onOpenRow={adapter.canEdit ? openRow : undefined}
@@ -352,16 +335,14 @@ export default function HomeScreenSettings() {
 
       <RemoveRowDialog
         row={removing}
-        page={adapter.page}
-        pageLabel={label}
+        pageName={pageName}
         onConfirm={confirmRemove}
         onOpenChange={(open) => !open && setRemoving(null)}
         skipReturnFocus={skipReturnFocus}
       />
       <ResetProfileDialog
         open={resetOpen}
-        page={adapter.page}
-        pageLabel={label}
+        pageName={pageName}
         ownTitles={adapter.rows.filter((row) => row.own).map((row) => row.title)}
         onConfirm={() => {
           setResetOpen(false);
@@ -390,11 +371,7 @@ export default function HomeScreenSettings() {
             if (onAdded) landing.current = { ids: newIds, onAdded };
             else setHighlightId(newIds[0] ?? null);
           }}
-          deleteLabel={
-            editingRow && !editingRow.own
-              ? t("web.settings.homeScreen.removeFromPage", { page: pageName })
-              : undefined
-          }
+          deleteLabel={editingRow && !editingRow.own ? `Remove from my ${pageName}…` : undefined}
           onDelete={(session) => {
             setRowDialog(null);
             setRemoving(session.row);

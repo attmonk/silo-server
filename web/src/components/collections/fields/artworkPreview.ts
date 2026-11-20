@@ -6,8 +6,7 @@ import type { ArtworkSlotDraft } from "@/lib/collections/scope";
 /**
  * What a poster shows without an image of its own: the collage the server
  * made (`collageUrl`, once built), or nothing when the collection never gets
- * one (`collages: false`: any backdrop, or a personal collection's poster on a
- * server that makes no personal collages).
+ * one (`collages: false`, a server Smart collection's poster or any backdrop).
  */
 export interface ArtworkFallback {
   collages: boolean;

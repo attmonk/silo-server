@@ -1,5 +1,4 @@
 import type { Profile } from "@/api/types";
-import { t } from "@/i18n";
 
 export interface ProfileAvatarPreset {
   id: string;
@@ -17,115 +16,67 @@ export interface ProfileAvatarStyleOption {
 const LEGACY_PROFILE_AVATAR_PRESETS: ProfileAvatarPreset[] = [
   {
     id: "avatar-1",
-    get label() {
-      return t("web.profiles.helpers.avatar.legacy.skyFox");
-    },
+    label: "Sky Fox",
     previewUrl: "/profile-avatars/avatar-1.svg",
     styleId: "legacy",
   },
   {
     id: "avatar-2",
-    get label() {
-      return t("web.profiles.helpers.avatar.legacy.cometCat");
-    },
+    label: "Comet Cat",
     previewUrl: "/profile-avatars/avatar-2.svg",
     styleId: "legacy",
   },
   {
     id: "avatar-3",
-    get label() {
-      return t("web.profiles.helpers.avatar.legacy.starBear");
-    },
+    label: "Star Bear",
     previewUrl: "/profile-avatars/avatar-3.svg",
     styleId: "legacy",
   },
   {
     id: "avatar-4",
-    get label() {
-      return t("web.profiles.helpers.avatar.legacy.neonPup");
-    },
+    label: "Neon Pup",
     previewUrl: "/profile-avatars/avatar-4.svg",
     styleId: "legacy",
   },
   {
     id: "avatar-5",
-    get label() {
-      return t("web.profiles.helpers.avatar.legacy.orbitBunny");
-    },
+    label: "Orbit Bunny",
     previewUrl: "/profile-avatars/avatar-5.svg",
     styleId: "legacy",
   },
   {
     id: "avatar-6",
-    get label() {
-      return t("web.profiles.helpers.avatar.legacy.solarOwl");
-    },
+    label: "Solar Owl",
     previewUrl: "/profile-avatars/avatar-6.svg",
     styleId: "legacy",
   },
   {
     id: "avatar-7",
-    get label() {
-      return t("web.profiles.helpers.avatar.legacy.novaGecko");
-    },
+    label: "Nova Gecko",
     previewUrl: "/profile-avatars/avatar-7.svg",
     styleId: "legacy",
   },
   {
     id: "avatar-8",
-    get label() {
-      return t("web.profiles.helpers.avatar.legacy.pixelPenguin");
-    },
+    label: "Pixel Penguin",
     previewUrl: "/profile-avatars/avatar-8.svg",
     styleId: "legacy",
   },
 ];
 
 export const PROFILE_AVATAR_STYLES: ProfileAvatarStyleOption[] = [
-  {
-    id: "identicon",
-    get label() {
-      return t("web.profiles.helpers.avatar.style.identicon.label");
-    },
-    get summary() {
-      return t("web.profiles.helpers.avatar.style.identicon.summary");
-    },
-  },
+  { id: "identicon", label: "Identicon", summary: "Geometric, technical, high-contrast patterns" },
   {
     id: "initials",
-    get label() {
-      return t("web.profiles.helpers.avatar.style.initials.label");
-    },
-    get summary() {
-      return t("web.profiles.helpers.avatar.style.initials.summary");
-    },
+    label: "Initials",
+    summary: "Clean letter-based avatars with bold backgrounds",
   },
-  {
-    id: "bottts-neutral",
-    get label() {
-      return t("web.profiles.helpers.avatar.style.botttsNeutral.label");
-    },
-    get summary() {
-      return t("web.profiles.helpers.avatar.style.botttsNeutral.summary");
-    },
-  },
-  {
-    id: "fun-emoji",
-    get label() {
-      return t("web.profiles.helpers.avatar.style.funEmoji.label");
-    },
-    get summary() {
-      return t("web.profiles.helpers.avatar.style.funEmoji.summary");
-    },
-  },
+  { id: "bottts-neutral", label: "Bottts Neutral", summary: "Cute modular robot-style icons" },
+  { id: "fun-emoji", label: "Fun Emoji", summary: "Big, colorful, instantly readable faces" },
   {
     id: "pixel-art-neutral",
-    get label() {
-      return t("web.profiles.helpers.avatar.style.pixelArtNeutral.label");
-    },
-    get summary() {
-      return t("web.profiles.helpers.avatar.style.pixelArtNeutral.summary");
-    },
+    label: "Pixel Art Neutral",
+    summary: "Retro pixel faces with lots of variation",
   },
 ];
 

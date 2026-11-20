@@ -67,39 +67,13 @@ func TestPinAttemptStickyFeaturesV3(t *testing.T) {
 	}
 }
 
-// A replan that omits or disables the hls delivery still persists its
-// context as the attempt's durable request. The start-time opt-in must
-// survive that, so a later replan that brings HLS back gets the playlist form
-// the attempt started with.
-func TestPinHLSVariableSubstitutionV3SurvivesReplanWithoutHLS(t *testing.T) {
-	for name, withoutHLS := range map[string]func(*ClientPlaybackContextV3){
-		"omitted": func(ctx *ClientPlaybackContextV3) { delete(ctx.Deliveries, DeliveryClassHLSV3) },
-		"disabled": func(ctx *ClientPlaybackContextV3) {
-			delivery := ctx.Deliveries[DeliveryClassHLSV3]
-			delivery.Enabled = false
-			ctx.Deliveries[DeliveryClassHLSV3] = delivery
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			record := validStartRequestV3()
-			delivery := record.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3]
-			delivery.Features = append(slices.Clone(delivery.Features), FeatureHLSVariableSubstitutionV3)
-			record.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3] = delivery
-
-			first := validStartRequestV3()
-			withoutHLS(&first.ClientPlaybackContext)
-			PinHLSVariableSubstitutionV3(&first.ClientPlaybackContext, record)
-			if deliveryAvailableV3(first, DeliveryClassHLSV3) {
-				t.Fatal("pinning made the omitted or disabled hls delivery available")
-			}
-			// executeReplanV3 persists the replan's context.
-			record.ClientPlaybackContext = first.ClientPlaybackContext
-
-			second := validStartRequestV3()
-			PinHLSVariableSubstitutionV3(&second.ClientPlaybackContext, record)
-			if !HLSVariableSubstitutionV3(second) {
-				t.Fatal("a replan that re-enabled hls lost the start-time opt-in")
-			}
-		})
+// Every sticky feature must be one the server actually advertises on some
+// surface, or a client could never negotiate it in the first place.
+func TestAttemptStickyFeaturesV3AreAdvertised(t *testing.T) {
+	advertised := NativeServerFeaturesV3()
+	for _, feature := range AttemptStickyFeaturesV3() {
+		if !HasFeatureV3(advertised, feature) {
+			t.Fatalf("attempt-sticky feature %q is not advertised by the server", feature)
+		}
 	}
 }

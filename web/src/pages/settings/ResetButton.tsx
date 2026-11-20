@@ -1,7 +1,6 @@
 import { RotateCcw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 
 /**
  * The small Reset beside a section title. Pages show it only when there is
@@ -16,7 +15,6 @@ export function ResetButton({
   disabled: boolean;
   onClick: () => void;
 }) {
-  const t = useT();
   return (
     <Button
       type="button"
@@ -27,7 +25,7 @@ export function ResetButton({
       onClick={onClick}
     >
       <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
-      {t("web.settings.resetButton.label")}
+      Reset
     </Button>
   );
 }

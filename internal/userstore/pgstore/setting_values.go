@@ -102,28 +102,9 @@ func listSettingValuesForResolution(ctx context.Context, db preferenceSettingsEx
 	if len(q.Keys) == 0 {
 		return nil, nil
 	}
-	return collectSettingValuesForResolution(db.Query(ctx, settingResolutionQuery, settingResolutionArgs(userID, q)...))
-}
 
-// QueueSettingValuesForResolution queues ListSettingValuesForResolution's read
-// for the account on batch. The returned function reads the result from the
-// sent batch, in the order the batch's reads were queued, with the answer
-// ListSettingValuesForResolution would give.
-func QueueSettingValuesForResolution(
-	batch *pgx.Batch, userID int, query userstore.SettingResolutionQuery,
-) func(pgx.BatchResults) ([]userstore.SettingValue, error) {
-	q := query.Normalized()
-	if len(q.Keys) == 0 {
-		return func(pgx.BatchResults) ([]userstore.SettingValue, error) { return nil, nil }
-	}
-	batch.Queue(settingResolutionQuery, settingResolutionArgs(userID, q)...)
-	return func(results pgx.BatchResults) ([]userstore.SettingValue, error) {
-		return collectSettingValuesForResolution(results.Query())
-	}
-}
-
-const settingResolutionQuery = `
-		SELECT ` + settingValueColumns + `
+	rows, err := db.Query(ctx, `
+		SELECT `+settingValueColumns+`
 		FROM user_setting_values
 		WHERE user_id = $1
 		  AND key = ANY($2::text[])
@@ -141,14 +122,9 @@ const settingResolutionQuery = `
 			        )
 			      )
 		ORDER BY key, scope, COALESCE(profile_id, ''), COALESCE(client_family, ''), COALESCE(device_id, ''),
-		         COALESCE(library_id, 0), COALESCE(series_id, '')`
-
-// settingResolutionArgs binds a normalized query to settingResolutionQuery.
-func settingResolutionArgs(userID int, q userstore.SettingResolutionQuery) []any {
-	return []any{userID, q.Keys, q.ProfileIDs, string(q.ClientFamily), q.DeviceID, q.LibraryIDs, q.SeriesIDs}
-}
-
-func collectSettingValuesForResolution(rows pgx.Rows, err error) ([]userstore.SettingValue, error) {
+		         COALESCE(library_id, 0), COALESCE(series_id, '')`,
+		userID, q.Keys, q.ProfileIDs, string(q.ClientFamily), q.DeviceID, q.LibraryIDs, q.SeriesIDs,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("listing setting values for resolution: %w", err)
 	}

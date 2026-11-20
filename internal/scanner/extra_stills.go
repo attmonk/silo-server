@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/imageutil"
 )
 
@@ -64,7 +63,7 @@ func (d *extraStillDirs) imageNames(dir string) (map[string][]string, bool) {
 	}
 	listed, ok := d.walked[dir]
 	if !ok {
-		entries, err := fspath.ReadDir(dir)
+		entries, err := os.ReadDir(dir)
 		if err != nil {
 			d.names[dir] = nil
 			return nil, false
@@ -129,7 +128,7 @@ func exactFirst(spellings []string, exact string) []string {
 // maxExtraStillBytes are skipped, as for other sidecar artwork. checked is
 // false when path could not be inspected.
 func usableExtraStill(path string) (info fs.FileInfo, checked bool) {
-	info, err := fspath.Lstat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, errors.Is(err, fs.ErrNotExist)
 	}
@@ -196,7 +195,7 @@ func (s *Scanner) setExtraStill(ctx context.Context, extraID, logPath, stored, s
 // sidecar's folder, and only the exact regular file find inspected is read,
 // so an image swapped for a symlink or another file in between is refused.
 func (s *Scanner) cacheExtraStill(ctx context.Context, extraID, path string, info fs.FileInfo) (string, string, error) {
-	file, err := os.OpenInRoot(fspath.Decode(filepath.Dir(path)), fspath.Decode(filepath.Base(path)))
+	file, err := os.OpenInRoot(filepath.Dir(path), filepath.Base(path))
 	if err != nil {
 		return "", "", err
 	}
@@ -205,7 +204,7 @@ func (s *Scanner) cacheExtraStill(ctx context.Context, extraID, path string, inf
 	if err != nil {
 		return "", "", err
 	}
-	if !fspath.SameFile(info, stat) || !stat.Mode().IsRegular() {
+	if !os.SameFile(info, stat) || !stat.Mode().IsRegular() {
 		return "", "", fmt.Errorf("extra image changed while being read: %s", path)
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxExtraStillBytes+1))
@@ -217,7 +216,7 @@ func (s *Scanner) cacheExtraStill(ctx context.Context, extraID, path string, inf
 	}
 	stored, thumbhash, err := s.imageCacher.CacheExtraStill(ctx, data, extraID)
 	// The same test a collection artwork upload uses for bad input.
-	if err != nil && imageutil.SourceUnusable(err, data) {
+	if err != nil && (errors.Is(err, imageutil.ErrInvalidImage) || imageutil.PixelDataUndecodable(data)) {
 		return "", "", fmt.Errorf("%w: %w", errUndecodableExtraStill, err)
 	}
 	return stored, thumbhash, err

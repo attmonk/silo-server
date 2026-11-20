@@ -14,11 +14,7 @@ import {
   formValuesFromConfig,
   humanizeConfigKey,
 } from "@/components/admin/plugins/configSchemaAdminForm";
-import {
-  buildSchemaValues,
-  fieldIsVisible,
-  parseFieldTypes,
-} from "@/components/admin/plugins/schemaFormUtils";
+import { buildSchemaValues, fieldIsVisible } from "@/components/admin/plugins/schemaFormUtils";
 import { authCapabilityOf } from "@/lib/externalSignInAdmin";
 
 /**
@@ -244,10 +240,5 @@ export function changedFieldCount(entry: SignInConfigEntry, draft: ConfigDraft |
 
 /** The entry a draft would save, as the config and connection-test endpoints take it. */
 export function stagedEntry(entry: SignInConfigEntry, values: Record<string, unknown>) {
-  return buildSchemaValues(
-    entry.descriptor,
-    values,
-    parseFieldTypes(entry.schema.json_schema),
-    SAVE_OPTIONS,
-  );
+  return buildSchemaValues(entry.descriptor, values, undefined, SAVE_OPTIONS);
 }

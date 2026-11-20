@@ -60,31 +60,14 @@ rebuilds the text in SQL, so the people ordering there must match Go's
 byte-wise sort (`COLLATE "C"` and the full sort key), and every SQL candidate
 is re-checked in Go before it counts against the 200-item quota.
 
-Embeddings use the AI provider `recommendations.embedding_provider_id` selects
-in the provider registry (see [AI provider authentication](ai-provider-authentication.md))
-and the model in `recommendations.embedding_model`. The engine is built at
-startup with the endpoint and model they resolve to; a changed choice applies
-after a restart. A new key for the provider it runs with applies on the next
-config reload, and only while the reloaded endpoint and model still match the
-running ones, so a key chosen for another endpoint never reaches this one.
-With no provider or model chosen, the catch-up stays idle and the nightly run
-fails with a message asking for one.
-
 The first stored vector writes the embedding lock (base URL, model, source and
-storage dimensions) in `server_settings`. Every later vector must come from the
-locked model with the locked dimensions. The lock belongs to the model, not the
-provider: the same model through another provider or address is accepted, and
-so is the same name behind a vendor prefix, so `google/gemini-embedding-001`
-through OpenRouter matches a `gemini-embedding-001` lock. Two different prefixes
-(`team-a/embed`, `team-b/embed`) name different models. Vectors from such a provider are stored
-under the lock's model name. The recorded base URL is informational.
+storage dimensions) in `server_settings`. Every later vector must match it.
 
 - A vector is checked before the lock is read or written: an empty vector or
   one wider than `embeddingvectors.CanonicalDimensions` (3072) ends the run,
   so an unusable model never pins the lock.
 - Vectors are zero-padded to 3072 for storage; cosine is unaffected.
-- Switching to another model requires the admin embeddings reset; switching
-  the provider or its address does not, and applies at restart. The reset
+- Changing the model or base URL requires the admin embeddings reset, which
   deletes the lock, embeddings, clusters and per-profile cached rows, and
   clears every taste vector, in one transaction while holding the embedding, taste and cache
   job claims and the stale sweep lock. Its transaction also takes the
@@ -171,9 +154,6 @@ not lost. A refresh that finds the profile's lock held by
 another server marks the profile stale and stops, so two refreshes never
 finish out of order.
 
-- Ratings are stored as scores from 1 to 10 and weighed in whole stars,
-  rounding half up: 9-10 is 5 stars, 7-8 is 4, 5-6 is 3, and 1-4 (1-2
-  stars) is a dislike. The star counts below use those bands.
 - Episodes roll up to their series. A series decays once by its most recent
   signal, as a movie decays by its last watch. A series with no signal for
   30 days counts in proportion to its episodes watched with a positive
@@ -307,10 +287,8 @@ Discover reads the profile's watched set once per request and shares it
 between its rows and the airings it blends in; Watch Tonight shares it
 between its candidates, its cold-start fallback and the handler's filter; a
 Home render shares it between its For You and Because You Watched rows. On
-the Postgres user store the set is one query planned for the profile, and the
-progress that abandoned titles and the taste profile come from is one query
-plus one for ebook reading progress; only a user store outside Postgres is
-walked page by page.
+the Postgres user store the set is one query planned for the profile; only a
+user store outside Postgres is walked page by page.
 
 Cache rows expire 26 hours after the run that wrote them, past the next daily
 cache run. A global row whose rebuild fails keeps its last good version until
@@ -520,19 +498,13 @@ finds a profile's rows missing asks for a refresh at most once per profile per
 asks too, so a lost first refresh recovers. Because You Watched anchors are the
 profile's three most recent completed titles of `recommendableMediaTypes` that
 still exist in the catalog, taken from its latest ten such completions and
-passing over those it rated 2 stars or lower or marked Not interested. A read
-whose filter limits the libraries (a library section, a Jellyfin `ParentId`, a
-viewer limited to some libraries, a disabled library) takes the three most
-recent in its libraries from the latest fifty completions instead, so watching
-one library does not take another library's row away until fifty newer titles
-were finished elsewhere. The worker builds rows for the three most recent
-overall and for each library's three most recent of the latest fifty, not
-counting titles in a disabled library, which covers every such read; Watch
-Tonight and a library's For You fill use the three most recent overall. A read
-asks for a refresh only when there are anchors and none has a cached row.
+passing over those it rated 2 stars or lower; the worker, the reads and
+Watch Tonight choose them the same way. A read asks for a refresh only when
+there are anchors and none has a cached row.
 
-List reads return at most 50 items per row (default 20), and section "see all"
-reads return up to 60, a whole cached row. Home and library sections read the whole cached pool,
+List reads return at most 50 items per row (default 20); the v1 for-you and
+similar-users reads keep 20, and section "see all" reads return up to 60, a
+whole cached row. Home and library sections read the whole cached pool,
 scope it to the section's libraries, then trim to the section's size. The
 main row is ranked for every title the profile can see, so a library with a
 small share of the catalog can hold few of its titles. A library's For You
@@ -546,5 +518,5 @@ Jellyfin's `/Movies/Recommendations` sends only rows its headings describe
 truthfully: up to two Because You Watched rows under their anchor's title,
 dropped when the viewer cannot see the anchor, and the taste-cluster rows
 under their genre label (see [jellycompat-api.md](../jellycompat-api.md)). A
-per-section items request that fails to load answers `500`; the v2 aggregate
-sections endpoints leave that row out.
+per-section items request that fails to load answers `500`; the aggregate
+sections endpoints still degrade to empty rows.

@@ -3,7 +3,6 @@ import type {
   RequestRouteConditions,
   RequestRouteMediaType,
 } from "@/api/v2/adminRequests";
-import { englishText, t } from "@/i18n";
 import { ROUTING_LANGUAGES, routingLanguageName } from "@/lib/requestRoutingOptions";
 
 import { cleanConditions } from "./requestRoutingModel";
@@ -28,10 +27,8 @@ export function adminLanguage(locale: string | undefined): string {
 
 export interface RulePreset {
   id: RulePresetId;
-  /** The card's title. */
+  /** The card's title, and the rule's name. */
   name: string;
-  /** The name a rule added from the preset is saved with: always English, since it is stored data the admin can rename. */
-  ruleName: string;
   description: string;
   conditions: RequestRouteConditions;
   /** "anime series", for "Where should anime series go?". */
@@ -46,42 +43,45 @@ export function rulePreset(
   mediaType: RequestRouteMediaType,
   language: string,
 ): RulePreset {
-  const values = { media_type: mediaType };
+  const plural = mediaType === "series" ? "series" : "movies";
   switch (id) {
     case "anime":
       return {
         id,
-        name: t("web.admin.settings.requests.presets.anime.name"),
-        ruleName: englishText("web.admin.settings.requests.presets.anime.name"),
-        description: t("web.admin.settings.requests.presets.anime.description", values),
+        name: "Anime",
+        description:
+          mediaType === "series"
+            ? "Japanese animation, and titles TMDB or AniDB list as anime. For Sonarr, also sets the series type to Anime."
+            : "Japanese animation, and titles TMDB or AniDB list as anime.",
         conditions: { anime: true },
-        noun: t("web.admin.settings.requests.presets.anime.noun", values),
-        matches: t("web.admin.settings.requests.presets.anime.matches", values),
+        noun: `anime ${plural}`,
+        matches: `${plural} that are anime`,
       };
     case "foreign": {
-      const named = { ...values, language: routingLanguageName(language) };
+      const name = routingLanguageName(language);
       return {
         id,
-        name: t("web.admin.settings.requests.presets.foreign.name"),
-        ruleName: englishText("web.admin.settings.requests.presets.foreign.name"),
-        description: t("web.admin.settings.requests.presets.foreign.description", named),
+        name: "Foreign language",
+        description: `Titles not originally in ${name}.`,
         conditions: { exclude_original_languages: [language] },
-        noun: t("web.admin.settings.requests.presets.foreign.noun", values),
-        matches: t("web.admin.settings.requests.presets.foreign.matches", named),
+        noun: `foreign-language ${plural}`,
+        matches: `${plural} not originally in ${name}`,
       };
     }
     case "kids":
       return {
         id,
-        name: t("web.admin.settings.requests.presets.kids.name"),
-        ruleName: englishText("web.admin.settings.requests.presets.kids.name"),
-        description: t("web.admin.settings.requests.presets.kids.description"),
+        name: "Kids & family",
+        description: "Family and kids titles rated PG or lower.",
         conditions: {
           genre_ids: mediaType === "series" ? [FAMILY_GENRE, KIDS_GENRE] : [FAMILY_GENRE],
           max_content_rating: "PG",
         },
-        noun: t("web.admin.settings.requests.presets.kids.noun", values),
-        matches: t("web.admin.settings.requests.presets.kids.matches", values),
+        noun: `kids & family ${plural}`,
+        matches:
+          mediaType === "series"
+            ? "family and kids series rated PG or lower"
+            : "family movies rated PG or lower",
       };
   }
 }

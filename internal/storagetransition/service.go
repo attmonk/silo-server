@@ -288,46 +288,12 @@ type Service struct {
 	memoryMu                sync.Mutex
 	memoryObjects           map[string]objectCheckpoint
 	memoryCursors           map[string]prefixCursor
-	// envManaged names the environment variable that sets each storage key
-	// this process locks; see SetEnvironmentManaged.
-	envManaged map[string]string
 }
 
 // SetNodeAdmission connects the transition to the API process's storage
 // admission lock. Production API processes install it before opening storage.
 func (s *Service) SetNodeAdmission(admission *pglock.NodeAdmission) {
 	s.nodeAdmission = admission
-}
-
-// SetEnvironmentManaged records the settings the environment sets on this
-// API server, keyed by setting with the variable as value. A transition
-// commits new storage settings, which the environment would replace on the
-// next start, so Start refuses while any storage setting is among them.
-func (s *Service) SetEnvironmentManaged(vars map[string]string) {
-	s.envManaged = vars
-}
-
-// environmentManagedStorageVars returns the sorted variables that set a
-// storage setting here.
-func (s *Service) environmentManagedStorageVars() []string {
-	var out []string
-	for _, key := range storageKeys() {
-		if name := s.envManaged[key]; name != "" {
-			out = append(out, name)
-		}
-	}
-	slices.Sort(out)
-	return out
-}
-
-// refuseEnvironmentManagedStorage is the refusal of a transition on a server
-// whose environment sets a storage setting.
-func (s *Service) refuseEnvironmentManagedStorage() error {
-	vars := s.environmentManagedStorageVars()
-	if len(vars) == 0 {
-		return nil
-	}
-	return validationErrorf("storage is set by the environment (%s); unset those variables and restart before a managed storage transition", strings.Join(vars, ", "))
 }
 
 func New(pool *pgxpool.Pool, settings Settings, jobs JobRepository, source, private blobstore.Store) *Service {
@@ -475,9 +441,6 @@ func (s *Service) Start(ctx context.Context, userID int, req StartRequest) (*mod
 	}
 	if !validPolicy(req.Policy) {
 		return nil, Preflight{}, validationErrorf("unknown migration policy %q", req.Policy)
-	}
-	if err := s.refuseEnvironmentManagedStorage(); err != nil {
-		return nil, Preflight{}, err
 	}
 	// Stage selection and job admission must have one owner. The job index
 	// alone cannot prevent a losing request from changing the winner's stage.
@@ -827,12 +790,6 @@ func (s *Service) ExecuteStorageTransition(ctx context.Context, req adminjob.Sto
 		// The runner settles the receipt instead of recording a failure.
 		return nil, fmt.Errorf("%w; awaiting restart or recovery", adminjob.ErrStorageTransitionAlreadyCommitted)
 	}
-	// A transition staged before a restart that added a storage variable
-	// would commit a location the environment replaces on the next start.
-	// One that already committed is past this point and settles above.
-	if err := s.refuseEnvironmentManagedStorage(); err != nil {
-		return nil, err
-	}
 	if err := s.updateStage(ctx, staged.ID, func(state *stagedTarget) {
 		state.Phase = transitionPhaseCopying
 		state.LastError = ""
@@ -842,13 +799,6 @@ func (s *Service) ExecuteStorageTransition(ctx context.Context, req adminjob.Sto
 	target, err := s.openPublic(staged.Values)
 	if err != nil {
 		return nil, err
-	}
-	// A target naming the directory the active store opened is the active
-	// store, which may carry the identity recorded under another path. Compare
-	// with that directory, not the recorded path: a link on it may since point
-	// somewhere else.
-	if blobstore.SameLocalRoot(target.Identity(), blobstore.Location(s.source)) {
-		target = s.source
 	}
 	targetPrivate := s.openPrivate(staged.Values)
 	publicChanged := target.Identity() != s.source.Identity()
@@ -1039,10 +989,6 @@ func (s *Service) copyTransitionData(ctx context.Context, staged stagedTarget, p
 		}
 	}
 	copyScope := func(scope string, source, destination blobstore.Store, prefix string, excluded ...string) error {
-		// Backups never move with storage: local ones hold unencrypted dumps
-		// that must not reach a bucket, and a bucket's are tied to their
-		// destination. Every pass, public or private, leaves them out.
-		excluded = append(excluded, blobstore.BackupNamespace)
 		copied, bytes, skipped, err := s.copyPrefixPass(ctx, staged.ID, scope, source, destination, prefix, progress, pass.objects, runID, sameRunListings, finalPass, excluded...)
 		if err != nil {
 			return err
@@ -1130,7 +1076,7 @@ var operationalPrefixes = append(append([]string(nil), operationalArtifactPrefix
 
 // preservedAssetPrefixes are the assets preserve_uploads copies: uploads that
 // cannot be downloaded again from a provider.
-var preservedAssetPrefixes = []string{"branding", "collection-images", "user-collection-images", "library-posters", "overlay-images", "subtitles"}
+var preservedAssetPrefixes = []string{"branding", "collection-images", "user-collection-images", "library-posters", "subtitles"}
 
 // operationalStore mirrors blobstore.Open: a private bucket owns diagnostics,
 // job artifacts, and avatars whatever the backend is, a local backend without
@@ -1188,8 +1134,8 @@ func storageNamespacesOverlap(sourceIdentity, targetIdentity string) bool {
 		return false
 	}
 	if strings.HasPrefix(sourceIdentity, blobstore.BackendLocal+"|") && strings.HasPrefix(targetIdentity, blobstore.BackendLocal+"|") {
-		sourceRoot := resolvedLocalRoot(sourceIdentity)
-		targetRoot := resolvedLocalRoot(targetIdentity)
+		sourceRoot := filepath.Clean(strings.TrimPrefix(sourceIdentity, blobstore.BackendLocal+"|"))
+		targetRoot := filepath.Clean(strings.TrimPrefix(targetIdentity, blobstore.BackendLocal+"|"))
 		return pathContains(sourceRoot, targetRoot) || pathContains(targetRoot, sourceRoot)
 	}
 	if strings.HasPrefix(sourceIdentity, blobstore.BackendS3+"|") && strings.HasPrefix(targetIdentity, blobstore.BackendS3+"|") {
@@ -1203,18 +1149,6 @@ func storageNamespacesOverlap(sourceIdentity, targetIdentity string) bool {
 		return keyPrefixContains(sourcePrefix, targetPrefix) || keyPrefixContains(targetPrefix, sourcePrefix)
 	}
 	return false
-}
-
-// resolvedLocalRoot is the root a local identity names with symlinks in its
-// parent directories resolved, the same rule blobstore.SameLocalRoot uses. A
-// store can keep the identity recorded under another path to its directory,
-// so containment compares where the roots are, not how they are written.
-func resolvedLocalRoot(identity string) string {
-	root := strings.TrimPrefix(identity, blobstore.BackendLocal+"|")
-	if resolved, err := blobstore.LocalIdentity(root); err == nil {
-		return strings.TrimPrefix(resolved, blobstore.BackendLocal+"|")
-	}
-	return filepath.Clean(root)
 }
 
 func pathContains(parent, child string) bool {
@@ -1264,7 +1198,7 @@ func namespacesOverlapObserved(ctx context.Context, source, target blobstore.Sto
 	if source == nil || target == nil {
 		return false, nil
 	}
-	if storageNamespacesOverlap(blobstore.Location(source), blobstore.Location(target)) {
+	if storageNamespacesOverlap(source.Identity(), target.Identity()) {
 		return true, nil
 	}
 	for _, probe := range namespaceProbes(source.Identity(), target.Identity()) {
@@ -2421,12 +2355,6 @@ func (s *Service) targetIdentities(values map[string]string) (assets, private st
 		assets, err = blobstore.LocalIdentity(values[settingArtworkLocalPath])
 		if err != nil {
 			return "", "", err
-		}
-		// The active store may carry the identity recorded under another path
-		// to the directory it opened; that directory is still the active
-		// location.
-		if s.source != nil && blobstore.SameLocalRoot(assets, blobstore.Location(s.source)) {
-			assets = s.source.Identity()
 		}
 	} else {
 		store, openErr := s.openPublic(values)

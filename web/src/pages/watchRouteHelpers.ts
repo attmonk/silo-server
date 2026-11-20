@@ -199,6 +199,7 @@ function buildInitialSubtitleTrackIndexes({
   subtitleMode,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
+  profileLanguage,
   showForcedSubtitles,
 }: {
   item: WatchDetail;
@@ -206,6 +207,7 @@ function buildInitialSubtitleTrackIndexes({
   subtitleMode: SubtitleMode;
   preferredSubtitleLanguage: string | null;
   preferredSubtitleTrackSignature: PlayerSubtitleTrackSignature | null;
+  profileLanguage: string | null;
   showForcedSubtitles: boolean;
 }): {
   start: Record<number, number>;
@@ -235,8 +237,6 @@ function buildInitialSubtitleTrackIndexes({
         track.embedded_title?.trim() ||
         track.file_name?.trim() ||
         track.language?.trim() ||
-        // Matched against a saved track signature, which stores this label in
-        // English, so it is data and is not translated (D44).
         `Subtitle ${index + 1}`,
       source: track.external ? "external" : "embedded",
       forced: track.forced,
@@ -253,6 +253,7 @@ function buildInitialSubtitleTrackIndexes({
       preferredLanguage: preferredSubtitleLanguage,
       preferredTrackSignature: preferredSubtitleTrackSignature,
       audioLanguage: resolveVersionAudioLanguage(version, selectedAudioTrackIndex),
+      profileLanguage,
       showForcedSubtitles,
     });
     if (selectedSubtitleTrackIndex === null) {
@@ -301,6 +302,7 @@ export function buildWatchPageProps({
     "auto") as SubtitleMode;
   const showForcedSubtitles =
     item.effective_show_forced_subtitles ?? currentProfile?.show_forced_subtitles ?? true;
+  const profileLanguage = currentProfile?.language || null;
 
   const subtitles: PlayerSubtitleInfo[] = item.subtitles.map((subtitle, index) => ({
     index,
@@ -362,6 +364,7 @@ export function buildWatchPageProps({
     subtitleMode,
     preferredSubtitleLanguage,
     preferredSubtitleTrackSignature: effectivePreferredSubtitleTrackSignature,
+    profileLanguage,
     showForcedSubtitles,
   });
 
@@ -408,7 +411,6 @@ export function buildWatchPageProps({
     contentId: request.contentId,
     title: item.title,
     year: item.year,
-    backdrop: { url: item.backdrop_url, thumbhash: item.backdrop_thumbhash },
     fileId: request.fileId,
     versionPicked: request.versionPicked,
     libraryId: request.libraryId,
@@ -425,6 +427,7 @@ export function buildWatchPageProps({
     preferredSubtitleTrackSignature: effectivePreferredSubtitleTrackSignature,
     subtitleMode,
     showForcedSubtitles,
+    profileLanguage,
     intro,
     introSkipMode,
     credits,

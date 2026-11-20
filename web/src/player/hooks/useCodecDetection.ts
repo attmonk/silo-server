@@ -10,13 +10,6 @@ const VIDEO_CODEC_MAP: Record<string, string> = {
   vp9: "vp09.00.10.08",
 };
 
-// Probes per bit depth for codecs whose higher-depth profile browsers often
-// refuse. Firefox and Safari decode H.264 High but not High 10, which a bare
-// "h264" claim would cover; Chromium decodes both.
-const VIDEO_BIT_DEPTH_PROBES: Record<string, Record<number, string>> = {
-  h264: { 8: "avc1.640028", 10: "avc1.6e0028" },
-};
-
 // Silo's native Dolby Vision remux recipe preserves the DOVI configuration
 // record under a dvh1 sample entry — the one Apple's HLS authoring spec calls
 // for, and the only one Safari answers "probably" for. Probe exactly that
@@ -55,15 +48,6 @@ const HDR10_PROGRESSIVE_CONFIGURATION = {
     transferFunction: "pq",
     hdrMetadataType: "smpteSt2086",
   },
-} satisfies MediaDecodingConfiguration;
-
-// The same shape at 60 fps. The HDR10 claim's frame-rate ceiling is the
-// fastest shape that decoded in real time, and the server refuses an HDR10
-// copy of anything faster, so a 24 fps-only probe sends every 25-60 fps HDR10
-// source to a tone-mapped transcode.
-const HDR10_PROGRESSIVE_60FPS_CONFIGURATION = {
-  ...HDR10_PROGRESSIVE_CONFIGURATION,
-  video: { ...HDR10_PROGRESSIVE_CONFIGURATION.video, framerate: 60 },
 } satisfies MediaDecodingConfiguration;
 
 /** A small SDR HEVC stream that any hardware HEVC decoder plays in real time. */
@@ -229,19 +213,18 @@ export function detectHDRFromMatchMedia(matchMediaFn: typeof matchMedia | undefi
  * describes the active output, not the decoder, and browsers tone-map HDR
  * content onto SDR outputs. The shape has to decode in real time
  * (decodesInRealTime), checked against a small SDR HEVC reference stream.
- * Resolves to the highest frame rate that does (60 or 24), or 0 when neither
- * does; the answer is the claim's `hdr10_max_frame_rate`.
  */
-export async function probeHDR10PlaybackSupport(): Promise<number> {
-  if (typeof navigator === "undefined" || !navigator.mediaCapabilities) return 0;
+export async function probeHDR10PlaybackSupport(): Promise<boolean> {
+  if (typeof navigator === "undefined" || !navigator.mediaCapabilities) return false;
 
-  const decodes = (configuration: MediaDecodingConfiguration) =>
-    decodesInRealTime(configuration, HEVC_REFERENCE_CONFIGURATION).catch(() => false);
-  if (!(await decodes(HDR10_PROGRESSIVE_CONFIGURATION))) return 0;
-  return (await decodes(HDR10_PROGRESSIVE_60FPS_CONFIGURATION)) ? 60 : 24;
+  try {
+    return await decodesInRealTime(HDR10_PROGRESSIVE_CONFIGURATION, HEVC_REFERENCE_CONFIGURATION);
+  } catch {
+    return false;
+  }
 }
 
-let initialHDR10Probe: Promise<number> | null = null;
+let initialHDR10Probe: Promise<boolean> | null = null;
 let maxDecodeResolutionProbe: Promise<string> | null = null;
 let maxDecodeResolutionAnswer: string | null = null;
 
@@ -283,7 +266,7 @@ function maxDecodeResolutionWithDeadline(): Promise<string> {
  * app. The shell calls this before playback is requested so opening a video
  * does not have to wait several seconds for the browser's first decoder probe.
  */
-export function prewarmCodecDetection(): Promise<number> {
+export function prewarmCodecDetection(): Promise<boolean> {
   void startMaxDecodeResolutionProbe();
   initialHDR10Probe ??= probeHDR10PlaybackSupport();
   return initialHDR10Probe;
@@ -365,14 +348,6 @@ export function probeWebCapabilities(): WebCapabilityProbe {
     }
   }
 
-  const videoBitDepths: Record<string, number[]> = {};
-  for (const [name, probes] of Object.entries(VIDEO_BIT_DEPTH_PROBES)) {
-    if (!codecsVideo.includes(name)) continue;
-    videoBitDepths[name] = Object.entries(probes)
-      .filter(([, codec]) => testMediaType(`video/mp4; codecs="${codec}"`))
-      .map(([depth]) => Number(depth));
-  }
-
   // Test audio codecs.
   for (const [name, mimeTypes] of Object.entries(AUDIO_CODEC_MAP)) {
     if (mimeTypes.some(testMediaType)) {
@@ -432,7 +407,6 @@ export function probeWebCapabilities(): WebCapabilityProbe {
     containers,
     codecsVideo,
     progressiveCodecsVideo,
-    videoBitDepths,
     codecsAudio,
     progressiveCodecsAudio,
     maxResolution: UNPROBED_MAX_RESOLUTION,
@@ -466,13 +440,13 @@ export function useCodecDetection(): SettledWebCapabilityProbe {
       typeof matchMedia === "undefined"
         ? []
         : [matchMedia("(dynamic-range: high)"), matchMedia("(video-dynamic-range: high)")];
-    const refresh = (hdr10Probe: Promise<number>) => {
+    const refresh = (hdr10Probe: Promise<boolean>) => {
       const generation = ++probeGeneration;
       const next = probeWebCapabilities();
       setCapabilities({ ...next, settled: false });
 
       const probes = Promise.all([hdr10Probe, maxDecodeResolutionWithDeadline()]);
-      void probes.then(([hdr10MaxFrameRate, maxResolution]) => {
+      void probes.then(([hdr10, maxResolution]) => {
         if (disposed || generation !== probeGeneration) return;
         setCapabilities((current) => ({
           ...current,
@@ -482,17 +456,17 @@ export function useCodecDetection(): SettledWebCapabilityProbe {
           // progressive MP4 route even when the separate generic HEVC probe was
           // rejected. Keep that evidence scoped away from original and HLS.
           progressiveCodecsVideo:
-            !hdr10MaxFrameRate || current.progressiveCodecsVideo.includes("hevc")
+            !hdr10 || current.progressiveCodecsVideo.includes("hevc")
               ? current.progressiveCodecsVideo
               : [...current.progressiveCodecsVideo, "hevc"],
           hdrDetails: {
             ...current.hdrDetails,
-            ...(hdr10MaxFrameRate
+            ...(hdr10
               ? {
                   hdr10: true,
                   hdr10_max_width: 3840,
                   hdr10_max_height: 2160,
-                  hdr10_max_frame_rate: hdr10MaxFrameRate,
+                  hdr10_max_frame_rate: 24,
                   hdr10_max_bitrate_kbps: 80_000,
                 }
               : {}),

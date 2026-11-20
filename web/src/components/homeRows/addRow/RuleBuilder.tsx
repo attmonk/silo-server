@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState } from "react";
 import { Plus, X } from "lucide-react";
 import type { FilterRule, QueryDefinition, QueryGroup } from "@/api/types";
 import { newFilterRule } from "@/components/collections/collectionBuilderFields";
@@ -8,10 +8,9 @@ import {
   getFilterRuleFieldOptions,
 } from "@/components/FilterRuleEditor";
 import LibraryMultiSelect from "@/components/LibraryMultiSelect";
-import { useQueryRuleCapabilities } from "@/hooks/queries/personSearch";
+import { useExtendedQueryRules } from "@/hooks/queries/personSearch";
 import { useShownRatingSources } from "@/hooks/queries/ratingsCapability";
 import { Button } from "@/components/ui/button";
-import { useT, type MessageKey } from "@/i18n";
 import {
   Select,
   SelectContent,
@@ -24,19 +23,16 @@ import { normalizeQuerySortForScope, querySortScopeForMediaScope } from "@/lib/q
 type MediaScope = NonNullable<QueryDefinition["media_scope"]> | "all";
 
 // Lower-case: each name reads inside the sentence ("Show movies from …").
-const SCOPES: ReadonlyArray<[MediaScope, MessageKey]> = [
-  ["all", "web.home.addRow.rules.scopeAll"],
-  ["video", "web.home.addRow.rules.scopeVideo"],
-  ["movie", "web.home.addRow.rules.scopeMovie"],
-  ["series", "web.home.addRow.rules.scopeSeries"],
-  ["episode", "web.home.addRow.rules.scopeEpisode"],
-  ["audiobook", "web.home.addRow.rules.scopeAudiobook"],
-  ["ebook", "web.home.addRow.rules.scopeEbook"],
-  ["manga", "web.home.addRow.rules.scopeManga"],
+const SCOPES: ReadonlyArray<[MediaScope, string]> = [
+  ["all", "all titles"],
+  ["video", "movies and shows"],
+  ["movie", "movies"],
+  ["series", "shows"],
+  ["episode", "episodes"],
+  ["audiobook", "audiobooks"],
+  ["ebook", "ebooks"],
+  ["manga", "manga"],
 ];
-
-/** A word of a sentence of controls, as its own flex item. */
-const word = (chunks: ReactNode[]) => <span>{chunks}</span>;
 
 const INLINE_TRIGGER = "h-9 w-auto gap-1.5 px-3 text-sm font-medium";
 
@@ -50,30 +46,23 @@ function MatchSelect({
   value: "all" | "any";
   onChange: (value: "all" | "any") => void;
   /** What "all" and "any" read as. */
-  names: { all: MessageKey; any: MessageKey };
+  names: { all: string; any: string };
 }) {
-  const t = useT();
   return (
     <Select value={value} onValueChange={(next) => onChange(next as "all" | "any")}>
       <SelectTrigger aria-label={label} className={INLINE_TRIGGER}>
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
-        <SelectItem value="all">{t(names.all)}</SelectItem>
-        <SelectItem value="any">{t(names.any)}</SelectItem>
+        <SelectItem value="all">{names.all}</SelectItem>
+        <SelectItem value="any">{names.any}</SelectItem>
       </SelectContent>
     </Select>
   );
 }
 
-const RULE_NAMES: { all: MessageKey; any: MessageKey } = {
-  all: "web.home.addRow.rules.matchAll",
-  any: "web.home.addRow.rules.matchAny",
-};
-const GROUP_JOIN_NAMES: { all: MessageKey; any: MessageKey } = {
-  all: "web.home.addRow.rules.joinAnd",
-  any: "web.home.addRow.rules.joinOr",
-};
+const RULE_NAMES = { all: "all", any: "any" };
+const GROUP_JOIN_NAMES = { all: "and", any: "or" };
 
 /**
  * Step 2 of a rule row, and a Smart collection's rules: "Show [movies] from
@@ -89,7 +78,8 @@ export function RuleBuilder({
   libraries,
   allowPersonalized = false,
   context = "homeRow",
-  allLibrariesLabel: allLibrariesProp,
+  librariesRequired = false,
+  allLibrariesLabel = "all libraries",
   librariesId,
 }: {
   value: QueryDefinition;
@@ -99,22 +89,23 @@ export function RuleBuilder({
   allowPersonalized?: boolean;
   /** What the rules fill: a Home row or a Smart collection. */
   context?: "homeRow" | "collection";
+  /** At least one library must be picked: there is no "all libraries" choice. */
+  librariesRequired?: boolean;
   /** How the sentence names every library, when none is picked. */
   allLibrariesLabel?: string;
   /** An id for the libraries control, so another part of the page can move focus to it. */
   librariesId?: string;
 }) {
-  const t = useT();
-  const allLibrariesLabel = allLibrariesProp ?? t("web.home.addRow.rules.allLibraries");
+  const subject = context === "collection" ? "collection" : "row";
   const { groups } = value;
   const scope: MediaScope = value.media_scope ?? "all";
   const shownRatingSources = useShownRatingSources();
-  const capabilities = useQueryRuleCapabilities();
+  const extendedRules = useExtendedQueryRules();
   const fieldOptions = getFilterRuleFieldOptions(
     allowPersonalized,
     scope,
     shownRatingSources,
-    capabilities,
+    extendedRules,
   );
   const several = groups.length > 1;
   // Follows the picker's summary: "library"/"libraries" only follows a summary that shows a
@@ -182,7 +173,7 @@ export function RuleBuilder({
     setFocusRule(`${groups.length}:0`);
   }
 
-  const joinsWithAnd = several && value.match === "all";
+  const join = several ? GROUP_JOIN_NAMES[value.match] : "or";
   const addGroupButton = (
     <Button
       type="button"
@@ -192,9 +183,7 @@ export function RuleBuilder({
       onClick={addGroup}
     >
       <Plus aria-hidden className="size-4" />
-      {joinsWithAnd
-        ? t("web.home.addRow.rules.addAndGroup")
-        : t("web.home.addRow.rules.addOrGroup")}
+      {`Add an “${join}” group`}
     </Button>
   );
 
@@ -202,118 +191,91 @@ export function RuleBuilder({
     <div className="grid gap-3">
       <div
         role="group"
-        aria-label={
-          context === "collection"
-            ? t("web.home.addRow.rules.whatCollectionShows")
-            : t("web.home.addRow.rules.whatRowShows")
-        }
+        aria-label={`What the ${subject} shows`}
         className="flex flex-wrap items-center gap-x-2 gap-y-2 text-[15px]"
       >
-        {t(
-          summaryShowsAName
-            ? "web.home.addRow.rules.sentenceNamed"
-            : value.library_ids.length > 0
-              ? "web.home.addRow.rules.sentencePicked"
-              : "web.home.addRow.rules.sentenceAll",
-          {
-            count: value.library_ids.length,
-            rules: groups.length > 0 ? "yes" : "no",
-            w: word,
-            scope: () => (
-              <Select value={scope} onValueChange={setScope}>
-                <SelectTrigger
-                  aria-label={t("web.home.addRow.rules.kindOfTitles")}
-                  className={INLINE_TRIGGER}
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {SCOPES.map(([key, name]) => (
-                    <SelectItem key={key} value={key}>
-                      {t(name)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            ),
-            libraries: () => (
-              <span id={librariesId} className="inline-flex">
-                <LibraryMultiSelect
-                  libraries={libraries}
-                  value={value.library_ids}
-                  onChange={(libraryIds) => onChange({ ...value, library_ids: libraryIds })}
-                  emptyLabel={allLibrariesLabel}
-                  allOptionLabel={
-                    allLibrariesLabel.charAt(0).toUpperCase() + allLibrariesLabel.slice(1)
-                  }
-                  triggerLabel={t("web.home.addRow.libraries")}
-                  triggerClassName={`${INLINE_TRIGGER} justify-between`}
-                />
-              </span>
-            ),
-            // The mockup starts the matching clause on its own line.
-            break: () => <span aria-hidden className="h-0 basis-full" />,
-            match: () =>
-              groups[0] ? (
-                <MatchSelect
-                  label={t("web.home.addRow.rules.howRulesCombine")}
-                  value={groups[0].match}
-                  names={RULE_NAMES}
-                  onChange={(match) => setGroup(0, { ...groups[0]!, match })}
-                />
-              ) : null,
-          },
-        )}
+        <span>Show</span>
+        <Select value={scope} onValueChange={setScope}>
+          <SelectTrigger aria-label="Kind of titles" className={INLINE_TRIGGER}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {SCOPES.map(([key, name]) => (
+              <SelectItem key={key} value={key}>
+                {name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <span>{value.library_ids.length > 0 ? "from the" : "from"}</span>
+        <span id={librariesId} className="inline-flex">
+          <LibraryMultiSelect
+            libraries={libraries}
+            value={value.library_ids}
+            onChange={(libraryIds) => onChange({ ...value, library_ids: libraryIds })}
+            emptyLabel={librariesRequired ? "choose libraries" : allLibrariesLabel}
+            allOptionLabel={allLibrariesLabel.charAt(0).toUpperCase() + allLibrariesLabel.slice(1)}
+            hideAllOption={librariesRequired}
+            triggerLabel="Libraries"
+            triggerClassName={`${INLINE_TRIGGER} justify-between`}
+          />
+        </span>
+        {summaryShowsAName ? (
+          <span>{value.library_ids.length === 1 ? "library" : "libraries"}</span>
+        ) : null}
+        {groups.length > 0 ? (
+          <>
+            {/* The mockup starts the matching clause on its own line. */}
+            <span aria-hidden className="h-0 basis-full" />
+            <span>that match</span>
+            <MatchSelect
+              label="How the rules combine"
+              value={groups[0]!.match}
+              names={RULE_NAMES}
+              onChange={(match) => setGroup(0, { ...groups[0]!, match })}
+            />
+            <span>of these:</span>
+          </>
+        ) : null}
       </div>
 
       <div className="border-border grid gap-2.5 rounded-2xl border p-3 sm:p-4">
         {groups.length === 0 ? (
           <p className="text-muted-foreground text-sm">
             {context === "collection"
-              ? t("web.home.addRow.rules.noRulesCollectionYet")
-              : t("web.home.addRow.rules.noRulesRow")}
+              ? "No rules yet, so the collection holds every title from these libraries."
+              : "No rules yet, so the row shows every title from these libraries."}
           </p>
         ) : null}
         {groups.map((group, index) => (
           <div
             key={index}
             role={several ? "group" : undefined}
-            aria-label={
-              several ? t("web.home.addRow.rules.group", { number: index + 1 }) : undefined
-            }
+            aria-label={several ? `Group ${index + 1}` : undefined}
             className="grid gap-2"
           >
             {index > 0 ? (
               <div className="border-border flex flex-wrap items-center gap-2 border-t pt-3 text-sm">
-                {t("web.home.addRow.rules.groupSentence", {
-                  w: word,
-                  join: () => (
-                    <MatchSelect
-                      label={t("web.home.addRow.rules.howGroupsCombine")}
-                      value={value.match}
-                      names={GROUP_JOIN_NAMES}
-                      onChange={(match) => onChange({ ...value, match })}
-                    />
-                  ),
-                  match: () => (
-                    <MatchSelect
-                      label={t("web.home.addRow.rules.groupMatchLabel", {
-                        number: index + 1,
-                      })}
-                      value={group.match}
-                      names={RULE_NAMES}
-                      onChange={(match) => setGroup(index, { ...group, match })}
-                    />
-                  ),
-                })}
+                <MatchSelect
+                  label="How the groups combine"
+                  value={value.match}
+                  names={GROUP_JOIN_NAMES}
+                  onChange={(match) => onChange({ ...value, match })}
+                />
+                <span>titles that match</span>
+                <MatchSelect
+                  label={`How group ${index + 1}'s rules combine`}
+                  value={group.match}
+                  names={RULE_NAMES}
+                  onChange={(match) => setGroup(index, { ...group, match })}
+                />
+                <span>of these:</span>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon"
-                  aria-label={t("web.home.addRow.rules.removeGroup", {
-                    number: index + 1,
-                  })}
-                  className="text-muted-foreground ms-auto size-8"
+                  aria-label={`Remove group ${index + 1}`}
+                  className="text-muted-foreground ml-auto size-8"
                   onClick={() => {
                     setFocusRule(null);
                     setGroups(groups.filter((_, at) => at !== index));
@@ -332,7 +294,7 @@ export function RuleBuilder({
                 onChange={(updates) => updateRule(index, ruleIndex, updates)}
                 onRemove={() => removeRule(index, ruleIndex)}
                 roomy
-                label={t("web.home.addRow.rules.rule", { number: ruleIndex + 1 })}
+                label={`Rule ${ruleIndex + 1}`}
                 valueScope={valueScope}
                 focusValue={focusRule === `${index}:${ruleIndex}`}
               />
@@ -340,7 +302,7 @@ export function RuleBuilder({
             <div className="flex flex-wrap items-center gap-1">
               <Button type="button" variant="ghost" size="sm" onClick={() => addRule(index)}>
                 <Plus aria-hidden className="size-4" />
-                {t("web.home.addRow.rules.addRule")}
+                Add rule
               </Button>
               {index === groups.length - 1 ? addGroupButton : null}
             </div>
@@ -350,7 +312,7 @@ export function RuleBuilder({
           <div>
             <Button type="button" variant="ghost" size="sm" onClick={() => addRule(0)}>
               <Plus aria-hidden className="size-4" />
-              {t("web.home.addRow.rules.addRule")}
+              Add rule
             </Button>
           </div>
         ) : null}
@@ -369,14 +331,11 @@ export function RuleSortField({
   onChange: (value: QueryDefinition) => void;
   allowPersonalized?: boolean;
 }) {
-  const t = useT();
   return (
     <div className="flex flex-wrap items-center justify-between gap-3">
       <div>
-        <span className="text-sm font-medium">{t("web.home.addRow.order")}</span>
-        <p className="text-muted-foreground mt-1 text-[13px]">
-          {t("web.home.addRow.rules.orderHint")}
-        </p>
+        <span className="text-sm font-medium">Order</span>
+        <p className="text-muted-foreground mt-1 text-[13px]">Which matching titles come first.</p>
       </div>
       <div className="flex items-center gap-2">
         <FilterSortControls

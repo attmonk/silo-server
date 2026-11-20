@@ -2,21 +2,15 @@ package policy
 
 import (
 	"context"
-	"slices"
+	"reflect"
+	"sort"
 	"testing"
-	"time"
 
-	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
-// TestPermissionPayloadParity pins the account payload's permissions
-// (auth.PolicyPermissions over the group-masked effective policy) against the
-// PDP the route gates consult. Clients grant an admin every permission while
-// it acts as admin and otherwise use the payload list. Whatever that shows,
-// the PDP must allow; for non-admins the two must agree exactly.
-func TestPermissionPayloadParity(t *testing.T) {
+func TestPermissionEffectivePermissionParity(t *testing.T) {
 	ctx := context.Background()
 	pdp := newPermissionParityPDP(t)
 
@@ -28,91 +22,40 @@ func TestPermissionPayloadParity(t *testing.T) {
 		{name: "marker_edit", permissions: []string{string(auth.PermissionMarkerEdit)}},
 		{name: "both", permissions: []string{string(auth.PermissionMarkerEdit), string(auth.PermissionMetadataCuration)}},
 	}
-	groupCases := []struct {
-		name    string
-		allowed []string
-		grouped bool
-	}{
-		{name: "ungrouped"},
-		{name: "group_unmasked", grouped: true},
-		{name: "group_masks_all", grouped: true, allowed: []string{}},
-		{name: "group_allows_curation", grouped: true, allowed: []string{string(auth.PermissionMetadataCuration)}},
-	}
-	profileCases := []struct {
-		name              string
-		declaredProfileID string
-		actingAsPrimary   bool
-	}{
-		{name: "no_profile"},
-		{name: "primary_profile", declaredProfileID: "prof-1", actingAsPrimary: true},
-		{name: "non_primary_profile", declaredProfileID: "prof-2"},
-	}
 	permissions := []auth.Permission{
 		auth.PermissionMarkerEdit,
 		auth.PermissionMetadataCuration,
 	}
 
 	for _, role := range []string{"admin", "user"} {
-		for _, assigned := range assignedCases {
-			for _, groupCase := range groupCases {
-				for _, profile := range profileCases {
-					t.Run(role+"/"+assigned.name+"/"+groupCase.name+"/"+profile.name, func(t *testing.T) {
-						user := &models.User{
-							ID:          7,
-							Role:        role,
-							Enabled:     true,
-							Permissions: clonePermissionStrings(assigned.permissions),
+		for _, enabled := range []bool{false, true} {
+			for _, assigned := range assignedCases {
+				t.Run(role+"/"+assigned.name, func(t *testing.T) {
+					user := &models.User{
+						ID:          7,
+						Role:        role,
+						Enabled:     enabled,
+						Permissions: clonePermissionStrings(assigned.permissions),
+					}
+					for _, permission := range permissions {
+						input := permissionInputForUser(user, string(permission))
+						decision, _, err := pdp.CheckPermission(ctx, input)
+						if err != nil {
+							t.Fatalf("CheckPermission(%s) error: %v", permission, err)
 						}
-						var group *access.GroupPolicy
-						if groupCase.grouped {
-							groupID := int64(3)
-							user.AccessGroupID = &groupID
-							policy := access.NoGroupPolicy()
-							if groupCase.allowed != nil {
-								policy.AllowedPermissions = clonePermissionStrings(groupCase.allowed)
-							}
-							group = &policy
+						want := auth.HasEffectivePermission(user, permission)
+						if decision.Allowed != want {
+							t.Fatalf("CheckPermission(%s) allowed = %t, want %t (decision %#v)", permission, decision.Allowed, want, decision)
 						}
-						effective := access.ApplyGroupPolicy(user, group)
-						payload := auth.PolicyPermissions(effective)
-						actingAdmin := role == "admin" && (profile.declaredProfileID == "" || profile.actingAsPrimary)
+					}
 
-						for _, permission := range permissions {
-							input := permissionInputForUser(user, string(permission))
-							input.AssignedPermissions = clonePermissionStrings(effective.Permissions)
-							input.DeclaredProfileID = profile.declaredProfileID
-							input.ActingAsPrimary = profile.actingAsPrimary
-							decision, _, err := pdp.CheckPermission(ctx, input)
-							if err != nil {
-								t.Fatalf("CheckPermission(%s) error: %v", permission, err)
-							}
-							shown := actingAdmin || slices.Contains(payload, string(permission))
-							if shown && !decision.Allowed {
-								t.Fatalf("%s shown to client (payload %#v) but PDP denies (decision %#v)", permission, payload, decision)
-							}
-							if shown != decision.Allowed {
-								t.Fatalf("%s shown = %t, PDP allowed = %t (payload %#v)", permission, shown, decision.Allowed, payload)
-							}
-						}
-					})
-				}
-			}
-		}
-	}
-}
-
-func TestPermissionDisabledAccountDenied(t *testing.T) {
-	ctx := context.Background()
-	pdp := newPermissionParityPDP(t)
-	for _, role := range []string{"admin", "user"} {
-		user := &models.User{ID: 7, Role: role, Permissions: []string{string(auth.PermissionMarkerEdit), string(auth.PermissionMetadataCuration)}}
-		for _, permission := range []string{PermissionMarkerEdit, PermissionMetadataCuration} {
-			decision, _, err := pdp.CheckPermission(ctx, permissionInputForUser(user, permission))
-			if err != nil {
-				t.Fatalf("CheckPermission(%s) error: %v", permission, err)
-			}
-			if decision.Allowed {
-				t.Fatalf("disabled %s allowed %s (decision %#v)", role, permission, decision)
+					gotEffective := policyEffectivePermissions(t, ctx, pdp, user)
+					wantEffective := auth.EffectivePermissions(user)
+					sort.Strings(wantEffective)
+					if !reflect.DeepEqual(gotEffective, wantEffective) {
+						t.Fatalf("policy effective permissions = %#v, want %#v", gotEffective, wantEffective)
+					}
+				})
 			}
 		}
 	}
@@ -266,7 +209,7 @@ func TestPermissionMetadataCurationLibraryScope(t *testing.T) {
 
 func newPermissionParityPDP(t *testing.T) *PDP {
 	t.Helper()
-	engine, err := NewEngine(context.Background(), WithEvalTimeout(time.Minute))
+	engine, err := NewEngine(context.Background())
 	if err != nil {
 		t.Fatalf("NewEngine() error: %v", err)
 	}
@@ -285,6 +228,25 @@ func permissionInputForUser(user *models.User, permission string) PermissionInpu
 		UserLibrariesRestricted: false,
 		RequestTime:             "2026-07-02T12:00:00Z",
 	}
+}
+
+func policyEffectivePermissions(t *testing.T, ctx context.Context, pdp *PDP, user *models.User) []string {
+	t.Helper()
+	var out []string
+	for _, permission := range []string{PermissionMarkerEdit, PermissionMetadataCuration} {
+		decision, _, err := pdp.CheckPermission(ctx, permissionInputForUser(user, permission))
+		if err != nil {
+			t.Fatalf("CheckPermission(%s) error: %v", permission, err)
+		}
+		if decision.Allowed {
+			out = append(out, permission)
+		}
+	}
+	sort.Strings(out)
+	if out == nil {
+		return []string{}
+	}
+	return out
 }
 
 func clonePermissionStrings(values []string) []string {

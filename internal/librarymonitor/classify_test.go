@@ -8,6 +8,54 @@ import (
 	"testing"
 )
 
+func TestClassifyFSType(t *testing.T) {
+	tests := []struct {
+		name    string
+		fsType  int64
+		want    fsSupport
+		display string
+	}{
+		{"ext4", 0xef53, fsMonitored, ""},
+		{"nfs", 0x6969, fsUnsupported, "NFS"},
+		{"fuse and virtiofs", 0x65735546, fsMonitoredCaveat, "FUSE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyFSType(tt.fsType)
+			if got.Support != tt.want || got.Name != tt.display {
+				t.Fatalf("classifyFSType(%#x) = %+v, want support %d name %q", tt.fsType, got, tt.want, tt.display)
+			}
+		})
+	}
+}
+
+func TestIgnoredName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"movie.mkv":           false,
+		"movie.mkv.partial":   true,
+		"movie.mkv.partial~":  true,
+		"movie.mkv.part":      true,
+		"movie.PART":          true,
+		"x.tmp":               true,
+		"movie.mkv.!qB":       true,
+		"@eaDir":              true,
+		"#recycle":            true,
+		".RecycleBin":         true,
+		".Trash-1000":         true,
+		"lost+found":          true,
+		"Season 1":            false,
+		"movie.partial.mkv":   false,
+		"trash-not-hidden.nf": false,
+	} {
+		if got := ignoredName(name); got != want {
+			t.Errorf("ignoredName(%q) = %v, want %v", name, got, want)
+		}
+	}
+	if !ignoredDir(".downloads") || ignoredName(".downloads") {
+		t.Errorf("scanner-skipped directory names apply to directories only")
+	}
+}
+
 func TestWalkTreeSkipsWhatTheScannerSkips(t *testing.T) {
 	root := t.TempDir()
 	mkdirs(t, root,
@@ -20,7 +68,6 @@ func TestWalkTreeSkipsWhatTheScannerSkips(t *testing.T) {
 		"@eaDir/thumbs",
 		"Downloading.partial",
 		".downloads",
-		".tool-workspace/Inside",
 		"Target/Deep",
 	)
 	writeFile(t, filepath.Join(root, "NoMedia", ".nomedia"), "")
@@ -33,10 +80,6 @@ func TestWalkTreeSkipsWhatTheScannerSkips(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(root, filepath.Join(root, "Target", "Loop")); err != nil {
-		t.Fatal(err)
-	}
-	// A hidden symlink to a directory is skipped like a hidden directory.
-	if err := os.Symlink(filepath.Join(root, "Target"), filepath.Join(root, ".linked")); err != nil {
 		t.Fatal(err)
 	}
 

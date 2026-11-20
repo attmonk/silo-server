@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -156,6 +157,47 @@ func TestRunFetchNeedsTrustForLocalServer(t *testing.T) {
 
 	if _, _, err := (privateNetworkProvider{provider}).Fetch(context.Background()); err != nil {
 		t.Fatalf("trusted fetch: %v", err)
+	}
+}
+
+func TestPublicRunReplacesDiagnostics(t *testing.T) {
+	stored := Run{
+		ID:           "run-1",
+		ErrorMessage: `plex http 403: {"secret":"internal body"}`,
+		Warnings: []string{
+			`failed to fetch watched movies from section "Movies": plex http 403: internal body`,
+			warnJellyfinFavoritesUnavailable,
+		},
+		UnmatchedSamples: []UnmatchedSample{{Kind: KindMovie, Title: "Heat", Reason: "db: connection reset"}},
+	}
+
+	public := PublicRun(stored)
+
+	if public.ErrorMessage != GenericRunError {
+		t.Fatalf("error message = %q", public.ErrorMessage)
+	}
+	for _, warning := range public.Warnings {
+		if strings.Contains(warning, "internal body") {
+			t.Fatalf("warning leaked a diagnostic: %q", warning)
+		}
+	}
+	if public.Warnings[0] != GenericRunWarning || public.Warnings[1] != jellyfinFavoritesUnavailableSummary {
+		t.Fatalf("warnings = %q", public.Warnings)
+	}
+	if public.UnmatchedSamples[0].Reason != GenericUnmatchedReason || public.UnmatchedSamples[0].Title != "Heat" {
+		t.Fatalf("sample = %+v", public.UnmatchedSamples[0])
+	}
+	if stored.UnmatchedSamples[0].Reason != "db: connection reset" {
+		t.Fatal("PublicRun modified the stored run")
+	}
+
+	for _, message := range []string{"", PrivateAddressMessage, BlockedAddressMessage, RunErrorNotCompleted} {
+		if got := PublicRunError(message); got != message {
+			t.Errorf("PublicRunError(%q) = %q, want it unchanged", message, got)
+		}
+	}
+	if got := PublicRun(Run{}); got.Warnings != nil || got.UnmatchedSamples != nil {
+		t.Fatal("nil slices must stay nil")
 	}
 }
 

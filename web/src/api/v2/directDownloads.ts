@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import {
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
@@ -14,8 +13,7 @@ export async function launchDirectDownload(
   fileId: number,
   isCurrent: () => boolean,
 ): Promise<void> {
-  if (!Number.isSafeInteger(fileId) || fileId <= 0)
-    throw new Error(t("web.common.errors.fileIdInvalid"));
+  if (!Number.isSafeInteger(fileId) || fileId <= 0) throw new Error("Invalid file ID.");
   const profileContext = captureProfileRequestContext();
   const requireCurrent = () => {
     if (!profileContext || !isCurrent() || !isCapturedProfileAuthorityActive(profileContext))
@@ -39,8 +37,7 @@ export async function launchDirectDownload(
     throw error;
   }
   requireCurrent();
-  if (res.status !== 200)
-    throw new Error(t("web.common.errors.downloadUnavailable", { status: res.status }));
+  if (res.status !== 200) throw new Error(`Download unavailable (${res.status}).`);
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = "";

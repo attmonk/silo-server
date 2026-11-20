@@ -1,6 +1,10 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { useT } from "@/i18n";
-import { BUFFERING_PILL_MS, type BufferingAnswer, type BufferingPill } from "../buffering-quality";
+import {
+  BUFFERING_PILL_MS,
+  BUFFERING_QUALITY_COPY as COPY,
+  type BufferingAnswer,
+  type BufferingPill,
+} from "../buffering-quality";
 
 interface BufferingQualityPillProps {
   kind: BufferingPill;
@@ -30,7 +34,6 @@ export function BufferingQualityPill({
   focusOnMount,
   onAnswer,
 }: BufferingQualityPillProps) {
-  const t = useT();
   const titleId = useId();
   const primaryRef = useRef<HTMLButtonElement>(null);
   const [now, setNow] = useState(() => performance.now());
@@ -60,7 +63,7 @@ export function BufferingQualityPill({
       className="animate-in fade-in pointer-events-auto max-w-xl rounded-2xl border border-sky-400/50 bg-sky-500/15 px-5 py-4 text-white shadow-2xl backdrop-blur duration-150"
     >
       <div id={titleId} role="status" className="text-sm font-semibold tracking-wide text-white">
-        {prompt ? t("bufferingQuality.prompt.title") : t("web.player.buffering.undoCaption")}
+        {prompt ? COPY.prompt_title : COPY.undo_caption}
       </div>
       <div className="mt-3 flex flex-wrap gap-2">
         <button
@@ -71,12 +74,10 @@ export function BufferingQualityPill({
         >
           <span
             aria-hidden="true"
-            className="absolute inset-y-0 start-0 bg-white/15"
+            className="absolute inset-y-0 left-0 bg-white/15"
             style={{ width: `${progress * 100}%` }}
           />
-          <span className="relative">
-            {prompt ? t("bufferingQuality.prompt.lower") : t("bufferingQuality.restore")}
-          </span>
+          <span className="relative">{prompt ? COPY.prompt_lower : COPY.undo_action}</span>
         </button>
         {prompt ? (
           <button
@@ -85,7 +86,7 @@ export function BufferingQualityPill({
             className={ACTION_CLASS}
             onClick={() => onAnswer("select_keep")}
           >
-            {t("bufferingQuality.prompt.keep")}
+            {COPY.prompt_keep}
           </button>
         ) : null}
       </div>

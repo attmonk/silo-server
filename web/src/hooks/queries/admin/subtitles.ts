@@ -19,7 +19,6 @@ import { v2 } from "@/api/v2/request";
 import type { SubtitleProviderTestRequest } from "@/api/types";
 import { adminKeys } from "../keys";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 
 const ADMIN_STALE_TIME = 30_000;
 
@@ -42,7 +41,7 @@ export function useAdminUpdateDownloadedSubtitle() {
     gcTime: 0,
     onSuccess: (_updated, { editor }) => {
       if (adminSubtitleListScope() !== editor.intent.scope) return;
-      toast.success(t("web.admin.subtitles.toast.updated"));
+      toast.success("Subtitle updated");
       void queryClient.invalidateQueries({
         queryKey: ["admin", "downloadedSubtitles", editor.intent.scope],
       });

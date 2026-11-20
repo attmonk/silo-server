@@ -7,13 +7,13 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
@@ -246,11 +246,11 @@ func H264LevelFor(width, height int, frameRate float64, kbps int) int {
 	return h264LevelFor(width, height, frameRate, kbps)
 }
 
-// EncodeEquivalentKbps is the rate an encode to targetCodec of a source at
-// sourceKbps in sourceCodec needs for the same quality (sourceEquivalentKbps),
-// or 0 when the source's rate is unknown.
-func EncodeEquivalentKbps(sourceKbps int, sourceCodec, targetCodec string) int {
-	return sourceEquivalentKbps(SourceDescriptorV3{BitrateKbps: sourceKbps, VideoCodec: sourceCodec}, targetCodec)
+// H264EquivalentKbps is the rate an H.264 encode of a source at sourceKbps in
+// sourceCodec needs for the same quality (sourceEquivalentKbps), or 0 when
+// the source's rate is unknown.
+func H264EquivalentKbps(sourceKbps int, sourceCodec string) int {
+	return sourceEquivalentKbps(SourceDescriptorV3{BitrateKbps: sourceKbps, VideoCodec: sourceCodec}, transcodeCodecH264)
 }
 
 // h264LevelBitrateKbps is the highest cap whose rate and doubled buffer fit
@@ -389,10 +389,6 @@ func PrepareFile(ctx context.Context, opts TranscodeOpts, outputPath string) err
 	}
 
 	logs := newPrepareLogWriter(ctx, opts)
-	// wroteOutput records whether the last failed attempt had written any of
-	// the artifact. FFmpeg writes the container header only once every encoder
-	// has opened, so an attempt that wrote nothing died while starting.
-	wroteOutput := false
 	runOnce := func(runOpts TranscodeOpts) error {
 		args := buildPrepareFileArgs(runOpts, partPath)
 		bin := runOpts.FFmpegPath
@@ -400,7 +396,7 @@ func PrepareFile(ctx context.Context, opts TranscodeOpts, outputPath string) err
 			bin = ffmpegBinary()
 		}
 
-		cmd := fspath.CommandContext(ctx, bin, args...)
+		cmd := exec.CommandContext(ctx, bin, args...)
 		stderr := newBoundedTailBuffer(stderrTailMaxBytes)
 		cmd.Stderr = stderr
 		if logs != nil {
@@ -408,13 +404,7 @@ func PrepareFile(ctx context.Context, opts TranscodeOpts, outputPath string) err
 			cmd.Stderr = io.MultiWriter(stderr, logs)
 		}
 		if runOpts.PrepareProgressSink != nil {
-			// Copied video keeps the source's own timing, which the probed
-			// average rate can misstate, so a remux reads out_time alone.
-			frameRate := runOpts.SourceFrameRate
-			if runOpts.AudioOnly || runOpts.TargetCodecVideo == codecCopyV3 {
-				frameRate = 0
-			}
-			cmd.Stdout = newPrepareProgressWriter(runOpts.PrepareProgressSink, runOpts.TotalDuration, frameRate)
+			cmd.Stdout = newPrepareProgressWriter(runOpts.PrepareProgressSink, runOpts.TotalDuration)
 		}
 		cmd.WaitDelay = 3 * time.Second
 
@@ -422,13 +412,10 @@ func PrepareFile(ctx context.Context, opts TranscodeOpts, outputPath string) err
 		err := cmd.Run()
 		logs.flush()
 		if err != nil {
-			info, statErr := os.Stat(partPath)
-			wroteOutput = statErr == nil && info.Size() > 0
 			_ = os.Remove(partPath)
 			logs.event("ffmpeg process exit error", formatWaitError(err))
-			retained := stderr.String()
-			if tail := truncateStderr(retained); tail != "" {
-				return classifyFFmpegFailure(fmt.Errorf("%w: %w (stderr: %s)", ErrTranscodeFailed, err, tail), retained)
+			if tail := truncateStderr(stderr.String()); tail != "" {
+				return fmt.Errorf("%w: %w (stderr: %s)", ErrTranscodeFailed, err, tail)
 			}
 			return fmt.Errorf("%w: %w", ErrTranscodeFailed, err)
 		}
@@ -450,29 +437,6 @@ func PrepareFile(ctx context.Context, opts TranscodeOpts, outputPath string) err
 			retryOpts := opts
 			retryOpts.HWAccel = retryAccel
 			err = runOnce(retryOpts)
-		} else if decodeRetry := NewSoftwareDecodeRetryPipeline(opts, err); decodeRetry.Enabled() {
-			// The hardware decoder rejected the source, so the same command
-			// fails again. Decode on the CPU with the hardware encoder, then
-			// fall back to software, as a playback start does.
-			slog.WarnContext(ctx, "prepared encode failed in the hardware decoder; retrying with CPU decoding",
-				"hw_accel", opts.HWAccel, "output", outputPath, "error", err)
-			logs.event("retrying with CPU decoding", "")
-			for {
-				err = runOnce(decodeRetry.Current())
-				// Only an attempt that died while starting says the hardware
-				// path is unusable. One that had written output got past
-				// encoder startup, and its failure (a full disk, say) would
-				// fail a software encode too.
-				if err == nil || ctx.Err() != nil || wroteOutput || !decodeRetry.AdvanceAfterFailure("") {
-					break
-				}
-				if decodeRetry.Current().HWAccel == transcodeHWNone {
-					// A software encode occupies no GPU; don't count it
-					// against the device for the rest of the encode.
-					releaseHWDevice()
-				}
-				logs.event("retrying with software encoding", "")
-			}
 		}
 	}
 	if err != nil {

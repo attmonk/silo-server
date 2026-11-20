@@ -36,7 +36,7 @@ func waitConfirmedPauseStates(t *testing.T, h *PlaybackHandler, sessionID string
 func TestRealtimeConfirmedPauseAndResumeScrobbleOnce(t *testing.T) {
 	file := &models.MediaFile{ID: 42, ContentID: "movie-1", Duration: 3600}
 	sessionMgr := playback.NewSessionManager(0, 0)
-	handler := newKeyedPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.CommandTracker = playback.NewCommandTracker()
 	defer handler.CommandTracker.Close()
 	scrobbler := &recordingPlaybackWatchScrobbler{}
@@ -106,7 +106,7 @@ func (s *blockingPauseScrobbler) ScrobbleStop(context.Context, watchsync.Scrobbl
 func TestRealtimeConfirmedStopRevokesAuthorityBeforeProviderFinalization(t *testing.T) {
 	file := &models.MediaFile{ID: 42, ContentID: "movie-1", Duration: 3600}
 	sessionMgr := playback.NewSessionManager(0, 0)
-	handler := newKeyedPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.CommandTracker = playback.NewCommandTracker()
 	defer handler.CommandTracker.Close()
 	scrobbler := &blockingPauseScrobbler{release: make(chan struct{}), entered: make(chan struct{})}
@@ -219,7 +219,7 @@ func TestRealtimeConfirmationSurvivesAcceptedProgressReplay(t *testing.T) {
 }
 
 func TestRealtimeResultQueueBoundsPendingPauseStates(t *testing.T) {
-	h := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	released := sync.OnceFunc(func() { close(release) })
@@ -422,7 +422,7 @@ func TestRealtimeStopReceiptKeepsCompletionAndBridgePosition(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			result := f.handler.realtimeStopHistory(t.Context(), snapshot).result
+			result := f.handler.realtimeStopHistory(t.Context(), snapshot)
 			if result.HistoryID == "" || (historyID != "" && result.HistoryID != historyID) || result.Completed != nativeSample || result.FinalPositionSeconds != position {
 				t.Fatalf("realtime stop result = %+v", result)
 			}

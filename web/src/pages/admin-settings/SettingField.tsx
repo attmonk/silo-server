@@ -5,7 +5,6 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { RestartBadge } from "@/components/settings/RestartBadge";
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 import {
   Select,
@@ -82,12 +81,6 @@ export interface SettingFieldRowProps {
   /** Amber "Restart" chip after the label; drive it from `useRestartKeys`. */
   restartRequired?: boolean;
   /**
-   * The environment variable that sets this setting on the server, from
-   * `form.envVar(key)`. The row says so under its description; the field
-   * components also disable their control.
-   */
-  managedByEnv?: string;
-  /**
    * Trailing unit for the control, e.g. "days" or "Mbps". It renders in the
    * row's own unit slot rather than beside the control on purpose: the slot is
    * reserved on every row, so a row that has a unit and a row that does not
@@ -113,7 +106,6 @@ export function SettingFieldRow({
   descriptionId,
   status,
   restartRequired,
-  managedByEnv,
   unit,
   className,
   children,
@@ -121,7 +113,6 @@ export function SettingFieldRow({
   // A group that already says "Changes apply after a restart" does not need the
   // same fact repeated on every row inside it.
   const groupSaysRestart = useGroupRestartAll();
-  const t = useT();
 
   return (
     <div
@@ -136,7 +127,7 @@ export function SettingFieldRow({
           {dirty ? (
             <span
               className="size-1.5 shrink-0 rounded-full bg-[var(--settings-accent)]"
-              title={t("web.admin.settings.fields.unsavedChange")}
+              title="Unsaved change"
             />
           ) : null}
           <Label htmlFor={htmlFor} className="text-sm font-medium">
@@ -150,19 +141,12 @@ export function SettingFieldRow({
           </p>
         ) : null}
         {status ? <div className="mt-1.5">{status}</div> : null}
-        {managedByEnv ? (
-          <div className="mt-1.5">
-            <SettingFieldStatus tone="muted">
-              {t("web.admin.settings.fields.managedByEnv", { env: managedByEnv })}
-            </SettingFieldStatus>
-          </div>
-        ) : null}
       </div>
-      {/* `sm:ms-auto` pins the control column to the row's end edge. The
+      {/* `sm:ml-auto` pins the control column to the row's right edge. The
           label column stops growing at its max width, so without it a row
           with a short label and a narrow control (a switch, a link button)
           would leave its control wherever the label column ended. */}
-      <div className="flex w-full items-center gap-2 sm:ms-auto sm:w-auto sm:shrink-0 sm:justify-end">
+      <div className="flex w-full items-center gap-2 sm:ml-auto sm:w-auto sm:shrink-0 sm:justify-end">
         {/* Grows to fill the row on a stacked phone layout; content-sized and
             right-aligned from `sm` up, which is what puts every control on the
             shared edge. */}
@@ -209,8 +193,6 @@ interface SettingFieldProps {
   disabled?: boolean;
   /** Marks the field with a restart badge; drive it from `useRestartKeys`. */
   restartRequired?: boolean;
-  /** See {@link SettingFieldRowProps.managedByEnv}; disables the control. */
-  managedByEnv?: string;
   className?: string;
 }
 
@@ -226,13 +208,10 @@ export function SettingField({
   onChange,
   options,
   sensitiveConfigured,
-  disabled: disabledProp,
+  disabled,
   restartRequired,
-  managedByEnv,
   className,
 }: SettingFieldProps) {
-  const t = useT();
-  const disabled = disabledProp || managedByEnv != null;
   const controlId = useId();
   const hintId = useId();
 
@@ -251,7 +230,6 @@ export function SettingField({
       descriptionId={hintId}
       status={status}
       restartRequired={restartRequired}
-      managedByEnv={managedByEnv}
       unit={unit}
       className={className}
     >
@@ -298,11 +276,7 @@ export function SettingField({
       <Input
         id={controlId}
         type="password"
-        placeholder={
-          sensitiveConfigured
-            ? t("web.admin.settings.fields.passwordConfigured")
-            : (hint ?? t("web.admin.settings.fields.passwordNotConfigured"))
-        }
+        placeholder={sensitiveConfigured ? "configured" : (hint ?? "Not configured")}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         disabled={disabled}

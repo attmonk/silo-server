@@ -118,12 +118,9 @@ func (r *Runner) reaperLoop() {
 	}
 }
 
-// InterruptedMessage is the error message a reaped job is failed with.
-const InterruptedMessage = "interrupted by server restart"
-
 func (r *Runner) reapStaleJobs() {
 	before := time.Now().Add(-StaleJobThreshold)
-	n, err := r.store.ResetStaleJobs(context.WithoutCancel(r.baseCtx), before, InterruptedMessage)
+	n, err := r.store.ResetStaleJobs(context.WithoutCancel(r.baseCtx), before, "interrupted by server restart")
 	if err != nil {
 		r.logger.Warn("failed to reset stale jobs", "jobs", r.label, "error", err)
 		return

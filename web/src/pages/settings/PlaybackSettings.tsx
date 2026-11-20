@@ -11,9 +11,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useT, type MessageKey, type Translate } from "@/i18n";
-import { formatWithUnit, optionsFor } from "@/lib/settingsDisplay";
-import { settingDescription, settingLabel } from "@/lib/settingsText";
+import { optionsFor } from "@/lib/settingsDisplay";
 import { SETTING_DEFINITIONS, SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
 import { bitrateSelectChoices } from "@/lib/bitrateOptions";
 import {
@@ -26,11 +24,6 @@ import { useSeekPreferences } from "@/hooks/queries/seekPreferences";
 import type { SeekDirection } from "@/lib/seekIntervals";
 import { useProfileDefaultWriter } from "@/hooks/queries/profileDefaults";
 import { isBrowserDecodingEnabled, setBrowserDecodingEnabled } from "@/player/engine/settings";
-import {
-  getStillWatchingThreshold,
-  setStillWatchingThreshold,
-  STILL_WATCHING_MAX,
-} from "@/player/stillWatching";
 import { normalizeQualityPreferenceV3 } from "@/player/protocol-v3";
 import { toast } from "sonner";
 import { LearnedLimitRow, PlaybackConnection } from "./PlaybackConnection";
@@ -54,11 +47,15 @@ const BASE_PLAYBACK_KEYS: SettingKey[] = [
   SETTING_KEYS.PLAYBACK_AUTO_SKIP_RECAP,
 ];
 
+const INTRO_SKIP_MODES = optionsFor(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE]);
 const BUFFERING_MODE_SETTING = SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_BUFFERING_QUALITY_MODE];
 
 // Radix Select cannot represent "" as an item value, so the unset entry needs
 // a sentinel that never collides with a stored bitrate.
 const NO_BITRATE_LIMIT = "__no_limit__";
+
+const AUTO_QUALITY_DESCRIPTION =
+  "Plays the original file whenever your device and connection can handle it.";
 
 /**
  * Quality is the same two settings every other surface edits.
@@ -74,7 +71,6 @@ const NO_BITRATE_LIMIT = "__no_limit__";
  * value that means the same thing, and no longer offers it.
  */
 function QualitySetting() {
-  const t = useT();
   const { data: effective } = useEffectiveSettings({
     keys: [SETTING_KEYS.PLAYBACK_PREFERRED_QUALITY, SETTING_KEYS.PLAYBACK_MAX_BITRATE_KBPS],
   });
@@ -92,20 +88,16 @@ function QualitySetting() {
     | null
     | undefined;
   const bitrateValue = bitrate == null ? "" : String(bitrate);
-  const bitrateChoices = bitrateSelectChoices(
-    bitrateDefinition,
-    bitrateValue,
-    t("web.settings.value.noLimit"),
-  );
+  const bitrateChoices = bitrateSelectChoices(bitrateDefinition, bitrateValue, "No limit");
 
   return (
     <>
       <SettingRow
-        label={settingLabel(qualityDefinition)}
+        label="Preferred quality"
         description={
           resolution === "auto"
-            ? t("web.settings.playback.quality.autoDescription")
-            : t("web.settings.playback.quality.description")
+            ? AUTO_QUALITY_DESCRIPTION
+            : "The resolution your profile should request when playback begins."
         }
         control={(id) => (
           <Select
@@ -113,7 +105,7 @@ function QualitySetting() {
             disabled={isSaving}
             onValueChange={(value) =>
               save(SETTING_KEYS.PLAYBACK_PREFERRED_QUALITY, value).catch(() =>
-                toast.error(t("web.settings.playback.quality.saveFailed")),
+                toast.error("Failed to save preferred quality"),
               )
             }
           >
@@ -132,8 +124,8 @@ function QualitySetting() {
       />
 
       <SettingRow
-        label={settingLabel(bitrateDefinition)}
-        description={t("web.settings.playback.maxBitrate.description")}
+        label="Maximum bitrate"
+        description="Cap how much bandwidth playback may use. No limit means Silo picks for the chosen resolution."
         control={(id) => (
           <Select
             value={bitrateValue === "" ? NO_BITRATE_LIMIT : bitrateValue}
@@ -147,7 +139,7 @@ function QualitySetting() {
                 next === NO_BITRATE_LIMIT
                   ? reset(SETTING_KEYS.PLAYBACK_MAX_BITRATE_KBPS)
                   : save(SETTING_KEYS.PLAYBACK_MAX_BITRATE_KBPS, Number(next));
-              request.catch(() => toast.error(t("web.settings.playback.maxBitrate.saveFailed")));
+              request.catch(() => toast.error("Failed to save maximum bitrate"));
             }}
           >
             <SelectTrigger id={id} className="w-full sm:w-[220px]">
@@ -181,20 +173,19 @@ function QualitySetting() {
  * per-device override becomes reachable from the web UI.
  */
 function AutoPlayNextSetting() {
-  const t = useT();
   const { enabled, setEnabled, isSaving } = useAutoPlayNextSetting();
 
   return (
     <SettingRow
-      label={settingLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_AUTO_PLAY_NEXT])}
-      description={t("web.settings.playback.autoPlayNext.description")}
+      label="Auto-play next episode"
+      description="Start the next episode automatically after the current one ends."
       control={(id) => (
         <Switch
           id={id}
           checked={enabled}
           disabled={isSaving}
           onCheckedChange={(checked) => {
-            setEnabled(checked).catch(() => toast.error(t("web.settings.playback.saveFailed")));
+            setEnabled(checked).catch(() => toast.error("Failed to save playback setting"));
           }}
         />
       )}
@@ -202,81 +193,13 @@ function AutoPlayNextSetting() {
   );
 }
 
-/** Stored in this browser: the contract classes the limit as client-local. */
-function StillWatchingSetting() {
-  const t = useT();
-  const [threshold, setThreshold] = useState(getStillWatchingThreshold);
-  const definition = SETTING_DEFINITIONS[SETTING_KEYS.PLAYER_PASSOUT_THRESHOLD];
-
-  return (
-    <SettingRow
-      label={settingLabel(definition)}
-      description={settingDescription(definition)}
-      control={(id) => (
-        <Select
-          value={String(threshold)}
-          onValueChange={(value) => {
-            const next = Number(value);
-            setStillWatchingThreshold(next);
-            setThreshold(next);
-          }}
-        >
-          <SelectTrigger id={id} className="w-full sm:w-[220px]">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {Array.from({ length: STILL_WATCHING_MAX + 1 }, (_, count) => (
-              <SelectItem key={count} value={String(count)}>
-                {count === 0
-                  ? t("web.settings.value.disabled")
-                  : formatWithUnit(String(count), "episodes")}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      )}
-    />
-  );
-}
-
-const SEEK_DIRECTION_LABELS: Record<SeekDirection, MessageKey> = {
-  back: "web.settings.playback.seek.rewindInterval",
-  forward: "web.settings.playback.seek.forwardInterval",
+const SEEK_DIRECTION_LABELS: Record<SeekDirection, string> = {
+  back: "Rewind interval",
+  forward: "Fast-forward interval",
 };
 
-/** Per media kind and direction: the row description, its load error and its save error. */
-const SEEK_ROW_TEXT: Record<
-  "video" | "audiobook",
-  Record<SeekDirection, { description: MessageKey; loadFailed: MessageKey; saveFailed: MessageKey }>
-> = {
-  video: {
-    back: {
-      description: "web.settings.playback.seek.video.rewindDescription",
-      loadFailed: "web.settings.playback.seek.video.rewindLoadFailed",
-      saveFailed: "web.settings.playback.seek.video.rewindSaveFailed",
-    },
-    forward: {
-      description: "web.settings.playback.seek.video.forwardDescription",
-      loadFailed: "web.settings.playback.seek.video.forwardLoadFailed",
-      saveFailed: "web.settings.playback.seek.video.forwardSaveFailed",
-    },
-  },
-  audiobook: {
-    back: {
-      description: "web.settings.playback.seek.audiobook.rewindDescription",
-      loadFailed: "web.settings.playback.seek.audiobook.rewindLoadFailed",
-      saveFailed: "web.settings.playback.seek.audiobook.rewindSaveFailed",
-    },
-    forward: {
-      description: "web.settings.playback.seek.audiobook.forwardDescription",
-      loadFailed: "web.settings.playback.seek.audiobook.forwardLoadFailed",
-      saveFailed: "web.settings.playback.seek.audiobook.forwardSaveFailed",
-    },
-  },
-};
-
-function formatSeconds(t: Translate, seconds: number) {
-  return t("web.settings.playback.seek.seconds", { count: seconds, count_text: seconds });
+function formatSeconds(seconds: number) {
+  return `${seconds} seconds`;
 }
 
 /**
@@ -292,39 +215,39 @@ function SeekIntervalRows({
   media: "video" | "audiobook";
   prefs: ReturnType<typeof useSeekPreferences>;
 }) {
-  const t = useT();
+  const noun = media === "video" ? "video" : "audiobooks";
   return (
     <>
       {(["back", "forward"] as const).map((direction) => {
         const value = direction === "back" ? prefs.skipBack : prefs.skipForward;
-        const text = SEEK_ROW_TEXT[media][direction];
+        const verb = direction === "back" ? "rewind" : "fast-forward";
         const choices = prefs.choices[direction];
         return (
           <SettingRow
             key={direction}
-            label={t(SEEK_DIRECTION_LABELS[direction])}
-            description={prefs.error ? t(text.loadFailed) : t(text.description)}
+            label={SEEK_DIRECTION_LABELS[direction]}
+            description={
+              prefs.error
+                ? `Could not load the ${verb} interval for ${noun}.`
+                : `How far ${noun === "video" ? "video" : "an audiobook"} jumps when you ${verb}.`
+            }
             control={(id) => (
               <Select
                 value={prefs.isLoading || prefs.error ? undefined : String(value)}
                 disabled={prefs.isLoading || Boolean(prefs.error) || prefs.isSaving}
                 onValueChange={(next) => {
-                  prefs.save(direction, Number(next)).catch(() => toast.error(t(text.saveFailed)));
+                  prefs
+                    .save(direction, Number(next))
+                    .catch(() => toast.error(`Failed to save ${verb} interval for ${noun}`));
                 }}
               >
                 <SelectTrigger id={id} className="w-full sm:w-[220px]">
-                  <SelectValue
-                    placeholder={
-                      prefs.isLoading
-                        ? t("web.settings.playback.seek.loading")
-                        : t("web.settings.playback.unavailable")
-                    }
-                  />
+                  <SelectValue placeholder={prefs.isLoading ? "Loading…" : "Unavailable"} />
                 </SelectTrigger>
                 <SelectContent>
                   {choices.map((seconds) => (
                     <SelectItem key={seconds} value={String(seconds)}>
-                      {formatSeconds(t, seconds)}
+                      {formatSeconds(seconds)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -339,9 +262,10 @@ function SeekIntervalRows({
 
 type ImportOutcome = { saved: SeekDirection[]; failed: SeekDirection[] };
 
-/** The `select` value naming one or both directions in the import messages. */
-function directionsArg(directions: SeekDirection[]) {
-  return directions.length > 1 ? "both" : directions[0] === "back" ? "back" : "forward";
+function describeDirections(directions: SeekDirection[]) {
+  return directions
+    .map((direction) => (direction === "back" ? "rewind" : "fast-forward"))
+    .join(" and ");
 }
 
 /**
@@ -352,20 +276,20 @@ function directionsArg(directions: SeekDirection[]) {
  * it is an overwrite the user asks for, not a migration to be marked done.
  */
 function LegacyAudiobookImportRow({ prefs }: { prefs: ReturnType<typeof useSeekPreferences> }) {
-  const t = useT();
   const [outcome, setOutcome] = useState<ImportOutcome | null>(null);
-  const { back, forward } = prefs.legacy;
-  if (back === undefined && forward === undefined) return null;
+  const entries = (Object.entries(prefs.legacy) as [SeekDirection, number][]).sort(([a]) =>
+    a === "back" ? -1 : 1,
+  );
+  if (entries.length === 0) return null;
 
-  const body =
-    back !== undefined && forward !== undefined
-      ? t("web.settings.playback.legacy.bodyBoth", {
-          back: formatSeconds(t, back),
-          forward: formatSeconds(t, forward),
-        })
-      : back !== undefined
-        ? t("web.settings.playback.legacy.bodyBack", { back: formatSeconds(t, back) })
-        : t("web.settings.playback.legacy.bodyForward", { forward: formatSeconds(t, forward!) });
+  const listed = entries
+    .map(([direction, seconds]) =>
+      direction === "back"
+        ? `rewind ${formatSeconds(seconds)}`
+        : `fast-forward ${formatSeconds(seconds)}`,
+    )
+    .join(" and ");
+  const untouched = entries.length === 1 ? (entries[0]![0] === "back" ? "forward" : "back") : null;
 
   const runImport = async () => {
     setOutcome(null);
@@ -376,16 +300,12 @@ function LegacyAudiobookImportRow({ prefs }: { prefs: ReturnType<typeof useSeekP
     }
     setOutcome(next);
     if (next.failed.length === 0) {
-      toast.success(
-        t("web.settings.playback.legacy.imported", { directions: directionsArg(next.saved) }),
-      );
+      toast.success(`Imported ${describeDirections(next.saved)} interval for audiobooks`);
     } else if (next.saved.length === 0) {
-      toast.error(
-        t("web.settings.playback.legacy.importFailed", { directions: directionsArg(next.failed) }),
-      );
+      toast.error(`Failed to import ${describeDirections(next.failed)} interval for audiobooks`);
     } else {
       toast.error(
-        t("web.settings.playback.legacy.importPartial", { saved: directionsArg(next.saved) }),
+        `Imported ${describeDirections(next.saved)} interval, but ${describeDirections(next.failed)} failed`,
       );
     }
   };
@@ -393,8 +313,16 @@ function LegacyAudiobookImportRow({ prefs }: { prefs: ReturnType<typeof useSeekP
   return (
     <div className="border-border/50 grid gap-3 border-t pt-4 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
       <div className="min-w-0 space-y-1">
-        <p className="text-sm font-medium">{t("web.settings.playback.legacy.title")}</p>
-        <p className="text-muted-foreground text-[13px] leading-relaxed">{body}</p>
+        <p className="text-sm font-medium">Use this browser's audiobook intervals</p>
+        <p className="text-muted-foreground text-[13px] leading-relaxed">
+          This browser still has {listed} saved locally. Importing replaces{" "}
+          {entries.length === 1 ? "that interval" : "both intervals"} for the active profile across
+          supported apps
+          {untouched
+            ? `; the ${untouched === "back" ? "rewind" : "fast-forward"} interval stays as it is`
+            : ""}
+          .
+        </p>
         {outcome ? (
           <p
             className={
@@ -404,18 +332,11 @@ function LegacyAudiobookImportRow({ prefs }: { prefs: ReturnType<typeof useSeekP
             }
             role="status"
           >
-            {[
-              outcome.saved.length > 0 &&
-                t("web.settings.playback.legacy.saved", {
-                  directions: directionsArg(outcome.saved),
-                }),
-              outcome.failed.length > 0 &&
-                t("web.settings.playback.legacy.notSaved", {
-                  directions: directionsArg(outcome.failed),
-                }),
-            ]
-              .filter(Boolean)
-              .join(" ")}
+            {outcome.saved.length > 0 ? `Saved ${describeDirections(outcome.saved)}.` : null}
+            {outcome.saved.length > 0 && outcome.failed.length > 0 ? " " : null}
+            {outcome.failed.length > 0
+              ? `Could not save ${describeDirections(outcome.failed)}. Try again to retry.`
+              : null}
           </p>
         ) : null}
       </div>
@@ -428,7 +349,7 @@ function LegacyAudiobookImportRow({ prefs }: { prefs: ReturnType<typeof useSeekP
           disabled={prefs.isSaving || prefs.isLoading || Boolean(prefs.error)}
           onClick={() => void runImport()}
         >
-          {t("web.settings.playback.legacy.button")}
+          Use this browser's audiobook intervals
         </Button>
       </div>
     </div>
@@ -443,7 +364,6 @@ function LegacyAudiobookImportRow({ prefs }: { prefs: ReturnType<typeof useSeekP
  * check renders nothing writable rather than a guess.
  */
 function SeekControls() {
-  const t = useT();
   const video = useSeekPreferences("video");
   const audiobook = useSeekPreferences("audiobook");
   const supported = video.supported && audiobook.supported;
@@ -452,25 +372,24 @@ function SeekControls() {
   return (
     <div className="space-y-4">
       <div className="space-y-1">
-        <h3 className="text-base font-semibold tracking-tight">
-          {t("web.settings.playback.seek.title")}
-        </h3>
+        <h3 className="text-base font-semibold tracking-tight">Seek controls</h3>
         <p className="text-muted-foreground max-w-2xl text-[13px] leading-relaxed">
-          {t("web.settings.playback.seek.description")}
+          How far rewind and fast-forward jump. These belong to the active profile and follow it
+          across supported Silo apps.
         </p>
       </div>
 
       {supported || video.isLoading ? (
         <>
           <SettingsGroup
-            title={t("web.settings.playback.seek.videoTitle")}
-            description={t("web.settings.playback.seek.videoDescription")}
+            title="Video"
+            description="Applies to the transport buttons, double-tap gestures, arrow keys, and system media controls."
           >
             <SeekIntervalRows media="video" prefs={video} />
           </SettingsGroup>
           <SettingsGroup
-            title={t("web.settings.playback.seek.audiobookTitle")}
-            description={t("web.settings.playback.seek.audiobookDescription")}
+            title="Audiobooks"
+            description="The same values the audiobook player's settings menu shows and edits."
           >
             <SeekIntervalRows media="audiobook" prefs={audiobook} />
             {supported ? <LegacyAudiobookImportRow prefs={audiobook} /> : null}
@@ -478,11 +397,12 @@ function SeekControls() {
         </>
       ) : discoveryError ? (
         <p className="text-destructive text-sm" role="alert">
-          {t("web.settings.playback.seek.discoveryFailed")}
+          Could not check whether this server supports shared seek intervals. Reload to try again.
         </p>
       ) : (
         <p className="text-muted-foreground text-sm">
-          {t("web.settings.playback.seek.unsupported")}
+          This server does not store seek intervals per profile yet. Audiobook intervals can still
+          be set for this browser from the audiobook player.
         </p>
       )}
     </div>
@@ -490,7 +410,6 @@ function SeekControls() {
 }
 
 export default function PlaybackSettings() {
-  const t = useT();
   const capabilities = useSettingsCapabilities();
   const supportsIntroSkipMode = settingsCapabilitiesSupportKey(
     capabilities.data,
@@ -516,25 +435,15 @@ export default function PlaybackSettings() {
     capabilities.data,
     SETTING_KEYS.PLAYBACK_BUFFERING_QUALITY_MODE,
   );
-  // The two provenance keys arrived together, so one gate covers both. Rows for
-  // keys the server does not define are left out rather than rendered dead: a
-  // switch that cannot save is worse than no switch.
-  const supportsMarkerProvenance = settingsCapabilitiesSupportKey(
-    capabilities.data,
-    SETTING_KEYS.PLAYBACK_SHOW_MARKER_CONFIDENCE,
-  );
   const playbackKeys = useMemo(
     () => [
       ...BASE_PLAYBACK_KEYS,
       ...(supportsBuffering ? [SETTING_KEYS.PLAYBACK_BUFFERING_QUALITY_MODE] : []),
-      ...(supportsMarkerProvenance
-        ? [SETTING_KEYS.PLAYBACK_SHOW_MARKER_CONFIDENCE, SETTING_KEYS.PLAYBACK_SHOW_MARKER_SOURCE]
-        : []),
       supportsIntroSkipMode
         ? SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE
         : SETTING_KEYS.PLAYBACK_AUTO_SKIP_INTRO,
     ],
-    [supportsIntroSkipMode, supportsBuffering, supportsMarkerProvenance],
+    [supportsIntroSkipMode, supportsBuffering],
   );
   const { data: effective } = useEffectiveSettings({ keys: playbackKeys });
   const { save: saveProfileDefault, isSaving } = useProfileDefaultWriter(effective);
@@ -551,28 +460,27 @@ export default function PlaybackSettings() {
   // several of these keys are device-overridable, and without the clear the
   // control would snap back to the override it cannot see.
   const saveValue = (key: SettingKey, value: unknown) => {
-    saveProfileDefault(key, value).catch(() => toast.error(t("web.settings.playback.saveFailed")));
+    saveProfileDefault(key, value).catch(() => toast.error("Failed to save playback setting"));
   };
 
   const pending = isSaving;
-  const introSkipModes = optionsFor(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE]);
 
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.playback.title")}
-        subtitle={t("web.settings.playback.subtitle")}
+        title="Playback"
+        subtitle="The defaults this profile starts playback with. A library, a series, or one of your devices can override some of them."
       />
 
       <SettingsGroup
-        title={t("web.settings.playback.quality.title")}
-        description={t("web.settings.playback.quality.groupDescription")}
+        title="Quality"
+        description="Each of your devices can override these, and a household manager can cap them for this profile."
       >
         <QualitySetting />
         {supportsBuffering && (
           <SettingRow
-            label={settingLabel(BUFFERING_MODE_SETTING)}
-            description={settingDescription(BUFFERING_MODE_SETTING)}
+            label={BUFFERING_MODE_SETTING.label}
+            description={BUFFERING_MODE_SETTING.description}
             control={(id) => (
               <Select
                 value={read<string>(SETTING_KEYS.PLAYBACK_BUFFERING_QUALITY_MODE)}
@@ -600,11 +508,11 @@ export default function PlaybackSettings() {
       </SettingsGroup>
       {supportsBuffering && <PlaybackConnection ignoresLearnedLimit={ignoresLearnedLimit} />}
 
-      <SettingsGroup title={t("web.settings.playback.skipping.title")}>
+      <SettingsGroup title="Skipping">
         {introSkipControl === "mode" ? (
           <SettingRow
-            label={settingLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE])}
-            description={t("web.settings.playback.skipping.introModeDescription")}
+            label="Skip intros"
+            description="Leave intros alone, offer a Skip Intro button, or skip automatically with an undo."
             control={(id) => (
               <Select
                 value={read<string>(SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE)}
@@ -615,7 +523,7 @@ export default function PlaybackSettings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {introSkipModes.map((mode) => (
+                  {INTRO_SKIP_MODES.map((mode) => (
                     <SelectItem key={mode.value} value={mode.value}>
                       {mode.label}
                     </SelectItem>
@@ -629,15 +537,15 @@ export default function PlaybackSettings() {
           // its place and asserts no value at all rather than showing a switch
           // whose position would be a guess the user could act on.
           <SettingRow
-            label={settingLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE])}
-            description={t("web.settings.playback.skipping.introModeUnknown")}
+            label="Skip intros"
+            description="Available once Silo has checked what this server supports."
             control={(id) => (
               <Select disabled>
                 <SelectTrigger id={id} className="w-full sm:w-[220px]">
-                  <SelectValue placeholder={t("web.settings.playback.unavailable")} />
+                  <SelectValue placeholder="Unavailable" />
                 </SelectTrigger>
                 <SelectContent>
-                  {introSkipModes.map((mode) => (
+                  {INTRO_SKIP_MODES.map((mode) => (
                     <SelectItem key={mode.value} value={mode.value}>
                       {mode.label}
                     </SelectItem>
@@ -648,10 +556,8 @@ export default function PlaybackSettings() {
           />
         ) : (
           <SettingRow
-            label={settingLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_AUTO_SKIP_INTRO])}
-            description={settingDescription(
-              SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_AUTO_SKIP_INTRO],
-            )}
+            label="Auto-skip intros"
+            description="Jump past intros automatically when Silo can detect them."
             control={(id) => (
               <Switch
                 id={id}
@@ -665,47 +571,9 @@ export default function PlaybackSettings() {
           />
         )}
 
-        {supportsMarkerProvenance && (
-          <SettingRow
-            label={settingLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_SHOW_MARKER_CONFIDENCE])}
-            description={settingDescription(
-              SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_SHOW_MARKER_CONFIDENCE],
-            )}
-            control={(id) => (
-              <Switch
-                id={id}
-                checked={read<boolean>(SETTING_KEYS.PLAYBACK_SHOW_MARKER_CONFIDENCE)}
-                disabled={pending}
-                onCheckedChange={(checked) =>
-                  saveValue(SETTING_KEYS.PLAYBACK_SHOW_MARKER_CONFIDENCE, checked)
-                }
-              />
-            )}
-          />
-        )}
-
-        {supportsMarkerProvenance && (
-          <SettingRow
-            label={settingLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_SHOW_MARKER_SOURCE])}
-            description={settingDescription(
-              SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_SHOW_MARKER_SOURCE],
-            )}
-            control={(id) => (
-              <Switch
-                id={id}
-                checked={read<boolean>(SETTING_KEYS.PLAYBACK_SHOW_MARKER_SOURCE)}
-                disabled={pending}
-                onCheckedChange={(checked) =>
-                  saveValue(SETTING_KEYS.PLAYBACK_SHOW_MARKER_SOURCE, checked)
-                }
-              />
-            )}
-          />
-        )}
-
         <SettingRow
-          label={settingLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_AUTO_SKIP_RECAP])}
-          description={t("web.settings.playback.skipping.recapDescription")}
+          label="Auto-skip recaps"
+          description="Skip 'previously on…' recaps automatically when Silo can detect them."
           control={(id) => (
             <Switch
               id={id}
@@ -719,10 +587,8 @@ export default function PlaybackSettings() {
         />
 
         <SettingRow
-          label={settingLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_AUTO_SKIP_CREDITS])}
-          description={settingDescription(
-            SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_AUTO_SKIP_CREDITS],
-          )}
+          label="Auto-skip credits"
+          description="Move through end credits automatically when a skip is available."
           control={(id) => (
             <Switch
               id={id}
@@ -736,14 +602,10 @@ export default function PlaybackSettings() {
         />
       </SettingsGroup>
 
-      {/* Sits with the marker settings above: these are the same feature seen
-          from the reporting side, and the viewer's own key lives here rather
-          than on the admin plugin page, which is server-wide. */}
-
-      <SettingsGroup title={t("web.settings.playback.nextEpisode.title")}>
+      <SettingsGroup title="Next episode">
         <SettingRow
-          label={t("web.settings.playback.nextEpisode.previewLabel")}
-          description={t("web.settings.playback.nextEpisode.previewDescription")}
+          label="Start next at preview"
+          description="Begin the next episode when the current one reaches its next-episode preview teaser, rather than waiting for the end credits."
           control={(id) => (
             <Switch
               id={id}
@@ -757,8 +619,6 @@ export default function PlaybackSettings() {
         />
 
         <AutoPlayNextSetting />
-
-        <StillWatchingSetting />
       </SettingsGroup>
 
       <SeekControls />
@@ -773,16 +633,15 @@ export default function PlaybackSettings() {
  * browser and the GPU, not on the profile.
  */
 function BrowserDecodingSetting() {
-  const t = useT();
   const [enabled, setEnabled] = useState(isBrowserDecodingEnabled);
   return (
     <SettingsGroup
-      title={t("web.settings.playback.browser.title")}
-      description={t("web.settings.playback.browser.description")}
+      title="This browser"
+      description="Saved in this browser only. Other browsers and apps keep their own choice."
     >
       <SettingRow
-        label={t("web.settings.playback.browser.decodeLabel")}
-        description={t("web.settings.playback.browser.decodeDescription")}
+        label="Decode in the browser (beta)"
+        description="Play files this browser cannot play natively, such as Dolby TrueHD or DTS audio and HDR video on SDR screens, by decoding them in the browser instead of converting them on the server. Applies from the next video you start."
         control={(id) => (
           <Switch
             id={id}

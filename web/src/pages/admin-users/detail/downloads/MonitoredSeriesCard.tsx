@@ -7,7 +7,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useT } from "@/i18n";
 
 import { formatStorageLimit } from "../format";
 import { DetailCard } from "../ui";
@@ -27,65 +26,50 @@ export function MonitoredSeriesCard({
   /** A device or profile filter is narrowing the list. */
   filtered?: boolean;
 }) {
-  const t = useT();
   return (
     <DetailCard
-      title={t("web.admin.users.detail.downloads.monitoredSeries")}
-      description={t("web.admin.users.detail.downloads.monitor.description")}
+      title="Monitored series"
+      description="New episodes download to the device automatically. Devices check when the app opens or refreshes in the background."
     >
       {monitors.length === 0 ? (
         <p className="text-muted-foreground px-5 py-6 text-center text-sm">
           {filtered
-            ? t("web.admin.users.detail.downloads.monitor.noMatch")
-            : t("web.admin.users.detail.downloads.monitor.empty")}
+            ? "No monitored series match these filters."
+            : "No series are monitored on this account’s devices."}
         </p>
       ) : (
         <div className="overflow-x-auto">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="ps-4 sm:ps-5">
-                  {t("web.admin.users.detail.downloads.monitor.column.series")}
-                </TableHead>
-                <TableHead className={wideOnly}>
-                  {t("web.admin.users.detail.downloads.monitor.column.deviceProfile")}
-                </TableHead>
-                <TableHead>{t("web.admin.users.detail.downloads.monitor.column.keeps")}</TableHead>
-                <TableHead className={wideOnly}>
-                  {t("web.admin.users.detail.downloads.monitor.column.afterWatching")}
-                </TableHead>
-                <TableHead className={wideOnly}>
-                  {t("web.admin.users.detail.downloads.monitor.column.storageLimit")}
-                </TableHead>
-                <TableHead className="pe-4 sm:pe-5">
-                  {t("web.admin.users.detail.downloads.monitor.column.now")}
-                </TableHead>
+                <TableHead className="pl-4 sm:pl-5">Series</TableHead>
+                <TableHead className={wideOnly}>Device · profile</TableHead>
+                <TableHead>Keeps</TableHead>
+                <TableHead className={wideOnly}>After watching</TableHead>
+                <TableHead className={wideOnly}>Storage limit</TableHead>
+                <TableHead className="pr-4 sm:pr-5">Now</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {monitors.map((monitor) => (
                 <TableRow key={monitor.id}>
-                  <TableCell className="ps-4 font-semibold wrap-anywhere whitespace-normal sm:ps-5">
+                  <TableCell className="pl-4 font-semibold whitespace-normal sm:pl-5">
                     {monitor.series_title || monitor.series_id}
                   </TableCell>
                   <TableCell className={`${wideOnly} text-muted-foreground`}>
-                    {[
-                      deviceName(monitor.device_id),
-                      profileNames.get(monitor.profile_id) || monitor.profile_id,
-                    ].join(" · ")}
+                    {deviceName(monitor.device_id)} ·{" "}
+                    {profileNames.get(monitor.profile_id) || monitor.profile_id}
                   </TableCell>
                   <TableCell className="whitespace-normal">{monitorKeepsLabel(monitor)}</TableCell>
                   <TableCell className={`${wideOnly} text-muted-foreground`}>
-                    {monitor.delete_watched
-                      ? t("web.admin.users.detail.downloads.monitor.deleteAfterWatching")
-                      : t("web.admin.users.detail.downloads.monitor.keep")}
+                    {monitor.delete_watched ? "Delete after watching" : "Keep"}
                   </TableCell>
                   <TableCell className={`${wideOnly} text-muted-foreground`}>
                     {monitor.max_storage_bytes > 0
                       ? formatStorageLimit(monitor.max_storage_bytes)
-                      : t("web.admin.users.detail.downloads.monitor.noLimit")}
+                      : "No limit"}
                   </TableCell>
-                  <TableCell className="text-muted-foreground pe-4 whitespace-normal sm:pe-5">
+                  <TableCell className="text-muted-foreground pr-4 whitespace-normal sm:pr-5">
                     {monitorNowLabel(monitor)}
                   </TableCell>
                 </TableRow>

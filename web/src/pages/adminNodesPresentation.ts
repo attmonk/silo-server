@@ -8,12 +8,9 @@ import type {
   ReprobeNodeResult,
   StreamNode,
   SystemResources,
-  UpdateNodeRequest,
 } from "@/api/types";
-import { t, type MessageKey } from "@/i18n";
 import { parseHWDeviceList } from "@/lib/hwDevices";
 import { formatFileSize } from "@/lib/mediaFormat";
-import { formatDecimal } from "@/lib/numberFormat";
 
 /**
  * How long a stored capability report may go unconfirmed before it is called
@@ -121,8 +118,8 @@ export function describeNodeGPU(node: StreamNode, now: number = Date.now()): Nod
   if (!capabilities) {
     return {
       kind: "awaiting",
-      label: t("web.admin.nodes.gpu.awaitingLabel"),
-      title: t("web.admin.nodes.gpu.awaitingTitle"),
+      label: "Awaiting first report",
+      title: "No hardware capability report has been stored for this node yet.",
     };
   }
 
@@ -174,10 +171,7 @@ function describeLiveGPU(
     busy: measured && video != null ? `${clampPercent(video)}%` : DASH,
     busyFill: measured && video != null ? clampPercent(video) : null,
     busyMuted: !measured || video == null,
-    sessions:
-      sessions === 0
-        ? t("web.admin.nodes.gpu.idle")
-        : t("web.admin.nodes.gpu.sessionCount", { count: sessions, count_text: sessions }),
+    sessions: sessions === 1 ? "1 session" : sessions === 0 ? "idle" : `${sessions} sessions`,
     title: liveGPUTitle(stats, detail, device, measured),
   };
 }
@@ -189,7 +183,7 @@ function liveGPUTitle(
   measured: boolean,
 ): string {
   const identity = [
-    device || detail?.path?.trim() || t("web.admin.nodes.gpu.unknownDevice"),
+    device || detail?.path?.trim() || "(unknown device)",
     detail?.description?.trim(),
   ]
     .filter((part): part is string => !!part)
@@ -198,38 +192,35 @@ function liveGPUTitle(
 
   if (measured) {
     const engines = [
-      formatEngine("web.admin.nodes.gpu.videoEngine", stats.video_busy_pct),
-      formatEngine("web.admin.nodes.gpu.renderEngine", stats.render_busy_pct),
+      formatEngine("video", stats.video_busy_pct),
+      formatEngine("render", stats.render_busy_pct),
     ].filter((part): part is string => part !== null);
     if (engines.length > 0) {
       lines.push(engines.join(" · "));
     }
   } else {
     // Zeros with no measurement behind them must not read as an idle GPU.
-    lines.push(t("web.admin.nodes.gpu.unmeasuredDevice"));
+    lines.push("No source could measure this device on the last sample.");
   }
 
   const whole = finiteNumber(stats.total_busy_pct);
   if (whole != null) {
-    lines.push(t("web.admin.nodes.gpu.wholeGpu", { percent: clampPercent(whole) }));
+    lines.push(`whole GPU ${clampPercent(whole)}% (all tenants)`);
   }
   const vram = formatUsedOfTotal(stats.vram_used_mb, stats.vram_total_mb, mebibytesToBytes);
   if (vram) {
-    lines.push(t("web.admin.nodes.gpu.vram", { amount: vram }));
+    lines.push(`VRAM ${vram}`);
   }
   const source = stats.source?.trim();
   if (source) {
-    lines.push(t("web.admin.nodes.gpu.source", { source }));
+    lines.push(`source: ${source}`);
   }
   return lines.join("\n");
 }
 
-function formatEngine(
-  key: "web.admin.nodes.gpu.videoEngine" | "web.admin.nodes.gpu.renderEngine",
-  value: number | null | undefined,
-): string | null {
+function formatEngine(name: string, value: number | null | undefined): string | null {
   const percent = finiteNumber(value);
-  return percent == null ? null : t(key, { percent: clampPercent(percent) });
+  return percent == null ? null : `${name} ${clampPercent(percent)}%`;
 }
 
 function isMeasuredGPUSource(source: string | undefined): boolean {
@@ -240,7 +231,7 @@ function isMeasuredGPUSource(source: string | undefined): boolean {
 function shortDeviceLabel(device: string, detail: NodeRenderDevice | undefined): string {
   const path = device || detail?.path?.trim() || "";
   if (path === "") {
-    return t("web.admin.nodes.gpu.genericDevice");
+    return "GPU";
   }
   const tail = path.split("/").filter((part) => part !== "");
   return tail[tail.length - 1] ?? path;
@@ -249,11 +240,14 @@ function shortDeviceLabel(device: string, detail: NodeRenderDevice | undefined):
 function describeBackend(resolved: string, detected: readonly NodeDetected[]): NodeGPUBackendBadge {
   if (resolved === "" || resolved === "none") {
     const skipped = detected.filter((entry) => entry.skipped);
-    const software = t("web.admin.nodes.backend.softwareBadge");
     if (skipped.length > 0 && skipped.length === detected.length) {
-      return badge(software, "none", t("web.admin.nodes.backend.devicesInaccessible"));
+      return badge(
+        "SW",
+        "none",
+        "Encoding in software — the configured GPU devices are not accessible on this node.",
+      );
     }
-    return badge(software, "none", t("web.admin.nodes.backend.noneVerified"));
+    return badge("SW", "none", "No hardware backend verified — encoding in software.");
   }
 
   const label = resolved.toUpperCase();
@@ -261,22 +255,22 @@ function describeBackend(resolved: string, detected: readonly NodeDetected[]): N
   if (!entry) {
     // A configured backend wins resolution even with no candidate hardware to
     // probe, so absence of an entry is unknown, not failure.
-    return badge(label, "unverified", t("web.admin.nodes.backend.noProbe", { backend: label }));
-  }
-  if (!entry.verified) {
     return badge(
       label,
-      "failed",
-      t("web.admin.nodes.backend.probeFailed", { backend: label, reason: failureReason(entry) }),
+      "unverified",
+      `${label} is in use but this node reported no verification probe for it.`,
     );
+  }
+  if (!entry.verified) {
+    return badge(label, "failed", `${label} probe failed: ${failureReason(entry)}`);
   }
   const device = entry.device?.trim();
   return badge(
     label,
     "verified",
     device
-      ? t("web.admin.nodes.backend.verifiedOnDevice", { backend: label, device })
-      : t("web.admin.nodes.backend.verified", { backend: label }),
+      ? `${label} verified by FFmpeg probe on ${device}.`
+      : `${label} verified by FFmpeg probe.`,
   );
 }
 
@@ -312,21 +306,19 @@ export function describeEffectiveAcceleration(node: StreamNode): string | null {
 
   const resolved = capabilities.resolved?.trim().toLowerCase() ?? "";
   if (resolved === "" || resolved === "none") {
-    return t("web.admin.nodes.effective.software");
+    return "Currently resolves: software encoding";
   }
 
   const label = resolved.toUpperCase();
   const entry = findDetectedEntry(resolved, capabilities.detected_backends ?? []);
   if (!entry) {
-    return t("web.admin.nodes.effective.unverified", { backend: label });
+    return `Currently resolves: ${label} — not verified`;
   }
   if (!entry.verified) {
-    return t("web.admin.nodes.effective.probeFailed", { backend: label });
+    return `Currently resolves: ${label} — probe failed`;
   }
   const device = entry.device?.trim();
-  return device
-    ? t("web.admin.nodes.effective.verifiedOnDevice", { backend: label, device })
-    : t("web.admin.nodes.effective.verified", { backend: label });
+  return `Currently resolves: ${label} — verified${device ? ` on ${device}` : ""}`;
 }
 
 function otherFailures(resolved: string, detected: readonly NodeDetected[]): NodeGPUFailure[] {
@@ -344,7 +336,7 @@ function otherFailures(resolved: string, detected: readonly NodeDetected[]): Nod
 }
 
 function failureReason(entry: NodeDetected): string {
-  return entry.reason?.trim() || t("web.admin.nodes.backend.noReason");
+  return entry.reason?.trim() || "no reason reported";
 }
 
 function capabilityReportStaleness(
@@ -399,7 +391,7 @@ function summarizeRenderDevices(capabilities: NodeCapabilities): {
     return { summary: null, title: null };
   }
   return {
-    summary: t("web.admin.nodes.gpu.renderDeviceCount", { count: paths.length }),
+    summary: paths.length === 1 ? "1 render device" : `${paths.length} render devices`,
     title: paths.join("\n"),
   };
 }
@@ -417,25 +409,16 @@ function countedDescriptions(details: readonly NodeRenderDevice[]): string {
     }
   }
   return counted
-    .map((entry) =>
-      entry.count > 1
-        ? t("web.admin.nodes.gpu.deviceMultiple", {
-            count: entry.count,
-            device: entry.label,
-          })
-        : entry.label,
-    )
+    .map((entry) => (entry.count > 1 ? `${entry.count}× ${entry.label}` : entry.label))
     .join(", ");
 }
 
 function deviceLabel(device: NodeRenderDevice): string {
-  return (
-    device.description?.trim() || device.path?.trim() || t("web.admin.nodes.gpu.genericDevice")
-  );
+  return device.description?.trim() || device.path?.trim() || "GPU";
 }
 
 function describeDeviceLine(device: NodeRenderDevice): string {
-  const path = device.path?.trim() || t("web.admin.nodes.gpu.unknownPath");
+  const path = device.path?.trim() || "(unknown path)";
   const parts = [path, device.description?.trim()].filter((part): part is string => !!part);
   const line = parts.join(" — ");
   const address = device.pci_address?.trim();
@@ -478,8 +461,8 @@ export function describeSharedGPU(
   }
 
   return {
-    label: t("web.admin.nodes.sharedGpu.label"),
-    title: t("web.admin.nodes.sharedGpu.title", { nodes: others.join(", ") }),
+    label: "Shared GPU",
+    title: `Shares a physical GPU with: ${others.join(", ")}`,
   };
 }
 
@@ -508,8 +491,12 @@ export function describeCapabilityDrift(node: StreamNode): CapabilityDriftBadge 
     return null;
   }
   return {
-    label: t("web.admin.nodes.drift.label"),
-    title: [note, t("web.admin.nodes.drift.meaning"), t("web.admin.nodes.drift.clears")].join("\n"),
+    label: "Drift",
+    title: [
+      note,
+      "A capability refetch found this node's hardware got worse than the report it replaced.",
+      "It stays until a refetch finds every hardware probe passing — re-probe the node to check whether it is still true.",
+    ].join("\n"),
   };
 }
 
@@ -554,7 +541,7 @@ function reportedDevices(node: StreamNode | null | undefined): ReportedDevice[] 
   return (node?.capabilities?.render_devices ?? [])
     .map((path) => path.trim())
     .filter((path) => path !== "")
-    .map((path) => ({ path, description: t("web.admin.nodes.gpu.genericDevice"), title: path }));
+    .map((path) => ({ path, description: "GPU", title: path }));
 }
 
 /**
@@ -594,10 +581,10 @@ export function buildNodeHWDeviceRows(
     }
     rows.push({
       path,
-      description: t("web.admin.nodes.devicePicker.unreportedDescription"),
+      description: "Pinned device this node does not report",
       reported: false,
       selected: true,
-      title: t("web.admin.nodes.devicePicker.unreportedTitle", { path }),
+      title: `${path} — not in this node's last capability report. A transcode pinned to a device the node cannot open falls back to software.`,
     });
   }
   return rows;
@@ -627,29 +614,25 @@ export function describeReprobeOutcome(
 ): ReprobeOutcome {
   const name = result.node_name?.trim() || node.name;
   if (result.status !== "ok") {
-    const reason = result.error?.trim() || t("web.admin.nodes.reprobe.noReason");
-    return { ok: false, message: t("web.admin.nodes.reprobe.failed", { name, reason }) };
+    const reason = result.error?.trim() || "the node reported no reason";
+    return { ok: false, message: `${name}: re-probe failed — ${reason}` };
   }
 
   const backend = reprobeBackendLabel(result.resolved);
   const hash = result.capability_hash?.trim() ?? "";
   const previous = node.capabilities_hash?.trim() ?? "";
-  // The node has recomputed either way; only the stored row lags, and saying so
-  // stops an operator re-running the action to explain an unchanged table.
-  const values = { name, backend, pending: result.capabilities_refreshed ? "no" : "yes" };
   let message: string;
   if (hash !== "" && previous !== "" && hash === previous) {
-    message = backend
-      ? t("web.admin.nodes.reprobe.unchangedWithBackend", values)
-      : t("web.admin.nodes.reprobe.unchanged", values);
+    message = `${name}: re-probed, no change${backend ? ` (${backend})` : ""}`;
   } else if (hash !== "" && previous !== "") {
-    message = backend
-      ? t("web.admin.nodes.reprobe.changedWithBackend", values)
-      : t("web.admin.nodes.reprobe.changed", values);
+    message = `${name}: re-probed, hardware report changed${backend ? ` — now ${backend}` : ""}`;
   } else {
-    message = backend
-      ? t("web.admin.nodes.reprobe.doneWithBackend", values)
-      : t("web.admin.nodes.reprobe.done", values);
+    message = `${name}: re-probed${backend ? ` — ${backend}` : ""}`;
+  }
+  // The node has recomputed either way; only the stored row lags, and saying so
+  // stops an operator re-running the action to explain an unchanged table.
+  if (!result.capabilities_refreshed) {
+    message += ". The stored report will catch up on the next health check";
   }
   return { ok: true, message };
 }
@@ -659,7 +642,7 @@ function reprobeBackendLabel(resolved: string | undefined): string {
   if (backend === "") {
     return "";
   }
-  return backend === "none" ? t("web.admin.nodes.backend.softwareName") : backend.toUpperCase();
+  return backend === "none" ? "software" : backend.toUpperCase();
 }
 
 // --- Per-node acceleration overrides ---------------------------------------
@@ -671,27 +654,19 @@ function reprobeBackendLabel(resolved: string | undefined): string {
  */
 export const HW_ACCEL_INHERIT = "inherit";
 
-// Product names, shown as they are in every language.
-const QSV_LABEL = "Intel Quick Sync (QSV)";
-const VAAPI_LABEL = "VA-API";
-const NVENC_LABEL = "NVIDIA NVENC";
-
 /**
  * The acceleration choices a node may be pinned to, inherit first. The backend
  * values mirror the playback.hw_accel enum: a per-node override may only name a
- * backend the cluster-wide setting could also name. Built on each call so the
- * labels follow the interface language.
+ * backend the cluster-wide setting could also name.
  */
-export function hwAccelOverrideOptions(): { value: string; label: string }[] {
-  return [
-    { value: HW_ACCEL_INHERIT, label: t("web.admin.nodes.hwAccel.clusterDefault") },
-    { value: "auto", label: t("web.admin.nodes.hwAccel.auto") },
-    { value: "qsv", label: QSV_LABEL },
-    { value: "vaapi", label: VAAPI_LABEL },
-    { value: "nvenc", label: NVENC_LABEL },
-    { value: "none", label: t("web.admin.nodes.hwAccel.software") },
-  ];
-}
+export const HW_ACCEL_OVERRIDE_OPTIONS: readonly { value: string; label: string }[] = [
+  { value: HW_ACCEL_INHERIT, label: "Cluster default" },
+  { value: "auto", label: "Auto" },
+  { value: "qsv", label: "Intel Quick Sync (QSV)" },
+  { value: "vaapi", label: "VA-API" },
+  { value: "nvenc", label: "NVIDIA NVENC" },
+  { value: "none", label: "Software" },
+];
 
 /**
  * Whether this node's devices are named as CUDA identities rather than render
@@ -796,30 +771,24 @@ export function describeNodeAccelerationOverride(
     return null;
   }
 
-  const accelLabel = accel === "none" ? t("web.admin.nodes.backend.softwareName") : accel;
+  const accelLabel = accel === "none" ? "software" : accel;
   const firstDevice = devices[0] ?? "";
-  const deviceLabel =
-    devices.length === 1
-      ? firstDevice
-      : t("web.admin.nodes.override.deviceCount", {
-          count: devices.length,
-          count_text: devices.length,
-        });
+  const deviceLabel = devices.length === 1 ? firstDevice : `${devices.length} devices`;
   const label = [accelLabel, devices.length > 0 ? deviceLabel : ""]
     .filter((part) => part !== "")
     .join(" · ");
 
   const title = [
     accel === ""
-      ? t("web.admin.nodes.override.accelInherited")
-      : t("web.admin.nodes.override.accelOverridden", { backend: accelLabel }),
+      ? "Acceleration: inherited from the cluster-wide Hardware Acceleration setting."
+      : `Acceleration: ${accelLabel}, overriding the cluster-wide Hardware Acceleration setting.`,
     devices.length === 0
-      ? t("web.admin.nodes.override.devicesInherited")
-      : t("web.admin.nodes.override.devicesOverridden", { devices: devices.join(", ") }),
-    t("web.admin.nodes.override.appliesWhen"),
+      ? "GPU devices: inherited from the cluster-wide setting."
+      : `GPU devices: ${devices.join(", ")}.`,
+    "A changed override applies to new transcodes within a minute; sessions already running keep the backend they started with.",
   ].join("\n");
 
-  return { label: t("web.admin.nodes.override.label", { policy: label }), title };
+  return { label: `override: ${label}`, title };
 }
 
 // --- Host resource samples -------------------------------------------------
@@ -840,12 +809,12 @@ const DASH = "—";
  */
 export const DISK_FILL_WARNING_PCT = 85;
 
-/** One derived reading, ready to render in a table cell or a meter row. */
+/** One derived reading, ready to render in a table cell or a stat tile. */
 export interface ResourceMetric {
   label: string;
   /** Rendered value, or a dash when `muted`. */
   value: string;
-  /** Short secondary line for the dashboard card; empty when there is none. */
+  /** Short secondary line for the dashboard tiles; empty when there is none. */
   detail: string;
   /** Hover text explaining the value, or why there is none. */
   title: string;
@@ -868,10 +837,8 @@ export interface ResourceMetric {
 export type NodeSystemPresentation =
   | {
       kind: "unreported";
-      /** Dash, so the column keeps its shape; "Stale" for an old sample. */
+      /** Dash, so the column keeps its shape. */
       label: string;
-      /** The node answered, but with a sample too old to count as current. */
-      stale: boolean;
       title: string;
     }
   | {
@@ -897,52 +864,34 @@ export function describeNodeSystem(node: StreamNode, now = Date.now()): NodeSyst
     return {
       kind: "unreported",
       label: DASH,
-      stale: false,
       title: node.healthy
-        ? t("web.admin.nodes.system.noSample")
-        : t("web.admin.nodes.system.notAnswering"),
+        ? "This node reported no resource sample. Sampling is Linux-only, and a node running a build from before resource sampling reports none."
+        : "This node is not answering health checks, so it has no current resource sample.",
     };
   }
   if (!node.healthy) {
     return {
       kind: "unreported",
       label: DASH,
-      stale: false,
-      title: t("web.admin.nodes.system.lastCheckFailed"),
+      title:
+        "The last health check did not reach this node, so its most recent resource sample is no longer current.",
     };
   }
-  if (nodeSampleIsStale(node, now)) {
-    return {
-      kind: "unreported",
-      label: t("web.admin.nodes.system.staleLabel"),
-      stale: true,
-      title: t("web.admin.nodes.system.staleTitle"),
-    };
-  }
-  return describeSystemStats(system, node.last_stats?.attribution);
-}
-
-/** The node is answering, but its sampler or its health checks have stopped moving. */
-function nodeSampleIsStale(node: StreamNode, now: number): boolean {
   const sampledAt = Date.parse(node.last_stats?.sampled_at ?? "");
   const checkedAt = Date.parse(node.last_health_check ?? "");
   const interval = node.last_stats?.attribution?.sample_interval_seconds ?? 5;
-  return (
+  if (
     Number.isFinite(sampledAt) &&
     Number.isFinite(checkedAt) &&
     (checkedAt - sampledAt > interval * 3000 || now - checkedAt > 90_000)
-  );
-}
-
-/**
- * The busiest GPU from a node's last sample, or null when that sample is not
- * current: a percentage that stopped moving reads as a live one.
- */
-export function describeNodeGPUBusy(node: StreamNode, now = Date.now()): ResourceMetric | null {
-  if (!node.healthy || nodeSampleIsStale(node, now)) {
-    return null;
+  ) {
+    return {
+      kind: "unreported",
+      label: "Stale",
+      title: "The node is answering with an old resource sample.",
+    };
   }
-  return describeGPUBusy(node.last_stats?.gpu ?? []);
+  return describeSystemStats(system, node.last_stats?.attribution);
 }
 
 /** Derive the four host readings from one system sample. */
@@ -962,37 +911,30 @@ export function describeSystemStats(
     processMemory: attribution ? describeProcessMemory(attribution, false) : null,
     cpu:
       attribution?.cpu?.available === false
-        ? mutedMetric(t("web.admin.nodes.metric.cpu"), t("web.admin.nodes.system.cpuUnavailable"))
+        ? mutedMetric("CPU", "The CPU source has no current reading.")
         : withResourceScope(describeCPU(system), attribution?.cpu?.scope),
     memory:
       attribution?.memory?.available === false
-        ? mutedMetric(
-            t("web.admin.nodes.metric.memory"),
-            t("web.admin.nodes.system.memoryUnavailable"),
-          )
+        ? mutedMetric("RAM", "The memory source has no current reading.")
         : withResourceScope(describeMemory(system), attribution?.memory?.scope),
     disk: describeWorstDisk(system.disks ?? []),
     network:
       attribution?.network?.available === false
-        ? mutedMetric(
-            t("web.admin.nodes.metric.network"),
-            t("web.admin.nodes.system.networkUnavailable"),
-          )
+        ? mutedMetric("Net", "The network source has no current reading.")
         : describeNetwork(system),
   };
 }
 
 function withResourceScope(metric: ResourceMetric, scope?: string): ResourceMetric {
-  const values = { metric: metric.label };
   const label =
     scope === "cgroup"
-      ? t("web.admin.nodes.metric.cgroupScope", values)
+      ? "Cgroup"
       : scope === "host"
-        ? t("web.admin.nodes.metric.hostScope", values)
+        ? "Host"
         : scope === "virtualized_host"
-          ? t("web.admin.nodes.metric.containerHostScope", values)
+          ? "Container host"
           : null;
-  return label ? { ...metric, label } : metric;
+  return label ? { ...metric, label: `${label} ${metric.label}` } : metric;
 }
 
 function describeCPU(system: HostSystemStats): ResourceMetric {
@@ -1000,28 +942,31 @@ function describeCPU(system: HostSystemStats): ResourceMetric {
   const cores = finiteNumber(system.cores);
   const load1 = finiteNumber(system.load1);
   if (cpu == null) {
-    return mutedMetric(t("web.admin.nodes.metric.cpu"), t("web.admin.nodes.cpu.noReading"));
+    return mutedMetric("CPU", "This sample carries no CPU reading.");
   }
 
   const percent = clampPercent(cpu);
-  const coreValues = cores != null ? { count: cores, count_text: cores } : null;
   const detail = [
-    coreValues && coreValues.count > 0 ? t("web.admin.nodes.cpu.cores", coreValues) : null,
-    load1 != null ? t("web.admin.nodes.cpu.load", { load: formatDecimal(load1, 2) }) : null,
+    cores != null && cores > 0 ? (cores === 1 ? "1 core" : `${cores} cores`) : null,
+    load1 != null ? `load ${load1.toFixed(2)}` : null,
   ]
     .filter((part): part is string => part !== null)
     .join(" · ");
 
   const title = [
-    t("web.admin.nodes.cpu.busyTitle", { percent: percent }),
-    coreValues && coreValues.count > 0 ? t("web.admin.nodes.cpu.coresTitle", coreValues) : null,
-    load1 != null ? t("web.admin.nodes.cpu.loadTitle", { load: formatDecimal(load1, 2) }) : null,
+    `${percent}% busy across all cores over the last sampling interval.`,
+    cores != null && cores > 0
+      ? `${cores} CPU(s) available to this host — its cgroup quota where one is set.`
+      : null,
+    load1 != null
+      ? `1-minute load ${load1.toFixed(2)}, which also counts tasks blocked on storage.`
+      : null,
   ]
     .filter((part): part is string => part !== null)
     .join(" ");
 
   return {
-    label: t("web.admin.nodes.metric.cpu"),
+    label: "CPU",
     value: `${percent}%`,
     detail,
     title,
@@ -1035,17 +980,16 @@ function describeMemory(system: HostSystemStats): ResourceMetric {
   const used = finiteNumber(system.mem_used_mb);
   const total = finiteNumber(system.mem_total_mb);
   if (used == null || total == null || total <= 0) {
-    return mutedMetric(t("web.admin.nodes.metric.memory"), t("web.admin.nodes.memory.noReading"));
+    return mutedMetric("RAM", "This sample carries no memory reading.");
   }
 
   const value = formatUsedOfTotal(used, total, mebibytesToBytes) ?? DASH;
   const percent = clampPercent((used / total) * 100);
-  const percentText = percent;
   return {
-    label: t("web.admin.nodes.metric.memory"),
+    label: "RAM",
     value,
-    detail: t("web.admin.nodes.memory.percentUsed", { percent: percentText }),
-    title: t("web.admin.nodes.memory.title", { amount: value, percent: percentText }),
+    detail: `${percent}% used`,
+    title: `${value} used (${percent}%). Under a cgroup this is the container's limit and working set, not the host's.`,
     muted: false,
     warning: false,
     fill: percent,
@@ -1054,7 +998,8 @@ function describeMemory(system: HostSystemStats): ResourceMetric {
 
 /**
  * The fullest sampled mount, which for a transcode node is its scratch dir —
- * the only mount it samples.
+ * the only mount it samples. Reporting the worst rather than the first keeps
+ * the same rule working on the API host, which also samples the media roots.
  */
 export function describeWorstDisk(disks: readonly HostDiskStats[]): ResourceMetric {
   const measured = disks
@@ -1066,18 +1011,15 @@ export function describeWorstDisk(disks: readonly HostDiskStats[]): ResourceMetr
     // Paths that exist but could not be measured are still worth naming in the
     // tooltip, so an operator sees which mount went away rather than a dash
     // with no explanation.
-    return mutedMetric(
-      t("web.admin.nodes.metric.disk"),
-      title === "" ? t("web.admin.nodes.disk.noReading") : title,
-    );
+    return mutedMetric("Disk", title === "" ? "This sample carries no disk reading." : title);
   }
 
   const worst = measured.reduce((a, b) => (b.fill > a.fill ? b : a));
   const name = diskName(worst.disk);
   return {
-    label: t("web.admin.nodes.metric.disk"),
+    label: "Disk",
     value: `${worst.fill}%`,
-    detail: name === "" ? t("web.admin.nodes.disk.fullDetail") : name,
+    detail: name === "" ? "full" : name,
     title,
     muted: false,
     warning: worst.fill >= DISK_FILL_WARNING_PCT,
@@ -1089,14 +1031,14 @@ function describeNetwork(system: HostSystemStats): ResourceMetric {
   const rx = formatBitsPerSecond(system.net_rx_bps);
   const tx = formatBitsPerSecond(system.net_tx_bps);
   if (rx === null && tx === null) {
-    return mutedMetric(t("web.admin.nodes.metric.network"), t("web.admin.nodes.network.noReading"));
+    return mutedMetric("Net", "This sample carries no network reading.");
   }
 
   return {
-    label: t("web.admin.nodes.metric.network"),
+    label: "Net",
     value: `↓ ${rx ?? DASH} · ↑ ${tx ?? DASH}`,
-    detail: t("web.admin.nodes.network.detail"),
-    title: t("web.admin.nodes.network.title", { rx: rx ?? DASH, tx: tx ?? DASH }),
+    detail: "rx · tx",
+    title: `Aggregate throughput with loopback excluded: ${rx ?? DASH} in, ${tx ?? DASH} out. In a container this is the container's own network namespace.`,
     muted: false,
     warning: false,
     // A link's throughput has no ceiling this sample knows: the sampler reports
@@ -1114,8 +1056,9 @@ export type ResourceSamplePresentation =
   | {
       kind: "sampled";
       cpu: ResourceMetric;
-      /** Leads with the percentage so it reads on the same scale as CPU and GPU. */
       memory: ResourceMetric;
+      disk: ResourceMetric;
+      network: ResourceMetric;
       /** Busiest GPU's video engine; null when this host reports no GPU. */
       gpu: ResourceMetric | null;
       /** When the sample was taken, for a freshness label; null when unstamped. */
@@ -1139,16 +1082,14 @@ export function describeResourceSample(
   if (!resources || resources.available !== true || !system) {
     return {
       kind: "unavailable",
-      title: t("web.admin.nodes.resources.notSampled"),
+      title:
+        "This host is not being sampled. Resource sampling is Linux-only, and the first sample lands a few seconds after startup.",
     };
   }
 
-  const { cpu, memory } = describeSystemStats(system, resources.attribution);
   return {
+    ...describeSystemStats(system, resources.attribution),
     kind: "sampled",
-    cpu,
-    memory:
-      memory.fill === null ? memory : { ...memory, value: `${memory.fill}%`, detail: memory.value },
     stale: resources.stale === true || resourceSampleIsOld(resources, now),
     instanceID: resources.attribution?.instance_id?.trim() || null,
     processMemory: resources.attribution
@@ -1171,22 +1112,15 @@ function describeProcessMemory(attribution: ResourceAttribution, heap: boolean):
   const value = finiteNumber(
     heap ? attribution.process?.heap_live_bytes : attribution.process?.resident_bytes,
   );
-  const label = heap
-    ? t("web.admin.nodes.process.heapLabel")
-    : t("web.admin.nodes.process.residentLabel");
-  if (value == null) return mutedMetric(label, t("web.admin.nodes.process.unmeasured"));
+  const label = heap ? "Go live heap" : "Silo process RAM";
+  if (value == null) return mutedMetric(label, "This source could not be measured.");
   return {
     label,
-    value: formatFileSize(value, {
-      iecUnits: true,
-      fallback: t("web.common.format.size.bytes", { size: 0 }),
-    }),
-    detail: heap
-      ? t("web.admin.nodes.process.heapDetail")
-      : t("web.admin.nodes.process.residentDetail"),
+    value: formatFileSize(value, { iecUnits: true, fallback: "0 B" }),
+    detail: heap ? "at the last GC" : "resident memory",
     title: heap
-      ? t("web.admin.nodes.process.heapTitle")
-      : t("web.admin.nodes.process.residentTitle"),
+      ? "Live Go heap at the last garbage collection. Native allocations and child processes are outside this measurement."
+      : "Resident memory of this Silo process, including native allocations and shared mappings. Child process memory is separate; subtracting Go heap does not give exact native memory.",
     muted: false,
     warning: false,
     fill: null,
@@ -1196,7 +1130,7 @@ function describeProcessMemory(attribution: ResourceAttribution, heap: boolean):
 /**
  * The busiest GPU's video engine, which is the one an operator asks about when
  * transcodes queue. Averaging would hide a saturated card behind an idle one.
- * Null when the host reports no GPU at all, so the row is omitted rather than
+ * Null when the host reports no GPU at all, so the tile is omitted rather than
  * showing a zero.
  */
 export function describeGPUBusy(gpu: readonly HostGPUStats[]): ResourceMetric | null {
@@ -1205,21 +1139,15 @@ export function describeGPUBusy(gpu: readonly HostGPUStats[]): ResourceMetric | 
   }
 
   const sessions = gpu.reduce((total, stats) => total + (finiteNumber(stats.sessions) ?? 0), 0);
-  const sessionLabel = t("web.admin.nodes.gpu.sessionCount", {
-    count: sessions,
-    count_text: sessions,
-  });
+  const sessionLabel = sessions === 1 ? "1 session" : `${sessions} sessions`;
   const title = gpu
     .map((stats) => {
-      const device = stats.device?.trim() || t("web.admin.nodes.gpu.unknownDevice");
+      const device = stats.device?.trim() || "(unknown device)";
       const measured = isMeasuredGPUSource(stats.source);
       const video = finiteNumber(stats.video_busy_pct);
-      const reading =
-        measured && video != null
-          ? t("web.admin.nodes.gpu.videoEngine", { percent: clampPercent(video) })
-          : t("web.admin.nodes.gpu.notMeasured");
+      const reading = measured && video != null ? `video ${clampPercent(video)}%` : "not measured";
       const count = Math.max(0, Math.trunc(finiteNumber(stats.sessions) ?? 0));
-      return `${device} — ${reading} · ${t("web.admin.nodes.gpu.sessionCount", { count, count_text: count })}`;
+      return `${device} — ${reading} · ${count === 1 ? "1 session" : `${count} sessions`}`;
     })
     .join("\n");
 
@@ -1230,18 +1158,12 @@ export function describeGPUBusy(gpu: readonly HostGPUStats[]): ResourceMetric | 
     .reduce<number | null>((best, value) => (best === null || value > best ? value : best), null);
 
   if (busiest === null) {
-    return mutedMetric(
-      t("web.admin.nodes.metric.gpu"),
-      title === "" ? t("web.admin.nodes.gpu.noReading") : title,
-    );
+    return mutedMetric("GPU", title === "" ? "No GPU reading in this sample." : title);
   }
 
-  const label =
-    gpu.length === 1
-      ? t("web.admin.nodes.gpu.singleEngine")
-      : t("web.admin.nodes.gpu.busiestOf", { count: gpu.length });
+  const label = gpu.length === 1 ? "video engine" : `busiest of ${gpu.length} GPUs`;
   return {
-    label: t("web.admin.nodes.metric.gpu"),
+    label: "GPU",
     value: `${clampPercent(busiest)}%`,
     detail: `${label} · ${sessionLabel}`,
     title,
@@ -1331,21 +1253,29 @@ function describeNodeGroup(value: string, members: readonly StreamNode[]): NodeG
 
   const lines = [describeGroupComposition(proxies, transcodes)];
   if (value === "") {
-    lines.push(t("web.admin.nodes.groups.ungroupedRouting"));
+    lines.push(
+      "These nodes have no group, so each is selected on its own: the least-loaded transcode node, and any proxy in the cluster.",
+    );
   } else if (proxies > 0 && transcodes > 0) {
-    lines.push(t("web.admin.nodes.groups.pairedRouting"));
+    lines.push(
+      "Transcodes on this group's nodes are served by a proxy in the same group, so the stream stays on one LAN.",
+    );
   } else if (transcodes > 0) {
-    lines.push(t("web.admin.nodes.groups.noProxyRouting"));
+    lines.push(
+      "No proxy in this group, so transcodes here are served by any proxy in the cluster.",
+    );
   } else {
-    lines.push(t("web.admin.nodes.groups.noTranscodeRouting"));
+    lines.push("No transcode node in this group, so nothing is pinned to these proxies.");
   }
   if (degraded) {
-    lines.push(t("web.admin.nodes.groups.outOfService"));
+    lines.push(
+      "Out of service: an enabled member is not healthy, so transcode nodes in this group stop taking work — and a group with its own proxies never falls back to another group's.",
+    );
   }
 
   return {
     value,
-    label: value === "" ? t("web.admin.nodes.groups.ungrouped") : value,
+    label: value === "" ? "Ungrouped" : value,
     count: members.length,
     proxies,
     transcodes,
@@ -1355,25 +1285,15 @@ function describeNodeGroup(value: string, members: readonly StreamNode[]): NodeG
 }
 
 function describeGroupComposition(proxies: number, transcodes: number): string {
-  const proxyText =
-    proxies > 0
-      ? t("web.admin.nodes.groups.proxyCount", { count: proxies, count_text: proxies })
-      : null;
-  const transcodeText =
+  const parts = [
+    proxies > 0 ? (proxies === 1 ? "1 proxy node" : `${proxies} proxy nodes`) : null,
     transcodes > 0
-      ? t("web.admin.nodes.groups.transcodeCount", {
-          count: transcodes,
-          count_text: transcodes,
-        })
-      : null;
-  if (proxyText && transcodeText) {
-    return t("web.admin.nodes.groups.compositionBoth", {
-      proxies: proxyText,
-      transcodes: transcodeText,
-    });
-  }
-  const only = proxyText ?? transcodeText;
-  return only ? t("web.admin.nodes.groups.compositionOne", { nodes: only }) : ".";
+      ? transcodes === 1
+        ? "1 transcode node"
+        : `${transcodes} transcode nodes`
+      : null,
+  ].filter((part): part is string => part !== null);
+  return `${parts.join(", ")}.`;
 }
 
 /**
@@ -1451,8 +1371,9 @@ export function describeNodeDrain(node: StreamNode): NodeDrainPresentation | nul
     return requested
       ? {
           phase: "draining",
-          label: t("web.admin.nodes.drain.requestedLabel"),
-          detail: t("web.admin.nodes.drain.disabledDetail"),
+          label: "Drain requested",
+          detail:
+            "The node is disabled. It stays out of new placement when it is enabled again until it is resumed.",
         }
       : null;
   }
@@ -1461,8 +1382,9 @@ export function describeNodeDrain(node: StreamNode): NodeDrainPresentation | nul
     return requested
       ? {
           phase: "draining",
-          label: t("web.admin.nodes.drain.notAnsweringLabel"),
-          detail: t("web.admin.nodes.drain.notAnsweringDetail"),
+          label: "Draining · not answering",
+          detail:
+            "Drain requested, but the node did not answer its last health check. New work stays off it.",
         }
       : null;
   }
@@ -1470,85 +1392,43 @@ export function describeNodeDrain(node: StreamNode): NodeDrainPresentation | nul
     return requested
       ? {
           phase: "drained",
-          label: t("web.admin.nodes.drain.safeToStopLabel"),
-          detail: t("web.admin.nodes.drain.safeToStopDetail"),
+          label: "Drained · safe to stop",
+          detail: "No sessions or jobs are left on this node. Resume it to take new work again.",
         }
       : {
           phase: "drained",
-          label: t("web.admin.nodes.drain.noWorkLabel"),
-          detail: t("web.admin.nodes.drain.noWorkDetail"),
+          label: "Drained · no work left",
+          detail: "The node takes no new work. A node that was told to stop exits now.",
         };
   }
   const active = Math.max(0, Math.trunc(finiteNumber(node.active_jobs) ?? 0));
+  const left = `${active} ${active === 1 ? "transcode" : "transcodes"} left`;
   return {
     phase: "draining",
-    label: t("web.admin.nodes.drain.drainingLabel", { count: active, count_text: active }),
+    label: `Draining · ${left}`,
     detail: requested
-      ? t("web.admin.nodes.drain.requestedDetail")
-      : t("web.admin.nodes.drain.stopSignalDetail"),
+      ? "New work goes to other nodes. Sessions already here keep playing until they end."
+      : "The node takes no new work. A node that was told to stop exits when its sessions end or its drain timeout passes.",
   };
-}
-
-/**
- * Whether a node is in the rotation, and why not when it is out of it.
- *
- * Enabled and healthy are two separate facts, but an operator reading the rack
- * asks one question — can this node take work — so they resolve to one state.
- * Disabled wins over unhealthy: a node somebody switched off is not a node
- * that is failing, however its last health check went. A healthy node that is
- * draining is out of the rotation for new work while it finishes what it has.
- */
-export type NodeState = "healthy" | "draining" | "drained" | "unhealthy" | "disabled";
-
-export const NODE_STATE_LABEL: Record<NodeState, MessageKey> = {
-  healthy: "web.admin.nodes.state.healthy",
-  draining: "web.admin.nodes.state.draining",
-  drained: "web.admin.nodes.state.drained",
-  unhealthy: "web.admin.nodes.state.unhealthy",
-  disabled: "web.admin.nodes.state.disabled",
-};
-
-export function nodeState(node: StreamNode): NodeState {
-  if (!node.enabled) {
-    return "disabled";
-  }
-  if (!node.healthy) {
-    return "unhealthy";
-  }
-  return describeNodeDrain(node)?.phase ?? "healthy";
-}
-
-/** A configured cap, or null: at or below zero is how the API spells "unlimited". */
-export function positiveCap(value: number | null | undefined): number | null {
-  const cap = finiteNumber(value);
-  return cap != null && cap > 0 ? cap : null;
 }
 
 /** Concurrency: transcodes on a transcode node, relayed streams on a proxy. */
 export function describeNodeJobs(node: StreamNode): ResourceMetric {
-  const label =
-    node.type === "proxy"
-      ? t("web.admin.nodes.capacity.streams")
-      : t("web.admin.nodes.capacity.transcodes");
+  const label = node.type === "proxy" ? "Streams" : "Transcodes";
   const active = Math.max(0, Math.trunc(finiteNumber(node.active_jobs) ?? 0));
-  const capped = positiveCap(node.max_jobs);
+  // A cap at or below zero is how the API spells "unlimited", which is also
+  // what an absent one means.
+  const cap = finiteNumber(node.max_jobs);
+  const capped = cap != null && cap > 0 ? cap : null;
 
   return {
     label,
     value: capped == null ? `${active}` : `${active} / ${capped}`,
-    detail:
-      capped == null ? t("web.admin.nodes.capacity.noCap") : t("web.admin.nodes.capacity.inUse"),
+    detail: capped == null ? "no cap" : "in use",
     title:
       capped == null
-        ? t("web.admin.nodes.capacity.jobsUncappedTitle", {
-            count: active,
-            count_text: active,
-          })
-        : t("web.admin.nodes.capacity.jobsCappedTitle", {
-            count: active,
-            count_text: active,
-            cap: capped,
-          }),
+        ? `${active} running. This node has no concurrency cap, so the planner places work on it by load alone.`
+        : `${active} of ${capped} running. New work goes elsewhere once this node is full.`,
     muted: false,
     warning: capped != null && active >= capped,
     fill: capacityFill(active, capped),
@@ -1558,18 +1438,18 @@ export function describeNodeJobs(node: StreamNode): ResourceMetric {
 /** Measured egress against a proxy node's bandwidth cap. */
 export function describeNodeEgress(node: StreamNode): ResourceMetric {
   const kbps = Math.max(0, finiteNumber(node.egress_kbps) ?? 0);
-  const capped = positiveCap(node.max_bandwidth_kbps);
+  const cap = finiteNumber(node.max_bandwidth_kbps);
+  const capped = cap != null && cap > 0 ? cap : null;
   const used = formatMbps(kbps);
 
   return {
-    label: t("web.admin.nodes.capacity.egress"),
+    label: "Egress",
     value: capped == null ? `${used} Mbps` : `${used} / ${formatMbps(capped)} Mbps`,
-    detail:
-      capped == null ? t("web.admin.nodes.capacity.noCap") : t("web.admin.nodes.capacity.ofCap"),
+    detail: capped == null ? "no cap" : "of cap",
     title:
       capped == null
-        ? t("web.admin.nodes.capacity.egressUncappedTitle", { used })
-        : t("web.admin.nodes.capacity.egressCappedTitle", { used, cap: formatMbps(capped) }),
+        ? `Measured egress ${used} Mbps. This node has no bandwidth cap.`
+        : `Measured egress ${used} Mbps of ${formatMbps(capped)} Mbps. New streams are routed elsewhere once this node's egress plus the new stream's expected bitrate would exceed the cap; streams already running are never interrupted.`,
     muted: false,
     warning: capped != null && kbps >= capped,
     fill: capacityFill(kbps, capped),
@@ -1578,7 +1458,7 @@ export function describeNodeEgress(node: StreamNode): ResourceMetric {
 
 /** Kilobits per second as Mbps to one decimal, trailing zero dropped. */
 function formatMbps(kbps: number): string {
-  return formatDecimal(Math.round(kbps / 100) / 10, 1, 0);
+  return (Math.round(kbps / 100) / 10).toString();
 }
 
 /**
@@ -1596,21 +1476,19 @@ function diskName(disk: HostDiskStats): string {
 }
 
 function describeDiskLine(disk: HostDiskStats): string {
-  const path = diskName(disk) || t("web.admin.nodes.disk.unknownMount");
+  const path = diskName(disk) || "(unknown mount)";
   if (disk.unavailable) {
-    return t("web.admin.nodes.disk.lineUnavailable", { path });
+    return `${path} — unavailable on this host`;
   }
   const fill = diskFillPercent(disk);
   if (fill === null) {
-    return t("web.admin.nodes.disk.lineNoCapacity", { path });
+    return `${path} — no capacity reported`;
   }
   const capacity = formatUsedOfTotal(disk.used_gb, disk.total_gb, gibibytesToBytes);
+  const line = `${path} — ${fill}% full${capacity ? ` (${capacity})` : ""}`;
   // "Real but old" is the normal reading for a network mount whose server went
   // away, and it is a different fact from "never measured".
-  const values = { path, percent: String(fill), stale: disk.stale ? "yes" : "no" };
-  return capacity
-    ? t("web.admin.nodes.disk.lineWithCapacity", { ...values, capacity })
-    : t("web.admin.nodes.disk.line", values);
+  return disk.stale ? `${line}, carried over from an earlier pass` : line;
 }
 
 function diskFillPercent(disk: HostDiskStats): number | null {
@@ -1636,12 +1514,9 @@ function formatUsedOfTotal(
   if (usedValue == null || totalValue == null || totalValue <= 0) {
     return null;
   }
-  const usedLabel = formatFileSize(toBytes(usedValue), {
-    iecUnits: true,
-    fallback: t("web.common.format.size.bytes", { size: 0 }),
-  });
+  const usedLabel = formatFileSize(toBytes(usedValue), { iecUnits: true, fallback: "0 B" });
   const totalLabel = formatFileSize(toBytes(totalValue), { iecUnits: true });
-  return t("web.admin.nodes.resources.usedOfTotal", { used: usedLabel, total: totalLabel });
+  return `${usedLabel} of ${totalLabel}`;
 }
 
 /**
@@ -1655,15 +1530,15 @@ export function formatBitsPerSecond(bps: number | null | undefined): string | nu
     return null;
   }
   if (value >= 1e9) {
-    return t("web.common.format.bitrate.gbps", { rate: formatDecimal(value / 1e9, 1) });
+    return `${(value / 1e9).toFixed(1)} Gbps`;
   }
   if (value >= 1e6) {
-    return t("web.common.format.bitrate.mbps", { rate: formatDecimal(value / 1e6, 1) });
+    return `${(value / 1e6).toFixed(1)} Mbps`;
   }
   if (value >= 1e3) {
-    return t("web.common.format.bitrate.kbps", { rate: String(Math.round(value / 1e3)) });
+    return `${Math.round(value / 1e3)} kbps`;
   }
-  return t("web.common.format.bitrate.bps", { rate: String(Math.round(value)) });
+  return `${Math.round(value)} bps`;
 }
 
 function mebibytesToBytes(value: number): number {
@@ -1684,38 +1559,4 @@ function finiteNumber(value: number | null | undefined): number | null {
 
 function clampPercent(value: number): number {
   return Math.min(100, Math.max(0, Math.round(value)));
-}
-
-/**
- * Puts the stored value back into every field of an edit the node declares
- * from its own environment (`env_managed`). The server refuses a change to
- * such a field and accepts one that restates it, so a full-form save sends
- * the stored values for them, whatever the form state holds. Only keys the
- * body already carries are restated, so a field the form leaves out for this
- * node type stays out.
- */
-export function restoreEnvManagedFields(
-  body: UpdateNodeRequest,
-  node: StreamNode,
-): UpdateNodeRequest {
-  const locked = new Set(node.env_managed ?? []);
-  const out: UpdateNodeRequest = { ...body };
-  const restate = <K extends keyof UpdateNodeRequest>(key: K, value: UpdateNodeRequest[K]) => {
-    if (locked.has(key) && key in out) out[key] = value;
-  };
-  restate("name", node.name);
-  restate("url", node.url);
-  restate("public_url", node.public_url ?? null);
-  restate("group", node.group ?? "");
-  restate("max_jobs", node.max_jobs ?? 0);
-  restate("max_bandwidth_kbps", node.max_bandwidth_kbps ?? 0);
-  restate("hw_accel_override", node.hw_accel_override ?? null);
-  restate("hw_device_override", node.hw_device_override ?? null);
-  restate("download_artifact_dir_override", node.download_artifact_dir_override ?? null);
-  restate(
-    "download_artifact_max_bytes_override",
-    node.download_artifact_max_bytes_override ?? null,
-  );
-  if (node.source_access) restate("source_access", node.source_access);
-  return out;
 }

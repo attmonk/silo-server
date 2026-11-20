@@ -1,29 +1,26 @@
-import { CircleAlert } from "lucide-react";
-import "@/styles/player-hud.css";
-import { isTransientV2Error } from "@/api/v2/request";
 import { isSourceFallbackReason } from "@/api/v2/watchTogetherSourceFallback";
-import { readWatchTogetherCapabilities } from "@/api/v2/watchTogetherCapabilities";
 import { playbackCapabilitiesV2 } from "../start-v2";
 import { playerV2Origin } from "../player-v2";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { PlayerFileVersion, PlayerPlaybackStateChange, WatchPageProps } from "../types";
 import type { PlaybackRealtimeEventEnvelope } from "../realtime-protocol";
+import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
-import { useMarkerChangeGuard } from "../hooks/useMarkerChangeGuard";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
 import { resolvePlayableSubtitles } from "../utils/playableSubtitles";
 import { patchVersionMarkers, resolveActiveVersionMarkers } from "../utils/watchPageMarkers";
+import {
+  buildSubtitleChoiceRequests,
+  sendSubtitleChoiceRequest,
+} from "../utils/subtitleChoicePersistence";
 import { VideoPlayer } from "./VideoPlayer";
-import { PlayerLoadingCover } from "./PlayerLoadingCover";
 import { fetchWatchDetail } from "@/hooks/queries/items";
-import { useWatchTrickplay } from "@/hooks/queries/trickplay";
+import { transientTrickplayError, useWatchTrickplay } from "@/hooks/queries/trickplay";
 import { itemKeys } from "@/hooks/queries/keys";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { useWatchTogetherRoomConnection } from "../hooks/useWatchTogetherRoomConnection";
-import { useTrackChoicePersistence } from "../hooks/useTrackChoicePersistence";
 import { toast } from "sonner";
-import { useT } from "@/i18n";
 
 function patchChapterThumbnail(
   versions: PlayerFileVersion[],
@@ -80,41 +77,24 @@ export function WatchPage(props: WatchPageProps) {
   );
 }
 
-// A server that serves rooms but advertises no room socket is current but has
-// no Redis, which the room socket's one-time handshake credentials need. An
-// older server, or a failed read, keeps the generic "needs an update" text.
-async function watchPartyNeedsRedis(): Promise<boolean> {
-  try {
-    const caps = await readWatchTogetherCapabilities();
-    return caps.state === "available" && caps.socket_protocol === "";
-  } catch {
-    return false;
-  }
-}
-
 function WatchPartyPlaybackGate(props: WatchPageProps) {
-  const t = useT();
   const config = usePlayerConfig();
-  const [status, setStatus] = useState<
-    "checking" | "supported" | "unsupported" | "redisRequired" | "failed"
-  >("checking");
+  const [status, setStatus] = useState<"checking" | "supported" | "unsupported" | "failed">(
+    "checking",
+  );
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     let cancelled = false;
     void playbackCapabilitiesV2(config)
-      .then(async ({ features }) => {
-        if (
-          features.includes("watch_party_coordinator_v1") &&
-          features.includes("fixed_media_file_v1")
-        ) {
-          return "supported" as const;
+      .then(({ features }) => {
+        if (!cancelled) {
+          setStatus(
+            features.includes("watch_party_coordinator_v1") &&
+              features.includes("fixed_media_file_v1")
+              ? "supported"
+              : "unsupported",
+          );
         }
-        return (await watchPartyNeedsRedis())
-          ? ("redisRequired" as const)
-          : ("unsupported" as const);
-      })
-      .then((next) => {
-        if (!cancelled) setStatus(next);
       })
       .catch(() => {
         if (!cancelled) setStatus("failed");
@@ -126,42 +106,38 @@ function WatchPartyPlaybackGate(props: WatchPageProps) {
 
   if (status === "supported") return <WatchPagePlayer {...props} />;
   return (
-    <div className="hud fixed inset-0 z-50 flex items-center justify-center bg-black px-6">
-      <div className="hud-card flex w-full max-w-md flex-col items-center gap-4 px-8 py-8 text-center">
-        <p className="text-lg font-semibold">
-          {status === "checking"
-            ? t("web.player.watchTogether.checkingSupport")
-            : t("web.player.watchTogether.unavailable")}
+    <div className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6">
+      <div className="surface-panel-subtle flex max-w-md flex-col items-center gap-4 rounded-[1.8rem] px-8 py-8 text-center">
+        <p className="text-base font-semibold text-white">
+          {status === "checking" ? "Checking Watch Party support..." : "Watch Party unavailable"}
         </p>
         {status !== "checking" && (
-          <p className="text-sm leading-relaxed text-[var(--hud-ash)]">
+          <p className="text-sm text-white/60">
             {status === "unsupported"
-              ? t("web.player.watchTogether.unsupported")
-              : status === "redisRequired"
-                ? t("web.player.watchTogether.redisRequired")
-                : t("web.player.watchTogether.checkFailed")}
+              ? "This server needs an update to support Watch Party."
+              : "Unable to check Watch Party support. Please try again."}
           </p>
         )}
         {status === "failed" && (
           <button
             type="button"
-            className="hud-primary-btn"
+            className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white"
             onClick={() => {
               setStatus("checking");
               setAttempt((value) => value + 1);
             }}
           >
-            {t("web.player.watch.tryAgain")}
+            Try Again
           </button>
         )}
         <button
           type="button"
-          className="hud-secondary-btn"
+          className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white"
           onClick={() => {
             void props.onExit();
           }}
         >
-          {t("player.goBack")}
+          Go Back
         </button>
       </div>
     </div>
@@ -172,7 +148,6 @@ function WatchPagePlayer({
   contentId,
   title,
   year,
-  backdrop,
   playbackRequestKey,
   fileId,
   versionPicked = false,
@@ -191,13 +166,11 @@ function WatchPagePlayer({
   preferredSubtitleTrackSignature,
   subtitleMode,
   showForcedSubtitles,
+  profileLanguage,
   introSkipMode,
-  showMarkerConfidence = false,
-  showMarkerSource = false,
   bufferingMode = "always",
   autoSkipRecap,
   autoPlayNextPreview,
-  autoPlayNext,
   canEditMarkers,
   seriesContext,
   onNavigateEpisode,
@@ -215,7 +188,6 @@ function WatchPagePlayer({
   watchTogetherRoomId,
   watchTogetherRoomToken,
 }: WatchPageProps) {
-  const t = useT();
   const config = usePlayerConfig();
   const queryClient = useQueryClient();
   const playbackController = useWatchPlaybackController();
@@ -313,15 +285,10 @@ function WatchPagePlayer({
     const key = `${session.playbackAttemptId}:${session.initialSubtitleError}`;
     if (initialSubtitleErrorKeyRef.current === key) return;
     initialSubtitleErrorKeyRef.current = key;
-    toast.error(session.initialSubtitleErrorTitle ?? t("web.player.watch.subtitleTrackUnusable"), {
+    toast.error(session.initialSubtitleErrorTitle ?? "That subtitle track can't be used", {
       description: session.initialSubtitleError,
     });
-  }, [
-    session.initialSubtitleError,
-    session.initialSubtitleErrorTitle,
-    session.playbackAttemptId,
-    t,
-  ]);
+  }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
   const audioTracks = useMemo(
     () => playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? [],
@@ -352,7 +319,7 @@ function WatchPagePlayer({
   // A failed refresh retains query data. A terminal response withdraws the
   // cached previews; transient failures keep them until the query recovers.
   const trickplay =
-    trickplayAvailable && (!trickplayQuery.isError || isTransientV2Error(trickplayQuery.error))
+    trickplayAvailable && (!trickplayQuery.isError || transientTrickplayError(trickplayQuery.error))
       ? (trickplayQuery.data ?? null)
       : null;
   const refetchTrickplay = trickplayQuery.refetch;
@@ -405,18 +372,11 @@ function WatchPagePlayer({
     });
   }, [activePlaybackVersion, onEnded, session.durationSeconds, session.mediaFileId, versionPinned]);
 
-  const { saveAudioChoice, saveSubtitleChoice } = useTrackChoicePersistence({
-    seriesId: seriesContext?.seriesId ?? contentId,
-    audioTracks,
-    subtitleTracks: playableSubtitles,
-  });
-  // A viewer's audio pick from the player menu: switch now, save for the series.
   const handleSwitchAudio = useCallback(
     (index: number, currentPosition: number) => {
       session.switchAudioTrack(index, currentPosition);
-      saveAudioChoice(index);
     },
-    [saveAudioChoice, session],
+    [session],
   );
 
   const updatePlaybackState = session.updatePlaybackState;
@@ -426,6 +386,32 @@ function WatchPagePlayer({
       onPlaybackStateChange?.(state);
     },
     [onPlaybackStateChange, updatePlaybackState],
+  );
+
+  /**
+   * Persists an in-player subtitle choice for the whole series.
+   *
+   * buildSubtitleChoiceRequests decides what a pick is worth storing and
+   * where; this only issues the requests. They are independent on purpose: a
+   * failed settings write must not cost the user the track they picked, and a
+   * failed track write must not cost them the language, so each is best effort
+   * on its own rather than one composite request that half-applies.
+   */
+  const handleSubtitleChanged = useCallback(
+    (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => {
+      const requests = buildSubtitleChoiceRequests({
+        seriesId: seriesContext?.seriesId ?? contentId,
+        index,
+        tracks: playableSubtitles,
+        inventoryTrack,
+      });
+      for (const request of requests) {
+        void sendSubtitleChoiceRequest(config, request).catch(() => {
+          // Best effort.
+        });
+      }
+    },
+    [config, seriesContext, contentId, playableSubtitles],
   );
 
   useEffect(() => {
@@ -496,17 +482,11 @@ function WatchPagePlayer({
     }
     chapterRefreshAttemptsRef.current.add(session.mediaFileId);
 
-    void queryClient
-      .fetchQuery({
-        queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
-        queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
-        staleTime: 0,
-      })
-      .catch(() => {
-        // The result arrives through the versions prop. A failed read leaves
-        // the chapters as they are. A read that a marker change restarted
-        // rejects here only if this call joined it; its replacement still runs.
-      });
+    void queryClient.fetchQuery({
+      queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
+      queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
+      staleTime: 0,
+    });
   }, [
     contentId,
     fileId,
@@ -519,17 +499,47 @@ function WatchPagePlayer({
     playbackVersions,
   ]);
 
-  const applyMarkerChange = useMarkerChangeGuard({
+  useEffect(() => {
+    if (
+      realtimeConnectionState !== "connected" ||
+      !session.sessionId ||
+      !session.mediaFileId ||
+      session.loading ||
+      session.replacing
+    ) {
+      return;
+    }
+
+    const activeFileId = session.mediaFileId;
+    let cancelled = false;
+    void queryClient
+      .fetchQuery({
+        queryKey: itemKeys.watchDetail(contentId, activeFileId, libraryId),
+        queryFn: () => fetchWatchDetail(contentId, activeFileId, libraryId),
+        staleTime: 0,
+      })
+      .then((detail) => {
+        if (!cancelled) {
+          setPlaybackVersions(detail.versions);
+        }
+      })
+      .catch(() => {
+        // Reconcile again on the next connection; keep the current markers meanwhile.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
     contentId,
-    fileId,
     libraryId,
-    versions,
-    setPlaybackVersions,
-    connected: realtimeConnectionState === "connected",
-    sessionId: session.sessionId,
-    activeFileId: session.mediaFileId,
-    busy: session.loading || session.replacing,
-  });
+    queryClient,
+    realtimeConnectionState,
+    session.loading,
+    session.mediaFileId,
+    session.replacing,
+    session.sessionId,
+  ]);
 
   const handleRealtimeEvent = useCallback(
     (event: PlaybackRealtimeEventEnvelope) => {
@@ -593,7 +603,7 @@ function WatchPagePlayer({
         return;
       }
 
-      applyMarkerChange((current) =>
+      setPlaybackVersions((current) =>
         patchVersionMarkers(
           current,
           file_id,
@@ -605,7 +615,7 @@ function WatchPagePlayer({
         ),
       );
     },
-    [applyMarkerChange, session.mediaFileId, session.sessionId],
+    [session.mediaFileId, session.sessionId],
   );
 
   // The plan is the player's contract: without one there is no transport, no
@@ -613,42 +623,26 @@ function WatchPagePlayer({
   if (!session.plan || !session.streamUrl || !session.sessionId) {
     if (session.loading || fallingBack) {
       return (
-        <PlayerLoadingCover
-          backdrop={backdrop}
-          label={
-            fallingBack
-              ? t("web.player.watch.findingCompatibleVersion")
-              : t("web.player.watch.loadingPlayer")
-          }
-          className="fixed inset-0 z-50"
-        >
-          {fallingBack ? (
-            <span className="text-sm text-[var(--hud-ash)]">
-              {t("web.player.watch.findingCompatibleVersion")}
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black">
+          <div className="flex flex-col items-center gap-3">
+            <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white" />
+            <span className="text-sm text-white/60">
+              {fallingBack ? "Finding a compatible version for everyone..." : "Loading player..."}
             </span>
-          ) : null}
-        </PlayerLoadingCover>
+          </div>
+        </div>
       );
     }
 
     return (
-      <div className="hud fixed inset-0 z-50 flex items-center justify-center bg-black bg-[radial-gradient(ellipse_at_center,rgb(255_255_255/0.06),transparent_60%)] px-6">
-        <div
-          role="alert"
-          className="hud-card flex w-full max-w-lg flex-col items-center gap-6 px-10 py-10 text-center"
-        >
-          <span
-            aria-hidden="true"
-            className="flex size-14 items-center justify-center rounded-full bg-white/[0.08] text-[var(--hud-lamp)]"
-          >
-            <CircleAlert className="size-7" strokeWidth={1.75} />
-          </span>
-          <div className="space-y-2.5">
-            <p className="text-xl font-semibold tracking-tight">
-              {session.errorTitle ?? t("web.player.watch.playbackUnavailable")}
+      <div className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6">
+        <div className="surface-panel-subtle flex max-w-md flex-col items-center gap-4 rounded-[1.8rem] px-8 py-8 text-center">
+          <div className="space-y-2">
+            <p className="text-base font-semibold text-white">
+              {session.errorTitle ?? "Playback unavailable"}
             </p>
-            <p className="text-[0.9375rem] leading-relaxed text-[var(--hud-ash)]">
-              {session.error ?? t("web.player.watch.startFailed")}
+            <p className="text-sm text-white/60">
+              {session.error ?? "Silo could not start playback."}
             </p>
           </div>
           <button
@@ -656,9 +650,9 @@ function WatchPagePlayer({
               void onExit();
             }}
             type="button"
-            className="hud-primary-btn min-h-12 px-7"
+            className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
           >
-            {t("player.goBack")}
+            Go Back
           </button>
         </div>
       </div>
@@ -682,7 +676,6 @@ function WatchPagePlayer({
     <VideoPlayer
       title={title}
       year={year}
-      backdrop={backdrop}
       streamUrl={session.streamUrl}
       plan={session.plan}
       planRevision={session.planRevision}
@@ -714,16 +707,14 @@ function WatchPagePlayer({
       connectionError={session.connectionError}
       onPlanInvalidated={session.invalidatePlan}
       onReanchorSeek={session.reanchorSeek}
-      onSeek={session.reportSeek}
       onApplySubtitleTrack={session.applySubtitleTrack}
       preferredSubtitleLanguage={preferredSubtitleLanguage}
       preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
       subtitleMode={session.initialSubtitleError ? "off" : subtitleMode}
       showForcedSubtitles={session.initialSubtitleError ? false : showForcedSubtitles}
+      profileLanguage={profileLanguage}
       intro={activeMarkers.intro}
       introSkipMode={introSkipMode}
-      showMarkerConfidence={showMarkerConfidence}
-      showMarkerSource={showMarkerSource}
       bufferingMode={bufferingMode}
       bandwidthCapKbps={maxBitrateKbps}
       bufferingTitleId={contentId}
@@ -742,13 +733,12 @@ function WatchPagePlayer({
       preview={activeMarkers.preview}
       markerSegments={selectedVersion?.marker_segments}
       autoPlayNextPreview={autoPlayNextPreview}
-      autoPlayNext={autoPlayNext}
       canEditMarkers={canEditMarkers}
-      onMarkersEdited={(editedFileId, markers) =>
-        applyMarkerChange((current) =>
+      onMarkersEdited={(fileId, markers) =>
+        setPlaybackVersions((current) =>
           patchVersionMarkers(
             current,
-            editedFileId,
+            fileId,
             markers.intro,
             markers.credits,
             markers.recap,
@@ -778,7 +768,7 @@ function WatchPagePlayer({
       audioTracks={audioTracks}
       activeAudioIndex={session.audioTrackIndex}
       onAudioSelect={handleSwitchAudio}
-      onSubtitleChanged={saveSubtitleChoice}
+      onSubtitleChanged={handleSubtitleChanged}
       onReturnFromPostRoll={onReturnFromPostRoll}
       watchTogetherRoomId={watchTogetherRoomId}
       watchTogetherConnection={watchTogetherConnection}

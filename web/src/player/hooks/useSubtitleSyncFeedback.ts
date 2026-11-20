@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useState } from "react";
-import { t, useT } from "@/i18n";
 import type { PlayerSubtitleInfo } from "../types";
 import { getLanguageName } from "../utils/languageNames";
 import {
@@ -138,7 +137,7 @@ export function finishApplying(state: FeedbackState): FeedbackState {
     notice: {
       id: applying.jobId,
       tone: "success",
-      title: t("web.subtitles.syncNotice.synced"),
+      title: "Subtitles synced",
       detail: applying.detail,
     },
   };
@@ -151,27 +150,23 @@ function outcomeNotice(watched: NonNullable<FeedbackInput["watched"]>): Subtitle
       return {
         id: job.id,
         tone: "success",
-        title: t("web.subtitles.syncNotice.trackSynced", { name }),
+        title: `${name} subtitles synced`,
         detail: describeTiming(watched.timing),
       };
     case "already_synced":
-      return {
-        id: job.id,
-        tone: "info",
-        title: t("web.subtitles.syncNotice.trackAlreadyMatches", { name }),
-      };
+      return { id: job.id, tone: "info", title: `${name} subtitles already match the audio` };
     case "no_match":
       return {
         id: job.id,
         tone: "warning",
-        title: t("web.subtitles.syncNotice.trackNoMatch", { name }),
-        detail: t("web.subtitles.syncNotice.noMatchDetail"),
+        title: `${name} subtitles don't match the audio`,
+        detail: "They're probably for another release. The timing wasn't changed.",
       };
     case "failed":
       return {
         id: job.id,
         tone: "warning",
-        title: t("web.subtitles.syncNotice.trackFailed", { name }),
+        title: `Couldn't sync ${name} subtitles`,
         detail: syncFailureMessage(job.failure),
       };
   }
@@ -212,7 +207,7 @@ export function stepFeedback(prev: FeedbackState, input: FeedbackInput): Feedbac
       show({
         id: job.id,
         tone: "progress",
-        title: t("web.subtitles.syncNotice.trackSyncing", { name: watched.name }),
+        title: `Syncing ${watched.name} subtitles`,
         detail: syncPhaseLabel(job) ?? undefined,
         percent: syncProgressPercent(job) ?? 0,
       });
@@ -225,12 +220,7 @@ export function stepFeedback(prev: FeedbackState, input: FeedbackInput): Feedbac
           detail: describeTiming(watched.timing),
           startRevision: next.startRevision.get(job.id) ?? watched.revision,
         };
-        show({
-          id: job.id,
-          tone: "progress",
-          title: t("web.subtitles.syncNotice.applying"),
-          percent: 100,
-        });
+        show({ id: job.id, tone: "progress", title: "Applying new timing…", percent: 100 });
       } else {
         show(outcomeNotice(watched));
       }
@@ -277,7 +267,7 @@ export function stepFeedback(prev: FeedbackState, input: FeedbackInput): Feedbac
       show({
         id: `timing:${input.activeKey}:${input.activeRevision}`,
         tone: "info",
-        title: t("web.subtitles.syncNotice.timingUpdated"),
+        title: "Subtitle timing updated",
       });
     }
   }
@@ -308,18 +298,15 @@ export function useSubtitleSyncFeedback({
   cueRevisions,
   loadState,
 }: Options): { notice: SubtitleSyncNotice | null; dismiss: () => void } {
-  const translate = useT();
   const entry = watchedEntry(sync.entries);
   const job = entry?.state.sync;
-  const track = entry ? tracks.find((tr) => syncKeyOf(tr) === entry.state.key) : undefined;
+  const track = entry ? tracks.find((t) => syncKeyOf(t) === entry.state.key) : undefined;
   const input: FeedbackInput = {
     watched:
       entry && job
         ? {
             key: entry.state.key,
-            name: track
-              ? getLanguageName(track.language) || track.label
-              : translate("web.subtitles.syncNotice.fallbackName"),
+            name: track ? getLanguageName(track.language) || track.label : "Subtitles",
             job,
             timing: entry.state.timing,
             revision: cueRevisions[entry.state.key] ?? 0,

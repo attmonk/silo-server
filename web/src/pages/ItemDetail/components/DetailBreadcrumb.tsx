@@ -1,7 +1,6 @@
 import { ChevronRight } from "lucide-react";
 
 import ViewTransitionLink from "@/components/ViewTransitionLink";
-import { useT } from "@/i18n";
 
 interface BreadcrumbSegment {
   label: string;
@@ -13,11 +12,10 @@ interface DetailBreadcrumbProps {
 }
 
 export default function DetailBreadcrumb({ segments }: DetailBreadcrumbProps) {
-  const t = useT();
   if (segments.length === 0) return null;
 
   return (
-    <nav aria-label={t("web.detail.breadcrumb.label")}>
+    <nav aria-label="Breadcrumb">
       <div className="flex items-center gap-1.5">
         {segments.map((segment, i) => {
           const isLast = i === segments.length - 1;

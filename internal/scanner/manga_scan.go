@@ -12,13 +12,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/idgen"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/titleutil"
+	"github.com/jackc/pgx/v5"
 )
 
 // ScanMangaFolder scans a manga library. It is a fork of ScanEbookFolder: the
@@ -38,14 +36,9 @@ func (s *Scanner) scanMangaPaths(ctx context.Context, folder *models.MediaFolder
 	if s == nil || folder == nil {
 		return fmt.Errorf("scanMangaPaths: nil scanner or folder")
 	}
-	ctx = withScopedScan(ctx, fullScan)
 	warning, err := s.scanWarningBeforeWalk(ctx, folder.ID, fullScan)
 	if err != nil {
 		return err
-	}
-	inventoryAt, err := s.scanInventoryTime(ctx)
-	if err != nil {
-		return fmt.Errorf("manga scan: %w", err)
 	}
 	scans, err := collectEbookRootScans(ctx, folder.ID, roots, folder.Paths)
 	if err != nil {
@@ -60,7 +53,7 @@ func (s *Scanner) scanMangaPaths(ctx context.Context, folder *models.MediaFolder
 	}
 
 	if len(candidates) == 0 {
-		return s.reconcileMangaScan(ctx, folder, scans, inventoryAt, nil, fullScan, warning)
+		return s.reconcileMangaScan(ctx, folder, scans, nil, fullScan, warning)
 	}
 
 	workers := ebookScanWorkers()
@@ -163,15 +156,15 @@ func (s *Scanner) scanMangaPaths(ctx context.Context, folder *models.MediaFolder
 	for _, p := range candidates {
 		seenPaths[p] = true
 	}
-	return s.reconcileMangaScan(ctx, folder, scans, inventoryAt, seenPaths, fullScan, warning)
+	return s.reconcileMangaScan(ctx, folder, scans, seenPaths, fullScan, warning)
 }
 
 // reconcileMangaScan runs the shared ebook missing-file reconciliation (which
 // removes vanished chapters) and then deletes any type='manga' series left with
 // no chapters. Series items are file-less parents reconciled by chapter count,
 // not file presence — catalog.ReconcileFolderMembership deliberately skips them.
-func (s *Scanner) reconcileMangaScan(ctx context.Context, folder *models.MediaFolder, scans []ebookRootScan, inventoryAt time.Time, seenPaths map[string]bool, fullScan bool, warning catalog.ScanWarning) error {
-	if err := s.reconcileEbookScan(ctx, folder, scans, inventoryAt, seenPaths, fullScan, warning); err != nil {
+func (s *Scanner) reconcileMangaScan(ctx context.Context, folder *models.MediaFolder, scans []ebookRootScan, seenPaths map[string]bool, fullScan bool, warning catalog.ScanWarning) error {
+	if err := s.reconcileEbookScan(ctx, folder, scans, seenPaths, fullScan, warning); err != nil {
 		return err
 	}
 	return s.deleteOrphanedMangaSeries(ctx, folder.ID)
@@ -234,7 +227,7 @@ func (s *Scanner) deleteOrphanedMangaSeries(ctx context.Context, folderID int) e
 // find-or-creates the single type='manga' series item for the chapter's series
 // folder and links the chapter to it with its parsed index/volume.
 func (s *Scanner) reconcileMangaFile(ctx context.Context, folder *models.MediaFolder, filePath string, skipped *int64, groupLocks *ebookGroupLocks) error {
-	info, err := fspath.Stat(filePath)
+	info, err := os.Stat(filePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -244,14 +237,14 @@ func (s *Scanner) reconcileMangaFile(ctx context.Context, folder *models.MediaFo
 	size := info.Size()
 	modifiedAt := normalizeFileModifiedAt(info.ModTime())
 
-	isUnchanged, skipErr := s.mangaFileShouldSkip(ctx, folder, filePath, size, modifiedAt)
+	_, isUnchanged, skipErr := s.ebookFileShouldSkip(ctx, folder, filePath, size, modifiedAt)
 	if skipErr != nil {
 		slog.WarnContext(ctx, "manga scan: skip-check failed, falling through", "component", "scanner",
 			"folder_id", folder.ID,
 			"path", filePath,
 			"error", skipErr,
 		)
-	} else if isUnchanged && s.confirmUnchangedFiles(ctx, folder.ID, []string{filePath}) {
+	} else if isUnchanged {
 		atomic.AddInt64(skipped, 1)
 		return nil
 	}
@@ -261,14 +254,14 @@ func (s *Scanner) reconcileMangaFile(ctx context.Context, folder *models.MediaFo
 		return fmt.Errorf("parse manga file %s: %w", filePath, err)
 	}
 	if parsed.Title == "" {
-		parsed.Title = ebookDisplayTitleFromPath(filePath)
+		parsed.Title = ebookTitleFromPath(filePath)
 	}
 
 	seriesName := mangaSeriesFromPath(filePath)
 	if seriesName == "" {
-		seriesName = ebookDisplayTitleFromPath(filePath)
+		seriesName = ebookTitleFromPath(filePath)
 	}
-	stem := fspath.Display(strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath)))
+	stem := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
 	vol, idx, has := mangaIndexForFile(stem, seriesName)
 
 	// 1. Keep the file as a readable type='ebook' chapter item, exactly as the
@@ -317,25 +310,12 @@ func (s *Scanner) reconcileMangaFile(ctx context.Context, folder *models.MediaFo
 		// reconcile). Without it the library-scoped catalog browse, which joins
 		// media_item_libraries, would never surface the series card. The insert is
 		// ON CONFLICT DO NOTHING, so re-scans never duplicate the membership.
-		//
-		// The membership and the chapter link commit together. Every manga scan
-		// ends by deleting the folder's series that have a membership and no
-		// chapters (deleteOrphanedMangaSeries); committed apart, another scan's
-		// delete could remove a series this scan just created between the two
-		// writes. An existing series that loses its last chapter to a concurrent
-		// scan can still be deleted under this link; the skip check above
-		// restores it on the chapter's next scan.
+		if err := insertEbookLibraryMembership(ctx, s.fileRepo.Pool(), seriesID, folder.ID); err != nil {
+			return fmt.Errorf("upsert manga series library membership: %w", err)
+		}
 		idxPtr, volOut := mangaChapterWrite(vol, idx, has)
-		if err := pgx.BeginFunc(ctx, s.fileRepo.Pool(), func(tx pgx.Tx) error {
-			if err := insertEbookLibraryMembership(ctx, tx, seriesID, folder.ID); err != nil {
-				return fmt.Errorf("upsert manga series library membership: %w", err)
-			}
-			if err := upsertMangaChapter(ctx, tx, chapterID, seriesID, idxPtr, volOut); err != nil {
-				return fmt.Errorf("link manga chapter to series: %w", err)
-			}
-			return nil
-		}); err != nil {
-			return err
+		if err := upsertMangaChapter(ctx, s.fileRepo.Pool(), chapterID, seriesID, idxPtr, volOut); err != nil {
+			return fmt.Errorf("link manga chapter to series: %w", err)
 		}
 	}
 
@@ -440,29 +420,6 @@ func (s *Scanner) findOrCreateMangaSeries(ctx context.Context, folderID int, ser
 		}
 	}
 	return id, nil
-}
-
-// mangaFileShouldSkip reports whether the chapter file is unchanged since its
-// last scan and still linked to a series that has a library membership. A scan
-// that stopped, or lost its series to a concurrent scan's orphan delete, after
-// writing the file row must not leave the chapter skipped without a series. Any
-// library counts: a chapter item shared by two manga libraries over one path has
-// one link, and requiring this folder's series would relink it on every scan of
-// either library.
-func (s *Scanner) mangaFileShouldSkip(ctx context.Context, folder *models.MediaFolder, filePath string, size int64, modifiedAt time.Time) (bool, error) {
-	if s.fileRepo == nil || s.itemRepo == nil {
-		return false, nil
-	}
-	state, err := s.fileRepo.loadEbookSkipState(ctx, folder.ID, []string{filePath})
-	if err != nil {
-		return false, err
-	}
-	files := state[filePath]
-	if _, unchanged := unchangedEbookFile(files, filePath, size, modifiedAt); !unchanged {
-		return false, nil
-	}
-	// unchangedEbookFile only reports unchanged for exactly one file row.
-	return files[0].mangaSeriesLinked, nil
 }
 
 // lookupMangaSeries returns the content_id of the type='manga' series item

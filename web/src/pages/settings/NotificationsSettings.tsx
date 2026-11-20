@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { PageHeader } from "@/components/page/PageHeader";
-import { invalidEmailMessage, isValidEmail } from "@/lib/email";
+import { INVALID_EMAIL_MESSAGE, isValidEmail } from "@/lib/email";
 import type {
   NotificationChannelMode,
   NotificationEmailPreferences,
@@ -80,16 +80,8 @@ import {
 } from "@/hooks/queries/notificationWebhooks";
 import { notificationKeys } from "@/hooks/queries/keys";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
-import { useOptionalAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import { formatRelativeTime } from "@/lib/date";
-import { useT, type MessageKey, type Translate } from "@/i18n";
-import { PluginDestinationsSection } from "./PluginDestinationsSection";
-import {
-  DESTINATION_NOTIFY_FIELDS as WEBHOOK_NOTIFY_FIELDS,
-  REASON_FIELDS,
-  type DestinationNotifyKey,
-} from "./notificationReasonFields";
 import {
   currentWebPushSubscription,
   disableWebPush,
@@ -97,20 +89,30 @@ import {
   webPushSupport,
 } from "@/lib/webPush";
 
-/** Example URL in the create dialog's URL field; a URL, so not translated. */
-const DISCORD_WEBHOOK_URL_EXAMPLE = "https://discord.com/api/webhooks/…";
+const REASON_FIELDS = [
+  { key: "notify_favorites", label: "Favorites" },
+  { key: "notify_watchlist", label: "Watchlist" },
+  { key: "notify_continue_watching", label: "Continue Watching" },
+  { key: "notify_next_up", label: "Next Up" },
+] as const;
 
-type WebhookNotifyKey = DestinationNotifyKey;
+// Webhooks additionally carry the request.fulfilled toggle; it is not an
+// episode reason, so the profile preferences section keeps REASON_FIELDS.
+const WEBHOOK_NOTIFY_FIELDS = [
+  ...REASON_FIELDS,
+  { key: "notify_requests", label: "Requests" },
+] as const;
+
+type WebhookNotifyKey = (typeof WEBHOOK_NOTIFY_FIELDS)[number]["key"];
 
 function PreferencesSection() {
-  const t = useT();
   const { data: prefs, isLoading } = useNotificationPreferences();
   const updatePrefs = useUpdateNotificationPreferences();
   const { data: capability } = useNotificationCapability();
 
   if (isLoading || !prefs) {
     return (
-      <SettingsGroup title={t("web.settings.notifications.episodes.title")}>
+      <SettingsGroup title="New Episode Notifications">
         <Skeleton className="h-24 w-full" />
       </SettingsGroup>
     );
@@ -118,10 +120,10 @@ function PreferencesSection() {
 
   return (
     <SettingsGroup
-      title={t("web.settings.notifications.episodes.title")}
+      title="New Episode Notifications"
       description={
         <>
-          {t("web.settings.notifications.episodes.nextUpDescription")}
+          Choose which series relationships notify this profile when a new episode arrives.
           {capability?.series?.available && (
             <>
               {" "}
@@ -129,7 +131,7 @@ function PreferencesSection() {
                 to="/notifications?view=series"
                 className="text-foreground underline underline-offset-4"
               >
-                {t("web.settings.notifications.episodes.seriesLink")}
+                See which series notify you
               </Link>
             </>
           )}
@@ -138,12 +140,8 @@ function PreferencesSection() {
     >
       <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="text-sm font-medium">
-            {t("web.settings.notifications.episodes.enable")}
-          </div>
-          <div className="text-muted-foreground text-xs">
-            {t("web.settings.notifications.episodes.enableHint")}
-          </div>
+          <div className="text-sm font-medium">Enable notifications</div>
+          <div className="text-muted-foreground text-xs">Master switch for this profile</div>
         </div>
         <Switch
           checked={prefs.enabled}
@@ -152,7 +150,7 @@ function PreferencesSection() {
       </div>
       {REASON_FIELDS.map((field) => (
         <div key={field.key} className="flex items-center justify-between gap-3">
-          <div className="text-sm">{t(field.labelKey)}</div>
+          <div className="text-sm">{field.label}</div>
           <Switch
             checked={prefs[field.key as keyof NotificationPreferences] as boolean}
             disabled={!prefs.enabled}
@@ -184,20 +182,16 @@ function ChannelFrequencyRow({
   perEpisodeHint: string;
   onChange: (mode: NotificationChannelMode) => void;
 }) {
-  const t = useT();
-  const digestText = t("web.settings.notifications.frequency.digestHint", { hour: digestHour });
+  const digestText = `One summary per day, around ${digestHour}:00 server time`;
   return (
     <div className="flex items-center justify-between gap-3">
       <div>
-        <div className="text-sm">{t("web.settings.notifications.frequency.label")}</div>
+        <div className="text-sm">Frequency</div>
         <div className="text-muted-foreground text-xs">
           {mode === "per_episode"
             ? perEpisodeHint
             : mode === "per_episode_and_digest"
-              ? t("web.settings.notifications.frequency.perEpisodeAndDigestHint", {
-                  per_episode: perEpisodeHint,
-                  hour: digestHour,
-                })
+              ? `${perEpisodeHint}, plus a daily summary around ${digestHour}:00 server time`
               : digestText}
         </div>
       </div>
@@ -210,17 +204,15 @@ function ChannelFrequencyRow({
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value="daily_digest">
-            {t("web.settings.notifications.frequency.dailyDigest")}
-          </SelectItem>
+          <SelectItem value="daily_digest">Daily digest</SelectItem>
           {(allowPerEpisode || mode === "per_episode") && (
             <SelectItem value="per_episode" disabled={!allowPerEpisode}>
-              {t("web.settings.notifications.frequency.perEpisode")}
+              Every episode
             </SelectItem>
           )}
           {(allowPerEpisode || mode === "per_episode_and_digest") && (
             <SelectItem value="per_episode_and_digest" disabled={!allowPerEpisode}>
-              {t("web.settings.notifications.frequency.perEpisodeAndDigest")}
+              Every episode + daily digest
             </SelectItem>
           )}
         </SelectContent>
@@ -237,7 +229,6 @@ function ChannelFrequencyRow({
  * turns the channel off. Child profiles cannot set addresses.
  */
 function EmailDestinationRow({ prefs }: { prefs: NotificationEmailPreferences }) {
-  const t = useT();
   const [editing, setEditing] = useState(false);
   const [address, setAddress] = useState("");
   const requestAddress = useRequestEmailNotificationAddress();
@@ -251,7 +242,7 @@ function EmailDestinationRow({ prefs }: { prefs: NotificationEmailPreferences })
       return;
     }
     if (!isValidEmail(trimmed)) {
-      toast.error(invalidEmailMessage());
+      toast.error(INVALID_EMAIL_MESSAGE);
       return;
     }
     requestAddress.mutate(trimmed, {
@@ -266,9 +257,9 @@ function EmailDestinationRow({ prefs }: { prefs: NotificationEmailPreferences })
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="text-sm">{t("web.settings.notifications.email.deliverTo")}</div>
+          <div className="text-sm">Deliver to</div>
           <div className="text-muted-foreground text-xs">
-            {hasAddress ? prefs.custom_email : t("web.settings.notifications.email.noAddress")}
+            {hasAddress ? prefs.custom_email : "No address set — verify one to receive emails"}
           </div>
         </div>
         {prefs.can_edit_address && (
@@ -280,7 +271,7 @@ function EmailDestinationRow({ prefs }: { prefs: NotificationEmailPreferences })
                 disabled={clearAddress.isPending || requestAddress.isPending}
                 onClick={() => clearAddress.mutate()}
               >
-                {t("web.settings.notifications.email.remove")}
+                Remove
               </Button>
             )}
             <Button
@@ -289,47 +280,41 @@ function EmailDestinationRow({ prefs }: { prefs: NotificationEmailPreferences })
               disabled={requestAddress.isPending}
               onClick={() => setEditing((value) => !value)}
             >
-              {editing
-                ? t("common.cancel")
-                : hasAddress
-                  ? t("web.settings.notifications.email.change")
-                  : t("web.settings.notifications.email.addAddress")}
+              {editing ? "Cancel" : hasAddress ? "Change" : "Add address"}
             </Button>
           </div>
         )}
       </div>
       {editing && (
-        <form
-          className="flex items-center gap-2"
-          // submit() reports a bad address in its own toast.
-          noValidate
-          onSubmit={(event) => {
-            event.preventDefault();
-            submit();
-          }}
-        >
+        <div className="flex items-center gap-2">
           <Input
             type="email"
             disabled={requestAddress.isPending}
-            placeholder={t("web.settings.notifications.email.addressPlaceholder")}
+            placeholder="name@example.com"
             value={address}
             onChange={(event) => setAddress(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                submit();
+              }
+            }}
             className="max-w-xs"
           />
-          <Button type="submit" size="sm" disabled={requestAddress.isPending || !address.trim()}>
-            {requestAddress.isPending && <Loader2 className="me-1 h-3 w-3 animate-spin" />}
-            {t("web.settings.notifications.email.requestVerification")}
+          <Button size="sm" disabled={requestAddress.isPending || !address.trim()} onClick={submit}>
+            {requestAddress.isPending && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
+            Request verification
           </Button>
-        </form>
+        </div>
       )}
       {prefs.pending_email !== "" && (
         <div className="text-xs text-amber-500">
-          {t("web.settings.notifications.email.pending", { email: prefs.pending_email })}
+          Verification pending for {prefs.pending_email}. Open the verification link when the email
+          arrives to activate the address.
         </div>
       )}
       {!prefs.can_edit_address && (
         <div className="text-muted-foreground text-xs">
-          {t("web.settings.notifications.email.childProfile")}
+          Child profiles can't receive email notifications.
         </div>
       )}
     </div>
@@ -337,7 +322,6 @@ function EmailDestinationRow({ prefs }: { prefs: NotificationEmailPreferences })
 }
 
 function EmailSection() {
-  const t = useT();
   const capability = useNotificationCapability();
   const emailCap = capability.data?.email;
   const available = emailCap?.available ?? false;
@@ -355,7 +339,7 @@ function EmailSection() {
 
   if (isLoading || !prefs) {
     return (
-      <SettingsGroup title={t("web.settings.notifications.email.title")}>
+      <SettingsGroup title="Email Notifications">
         <Skeleton className="h-16 w-full" />
       </SettingsGroup>
     );
@@ -365,14 +349,14 @@ function EmailSection() {
 
   return (
     <SettingsGroup
-      title={t("web.settings.notifications.email.title")}
-      description={t("web.settings.notifications.email.description")}
+      title="Email Notifications"
+      description="Per profile: each profile verifies its own address and picks its own frequency."
     >
       <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="text-sm font-medium">{t("web.settings.notifications.email.enable")}</div>
+          <div className="text-sm font-medium">Email this profile's notifications</div>
           <div className="text-muted-foreground text-xs">
-            {t("web.settings.notifications.email.enableHint")}
+            Notifications you'd see in the inbox, delivered by email
           </div>
         </div>
         <Switch
@@ -390,29 +374,29 @@ function EmailSection() {
           allowPerEpisode={allowPerEpisode}
           digestHour={digestHour}
           isPending={updatePrefs.isPending}
-          perEpisodeHint={t("web.settings.notifications.email.perEpisodeHint")}
+          perEpisodeHint="An email as soon as each notification arrives"
           onChange={(value) => updatePrefs.mutate({ mode: value })}
         />
       )}
       {enabled && mode !== "daily_digest" && !allowPerEpisode && (
         <div className="text-xs text-amber-500">
-          {t("web.settings.notifications.email.perEpisodeDisabled")}
+          Per-episode email is disabled by the administrator; you'll receive the daily digest
+          instead.
         </div>
       )}
     </SettingsGroup>
   );
 }
 
-const DISCORD_LINK_ERRORS: Record<string, MessageKey> = {
-  denied: "web.settings.notifications.discord.linkError.denied",
-  disabled: "web.settings.notifications.discord.linkError.disabled",
-  invalid_callback: "web.settings.notifications.discord.linkError.invalidCallback",
-  state_invalid: "web.settings.notifications.discord.linkError.stateInvalid",
-  exchange_failed: "web.settings.notifications.discord.linkError.exchangeFailed",
+const DISCORD_LINK_ERRORS: Record<string, string> = {
+  denied: "Discord linking was cancelled",
+  disabled: "Discord notifications were disabled by the administrator",
+  invalid_callback: "Discord linking failed: invalid callback",
+  state_invalid: "Discord linking expired — try again",
+  exchange_failed: "Discord linking failed — try again",
 };
 
 function DiscordSection() {
-  const t = useT();
   const { profile } = useCurrentProfile();
   const canManage = profile?.is_primary === true;
   const authority = captureProfileRequestContext();
@@ -435,18 +419,16 @@ function DiscordSection() {
       return;
     }
     if (linked) {
-      toast.success(t("web.settings.notifications.discord.linked"));
+      toast.success("Discord account linked");
       void queryClient.invalidateQueries({ queryKey: notificationKeys.discordPreferences() });
     } else if (error) {
-      toast.error(
-        t(DISCORD_LINK_ERRORS[error] ?? "web.settings.notifications.discord.linkError.generic"),
-      );
+      toast.error(DISCORD_LINK_ERRORS[error] ?? "Discord linking failed");
     }
     const next = new URLSearchParams(searchParams);
     next.delete("discord_linked");
     next.delete("discord_error");
     setSearchParams(next, { replace: true });
-  }, [searchParams, setSearchParams, queryClient, t]);
+  }, [searchParams, setSearchParams, queryClient]);
 
   if (!available) {
     return null;
@@ -454,7 +436,7 @@ function DiscordSection() {
 
   if (isLoading) {
     return (
-      <SettingsGroup title={t("web.settings.notifications.discord.title")}>
+      <SettingsGroup title="Discord Notifications">
         <Skeleton className="h-16 w-full" />
       </SettingsGroup>
     );
@@ -477,27 +459,25 @@ function DiscordSection() {
 
   return (
     <SettingsGroup
-      title={t("web.settings.notifications.discord.title")}
-      description={t("web.settings.notifications.discord.description")}
+      title="Discord Notifications"
+      description="Account-wide: the Silo bot sends direct messages covering every profile on this account. You must share a Discord server with the bot."
     >
       {!canManage && (
         <p className="text-muted-foreground text-sm">
-          {t("web.settings.notifications.discord.primaryOnly")}
+          Switch to the primary profile to manage Discord notifications for this account.
         </p>
       )}
       {!linked ? (
         <div className="flex items-center justify-between gap-3">
           <div>
-            <div className="text-sm font-medium">
-              {t("web.settings.notifications.discord.link")}
-            </div>
+            <div className="text-sm font-medium">Link your Discord account</div>
             <div className="text-muted-foreground text-xs">
-              {t("web.settings.notifications.discord.linkHint")}
+              Authorize on Discord so the bot knows who to message
             </div>
           </div>
           <Button size="sm" disabled={!canManage || linkInit.isPending} onClick={startLink}>
-            {linkInit.isPending && <Loader2 className="me-1.5 h-3.5 w-3.5 animate-spin" />}
-            {t("web.settings.notifications.discord.linkButton")}
+            {linkInit.isPending && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+            Link Discord
           </Button>
         </div>
       ) : (
@@ -505,13 +485,10 @@ function DiscordSection() {
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-sm font-medium">
-                {t("web.settings.notifications.discord.linkedAs", {
-                  name:
-                    prefs?.discord_username || t("web.settings.notifications.discord.unknownUser"),
-                })}
+                Linked as {prefs?.discord_username || "Discord user"}
               </div>
               <div className="text-muted-foreground text-xs">
-                {t("web.settings.notifications.discord.enableHint")}
+                Notifications you'd see in the inbox, delivered as a DM
               </div>
             </div>
             <div className="flex items-center gap-2">
@@ -529,7 +506,7 @@ function DiscordSection() {
                 disabled={!canManage || unlink.isPending}
                 onClick={() => unlink.mutate()}
               >
-                {t("web.settings.notifications.discord.unlink")}
+                Unlink
               </Button>
             </div>
           </div>
@@ -539,13 +516,14 @@ function DiscordSection() {
               allowPerEpisode={allowPerEpisode}
               digestHour={digestHour}
               isPending={!canManage || updatePrefs.isPending}
-              perEpisodeHint={t("web.settings.notifications.discord.perEpisodeHint")}
+              perEpisodeHint="A DM as soon as each notification arrives"
               onChange={(value) => updatePrefs.mutate({ mode: value })}
             />
           )}
           {enabled && mode !== "daily_digest" && !allowPerEpisode && (
             <div className="text-xs text-amber-500">
-              {t("web.settings.notifications.discord.perEpisodeDisabled")}
+              Per-episode DMs are disabled by the administrator; you'll receive the daily digest
+              instead.
             </div>
           )}
           {enabled && prefs?.link_failure && (
@@ -564,60 +542,36 @@ function DiscordSection() {
  * Delivery health for one push subscription, derived the same way as webhook
  * health: a failure newer than the last success means the device is failing.
  */
-function webPushHealth(
-  t: Translate,
-  sub: WebPushSubscriptionView,
-): { text: string; failing: boolean; delivered?: false } {
+function webPushHealth(sub: WebPushSubscriptionView): { text: string; failing: boolean } {
   if (!sub.enabled) {
-    return { text: t("web.settings.notifications.push.disabledAfterFailures"), failing: true };
+    return { text: "Disabled after repeated delivery failures", failing: true };
   }
   const failing =
     sub.last_failure_at != null &&
     (sub.last_success_at == null || sub.last_failure_at > sub.last_success_at);
   if (failing) {
     const when = formatRelativeTime(sub.last_failure_at);
-    return {
-      text: when
-        ? t("web.settings.notifications.push.lastFailedAt", { when })
-        : t("web.settings.notifications.push.lastFailed"),
-      failing: true,
-    };
+    return { text: when ? `Last delivery failed ${when}` : "Last delivery failed", failing: true };
   }
   if (sub.last_success_at) {
     const when = formatRelativeTime(sub.last_success_at);
-    return {
-      text: when
-        ? t("web.settings.notifications.push.lastDeliveredAt", { when })
-        : t("web.settings.notifications.push.delivering"),
-      failing: false,
-    };
+    return { text: when ? `Last delivered ${when}` : "Delivering", failing: false };
   }
-  return {
-    text: t("web.settings.notifications.push.noDeliveries"),
-    failing: false,
-    delivered: false,
-  };
+  return { text: "No deliveries yet", failing: false };
 }
 
-function webPushSubtitle(
-  t: Translate,
-  sub: WebPushSubscriptionView,
-): { text: string; failing: boolean; delivered?: false } {
-  const health = webPushHealth(t, sub);
+function webPushSubtitle(sub: WebPushSubscriptionView): { text: string; failing: boolean } {
+  const health = webPushHealth(sub);
   const added = formatRelativeTime(sub.created_at);
   return {
-    text: added
-      ? t("web.settings.notifications.push.addedWithStatus", { added, status: health.text })
-      : health.text,
+    text: added ? `Added ${added} · ${health.text}` : health.text,
     failing: health.failing,
   };
 }
 
 function WebPushSection() {
-  const t = useT();
   const queryClient = useQueryClient();
   const capability = useNotificationCapability();
-  const userId = useOptionalAuth()?.user?.id;
   const webPushCap = capability.data?.web_push;
   const available = webPushCap?.available ?? false;
   const { data: subscriptions } = useWebPushSubscriptions(available);
@@ -635,29 +589,25 @@ function WebPushSection() {
       ? (subscriptions ?? []).find((sub) => sub.endpoint === thisEndpoint)
       : undefined;
   const subscribedHere = thisSub != null;
-  const thisHealth = thisSub ? webPushHealth(t, thisSub) : null;
+  const thisHealth = thisSub ? webPushHealth(thisSub) : null;
 
   const enable = async () => {
-    if (!webPushCap?.public_key || userId == null) {
-      toast.error(t("web.settings.notifications.push.unavailable"));
+    if (!webPushCap?.public_key) {
+      toast.error("Web push is not available on this server");
       return;
     }
     const authority = captureNotificationAuthority();
     setBusy(true);
     try {
-      await enableWebPush(webPushCap.public_key, userId, authority);
+      await enableWebPush(webPushCap.public_key, authority);
       requireNotificationAuthority(authority);
       const sub = await currentWebPushSubscription();
       requireNotificationAuthority(authority);
       setThisEndpoint(sub?.endpoint ?? null);
-      toast.success(t("web.settings.notifications.push.enabled"));
+      toast.success("Browser notifications enabled");
     } catch (error) {
       if (isCapturedProfileAuthorityActive(authority))
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : t("web.settings.notifications.push.enableFailed"),
-        );
+        toast.error(error instanceof Error ? error.message : "Failed to enable notifications");
     } finally {
       setBusy(false);
       if (isCapturedProfileAuthorityActive(authority))
@@ -677,11 +627,7 @@ function WebPushSection() {
       setThisEndpoint(null);
     } catch (error) {
       if (isCapturedProfileAuthorityActive(authority))
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : t("web.settings.notifications.push.disableFailed"),
-        );
+        toast.error(error instanceof Error ? error.message : "Failed to disable notifications");
     } finally {
       setBusy(false);
       if (isCapturedProfileAuthorityActive(authority))
@@ -700,39 +646,36 @@ function WebPushSection() {
 
   return (
     <SettingsGroup
-      title={t("web.settings.notifications.push.title")}
-      description={t("web.settings.notifications.push.description")}
+      title="Browser Notifications"
+      description="Get notified even when Silo is closed. Notifications are encrypted end-to-end — the browser vendor's push service never sees their content."
     >
       {support === "unsupported" ? (
         <div className="text-muted-foreground text-sm">
-          {t("web.settings.notifications.push.unsupported")}
+          This browser does not support push notifications.
         </div>
       ) : support === "denied" && !subscribedHere ? (
         <div className="text-muted-foreground text-sm">
-          {t("web.settings.notifications.push.blocked")}
+          Notifications are blocked for this site. Allow them in your browser's site settings, then
+          return here.
         </div>
       ) : (
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <BellRing className="text-muted-foreground h-4 w-4" />
             <div>
-              <div className="text-sm font-medium">
-                {t("web.settings.notifications.push.thisBrowser")}
-              </div>
+              <div className="text-sm font-medium">This browser</div>
               <div
                 className={
                   thisHealth?.failing ? "text-xs text-amber-500" : "text-muted-foreground text-xs"
                 }
               >
                 {!subscribedHere
-                  ? t("web.settings.notifications.push.notReceiving")
+                  ? "Not receiving notifications"
                   : thisHealth?.failing
                     ? thisHealth.text
-                    : thisHealth && thisHealth.delivered !== false
-                      ? t("web.settings.notifications.push.receivingWithStatus", {
-                          status: thisHealth.text,
-                        })
-                      : t("web.settings.notifications.push.receiving")}
+                    : thisHealth && thisHealth.text !== "No deliveries yet"
+                      ? `Receiving notifications · ${thisHealth.text}`
+                      : "Receiving notifications"}
               </div>
             </div>
           </div>
@@ -742,10 +685,8 @@ function WebPushSection() {
             disabled={busy}
             onClick={() => void (subscribedHere ? disable() : enable())}
           >
-            {busy && <Loader2 className="me-1.5 h-3.5 w-3.5 animate-spin" />}
-            {subscribedHere
-              ? t("web.settings.notifications.push.disable")
-              : t("web.settings.notifications.push.enable")}
+            {busy && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+            {subscribedHere ? "Disable" : "Enable"}
           </Button>
         </div>
       )}
@@ -753,20 +694,16 @@ function WebPushSection() {
       {otherSubscriptions.length > 0 && (
         <div className="space-y-2">
           <div className="text-muted-foreground text-xs font-medium">
-            {t("web.settings.notifications.push.otherDevices", {
-              count: otherSubscriptions.length,
-            })}
+            Other devices ({otherSubscriptions.length})
           </div>
           {otherSubscriptions.map((sub) => {
-            const subtitle = webPushSubtitle(t, sub);
+            const subtitle = webPushSubtitle(sub);
             return (
               <div key={sub.id} className="flex items-center justify-between gap-3">
                 <div className="flex min-w-0 items-center gap-2">
                   <MonitorSmartphone className="text-muted-foreground h-4 w-4 shrink-0" />
                   <div className="min-w-0">
-                    <div className="truncate text-sm">
-                      {sub.device_name || t("web.settings.notifications.push.unknownDevice")}
-                    </div>
+                    <div className="truncate text-sm">{sub.device_name || "Unknown device"}</div>
                     <div
                       className={
                         subtitle.failing
@@ -785,8 +722,8 @@ function WebPushSection() {
                   disabled={removeSubscription.isPending}
                   onClick={() => removeSubscription.mutate(sub.id)}
                 >
-                  <Trash2 className="me-1.5 h-3.5 w-3.5" />
-                  {t("web.settings.notifications.push.remove")}
+                  <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                  Remove
                 </Button>
               </div>
             );
@@ -810,12 +747,14 @@ function WebhookFormDialog({
   globalPrefs: NotificationPreferences | undefined;
   onSecret: (secret: string) => void;
 }) {
-  const t = useT();
   const create = useCreateNotificationWebhook();
   const update = useUpdateNotificationWebhook();
   const [name, setName] = useState(webhook?.name ?? "");
   const [url, setUrl] = useState("");
   const [reasons, setReasons] = useState<Record<WebhookNotifyKey, boolean>>({
+    notify_favorites: webhook?.notify_favorites ?? true,
+    notify_watchlist: webhook?.notify_watchlist ?? true,
+    notify_continue_watching: webhook?.notify_continue_watching ?? true,
     notify_next_up: webhook?.notify_next_up ?? true,
     notify_requests: webhook?.notify_requests ?? true,
   });
@@ -837,7 +776,7 @@ function WebhookFormDialog({
       return;
     }
     if (!input.url) {
-      toast.error(t("web.settings.notifications.webhooks.urlRequired"));
+      toast.error("A webhook URL is required");
       return;
     }
     const authority = captureNotificationAuthority();
@@ -849,7 +788,7 @@ function WebhookFormDialog({
           return;
         }
         onOpenChange(false);
-        toast.success(t("web.settings.notifications.webhooks.created", { name: created.name }));
+        toast.success(`Webhook "${created.name}" created`);
         if (created.signing_secret) {
           onSecret(created.signing_secret);
         }
@@ -860,11 +799,7 @@ function WebhookFormDialog({
         } catch {
           return;
         }
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : t("web.settings.notifications.webhooks.createFailed"),
-        );
+        toast.error(error instanceof Error ? error.message : "Failed to create webhook");
       },
     });
   };
@@ -873,45 +808,38 @@ function WebhookFormDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>
-            {editing
-              ? t("web.settings.notifications.webhooks.editTitle", { name: webhook.name })
-              : t("web.settings.notifications.webhooks.add")}
-          </DialogTitle>
+          <DialogTitle>{editing ? `Edit "${webhook.name}"` : "Add webhook"}</DialogTitle>
           <DialogDescription>
-            {t("web.settings.notifications.webhooks.dialogDescription")}
+            Discord webhook URLs render as native embeds. Any other HTTPS endpoint receives signed
+            JSON.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
           <div className="space-y-1.5">
-            <Label htmlFor="webhook-name">{t("web.settings.notifications.webhooks.name")}</Label>
+            <Label htmlFor="webhook-name">Name</Label>
             <Input
               id="webhook-name"
               value={name}
               maxLength={64}
-              placeholder={t("web.settings.notifications.webhooks.namePlaceholder")}
+              placeholder="Family Discord"
               onChange={(event) => setName(event.target.value)}
             />
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="webhook-url">
-              {editing
-                ? t("web.settings.notifications.webhooks.replaceUrl")
-                : t("web.settings.notifications.webhooks.url")}
-            </Label>
+            <Label htmlFor="webhook-url">{editing ? "Replace URL (optional)" : "URL"}</Label>
             <Input
               id="webhook-url"
               value={url}
               placeholder={
                 editing
-                  ? t("web.settings.notifications.webhooks.currentUrl", { host: webhook.url_host })
-                  : DISCORD_WEBHOOK_URL_EXAMPLE
+                  ? `Currently pointing at ${webhook.url_host}`
+                  : "https://discord.com/api/webhooks/…"
               }
               onChange={(event) => setUrl(event.target.value)}
             />
           </div>
           <div className="space-y-2">
-            <Label>{t("web.settings.notifications.webhooks.sendFor")}</Label>
+            <Label>Send notifications for</Label>
             {WEBHOOK_NOTIFY_FIELDS.map((field) => {
               // Requests have no per-profile reason toggle; only the master
               // switch suppresses them.
@@ -923,10 +851,10 @@ function WebhookFormDialog({
               return (
                 <div key={field.key} className="flex items-center justify-between gap-3">
                   <div className="text-sm">
-                    {t(field.labelKey)}
+                    {field.label}
                     {globallyDisabled && (
-                      <span className="text-muted-foreground ms-2 text-xs">
-                        {t("web.settings.notifications.webhooks.disabledInProfile")}
+                      <span className="text-muted-foreground ml-2 text-xs">
+                        disabled in profile preferences
                       </span>
                     )}
                   </div>
@@ -944,11 +872,11 @@ function WebhookFormDialog({
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
-            {t("common.cancel")}
+            Cancel
           </Button>
           <Button onClick={submit} disabled={pending || !name.trim()}>
-            {pending && <Loader2 className="me-2 h-4 w-4 animate-spin" />}
-            {editing ? t("common.save") : t("web.settings.notifications.webhooks.create")}
+            {pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            {editing ? "Save" : "Create"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -965,7 +893,6 @@ function WebhookCard({
   onEdit: () => void;
   onSecret: (secret: string) => void;
 }) {
-  const t = useT();
   const update = useUpdateNotificationWebhook();
   const remove = useDeleteNotificationWebhook();
   const authority = captureProfileRequestContext();
@@ -982,26 +909,7 @@ function WebhookCard({
     (webhook.last_success_at == null || webhook.last_failure_at > webhook.last_success_at);
   const enabledReasons = WEBHOOK_NOTIFY_FIELDS.filter(
     (field) => webhook[field.key as keyof NotificationWebhook] as boolean,
-  ).map((field) => t(field.labelKey));
-  const failureMessage =
-    webhook.last_failure_message ||
-    (webhook.last_failure_status != null
-      ? t("web.settings.notifications.webhooks.httpStatus", {
-          status: webhook.last_failure_status,
-        })
-      : t("web.settings.notifications.webhooks.httpError"));
-  const testResultText = testResult
-    ? t(
-        testResult.http_status
-          ? "web.settings.notifications.webhooks.testResultHttp"
-          : "web.settings.notifications.webhooks.testResult",
-        {
-          outcome: testResult.ok ? "ok" : "failed",
-          status: String(testResult.http_status),
-          duration: testResult.duration_ms,
-        },
-      )
-    : "";
+  ).map((field) => field.label);
 
   return (
     <div className="border-border/60 space-y-2 rounded-xl border p-4">
@@ -1009,9 +917,9 @@ function WebhookCard({
         <span className="text-sm font-medium">{webhook.name}</span>
         <Badge variant="secondary">{webhook.type}</Badge>
         <span className="text-muted-foreground text-xs">{webhook.url_host}</span>
-        <div className="ms-auto flex items-center gap-1.5">
+        <div className="ml-auto flex items-center gap-1.5">
           <span className="text-muted-foreground text-xs">
-            {webhook.enabled ? t("web.settings.value.enabled") : t("web.settings.value.disabled")}
+            {webhook.enabled ? "Enabled" : "Disabled"}
           </span>
           <Switch
             checked={webhook.enabled}
@@ -1024,42 +932,33 @@ function WebhookCard({
 
       <div className="text-muted-foreground text-xs">
         {enabledReasons.length === WEBHOOK_NOTIFY_FIELDS.length
-          ? t("web.settings.notifications.webhooks.allReasons")
+          ? "All reasons"
           : enabledReasons.length > 0
             ? enabledReasons.join(" · ")
-            : t("web.settings.notifications.webhooks.noReasons")}
+            : "No reasons selected"}
       </div>
 
       {lastSuccess && !failing && (
-        <div className="text-muted-foreground text-xs">
-          {t("web.settings.notifications.webhooks.lastSuccess", { when: lastSuccess })}
-        </div>
+        <div className="text-muted-foreground text-xs">Last success: {lastSuccess}</div>
       )}
       {failing && (
         <div className="flex items-start gap-1.5 text-xs text-amber-500">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>
             {webhook.disabled_reason
-              ? t("web.settings.notifications.webhooks.disabledReason", {
-                  reason: webhook.disabled_reason,
-                })
-              : lastFailure
-                ? t("web.settings.notifications.webhooks.lastFailureAt", {
-                    when: lastFailure,
-                    message: failureMessage,
-                  })
-                : t("web.settings.notifications.webhooks.lastFailure", { message: failureMessage })}
+              ? `Disabled: ${webhook.disabled_reason}`
+              : `Last failure${lastFailure ? ` ${lastFailure}` : ""}: ${
+                  webhook.last_failure_message || `HTTP ${webhook.last_failure_status ?? "error"}`
+                }. Check the destination URL.`}
           </span>
         </div>
       )}
       {testResult && (
         <div className={`text-xs ${testResult.ok ? "text-emerald-500" : "text-amber-500"}`}>
-          {testResult.message
-            ? t("web.settings.notifications.webhooks.testResultDetail", {
-                result: testResultText,
-                message: testResult.message,
-              })
-            : testResultText}
+          Test {testResult.ok ? "succeeded" : "failed"}
+          {testResult.http_status ? ` (HTTP ${testResult.http_status}` : " ("}
+          {`${testResult.duration_ms}ms)`}
+          {testResult.message ? ` — ${testResult.message}` : ""}
         </div>
       )}
 
@@ -1075,21 +974,21 @@ function WebhookCard({
               },
               onError: () => {
                 if (authority && isCapturedProfileAuthorityActive(authority))
-                  toast.error(t("web.settings.notifications.webhooks.testFailed"));
+                  toast.error("Test request failed");
               },
             })
           }
         >
           {test.isPending ? (
-            <Loader2 className="me-1.5 h-3.5 w-3.5 animate-spin" />
+            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
           ) : (
-            <Send className="me-1.5 h-3.5 w-3.5" />
+            <Send className="mr-1.5 h-3.5 w-3.5" />
           )}
-          {t("web.settings.notifications.webhooks.test")}
+          Test
         </Button>
         <Button variant="outline" size="sm" onClick={onEdit}>
-          <Pencil className="me-1.5 h-3.5 w-3.5" />
-          {t("web.settings.notifications.webhooks.edit")}
+          <Pencil className="mr-1.5 h-3.5 w-3.5" />
+          Edit
         </Button>
         {webhook.type === "generic" && (
           <Button
@@ -1102,8 +1001,8 @@ function WebhookCard({
               })
             }
           >
-            <KeyRound className="me-1.5 h-3.5 w-3.5" />
-            {t("web.settings.notifications.webhooks.rotateSecret")}
+            <KeyRound className="mr-1.5 h-3.5 w-3.5" />
+            Rotate secret
           </Button>
         )}
         <Button
@@ -1115,17 +1014,17 @@ function WebhookCard({
             setConfirmDelete(true);
           }}
         >
-          <Trash2 className="me-1.5 h-3.5 w-3.5" />
-          {t("web.settings.notifications.webhooks.delete")}
+          <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+          Delete
         </Button>
       </div>
 
       <ConfirmDialog
         open={confirmDelete}
         onOpenChange={setConfirmDelete}
-        title={t("web.settings.notifications.webhooks.deleteTitle", { name: webhook.name })}
-        description={t("web.settings.notifications.webhooks.deleteDescription")}
-        confirmLabel={t("web.settings.notifications.webhooks.delete")}
+        title={`Delete "${webhook.name}"?`}
+        description="Notifications will stop posting to this destination. This cannot be undone."
+        confirmLabel="Delete"
         variant="destructive"
         isPending={remove.isPending}
         onConfirm={() => {
@@ -1134,15 +1033,12 @@ function WebhookCard({
         }}
       />
       {/* The edit dialog is hosted by the parent so state resets per webhook. */}
-      {update.isPending && (
-        <span className="sr-only">{t("web.settings.notifications.webhooks.saving")}</span>
-      )}
+      {update.isPending && <span className="sr-only">Saving…</span>}
     </div>
   );
 }
 
 function WebhooksSection() {
-  const t = useT();
   const capability = useNotificationCapability();
   const webhooksAvailable = capability.data?.webhooks.available ?? false;
   const { data: webhooks, isLoading } = useNotificationWebhooks(webhooksAvailable);
@@ -1161,8 +1057,8 @@ function WebhooksSection() {
   return (
     <>
       <SettingsGroup
-        title={t("web.settings.notifications.webhooks.title")}
-        description={t("web.settings.notifications.webhooks.description")}
+        title="Webhooks"
+        description="Send this profile's notifications to a webhook URL. Discord URLs render as native embeds; other URLs receive signed JSON."
       >
         {isLoading ? (
           <Skeleton className="h-24 w-full" />
@@ -1182,7 +1078,7 @@ function WebhooksSection() {
             {(webhooks ?? []).length === 0 && (
               <div className="text-muted-foreground flex items-center gap-2 text-sm">
                 <WebhookIcon className="h-4 w-4" />
-                {t("web.settings.notifications.webhooks.empty")}
+                No webhooks yet.
               </div>
             )}
             <div>
@@ -1195,15 +1091,12 @@ function WebhooksSection() {
                   setFormOpen(true);
                 }}
               >
-                <Plus className="me-1.5 h-4 w-4" />
-                {t("web.settings.notifications.webhooks.add")}
+                <Plus className="mr-1.5 h-4 w-4" />
+                Add webhook
               </Button>
               {atLimit && (
-                <span className="text-muted-foreground ms-2 text-xs">
-                  {t("web.settings.notifications.webhooks.limit", {
-                    count: maxPerProfile,
-                    count_text: maxPerProfile,
-                  })}
+                <span className="text-muted-foreground ml-2 text-xs">
+                  Limit of {maxPerProfile} webhooks reached
                 </span>
               )}
             </div>
@@ -1232,14 +1125,13 @@ function WebhooksSection() {
 }
 
 export default function NotificationsSettings() {
-  const t = useT();
-  useDocumentTitle(t("web.settings.notifications.documentTitle"));
+  useDocumentTitle("Notification Settings");
 
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.notifications.title")}
-        subtitle={t("web.settings.notifications.subtitle")}
+        title="Notifications"
+        subtitle="New-episode alerts by email, Discord, push, or webhook."
       />
 
       <PreferencesSection />
@@ -1251,8 +1143,6 @@ export default function NotificationsSettings() {
       <DiscordSection key={notificationScope()} />
 
       <WebhooksSection />
-
-      <PluginDestinationsSection />
     </div>
   );
 }

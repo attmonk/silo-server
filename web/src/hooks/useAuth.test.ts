@@ -235,16 +235,15 @@ describe("endImpersonationWithRecovery", () => {
         refreshToken: "admin-refresh",
         returnPath: "/admin/users/42",
       });
-      const restoreAdminUser = vi.fn<() => Promise<boolean>>().mockResolvedValue(true);
-      const followBrowserSession = vi.fn();
+      const restoreAdminUser = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+      const clearAuthState = vi.fn();
       const clearActiveAuthState = vi.fn();
 
       await endImpersonationWithRecovery({
-        isCurrent: () => true,
         endImpersonationRequest,
         loadStoredImpersonationAdminSession,
         restoreAdminUser,
-        followBrowserSession,
+        clearAuthState,
         clearActiveAuthState,
       });
 
@@ -255,7 +254,7 @@ describe("endImpersonationWithRecovery", () => {
         refreshToken: "admin-refresh",
         returnPath: "/admin/users/42",
       });
-      expect(followBrowserSession).not.toHaveBeenCalled();
+      expect(clearAuthState).not.toHaveBeenCalled();
       expect(clearActiveAuthState).not.toHaveBeenCalled();
     },
   );
@@ -268,43 +267,41 @@ describe("endImpersonationWithRecovery", () => {
       refreshToken: "admin-refresh",
       returnPath: "/admin/users/42",
     });
-    const restoreAdminUser = vi.fn<() => Promise<boolean>>().mockResolvedValue(true);
-    const followBrowserSession = vi.fn();
+    const restoreAdminUser = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+    const clearAuthState = vi.fn();
     const clearActiveAuthState = vi.fn();
 
     await expect(
       endImpersonationWithRecovery({
-        isCurrent: () => true,
         endImpersonationRequest,
         loadStoredImpersonationAdminSession,
         restoreAdminUser,
-        followBrowserSession,
+        clearAuthState,
         clearActiveAuthState,
       }),
     ).rejects.toBe(error);
 
     expect(restoreAdminUser).not.toHaveBeenCalled();
-    expect(followBrowserSession).not.toHaveBeenCalled();
+    expect(clearAuthState).not.toHaveBeenCalled();
     expect(clearActiveAuthState).not.toHaveBeenCalled();
   });
 
-  it("follows the browser session when ending impersonation succeeds without a preserved admin session", async () => {
+  it("clears auth when ending impersonation succeeds without a preserved admin session", async () => {
     const endImpersonationRequest = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
     const loadStoredImpersonationAdminSession = vi.fn().mockReturnValue(null);
-    const restoreAdminUser = vi.fn<() => Promise<boolean>>().mockResolvedValue(true);
-    const followBrowserSession = vi.fn();
+    const restoreAdminUser = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+    const clearAuthState = vi.fn();
     const clearActiveAuthState = vi.fn();
 
     await endImpersonationWithRecovery({
-      isCurrent: () => true,
       endImpersonationRequest,
       loadStoredImpersonationAdminSession,
       restoreAdminUser,
-      followBrowserSession,
+      clearAuthState,
       clearActiveAuthState,
     });
 
-    expect(followBrowserSession).toHaveBeenCalledTimes(1);
+    expect(clearAuthState).toHaveBeenCalledTimes(1);
     expect(restoreAdminUser).not.toHaveBeenCalled();
     expect(clearActiveAuthState).not.toHaveBeenCalled();
   });
@@ -316,16 +313,15 @@ describe("endImpersonationWithRecovery", () => {
       refreshToken: "admin-refresh",
       returnPath: "/admin/users/42",
     });
-    const restoreAdminUser = vi.fn<() => Promise<boolean>>().mockResolvedValue(true);
-    const followBrowserSession = vi.fn();
+    const restoreAdminUser = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+    const clearAuthState = vi.fn();
     const clearActiveAuthState = vi.fn();
 
     await endImpersonationWithRecovery({
-      isCurrent: () => true,
       endImpersonationRequest,
       loadStoredImpersonationAdminSession,
       restoreAdminUser,
-      followBrowserSession,
+      clearAuthState,
       clearActiveAuthState,
     });
 
@@ -334,7 +330,7 @@ describe("endImpersonationWithRecovery", () => {
       refreshToken: "admin-refresh",
       returnPath: "/admin/users/42",
     });
-    expect(followBrowserSession).not.toHaveBeenCalled();
+    expect(clearAuthState).not.toHaveBeenCalled();
     expect(clearActiveAuthState).not.toHaveBeenCalled();
   });
 });

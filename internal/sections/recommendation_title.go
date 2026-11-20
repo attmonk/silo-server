@@ -49,10 +49,7 @@ func (f *Fetcher) fetchRecommendationRowWithTitle(ctx context.Context, section R
 	result.Items = limitRecommendationItems(items, section.ItemLimit)
 	result.TotalCount = len(result.Items)
 	if len(result.Items) > 0 {
-		if title := recommendationSectionTitle(section.Title, row); title != section.Title {
-			result.Title = title
-			result.TitleKey, result.TitleArgs = row.TitleKey()
-		}
+		result.Title = recommendationSectionTitle(section.Title, row)
 	}
 	return result, nil
 }

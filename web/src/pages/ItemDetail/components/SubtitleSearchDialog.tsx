@@ -28,11 +28,9 @@ import {
   useUploadSubtitle,
 } from "@/hooks/queries/subtitles";
 import { cn } from "@/lib/utils";
-import { languageOptions, getLanguageName } from "@/player/utils/languageNames";
+import { LANGUAGES, getLanguageName } from "@/player/utils/languageNames";
 import { SubtitleUploadForm } from "@/components/subtitles/SubtitleUploadForm";
 import { buildQualitySummary } from "./VersionFlyout";
-import { formatLocale } from "@/lib/appLocale";
-import { useT } from "@/i18n";
 
 interface SubtitleSearchDialogProps {
   open: boolean;
@@ -83,7 +81,6 @@ export default function SubtitleSearchDialog({
   version,
   title,
 }: SubtitleSearchDialogProps) {
-  const t = useT();
   const downloadSubtitleMutation = useDownloadSubtitle();
   const uploadSubtitleMutation = useUploadSubtitle();
   const downloadedQuery = useDownloadedSubtitles(open ? version?.file_id : undefined);
@@ -165,13 +162,13 @@ export default function SubtitleSearchDialog({
     } catch (err) {
       if (controller.signal.aborted) return;
       setResults([]);
-      setSearchError(err instanceof Error ? err.message : t("web.detail.subtitleSearch.failed"));
+      setSearchError(err instanceof Error ? err.message : "Search failed");
     } finally {
       if (!controller.signal.aborted) {
         setSearching(false);
       }
     }
-  }, [selectedLanguage, t, version]);
+  }, [selectedLanguage, version]);
 
   const handleDownload = useCallback(
     async (result: SubtitleResult) => {
@@ -231,25 +228,20 @@ export default function SubtitleSearchDialog({
   }, [downloadedQuery]);
 
   const versionLabel = version ? buildQualitySummary(version) : "";
-  const hearingImpairedLabel = t("web.detail.mediaInfo.hearingImpairedShort");
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-w-3xl flex-col overflow-hidden sm:max-w-3xl">
         <DialogHeader className="min-w-0">
-          <DialogTitle>{t("web.detail.subtitleSearch.title")}</DialogTitle>
+          <DialogTitle>Add Subtitles</DialogTitle>
           <DialogDescription className="truncate">
-            {versionLabel
-              ? t("web.detail.subtitleSearch.descriptionWithVersion", {
-                  title,
-                  version: versionLabel,
-                })
-              : title}
+            {title}
+            {versionLabel ? ` \u00B7 ${versionLabel}` : ""}
           </DialogDescription>
         </DialogHeader>
 
         <TooltipProvider delayDuration={250}>
-          <div className="overlay-scroll min-h-0 min-w-0 flex-1 space-y-4 overflow-y-auto overscroll-contain pe-1">
+          <div className="overlay-scroll min-h-0 min-w-0 flex-1 space-y-4 overflow-y-auto overscroll-contain pr-1">
             {version && (
               <SubtitleUploadForm
                 mediaFileId={version.file_id}
@@ -262,16 +254,14 @@ export default function SubtitleSearchDialog({
 
             {onlineSearchEnabled && (
               <div className="space-y-2">
-                <p className="text-sm font-medium">{t("web.detail.subtitleSearch.searchOnline")}</p>
+                <p className="text-sm font-medium">Search online</p>
                 <div className="flex flex-col gap-2 sm:flex-row">
                   <Select value={selectedLanguage} onValueChange={setSelectedLanguage}>
                     <SelectTrigger className="w-full sm:w-[220px]">
-                      <SelectValue
-                        placeholder={t("web.detail.subtitleSearch.languagePlaceholder")}
-                      />
+                      <SelectValue placeholder="Language" />
                     </SelectTrigger>
                     <SelectContent>
-                      {languageOptions().map((language) => (
+                      {LANGUAGES.map((language) => (
                         <SelectItem key={language.code} value={language.code}>
                           {language.label}
                         </SelectItem>
@@ -285,7 +275,7 @@ export default function SubtitleSearchDialog({
                     ) : (
                       <Search className="size-4" />
                     )}
-                    {t("web.detail.subtitleSearch.searchButton")}
+                    Search
                   </Button>
                 </div>
               </div>
@@ -336,9 +326,7 @@ export default function SubtitleSearchDialog({
                           tone.bg,
                           tone.ring,
                         )}
-                        aria-label={t("web.detail.subtitleSearch.matchScore", {
-                          score: score,
-                        })}
+                        aria-label={`Match score ${score}`}
                       >
                         <span
                           className={cn(
@@ -354,7 +342,7 @@ export default function SubtitleSearchDialog({
                             tone.text,
                           )}
                         >
-                          {t("web.detail.subtitleSearch.scoreLabel")}
+                          Score
                         </span>
                       </div>
 
@@ -371,15 +359,13 @@ export default function SubtitleSearchDialog({
                           </Badge>
                           {result.hearing_impaired && (
                             <Badge variant="outline" className="h-5 gap-1 px-1.5 text-[10px]">
-                              <Ear className="size-2.5" /> {hearingImpairedLabel}
+                              <Ear className="size-2.5" /> HI
                             </Badge>
                           )}
                           {result.downloads > 0 && (
-                            <span className="text-muted-foreground ms-0.5 text-[11px] tabular-nums">
-                              {t("web.detail.subtitleSearch.downloadCount", {
-                                count: result.downloads,
-                                count_text: result.downloads.toLocaleString(formatLocale()),
-                              })}
+                            <span className="text-muted-foreground ml-0.5 text-[11px] tabular-nums">
+                              {result.downloads.toLocaleString()}{" "}
+                              {result.downloads === 1 ? "download" : "downloads"}
                             </span>
                           )}
                         </div>
@@ -402,9 +388,7 @@ export default function SubtitleSearchDialog({
                               {hasExtras ? (
                                 <div className="space-y-1.5">
                                   <p className="text-muted-foreground font-sans text-[10px] tracking-[0.12em] uppercase">
-                                    {t("web.detail.subtitleSearch.releaseNameCount", {
-                                      count: names.length,
-                                    })}
+                                    {names.length} release name{names.length === 1 ? "" : "s"}
                                   </p>
                                   <ul className="space-y-1 leading-snug">
                                     {names.map((name, i) => (
@@ -419,7 +403,7 @@ export default function SubtitleSearchDialog({
                           </Tooltip>
 
                           {hasExtras && expanded && (
-                            <ul className="border-border/60 text-muted-foreground space-y-0.5 border-s ps-2 font-mono text-[12px] leading-snug">
+                            <ul className="border-border/60 text-muted-foreground space-y-0.5 border-l pl-2 font-mono text-[12px] leading-snug">
                               {extras.map((name, i) => (
                                 <li key={i} className="truncate" title={name}>
                                   {name}
@@ -440,10 +424,8 @@ export default function SubtitleSearchDialog({
                                 )}
                               />
                               {expanded
-                                ? t("web.detail.subtitleSearch.collapse")
-                                : t("web.detail.subtitleSearch.moreVariants", {
-                                    count: extras.length,
-                                  })}
+                                ? "Collapse"
+                                : `${extras.length} more variant${extras.length === 1 ? "" : "s"}`}
                             </button>
                           )}
                         </div>
@@ -462,9 +444,7 @@ export default function SubtitleSearchDialog({
                           ) : (
                             <Download className="size-4" />
                           )}
-                          {isDownloading
-                            ? t("web.detail.subtitleSearch.downloading")
-                            : t("web.detail.actions.download")}
+                          {isDownloading ? "Downloading" : "Download"}
                         </Button>
                       </div>
                     </div>
@@ -476,7 +456,7 @@ export default function SubtitleSearchDialog({
               !searching &&
               !searchError && (
                 <div className="text-muted-foreground rounded-xl border border-dashed px-4 py-6 text-center text-sm">
-                  {t("web.detail.subtitleSearch.noResults")}
+                  No subtitles found for this version and language.
                 </div>
               )
             )}

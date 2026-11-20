@@ -1,7 +1,6 @@
 import { useSearchParams } from "react-router";
 import { PageHeader } from "@/components/page/PageHeader";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { useT } from "@/i18n";
 import { useAdminDownloadPreparations } from "@/hooks/queries/admin/downloadPreparations";
 import DeviceCopiesTab from "@/pages/admin-downloads/DeviceCopiesTab";
 import HistoryTab from "@/pages/admin-downloads/HistoryTab";
@@ -16,7 +15,6 @@ import { TabCount } from "@/pages/admin-downloads/controls";
 import { activePreparationCount } from "@/pages/adminDownloadPreparationPresentation";
 
 export default function AdminDownloads() {
-  const t = useT();
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = parseAdminDownloadsTab(searchParams.get("tab"));
   const location = searchParams.get("location") ?? "";
@@ -37,8 +35,8 @@ export default function AdminDownloads() {
   return (
     <div className="space-y-5 lg:space-y-6">
       <PageHeader
-        title={t("web.admin.downloads.page.title")}
-        subtitle={t("web.admin.downloads.page.subtitle")}
+        title="Downloads"
+        subtitle="Preparing downloads, the prepared files on the server and nodes, and the copies on people's devices."
       />
       <Tabs
         value={tab}
@@ -50,20 +48,20 @@ export default function AdminDownloads() {
           className="border-border w-full justify-start overflow-x-auto overflow-y-hidden border-b"
         >
           <TabsTrigger value="storage" className="flex-none">
-            {t("web.admin.downloads.tabs.storage")}
+            Storage
           </TabsTrigger>
           <TabsTrigger value="preparation" className="flex-none">
-            {t("web.admin.downloads.tabs.preparation")}
+            Preparation
             <TabCount count={activePreparations} />
           </TabsTrigger>
           <TabsTrigger value="files" className="flex-none">
-            {t("web.admin.downloads.tabs.files")}
+            Prepared files
           </TabsTrigger>
           <TabsTrigger value="devices" className="flex-none">
-            {t("web.admin.downloads.tabs.devices")}
+            Device copies
           </TabsTrigger>
           <TabsTrigger value="history" className="flex-none">
-            {t("web.admin.downloads.tabs.history")}
+            History
           </TabsTrigger>
         </TabsList>
         <TabsContent value="storage">

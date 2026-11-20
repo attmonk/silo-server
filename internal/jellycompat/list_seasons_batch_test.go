@@ -73,10 +73,10 @@ func (c *countingEpisodeListSource) GetByIDs(_ context.Context, _ []string) ([]*
 	return nil, nil
 }
 
-// TestListSeasons_FallbackUsesGroupedEpisodes verifies that with a store
-// without the SQL rollup and an empty seasons table, ListSeasons uses the
-// single grouped fetch and derives synthetic seasons from it (audit
-// 2026-05-01 §2.2 fallback path).
+// TestListSeasons_FallbackUsesGroupedEpisodes verifies that when the
+// seasons table is empty, ListSeasons still uses the single grouped fetch
+// and derives synthetic seasons without issuing an extra aggregation
+// query (audit 2026-05-01 §2.2 fallback path).
 func TestListSeasons_FallbackUsesGroupedEpisodes(t *testing.T) {
 	provider := newProgressCountingStoreProvider()
 	episodeRepo := &countingEpisodeListSource{

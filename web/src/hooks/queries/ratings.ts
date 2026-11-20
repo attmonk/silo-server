@@ -1,6 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 import type { ItemDetail } from "@/api/types";
 import { v2 } from "@/api/v2/request";
 import { invalidateRatingSurfaceQueries } from "./ratingsSurfaceRefresh";
@@ -39,7 +38,7 @@ export function useSetRating(itemId: string) {
       for (const [queryKey, value] of context?.previous ?? []) {
         queryClient.setQueryData(queryKey, value);
       }
-      toast.error(t("web.common.toast.ratings.updateFailed"));
+      toast.error("Failed to update rating");
     },
     onSettled: () => {
       return invalidateRatingSurfaceQueries(queryClient, itemId);
@@ -71,7 +70,7 @@ export function useDeleteRating(itemId: string) {
       for (const [queryKey, value] of context?.previous ?? []) {
         queryClient.setQueryData(queryKey, value);
       }
-      toast.error(t("web.common.toast.ratings.updateFailed"));
+      toast.error("Failed to update rating");
     },
     onSettled: () => {
       return invalidateRatingSurfaceQueries(queryClient, itemId);

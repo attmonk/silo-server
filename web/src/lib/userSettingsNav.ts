@@ -1,5 +1,4 @@
 import {
-  ArrowDownUp,
   Bell,
   Bookmark,
   Cast,
@@ -21,8 +20,6 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
-import { appIntl, englishText, t, type MessageKey } from "@/i18n";
-
 export interface UserSettingsNavItem {
   path: string;
   label: string;
@@ -41,57 +38,7 @@ export interface UserSettingsNavGroup {
   items: UserSettingsNavItem[];
 }
 
-/** A page in the table below: its text as message ids, translated when read. */
-interface UserSettingsNavSource {
-  path: string;
-  label: MessageKey;
-  icon: LucideIcon;
-  description: MessageKey;
-  /** English search terms; they match in every language. */
-  keywords?: readonly string[];
-  /** Every control on the page, by the id of its visible label, so search can find it. */
-  settings?: readonly MessageKey[];
-  primaryOrAdmin?: boolean;
-  requiresRequests?: boolean;
-}
-
-interface UserSettingsNavGroupSource {
-  label: MessageKey;
-  items: UserSettingsNavSource[];
-}
-
-/**
- * The English text of `ids` that the current language shows differently, so
- * a search typed in English still finds a page in any language.
- */
-function englishTerms(...ids: MessageKey[]): string[] {
-  // In English every term would equal its label; skip formatting each twice.
-  if (appIntl().locale === "en") return [];
-  return ids.flatMap((id) => {
-    const english = englishText(id);
-    return english === t(id) ? [] : [english];
-  });
-}
-
-/** A page with its text in the current language; English stays searchable. */
-function navItem(group: MessageKey, source: UserSettingsNavSource): UserSettingsNavItem {
-  return {
-    path: source.path,
-    icon: source.icon,
-    label: t(source.label),
-    description: t(source.description),
-    keywords: [
-      ...(source.keywords ?? []),
-      ...englishTerms(group, source.label, source.description),
-    ],
-    settings: source.settings?.map((id) => {
-      const keywords = englishTerms(id);
-      return keywords.length > 0 ? { label: t(id), keywords } : { label: t(id) };
-    }),
-    primaryOrAdmin: source.primaryOrAdmin,
-    requiresRequests: source.requiresRequests,
-  };
-}
+const settingIndex = (...labels: string[]) => labels.map((label) => ({ label }));
 
 /**
  * Grouped by the question a person arrives with, not by which service stores
@@ -104,15 +51,15 @@ function navItem(group: MessageKey, source: UserSettingsNavSource): UserSettings
  * notification emails to `notifications`, sign-in linking to `account`, Plex
  * sign-in to `webhook-sync`), so rename labels freely but keep paths.
  */
-const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
+export const USER_SETTINGS_GROUPS: UserSettingsNavGroup[] = [
   {
-    label: "web.settings.nav.group.playback",
+    label: "Playback",
     items: [
       {
         path: "playback",
-        label: "web.settings.playback.title",
+        label: "Playback",
         icon: Play,
-        description: "web.settings.nav.playback.description",
+        description: "Quality, skipping, and what plays next.",
         keywords: [
           "video quality",
           "resolution",
@@ -133,25 +80,25 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "skip interval",
           "audiobook skip",
         ],
-        settings: [
-          "settingsManifest.playback.preferred_quality.label",
-          "settingsManifest.playback.max_bitrate_kbps.label",
-          "settingsManifest.playback.intro_skip_mode.label",
-          "settingsManifest.playback.auto_skip_recap.label",
-          "settingsManifest.playback.auto_skip_credits.label",
-          "web.settings.playback.nextEpisode.previewLabel",
-          "settingsManifest.playback.auto_play_next.label",
-          "web.settings.playback.seek.title",
-          "web.settings.playback.seek.rewindInterval",
-          "web.settings.playback.seek.forwardInterval",
-          "web.settings.playback.legacy.title",
-        ],
+        settings: settingIndex(
+          "Preferred quality",
+          "Maximum bitrate",
+          "Skip intros",
+          "Auto-skip recaps",
+          "Auto-skip credits",
+          "Start next at preview",
+          "Auto-play next episode",
+          "Seek controls",
+          "Rewind interval",
+          "Fast-forward interval",
+          "Use this browser's audiobook intervals",
+        ),
       },
       {
         path: "subtitle-appearance",
-        label: "web.settings.subtitleAppearance.title",
+        label: "Language & Subtitles",
         icon: Subtitles,
-        description: "web.settings.nav.subtitleAppearance.description",
+        description: "Preferred languages, when subtitles appear, and how they look.",
         keywords: [
           "language",
           "audio language",
@@ -170,34 +117,35 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "timing",
           "subtitle delay",
         ],
-        settings: [
-          "web.settings.subtitleAppearance.language.spokenLabel",
-          "web.settings.metadataLanguage.label",
-          "web.settings.metadataLanguage.addException",
-          "web.settings.subtitleAppearance.subtitles.languageLabel",
-          "web.settings.subtitleAppearance.subtitles.behaviorLabel",
-          "settingsManifest.playback.show_forced_subtitles.label",
-          "web.settings.subtitleAppearance.preview.title",
-          "web.settings.subtitleAppearance.preview.save",
-          "web.settings.subtitleAppearance.preview.discard",
-          "web.settings.subtitleAppearance.text.fontSize",
-          "web.settings.subtitleAppearance.text.fontFamily",
-          "web.settings.subtitleAppearance.text.fontColor",
-          "web.settings.subtitleAppearance.text.opacity",
-          "web.settings.subtitleAppearance.text.outline",
-          "web.settings.subtitleAppearance.text.outlineColor",
-          "web.settings.subtitleAppearance.background.style",
-          "web.settings.subtitleAppearance.background.opacity",
-          "web.settings.subtitleAppearance.background.color",
-          "web.settings.subtitleAppearance.background.position",
-          "web.settings.subtitleAppearance.timing.offset",
-        ],
+        settings: settingIndex(
+          "Spoken language",
+          "Metadata language",
+          "Add exception",
+          "Subtitle language",
+          "Subtitle behavior",
+          "Show forced subtitles",
+          "Preview",
+          "Save appearance",
+          "Discard changes",
+          "Font size",
+          "Font family",
+          "Font color",
+          "Text opacity",
+          "Text outline",
+          "Outline color",
+          "Background style",
+          "Background opacity",
+          "Background color",
+          "Subtitle position",
+          "Subtitle offset",
+        ),
       },
       {
         path: "devices",
-        label: "web.settings.device.title",
+        label: "Your Devices",
         icon: MonitorSmartphone,
-        description: "web.settings.nav.devices.description",
+        description:
+          "Override playback, subtitles, and episode behavior on one device, and choose the profile this browser opens.",
         keywords: [
           "devices",
           "tv",
@@ -216,50 +164,54 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "launch",
           "override",
         ],
-        settings: [
-          "web.settings.profileLaunch.label",
-          "web.settings.profileLaunch.remember",
-          "web.settings.profileLaunch.ask",
-          "web.settings.device.useProfileSettings",
-          "web.settings.device.forget",
-          "settingsManifest.playback.preferred_quality.label",
-          "settingsManifest.playback.max_bitrate_kbps.label",
-          "settingsManifest.player.hdr_enabled.label",
-          "settingsManifest.player.dolby_vision_enabled.label",
-          "settingsManifest.player.dv_profile7_hdr10_fallback.label",
-          "settingsManifest.player.match_frame_rate.label",
-          "settingsManifest.player.video_gravity.label",
-          "settingsManifest.player.orientation_mode.label",
-          "settingsManifest.playback.audio_language.label",
-          "settingsManifest.ui.theme_music_enabled.label",
-          "settingsManifest.player.audio_sync_ms.label",
-          "settingsManifest.player.playback_speed.label",
-          "settingsManifest.playback.subtitle_language.label",
-          "settingsManifest.playback.subtitle_appearance.label",
-          "settingsManifest.player.subtitle_sync_ms.label",
-          "settingsManifest.playback.intro_skip_mode.label",
-          "settingsManifest.playback.auto_play_next.label",
-          "settingsManifest.playback.auto_play_next_preview.label",
-          "settingsManifest.player.sleep_timer_default_minutes.label",
-          "settingsManifest.ui.title_art.label",
-        ],
+        settings: settingIndex(
+          "Profile at launch",
+          "Remember last profile",
+          "Ask who's watching",
+          "Use profile settings",
+          "Forget",
+          "Preferred quality",
+          "Maximum bitrate",
+          "HDR",
+          "Dolby Vision",
+          "Dolby Vision Profile 7 fallback",
+          "Match content frame rate",
+          "Video sizing",
+          "Screen orientation",
+          "Preferred audio language",
+          "Theme music",
+          "Audio sync offset",
+          "Playback speed",
+          "Preferred subtitle language",
+          "Subtitle appearance",
+          "Subtitle sync offset",
+          "Skip intros",
+          "Auto-play next",
+          "Preview next episode",
+          "Default sleep timer",
+          "Show title art",
+        ),
       },
     ],
   },
   {
-    label: "web.settings.nav.group.appearance",
+    label: "Appearance",
     items: [
       {
         path: "interface",
-        label: "web.settings.interface.title",
+        label: "Navigation & Cards",
         icon: PanelTop,
-        description: "web.settings.nav.interface.description",
+        description: "Poster size, captions, shortcuts and badges on posters, and your menu.",
         keywords: [
           "navigation",
           "menu",
           "pin library",
           "poster size",
           "card size",
+          "caption",
+          "hide title",
+          "hide year",
+          "artwork only",
           "poster",
           "badges",
           "overlay",
@@ -272,32 +224,35 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "watched",
           "server defaults",
         ],
-        settings: [
-          "web.settings.interface.preview.title",
-          "web.settings.interface.postersTitle",
-          "web.settings.interface.posterSize",
-          "web.settings.cardOverlay.shortcutsTitle",
-          "web.settings.cardOverlay.badgesTitle",
-          "web.settings.cardOverlay.showBadges",
-          "web.settings.cardOverlay.style",
-          "web.settings.nav.setting.mediaInfo",
-          "web.settings.nav.setting.ratingsCertifications",
-          "web.settings.nav.setting.contentMetadata",
-          "web.settings.nav.setting.statusAwards",
-          "web.settings.cardOverlay.adjust",
-          "web.settings.nav.setting.corner",
-          "web.settings.cardOverlay.color",
-          "web.settings.cardOverlay.showIcon",
-          "web.settings.interface.menuTitle",
-          "web.settings.interface.addLink",
-          "web.settings.resetButton.label",
-        ],
+        settings: settingIndex(
+          "Preview",
+          "Posters",
+          "Size",
+          "Under each poster",
+          "Title and details",
+          "Title only",
+          "Shortcuts",
+          "Badges",
+          "Show badges on posters",
+          "Style",
+          "Media Info",
+          "Ratings & Certifications",
+          "Content Metadata",
+          "Status & Awards",
+          "Adjust",
+          "Corner",
+          "Color",
+          "Show icon",
+          "Menu",
+          "Add a link",
+          "Reset",
+        ),
       },
       {
         path: "title-pages",
-        label: "web.settings.titlePages.title",
+        label: "Title Pages",
         icon: Clapperboard,
-        description: "web.settings.nav.titlePages.description",
+        description: "Title art, theme music, spoilers, and age guidance on movie and show pages.",
         keywords: [
           "title art",
           "logo",
@@ -311,21 +266,21 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "age rating",
           "common sense media",
         ],
-        settings: [
-          "settingsManifest.ui.title_art.label",
-          "web.settings.titleArt.allDevices",
-          "settingsManifest.ui.theme_music_enabled.label",
-          "settingsManifest.ui.theme_music_loop.label",
-          "settingsManifest.catalog.hide_unwatched_episode_images.label",
-          "settingsManifest.catalog.hide_unwatched_episode_overviews.label",
-          "settingsManifest.catalog.show_advisory_age.label",
-        ],
+        settings: settingIndex(
+          "Show title art",
+          "Apply to all devices",
+          "Theme music",
+          "Loop theme music",
+          "Blur unwatched episode images",
+          "Hide unwatched episode descriptions",
+          "Show advisory age",
+        ),
       },
       {
         path: "accessibility",
-        label: "web.settings.accessibility.title",
+        label: "Accessibility",
         icon: Eye,
-        description: "web.settings.nav.accessibility.description",
+        description: "Text size, weight, contrast, and date and time formats.",
         keywords: [
           "contrast",
           "readability",
@@ -336,27 +291,27 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "24-hour",
           "12-hour",
         ],
-        settings: [
-          "web.settings.accessibility.textSize",
-          "web.settings.accessibility.textWeight",
-          "web.settings.accessibility.contrast",
-          "web.settings.accessibility.contrastHigh",
-          "web.settings.accessibility.previewTitle",
-          "web.settings.accessibility.dateTimeTitle",
-          "web.settings.accessibility.dateFormat",
-          "web.settings.accessibility.timeFormat",
-        ],
+        settings: settingIndex(
+          "Text size",
+          "Text weight",
+          "Contrast",
+          "High Contrast",
+          "Preview",
+          "Date & time",
+          "Date format",
+          "Time format",
+        ),
       },
     ],
   },
   {
-    label: "web.settings.nav.group.homeDiscovery",
+    label: "Home & Discovery",
     items: [
       {
         path: "home-screen",
-        label: "web.settings.homeScreen.title",
+        label: "Home Screen",
         icon: LayoutDashboard,
-        description: "web.settings.nav.homeScreen.description",
+        description: "The rows on Home and each library page, and what they hold.",
         keywords: [
           "home rows",
           "sections",
@@ -366,24 +321,24 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "library pages",
           "hero banner",
         ],
-        settings: [
-          "web.settings.nav.setting.homeRows",
-          "web.settings.nav.setting.addRow",
-          "settingsManifest.home.hide_watched_items.label",
-          "settingsManifest.ui.next_up_mode.label",
-          "web.settings.homeScreen.export",
-          "web.settings.homeScreen.import",
-          "web.settings.nav.setting.resetHome",
-          "web.settings.nav.setting.continueWatching",
-          "web.settings.nav.setting.nextUp",
-          "web.settings.nav.setting.recentlyAdded",
-        ],
+        settings: settingIndex(
+          "Home rows",
+          "Add row",
+          "Hide watched items",
+          "Next up episodes",
+          "Export layout",
+          "Import layout",
+          "Reset Home",
+          "Continue Watching",
+          "Next Up",
+          "Recently Added",
+        ),
       },
       {
         path: "libraries",
-        label: "web.settings.library.title",
+        label: "Libraries",
         icon: Library,
-        description: "web.settings.nav.libraries.description",
+        description: "Which libraries you see, their order, and per-library languages.",
         keywords: [
           "library visibility",
           "access",
@@ -391,25 +346,25 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "library order",
           "playback preferences",
         ],
-        settings: [
-          "web.settings.library.rememberPages.label",
-          "web.settings.nav.setting.libraryVisibility",
-          "web.settings.library.visibleInNavigation",
-          "web.settings.library.showAll",
-          "web.settings.library.hideAll",
-          "settingsManifest.ui.library_order.label",
-          "web.settings.library.spokenLanguage",
-          "web.settings.library.subtitleLanguage",
-          "web.settings.library.subtitleBehavior",
-          "web.settings.library.forcedSubtitles",
-          "web.settings.nav.setting.playbackPreferences",
-        ],
+        settings: settingIndex(
+          "Remember library pages",
+          "Library visibility",
+          "Visible in navigation",
+          "Show all",
+          "Hide all",
+          "Library order",
+          "Spoken language",
+          "Subtitle language",
+          "Subtitle behavior",
+          "Forced subtitles",
+          "Playback preferences",
+        ),
       },
       {
         path: "personalize",
-        label: "web.settings.personalize.title",
+        label: "Personalize",
         icon: Sparkles,
-        description: "web.settings.nav.personalize.description",
+        description: "Re-tune the taste profile behind your recommendations.",
         keywords: [
           "taste profile",
           "recommendations",
@@ -420,33 +375,33 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "hidden",
           "tour",
         ],
-        settings: [
-          "web.settings.personalize.refineTitle",
-          "web.settings.nav.setting.tasteProfile",
-          "web.settings.nav.setting.recommendations",
-          "web.settings.notInterestedList.title",
-          "web.settings.personalize.tourTitle",
-        ],
+        settings: settingIndex(
+          "Refine your taste profile",
+          "Taste profile",
+          "Recommendations",
+          "Not interested",
+          "Replay the feature tour",
+        ),
       },
       {
         path: "requests",
-        label: "web.settings.requests.title",
+        label: "Requests",
         icon: Bookmark,
-        description: "web.settings.nav.requests.description",
+        description: "Whether adding to your watchlist also requests the title.",
         keywords: ["watchlist", "request", "discover", "auto request"],
-        settings: ["settingsManifest.requests.watchlist_auto_request.label"],
+        settings: settingIndex("Request titles I add to my watchlist"),
         requiresRequests: true,
       },
     ],
   },
   {
-    label: "web.settings.nav.group.connections",
+    label: "Connections",
     items: [
       {
         path: "connect-apps",
-        label: "web.settings.connectApps.title",
+        label: "Connect Apps",
         icon: Cast,
-        description: "web.settings.nav.connectApps.description",
+        description: "Sign-in details for Silo and Jellyfin-compatible apps.",
         keywords: [
           "jellyfin",
           "infuse",
@@ -460,30 +415,22 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "username",
           "pin",
         ],
-        settings: [
-          "web.settings.connectApps.appType.silo",
-          "web.settings.connectApps.appType.jellyfin",
-          "web.settings.connectApps.field.server",
-          "web.settings.connectApps.field.username",
-          "web.settings.connectApps.field.password",
-          "web.settings.connectApps.profilePicker.title",
-          "web.settings.connectApps.troubleshooting.title",
-          "web.settings.connectApps.glance.title",
-        ],
-      },
-      {
-        path: "api-keys",
-        label: "web.settings.apiKeys.title",
-        icon: KeyRound,
-        description: "web.settings.nav.apiKeys.description",
-        keywords: ["api", "key", "token", "script", "automation", "export", "sync", "websocket"],
-        settings: ["web.settings.apiKeys.createKey"],
+        settings: settingIndex(
+          "Silo app or website",
+          "Jellyfin-compatible app",
+          "Server",
+          "Username",
+          "Password",
+          "Which profile are you signing in as?",
+          "A Jellyfin app says my username or password is wrong",
+          "Every profile at a glance",
+        ),
       },
       {
         path: "watch-providers",
-        label: "web.settings.watchProviders.title",
+        label: "Watch Providers",
         icon: Cloud,
-        description: "web.settings.nav.watchProviders.description",
+        description: "Sync watch history, ratings, and watchlists with services like Simkl.",
         keywords: [
           "simkl",
           "import",
@@ -494,104 +441,98 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "watchlist",
           "ratings",
         ],
-        settings: [
-          "web.settings.watchProviders.stats.lastImported",
-          "web.settings.watchProviders.stats.lastExported",
-          "web.settings.watchProviders.stats.watched",
-          "web.settings.watchProviders.stats.progress",
-          "web.settings.watchProviders.stats.favorites",
-          "web.settings.watchProviders.stats.watchlist",
-          "web.settings.watchProviders.stats.ratings",
-          "web.settings.watchProviders.stats.exported",
-          "web.settings.watchProviders.toggle.importWatched.label",
-          "web.settings.watchProviders.toggle.importProgress.label",
-          "web.settings.watchProviders.toggle.exportWatched.label",
-          "web.settings.nav.setting.sendUnwatched",
-          "web.settings.watchProviders.toggle.favorites.label",
-          "web.settings.watchProviders.toggle.favoriteRemovals.label",
-          "web.settings.watchProviders.toggle.watchlist.label",
-          "web.settings.watchProviders.toggle.watchlistOrder.label",
-          "web.settings.watchProviders.toggle.importRatings.label",
-          "web.settings.watchProviders.toggle.exportRatings.label",
-          "web.settings.watchProviders.toggle.syncDropped.label",
-          "web.settings.watchProviders.toggle.scrobble.label",
-        ],
+        settings: settingIndex(
+          "Last imported",
+          "Last exported",
+          "Watched",
+          "Progress",
+          "Favorites",
+          "Watchlist",
+          "Ratings",
+          "Exported",
+          "Import watched history",
+          "Import paused progress",
+          "Send watched changes",
+          "Send unwatched changes",
+          "Sync favorites",
+          "Sync favorite removals",
+          "Sync watchlist",
+          "Mirror watchlist order",
+          "Import ratings",
+          "Send ratings",
+          "Sync dropped shows",
+          "Scrobble playback",
+        ),
       },
       {
         path: "webhook-sync",
-        label: "web.settings.webhooks.title",
+        label: "Webhook Sync",
         icon: Server,
-        description: "web.settings.nav.webhookSync.description",
+        description: "Take watch progress from Plex, Emby, and Jellyfin as it happens.",
         keywords: ["plex", "emby", "jellyfin", "webhook", "progress", "watched", "live"],
-        settings: [
-          "web.settings.webhooks.add.title",
-          "web.settings.webhooks.servers.title",
-          "web.settings.webhooks.detail.webhookUrl",
-          "web.settings.webhooks.defaultProfile",
-          "web.settings.webhooks.mapping.title",
-          "web.settings.webhooks.deliveries.title",
-        ],
-        primaryOrAdmin: true,
+        settings: settingIndex(
+          "Add a connection",
+          "Connected servers",
+          "Webhook URL",
+          "Default profile",
+          "Profile mapping",
+          "Recent deliveries",
+          "Plex",
+          "Emby",
+          "Jellyfin",
+        ),
       },
       {
         path: "history-import",
-        label: "web.settings.historyImport.title",
+        label: "History Import",
         icon: Clock,
-        description: "web.settings.nav.historyImport.description",
+        description:
+          "Copy watch history, watchlist, and favorites from Emby, Plex, or Jellyfin once.",
         keywords: ["emby", "plex", "jellyfin", "watched history", "import", "mapping", "migrate"],
-        settings: [
-          "web.settings.historyImport.newImport.title",
-          "web.settings.historyImport.importIntoProfile",
-          "web.settings.historyImport.startImport",
-          "web.settings.historyImport.latestImport.title",
-          "web.settings.historyImport.history.title",
-          "web.settings.historyImport.metric.fetched",
-          "web.settings.historyImport.metric.matched",
-          "web.settings.historyImport.metric.unmatched",
-          "web.settings.historyImport.metric.skipped",
-        ],
+        settings: settingIndex(
+          "New import",
+          "Import into profile",
+          "Start import",
+          "Latest import",
+          "Import history",
+          "Fetched",
+          "Matched",
+          "Unmatched",
+          "Skipped",
+        ),
       },
     ],
   },
   {
-    label: "web.settings.nav.group.account",
+    label: "Account",
     items: [
       {
         path: "notifications",
-        label: "web.settings.notifications.title",
+        label: "Notifications",
         icon: Bell,
-        description: "web.settings.notifications.subtitle",
+        description: "New-episode alerts by email, Discord, push, or webhook.",
         keywords: ["new episodes", "email", "discord", "browser push", "webhooks", "alerts"],
-        settings: [
-          "web.settings.notifications.episodes.title",
-          "web.settings.notifications.reason.nextUp",
-          "web.settings.notifications.push.title",
-          "web.settings.notifications.email.title",
-          "web.settings.notifications.email.deliverTo",
-          "web.settings.notifications.frequency.label",
-          "web.settings.nav.setting.digest",
-          "web.settings.notifications.discord.title",
-          "web.settings.notifications.webhooks.title",
-          "web.settings.webhooks.detail.webhookUrl",
-        ],
-      },
-      {
-        path: "your-data",
-        label: "web.settings.yourData.title",
-        icon: ArrowDownUp,
-        description: "web.settings.yourData.subtitle",
-        keywords: ["export", "import", "download", "backup", "move", "migrate", "json", "my data"],
-        settings: [
-          "web.settings.yourData.export.title",
-          "web.settings.yourData.import.title",
-          "web.settings.yourData.import.chooseFile",
-        ],
+        settings: settingIndex(
+          "New Episode Notifications",
+          "Favorites",
+          "Watchlist",
+          "Continue Watching",
+          "Next Up",
+          "Browser Notifications",
+          "Email Notifications",
+          "Deliver to",
+          "Frequency",
+          "Digest",
+          "Discord Notifications",
+          "Webhooks",
+          "Webhook URL",
+        ),
       },
       {
         path: "profiles",
-        label: "web.settings.profiles.title",
+        label: "Profiles",
         icon: Users,
-        description: "web.settings.nav.profiles.description",
+        description: "Household profiles, their PINs, and what each may watch.",
         keywords: [
           "profile name",
           "pin",
@@ -601,43 +542,43 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "kids",
           "parental controls",
         ],
-        settings: [
-          "web.settings.profiles.newProfile",
-          "web.settings.nav.setting.profileName",
-          "web.profiles.pin.label",
-          "web.profiles.editor.kids",
-          "web.profiles.editor.maxContentRating",
-          "web.profiles.editor.maxAdvisoryAge",
-          "web.profiles.editor.maxPlaybackQuality",
-          "web.profiles.editor.restrictLibraries",
-          "web.profiles.streams.heading",
-          "web.settings.profiles.deleteTitle",
-          "web.settings.nav.setting.primaryProfile",
-        ],
+        settings: settingIndex(
+          "New profile",
+          "Profile name",
+          "PIN",
+          "Kids profile",
+          "Maximum content rating",
+          "Maximum advisory age",
+          "Maximum playback quality",
+          "Restrict libraries",
+          "Active streams",
+          "Delete profile",
+          "Primary profile",
+        ),
         primaryOrAdmin: true,
       },
       {
         path: "account",
-        label: "web.settings.account.title",
+        label: "Account",
         icon: KeyRound,
-        description: "web.settings.nav.account.description",
+        description: "The password and sign-in providers every household profile shares.",
         keywords: ["password", "credential", "sign in", "security", "account", "sso"],
-        settings: [
-          "web.settings.account.password.current",
-          "web.settings.account.password.new",
-          "web.settings.account.password.confirm",
-          "web.settings.account.password.change",
-          "web.settings.accountSignIn.title",
-          "web.settings.accountSignIn.connect",
-          "web.settings.accountSignIn.disconnect",
-        ],
+        settings: settingIndex(
+          "Current password",
+          "New password",
+          "Confirm new password",
+          "Change password",
+          "Sign-in",
+          "Connect",
+          "Disconnect",
+        ),
         primaryOrAdmin: true,
       },
       {
         path: "sessions",
-        label: "web.settings.nav.sessions.label",
+        label: "Signed-in sessions",
         icon: ShieldCheck,
-        description: "web.settings.nav.sessions.description",
+        description: "See where your account is signed in, and sign out a browser or app.",
         primaryOrAdmin: true,
         keywords: [
           "sessions",
@@ -649,12 +590,12 @@ const USER_SETTINGS_GROUPS: UserSettingsNavGroupSource[] = [
           "revoke",
           "security",
         ],
-        settings: [
-          "web.settings.nav.setting.activeSignIns",
-          "web.settings.nav.setting.thisBrowser",
-          "web.settings.nav.setting.otherSessions",
-          "web.settings.nav.setting.signOutEverywhere",
-        ],
+        settings: settingIndex(
+          "Active sign-ins",
+          "This browser",
+          "Other signed-in sessions",
+          "Sign out everywhere",
+        ),
       },
     ],
   },
@@ -667,23 +608,17 @@ export interface UserSettingsNavAccess {
   requestsEnabled: boolean;
 }
 
-/**
- * The groups this profile can open, with empty groups dropped, in the current
- * language. Call it again after a language change.
- */
+/** The groups this profile can open, with empty groups dropped. */
 export function visibleUserSettingsGroups({
   canManageProfiles,
   requestsEnabled,
 }: UserSettingsNavAccess): UserSettingsNavGroup[] {
   return USER_SETTINGS_GROUPS.map((group) => ({
-    label: t(group.label),
-    items: group.items
-      .filter(
-        (item) =>
-          (!item.primaryOrAdmin || canManageProfiles) &&
-          (!item.requiresRequests || requestsEnabled),
-      )
-      .map((item) => navItem(group.label, item)),
+    ...group,
+    items: group.items.filter(
+      (item) =>
+        (!item.primaryOrAdmin || canManageProfiles) && (!item.requiresRequests || requestsEnabled),
+    ),
   })).filter((group) => group.items.length > 0);
 }
 

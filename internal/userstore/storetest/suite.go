@@ -155,7 +155,7 @@ func testCollectionSortPreferences(t *testing.T, newStore func(t *testing.T) use
 		t.Fatalf("SetCollectionSortPreference(profile delete target): %v", err)
 	}
 
-	if _, err := store.DeleteProfile(ctx, profileID); err != nil {
+	if err := store.DeleteProfile(ctx, profileID); err != nil {
 		t.Fatalf("DeleteProfile: %v", err)
 	}
 	deletedPref, err = store.GetCollectionSortPreference(ctx, viewerProfileID, userstore.CollectionKindUser, profileDeletedCollection.ID)
@@ -424,38 +424,6 @@ func testMarkWatchedBatch(t *testing.T, newStore func(t *testing.T) userstore.Us
 	history, err = store.ListHistory(ctx, "p1", 50, 0)
 	if err != nil || len(history) != 2 {
 		t.Fatalf("history after retry: %+v %v", history, err)
-	}
-
-	// A rewatch in progress (completed, with a resume position) is left alone
-	// unless the target asks to record it: then the mark records another play
-	// and clears the position, and a repeat with no new position in between
-	// records nothing.
-	if err := store.SetProgress(ctx, "p1", "ep-1", 300, 1200, userstore.ProgressThresholds{}); err != nil {
-		t.Fatalf("SetProgress(ep-1 rewatch): %v", err)
-	}
-	if progress, err := store.GetProgress(ctx, "p1", "ep-1"); err != nil || progress == nil || !progress.Completed || progress.PositionSeconds != 300 {
-		t.Fatalf("rewatch progress = %+v, %v; want completed with a resume position", progress, err)
-	}
-	rewatchEntry := entries[0]
-	rewatchEntry.ID = ""
-	rewatchEntry.WatchedAt = watchedAt.Add(2 * time.Hour).Format(time.RFC3339)
-	rewatchTarget := targets[0]
-	for attempt, want := range []struct {
-		recordRewatch bool
-		entries       int
-	}{{false, 0}, {true, 1}, {true, 0}} {
-		rewatchTarget.RecordRewatch = want.recordRewatch
-		rewatched, err := userstore.MarkWatchedBatch(ctx, store, "p1", []userstore.MarkWatchedTarget{rewatchTarget}, []userstore.WatchHistoryEntry{rewatchEntry})
-		if err != nil || len(rewatched) != want.entries {
-			t.Fatalf("rewatch mark %d (record %v): %+v %v; want %d entries", attempt, want.recordRewatch, rewatched, err, want.entries)
-		}
-	}
-	if progress, err := store.GetProgress(ctx, "p1", "ep-1"); err != nil || progress == nil || !progress.Completed || progress.PositionSeconds != 0 {
-		t.Fatalf("rewatch mark progress = %+v, %v; want completed with no resume position", progress, err)
-	}
-	history, err = store.ListHistory(ctx, "p1", 50, 0)
-	if err != nil || len(history) != 3 {
-		t.Fatalf("history after rewatch mark: %+v %v; want one more play", history, err)
 	}
 
 	// Start incomplete so the zero-duration mark must update the row.
@@ -737,7 +705,7 @@ func RunNotInterested(t *testing.T, newStore func(t *testing.T) userstore.UserSt
 			t.Fatalf("keyset walk = %v, want %s", got, want)
 		}
 
-		if _, err := store.DeleteProfile(ctx, "p1"); err != nil {
+		if err := store.DeleteProfile(ctx, "p1"); err != nil {
 			t.Fatalf("DeleteProfile: %v", err)
 		}
 		if rows, err := store.ListNotInterestedPage(ctx, "p1", nil, 10); err != nil || len(rows) != 0 {
@@ -1010,23 +978,6 @@ func testProgressPage(t *testing.T, newStore func(t *testing.T) userstore.UserSt
 	}
 	if len(rest) != 5 || rest[0].MediaItemID != want[0] {
 		t.Fatalf("rest = %d rows, first %q", len(rest), rest[0].MediaItemID)
-	}
-
-	// The unpaged item listing matches the full listing and stays within the
-	// profile: another profile on the same account keeps its own progress.
-	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p2", Name: "Other"}); err != nil {
-		t.Fatalf("CreateProfile(p2): %v", err)
-	}
-	if err := store.SetProgressAt(ctx, "p2", "m-other", 10, 1000, false, base); err != nil {
-		t.Fatalf("write m-other: %v", err)
-	}
-	itemIDs, err := store.ListProgressItemIDs(ctx, "p1")
-	if err != nil {
-		t.Fatalf("ListProgressItemIDs: %v", err)
-	}
-	slices.Sort(itemIDs)
-	if wantIDs := []string{"m-a", "m-b", "m-c", "m-d", "m-done", "m-e"}; !slices.Equal(itemIDs, wantIDs) {
-		t.Fatalf("ListProgressItemIDs = %v, want %v", itemIDs, wantIDs)
 	}
 }
 

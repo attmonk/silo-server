@@ -2,7 +2,9 @@ package apiv2
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"testing"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
@@ -21,11 +23,10 @@ type fakeWatch struct {
 }
 
 type fakeMark struct {
-	userID        int
-	profileID     string
-	contentID     string
-	played        bool
-	recordRewatch bool
+	userID    int
+	profileID string
+	contentID string
+	played    bool
 }
 
 func (f *fakeWatch) ContextAccessFilter(_ context.Context, opts handlers.AccessFilterOptions) (catalogpkg.AccessFilter, error) {
@@ -71,14 +72,14 @@ func (f *fakeWatch) WatchDetail(_ context.Context, userID int, profileID, conten
 	return nil, &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Watch target not found"}
 }
 
-func (f *fakeWatch) SetWatchedState(_ context.Context, userID int, profileID, contentID string, played, recordRewatch bool, _ catalogpkg.AccessFilter) (handlers.WatchedStateView, error) {
+func (f *fakeWatch) SetWatchedState(_ context.Context, userID int, profileID, contentID string, played bool, _ catalogpkg.AccessFilter) (handlers.WatchedStateView, error) {
 	if f.err != nil {
 		return handlers.WatchedStateView{}, f.err
 	}
 	if contentID != "movie:heat-1995" && contentID != "series:heat" {
 		return handlers.WatchedStateView{}, &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Item not found"}
 	}
-	f.marks = append(f.marks, fakeMark{userID: userID, profileID: profileID, contentID: contentID, played: played, recordRewatch: recordRewatch})
+	f.marks = append(f.marks, fakeMark{userID: userID, profileID: profileID, contentID: contentID, played: played})
 	return handlers.WatchedStateView{ContentID: contentID, Type: "movie", AffectedCount: 1, Played: played}, nil
 }
 
@@ -94,4 +95,130 @@ func (f *fakeWatch) ClearResumePosition(_ context.Context, userID int, profileID
 		return nil
 	}
 	return &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Item not found"}
+}
+
+func watchDeps(watch *fakeWatch) Dependencies {
+	deps := pilotDeps(nil, nil)
+	deps.Watch = watch
+	return deps
+}
+
+func TestGetWatchStateRejects(t *testing.T) {
+	h := newTestHandler(t, watchDeps(&fakeWatch{}))
+	owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
+
+	p := requireProblem(t, do(t, h, http.MethodGet, "/api/v2/watch/series:heat", "", owner), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "path.id" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/watch/movie:missing", "", owner), TypeNotFound)
+	p = requireProblem(t, do(t, h, http.MethodGet, "/api/v2/watch/movie:heat-1995?file_id=abc", "", owner), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "query.file_id" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/watch/movie:heat-1995?image_size=huge", "", owner), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/watch/movie:heat-1995?fileId=1", "", owner), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/watch/movie:heat-1995", "", nil), TypeAuthenticationRequired)
+
+	off := newTestHandler(t, parityDeps(false))
+	requireProblem(t, do(t, off, http.MethodGet, "/api/v2/watch/movie:heat-1995", "", owner), TypeDependencyUnavailable)
+}
+
+func TestMarkWatched(t *testing.T) {
+	watch := &fakeWatch{}
+	h := newTestHandler(t, watchDeps(watch))
+	owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
+
+	rec := do(t, h, http.MethodPost, "/api/v2/watched/series:heat", "", owner)
+	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodDelete, "/api/v2/watched/movie:heat-1995", "", owner)
+	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if len(watch.marks) != 2 || watch.marks[0] != (fakeMark{userID: 1, profileID: "p-owner", contentID: "series:heat", played: true}) ||
+		watch.marks[1] != (fakeMark{userID: 1, profileID: "p-owner", contentID: "movie:heat-1995", played: false}) {
+		t.Fatalf("marks = %+v", watch.marks)
+	}
+
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/watched/movie:missing", "", owner), TypeNotFound)
+	requireProblem(t, do(t, h, http.MethodDelete, "/api/v2/watched/movie:missing", "", owner), TypeNotFound)
+	// The mark needs a profile, as v1's RequireProfile group.
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/watched/movie:heat-1995", "", bearer(memberToken)), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodDelete, "/api/v2/watched/movie:heat-1995", "", bearer(memberToken)), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/watched/movie:heat-1995", "", nil), TypeAuthenticationRequired)
+
+	watch.err = &handlers.APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "Failed to update watched state"}
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/watched/movie:heat-1995", "", owner), TypeInternalError)
+
+	off := newTestHandler(t, parityDeps(false))
+	requireProblem(t, do(t, off, http.MethodPost, "/api/v2/watched/movie:heat-1995", "", owner), TypeDependencyUnavailable)
+}
+
+func TestClearResumePosition(t *testing.T) {
+	watch := &fakeWatch{}
+	h := newTestHandler(t, watchDeps(watch))
+	owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
+	path := Prefix + "/progress/movie:heat-1995/position"
+
+	rec := do(t, h, http.MethodDelete, path, "", owner)
+	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if len(watch.clears) != 1 || watch.clears[0] != (fakeMark{userID: 1, profileID: "p-owner", contentID: "movie:heat-1995"}) {
+		t.Fatalf("clears = %+v", watch.clears)
+	}
+
+	// A season or series has no single resume position to clear.
+	problem := requireProblem(t, do(t, h, http.MethodDelete, Prefix+"/progress/series:heat/position", "", owner), TypeValidationFailed)
+	if len(problem.Errors) != 1 || problem.Errors[0].Location != "path.media_item_id" {
+		t.Fatalf("errors = %+v", problem.Errors)
+	}
+	requireProblem(t, do(t, h, http.MethodDelete, Prefix+"/progress/movie:missing/position", "", owner), TypeNotFound)
+	requireProblem(t, do(t, h, http.MethodDelete, path, "", bearer(memberToken)), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodDelete, path, "", nil), TypeAuthenticationRequired)
+	if len(watch.clears) != 1 {
+		t.Fatalf("rejected requests cleared progress: %+v", watch.clears)
+	}
+
+	watch.err = &handlers.APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "Failed to clear resume position"}
+	requireProblem(t, do(t, h, http.MethodDelete, path, "", owner), TypeInternalError)
+
+	off := newTestHandler(t, parityDeps(false))
+	requireProblem(t, do(t, off, http.MethodDelete, path, "", owner), TypeDependencyUnavailable)
+}
+
+func TestGetProgressCapabilities(t *testing.T) {
+	path := Prefix + "/progress/capabilities"
+	owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
+	h := newTestHandler(t, watchDeps(&fakeWatch{}))
+	requireProblem(t, do(t, h, http.MethodGet, path, "", nil), TypeAuthenticationRequired)
+
+	rec := do(t, h, http.MethodGet, path, "", owner)
+	var out ProgressCapabilities
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK || out.State != StateAvailable || out.Allowed == nil || !*out.Allowed || out.Revision == "" || !out.ClearResumePosition {
+		t.Fatalf("capabilities: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != cachePrivateNoCache {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	tag := rec.Header().Get("ETag")
+	if cached := do(t, h, http.MethodGet, path, "", with(owner, "If-None-Match", tag)); tag == "" || cached.Code != http.StatusNotModified {
+		t.Fatalf("revalidation with %q: %d", tag, cached.Code)
+	}
+
+	deps := watchDeps(&fakeWatch{})
+	deps.Watch = nil
+	rec = do(t, newTestHandler(t, deps), http.MethodGet, path, "", owner)
+	out = ProgressCapabilities{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK || out.State != StateNotConfigured || out.Allowed == nil || *out.Allowed || out.ClearResumePosition {
+		t.Fatalf("unconfigured: %d %s", rec.Code, rec.Body.String())
+	}
 }

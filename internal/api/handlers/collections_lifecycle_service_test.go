@@ -2,12 +2,16 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"slices"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/blobstore/blobstoretest"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/usercollections"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
@@ -41,9 +45,6 @@ func (s *lifecycleStore) ReorderCollectionItems(context.Context, string, []strin
 func (s *lifecycleStore) UpdateCollection(_ context.Context, input userstore.UpdateCollectionInput) error {
 	s.mutations++
 	s.update = input
-	if input.PosterURL != nil {
-		s.collection.PosterURL = *input.PosterURL
-	}
 	return nil
 }
 func (s *lifecycleStore) ListCollectionItems(context.Context, string) ([]userstore.CollectionItem, error) {
@@ -106,7 +107,11 @@ func TestPersonalCollectionLifecycleProfileAccess(t *testing.T) {
 			if tc.want != 0 && store.mutations != 0 {
 				t.Fatalf("unauthorized mutations: %d", store.mutations)
 			}
-			_, err := h.GetPersonalCollection(t.Context(), 1, profile, "c")
+			_, err := h.ListPersonalCollectionItems(t.Context(), 1, profile, "c")
+			if (err == nil) != tc.wantRead {
+				t.Errorf("list error = %v", err)
+			}
+			_, err = h.GetPersonalCollection(t.Context(), 1, profile, "c")
 			if (err == nil) != tc.wantRead {
 				t.Errorf("get error = %v", err)
 			}
@@ -118,6 +123,84 @@ type failingPrefixStore struct{ *blobstoretest.Memory }
 
 func (failingPrefixStore) DeletePrefix(context.Context, string) (int, error) {
 	return 0, errors.New("storage unavailable")
+}
+
+// Deleting a personal collection reclaims its artwork directory once the row
+// is gone. A failed row delete keeps the artwork, and a failed sweep only logs.
+func TestDeletePersonalCollectionRemovesArtwork(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		deleteErr   error
+		failSweep   bool
+		wantErr     bool
+		wantRemoved bool
+	}{
+		{name: "deleted", wantRemoved: true},
+		{name: "row delete fails", deleteErr: errors.New("db down"), wantErr: true},
+		{name: "sweep fails", failSweep: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objects := blobstoretest.New()
+			for _, key := range []string{
+				"user-collection-images/c/poster/abc-small.webp",
+				"user-collection-images/c/collage/def.webp",
+				"user-collection-images/c2/poster/abc-small.webp",
+			} {
+				if err := objects.Put(t.Context(), key, []byte("x")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store := &lifecycleStore{collection: userstore.Collection{ID: "c", CreatorProfileID: "owner", CollectionType: "manual"}, deleteErr: tc.deleteErr}
+			h := NewCollectionHandler(lifecycleProvider{store: store})
+			h.ArtworkStore = objects
+			if tc.failSweep {
+				h.ArtworkStore = failingPrefixStore{objects}
+			}
+
+			err := h.DeletePersonalCollection(t.Context(), 1, "owner", "c")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("delete error = %v, want error %t", err, tc.wantErr)
+			}
+			remaining := make([]string, 0, len(objects.Objects))
+			for key := range objects.Objects {
+				remaining = append(remaining, key)
+			}
+			slices.Sort(remaining)
+			want := []string{
+				"user-collection-images/c/collage/def.webp",
+				"user-collection-images/c/poster/abc-small.webp",
+				"user-collection-images/c2/poster/abc-small.webp",
+			}
+			if tc.wantRemoved {
+				want = want[2:]
+			}
+			if !slices.Equal(remaining, want) {
+				t.Fatalf("remaining artwork = %v, want %v", remaining, want)
+			}
+		})
+	}
+}
+
+func TestPersonalCollectionUpdatePreservesNullableGroupAndImportConfig(t *testing.T) {
+	store := &lifecycleStore{collection: userstore.Collection{ID: "c", CreatorProfileID: "owner", CollectionType: "mdblist", SourceConfig: `{"url":"https://mdblist.com/lists/user/list","limit":10,"library_ids":[7]}`}}
+	h := NewCollectionHandler(lifecycleProvider{store: store})
+	var req PersonalCollectionUpdateRequest
+	if err := json.Unmarshal([]byte(`{"group_id":null,"max_items":0}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.UpdatePersonalCollection(t.Context(), PersonalCollectionUpdateCommand{UserID: 1, ProfileID: "owner", CollectionID: "c", Request: req}); err != nil {
+		t.Fatal(err)
+	}
+	if store.update.GroupID == nil || *store.update.GroupID != nil {
+		t.Fatalf("group null not preserved: %#v", store.update.GroupID)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(*store.update.SourceConfigPatch), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg) != 1 || cfg["limit"] != nil {
+		t.Fatalf("patch must only clear limit: %#v", cfg)
+	}
 }
 
 // groupLessStore reports the features of a store without collection groups,
@@ -135,4 +218,49 @@ type groupLessProvider struct {
 
 func (p groupLessProvider) ForUser(context.Context, int) (userstore.UserStore, error) {
 	return p.store, nil
+}
+
+func TestPersonalCollectionUpdateWithoutGroupsIgnoresNullGroup(t *testing.T) {
+	for _, body := range []string{`{"name":"Renamed","group_id":null}`, `{"name":"Renamed","group_id":"  "}`} {
+		inner := &lifecycleStore{collection: userstore.Collection{ID: "c", CreatorProfileID: "owner", CollectionType: "manual"}}
+		h := NewCollectionHandler(groupLessProvider{store: groupLessStore{inner}})
+		var req PersonalCollectionUpdateRequest
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.UpdatePersonalCollection(t.Context(), PersonalCollectionUpdateCommand{UserID: 1, ProfileID: "owner", CollectionID: "c", Request: req}); err != nil {
+			t.Fatalf("%s: %v", body, err)
+		}
+		if inner.update.Name == nil || *inner.update.Name != "Renamed" || inner.update.GroupID != nil {
+			t.Fatalf("%s: update = %#v, want the rename without a group change", body, inner.update)
+		}
+	}
+
+	inner := &lifecycleStore{collection: userstore.Collection{ID: "c", CreatorProfileID: "owner", CollectionType: "manual"}}
+	h := NewCollectionHandler(groupLessProvider{store: groupLessStore{inner}})
+	var req PersonalCollectionUpdateRequest
+	if err := json.Unmarshal([]byte(`{"name":"Renamed","group_id":"g1"}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	_, err := h.UpdatePersonalCollection(t.Context(), PersonalCollectionUpdateCommand{UserID: 1, ProfileID: "owner", CollectionID: "c", Request: req})
+	if apiErr, ok := errors.AsType[*APIError](err); !ok || apiErr.Status != http.StatusNotImplemented {
+		t.Fatalf("named group error = %#v, want 501", err)
+	}
+}
+
+// Sync answers like every other mutation: a collection the profile cannot
+// see does not exist for it (404), and a shared collection it does not own
+// is refused (403).
+func TestSyncPersonalCollectionNotFoundVersusForbidden(t *testing.T) {
+	for _, tc := range []struct {
+		shared bool
+		want   int
+	}{{shared: false, want: 404}, {shared: true, want: 403}} {
+		store := &lifecycleStore{collection: userstore.Collection{ID: "c", CreatorProfileID: "owner", IsShared: tc.shared, CollectionType: "mdblist"}}
+		h := NewUserCollectionImportHandler(lifecycleProvider{store: store}, &usercollections.Service{}, nil, nil, nil, nil)
+		_, err := h.SyncPersonalCollection(t.Context(), 1, "viewer", "c")
+		if e, ok := errors.AsType[*APIError](err); !ok || e.Status != tc.want {
+			t.Errorf("shared=%t: sync error = %v; want %d", tc.shared, err, tc.want)
+		}
+	}
 }

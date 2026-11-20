@@ -4,7 +4,6 @@ import { v2, type V2Result } from "@/api/v2/request";
 import { SettingRow } from "@/components/settings/SettingRow";
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
 import { Button } from "@/components/ui/button";
-import { useT, type MessageKey, type Translate } from "@/i18n";
 import { formatConnectionRateKbps } from "@/lib/bitrateOptions";
 import { preferredDateLocale } from "@/lib/datetime";
 import {
@@ -15,30 +14,23 @@ import {
   testConnectionSpeed,
 } from "@/player/bandwidth-probe";
 
-const TRANSPORT_LABELS: Record<string, MessageKey> = {
-  wifi: "web.settings.playbackConnection.transport.wifi",
-  ethernet: "web.settings.playbackConnection.transport.ethernet",
-  cellular: "web.settings.playbackConnection.transport.cellular",
+const TRANSPORT_LABELS: Record<string, string> = {
+  wifi: "Wi-Fi",
+  ethernet: "Ethernet",
+  cellular: "cellular",
 };
 
 /** "just now", "3 minutes ago", "2 hours ago", "4 days ago". */
-function measuredAgo(t: Translate, measuredAt: string, now: number): string {
+function measuredAgo(measuredAt: string, now: number): string {
   const minutes = Math.max(0, Math.floor((now - Date.parse(measuredAt)) / 60_000));
-  if (minutes < 1) return t("web.settings.playbackConnection.ago.justNow");
-  if (minutes < 60)
-    return t("web.settings.playbackConnection.ago.minutes", {
-      count: minutes,
-      count_text: minutes,
-    });
-  if (minutes < 24 * 60) {
-    const hours = Math.floor(minutes / 60);
-    return t("web.settings.playbackConnection.ago.hours", {
-      count: hours,
-      count_text: hours,
-    });
-  }
-  const days = Math.floor(minutes / (24 * 60));
-  return t("web.settings.playbackConnection.ago.days", { count: days, count_text: days });
+  if (minutes < 1) return "just now";
+  const [count, unit] =
+    minutes < 60
+      ? [minutes, "minute"]
+      : minutes < 24 * 60
+        ? [Math.floor(minutes / 60), "hour"]
+        : [Math.floor(minutes / (24 * 60)), "day"];
+  return `${count} ${unit}${count === 1 ? "" : "s"} ago`;
 }
 
 /**
@@ -71,7 +63,6 @@ function usePlaybackConnection() {
  * Lower quality when buffering while this connection has a limit.
  */
 export function LearnedLimitRow() {
-  const t = useT();
   const { connection } = usePlaybackConnection();
   const [resetting, setResetting] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -84,10 +75,7 @@ export function LearnedLimitRow() {
   return (
     <>
       <SettingRow
-        label={t("web.settings.playbackConnection.learnedLimit", {
-          rate: formatConnectionRateKbps(limit.kbps),
-          date: observed,
-        })}
+        label={`Limited to ${formatConnectionRateKbps(limit.kbps)} after buffering on ${observed}`}
         control={() => (
           <Button
             variant="outline"
@@ -101,13 +89,13 @@ export function LearnedLimitRow() {
                 .finally(() => setResetting(false));
             }}
           >
-            {t("web.settings.playbackConnection.reset")}
+            Reset
           </Button>
         )}
       />
       {failed && (
         <p className="text-muted-foreground text-[13px] leading-relaxed" role="status">
-          {t("web.settings.playbackConnection.resetFailed")}
+          Couldn't reset the limit. Try again.
         </p>
       )}
     </>
@@ -121,7 +109,6 @@ type ConnectionState = V2Result<"GET /api/v2/playback/connection">;
  * or the best playback throughput, which is only a lower bound.
  */
 function speedDescription(
-  t: Translate,
   connection: ConnectionState | undefined,
   now: number,
 ): string | undefined {
@@ -131,22 +118,12 @@ function speedDescription(
   // must not hide behind an older, higher sample.
   if (probe) {
     const rate = probe.lower_bound
-      ? t("web.settings.playbackConnection.fasterThan", {
-          rate: formatConnectionRateKbps(probe.kbps),
-        })
+      ? `Faster than ${formatConnectionRateKbps(probe.kbps)}`
       : formatConnectionRateKbps(probe.kbps);
-    const transport = TRANSPORT_LABELS[probe.transport];
-    return t("web.settings.playbackConnection.measured", {
-      rate,
-      ago: measuredAgo(t, probe.measured_at, now),
-      transport: transport ? t(transport) : t("web.settings.playbackConnection.transport.unknown"),
-    });
+    return `${rate} · measured ${measuredAgo(probe.measured_at, now)} on ${TRANSPORT_LABELS[probe.transport] ?? "this connection"}`;
   }
   if (sample) {
-    return t("web.settings.playbackConnection.seenDuringPlayback", {
-      rate: formatConnectionRateKbps(sample.kbps),
-      ago: measuredAgo(t, sample.measured_at, now),
-    });
+    return `Faster than ${formatConnectionRateKbps(sample.kbps)} · seen during playback ${measuredAgo(sample.measured_at, now)}`;
   }
   return undefined;
 }
@@ -155,10 +132,11 @@ function speedDescription(
  * What replaces the speed on a link that is not tested: cellular, where the
  * browser reports it, or a metered link (Data Saver), in the spec's words.
  */
-function meteredNote(): MessageKey | undefined {
+function meteredNote(): string | undefined {
   const network = networkInformation();
-  if (network?.type === "cellular") return "web.settings.playbackConnection.skippedCellular";
-  if (network?.saveData === true) return "web.settings.playbackConnection.skippedMetered";
+  if (network?.type === "cellular")
+    return "Speed tests are skipped on cellular, and the Cellular quality settings apply.";
+  if (network?.saveData === true) return "Speed tests are skipped on metered networks.";
   return undefined;
 }
 
@@ -168,7 +146,6 @@ function meteredNote(): MessageKey | undefined {
  * learned limit that the server's budget includes.
  */
 export function PlaybackConnection({ ignoresLearnedLimit = false }) {
-  const t = useT();
   const { connection, speedAvailable } = usePlaybackConnection();
   const [testing, setTesting] = useState(false);
   // A message shown for `forMs` hides itself then.
@@ -196,15 +173,12 @@ export function PlaybackConnection({ ignoresLearnedLimit = false }) {
     ignoresLearnedLimit && connection.data?.learned_limit
       ? undefined
       : connection.data?.auto_budget_kbps;
-  const description =
-    (note && t(note)) ??
-    speedDescription(t, connection.data, now) ??
-    t("web.settings.playbackConnection.notMeasured");
+  const description = note ?? speedDescription(connection.data, now) ?? "Not measured yet";
   const say = (text: string, forMs?: number) => setMessage({ text, forMs });
   return (
-    <SettingsGroup title={t("web.settings.playbackConnection.title")}>
+    <SettingsGroup title="Connection">
       <SettingRow
-        label={t("web.settings.playbackConnection.speed")}
+        label="Connection speed"
         description={description}
         control={() =>
           note ? null : (
@@ -216,32 +190,24 @@ export function PlaybackConnection({ ignoresLearnedLimit = false }) {
                 setMessage(undefined);
                 void testConnectionSpeed()
                   .then(async (result) => {
-                    if (result === "playing")
-                      say(t("web.settings.playbackConnection.stopPlayback"));
-                    else if (result === "busy") say(t("web.settings.playbackConnection.busy"));
+                    if (result === "playing") say("Stop playback before testing, then try again.");
+                    else if (result === "busy")
+                      say("A speed test is already running. Try again in a moment.");
                     // The link turned metered: the row already shows why.
                     else if (result === "metered") setNote(meteredNote());
                     else await connection.refetch();
                   })
                   .catch((error: unknown) => {
                     if (error instanceof ProbeRateLimited)
-                      say(
-                        t("web.settings.playbackConnection.rateLimited", {
-                          count: error.retryAfter,
-                          count_text: error.retryAfter,
-                        }),
-                        error.retryAfter * 1000,
-                      );
+                      say(error.message, error.retryAfter * 1000);
                     else if (error instanceof ProbeNotSaved)
-                      say(t("web.settings.playbackConnection.notSaved"));
-                    else say(t("web.settings.playbackConnection.testFailed"));
+                      say("Couldn't save the speed test. Try again.");
+                    else say("Couldn't measure the connection speed. Try again.");
                   })
                   .finally(() => setTesting(false));
               }}
             >
-              {testing
-                ? t("web.settings.playbackConnection.testing")
-                : t("web.settings.playbackConnection.test")}
+              {testing ? "Testing…" : "Test speed"}
             </Button>
           )
         }
@@ -253,9 +219,7 @@ export function PlaybackConnection({ ignoresLearnedLimit = false }) {
       )}
       {budget !== undefined && !note && (
         <p className="text-muted-foreground text-[13px] leading-relaxed">
-          {t("web.settings.playbackConnection.autoBudget", {
-            rate: formatConnectionRateKbps(budget),
-          })}
+          Auto plays videos up to {formatConnectionRateKbps(budget)} without converting them.
         </p>
       )}
     </SettingsGroup>

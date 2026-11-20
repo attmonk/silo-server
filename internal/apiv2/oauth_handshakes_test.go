@@ -38,8 +38,6 @@ type handshakeCompleter struct {
 	links int
 }
 
-func (f *handshakeCompleter) ProviderAnswerFence(context.Context) (int64, error) { return 0, nil }
-
 func (f *handshakeCompleter) ResolveOAuthLogin(_ context.Context, in auth.OAuthLoginInput) (*models.User, int64, error) {
 	f.in = in
 	f.calls++
@@ -79,7 +77,7 @@ func newHandshakeRig(t *testing.T) *handshakeRig {
 	})
 	deps := pilotDeps(nil, nil)
 	deps.OAuth = svc
-	deps.Accounts = fakeAccounts{users: map[int]handlers.UserView{1: {ID: 1, Username: "laura", Email: "laura@example.test", Role: "user", PolicyPermissions: []string{}}}}
+	deps.Accounts = fakeAccounts{users: map[int]handlers.UserView{1: {ID: 1, Username: "laura", Email: "laura@example.test", Role: "user", Permissions: []string{}}}}
 	rig.h = newTestHandler(t, deps)
 	return rig
 }

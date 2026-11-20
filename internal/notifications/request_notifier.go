@@ -102,8 +102,7 @@ func (s *System) fulfilledDelivered(ctx context.Context, recipient requests.Foll
 
 func (s *System) dispatchFulfilled(ctx context.Context, delivery Delivery) error {
 	_, err := s.DispatchOperational(ctx, delivery, OperationalDispatch{
-		WebhookFilter:           func(hook Webhook) bool { return hook.NotifyRequests },
-		PluginDestinationFilter: func(d PluginDestination) bool { return d.NotifyRequests },
+		WebhookFilter: func(hook Webhook) bool { return hook.NotifyRequests },
 	})
 	return err
 }
@@ -319,8 +318,7 @@ func (s *System) dispatchRequestLifecycle(ctx context.Context, req requests.Requ
 		ReasonFlags: encoded,
 	}
 	_, err = s.DispatchOperational(ctx, delivery, OperationalDispatch{
-		WebhookFilter:           func(hook Webhook) bool { return hook.NotifyRequests },
-		PluginDestinationFilter: func(d PluginDestination) bool { return d.NotifyRequests },
+		WebhookFilter: func(hook Webhook) bool { return hook.NotifyRequests },
 	})
 	return err
 }

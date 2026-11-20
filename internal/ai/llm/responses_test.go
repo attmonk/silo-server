@@ -155,8 +155,38 @@ func TestSubscriptionCredentialsDoNotFollowRedirects(t *testing.T) {
 	}
 }
 
+func TestChatReasoningOmitsUnsupportedTemperature(t *testing.T) {
+	for _, test := range []struct {
+		model, effort string
+		temperature   bool
+	}{
+		{model: "gpt-4o-mini", temperature: true},
+		{model: "gpt-6.1-sol"},
+		{model: "custom-model", effort: "high"},
+	} {
+		t.Run(test.model, func(t *testing.T) {
+			client := NewClient(Config{BaseURL: "https://provider.example.test", ChatModel: test.model, ReasoningEffort: test.effort})
+			client.chatHTTP.Transport = retryRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				_, temperature := body["temperature"]
+				if temperature != test.temperature {
+					t.Fatalf("temperature: %v", body)
+				}
+				if test.effort != "" && body["reasoning_effort"] != test.effort {
+					t.Fatalf("effort missing: %v", body)
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(chatOK))}, nil
+			})
+			if _, err := client.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, true); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestSubscriptionDoesNotAuthorizeTranscription(t *testing.T) {
-	client := NewClient(Config{ASRBaseURL: "https://speech.example.test", ASRAPIKey: "speech-key", AuthMode: "chatgpt", ASRModel: "whisper-1", ChatGPTTokenSource: testTokenSource(func(context.Context) (string, error) {
+	client := NewClient(Config{BaseURL: "https://speech.example.test", APIKey: "speech-key", AuthMode: "chatgpt", ASRModel: "whisper-1", ChatGPTTokenSource: testTokenSource(func(context.Context) (string, error) {
 		t.Fatal("ChatGPT subscription token requested for transcription")
 		return "", nil
 	})})
@@ -236,6 +266,31 @@ func TestSubscriptionRecoversUnauthorizedOnlyOnce(t *testing.T) {
 	}
 }
 
+func TestSubscriptionUsageUnavailableRetries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		if isExhaustedQuota([]byte(`{"error":{"code":"subscription_sharing_usage_unavailable"}}`)) {
+			t.Fatal("temporary usage failure classified as exhausted quota")
+		}
+		calls := 0
+		client := NewClient(Config{AuthMode: AuthModeChatGPT, ChatModel: "gpt-6.1-sol",
+			ChatGPTTokenSource:   testTokenSource(func(context.Context) (string, error) { return "token", nil }),
+			ChatGPTTokenRejected: func(context.Context, string, bool) error { t.Fatal("usage outage invalidated credentials"); return nil },
+		})
+		client.chatHTTP.Transport = retryRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			body := "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"subscription_sharing_usage_unavailable\"}}}\n\n"
+			if calls > 1 {
+				body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"complete\"}\n\ndata: {\"type\":\"response.completed\"}\n\n"
+			}
+			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+		})
+		out, err := client.Chat(t.Context(), []Message{{Role: "user", Content: "translate"}}, false)
+		if err != nil || out != "complete" || calls != 2 {
+			t.Fatalf("temporary failure recovery: %q, %v, calls=%d", out, err, calls)
+		}
+	})
+}
+
 func testTokenSource(getToken func(context.Context) (string, error)) func(context.Context) (func(context.Context) (string, error), error) {
 	return func(context.Context) (func(context.Context) (string, error), error) { return getToken, nil }
 }
@@ -303,33 +358,18 @@ func TestSubscriptionRetriesPinAccountAndRequestConfig(t *testing.T) {
 	}
 }
 
-// Incomplete or refused translations must never replace the source text, even
-// when the provider includes partial output alongside its terminal status.
-func TestAPIResponsesRejectsUnusableOutput(t *testing.T) {
-	for name, tc := range map[string]struct {
-		body string
-		kind FailureKind
-	}{
-		"incomplete":     {`{"status":"incomplete","output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]}`, FailureUnusableResponse},
-		"failed":         {`{"status":"failed","error":{"code":"invalid_prompt"}}`, FailureRejected},
-		"refused":        {`{"status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"no"}]}]}`, FailureUnusableResponse},
-		"reasoning only": {`{"status":"completed","output":[{"type":"reasoning","content":[{"type":"output_text","text":"private reasoning"}]}]}`, FailureUnusableResponse},
-	} {
-		t.Run(name, func(t *testing.T) {
-			cfg := chatConfig("https://api.openai.com")
-			cfg.ServiceTier = serviceTierUltrafast
-			client := NewClient(cfg)
+func TestSubscriptionPermanentStreamFailuresDoNotRetry(t *testing.T) {
+	for _, code := range []string{"invalid_request_error", "subscription_sharing_usage_limit_exceeded"} {
+		t.Run(code, func(t *testing.T) {
+			client := NewClient(Config{AuthMode: AuthModeChatGPT, ChatModel: "gpt-6.1-sol", ChatGPTTokenSource: testTokenSource(func(context.Context) (string, error) { return "token", nil })})
 			calls := 0
-			client.chatHTTP.Transport = retryRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			client.chatHTTP.Transport = retryRoundTripFunc(func(*http.Request) (*http.Response, error) {
 				calls++
-				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+				body := fmt.Sprintf("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":%q}}}\n\n", code)
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 			})
-			content, err := client.Chat(t.Context(), []Message{{Role: "user", Content: "translate"}}, true)
-			if err == nil || content != "" || calls != 1 {
-				t.Fatalf("content=%q err=%v calls=%d; want no output and one failed attempt", content, err, calls)
-			}
-			if got := Classify(err); got != tc.kind {
-				t.Fatalf("Classify(%v) = %v, want %v", err, got, tc.kind)
+			if out, err := client.Chat(t.Context(), []Message{{Role: "user", Content: "translate"}}, false); out != "" || err == nil || calls != 1 {
+				t.Fatalf("permanent failure retried or published output: %q, %v, calls=%d", out, err, calls)
 			}
 		})
 	}

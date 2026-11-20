@@ -14,23 +14,20 @@ import { PosterArt } from "@/components/calm/PosterTile";
 import type { PeekRequest } from "@/components/calm/usePeekLimiter";
 import { formatRelativeTime } from "@/lib/date";
 import { rowTag, showOnTabsLabel } from "@/lib/collections/adminList";
-import { hiddenFromTab, hiddenTag, onHome, pinnedTag } from "@/lib/collections/copy";
-import { collectionKindLabel, collectionKindOf } from "@/lib/collections/types";
+import { HIDDEN_FROM_TAB, HIDDEN_TAG, ON_HOME, PINNED } from "@/lib/collections/copy";
+import { COLLECTION_KIND_LABEL, collectionKindOf } from "@/lib/collections/types";
 import { cn } from "@/lib/utils";
-import { useAppLanguage, useT } from "@/i18n";
-import { formatLocale, joinList } from "@/lib/appLocale";
 
 const TAG =
   "inline-flex h-[22px] shrink-0 items-center gap-1 rounded-full px-2 text-[11.5px] font-semibold";
 
 function Tag({ collection, visible }: { collection: LibraryCollection; visible: boolean }) {
-  useAppLanguage();
   const tag = rowTag({ ...collection, visibility: visible ? "visible" : "hidden" });
   if (tag === "home")
     return (
       <span className={cn(TAG, "bg-success/15 text-success ring-success/30 ring-1 ring-inset")}>
         <Check aria-hidden className="size-3" />
-        {onHome()}
+        {ON_HOME}
       </span>
     );
   if (tag === "hidden")
@@ -39,7 +36,7 @@ function Tag({ collection, visible }: { collection: LibraryCollection; visible: 
         className={cn(TAG, "text-muted-foreground ring-border ring-1 ring-inset max-sm:hidden")}
       >
         <EyeOff aria-hidden className="size-3" />
-        {hiddenFromTab()}
+        {HIDDEN_FROM_TAB}
       </span>
     );
   return null;
@@ -47,13 +44,12 @@ function Tag({ collection, visible }: { collection: LibraryCollection; visible: 
 
 /** Failed or syncing lists say so at the end of the meta line; a healthy sync stays quiet. */
 function SyncStatus({ collection, syncing }: { collection: LibraryCollection; syncing: boolean }) {
-  const t = useT();
   if (syncing || collection.last_sync_status === "running")
     return (
       <>
         <MetaDot />
-        <Loader2 aria-hidden className="me-1 inline size-3 animate-spin align-[-1px]" />
-        {t("web.collections.list.syncingNow")}
+        <Loader2 aria-hidden className="mr-1 inline size-3 animate-spin align-[-1px]" />
+        Syncing now
       </>
     );
   if (collection.last_sync_status !== "failed") return null;
@@ -65,13 +61,9 @@ function SyncStatus({ collection, syncing }: { collection: LibraryCollection; sy
         title={collection.last_sync_message || undefined}
         className="text-destructive font-medium"
       >
-        {when
-          ? t("web.collections.list.syncFailedWhen", { when })
-          : t("web.collections.list.syncFailed")}
+        Sync failed{when ? ` ${when}` : ""}
         {collection.last_sync_message ? (
-          <span className="sr-only">
-            {t("web.collections.list.syncFailedMessage", { message: collection.last_sync_message })}
-          </span>
+          <span className="sr-only">: {collection.last_sync_message}</span>
         ) : null}
       </span>
     </>
@@ -116,7 +108,6 @@ function ListItem({
   menu,
   selection,
 }: ListItemProps) {
-  const t = useT();
   const titles = collection.item_count;
   return (
     <ListRow
@@ -133,18 +124,15 @@ function ListItem({
       tags={<Tag collection={collection} visible={visible} />}
       meta={
         <>
-          {collectionKindLabel(collectionKindOf(collection.collection_type))}
+          {COLLECTION_KIND_LABEL[collectionKindOf(collection.collection_type)]}
           {showLibraries && libraryNames.length > 0 ? (
             <>
               <MetaDot />
-              {joinList(libraryNames)}
+              {libraryNames.join(", ")}
             </>
           ) : null}
           <MetaDot />
-          {t("web.collections.metaLine.titleCount", {
-            count: titles,
-            shown: titles.toLocaleString(formatLocale()),
-          })}
+          {titles} title{titles === 1 ? "" : "s"}
           <SyncStatus collection={collection} syncing={syncing} />
         </>
       }
@@ -162,14 +150,8 @@ function ListItem({
 
 /** The pin glyph that marks a pinned collection: pinned state is a glyph, never a tag. */
 export function PinGlyph({ className }: { className?: string }) {
-  useAppLanguage();
   return (
-    <span
-      role="img"
-      aria-label={pinnedTag()}
-      title={pinnedTag()}
-      className={cn("inline-flex", className)}
-    >
+    <span role="img" aria-label={PINNED} title={PINNED} className={cn("inline-flex", className)}>
       <Pin aria-hidden className="size-full" />
     </span>
   );
@@ -207,7 +189,6 @@ function CompactItem({
   style,
   dragging,
 }: CompactItemProps) {
-  const t = useT();
   const titles = collection.item_count;
   return (
     <li
@@ -215,10 +196,10 @@ function CompactItem({
       style={style}
       data-collection-id={collection.id}
       className={cn(
-        "bg-card/60 border-border/80 hover:bg-accent/50 relative grid min-h-[54px] items-center gap-2.5 rounded-[14px] border py-1.5 pe-1.5",
+        "bg-card/60 border-border/80 hover:bg-accent/50 relative grid min-h-[54px] items-center gap-2.5 rounded-[14px] border py-1.5 pr-1.5",
         handleProps
-          ? "grid-cols-[28px_30px_minmax(0,1fr)_auto_auto] ps-1"
-          : "grid-cols-[30px_minmax(0,1fr)_auto_auto] ps-3",
+          ? "grid-cols-[28px_30px_minmax(0,1fr)_auto_auto] pl-1"
+          : "grid-cols-[30px_minmax(0,1fr)_auto_auto] pl-3",
         dragging && "bg-surface-raised z-10 shadow-lg",
       )}
     >
@@ -236,12 +217,9 @@ function CompactItem({
       <div className={cn("min-w-0 cursor-pointer", !visible && "opacity-60")} onClick={onOpen}>
         <p className="truncate text-[14px] font-semibold tracking-[-0.01em]">{collection.title}</p>
         <p className="text-muted-foreground truncate text-[12.5px]">
-          {collectionKindLabel(collectionKindOf(collection.collection_type))}
+          {COLLECTION_KIND_LABEL[collectionKindOf(collection.collection_type)]}
           <MetaDot />
-          {t("web.collections.metaLine.titleCount", {
-            count: titles,
-            shown: titles.toLocaleString(formatLocale()),
-          })}
+          {titles} title{titles === 1 ? "" : "s"}
         </p>
       </div>
       <span className="inline-flex items-center gap-2">
@@ -251,7 +229,7 @@ function CompactItem({
             className={cn(TAG, "text-muted-foreground ring-border font-medium ring-1 ring-inset")}
           >
             <EyeOff aria-hidden className="size-3" />
-            {hiddenTag()}
+            {HIDDEN_TAG}
           </span>
         )}
       </span>
@@ -270,12 +248,13 @@ export function CollectionListItem(props: ListItemProps | CompactItemProps) {
 
 /** The heads of the List's two columns: how many collections, and what the switch means. */
 export function CollectionColumnHeader({ count }: { count: number }) {
-  const t = useT();
   return (
     <div className="text-muted-foreground flex items-center justify-between px-4 pt-1 pb-2 text-[12.5px]">
-      <span role="status">{t("web.collections.shelves.count", { count, count_text: count })}</span>
-      <span aria-hidden className="pe-14 max-lg:pe-16">
-        {t("web.collections.admin.onCollectionsTab")}
+      <span role="status">
+        {count} collection{count === 1 ? "" : "s"}
+      </span>
+      <span aria-hidden className="pr-14 max-lg:pr-16">
+        On Collections tab
       </span>
     </div>
   );

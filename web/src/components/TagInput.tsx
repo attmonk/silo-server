@@ -1,8 +1,6 @@
 import { useState, useRef, type KeyboardEvent } from "react";
 import { X } from "lucide-react";
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { isImeComposing } from "@/lib/imeComposition";
 
 interface TagInputProps {
   value: string[];
@@ -11,8 +9,7 @@ interface TagInputProps {
   className?: string;
 }
 
-export function TagInput({ value, onChange, placeholder, className }: TagInputProps) {
-  const t = useT();
+export function TagInput({ value, onChange, placeholder = "Add...", className }: TagInputProps) {
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -29,7 +26,6 @@ export function TagInput({ value, onChange, placeholder, className }: TagInputPr
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
-    if (isImeComposing(e)) return;
     if ((e.key === "Enter" || e.key === ",") && input.trim()) {
       e.preventDefault();
       addTag(input);
@@ -41,7 +37,7 @@ export function TagInput({ value, onChange, placeholder, className }: TagInputPr
   return (
     <div
       className={cn(
-        "border-input bg-background focus-within:border-ring focus-within:ring-ring/50 flex min-h-9 flex-wrap items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm shadow-xs transition-[color,box-shadow] focus-within:ring-[3px]",
+        "border-border bg-background focus-within:border-ring focus-within:ring-ring/50 flex min-h-9 flex-wrap items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm shadow-xs transition-[color,box-shadow] focus-within:ring-[3px]",
         className,
       )}
       onClick={() => inputRef.current?.focus()}
@@ -58,7 +54,6 @@ export function TagInput({ value, onChange, placeholder, className }: TagInputPr
               e.stopPropagation();
               removeTag(i);
             }}
-            aria-label={t("web.settings.interface.remove", { label: tag })}
             className="hover:bg-primary/20 rounded-full p-0.5 transition-colors"
           >
             <X className="size-3" />
@@ -74,9 +69,7 @@ export function TagInput({ value, onChange, placeholder, className }: TagInputPr
         onBlur={() => {
           if (input.trim()) addTag(input);
         }}
-        placeholder={
-          value.length === 0 ? (placeholder ?? t("web.common.ui.tagInput.placeholder")) : ""
-        }
+        placeholder={value.length === 0 ? placeholder : ""}
         className="text-foreground placeholder:text-muted-foreground/50 min-w-[80px] flex-1 border-0 bg-transparent text-sm outline-none"
       />
     </div>

@@ -80,7 +80,7 @@ metadata (NFO text and sidecar artwork), then remote providers (TMDB, TVDB,
 - **One switch per library.** The chain editor shows the local entry as a
   pinned "Local metadata (NFO + artwork)" switch that sets every level's row at
   once and cannot be reordered. v2 marks the entry with
-  `ProviderChainEntry.local`. Text and
+  `ProviderChainEntry.local`; the frozen v1 shape is unchanged. Text and
   artwork come from the same provider, so the switch turns both on or off.
 
 ## Reading NFO files
@@ -190,7 +190,7 @@ it rejects silently counts as "no NFO".
   `<writer>` (both writers, one credit per name), split on Kodi's ` / `
   separator. A show's `<studio>` also fills its networks; Kodi has no network
   element. `<tag>` is not split.
-- Shows: `<status>` through `showstatus.Normalize`.
+- Shows: `<status>` through `NormalizeShowStatus`.
 - Trailers: `<trailer>` as a YouTube or Vimeo video, from the YouTube add-on
   link Kodi's scrapers write (`plugin://plugin.video.youtube/...`) or a web
   link. A link to any other site is dropped: videos are stored as a site and a
@@ -276,13 +276,6 @@ by mode:
   merges carry the mark along, and a later refresh whose NFO names a different
   identity keeps the chosen one. Running Identify again is how an admin
   changes it.
-
-A manual refresh or Identify that corrects the match (the chosen IDs contradict
-the stored ones) also empties the stored fields, credits and localized text it
-may rewrite, so a value the new match lacks does not outlive the previous title.
-Locks and manual translations hold, and the title and artwork stay. A refresh or
-Identify that keeps the match never clears a stored field, credit or localized
-text the providers leave empty.
 
 Whenever a run keeps an identity the NFO's IDs contradict, it logs the
 conflict and leaves the NFO provider out of every phase of that run (series,
@@ -371,52 +364,6 @@ precedence order, each tried with `.jpg`, `.jpeg`, `.png`, `.webp`, `.tbn`,
   replaces a frame with it, and the task never overwrites one. An extra whose
   sidecar cannot be decoded gets no frame either; it shows no image until the
   sidecar is fixed or removed.
-- After the extras, the same task run gives each movie with no poster a frame
-  of its own video (`internal/extrastills/posters.go`): an item of type movie,
-  not pending its first match, with unlocked images, an empty `poster_path`,
-  and a `poster_source_path` that is empty or a lost frame's. A sidecar or
-  provider poster waiting for its copy has a source of its own, so it is never
-  raced. A movie with live main files in more than one library gets no frame,
-  since the poster is shared by every library the item is in and a frame from
-  one library's file would show viewers of another a file they may not see.
-  The save checks this again, and each run first removes the frame of a movie
-  that has since gained a file in another library, and any frame whose file
-  is no longer a live main file of the movie (missing, deleted, or moved), so
-  the frame goes within one task interval and the movie takes a new one from
-  a file it has now; this outranks the images lock, since a frame was never
-  anyone's choice. The removal finds frame posters through the partial index
-  `idx_media_items_frame_poster` on `poster_source_path LIKE 'frame:%'`.
-  The frame is taken from the lowest-id live file with a known duration
-  and no blocking failure record, at the extras position, cropped to a
-  centered 2:3 portrait at its own scale (`imageutil.CropToPoster`), and stored
-  under the item's `local/` poster keys with the usual poster variants.
-  `poster_source_path` then holds `frame:` and the file's frame key. The save
-  is a compare-and-set on the empty slot and the source read
-  (`ItemRepository.SetFramePosterIfSource`); a frame that loses is left to the
-  artwork revision GC. Failures are per-file media analysis artifacts
-  (`internal/mediaartifact`, kind `frame_poster`, all recorded under one
-  recorder name): a file ffmpeg cannot decode is skipped until it changes,
-  other failures back off the same on every server, growing with each failure,
-  and the poster pass stops after three failures in a row (an offline share)
-  or when no transcode node can be reserved. Like the extras' stills, a frame
-  poster is stored whatever `metadata.cache_images` is set to, so with caching
-  off, where sidecar files are not read, a movie with a poster file beside it
-  shows a frame. Any other image replaces a frame: a sidecar or admin pick as
-  usual, and in a fill-empty refresh (initial match, scheduled refresh) the
-  merge treats an unlocked frame poster as empty, so even an unrated provider
-  poster wins; with no image offered the frame stays. A frame's stored path
-  only ever goes with its `frame:` source: when another image replaces it, the
-  slot serves that image's remote path, or nothing while a local copy is
-  pending, never the frame as a stand-in. A localized provider
-  poster also replaces a frame for viewers in its language, although the frame
-  sits under the `local/` keys that otherwise mark library artwork. Known limits: only the
-  poster slot is filled, so a detail screen that shows only a backdrop still
-  shows none; a frame saved between a refresh's read and its write can be
-  overwritten by that write and is taken again on the next run; with
-  `metadata.cache_images` off, the stored-artwork releaser queues a matched
-  movie showing a frame for a refresh at most weekly; after an admin picks
-  another image there is no way back to the frame; and a replaced file keeps
-  its old frame while the poster slot is filled.
 - Basename names attach to one of the item's own media files and beat generic
   names, as in Kodi. A series has no media file of its own (its request lists
   every episode file), so a series uses generic names only and
@@ -455,11 +402,9 @@ Caching and refresh:
 - The metadata image-cache processor caches the file under
   `local/{contentType}/{contentID}/{hash8}/{imageType}/...` (`hash8` = content
   hash; the discriminator sits before the imageType segment because variant
-  clamping reads the parent directory). A replaced image rotates the key. The
-  catalog update that points at the new copy displaces the old one to the
-  artwork revision GC, which deletes it only once nothing references it: an
-  admin pick of the same bytes shares the key. Item deletion trims local
-  paths to the content prefix.
+  clamping reads the parent directory). A replaced image rotates the key; the
+  stale hashed prefix is deleted after a successful re-cache, and item
+  deletion trims local paths to the content prefix.
 - The process that discovered the sidecar copies it
   (`internal/metadata/local_artwork_copy.go`). Only `api` and `integrated`
   processes run refreshes and the image cache, and a refresh can only discover
@@ -488,17 +433,7 @@ Caching and refresh:
   library root is opened as an `os.Root` before the path is resolved, and the
   file is opened through the handle that is the same directory as the resolved
   root, so a root or folder swapped for a symlink after that point cannot lead
-  the open out of the library. A path whose folders lead out of every root
-  through a symlink, as a per-title folder linked into another tree does, is
-  read only when a folder it physically sits in, below the library root, also
-  holds a present `media_files` row of the same title (the series, for season
-  and episode images): the scanner reached that file through the same link.
-  That folder is opened as an `os.Root`, that file must be the same file
-  reached through it, and the image is read through it. Every cataloged
-  file under the folder is tried before it is refused. Anything else stays
-  the outside-roots failure, except that a storage error while checking, or
-  a failed listing, is a read failure retried as usual. The admin image
-  picker reads sidecars the same way. When
+  the open out of the library. When
   the re-check or the read fails, the processor probes, through
   `internal/rootcheck`, the nearest folder that exists at or above the file's
   folder, searching no higher than the library root: unless it lists entries
@@ -680,24 +615,10 @@ when the item's sidecar discovery offers that exact source for that image type,
 so a file replaced since the list (a new fingerprint) must be picked again. It
 reads the file under the same checks, stores it under the same `local/...` key
 the processor would use, and publishes the fingerprinted source with the images
-lock like any other choice. Seasons and episodes keep provider-only
+lock like any other choice. Seasons, episodes and frozen v1 keep provider-only
 choices. The server answering the admin API reads the file, so it needs the
 library mounted, like a server that copies local artwork; on a server without
 the mount discovery finds nothing and local choices are not offered.
-
-An admin can also upload a poster, backdrop or logo for a movie or series, or
-a season's poster (`POST .../images/upload`). Silo does not write into library
-folders, which are usually mounted read-only, so the upload is stored only in
-artwork storage: under the same `local/...` keys as cached sidecar art, with
-the image's digest as the key discriminator. It is published with the images
-lock, and its source is `upload://sha256:<hex>`, one of the non-provider
-schemes image caching, artwork reconcile and the ladder backfill never try to
-download. A storage reconcile that resets cached artwork in bulk still checks
-each upload's object and clears the row only when the object is gone. The list offers the upload as a local choice only while the item
-shows it; applying another image replaces it, and revision GC reclaims it
-after the grace period like any displaced revision. Its only record is the
-item's artwork columns, so there is no upload table to keep in step with
-content ID moves or GC references.
 
 The reads open each library root as an `os.Root`, which needs read (list)
 permission on the root directory, not only search permission. The scanner lists
@@ -725,22 +646,6 @@ contract for sports/mixed libraries (events as movies, weekly shows as series).
 
 A matched item picks up an edited NFO or sidecar image without a manual
 refresh (`internal/metadata/local_sidecar.go`, `local_reapply.go`).
-
-The checks below skip unmatched items. A pending, unmatched or ambiguous item
-that no provider gives metadata still takes the sidecar poster, backdrop and
-logo beside it on each metadata run, which every library scan repeats for such
-items (`saveProvisionalLocalArtwork`, `internal/metadata/local_artwork_discovery.go`).
-The write touches only those artwork columns, and only while the row is still
-provisional and holds the sources and images lock the run read
-(`ItemRepository.UpdateProvisionalArtwork`), so a match, Identify or admin
-artwork choice or lock made meanwhile wins. A slot taking a new sidecar drops
-the cached copy of its previous one, so a replaced file shows no image until
-its new copy lands. A slot on its sidecar is queued again on each run until it
-holds a cached copy, which can then only be that sidecar's. Remote images are
-not applied, nor are the
-other item slots, season posters or episode stills. A removed sidecar goes
-unnoticed, so its stored copy keeps serving. An item an admin marked to stay
-unmatched (`match_ignored_at`) is not processed and takes none.
 
 - **Fingerprints.** `local_sidecar_fingerprints` stores, per library and per
   item, season and episode, a SHA-256 of the path, size and modification time
@@ -785,13 +690,13 @@ unmatched (`match_ignored_at`) is not processed and takes none.
   its change published, under the content ID its media file names after the
   refresh.
 - **Re-apply.** Local files only, no remote provider call. The item's NFO
-  values merge with `MergeReplaceUnlocked` through `mergeAndPersist`
+  values merge with `ReplaceUnlocked` through `mergeAndPersist`
   (`localReapply`), so field locks win and lists the NFO supplies replace the
   stored ones; credits keep the provider IDs and photos the stored cast
   already has. Local artwork applies as on any refresh, so an image replaced
   under the same name gets a new `?v=` source and is cached again; identity,
   videos and refresh bookkeeping are left alone. Seasons and episodes merge their local
-  results with `MergeReplaceUnlocked` through `persistSeasonAndEpisodeRows`.
+  results with `ReplaceUnlocked` through `persistSeasonAndEpisodeRows`.
 - **Chain order.** A level's local provider always runs ahead of its remote
   ones (see Precedence), so wherever a level has one, its NFO text, artwork
   and identity are tracked and re-applied. A level without one records no
@@ -858,11 +763,8 @@ unmatched (`match_ignored_at`) is not processed and takes none.
 - Seasons have no banner, thumb or extra backdrops (`seasonNN-fanart`,
   `seasonNN-banner`, `seasonNN-landscape` and their season-folder forms are not
   read).
-- In movie and series NFOs, `<thumb aspect="banner|landscape|thumb|clearart|discart|disc|keyart">`
-  references are parsed but fill no item-art slot (`nfoArtImageTypes`). Episode
-  NFOs are the exception: every non-empty episode `<thumb>` is read as the
-  episode's still, whatever its aspect (`episodeArtRefs`). A provider that
-  offers banners, thumbs, clear art or disc art
+- NFO `<thumb aspect="banner|landscape|clearart|discart">` and `<fanart>` URLs
+  are not read. A provider that offers banners, thumbs, clear art or disc art
   returns `RemoteImage` entries of type `ImageBanner`, `ImageThumb`,
   `ImageClearArt` or `ImageDisc` (plugin image kinds `banner`, `thumb`,
   `clearart`, `disc`), and `applyBestImages` fills the slot when no sidecar
@@ -898,8 +800,9 @@ unmatched (`match_ignored_at`) is not processed and takes none.
   there is not found.
 - No NFO writing, no music/audiobook/ebook NFO (those ecosystems use
   OPF/metadata.json — future builtin providers via the same registry).
-- Feature detection: an entry with `local: true` in
-  `GET /api/v2/libraries/provider-defaults`.
+- Feature detection: the `nfo` capability's presence in
+  `GET /api/v1/libraries/provider-defaults` (see
+  `docs/architecture/v1-scope.md`); in v2 an entry with `local: true`.
 - `<set>` (movie collections) is not mapped: `MetadataResult` has no
   collection field, so `nfoCommon` (`internal/metadata/nfo/nfo.go`) does not
   decode it.

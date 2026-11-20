@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { useQueries, useQuery, type Query } from "@tanstack/react-query";
+import { useQueries, useQuery } from "@tanstack/react-query";
 import { fetchCatalogPage, createCatalogSearchState } from "@/hooks/queries/catalog";
 import {
   fetchHomeSectionItems,
@@ -8,12 +8,7 @@ import {
   useHomeLayout,
 } from "@/hooks/queries/sections";
 import { sectionKeys } from "@/hooks/queries/keys";
-import type {
-  BrowseItem,
-  HomeSectionItemsResponse,
-  SectionItem,
-  SectionTitleKey,
-} from "@/api/types";
+import type { BrowseItem, SectionItem } from "@/api/types";
 import {
   getWatchTogetherRoomPicker,
   queryWatchTogetherMemberState,
@@ -21,7 +16,6 @@ import {
 } from "@/lib/watchTogether";
 import type { ItemMemberState } from "@/api/v2/watchTogetherMemberState";
 import { useDebounce } from "@/hooks/useDebounce";
-import { sectionTitleKey } from "@/lib/sectionTitle";
 
 export const pickerKeys = {
   rows: (roomId: string, members: WatchTogetherRoomMember[]) =>
@@ -175,8 +169,7 @@ const skippedSectionTypes = new Set([
 ]);
 const maxShelfSections = 4;
 
-/** A home row on the shelf; its title shows through `useSectionTitle`. */
-export interface ShelfSection extends SectionTitleKey {
+export interface ShelfSection {
   id: string;
   title: string;
   items: (SectionItem & { type: "movie" | "series" })[];
@@ -186,7 +179,6 @@ export interface ShelfSection extends SectionTitleKey {
  * The first few discovery rows from the home screen (trending, curated
  * collections, hidden gems…) with only movies and series kept. Shares the
  * home page's section cache so a room opened from home costs nothing extra.
- * Home caches most rows in part; the shelf shows those and reads them whole.
  */
 export function useHomeShelfSections(enabled: boolean) {
   const layout = useHomeLayout(enabled);
@@ -201,9 +193,8 @@ export function useHomeShelfSections(enabled: boolean) {
     queries: wanted.map((section) => ({
       queryKey: sectionKeys.homeItems(section.id),
       queryFn: ({ signal }: { signal?: AbortSignal }) =>
-        fetchHomeSectionItems(section.id, { signal, featured: section.featured }),
-      staleTime: (query: Query<HomeSectionItemsResponse>) =>
-        query.state.data?.partial ? 0 : HOME_SECTION_STALE_TIME,
+        fetchHomeSectionItems(section.id, { signal }),
+      staleTime: HOME_SECTION_STALE_TIME,
       gcTime: HOME_SECTION_GC_TIME,
       enabled,
     })),
@@ -214,9 +205,7 @@ export function useHomeShelfSections(enabled: boolean) {
         const resolved = results[index]?.data?.section;
         if (!resolved) return [];
         const items = resolved.items.filter(isPickable);
-        return items.length > 0
-          ? [{ id: section.id, title: resolved.title, ...sectionTitleKey(resolved), items }]
-          : [];
+        return items.length > 0 ? [{ id: section.id, title: resolved.title, items }] : [];
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- results is a new array each render; its data is what matters
     [wanted, ...results.map((result) => result.data)],

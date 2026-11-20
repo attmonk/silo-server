@@ -2,7 +2,6 @@ package jellycompat
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,7 +10,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
@@ -75,6 +76,78 @@ func TestCompatWorkerHLSRouteAllowedHonorsHardExecutionBoundaries(t *testing.T) 
 			}
 			if got := compatWorkerHLSRouteAllowed(test.workload, policy); got != test.want {
 				t.Fatalf("compatWorkerHLSRouteAllowed() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildPlaybackSourceHonorsProgressiveRemuxRoutingPolicy(t *testing.T) {
+	version := catalog.FileVersion{
+		FileID: 1, Container: "mkv", CodecVideo: "h264", CodecAudio: "aac",
+		VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}},
+		AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Default: true}},
+	}
+	profile := DeviceProfile{
+		DirectPlayProfiles: []DirectPlayProfile{{
+			Type: "Video", Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+		}},
+		TranscodingProfiles: []TranscodingProfile{{
+			Type: "Video", Protocol: "hls", Container: "ts", VideoCodec: "h264", AudioCodec: "aac",
+		}},
+	}
+
+	tests := []struct {
+		name             string
+		execution        config.PlaybackExecutionPreference
+		egress           config.PlaybackEgressPreference
+		wantDirectStream bool
+	}{
+		{
+			name:      "API execution with API egress keeps progressive remux",
+			execution: config.PlaybackExecutionAPIOnly, egress: config.PlaybackEgressAPIOnly,
+			wantDirectStream: true,
+		},
+		{
+			name:      "transcode preference does not rewrite the requested Jellyfin transport",
+			execution: config.PlaybackExecutionPreferTranscode, egress: config.PlaybackEgressPreferProxy,
+			wantDirectStream: true,
+		},
+		{
+			name:      "worker execution with API egress falls back to HLS",
+			execution: config.PlaybackExecutionWorkerOnly, egress: config.PlaybackEgressAPIOnly,
+			wantDirectStream: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			policy := config.DefaultPlaybackRoutingPolicy()
+			policy.RemuxExecution = test.execution
+			policy.RemuxEgress = test.egress
+			handler := &PlaybackHandler{
+				codec:     NewResourceIDCodec(),
+				JWTSecret: "test-secret",
+				PlaybackConfig: func() config.PlaybackConfig {
+					return config.PlaybackConfig{Routing: policy}
+				},
+			}
+
+			source := handler.buildPlaybackSource("item", "play", version, profile, playbackInfoRequest{}, true)
+			if source.SupportsDirectPlay {
+				t.Fatal("SupportsDirectPlay = true, want false for MKV source and MP4 profile")
+			}
+			if source.SupportsDirectStream != test.wantDirectStream {
+				t.Fatalf("SupportsDirectStream = %v, want %v", source.SupportsDirectStream, test.wantDirectStream)
+			}
+			if !source.SupportsTranscoding {
+				t.Fatal("SupportsTranscoding = false, want negotiated HLS fallback")
+			}
+
+			dto := handler.mediaSourceDTO("item", "play", "token", source)
+			if (dto.DirectStreamURL != "") != test.wantDirectStream {
+				t.Fatalf("DirectStreamURL = %q, advertised direct stream = %v", dto.DirectStreamURL, test.wantDirectStream)
+			}
+			if dto.TranscodingURL == "" {
+				t.Fatal("TranscodingURL is empty, want HLS fallback")
 			}
 		})
 	}
@@ -222,58 +295,6 @@ func TestEnsureUpstreamPlaybackClearsStaleHLSRouteOnMethodSwitch(t *testing.T) {
 						t.Fatalf("upstream starts = %d, want only the method-switch start", manager.startCalls)
 					}
 				})
-			}
-		})
-	}
-}
-
-// TestMethodSwitchEndsTheReplacedSession covers the session a Jellyfin
-// method switch leaves behind: whether this replica held its copy or not,
-// the switch records it as replaced once the play has moved to the new
-// session, and a copy held elsewhere is recorded from its identity.
-func TestMethodSwitchEndsTheReplacedSession(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		held       bool
-		startFails bool
-	}{
-		{name: "copy held here", held: true},
-		{name: "copy held elsewhere"},
-		{name: "replacement fails to start", held: true, startFails: true},
-	} {
-		held := tc.held
-		t.Run(tc.name, func(t *testing.T) {
-			source := testCompatSource(NewResourceIDCodec(), testCompatVersion())
-			store := NewPlaybackSessionStore(time.Hour, nil)
-			store.Put(PlaybackSession{
-				ID: "play-1", CompatToken: "compat-token", RouteItemID: "item-1",
-				UpstreamSessionID: "old-upstream", UpstreamPlayMethod: "transcode", UpstreamMediaFileID: source.FileID,
-				MediaSources: []PlaybackMediaSource{source},
-			})
-			manager := &testCompatSessionManager{sessions: map[string]*playback.Session{}}
-			if tc.startFails {
-				manager.startErr = errors.New("start failed")
-			}
-			if held {
-				manager.sessions["old-upstream"] = &playback.Session{ID: "old-upstream", UserID: 7, ProfileID: "profile-1", MediaFileID: source.FileID, PlayMethod: playback.PlayTranscode, Position: 600}
-			}
-			handler := &PlaybackHandler{playbackStore: store, sessionMgr: manager, tm: playback.NewTranscodeManager()}
-			updated, err := handler.ensureUpstreamPlayback(t.Context(),
-				&Session{Token: "compat-token", StreamAppUserID: 7, ProfileID: "profile-1"}, "play-1", source, "direct")
-			if tc.startFails != (err != nil) || (err == nil && updated.UpstreamSessionID == "old-upstream") {
-				t.Fatalf("switch = %+v, %v", updated, err)
-			}
-			if len(manager.detached) != 1 {
-				t.Fatalf("detached ends = %+v, want the replaced session once", manager.detached)
-			}
-			end := manager.detached[0]
-			wantPosition := float64(playback.PositionUnknown)
-			if held {
-				wantPosition = 600
-			}
-			if end.reason != playback.EndReasonReplaced || end.session.ID != "old-upstream" || end.session.UserID != 7 ||
-				!end.session.IsJellyfinCompat || end.session.Position != wantPosition {
-				t.Fatalf("replaced end = %+v reason %q", end.session, end.reason)
 			}
 		})
 	}

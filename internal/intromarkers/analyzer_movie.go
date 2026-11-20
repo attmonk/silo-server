@@ -32,7 +32,10 @@ const movieCandidatePageSize = 200
 // the movies. progress is called with the number of movies finished and the
 // share of the budget used, from 0 to 1.
 func (a *Analyzer) runMovies(ctx context.Context, progress func(done int, budgetUsed float64)) (RunSummary, error) {
-	budget := a.movieRunBudget()
+	budget := a.movieBudget
+	if budget <= 0 {
+		budget = movieCreditsRunBudget
+	}
 	started := a.clock()
 	deadline := started.Add(budget)
 	pageSize := a.moviePageSize
@@ -98,14 +101,6 @@ func (a *Analyzer) analyzeMovieCandidates(ctx context.Context, candidates []Cand
 	}
 	mergeRunSummary(&summary, a.analyzeMovies(ctx, candidates, movieRunOptions{}))
 	return summary, ctx.Err()
-}
-
-// movieRunBudget is how long a scheduled run starts new movies.
-func (a *Analyzer) movieRunBudget() time.Duration {
-	if a.movieBudget > 0 {
-		return a.movieBudget
-	}
-	return movieCreditsRunBudget
 }
 
 // clock returns the time movie budgets are measured by.
@@ -213,7 +208,7 @@ func (a *Analyzer) analyzeMovie(ctx context.Context, candidate Candidate, tailRe
 	if !tailReady {
 		return summary
 	}
-	tail, sampled, stale := a.movieTail(ctx, candidate, deadline, &summary)
+	tail, sampled := a.movieTail(ctx, candidate, deadline, &summary)
 	if tail == nil {
 		return summary
 	}
@@ -260,47 +255,31 @@ func (a *Analyzer) analyzeMovie(ctx context.Context, candidate Candidate, tailRe
 		}
 		return summary
 	}
-	// A cached tail stored before the file's markers were last invalidated
-	// is stored again with the file's current invalidation time, which
-	// settles the movie once more whether or not it placed credits. A timed
-	// out silence pass settles it too: a failure would not replace the
-	// complete row, so the movie would otherwise come back every run.
-	if !sampled && !stale {
-		return summary
-	}
-	if err := a.storeCreditsTail(ctx, candidate, movieTailSpec(candidate), *tail); err != nil {
-		summary.Errors = append(summary.Errors, err.Error())
+	if sampled {
+		if err := a.storeCreditsTail(ctx, candidate, movieTailSpec(candidate), *tail); err != nil {
+			summary.Errors = append(summary.Errors, err.Error())
+		}
 	}
 	return summary
-}
-
-// sameInstant reports whether two optional times are both absent or equal.
-func sameInstant(a, b *time.Time) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return a.Equal(*b)
 }
 
 // movieTail returns the candidate's movie tail pass, from the cache or by
 // sampling it, and records how it was obtained in summary. sampled reports
 // a tail sampled now, which the caller stores once it has placed the
-// credits. stale reports a cached tail stored with another invalidation time
-// than the file's, which the caller stores again once it has placed the
 // credits. It returns no tail when the tail is unusable, backing off after
 // a failure, fails now, or deadline passed while it waited for ffmpeg.
-func (a *Analyzer) movieTail(ctx context.Context, candidate Candidate, deadline time.Time, summary *RunSummary) (tail *creditsTail, sampled, stale bool) {
+func (a *Analyzer) movieTail(ctx context.Context, candidate Candidate, deadline time.Time, summary *RunSummary) (tail *creditsTail, sampled bool) {
 	// Decided from the file's current probe metadata, which a probe repair
 	// can change without changing the file, so it is not stored.
 	if tailUnusableBeforeSampling(candidate) != "" {
 		summary.CreditsTailUnusable++
-		return nil, false, false
+		return nil, false
 	}
 	spec := movieTailSpec(candidate)
 	artifacts, err := a.loadCreditsArtifacts(ctx, []Candidate{candidate}, spec.key)
 	if err != nil {
 		summary.Errors = append(summary.Errors, err.Error())
-		return nil, false, false
+		return nil, false
 	}
 	var stored *mediaartifact.Artifact
 	if artifact, ok := artifacts[candidate.FileID]; ok {
@@ -310,26 +289,26 @@ func (a *Analyzer) movieTail(ctx context.Context, candidate Candidate, deadline 
 	switch {
 	case tail != nil:
 		summary.CreditsTailCacheHits++
-		return tail, false, !sameInstant(candidate.MarkersInvalidatedAt, stored.MarkersInvalidatedAt)
+		return tail, false
 	case state == mediaartifact.Skipped && stored.Status != mediaartifact.StatusFailed:
 		summary.CreditsTailUnusable++
-		return nil, false, false
+		return nil, false
 	case state == mediaartifact.Skipped:
-		return nil, false, false
+		return nil, false
 	}
 	release, err := a.ffmpegAcquirer()(ctx)
 	if err != nil {
-		return nil, false, false
+		return nil, false
 	}
 	if a.pastDeadline(deadline) {
 		release()
 		summary.MovieBudgetExhausted = true
-		return nil, false, false
+		return nil, false
 	}
 	sampledTail, sampleErr := a.movieSampler.SampleMovieTail(ctx, candidate)
 	release()
 	if ctx.Err() != nil {
-		return nil, false, false
+		return nil, false
 	}
 	// As with episodes, a clean run without keyframes points at the log
 	// format rather than the file, so it is retried later.
@@ -340,14 +319,14 @@ func (a *Analyzer) movieTail(ctx context.Context, candidate Candidate, deadline 
 	switch {
 	case err != nil:
 		summary.Errors = append(summary.Errors, err.Error())
-		return nil, false, false
+		return nil, false
 	case sampleErr != nil && !mediasample.Classify(sampleErr).Permanent():
 		summary.CreditsTailScanErrors++
-		return nil, false, false
+		return nil, false
 	case !usable:
 		summary.CreditsTailUnusable++
-		return nil, false, false
+		return nil, false
 	}
 	summary.CreditsTailScansComputed++
-	return &sampledTail, true, false
+	return &sampledTail, true
 }

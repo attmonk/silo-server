@@ -5,13 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
 	"github.com/Silo-Server/silo-server/internal/clientip"
-	"github.com/Silo-Server/silo-server/internal/clientmetadata"
 	"github.com/Silo-Server/silo-server/internal/netaccess"
 	"github.com/Silo-Server/silo-server/internal/streamlocation"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
@@ -46,11 +48,7 @@ type Session struct {
 	ClientBuild                   string // opaque reported client build identifier, when available
 	ClientChannel                 string // opaque reported client distribution channel, when available
 	ClientUserAgent               string // trimmed request user agent for the playback session
-	// DeviceID and DevicePlatform are the device the client declared when the
-	// session started (see ClientInfo); empty when it declared none.
-	DeviceID         string
-	DevicePlatform   string
-	IsJellyfinCompat bool // immutable origin identity for Jellyfin compatibility sessions
+	IsJellyfinCompat              bool   // immutable origin identity for Jellyfin compatibility sessions
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
 	// only a route identifier from legacy HLS transports where that UUID also
 	// acts as the bearer capability. Secure transports carry no reconstruction
@@ -89,9 +87,6 @@ type Session struct {
 	TargetBitrateKbps      int          // requested output bitrate cap for transcodes
 	TranscodeHWAccel       string       // effective hardware acceleration mode for transcodes
 	ToneMapMode            tonemap.Mode // effective HDR-to-SDR executor for transcodes
-	// AdaptationReasons says why the route changes the file (see
-	// AdaptationReasons); empty for direct play or an unplanned session.
-	AdaptationReasons []string
 
 	// Byte-affecting transcode recipe fields the offloaded restart path needs to
 	// rebuild the exact same stream after an audio switch. Local transcodes read
@@ -107,14 +102,6 @@ type Session struct {
 	// Watch measures how much of the session was actually watched; Position
 	// is only where the player is now. See WatchTime.
 	Watch WatchTime
-	// TimelineDuration is the length in seconds of the timeline Position is
-	// measured on when that is more than the session's file, such as a whole
-	// Audiobookshelf book of several files. Zero means the file's own
-	// duration.
-	TimelineDuration float64
-	// ReportedListening is the highest running listening total the client
-	// has reported for the play (see UpdateProgressReported).
-	ReportedListening float64
 	// StopReported marks a session a client reported stopped without an ID
 	// that could end it (#1454). It only hides the session from the live
 	// admin view: pause state and idle grace are untouched, so a stale stop
@@ -127,7 +114,6 @@ type Session struct {
 	StartedAt                  time.Time
 	UpdatedAt                  time.Time
 	LastActivityAt             time.Time
-	PlanCommittedAt            time.Time // when the current plan reached the client; see StartupSessionGrace
 	activeTransportCount       int
 	replacementPlayMethod      PlayMethod
 	streamRevision             uint64
@@ -169,7 +155,6 @@ type SessionStreamState struct {
 	TargetBitrateKbps             int
 	TranscodeHWAccel              string
 	ToneMapMode                   tonemap.Mode
-	AdaptationReasons             []string
 	TranscodeNodeURL              string
 	TranscodeTransportID          string
 	TranscodeRouteSet             bool
@@ -249,7 +234,6 @@ type SessionReplacementRollback struct {
 	previousWatch                WatchTime
 	restoreProgress              bool
 	previousReplacementMethod    PlayMethod
-	previousPlanCommittedAt      time.Time
 }
 
 // ErrSessionReplacementSuperseded means a replacement rollback would overwrite
@@ -273,14 +257,7 @@ type ClientInfo struct {
 	// against an enum so a new channel needs no server change.
 	Channel   string
 	UserAgent string
-	// DeviceID and DevicePlatform name the device: the profile device
-	// registry's identity (X-Silo-Device-Id and X-Silo-Device-Platform) on the
-	// native API, the MediaBrowser DeviceId on a Jellyfin play. The platform
-	// is only ever what the client declared; it is never derived from the
-	// user agent.
-	DeviceID       string
-	DevicePlatform string
-	IsCompat       bool
+	IsCompat  bool
 }
 
 // Normalized returns the identity with every field trimmed and clamped to the
@@ -291,13 +268,11 @@ type ClientInfo struct {
 // identity, so clamping only at session creation would let a client's oversized
 // header through to both.
 func (c ClientInfo) Normalized() ClientInfo {
-	c.Name = normalizeClientMetadataValue(c.Name, clientmetadata.Name)
-	c.Version = normalizeClientMetadataValue(c.Version, clientmetadata.Version)
-	c.Build = normalizeClientMetadataValue(c.Build, clientmetadata.Build)
-	c.Channel = normalizeClientMetadataValue(c.Channel, clientmetadata.Channel)
-	c.UserAgent = normalizeClientMetadataValue(c.UserAgent, clientmetadata.UserAgent)
-	c.DeviceID = normalizeClientMetadataValue(c.DeviceID, 128)
-	c.DevicePlatform = normalizeClientMetadataValue(c.DevicePlatform, 40)
+	c.Name = normalizeClientMetadataValue(c.Name, 128)
+	c.Version = normalizeClientMetadataValue(c.Version, 64)
+	c.Build = normalizeClientMetadataValue(c.Build, 64)
+	c.Channel = normalizeClientMetadataValue(c.Channel, 32)
+	c.UserAgent = normalizeClientMetadataValue(c.UserAgent, 512)
 	return c
 }
 
@@ -332,14 +307,12 @@ func (s *Session) ClientInfo() ClientInfo {
 		return ClientInfo{}
 	}
 	return ClientInfo{
-		Name:           s.ClientName,
-		Version:        s.ClientVersion,
-		Build:          s.ClientBuild,
-		Channel:        s.ClientChannel,
-		UserAgent:      s.ClientUserAgent,
-		DeviceID:       s.DeviceID,
-		DevicePlatform: s.DevicePlatform,
-		IsCompat:       s.IsJellyfinCompat,
+		Name:      s.ClientName,
+		Version:   s.ClientVersion,
+		Build:     s.ClientBuild,
+		Channel:   s.ClientChannel,
+		UserAgent: s.ClientUserAgent,
+		IsCompat:  s.IsJellyfinCompat,
 	}
 }
 
@@ -372,10 +345,8 @@ type SessionManager struct {
 	pausedGrace          time.Duration
 	expireHooks          []func(*Session)
 	finishHooks          []func(context.Context, *Session)
-	lifecycleHooks       []LifecycleHooks
 	compatActivityReader SessionActivityReader
 	compatExpiryClaimer  SessionExpiryClaimer
-	compatAdminEnd       CompatAdminEnd
 	// deliveryActivityReader reports media that another node served for a
 	// remote-transport session. See SetDeliveryActivityReader.
 	deliveryActivityReader SessionActivityReader
@@ -435,30 +406,6 @@ const (
 	// DefaultActiveSessionGrace is how long an unpaused session may go without
 	// observed playback activity before it stops counting toward limits.
 	DefaultActiveSessionGrace = 45 * time.Second
-
-	// StartupSessionGrace is how long after a plan is committed the liveness
-	// policy keeps the session, however long it has been idle. A client that
-	// cannot start the plan sends no progress (its player has no position
-	// yet) and asks for the next fallback only when its startup timeout runs
-	// out, so this must outlast every client's startup timeout plus a replan
-	// round trip (issue #3202). docs/architecture/playback-protocol-v3.md
-	// §2.5 publishes it to clients.
-	StartupSessionGrace = 90 * time.Second
-
-	// PausedStreamSlotGrace is how long a paused session keeps holding one of
-	// its user's stream slots without activity. Clients report progress every
-	// 10 seconds while paused, but a browser throttles the timers of a hidden
-	// tab to about once a minute, so this outlasts that. A paused session quiet
-	// for longer has lost its player (a closed tab, a killed app): it frees the
-	// stream slot, while cleanup still keeps it for DefaultPausedSessionGrace so
-	// a returning client can resume (#243). Its transcode slot stays held until
-	// then, because its encoder does.
-	PausedStreamSlotGrace = 2 * time.Minute
-
-	// noPausedSlotCap keeps a paused session in a count for its whole paused
-	// grace. The transcode count uses it: a quiet paused session keeps its
-	// encoder until cleanup, so it keeps that slot too.
-	noPausedSlotCap time.Duration = 0
 
 	// remoteTransportIdleGrace is the floor on the idle windows for a session
 	// whose media is served by another node. See remoteTransportGrace: it must
@@ -552,7 +499,43 @@ func (m *SessionManager) AddFinishHook(fn func(context.Context, *Session)) {
 }
 
 func normalizeClientMetadataValue(value string, maxLen int) string {
-	return clientmetadata.Normalize(value, maxLen)
+	// A text column takes neither invalid UTF-8 nor a NUL, and Postgres refuses
+	// the whole statement for either. The per-node session upserts share one
+	// transaction, so a single malformed client string would stop that entire
+	// node from reconciling — not just its own row — until the session goes
+	// away. Both scrubs are needed: NUL is perfectly valid UTF-8, so
+	// ToValidUTF8 leaves it, and a v3 start body can carry one as the JSON
+	// escape (headers cannot — net/http rejects bytes below 0x20).
+	// Control characters are stripped wholesale rather than just NUL: none of
+	// them belong in an identity label rendered in the admin UI and written to
+	// structured logs.
+	if !utf8.ValidString(value) {
+		value = strings.ToValidUTF8(value, "")
+	}
+	if strings.ContainsFunc(value, unicode.IsControl) {
+		value = strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) {
+				return -1
+			}
+			return r
+		}, value)
+	}
+	value = strings.TrimSpace(value)
+	if maxLen <= 0 || len(value) <= maxLen {
+		return value
+	}
+	// Clamp by runes, not bytes. These bounds are published to clients as JSON
+	// Schema maxLength, which counts characters — a byte clamp would silently
+	// cut a value the contract calls valid, and cutting mid-rune would produce
+	// exactly the invalid UTF-8 scrubbed above.
+	runes := 0
+	for offset := range value {
+		if runes == maxLen {
+			return value[:offset]
+		}
+		runes++
+	}
+	return value
 }
 
 // StartSession creates a new playback session using the same file as both the
@@ -708,13 +691,10 @@ func newSession(
 		ClientBuild:            clientInfo.Build,
 		ClientChannel:          clientInfo.Channel,
 		ClientUserAgent:        clientInfo.UserAgent,
-		DeviceID:               clientInfo.DeviceID,
-		DevicePlatform:         clientInfo.DevicePlatform,
 		IsJellyfinCompat:       clientInfo.IsCompat,
 		StartedAt:              now,
 		UpdatedAt:              now,
 		LastActivityAt:         now,
-		PlanCommittedAt:        now,
 	}
 }
 
@@ -762,7 +742,6 @@ func (m *SessionManager) RegisterReconstructed(s *Session) *Session {
 	}
 	s.UpdatedAt = now
 	s.LastActivityAt = now
-	s.PlanCommittedAt = now
 	m.sessions[s.ID] = s
 	return s
 }
@@ -819,7 +798,6 @@ func (m *SessionManager) RegisterReconstructedWithLimits(ctx context.Context, s 
 	}
 	s.UpdatedAt = now
 	s.LastActivityAt = now
-	s.PlanCommittedAt = now
 	m.sessions[s.ID] = s
 	return s, nil
 }
@@ -1016,37 +994,6 @@ func (m *SessionManager) UpdateProgress(sessionID string, position float64, isPa
 	return m.updateProgress(sessionID, position, isPaused, -1)
 }
 
-// UpdateProgressReported is UpdateProgress for a playing client that reports
-// its listening as a running total for the play: the session credits how far
-// the total rose past the highest one seen (see WatchTime.Credit), so a late
-// or repeated report credits nothing. A report that does not raise the total
-// leaves the listening baseline where it was, so the next rise is still
-// capped by all the time since the last one. A client that has not reported a
-// total is measured from its position instead, as UpdateProgress does.
-func (m *SessionManager) UpdateProgressReported(sessionID string, position, total float64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	s, ok := m.sessions[sessionID]
-	if !ok {
-		return ErrSessionNotFound
-	}
-	s.Position = position
-	s.IsPaused = false
-	s.StopReported = false
-	s.streamRevision++
-	m.touchSessionLocked(s)
-	switch {
-	case total <= 0 && s.ReportedListening <= 0:
-		s.Watch.Observe(position, false, s.UpdatedAt)
-	case total > s.ReportedListening:
-		listened := total - s.ReportedListening
-		s.ReportedListening = total
-		s.Watch.Credit(position, listened, s.StartedAt, s.UpdatedAt)
-	}
-	return nil
-}
-
 // UpdateProgressSample keeps a confirmed pause state when an already accepted
 // sequenced sample is replayed. Position and activity still persist normally.
 func (m *SessionManager) UpdateProgressSample(sessionID string, sample ProgressSampleV3) error {
@@ -1184,23 +1131,6 @@ func (m *SessionManager) UpdateStreamState(sessionID string, state SessionStream
 	return nil
 }
 
-// MarkPlanCommitted restarts the StartupSessionGrace window once a start has
-// committed the plan it is about to return. Admission sets the window too, but
-// preparing the transport can take long enough to eat into it before the
-// client has even received the plan. Ordinary stream-state updates leave it.
-func (m *SessionManager) MarkPlanCommitted(sessionID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	s, ok := m.sessions[sessionID]
-	if !ok {
-		return ErrSessionNotFound
-	}
-	m.touchSessionLocked(s)
-	s.PlanCommittedAt = s.LastActivityAt
-	return nil
-}
-
 // SetStreamLocation preserves the negotiated bitrate-policy classification
 // when a compatible client starts its media request on another network path.
 func (m *SessionManager) SetStreamLocation(sessionID, location string) error {
@@ -1265,7 +1195,6 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.TargetBitrateKbps = state.TargetBitrateKbps
 	s.TranscodeHWAccel = state.TranscodeHWAccel
 	s.ToneMapMode = state.ToneMapMode
-	s.AdaptationReasons = state.AdaptationReasons
 	if state.TranscodeRouteSet {
 		s.TranscodeNodeURL = state.TranscodeNodeURL
 		s.TranscodeTransportID = state.TranscodeTransportID
@@ -1317,7 +1246,6 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		TargetBitrateKbps:             s.TargetBitrateKbps,
 		TranscodeHWAccel:              s.TranscodeHWAccel,
 		ToneMapMode:                   s.ToneMapMode,
-		AdaptationReasons:             s.AdaptationReasons,
 		TranscodeNodeURL:              s.TranscodeNodeURL,
 		TranscodeTransportID:          s.TranscodeTransportID,
 		TranscodeRouteSet:             true,
@@ -1361,7 +1289,6 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.TargetBitrateKbps = state.TargetBitrateKbps
 	s.TranscodeHWAccel = state.TranscodeHWAccel
 	s.ToneMapMode = state.ToneMapMode
-	s.AdaptationReasons = state.AdaptationReasons
 	s.TranscodeNodeURL = state.TranscodeNodeURL
 	s.TranscodeTransportID = state.TranscodeTransportID
 	s.RoutingNetworkProvider = state.RoutingNetworkProvider
@@ -1428,7 +1355,6 @@ func (m *SessionManager) applyReplacementLocked(
 		previousEffectiveMediaFileID: s.MediaFileID,
 		previousStreamState:          snapshotSessionStreamStateLocked(s),
 		previousReplacementMethod:    s.replacementPlayMethod,
-		previousPlanCommittedAt:      s.PlanCommittedAt,
 	}
 	if replacement.PositionSeconds != nil {
 		rollback.previousPosition = s.Position
@@ -1453,7 +1379,6 @@ func (m *SessionManager) applyReplacementLocked(
 	s.streamRevision++
 	rollback.appliedRevision = s.streamRevision
 	m.touchSessionLocked(s)
-	s.PlanCommittedAt = s.LastActivityAt
 	if replacement.PositionSeconds != nil {
 		s.Watch.Observe(s.Position, s.IsPaused, s.UpdatedAt)
 	}
@@ -1484,19 +1409,17 @@ func (m *SessionManager) RollbackReplacement(sessionID string, rollback SessionR
 		s.Watch = rollback.previousWatch
 	}
 	s.replacementPlayMethod = rollback.previousReplacementMethod
-	s.PlanCommittedAt = rollback.previousPlanCommittedAt
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return nil
 }
 
 // SetTranscodeStreamDetails records the actual encode decisions of a running
-// transcode on the session — video copy vs re-encode, whether audio is
-// re-encoded, and the resolution/bitrate ceiling the encode was capped to —
-// together with the confirmed hardware and tone-map executors — so session
-// sync and the admin activity views describe what ffmpeg is doing rather
-// than relying on requested transport defaults.
-func (m *SessionManager) SetTranscodeStreamDetails(sessionID, targetVideoCodec, targetAudioCodec string, transcodeAudio bool, hwAccel string, toneMapMode tonemap.Mode, targetResolution string, targetBitrateKbps int) error {
+// transcode on the session — video copy vs re-encode, and whether audio is
+// re-encoded — together with the confirmed hardware and tone-map executors —
+// so session sync and the admin activity views describe what ffmpeg is doing
+// rather than relying on requested transport defaults.
+func (m *SessionManager) SetTranscodeStreamDetails(sessionID, targetVideoCodec, targetAudioCodec string, transcodeAudio bool, hwAccel string, toneMapMode tonemap.Mode) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1510,8 +1433,6 @@ func (m *SessionManager) SetTranscodeStreamDetails(sessionID, targetVideoCodec, 
 	s.TranscodeAudio = transcodeAudio
 	s.TranscodeHWAccel = hwAccel
 	s.ToneMapMode = toneMapMode
-	s.TargetResolution = targetResolution
-	s.TargetBitrateKbps = targetBitrateKbps
 	m.touchSessionLocked(s)
 	return nil
 }
@@ -1672,22 +1593,6 @@ func (m *SessionManager) SetProgressPersistenceDisabled(sessionID string, disabl
 
 	s.DisableProgressPersistence = disabled
 	m.touchSessionLocked(s)
-	return nil
-}
-
-// SetTimelineDuration records the length of the timeline the session's
-// Position is measured on, for a player whose position spans more than the
-// session's file. See Session.TimelineDuration.
-func (m *SessionManager) SetTimelineDuration(sessionID string, seconds float64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	s, ok := m.sessions[sessionID]
-	if !ok {
-		return ErrSessionNotFound
-	}
-
-	s.TimelineDuration = seconds
 	return nil
 }
 
@@ -1885,117 +1790,6 @@ func (m *SessionManager) FinishSession(ctx context.Context, sessionID string) er
 	return nil
 }
 
-// LifecycleHooks hear a playback frontend announce a session's start and
-// report a pause without a progress sequence (Jellyfin, Audiobookshelf, the
-// v1 bridge), for the admin lifecycle events.
-type LifecycleHooks struct {
-	Started       func(ctx context.Context, s *Session, frontend string)
-	PauseReported func(ctx context.Context, sessionID string, paused bool)
-}
-
-// AddLifecycleHooks registers hooks for AnnounceStart and ReportPause.
-func (m *SessionManager) AddLifecycleHooks(hooks LifecycleHooks) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.lifecycleHooks = append(m.lifecycleHooks, hooks)
-}
-
-// AnnounceStart tells the lifecycle hooks a frontend started this session.
-// frontend names the surface: native, bridge, jellyfin or abs.
-func (m *SessionManager) AnnounceStart(ctx context.Context, sessionID, frontend string) {
-	m.mu.RLock()
-	s, ok := m.sessions[sessionID]
-	var started Session
-	if ok {
-		started = *s
-	}
-	hooks := append([]LifecycleHooks{}, m.lifecycleHooks...)
-	m.mu.RUnlock()
-	if !ok {
-		return
-	}
-	for _, hook := range hooks {
-		if hook.Started != nil {
-			hook.Started(ctx, &started, frontend)
-		}
-	}
-}
-
-// AnnounceDetachedStart tells the lifecycle hooks a frontend started a play
-// that no replica holds in memory, such as an Audiobookshelf play a client
-// only reports. The caller supplies the snapshot; registered sessions are
-// left as they are.
-func (m *SessionManager) AnnounceDetachedStart(ctx context.Context, s Session, frontend string) {
-	m.mu.RLock()
-	hooks := append([]LifecycleHooks{}, m.lifecycleHooks...)
-	m.mu.RUnlock()
-	for _, hook := range hooks {
-		if hook.Started != nil {
-			hook.Started(ctx, &s, frontend)
-		}
-	}
-}
-
-// ReportPause tells the lifecycle hooks a client reported this pause state
-// without a progress sequence.
-func (m *SessionManager) ReportPause(ctx context.Context, sessionID string, paused bool) {
-	m.mu.RLock()
-	hooks := append([]LifecycleHooks{}, m.lifecycleHooks...)
-	m.mu.RUnlock()
-	for _, hook := range hooks {
-		if hook.PauseReported != nil {
-			hook.PauseReported(ctx, sessionID, paused)
-		}
-	}
-}
-
-// FinishDetached runs the finish hooks for a play this replica no longer
-// holds: one ended on another replica's copy, or a copy this replica already
-// removed. The caller supplies the snapshot; registered sessions are left as
-// they are. ctx carries the end reason (WithEndReason) and marks the snapshot
-// as detached (IsDetachedFinish), so the hooks can fill what it lacks from
-// shared state.
-func (m *SessionManager) FinishDetached(ctx context.Context, s Session) {
-	m.mu.RLock()
-	hooks := append([]func(context.Context, *Session){}, m.finishHooks...)
-	m.mu.RUnlock()
-	ctx = context.WithValue(ctx, detachedFinishKey{}, true)
-	for _, hook := range hooks {
-		hook(ctx, &s)
-	}
-}
-
-// PositionUnknown marks a FinishDetached snapshot whose position nobody
-// reported: the finish hooks take it from shared state. An explicit zero is
-// a reported position and is kept.
-const PositionUnknown = -1
-
-// EndReasonReplaced is the end reason of a session another one replaced
-// mid-play: a Jellyfin client switched play method.
-const EndReasonReplaced = "replaced"
-
-type endReasonKey struct{}
-type detachedFinishKey struct{}
-
-// WithEndReason tells the finish hooks why the play ended. Without it a
-// finished play ended because its client stopped it.
-func WithEndReason(ctx context.Context, reason string) context.Context {
-	return context.WithValue(ctx, endReasonKey{}, reason)
-}
-
-// EndReasonFromContext is the reason WithEndReason recorded, or "".
-func EndReasonFromContext(ctx context.Context) string {
-	reason, _ := ctx.Value(endReasonKey{}).(string)
-	return reason
-}
-
-// IsDetachedFinish reports whether a finish hook runs for a FinishDetached
-// snapshot rather than a copy this replica held.
-func IsDetachedFinish(ctx context.Context) bool {
-	detached, _ := ctx.Value(detachedFinishKey{}).(bool)
-	return detached
-}
-
 // GetSession returns the session with the given ID, or ErrSessionNotFound.
 func (m *SessionManager) GetSession(sessionID string) (*Session, error) {
 	m.mu.RLock()
@@ -2077,7 +1871,7 @@ func (m *SessionManager) activeCountExcludingLocked(userID int, excludeSessionID
 		if excludeSessionID != "" && s.ID == excludeSessionID {
 			continue
 		}
-		if s.UserID == userID && m.countsTowardLimitsLocked(s, now, PausedStreamSlotGrace) {
+		if s.UserID == userID && m.countsTowardLimitsLocked(s, now) {
 			count++
 		}
 	}
@@ -2096,7 +1890,7 @@ func (m *SessionManager) transcodeCountExcludingLocked(userID int, excludeSessio
 		if excludeSessionID != "" && s.ID == excludeSessionID {
 			continue
 		}
-		if s.UserID == userID && (s.PlayMethod == PlayTranscode || s.replacementPlayMethod == PlayTranscode) && m.countsTowardLimitsLocked(s, now, noPausedSlotCap) {
+		if s.UserID == userID && (s.PlayMethod == PlayTranscode || s.replacementPlayMethod == PlayTranscode) && m.countsTowardLimitsLocked(s, now) {
 			count++
 		}
 	}
@@ -2130,24 +1924,19 @@ func (m *SessionManager) CleanStale() []*Session {
 	active := m.activeGrace
 	paused := m.pausedGrace
 	m.mu.RUnlock()
-	return m.cleanInactive(active, paused, StartupSessionGrace)
+	return m.CleanInactive(active, paused)
 }
 
 // CleanInactive removes sessions whose last playback activity exceeds the
 // provided grace period. Sessions with an active media transport request are
-// preserved even if they have not emitted a recent heartbeat yet. Unlike
-// CleanStale it applies no startup window.
+// preserved even if they have not emitted a recent heartbeat yet.
 func (m *SessionManager) CleanInactive(activeIdle, pausedIdle time.Duration) []*Session {
-	return m.cleanInactive(activeIdle, pausedIdle, 0)
-}
-
-func (m *SessionManager) cleanInactive(activeIdle, pausedIdle, startupIdle time.Duration) []*Session {
-	m.refreshDeliveryActivity(activeIdle, pausedIdle, startupIdle)
-	protected := m.refreshCompatActivity(activeIdle, pausedIdle, startupIdle)
+	m.refreshDeliveryActivity(activeIdle, pausedIdle)
+	protected := m.refreshCompatActivity(activeIdle, pausedIdle)
 	m.mu.Lock()
 
 	now := time.Now()
-	claimed := m.claimCompatExpiryLocked(now, activeIdle, pausedIdle, startupIdle, protected)
+	claimed := m.claimCompatExpiryLocked(now, activeIdle, pausedIdle, protected)
 	var expired []*Session
 	for id, s := range m.sessions {
 		if protected[s] || s.IsJellyfinCompat && claimed != nil && !claimed[id] {
@@ -2157,7 +1946,7 @@ func (m *SessionManager) cleanInactive(activeIdle, pausedIdle, startupIdle time.
 			continue
 		}
 		activeIdle, pausedIdle := remoteTransportGrace(s, activeIdle, pausedIdle)
-		if m.sessionIsInactiveLocked(s, now, activeIdle, pausedIdle, startupIdle) {
+		if m.sessionIsInactiveLocked(s, now, activeIdle, pausedIdle) {
 			cp := *s
 			expired = append(expired, &cp)
 			delete(m.sessions, id)
@@ -2180,10 +1969,7 @@ func (m *SessionManager) touchSessionLocked(s *Session) {
 	s.UpdatedAt = now
 }
 
-// countsTowardLimitsLocked reports whether s holds one of its user's slots.
-// A positive pausedSlotGrace caps how long a paused session holds the slot
-// after its last activity, below its whole paused grace.
-func (m *SessionManager) countsTowardLimitsLocked(s *Session, now time.Time, pausedSlotGrace time.Duration) bool {
+func (m *SessionManager) countsTowardLimitsLocked(s *Session, now time.Time) bool {
 	if s == nil {
 		return false
 	}
@@ -2197,10 +1983,7 @@ func (m *SessionManager) countsTowardLimitsLocked(s *Session, now time.Time, pau
 		return true
 	}
 	activeGrace, pausedGrace := remoteTransportGrace(s, m.activeGrace, m.pausedGrace)
-	if pausedSlotGrace > 0 {
-		pausedGrace = min(pausedGrace, pausedSlotGrace)
-	}
-	return !m.sessionIsInactiveLocked(s, now, activeGrace, pausedGrace, StartupSessionGrace)
+	return !m.sessionIsInactiveLocked(s, now, activeGrace, pausedGrace)
 }
 
 // remoteTransportGrace widens the idle windows for a session whose bytes are
@@ -2228,10 +2011,7 @@ func remoteTransportGrace(s *Session, activeIdle, pausedIdle time.Duration) (tim
 	return activeIdle, pausedIdle
 }
 
-// sessionIsInactiveLocked reports whether s has been idle past its window. A
-// positive startupIdle also keeps it until that long after its plan was
-// committed (see StartupSessionGrace).
-func (m *SessionManager) sessionIsInactiveLocked(s *Session, now time.Time, activeIdle, pausedIdle, startupIdle time.Duration) bool {
+func (m *SessionManager) sessionIsInactiveLocked(s *Session, now time.Time, activeIdle, pausedIdle time.Duration) bool {
 	if s == nil {
 		return true
 	}
@@ -2253,9 +2033,6 @@ func (m *SessionManager) sessionIsInactiveLocked(s *Session, now time.Time, acti
 	}
 	if grace <= 0 {
 		return !lastActivity.After(now)
-	}
-	if startupIdle > 0 && s.PlanCommittedAt.Add(startupIdle).After(now) {
-		return false
 	}
 
 	return !lastActivity.Add(grace).After(now)

@@ -6,7 +6,6 @@ import {
   keptForRows,
 } from "@/lib/collections/copy";
 import type { CollectionKind } from "@/lib/collections/types";
-import { useT } from "@/i18n";
 
 /**
  * Confirms deleting several server collections at once (Delete all in this
@@ -41,7 +40,6 @@ export function DeleteCollectionsDialog({
   blocked: string | null;
   onConfirm: () => void;
 }) {
-  const t = useT();
   const items = [
     ...(elsewhere.length > 0 ? [alsoDeletedElsewhere(elsewhere, kind)] : []),
     ...(kept.length > 0 ? [keptForRows(kept)] : []),
@@ -52,13 +50,11 @@ export function DeleteCollectionsDialog({
       onOpenChange={onOpenChange}
       title={deleteCollectionsTitle(count, kind, where)}
       description={deleteCollectionsDescription(count)}
-      bullets={
-        items.length > 0 ? { label: t("web.collections.deleteDialog.also"), items } : undefined
-      }
+      bullets={items.length > 0 ? { label: "Also", items } : undefined}
       irreversible
       error={blocked}
       confirmDisabled={blocked !== null}
-      confirmLabel={t("web.collections.deleteDialog.deleteCount", { count: count })}
+      confirmLabel={`Delete ${count}`}
       variant="destructive"
       onConfirm={onConfirm}
     />

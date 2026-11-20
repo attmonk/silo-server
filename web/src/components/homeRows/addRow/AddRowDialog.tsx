@@ -7,8 +7,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useRowPreview } from "@/hooks/queries/homeRows/useRowPreview";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
-import { useAppLanguage, useT } from "@/i18n";
-import { joinList } from "@/lib/appLocale";
 import {
   isPersonalRowKind,
   pickerGroups,
@@ -19,7 +17,6 @@ import {
 import { canCopyToLibraries, copyTargetPages, libraryCopyIds } from "@/lib/homeRows/bulkCopy";
 import { pageLabel as labelOfPage, libraryPagesOf } from "@/lib/homeRows/pages";
 import { collectionIdOf } from "@/lib/homeRows/payloads";
-import { holdsCollections } from "@/lib/sectionTypes";
 import {
   canSaveDraft,
   DRAFT_FIELD_LABELS,
@@ -93,9 +90,8 @@ export function AddRowDialog({
   onClose,
   onSaved,
   onDelete,
-  deleteLabel,
+  deleteLabel = "Delete row…",
 }: AddRowDialogProps) {
-  const t = useT();
   const editing = initialSession !== null;
   const narrow = useMediaQuery("(max-width: 1023px)");
   const phone = useMediaQuery("(max-width: 639px)");
@@ -146,13 +142,7 @@ export function AddRowDialog({
     else headingRef.current?.focus();
   }, [step]);
 
-  // The groups' names and cards come from plain helpers; rebuild them on a language change.
-  const language = useAppLanguage();
-  const groups = useMemo(
-    () => searchPickerGroups(pickerGroups(catalog), query),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- language: the groups' language
-    [catalog, query, language],
-  );
+  const groups = useMemo(() => searchPickerGroups(pickerGroups(catalog), query), [catalog, query]);
   const typesOnPage = useMemo(
     () => new Set(adapter.rows.map((row) => row.sectionType)),
     [adapter.rows],
@@ -175,11 +165,11 @@ export function AddRowDialog({
   }, [collections, page, adapter.rows, adapter.surface, draft]);
   const previewWait = draft ? previewWaitText(draft, adapter.surface) : null;
   // Why the strip shows no titles: this surface has no preview, or the draft can't have one yet.
-  let previewOffText = t("web.home.addRow.previewUnavailable");
+  let previewOffText = "Previews aren't available on this server.";
   if (adapter.surface === "profile")
     previewOffText = editing
-      ? t("web.home.addRow.previewAfterSave", { page })
-      : t("web.home.addRow.previewAfterAdd", { page });
+      ? `You'll see your changes on ${page} after you save.`
+      : `You'll see it on ${page} after you add it.`;
   else if (adapter.capabilities.draftPreview && previewWait) previewOffText = previewWait;
   const libraryPages = useMemo(() => libraryPagesOf(adapter.pages), [adapter.pages]);
   // A new row on a library page may go to other library pages too, when its
@@ -219,9 +209,7 @@ export function AddRowDialog({
             title: draft.titleFollowsVariant ? fresh.title : draft.title,
             titleFollowsVariant: draft.titleFollowsVariant,
             itemLimit: draft.itemLimit,
-            // A row of collections can't be the hero.
-            hero: draft.hero && !holdsCollections(fresh.sectionType),
-            webOnly: draft.webOnly,
+            hero: draft.hero,
           }
         : fresh,
     );
@@ -267,10 +255,7 @@ export function AddRowDialog({
           return;
         }
         toast.error(
-          errorMessage(
-            error,
-            session ? t("web.home.addRow.saveFailed") : t("web.home.addRow.addFailed"),
-          ),
+          errorMessage(error, session ? "Could not save this row" : "Could not add this row"),
         );
       }
     });
@@ -290,7 +275,7 @@ export function AddRowDialog({
         setChangedUpstream(merged.changedUpstream);
         setConflict(false);
       } catch (error) {
-        toast.error(errorMessage(error, t("web.home.addRow.reloadFailed")));
+        toast.error(errorMessage(error, "Could not reload this row"));
       }
     });
   }
@@ -299,47 +284,44 @@ export function AddRowDialog({
   // Step 2 of Add row goes back to the picker; the Change picker goes back to Edit row.
   const back =
     step === "form" && !editing
-      ? (initialSeed?.back ?? {
-          label: t("web.home.addRow.allRows"),
-          onClick: () => setStep("pick"),
-        })
+      ? (initialSeed?.back ?? { label: "All rows", onClick: () => setStep("pick") })
       : changing
-        ? { label: t("web.home.addRow.editRow"), onClick: () => setStep("form") }
+        ? { label: "Edit row", onClick: () => setStep("form") }
         : null;
   let title: string;
   let description: ReactNode;
   if (step === "pick") {
-    title = changing ? t("web.home.addRow.changeTitle") : t("web.home.addRow.addTitle", { page });
+    title = changing ? "Change what this row shows" : `Add a row to ${page}`;
     description = changing
-      ? t("web.home.addRow.changeDescription")
+      ? "Pick another kind of row. Its settings start fresh; the name and More options stay."
       : phone
-        ? t("web.home.addRow.pickDescriptionPhone", { page })
-        : t("web.home.addRow.pickDescription");
+        ? `Pick what it shows. It goes to the bottom of ${page}.`
+        : "Pick what the row shows. Next you'll see a preview and can name it.";
   } else if (editing) {
-    title = t("web.home.addRow.editRow");
+    title = "Edit row";
     // A profile save stores only the fields that profile changed, so an
     // admin's edit reaches every profile except in what it changed itself.
     description =
       adapter.surface === "profile"
-        ? t("web.home.addRow.editDescriptionProfile")
-        : t("web.home.addRow.editDescription", { page });
+        ? "Changes apply only to this profile."
+        : `Changes apply to everyone on ${page}. A profile that changed this row keeps its own changes.`;
   } else {
     const type = draft?.sectionType ?? "";
     title = rowKindLabel(type);
     if (type === "collection") {
-      description = t("web.home.addRow.collectionDescription", {
-        link: (chunks) => (
+      description = (
+        <>
+          Show one of your collections as a row. Make or change collections in{" "}
           <Link to={collections.href} className="text-foreground underline underline-offset-2">
-            {chunks}
+            Collections
           </Link>
-        ),
-      });
+          .
+        </>
+      );
     } else if (type === "custom_filter") {
-      description = t("web.home.addRow.customFilterDescription");
+      description = "Describe the titles you want. New matches show up on their own.";
     } else {
-      description = isPersonalRowKind(type)
-        ? t("web.home.addRow.personalSentence", { sentence: rowKindSentence(type) })
-        : rowKindSentence(type);
+      description = `${rowKindSentence(type)}${isPersonalRowKind(type) ? " Different for each viewer." : ""}`;
     }
   }
 
@@ -348,12 +330,10 @@ export function AddRowDialog({
   if (!editing) {
     footerStart =
       step === "pick" ? (
-        <StepCount step={1}>{t("web.home.addRow.footerPickStep", { page })}</StepCount>
+        <StepCount step={1}>{`New rows go to the bottom of ${page}`}</StepCount>
       ) : (
         <StepCount step={2}>
-          {copies.length > 0
-            ? t("web.home.addRow.footerFormStepCopies")
-            : t("web.home.addRow.footerFormStep", { page })}
+          {copies.length > 0 ? "Goes to the bottom of each page" : `Goes to the bottom of ${page}`}
         </StepCount>
       );
   } else if (step === "form") {
@@ -361,12 +341,12 @@ export function AddRowDialog({
       <Button
         type="button"
         variant="ghost"
-        className="text-destructive hover:text-destructive -ms-3"
+        className="text-destructive hover:text-destructive -ml-3"
         disabled={busy || !onDelete}
         onClick={() => session && onDelete?.(session)}
       >
         <Trash2 aria-hidden className="size-4" />
-        {deleteLabel ?? t("web.home.addRow.deleteRow")}
+        {deleteLabel}
       </Button>
     );
   }
@@ -389,16 +369,14 @@ export function AddRowDialog({
           <div className="relative mt-3">
             <Search
               aria-hidden
-              className="text-muted-foreground absolute start-3.5 top-1/2 size-4 -translate-y-1/2"
+              className="text-muted-foreground absolute top-1/2 left-3.5 size-4 -translate-y-1/2"
             />
             <Input
               ref={searchRef}
               type="search"
-              aria-label={t("web.home.addRow.searchRows")}
-              placeholder={
-                phone ? t("web.home.addRow.searchRows") : t("web.home.addRow.searchRowsPlaceholder")
-              }
-              className="h-11 ps-10"
+              aria-label="Search rows"
+              placeholder={phone ? "Search rows" : "Search, e.g. trending, 4K, Ghibli, Christmas"}
+              className="h-11 pl-10"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
@@ -416,14 +394,12 @@ export function AddRowDialog({
           >
             <p className="min-w-0 flex-1">
               {conflict
-                ? t("web.home.addRow.conflict")
-                : t("web.home.addRow.changedElsewhere", {
-                    fields: joinList(changedUpstream.map((field) => t(DRAFT_FIELD_LABELS[field]))),
-                  })}
+                ? "This row changed since you opened it. Your changes are kept. Reload the row to see what changed, then save again."
+                : `Changed elsewhere: ${changedUpstream.map((field) => DRAFT_FIELD_LABELS[field]).join(", ")}`}
             </p>
             {conflict ? (
               <Button type="button" size="sm" variant="outline" disabled={busy} onClick={reloadRow}>
-                {t("web.home.addRow.reloadRow")}
+                Reload row
               </Button>
             ) : null}
           </div>
@@ -434,13 +410,11 @@ export function AddRowDialog({
         step === "form" ? (
           <Button type="button" disabled={busy || conflict || !canSave} onClick={submit}>
             {editing ? (
-              t("web.home.addRow.save")
+              "Save"
             ) : (
               <>
                 <Plus aria-hidden className="size-4" />
-                {copies.length > 0
-                  ? t("web.home.addRow.addToPages", { count: copies.length + 1 })
-                  : t("web.home.addRow.addRow")}
+                {copies.length > 0 ? `Add to ${copies.length + 1} pages` : "Add row"}
               </>
             )}
           </Button>
@@ -465,8 +439,8 @@ export function AddRowDialog({
           ) : (
             <p role="status" className="text-muted-foreground px-7 py-10 text-sm">
               {catalogFailed
-                ? t("web.home.addRow.catalogFailed")
-                : t("web.home.addRow.catalogLoading")}
+                ? "The kinds of rows didn't load. Close this and try again."
+                : "Loading kinds of rows…"}
             </p>
           )}
         </div>
@@ -477,9 +451,7 @@ export function AddRowDialog({
             onChange={setDraft}
             catalog={catalog}
             preview={preview}
-            liveLabel={
-              editing ? t("web.home.addRow.livePreview") : t("web.home.addRow.livePreviewAdd")
-            }
+            liveLabel={editing ? "Live preview" : "Live preview from your libraries"}
             previewOffText={previewOffText}
             collectionChoices={collectionChoices}
             shows={
@@ -497,7 +469,6 @@ export function AddRowDialog({
             onVariant={(presetKey) => setDraft(withVariant(draft, def, presetKey))}
             libraryPages={copyPages}
             contentLocked={session?.kindLocked}
-            webOnlyChoice={adapter.capabilities.webOnlyHero === true}
           />
         </div>
       ) : null}

@@ -194,7 +194,7 @@ func normalizeTitleForComparison(input string) string {
 	var b strings.Builder
 	b.Grow(len(input))
 
-	for _, r := range foldSearchDiacritics(input) {
+	for _, r := range input {
 		switch {
 		case unicode.IsLetter(r), unicode.IsDigit(r):
 			b.WriteRune(unicode.ToLower(r))

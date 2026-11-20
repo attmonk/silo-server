@@ -73,7 +73,7 @@ func DefaultConfig(root string) Config {
 			},
 			{
 				ID:          ListenerAPI,
-				Description: "Main Silo API listener: the /api/v2 handler, the retained /api/v1 probes and tombstone, and the routes mounted beside them.",
+				Description: "Main Silo API listener: the /api/v1 namespace and the routes mounted beside it.",
 				Dir:         internalAPIDir,
 				Func:        apiRouterFunc,
 				Constructor: apiRouterCtor,

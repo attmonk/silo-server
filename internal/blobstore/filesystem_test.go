@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -85,6 +87,31 @@ func TestFilesystemOpenReaderSurvivesReplacement(t *testing.T) {
 	}
 }
 
+func TestFilesystemPaginationUsesFullKeyOrder(t *testing.T) {
+	s, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	want := []string{"a.jpg", "a/z.jpg", "a0.jpg", "b/z.jpg"}
+	for _, key := range want {
+		if err := s.Put(ctx, key, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cursor := ""
+	for i, key := range want {
+		page, next, err := s.List(ctx, "", cursor, 1)
+		if err != nil || len(page) != 1 || page[0].Key != key {
+			t.Fatalf("page %d: %v %q %v", i, page, next, err)
+		}
+		cursor = next
+	}
+	if cursor != "" {
+		t.Fatal(cursor)
+	}
+}
+
 func TestFilesystemCleansOnlyAbandonedTemporaryFiles(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewFilesystem(dir)
@@ -133,6 +160,105 @@ func TestFilesystemCleansOnlyAbandonedTemporaryFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
 		t.Fatalf("released orphan: %v", err)
+	}
+}
+
+func TestFilesystemRootValidationAndRecovery(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFilesystem(filepath.Join(file, "art")); err == nil {
+		t.Fatal("file parent accepted")
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(t.TempDir(), link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFilesystem(link); err == nil {
+		t.Fatal("symlink root accepted")
+	}
+	aliasStore, err := NewFilesystem(filepath.Join(link, "art"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := filepath.EvalSymlinks(filepath.Join(link, "art"))
+	if err != nil || aliasStore.root != canonical {
+		t.Fatalf("canonical root: %q %q %v", aliasStore.root, canonical, err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := aliasStore.Put(context.Background(), "stable.jpg", []byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewFilesystem(filepath.Join(dir, "art"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(s.root); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(context.Background(), "recovered.jpg", []byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := s.List(ctx, "", "", 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled list: %v", err)
+	}
+}
+
+func TestFilesystemListSkipsCompletedSubtrees(t *testing.T) {
+	s, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"a/first.jpg", "z/last.jpg"} {
+		if err := s.Put(context.Background(), key, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := filepath.Join(s.root, "a")
+	if err := os.Chmod(blocked, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(blocked, 0755) }()
+	page, _, err := s.List(context.Background(), "", "b", 1)
+	if err != nil || len(page) != 1 || page[0].Key != "z/last.jpg" {
+		t.Fatalf("page=%v err=%v", page, err)
+	}
+}
+
+func TestOpenLocalDegradedStartupRecovers(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires ordinary filesystem permissions")
+	}
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(parent, 0755) }()
+	stores, backend, err := Open(context.Background(), Options{Backend: BackendLocal, LocalPath: filepath.Join(parent, "art")})
+	if err != nil || backend != BackendLocal {
+		t.Fatalf("open: %s %v", backend, err)
+	}
+	store := stores.Assets
+	if err := store.Probe(context.Background()); err == nil {
+		t.Fatal("unwritable storage reported ready")
+	}
+	if err := os.Chmod(parent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(context.Background(), "ready.jpg", []byte("ok")); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -185,237 +311,60 @@ func TestProbeReclaimsRootOrphansPastFreshFiles(t *testing.T) {
 	}
 }
 
-// cancelAfter reports cancellation once Err has been called more than n times.
-type cancelAfter struct {
-	context.Context //nolint:containedctx // wraps the context to count Err calls
-	n               int
-}
-
-func (c *cancelAfter) Err() error {
-	if c.n <= 0 {
-		return context.Canceled
-	}
-	c.n--
-	return nil
-}
-
-func TestFilesystemDeletePrefixStopsOnCancellation(t *testing.T) {
-	s, err := NewFilesystem(t.TempDir())
+func TestPutTracksCreatedAncestors(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFilesystem(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
-	for i := range 10 {
-		if err = s.Put(ctx, fmt.Sprintf("item/h%d/image.jpg", i), []byte("x")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// The walk checks the context once per entry and once before removing
-	// each directory: the prefix, then per item its hash directory, its file,
-	// and the directory removal. Allow two files; the second hash directory is
-	// left behind (empty) because cancellation stops before removing it.
-	n, err := s.DeletePrefix(&cancelAfter{Context: ctx, n: 6}, "item")
-	if !errors.Is(err, context.Canceled) || n != 2 {
-		t.Fatalf("partial delete = %d, %v; want 2, context.Canceled", n, err)
-	}
-	keys, _, err := s.List(ctx, "item/", "", 100)
-	if err != nil || len(keys) != 8 {
-		t.Fatalf("remaining = %d, %v; want 8", len(keys), err)
-	}
-	if _, err = os.Stat(filepath.Join(s.root, "item", "h0")); !os.IsNotExist(err) {
-		t.Fatalf("emptied directory not removed during the walk: %v", err)
-	}
-	if n, err = s.DeletePrefix(ctx, "item"); err != nil || n != 8 {
-		t.Fatalf("resumed delete = %d, %v; want 8", n, err)
-	}
-	if _, err = os.Stat(filepath.Join(s.root, "item")); !os.IsNotExist(err) {
-		t.Fatalf("prefix directory left behind: %v", err)
-	}
-}
-
-// TestFilesystemDeletePrefixDoesNotFollowSwappedDirectory replaces a
-// directory with a symlink to another key's directory between the Lstat and
-// the descent, as a concurrent writer could, and checks that the other key's
-// file survives.
-func TestFilesystemDeletePrefixDoesNotFollowSwappedDirectory(t *testing.T) {
-	s, err := NewFilesystem(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	for _, key := range []string{"item/h0/image.jpg", "other/h1/image.jpg"} {
-		if err = s.Put(ctx, key, []byte("x")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	root, err := os.OpenRoot(s.root)
+	root, err := os.OpenRoot(fs.root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	info, err := root.Lstat("item/h0")
+	created, err := mkdirAllTracked(root, "a/b/c")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = os.Rename(filepath.Join(s.root, "item", "h0"), filepath.Join(s.root, "item", "moved")); err != nil {
-		t.Fatal(err)
+	if want := []string{"a/b/c", "a/b", "a"}; !slices.Equal(created, want) {
+		t.Fatalf("created = %v, want %v", created, want)
 	}
-	if err = os.Symlink(filepath.Join("..", "other", "h1"), filepath.Join(s.root, "item", "h0")); err != nil {
-		t.Fatal(err)
-	}
-
-	n := 0
-	if err = deleteChildren(ctx, root, "item/h0", info, &n); err == nil || n != 0 {
-		t.Fatalf("descent through swapped directory = %d, %v; want 0 and an error", n, err)
-	}
-	if _, err = os.Stat(filepath.Join(s.root, "other", "h1", "image.jpg")); err != nil {
-		t.Fatalf("file outside the prefix was removed: %v", err)
-	}
-}
-
-// TestFilesystemDeletePrefixContinuesPastStuckEntry checks that one entry
-// that cannot be removed does not leave the rest of the prefix behind.
-func TestFilesystemDeletePrefixContinuesPastStuckEntry(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("directory permissions do not apply to root")
-	}
-	s, err := NewFilesystem(t.TempDir())
+	created, err = mkdirAllTracked(root, "a/b/d")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
-	for i := range 5 {
-		if err = s.Put(ctx, fmt.Sprintf("item/h%d/image.jpg", i), []byte("x")); err != nil {
-			t.Fatal(err)
-		}
+	if want := []string{"a/b/d"}; !slices.Equal(created, want) {
+		t.Fatalf("created = %v, want %v", created, want)
 	}
-	stuck := filepath.Join(s.root, "item", "h1")
-	if err = os.Chmod(stuck, 0o555); err != nil {
+	if created, err = mkdirAllTracked(root, "a/b/d"); err != nil || len(created) != 0 {
+		t.Fatalf("existing dir reported as created: %v, %v", created, err)
+	}
+	if err := fs.Put(t.Context(), "x/y/z/file.webp", []byte("ok")); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(stuck, 0o755) })
-
-	n, err := s.DeletePrefix(ctx, "item")
-	if err == nil || n != 4 {
-		t.Fatalf("delete with a stuck entry = %d, %v; want 4 and an error", n, err)
-	}
-	keys, _, err := s.List(ctx, "item/", "", 100)
-	if err != nil || len(keys) != 1 || keys[0].Key != "item/h1/image.jpg" {
-		t.Fatalf("remaining = %v, %v; want only item/h1/image.jpg", keys, err)
+	if _, err := os.Stat(filepath.Join(fs.root, "x/y/z/file.webp")); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// TestFilesystemDeletePrefixDoesNotFollowSymlinkToSameDirectory renames a
-// directory out of the prefix and leaves a symlink to it under its old name
-// between the Lstat and the descent. The opened directory is still the file
-// Lstat saw, so only the second look at the name catches the swap.
-func TestFilesystemDeletePrefixDoesNotFollowSymlinkToSameDirectory(t *testing.T) {
-	s, err := NewFilesystem(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	for _, key := range []string{"item/h0/image.jpg", "other/keep.jpg"} {
-		if err = s.Put(ctx, key, []byte("x")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	root, err := os.OpenRoot(s.root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = root.Close() }()
-	info, err := root.Lstat("item/h0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = os.Rename(filepath.Join(s.root, "item", "h0"), filepath.Join(s.root, "other", "h0")); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.Symlink(filepath.Join("..", "other", "h0"), filepath.Join(s.root, "item", "h0")); err != nil {
-		t.Fatal(err)
-	}
-
-	n := 0
-	if err = deleteChildren(ctx, root, "item/h0", info, &n); err == nil || n != 0 {
-		t.Fatalf("descent through symlink to the same directory = %d, %v; want 0 and an error", n, err)
-	}
-	if _, err = os.Stat(filepath.Join(s.root, "other", "h0", "image.jpg")); err != nil {
-		t.Fatalf("file outside the prefix was removed: %v", err)
-	}
-}
-
-// TestFilesystemDeletePrefixReadsInBatches deletes a directory with more
-// entries than one batch, including a full batch of entries that cannot be
-// removed, and checks that every removable entry is still deleted.
-func TestFilesystemDeletePrefixReadsInBatches(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("directory permissions do not apply to root")
-	}
-	defer func(old int) { deleteBatch = old }(deleteBatch)
-	deleteBatch = 2
-
-	s, err := NewFilesystem(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	for i := range 7 {
-		if err = s.Put(ctx, fmt.Sprintf("item/h%d/image.jpg", i), []byte("x")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, h := range []string{"h2", "h5"} {
-		stuck := filepath.Join(s.root, "item", h)
-		if err = os.Chmod(stuck, 0o555); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.Chmod(stuck, 0o755) })
-	}
-
-	n, err := s.DeletePrefix(ctx, "item")
-	if err == nil || n != 5 {
-		t.Fatalf("batched delete = %d, %v; want 5 and an error", n, err)
-	}
-	keys, _, err := s.List(ctx, "item/", "", 100)
-	if err != nil || len(keys) != 2 {
-		t.Fatalf("remaining = %v, %v; want the two stuck files", keys, err)
-	}
-}
-
-// cancelingReader cancels its write's context while handing over the last
-// bytes, as a deadline passing mid-write does.
-type cancelingReader struct {
-	data   []byte
-	cancel context.CancelFunc
-}
-
-func (r *cancelingReader) Read(p []byte) (int, error) {
-	r.cancel()
-	n := copy(p, r.data)
-	r.data = r.data[n:]
-	return n, io.EOF
-}
-
-// TestFilesystemCanceledStreamIsNeverPublished: a write whose context ends
-// while it is writing closes and removes its temporary file and publishes
-// nothing, even when its reader finished.
-func TestFilesystemCanceledStreamIsNeverPublished(t *testing.T) {
+func TestFilesystemIdentityIsAbsoluteRoot(t *testing.T) {
 	root := t.TempDir()
-	s, err := NewFilesystem(root)
+	a, err := NewFilesystem(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	err = s.PutStream(ctx, "uploads/part", &cancelingReader{data: []byte("bytes"), cancel: cancel}, "")
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("PutStream = %v, want context.Canceled", err)
+	b, err := NewFilesystem(root + string(filepath.Separator))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := s.Stat(context.Background(), "uploads/part"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("a canceled write was published: %v", err)
+	if a.Identity() != b.Identity() || !strings.HasPrefix(a.Identity(), BackendLocal+"|"+string(filepath.Separator)) {
+		t.Fatalf("identities %q and %q", a.Identity(), b.Identity())
 	}
-	entries, err := os.ReadDir(filepath.Join(root, "uploads"))
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("left behind %v (%v)", entries, err)
+	other, err := NewFilesystem(filepath.Join(root, "other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Identity() == a.Identity() {
+		t.Fatal("different roots share an identity")
 	}
 }

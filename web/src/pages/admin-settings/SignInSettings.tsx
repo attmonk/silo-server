@@ -1,5 +1,4 @@
 import { useMemo, useRef, useState } from "react";
-import { joinList } from "@/lib/appLocale";
 import { useIsMutating } from "@tanstack/react-query";
 import { ArrowRight } from "lucide-react";
 import { Link } from "react-router";
@@ -15,12 +14,11 @@ import {
   useExternalSignInCapabilities,
 } from "@/hooks/queries/admin/externalSignIn";
 import { useAdminUsers } from "@/hooks/queries/admin/users";
-import { useT } from "@/i18n";
 import { useRestartKeys } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import {
   activeSignInInstallation,
-  breakGlassRequiredText,
+  BREAK_GLASS_REQUIRED_TEXT,
   primarySignInInstallations,
 } from "@/lib/externalSignInAdmin";
 import { SaveBar } from "@/components/SaveBar";
@@ -33,7 +31,6 @@ import { useSignInProviderDrafts } from "./useSignInProviderDrafts";
 
 export const LOCAL_LOGIN_KEY = "auth.local_password_login";
 export const EMAIL_MATCH_KEY = "auth.email_auto_match";
-export const USER_API_KEYS_KEY = "auth.user_api_keys";
 // Both only work for Silo-password accounts: the server refuses a signup while
 // password sign-in is off, and a reset needs a local password to replace.
 const PASSWORD_ACCOUNT_KEYS = ["signup.enabled", "password_reset.self_service_enabled"];
@@ -42,13 +39,7 @@ const PASSWORD_ACCOUNT_KEYS = ["signup.enabled", "password_reset.self_service_en
 // support — auth.access_token_expiry, auth.refresh_token_expiry,
 // auth.provider_recheck_interval, auth.provider_recheck_outage_policy.
 // server.public_url is read, not edited: OpenID Connect needs it.
-const KEYS = [
-  LOCAL_LOGIN_KEY,
-  ...PASSWORD_ACCOUNT_KEYS,
-  EMAIL_MATCH_KEY,
-  USER_API_KEYS_KEY,
-  "server.public_url",
-];
+const KEYS = [LOCAL_LOGIN_KEY, ...PASSWORD_ACCOUNT_KEYS, EMAIL_MATCH_KEY, "server.public_url"];
 
 /**
  * Settings → Sign-in: whether Silo passwords still sign in, with public
@@ -59,12 +50,7 @@ const KEYS = [
  * on or off applies at once. The rules are in
  * docs/architecture/external-sign-in.md.
  */
-// Code shown in the Locked out? note: a path and a server command.
-const LOCAL_LOGIN_PATH = "/login?local=1";
-const LOCAL_LOGIN_COMMAND = "silo auth local-login enable";
-
 export default function SignInSettings() {
-  const t = useT();
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
   const restartKeys = useRestartKeys();
   const capabilities = useExternalSignInCapabilities();
@@ -105,11 +91,15 @@ export default function SignInSettings() {
 
   function changeLocalLogin(value: string) {
     if (value === "false" && breakGlassKnown && breakGlass.length === 0) {
-      showLocalError(t("web.admin.settings.signIn.page.noBreakGlassError"));
+      showLocalError(
+        "Password sign-in can't be turned off yet: no admin is a break-glass account. Open an admin on the Users page and turn on Break-glass account first, so someone can still sign in if the provider is down.",
+      );
       return;
     }
     if (value === "false" && providerKnown && !providerOn) {
-      showLocalError(t("web.admin.settings.signIn.page.noProviderError"));
+      showLocalError(
+        "Turn on a sign-in provider first. With password sign-in off and no provider on, only break-glass admins could sign in.",
+      );
       return;
     }
     setLocalError(null);
@@ -131,7 +121,7 @@ export default function SignInSettings() {
       await form.save();
     } catch (error) {
       if (error instanceof V2ProblemError && error.problemType === "break_glass_required") {
-        showLocalError(breakGlassRequiredText());
+        showLocalError(BREAK_GLASS_REQUIRED_TEXT);
       }
       // Every other failure is already reported by the save's own toast.
     }
@@ -139,15 +129,11 @@ export default function SignInSettings() {
 
   if (form.isLoading) {
     return (
-      <div
-        className="space-y-6"
-        role="status"
-        aria-label={t("web.admin.settings.signIn.page.loading")}
-      >
+      <div className="space-y-6" role="status" aria-label="Loading settings">
         <Skeleton className="h-8 w-48" />
         <Skeleton className="h-24 w-full" />
         <Skeleton className="h-24 w-full" />
-        <span className="sr-only">{t("web.admin.settings.signIn.page.loading")}</span>
+        <span className="sr-only">Loading settings</span>
       </div>
     );
   }
@@ -165,52 +151,48 @@ export default function SignInSettings() {
 
   return (
     <div className="flex h-full flex-col">
-      <SettingsPageHeader title={t("web.admin.settings.signIn.page.title")} />
+      <SettingsPageHeader title="Sign-in" />
 
       <div className="flex-1 space-y-5">
         {capabilities.isError || (caps && !supported) ? (
           <p className="text-muted-foreground text-sm" role="status">
-            {t("web.admin.settings.signIn.page.externalUnavailable")}
+            External sign-in isn't available on this server, so only Silo passwords sign in.
           </p>
         ) : null}
 
         <FieldGroup
-          label={t("web.admin.settings.signIn.page.passwordsGroup")}
+          label="Silo passwords"
           dirty={[LOCAL_LOGIN_KEY, ...PASSWORD_ACCOUNT_KEYS].some((key) => form.isDirty(key))}
           actions={
             <Link
               to="/admin/users?tab=invite-codes"
               className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1.5 text-xs font-medium transition-colors"
             >
-              {t("web.admin.settings.signIn.page.manageInviteCodes")}
+              Manage invite codes
               <ArrowRight className="h-3 w-3" aria-hidden="true" />
             </Link>
           }
         >
           <SettingField
-            label={t("web.admin.settings.signIn.page.allowPasswordLabel")}
+            label="Allow password sign-in"
             dirty={form.isDirty(LOCAL_LOGIN_KEY)}
             type="toggle"
-            description={t("web.admin.settings.signIn.page.allowPasswordDescription")}
+            description="Off: everyone signs in with the provider, except break-glass admins. Needs at least one break-glass admin; the server owner is one by default."
             value={localLoginOn ? "true" : "false"}
             onChange={changeLocalLogin}
             status={
               !breakGlassKnown ? null : breakGlass.length > 0 ? (
                 <SettingFieldStatus tone="muted">
-                  {t("web.admin.settings.signIn.page.breakGlassAdmins", {
-                    count: breakGlass.length,
-                    names: joinList(breakGlass.map((user) => user.username)),
-                  })}
+                  Break-glass {breakGlass.length === 1 ? "admin" : "admins"}:{" "}
+                  {breakGlass.map((user) => user.username).join(", ")}
                 </SettingFieldStatus>
               ) : (
                 <SettingFieldStatus tone="warn">
-                  {t("web.admin.settings.signIn.page.noBreakGlassStatus", {
-                    link: (chunks) => (
-                      <Link to="/admin/users" className="underline underline-offset-4">
-                        {chunks}
-                      </Link>
-                    ),
-                  })}
+                  No break-glass admin yet. Turn on Break-glass account on an admin's{" "}
+                  <Link to="/admin/users" className="underline underline-offset-4">
+                    user page
+                  </Link>
+                  .
                 </SettingFieldStatus>
               )
             }
@@ -226,41 +208,36 @@ export default function SignInSettings() {
             </p>
           ) : null}
           <SettingField
-            label={t("web.admin.settings.signIn.page.publicSignupsLabel")}
+            label="Public signups"
             dirty={form.isDirty("signup.enabled")}
             type="toggle"
-            description={t("web.admin.settings.signIn.page.publicSignupsDescription")}
+            description="Anyone with a valid invite code can create an account."
             value={form.getValue("signup.enabled")}
             onChange={(v) => form.setValue("signup.enabled", v)}
             restartRequired={restartKeys.has("signup.enabled")}
-            managedByEnv={form.envVar("signup.enabled")}
           />
           <SettingField
-            label={t("web.admin.settings.signIn.page.passwordResetLabel")}
+            label="Self-service password reset"
             dirty={form.isDirty("password_reset.self_service_enabled")}
             type="toggle"
-            description={t("web.admin.settings.signIn.page.passwordResetDescription")}
+            description="Adds “Forgot password?” to the sign-in page, so people can get a reset link by email. Needs email and the public URL."
             value={form.getValue("password_reset.self_service_enabled")}
             onChange={(v) => form.setValue("password_reset.self_service_enabled", v)}
             restartRequired={restartKeys.has("password_reset.self_service_enabled")}
           />
-          <AdvancedSection
-            id="sign-in.locked-out"
-            title={t("web.admin.settings.signIn.page.lockedOutTitle")}
-          >
+          <AdvancedSection id="sign-in.locked-out" title="Locked out?">
             <p className="settings-field-note text-muted-foreground py-2 text-xs leading-relaxed">
-              {t("web.admin.settings.signIn.page.lockedOutNote", {
-                login_path: LOCAL_LOGIN_PATH,
-                command: LOCAL_LOGIN_COMMAND,
-                code: (chunks) => <code className="font-mono">{chunks}</code>,
-              })}
+              <code className="font-mono">/login?local=1</code> shows the password form for
+              break-glass admins, and{" "}
+              <code className="font-mono">silo auth local-login enable</code> run on the server
+              turns password sign-in back on.
             </p>
           </AdvancedSection>
         </FieldGroup>
 
         <FieldGroup
-          label={t("web.admin.settings.signIn.page.ssoGroup")}
-          description={t("web.admin.settings.signIn.page.ssoDescription")}
+          label="Single sign-on"
+          description="Let people sign in with your identity provider. A server uses one provider at a time."
           dirty={drafts.changeCount > 0 || form.isDirty(EMAIL_MATCH_KEY)}
         >
           <div className="settings-field-note">
@@ -277,15 +254,19 @@ export default function SignInSettings() {
           </div>
           {showEmailMatch ? (
             <SettingField
-              label={t("web.admin.settings.signIn.page.emailMatchLabel")}
+              label="Match existing accounts by email"
               dirty={form.isDirty(EMAIL_MATCH_KEY)}
               type="toggle"
-              description={t("web.admin.settings.signIn.page.emailMatchDescription")}
+              description="A first sign-in connects to the regular Silo account with the same email, when the provider says the email is verified. Admin, owner and break-glass accounts are never matched."
               value={emailMatchOn ? "true" : "false"}
               onChange={(value) => form.setValue(EMAIL_MATCH_KEY, value)}
               status={
                 <SettingFieldStatus tone={emailMatchOn ? "warn" : "muted"}>
-                  {t("web.admin.settings.signIn.page.emailMatchWarning")}
+                  Whoever controls that email at the provider takes over the Silo account. Silo
+                  doesn't verify account emails, so the account matched is whichever one registered
+                  or set the address first; matching signs it out everywhere and deletes its API
+                  keys. Turn this on only if the provider verifies every email and people can't
+                  change their own.
                 </SettingFieldStatus>
               }
             />
@@ -293,20 +274,6 @@ export default function SignInSettings() {
         </FieldGroup>
 
         <NetworkSignInSection installations={installations.data} />
-
-        <FieldGroup
-          label={t("web.admin.settings.signIn.page.apiKeysGroup")}
-          dirty={form.isDirty(USER_API_KEYS_KEY)}
-        >
-          <SettingField
-            label={t("web.admin.settings.signIn.page.userApiKeysLabel")}
-            dirty={form.isDirty(USER_API_KEYS_KEY)}
-            type="toggle"
-            description={t("web.admin.settings.signIn.page.userApiKeysDescription")}
-            value={form.getValue(USER_API_KEYS_KEY) === "true" ? "true" : "false"}
-            onChange={(value) => form.setValue(USER_API_KEYS_KEY, value)}
-          />
-        </FieldGroup>
       </div>
 
       <SaveBar

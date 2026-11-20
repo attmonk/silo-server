@@ -28,11 +28,7 @@ export interface ActivityEntry {
   id: string;
   at: number;
   kind: ActivityKind;
-  /**
-   * Display name of the member the entry is about, when there is one. A
-   * suggestion whose suggester has left has none; the feed names them at
-   * render time, in the current language.
-   */
+  /** Display name of the member the entry is about, when there is one. */
   who?: string;
   /** Free text detail: a title, a mode, a playback state. */
   detail?: string;
@@ -46,11 +42,13 @@ function suggesterName(
   room: WatchTogetherRoomSnapshot | null,
   suggestion: WatchTogetherSuggestion,
 ) {
-  return room?.members?.find(
-    (member) =>
-      member.user_id === suggestion.suggester_user_id &&
-      member.profile_id === suggestion.suggester_profile_id,
-  )?.display_name;
+  return (
+    room?.members?.find(
+      (member) =>
+        member.user_id === suggestion.suggester_user_id &&
+        member.profile_id === suggestion.suggester_profile_id,
+    )?.display_name ?? "Someone"
+  );
 }
 
 export function diffSnapshots(

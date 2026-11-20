@@ -242,7 +242,6 @@ var itemColumnNames = []string{
 	"matched_at", "last_refreshed", "refresh_failures",
 	"episode_metadata_incomplete", "episode_metadata_last_checked_at", "locked_fields", "status", "created_at", "updated_at",
 	advisoryAgeColumn, advisorySourceColumn,
-	"digital_release_date::text", "physical_release_date::text",
 }
 
 // nullableStringItemColumns are media_items columns that may hold NULL but
@@ -381,8 +380,6 @@ func scanItem(row pgx.Row) (*models.MediaItem, error) {
 		&item.UpdatedAt,
 		&item.AdvisoryAge,
 		&item.AdvisorySource,
-		&item.DigitalReleaseDate,
-		&item.PhysicalReleaseDate,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -461,8 +458,6 @@ func listItemScanDests(item *models.MediaItem) []any {
 		&item.UpdatedAt,
 		&item.AdvisoryAge,
 		&item.AdvisorySource,
-		&item.DigitalReleaseDate,
-		&item.PhysicalReleaseDate,
 	}
 }
 
@@ -643,26 +638,6 @@ func (r *ItemRepository) upsert(ctx context.Context, execer itemExecer, item *mo
 	return err
 }
 
-// itemArtworkAssignments keeps an item's artwork slots that an admin pick
-// locked after the writer read the item; see lockedArtworkAssignments.
-var itemArtworkAssignments = func() string {
-	locked := imagesLockedSQL("media_items.locked_fields")
-	slots := [][]string{
-		{"poster_path", "poster_source_path", "poster_thumbhash"},
-		{"backdrop_path", "backdrop_source_path", "backdrop_thumbhash"},
-		{"logo_path", "logo_source_path"},
-		{"banner_path", "banner_source_path", "banner_thumbhash"},
-		{"thumb_path", "thumb_source_path", "thumb_thumbhash"},
-		{"clearart_path", "clearart_source_path"},
-		{"disc_path", "disc_source_path"},
-	}
-	assignments := make([]string, len(slots))
-	for i, slot := range slots {
-		assignments[i] = lockedArtworkAssignments("media_items", locked, slot...)
-	}
-	return strings.Join(assignments, ",\n\t\t\t")
-}()
-
 // writeItem inserts item and, when update is set, overwrites every mutable
 // field of an existing row. It reports whether a row was written. An update
 // that leaves the item matched also clears match_ignored_at, since an
@@ -690,8 +665,7 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			content_rating_age,
 			advisory_age, advisory_source,
 			banner_path, banner_source_path, banner_thumbhash, thumb_path, thumb_source_path, thumb_thumbhash,
-			clearart_path, clearart_source_path, disc_path, disc_source_path,
-			digital_release_date, physical_release_date
+			clearart_path, clearart_source_path, disc_path, disc_source_path
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8,
 			$9, $10, $11, $12,
@@ -706,8 +680,7 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			$48,
 			$49, $50,
 			$51, $52, $53, $54, $55, $56,
-			$57, $58, $59, $60,
-			$61, $62
+			$57, $58, $59, $60
 		)`
 	conflict := `
 		ON CONFLICT (content_id) DO NOTHING`
@@ -722,10 +695,7 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			year = EXCLUDED.year,
 			genres = EXCLUDED.genres,
 			content_rating = EXCLUDED.content_rating,
-			-- Audiobook runtime is maintained from active files. Preserve the
-			-- current value even when a metadata request read an older one.
-			runtime = CASE WHEN media_items.type = 'audiobook'
-				THEN media_items.runtime ELSE EXCLUDED.runtime END,
+			runtime = EXCLUDED.runtime,
 			overview = EXCLUDED.overview,
 			tagline = EXCLUDED.tagline,
 			rating_imdb = EXCLUDED.rating_imdb,
@@ -735,7 +705,14 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			imdb_id = EXCLUDED.imdb_id,
 			tmdb_id = EXCLUDED.tmdb_id,
 			tvdb_id = EXCLUDED.tvdb_id,
-			` + itemArtworkAssignments + `,
+			poster_path = EXCLUDED.poster_path,
+			poster_source_path = EXCLUDED.poster_source_path,
+			poster_thumbhash = EXCLUDED.poster_thumbhash,
+			backdrop_path = EXCLUDED.backdrop_path,
+			backdrop_source_path = EXCLUDED.backdrop_source_path,
+			backdrop_thumbhash = EXCLUDED.backdrop_thumbhash,
+			logo_path = EXCLUDED.logo_path,
+			logo_source_path = EXCLUDED.logo_source_path,
 			metadata_s3_path = EXCLUDED.metadata_s3_path,
 			metadata_etag = EXCLUDED.metadata_etag,
 			season_count = EXCLUDED.season_count,
@@ -745,8 +722,6 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			keywords = EXCLUDED.keywords,
 			original_language = EXCLUDED.original_language,
 			release_date = EXCLUDED.release_date,
-			digital_release_date = EXCLUDED.digital_release_date,
-			physical_release_date = EXCLUDED.physical_release_date,
 			first_air_date = EXCLUDED.first_air_date,
 			last_air_date = EXCLUDED.last_air_date,
 			air_time = EXCLUDED.air_time,
@@ -762,6 +737,16 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 			content_rating_age = EXCLUDED.content_rating_age,
 			advisory_age = EXCLUDED.advisory_age,
 			advisory_source = EXCLUDED.advisory_source,
+			banner_path = EXCLUDED.banner_path,
+			banner_source_path = EXCLUDED.banner_source_path,
+			banner_thumbhash = EXCLUDED.banner_thumbhash,
+			thumb_path = EXCLUDED.thumb_path,
+			thumb_source_path = EXCLUDED.thumb_source_path,
+			thumb_thumbhash = EXCLUDED.thumb_thumbhash,
+			clearart_path = EXCLUDED.clearart_path,
+			clearart_source_path = EXCLUDED.clearart_source_path,
+			disc_path = EXCLUDED.disc_path,
+			disc_source_path = EXCLUDED.disc_source_path,
 			updated_at = NOW()`
 	}
 
@@ -831,8 +816,6 @@ func (r *ItemRepository) writeItem(ctx context.Context, execer itemExecer, item 
 		item.ClearArtSourcePath,
 		item.DiscPath,
 		item.DiscSourcePath,
-		item.DigitalReleaseDate,
-		item.PhysicalReleaseDate,
 	)
 	if err != nil {
 		return false, fmt.Errorf("writing media item: %w", err)
@@ -915,24 +898,13 @@ func (r *ItemRepository) GetStatusByIDs(ctx context.Context, ids []string) (map[
 // (libraryAccessConditions), the same semantics EnsureAccessible and
 // EnsureAccessibleIDs enforce.
 func (r *ItemRepository) GetByIDsWithAccess(ctx context.Context, contentIDs []string, access AccessFilter) ([]*models.MediaItem, error) {
-	return r.getByIDsWithAccess(ctx, contentIDs, access, itemAccessConditions)
-}
-
-// GetListedByIDsWithAccess is GetByIDsWithAccess for a listing built from
-// stored IDs, such as a collection's member page: it also leaves out items in
-// no library, as listedItemAccessConditions does.
-func (r *ItemRepository) GetListedByIDsWithAccess(ctx context.Context, contentIDs []string, access AccessFilter) ([]*models.MediaItem, error) {
-	return r.getByIDsWithAccess(ctx, contentIDs, access, listedItemAccessConditions)
-}
-
-func (r *ItemRepository) getByIDsWithAccess(ctx context.Context, contentIDs []string, access AccessFilter, conditions itemConditions) ([]*models.MediaItem, error) {
 	if len(contentIDs) == 0 {
 		return []*models.MediaItem{}, nil
 	}
 	if access.AllowedLibraryIDs != nil && len(access.AllowedLibraryIDs) == 0 {
 		return []*models.MediaItem{}, nil
 	}
-	sql, args := r.buildGetByIDsWithAccessSQL(contentIDs, access, conditions)
+	sql, args := r.buildGetByIDsWithAccessSQL(contentIDs, access)
 	rows, err := r.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("fetching media items by IDs with access: %w", err)
@@ -941,17 +913,14 @@ func (r *ItemRepository) getByIDsWithAccess(ctx context.Context, contentIDs []st
 	return scanItems(rows)
 }
 
-// itemConditions renders access predicates over media_items mi.
-type itemConditions func(access AccessFilter, args *[]any, argIdx *int) []string
-
-func (r *ItemRepository) buildGetByIDsWithAccessSQL(contentIDs []string, access AccessFilter, conditions itemConditions) (string, []any) {
+func (r *ItemRepository) buildGetByIDsWithAccessSQL(contentIDs []string, access AccessFilter) (string, []any) {
 	sql := `SELECT ` + itemColumns + `
             FROM media_items mi
             WHERE mi.content_id = ANY($1)`
 	args := []any{contentIDs}
 	argIdx := 2
 
-	for _, c := range conditions(access, &args, &argIdx) {
+	for _, c := range itemAccessConditions(access, &args, &argIdx) {
 		sql += "\n            AND " + c
 	}
 
@@ -966,18 +935,6 @@ func itemAccessConditions(access AccessFilter, args *[]any, argIdx *int) []strin
 	var conditions []string
 	appendLibraryAccessConditions("mi.content_id", access, &conditions, args, argIdx)
 	applyAccessFilter("mi", AccessFilter{MaturityLimits: access.MaturityLimits, ExcludedMediaTypes: access.ExcludedMediaTypes}, &conditions, args, argIdx)
-	return conditions
-}
-
-// listedItemAccessConditions is itemAccessConditions for listings and their
-// counts: with no library restriction it still requires the item to be in a
-// library, so an item held only by the scanner's file removal grace is left
-// out (see InSomeLibraryWhere).
-func listedItemAccessConditions(access AccessFilter, args *[]any, argIdx *int) []string {
-	conditions := itemAccessConditions(access, args, argIdx)
-	if access.AllowedLibraryIDs == nil && len(access.DisabledLibraryIDs) == 0 {
-		conditions = append(conditions, InSomeLibraryWhere("mi.content_id"))
-	}
 	return conditions
 }
 
@@ -1017,7 +974,7 @@ func buildCountVisiblePersonalCollectionMembersSQL(userID int, collectionIDs []s
             WHERE upci.user_id = $1 AND upci.collection_id = ANY($2) AND upci.sub_item_id = ''`
 	args := []any{userID, collectionIDs}
 	argIdx := 3
-	for _, c := range listedItemAccessConditions(access, &args, &argIdx) {
+	for _, c := range itemAccessConditions(access, &args, &argIdx) {
 		sql += "\n            AND " + c
 	}
 	// The catalog view never lists manga chapters as items.
@@ -2324,10 +2281,10 @@ func appendSearchScopeFilters(itemTypes []string, filter AccessFilter, condition
 	// passing and a disabled library must not slip through. The old JOIN +
 	// NOT(mil.media_folder_id = ANY(...)) form let the passing membership row
 	// satisfy the deny check (audit 2026-05-01 §3.3), so both the FTS search and
-	// the fuzzy fallback that share this helper used it. The helper emits
-	// independent EXISTS/NOT EXISTS subqueries keyed on mi.content_id and needs
-	// no JOIN, and as a listing it leaves out an item in no library.
-	appendListedLibraryAccessConditions("mi.content_id", filter, conditions, args, argIdx)
+	// the fuzzy fallback that share this helper used it. appendLibraryAccessConditions
+	// emits independent EXISTS/NOT EXISTS subqueries keyed on mi.content_id and
+	// needs no JOIN.
+	appendLibraryAccessConditions("mi.content_id", filter, conditions, args, argIdx)
 
 	applyAccessFilter("mi", AccessFilter{MaturityLimits: filter.MaturityLimits, ExcludedMediaTypes: filter.ExcludedMediaTypes}, conditions, args, argIdx)
 
@@ -2696,55 +2653,15 @@ func (r *ItemRepository) ReplacePeople(ctx context.Context, contentID string, pe
 	}
 	defer tx.Rollback(ctx)
 
-	if err := r.ReplacePeopleTx(ctx, tx, contentID, people); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
-// ReplacePeopleTx is ReplacePeople in the caller's transaction.
-func (r *ItemRepository) ReplacePeopleTx(ctx context.Context, tx pgx.Tx, contentID string, people []models.ItemPerson) error {
 	if _, err := tx.Exec(ctx, "DELETE FROM item_people WHERE content_id = $1", contentID); err != nil {
 		return fmt.Errorf("delete existing people: %w", err)
 	}
-	return r.insertPeopleTx(ctx, tx, contentID, people)
-}
 
-// PersonKindsOf returns the distinct credit kinds in people, in first-seen
-// order.
-func PersonKindsOf(people []models.ItemPerson) []models.PersonKind {
-	var kinds []models.PersonKind
-	for _, p := range people {
-		if !slices.Contains(kinds, p.Kind) {
-			kinds = append(kinds, p.Kind)
-		}
-	}
-	return kinds
-}
-
-// ReplacePeopleKindsTx replaces only the credits of the given kinds in the
-// caller's transaction and leaves every other kind on the item as it is.
-func (r *ItemRepository) ReplacePeopleKindsTx(ctx context.Context, tx pgx.Tx, contentID string, kinds []models.PersonKind, people []models.ItemPerson) error {
-	if len(kinds) == 0 {
-		return nil
-	}
-	kindValues := make([]int, len(kinds))
-	for i, k := range kinds {
-		kindValues[i] = int(k)
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM item_people WHERE content_id = $1 AND kind = ANY($2)", contentID, kindValues); err != nil {
-		return fmt.Errorf("delete existing people: %w", err)
-	}
-	return r.insertPeopleTx(ctx, tx, contentID, people)
-}
-
-// insertPeopleTx inserts credits and queues the item's search-index update.
-func (r *ItemRepository) insertPeopleTx(ctx context.Context, tx pgx.Tx, contentID string, people []models.ItemPerson) error {
 	if len(people) == 0 {
 		if err := r.searchIndexEvents.EnqueueUpsert(ctx, tx, contentID); err != nil {
 			return fmt.Errorf("enqueueing catalog search people update: %w", err)
 		}
-		return nil
+		return tx.Commit(ctx)
 	}
 
 	// Deduplicate by (person_id, kind, character) — PostgreSQL's ON CONFLICT
@@ -2791,20 +2708,8 @@ func (r *ItemRepository) insertPeopleTx(ctx context.Context, tx pgx.Tx, contentI
 	if err := r.searchIndexEvents.EnqueueUpsert(ctx, tx, contentID); err != nil {
 		return fmt.Errorf("enqueueing catalog search people update: %w", err)
 	}
-	return nil
-}
 
-// ClearPeopleTx removes every credit on a media item in the caller's
-// transaction, so the change commits or fails with the item write it belongs
-// to.
-func (r *ItemRepository) ClearPeopleTx(ctx context.Context, tx pgx.Tx, contentID string) error {
-	if _, err := tx.Exec(ctx, "DELETE FROM item_people WHERE content_id = $1", contentID); err != nil {
-		return fmt.Errorf("delete existing people: %w", err)
-	}
-	if err := r.searchIndexEvents.EnqueueUpsert(ctx, tx, contentID); err != nil {
-		return fmt.Errorf("enqueueing catalog search people update: %w", err)
-	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // GetPeople returns all people credited on a media item via the item_people + people JOIN.
@@ -2832,15 +2737,12 @@ func (r *ItemRepository) GetPeople(ctx context.Context, contentID string) ([]mod
 // cleared rating also loses its per-source row. Always bumps updated_at.
 // Returns ErrItemNotFound if no row matches contentID.
 func (r *ItemRepository) UpdateMetadata(ctx context.Context, contentID string, upd *MetadataUpdate) error {
-	tx, err := r.pool.BeginTx(ctx, MetadataCurationTxOptions(ctx))
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin metadata update tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	if err := lockCuratedProviderIDs(ctx, tx, contentID, upd); err != nil {
-		return err
-	}
 	if err := r.UpdateMetadataTx(ctx, tx, contentID, upd); err != nil {
 		return err
 	}
@@ -2848,57 +2750,6 @@ func (r *ItemRepository) UpdateMetadata(ctx context.Context, contentID string, u
 		return fmt.Errorf("commit metadata update tx: %w", err)
 	}
 	return nil
-}
-
-// UpdateProvisionalArtwork applies upd, an artwork-only update, to the item
-// read describes while that item is still pending, unmatched or ambiguous,
-// its images lock is as read had it, and each poster, backdrop or logo slot upd
-// writes still has read's source. A match, an Identify, or an admin's artwork
-// pick or lock that committed since the read wins: nothing is written and it
-// returns false.
-func (r *ItemRepository) UpdateProvisionalArtwork(ctx context.Context, read *models.MediaItem, upd *MetadataUpdate) (bool, error) {
-	contentID := read.ContentID
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("begin provisional artwork update tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // a no-op once committed
-
-	// A slot upd leaves alone is not compared (NULL expected source).
-	expected := func(written *string, source string) *string {
-		if written == nil {
-			return nil
-		}
-		return &source
-	}
-	var one int
-	err = tx.QueryRow(ctx, `
-		SELECT 1 FROM media_items
-		WHERE content_id = $1
-		  AND lower(trim(status)) IN ('pending', 'unmatched', 'ambiguous')
-		  AND ($2::text IS NULL OR COALESCE(poster_source_path, '') = $2)
-		  AND ($3::text IS NULL OR COALESCE(backdrop_source_path, '') = $3)
-		  AND ($4::text IS NULL OR COALESCE(logo_source_path, '') = $4)
-		  AND COALESCE(`+imagesLockedSQL("locked_fields")+`, false) = $5
-		FOR UPDATE`, contentID,
-		expected(upd.PosterSourcePath, read.PosterSourcePath),
-		expected(upd.BackdropSourcePath, read.BackdropSourcePath),
-		expected(upd.LogoSourcePath, read.LogoSourcePath),
-		slices.Contains(read.LockedFields, fieldImagesLocked),
-	).Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("locking provisional item artwork: %w", err)
-	}
-	if err := r.UpdateMetadataTx(ctx, tx, contentID, upd); err != nil {
-		return false, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("commit provisional artwork update tx: %w", err)
-	}
-	return true, nil
 }
 
 // UpdateMetadataTx applies the same metadata update using the caller's
@@ -3022,30 +2873,12 @@ func (r *ItemRepository) UpdateMetadataTx(ctx context.Context, tx pgx.Tx, conten
 		strings.Join(setClauses, ", "), argIdx)
 	args = append(args, contentID)
 
-	// The item's ID columns before the edit, read under the lock the UPDATE
-	// takes anyway; the durable-ID sync below skips an ID this edit resends.
-	var storedTMDB, storedIMDb, storedTVDB string
-	if upd.TmdbID != nil || upd.ImdbID != nil || upd.TvdbID != nil {
-		err := tx.QueryRow(ctx, `
-			SELECT COALESCE(tmdb_id, ''), COALESCE(imdb_id, ''), COALESCE(tvdb_id, '')
-			FROM media_items WHERE content_id = $1 FOR NO KEY UPDATE`, contentID).Scan(&storedTMDB, &storedIMDb, &storedTVDB)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("reading edited item provider ids: %w", err)
-		}
-	}
 	tag, err := tx.Exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("updating media item metadata: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrItemNotFound
-	}
-	if upd.Runtime != nil || upd.LockedFields != nil {
-		// Removing the runtime lock restores the file-derived value even
-		// when an unchanged audiobook will be skipped by the next scan.
-		if _, err := tx.Exec(ctx, `SELECT refresh_audiobook_runtime(ARRAY[$1]::text[])`, contentID); err != nil {
-			return fmt.Errorf("refreshing audiobook runtime: %w", err)
-		}
 	}
 	// The UPDATE above locked the item row before its rating sources, the
 	// order every rating source writer follows (see lockRatingSourceItem).
@@ -3057,83 +2890,8 @@ func (r *ItemRepository) UpdateMetadataTx(ctx context.Context, tx pgx.Tx, conten
 			return fmt.Errorf("deleting cleared rating sources: %w", err)
 		}
 	}
-	for _, edited := range []struct {
-		provider string
-		value    *string
-		stored   string
-	}{
-		{contentid.ProviderTMDB, upd.TmdbID, storedTMDB},
-		{contentid.ProviderTVDB, upd.TvdbID, storedTVDB},
-		{contentid.ProviderIMDB, upd.ImdbID, storedIMDb},
-	} {
-		// Only a changed ID is a choice, as lockCuratedProviderIDs judges it: an
-		// edit form resends unchanged IDs, and a curator's scope check skips
-		// them, so their durable rows stay as they are.
-		if edited.value == nil || strings.EqualFold(strings.TrimSpace(*edited.value), strings.TrimSpace(edited.stored)) {
-			continue
-		}
-		if err := syncEditedProviderIDTx(ctx, tx, contentID, edited.provider, *edited.value); err != nil {
-			return err
-		}
-	}
 	if err := r.searchIndexEvents.EnqueueUpsert(ctx, tx, contentID); err != nil {
 		return fmt.Errorf("enqueueing catalog search metadata update: %w", err)
-	}
-	return nil
-}
-
-// syncEditedProviderIDTx makes the item's durable provider ID for provider
-// match an edited ID column. Lookups, AttachTMDBID and a refresh's ID seeding
-// read the durable row, so leaving it would keep the replaced or cleared ID
-// in use. Callers sync providers in preferredProviderIDOrder, the order
-// ReplaceByContentIDTx writes them in, so the two can't wait on each other.
-//
-// An ID another item of the same type already holds stays on the column only,
-// as before this sync existed; the next refresh's conflict recovery decides
-// between the two items. The NOT EXISTS check settles that without waiting on
-// the holder's row, so two edits that swap IDs don't deadlock. A holder that
-// commits after the check fails the insert on the unique key instead; the
-// savepoint confines that failure to the durable row, so the edit still saves.
-// ReplaceByContentID and the provider-ID drift repair lock the item before its
-// rows, so they wait for the edit; the upsert overwrites a row any other
-// writer puts back between the delete and the insert.
-func syncEditedProviderIDTx(ctx context.Context, tx pgx.Tx, contentID, provider, value string) error {
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM media_item_provider_ids
-		WHERE content_id = $1 AND lower(provider) = $2`, contentID, provider); err != nil {
-		return fmt.Errorf("deleting edited %s provider id: %w", provider, err)
-	}
-	if value == "" {
-		return nil
-	}
-	savepoint, err := tx.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("storing edited %s provider id: %w", provider, err)
-	}
-	defer savepoint.Rollback(ctx) //nolint:errcheck // a no-op once the savepoint is released
-	_, err = savepoint.Exec(ctx, `
-		INSERT INTO media_item_provider_ids (content_id, item_type, provider, provider_id, created_at, updated_at)
-		SELECT mi.content_id, mi.type, $2, $3, NOW(), NOW()
-		FROM media_items mi
-		WHERE mi.content_id = $1
-		  AND NOT EXISTS (
-			SELECT 1 FROM media_item_provider_ids held
-			WHERE held.provider = $2 AND held.provider_id = $3
-			  AND held.item_type = mi.type AND held.content_id <> mi.content_id
-		  )
-		ON CONFLICT (content_id, provider) DO UPDATE
-		SET item_type = EXCLUDED.item_type,
-		    provider_id = EXCLUDED.provider_id,
-		    updated_at = NOW()`, contentID, provider, value)
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok &&
-		pgErr.Code == "23505" && pgErr.ConstraintName == "media_item_provider_ids_provider_provider_id_item_type_key" {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("storing edited %s provider id: %w", provider, err)
-	}
-	if err := savepoint.Commit(ctx); err != nil {
-		return fmt.Errorf("storing edited %s provider id: %w", provider, err)
 	}
 	return nil
 }
@@ -3408,9 +3166,7 @@ func lookupExternalIDsSQL() string {
 		),
 		direct_matches AS (
 			SELECT r.query_tmdb_id, mi.content_id, r.provider, mil.media_folder_id::text, mi.title, r.ord,
-			       CASE r.provider WHEN 'tmdb' THEN 0 WHEN 'tvdb' THEN 1 WHEN 'imdb' THEN 2 ELSE 3 END AS provider_rank,
-			       COALESCE(mi.tmdb_id, '') AS item_tmdb_id, COALESCE(mi.tvdb_id, '') AS item_tvdb_id,
-			       COALESCE(mi.imdb_id, '') AS item_imdb_id
+			       CASE r.provider WHEN 'tmdb' THEN 0 WHEN 'tvdb' THEN 1 WHEN 'imdb' THEN 2 ELSE 3 END AS provider_rank
 			FROM requested r
 			JOIN media_items mi
 			  ON mi.type = $5
@@ -3425,9 +3181,7 @@ func lookupExternalIDsSQL() string {
 		),
 		provider_matches AS (
 			SELECT r.query_tmdb_id, mi.content_id, r.provider, mil.media_folder_id::text, mi.title, r.ord,
-			       CASE r.provider WHEN 'tmdb' THEN 0 WHEN 'tvdb' THEN 1 WHEN 'imdb' THEN 2 ELSE 3 END AS provider_rank,
-			       COALESCE(mi.tmdb_id, '') AS item_tmdb_id, COALESCE(mi.tvdb_id, '') AS item_tvdb_id,
-			       COALESCE(mi.imdb_id, '') AS item_imdb_id
+			       CASE r.provider WHEN 'tmdb' THEN 0 WHEN 'tvdb' THEN 1 WHEN 'imdb' THEN 2 ELSE 3 END AS provider_rank
 			FROM requested r
 			JOIN media_item_provider_ids mip
 			  ON mip.provider = r.provider
@@ -3438,10 +3192,8 @@ func lookupExternalIDsSQL() string {
 			JOIN media_folders mf ON mf.id = mil.media_folder_id
 			WHERE mf.enabled = true
 		)
-		-- Every match, best first per query_tmdb_id. LookupExternalIDs keeps
-		-- the first one that names the requested title.
-		SELECT query_tmdb_id, content_id, provider, media_folder_id, title, ord,
-		       item_tmdb_id, item_tvdb_id, item_imdb_id
+		SELECT DISTINCT ON (query_tmdb_id)
+		       query_tmdb_id, content_id, provider, media_folder_id, title
 		FROM (
 			SELECT * FROM direct_matches
 			UNION ALL
@@ -3491,39 +3243,11 @@ func (r *ItemRepository) LookupExternalIDs(
 	defer rows.Close()
 
 	out := make([]ExternalIDMatchRow, 0)
-	matched := make(map[string]bool)
 	for rows.Next() {
 		var row ExternalIDMatchRow
-		var ord int32
-		var itemTMDB, itemTVDB, itemIMDb string
-		if err := rows.Scan(&row.QueryTMDBID, &row.MediaID, &row.MatchedProvider, &row.LibraryID, &row.Title,
-			&ord, &itemTMDB, &itemTVDB, &itemIMDb); err != nil {
+		if err := rows.Scan(&row.QueryTMDBID, &row.MediaID, &row.MatchedProvider, &row.LibraryID, &row.Title); err != nil {
 			return nil, fmt.Errorf("scanning external id lookup row: %w", err)
 		}
-		if matched[row.QueryTMDBID] {
-			continue
-		}
-		// A TVDB or IMDb match stands in for the requested TMDB ID only when
-		// the item is not another title by the type's anchor precedence: an
-		// item holding a different TMDB ID is another movie, while a series
-		// sharing the TVDB ID is the same show whatever its TMDB ID.
-		if row.MatchedProvider != contentid.ProviderTMDB {
-			candidate := candidates[ord]
-			requested := map[string]string{
-				contentid.ProviderTMDB: candidate.TMDBID,
-				contentid.ProviderTVDB: candidate.TVDBID,
-				contentid.ProviderIMDB: candidate.IMDbID,
-			}
-			item := map[string]string{
-				contentid.ProviderTMDB: itemTMDB,
-				contentid.ProviderTVDB: itemTVDB,
-				contentid.ProviderIMDB: itemIMDb,
-			}
-			if IdentityProviderIDsContradict(mediaType, requested, item) {
-				continue
-			}
-		}
-		matched[row.QueryTMDBID] = true
 		out = append(out, row)
 	}
 	if err := rows.Err(); err != nil {

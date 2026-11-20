@@ -13,10 +13,10 @@ lifecycle; `internal/mediasample` decodes and tiles the frames (see
 A library opts in through `trickplay_enabled` on the v2 library resources
 (`createLibrary`, `updateLibrary`); `trickplay_supported` reports whether the
 server can generate them (an assets store is configured), and
-`GET /api/v2/libraries/capabilities` reports `trickplay: true`. Turning it on or off, or changing
-the library's type or whether it is enabled, runs a reconcile pass right away
-on the server that handled the change; turning it off, disabling the library,
-or changing it to a non-video type deletes the library's previews.
+`GET /api/v2/libraries/capabilities` reports `trickplay: true`. The frozen
+v1 library bodies neither read nor write it. Turning it on or off runs a
+reconcile pass right away on the server that handled the change; turning it
+off deletes the library's previews.
 
 ## The row
 
@@ -40,11 +40,8 @@ own publish.
 Every server works the queue; the work per file is independent, so nothing
 serializes it across servers.
 
-- A claim takes the due `pending` row of the newest file (the highest
-  `media_file_id`) with `FOR UPDATE SKIP LOCKED`, after any rows an
-  administrator queued for regeneration, so new files get previews before
-  a backlog and a retry that has come due does not wait behind it. It
-  leases the row with a fresh attempt token stored
+- A claim takes the due `pending` row that has waited longest with
+  `FOR UPDATE SKIP LOCKED`, and leases it with a fresh attempt token stored
   in `lease_owner`. It records the file's size, hash, and duration at that
   moment (`source_*`).
 - The worker renews its lease while it runs. A lease that runs out, because
@@ -67,10 +64,7 @@ serializes it across servers.
 `recipe_version` is the newest generation algorithm (`AlgorithmVersion`)
 that has touched a row. A server claims, requeues, and invalidates only rows
 at or below its own version, so servers on different versions during a
-rolling upgrade never undo each other's work. The one exception is the HDR
-conversion check (reconcile step 5), which servers at the same version but
-with a different classification can repeat, at most once per walk of the
-queue.
+rolling upgrade never undo each other's work.
 
 ## Reconcile
 
@@ -82,29 +76,12 @@ so a large library drains without waiting for the next scheduled task:
 1. Reclaims expired leases, as above.
 2. Adds the probed video files (with a duration and a video stream) of
    opted-in libraries that have no row.
-3. Deletes the rows of libraries that opted out, are disabled, or no longer
-   have a video type; their sheets are queued for deletion.
+3. Deletes the rows of libraries that opted out; their sheets are queued for
+   deletion.
 4. Requeues finished rows whose sheets no longer fit: made by an older
    algorithm, with other settings (`published_recipe`), in another store, or
    from a different file. An `unusable` row is requeued when its file
    changes.
-5. Checks the HDR conversion of the finished rows among the next 5,000 queue
-   rows, in file order from a cursor kept in the database
-   (`trickplay_tone_map_cursor`), so the whole queue is covered over successive
-   passes on whichever servers run them, at a bounded cost per pass. Rows
-   checked do not continue a pass; only a full batch of requeues does.
-   `tone_map_source` records the conversion the published sheets were made with
-   (`toneMapKey`: `none`, `best_effort`, or the `tonemap.SourceKind`). A row
-   whose file's catalog facts now call for another one is requeued: a rescan or
-   backfill rewrote its color facts without changing the file, such as an HDR10
-   file first recorded as limited range and later as full range. Requeuing,
-   here and in step 4, clears `tone_map_source`, so sheets a server that does
-   not record it republishes are adopted rather than requeued again. A row
-   without one (published before the column existed) takes the conversion its
-   facts call for, except `pq_full_range`, which arrived after sheets were
-   first published: those are made again. A server whose classification of the
-   same facts differs from another's requeues an affected file at most once per
-   walk of the queue while both run.
 
 ## Generation
 
@@ -151,14 +128,10 @@ and runs each file at idle CPU and I/O priority:
   signal: no chain without its RPU can show that base.
 - Hardware decode follows `playback.hw_accel` and `playback.hw_device`
   (QSV, VAAPI, VideoToolbox, and NVENC's CUDA decoder), with a software
-  attempt after a hardware failure, except when the hardware attempt on this
-  server found no video stream (`no_stream`). A GPU that cannot decode the codec fails
+  attempt after a hardware failure. A GPU that cannot decode the codec fails
   its attempt as `unsupported`, logged at debug rather than as the
   accelerator's first failure. Attempt timeouts grow with the samples: two minutes plus half a
-  second a sample on hardware, two seconds a sample in software. A
-  reference-picture read gets the chunk's playing time on top (see
-  [media sampling](media-sampling.md#sheets)), and a request to a node
-  waits that long too.
+  second a sample on hardware, two seconds a sample in software.
 - A file selected for local extraction that this server cannot read
   (an offline mount) is given back for an hour without counting a failure;
   `invalid_data` and `no_stream` mark it unusable; any other failure counts and backs off.
@@ -224,36 +197,28 @@ the lease, and the uploads; a node only decodes and tiles
 (`POST /trickplay/extract`, see
 [worker protocol](worker-http-protocol.md)).
 
-- A node is eligible while it is enabled, healthy, its stored capability
-  report is current (the hash its last health check named matches it, once a
-  check has run), and that report advertises the
+- A node is eligible while it is enabled, healthy, and advertises the
   `trickplay_extract_v2` transport feature, so nodes that would ignore the
   tone-map source signal (`trickplay_extract_v1` alone) are never sent
   work. Nodes keep advertising v1 for older API servers. The API server reserves capacity through the node planner shared
   with playback and downloads and chooses among nodes by available capacity
   and load. Those provisional reservations belong to one API process; a node's
   reported load accounts for work accepted from other replicas.
-- A node takes up to `playback.trickplay_node_capacity` runs at once
-  (default 1, at most 64, applied live, counted across every API server that
-  sends it work) and refuses the next at once with `node_busy` rather than
-  queueing it. Each run counts in the node's reported active jobs, so it
-  takes one of the node's `max_jobs` slots from playback while it runs. `node_busy`, `node_unavailable`, a
+- A node takes one run at a time. `node_busy`, `node_unavailable`, a
   refused request, or a connection that drops moves the run to the next
-  node. A node whose ffmpeg cannot open an input its source grant approved
+  node. A node whose ffmpeg cannot open an input that passed its path check
   (such as a file its user may not read) answers `input_unreadable`, which
   does not count against the file: it moves on like `node_unavailable`.
   `unsupported` (the node's ffmpeg lacks a filter, decoder, or device the run
-  needs) also moves on and, in `transcode_nodes_only` mode, counts against the file, as when this server's
+  needs) also moves on, and counts against the file, as when this server's
   own ffmpeg lacks it, unless another node that may have it was busy or at
   its job cap. Another
   transient sampling failure also tries another node, followed by local
   extraction in `prefer_transcode_nodes` mode. In `transcode_nodes_only` mode
   it counts against the file when no node makes the sheets. Only a
   `permanent` sampling failure marks the file unusable, as it would locally.
-- Remote extraction opens the file through a
-  [source grant](transcode-nodes.md#source-grants). Minting the grant stats the
-  file on the API server, so the API server's media mount must be readable;
-  when it is not, the node counts as unavailable.
+- Remote extraction checks the media path on the node. It does not require
+  the API server's media mount to be readable.
 - The request carries a hardware attempt and a software attempt; a node
   whose accelerator cannot decode drops the hardware attempt.
 
@@ -288,28 +253,12 @@ Players read previews through the native API:
   a file among the versions the watch detail lists for the caller, so it
   applies the same access rules. Every sheet is signed or the manifest is
   withheld: clients cut thumbnails by index and cannot skip a sheet.
-  Standard S3 delivery uses direct presigned URLs, and local storage uses
-  signed `/api/v2/artwork/...` URLs. S3 with a separate public or
-  token-authenticated read endpoint uses the endpoint's URLs only for a
-  revision whose `delivery_scope` matches the current endpoint
-  configuration, and the signed server route for any other. The server route
-  reads the storage API, so endpoint lag cannot hide newly published sheets.
-  Issued URLs protect the revision through their latest expiry; clients read
-  the manifest again after `expires_at`.
-- With such an endpoint, a generation fetches its last uploaded sheet through
-  it before publishing and records the scope when it answers; an endpoint
-  shows a generation's writes in about the order they were made, so one
-  ranged GET per revision stands for every sheet. A
-  revision that misses, one published before the endpoint was configured, or
-  one recorded under another scope is checked again by each server's
-  background pass (`internal/trickplay/delivery.go`), every 15 minutes: it
-  claims revisions not checked in that time, a batch at a time, and stops at
-  a probe error or a batch that confirms nothing, so a broken endpoint is not
-  probed for the whole backlog. Scope is compared when the manifest is read,
-  so during a rolling restart a server reads a revision another configuration
-  confirmed as unconfirmed and signs the server route; servers on the two
-  configurations may record their own scope over each other's until every
-  server runs the new one.
+  Local storage and S3 with a separate public or token-authenticated delivery
+  endpoint use signed `/api/v2/artwork/...` URLs. The server reads sheets from
+  the storage API, so delivery lag cannot hide newly published sheets.
+  Standard S3 delivery retains direct presigned URLs. Issued URLs protect the
+  revision through their latest expiry; clients read the manifest again after
+  `expires_at`.
 - Playback capabilities advertise `trickplay_v1`.
 
 Thumbnail i shows `[i*interval_ms, (i+1)*interval_ms)`; it sits on sheet
@@ -346,9 +295,8 @@ Sheets are deleted per revision through `blob_gc_queue` (see
 - Publishing queues the revision it displaces; finishing without publishing,
   and reclaiming an expired lease, queue the revision the work had started
   uploading. Both happen in the transaction that changes the row.
-- A trigger queues the revisions of every deleted row, whether reconcile
-  removed it (step 3 of [Reconcile](#reconcile)) or its media file was deleted
-  (the cascade).
+- A trigger queues the revisions of every deleted row, whether its library
+  opted out or its media file was deleted (the cascade).
 - Displaced and abandoned revisions wait at least 48 hours. Before serving
   a manifest, the reader protects its exact published revision until the
   latest expiry of all signed sheets. Publication and deletion carry that

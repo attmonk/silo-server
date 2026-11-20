@@ -19,17 +19,12 @@ import (
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 )
 
-// hungNodePartialBody outgrows the API server's response buffer, so the client
-// receives headers and bytes before the node stalls, as with a real segment.
-var hungNodePartialBody = strings.Repeat("p", 8<<10)
-
 // hungNode is a transcode node that serves segments until it is frozen, then
 // behaves like a process stopped with SIGSTOP: connections still open and
 // requests are still delivered, but nothing is answered, health included.
 type hungNode struct {
-	server           *httptest.Server
-	freezeAt         string // the first segment request that finds the node frozen
-	freezeDuringBody bool
+	server   *httptest.Server
+	freezeAt string // the first segment request that finds the node frozen
 
 	mu      sync.Mutex
 	frozen  bool
@@ -39,33 +34,21 @@ type hungNode struct {
 	released chan struct{}
 }
 
-func newHungNode(t *testing.T, freezeAt string, freezeDuringBody bool) *hungNode {
+func newHungNode(t *testing.T, freezeAt string) *hungNode {
 	t.Helper()
-	node := &hungNode{
-		freezeAt:         freezeAt,
-		freezeDuringBody: freezeDuringBody,
-		arrival:          make(chan struct{}),
-		released:         make(chan struct{}),
-	}
+	node := &hungNode{freezeAt: freezeAt, arrival: make(chan struct{}), released: make(chan struct{})}
 	node.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		segment := strings.TrimPrefix(r.URL.Path, "/transcode/"+rehomeTestTransport+"/segment/")
 		node.mu.Lock()
 		node.arrived = append(node.arrived, r.Method+" "+r.URL.Path)
 		close(node.arrival)
 		node.arrival = make(chan struct{})
-		freezeNow := segment == node.freezeAt && !node.frozen
-		if freezeNow {
+		if segment == node.freezeAt {
 			node.frozen = true
 		}
 		frozen := node.frozen
 		node.mu.Unlock()
 		if frozen {
-			if freezeNow && node.freezeDuringBody {
-				// No Content-Length: on a chunked body only an aborted
-				// relay tells the client the body is short.
-				_, _ = io.WriteString(w, hungNodePartialBody)
-				w.(http.Flusher).Flush()
-			}
 			select {
 			case <-node.released:
 			case <-r.Context().Done():
@@ -136,8 +119,8 @@ func serveRehomeFixture(t *testing.T, f *rehomeFixture) *httptest.Server {
 
 // fetchSegment requests a segment the way a player does, giving up after the
 // hls.js load timeout. It returns the status (0 when the client gave up), the
-// body, how long the answer took, and the error that ended the body read.
-func fetchSegment(t *testing.T, api *httptest.Server, f *rehomeFixture, name string) (int, string, time.Duration, error) {
+// body, and how long the answer took.
+func fetchSegment(t *testing.T, api *httptest.Server, f *rehomeFixture, name string) (int, string, time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -149,85 +132,64 @@ func fetchSegment(t *testing.T, api *httptest.Server, f *rehomeFixture, name str
 	started := time.Now()
 	resp, err := api.Client().Do(req)
 	if err != nil {
-		return 0, err.Error(), time.Since(started), err
+		return 0, err.Error(), time.Since(started)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, readErr := io.ReadAll(resp.Body)
-	return resp.StatusCode, string(body), time.Since(started), readErr
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body), time.Since(started)
 }
 
 // TestRelayMovesTranscodeOffHungNode covers issue #2296 end to end with the
 // production liveness timings: the transcode node freezes mid-stream without
-// closing its connections. The request that finds it frozen, or the retry
-// after a partial body, must move to the healthy node within the 10-second
-// failover bar and be answered from there,
+// closing its connections. The request that finds it frozen must be moved to
+// the healthy node within the 10-second failover bar and answered from there,
 // numbering must continue at the requested segment, the frozen node must stop
 // being selected, and it must be told to drop the transport.
 func TestRelayMovesTranscodeOffHungNode(t *testing.T) {
-	t.Parallel()
-	for _, phase := range []string{"headers", "body"} {
-		t.Run(phase, func(t *testing.T) {
-			t.Parallel()
-			hung := newHungNode(t, "seg_00003.ts", phase == "body")
-			healthy := newFakeRehomeNode(t, false)
-			f := newRehomeFixture(t, []*nodepool.Node{
-				pooledNode(1, hung.server.URL),
-				pooledNode(2, healthy.server.URL),
-			}, "ffmpeg")
-			api := serveRehomeFixture(t, f)
+	hung := newHungNode(t, "seg_00003.ts")
+	healthy := newFakeRehomeNode(t, false)
+	f := newRehomeFixture(t, []*nodepool.Node{
+		pooledNode(1, hung.server.URL),
+		pooledNode(2, healthy.server.URL),
+	}, "ffmpeg")
+	api := serveRehomeFixture(t, f)
 
-			for _, name := range []string{"seg_00000.ts", "seg_00001.ts", "seg_00002.ts"} {
-				if status, body, _, _ := fetchSegment(t, api, f, name); status != http.StatusOK || body != "hung-node:"+name {
-					t.Fatalf("%s before the hang: status = %d, body = %q", name, status, body)
-				}
-			}
+	for _, name := range []string{"seg_00000.ts", "seg_00001.ts", "seg_00002.ts"} {
+		if status, body, _ := fetchSegment(t, api, f, name); status != http.StatusOK || body != "hung-node:"+name {
+			t.Fatalf("%s before the hang: status = %d, body = %q", name, status, body)
+		}
+	}
 
-			if phase == "body" {
-				// Real production probe timings take about six seconds. The partial
-				// response cannot move; the client's retry must recover the same URL.
-				status, body, took, readErr := fetchSegment(t, api, f, "seg_00003.ts")
-				if status != http.StatusOK || body != hungNodePartialBody || took > 10*time.Second {
-					t.Fatalf("mid-body failure: status = %d, body length = %d after %v, want the %d-byte partial response within 10s", status, len(body), took, len(hungNodePartialBody))
-				}
-				if readErr == nil {
-					t.Fatal("mid-body failure ended with a clean EOF; the client would accept the partial body as complete")
-				}
-				if got := healthy.starts.Load(); got != 0 {
-					t.Fatalf("replacement starts before the client retries = %d, want 0", got)
-				}
-			}
-			status, body, took, _ := fetchSegment(t, api, f, "seg_00003.ts")
-			if status != http.StatusOK || body != "moved:seg_00003.ts" {
-				t.Fatalf("segment after the hang: status = %d, body = %q after %v; want it served by the healthy node", status, body, took)
-			}
-			if took > 10*time.Second {
-				t.Fatalf("failover took %v, want under 10s", took)
-			}
+	status, body, took := fetchSegment(t, api, f, "seg_00003.ts")
+	if status != http.StatusOK || body != "moved:seg_00003.ts" {
+		t.Fatalf("segment after the hang: status = %d, body = %q after %v; want it served by the healthy node", status, body, took)
+	}
+	if took > 10*time.Second {
+		t.Fatalf("failover took %v, want under 10s", took)
+	}
 
-			start := healthy.lastStart()
-			if start.SessionID != rehomeTestTransport || start.StartSegmentNumber != 3 || start.SeekSeconds != 6 {
-				t.Fatalf("healthy node started %q at segment %d (%.1fs), want %q at segment 3 (6.0s)",
-					start.SessionID, start.StartSegmentNumber, start.SeekSeconds, rehomeTestTransport)
-			}
-			session, err := f.sessions.GetSession(f.session.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if session.TranscodeNodeURL != healthy.server.URL || session.RoutingExecutionNodeID != 2 {
-				t.Fatalf("session runs on %q (node %d), want the healthy node", session.TranscodeNodeURL, session.RoutingExecutionNodeID)
-			}
-			if f.planner.TranscodeNodeHealthy(hung.server.URL) {
-				t.Fatal("the hung node is still selectable")
-			}
-			hung.waitForRequest(t, http.MethodDelete, "/transcode/"+rehomeTestTransport)
+	start := healthy.lastStart()
+	if start.SessionID != rehomeTestTransport || start.StartSegmentNumber != 3 || start.SeekSeconds != 6 {
+		t.Fatalf("healthy node started %q at segment %d (%.1fs), want %q at segment 3 (6.0s)",
+			start.SessionID, start.StartSegmentNumber, start.SeekSeconds, rehomeTestTransport)
+	}
+	session, err := f.sessions.GetSession(f.session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.TranscodeNodeURL != healthy.server.URL || session.RoutingExecutionNodeID != 2 {
+		t.Fatalf("session runs on %q (node %d), want the healthy node", session.TranscodeNodeURL, session.RoutingExecutionNodeID)
+	}
+	if f.planner.TranscodeNodeHealthy(hung.server.URL) {
+		t.Fatal("the hung node is still selectable")
+	}
+	hung.waitForRequest(t, http.MethodDelete, "/transcode/"+rehomeTestTransport)
 
-			if status, body, _, _ := fetchSegment(t, api, f, "seg_00004.ts"); status != http.StatusOK || body != "moved:seg_00004.ts" {
-				t.Fatalf("next segment: status = %d, body = %q", status, body)
-			}
-			if got := healthy.starts.Load(); got != 1 {
-				t.Fatalf("starts on the healthy node = %d, want 1", got)
-			}
-		})
+	if status, body, _ := fetchSegment(t, api, f, "seg_00004.ts"); status != http.StatusOK || body != "moved:seg_00004.ts" {
+		t.Fatalf("next segment: status = %d, body = %q", status, body)
+	}
+	if got := healthy.starts.Load(); got != 1 {
+		t.Fatalf("starts on the healthy node = %d, want 1", got)
 	}
 }
 
@@ -236,8 +198,7 @@ func TestRelayMovesTranscodeOffHungNode(t *testing.T) {
 // once the node is found hung instead of holding the request until the player
 // gives up.
 func TestRelayFailsPromptlyWhenNoNodeReplacesHungNode(t *testing.T) {
-	t.Parallel()
-	hung := newHungNode(t, "seg_00003.ts", false)
+	hung := newHungNode(t, "seg_00003.ts")
 	f := newRehomeFixture(t, []*nodepool.Node{pooledNode(1, hung.server.URL)}, writePlaybackTestFFmpegSleep(t, "30"))
 	previous := f.handler.PlaybackConfig
 	f.handler.PlaybackConfig = func() config.PlaybackConfig {
@@ -248,7 +209,7 @@ func TestRelayFailsPromptlyWhenNoNodeReplacesHungNode(t *testing.T) {
 	}
 	api := serveRehomeFixture(t, f)
 
-	status, body, took, _ := fetchSegment(t, api, f, "seg_00003.ts")
+	status, body, took := fetchSegment(t, api, f, "seg_00003.ts")
 	if status != http.StatusBadGateway {
 		t.Fatalf("status = %d, body = %q after %v; want 502", status, body, took)
 	}
@@ -267,7 +228,6 @@ func TestRelayFailsPromptlyWhenNoNodeReplacesHungNode(t *testing.T) {
 // than the liveness grace to answer, as during a rebuild, but still answers its
 // health endpoint, is waited on and keeps the session.
 func TestRelayWaitsOnSlowLiveNode(t *testing.T) {
-	t.Parallel()
 	// The segment is answered only once the watch has probed twice, after the
 	// grace and one interval, so the relay has had every chance to give up.
 	answer := make(chan struct{})
@@ -292,7 +252,7 @@ func TestRelayWaitsOnSlowLiveNode(t *testing.T) {
 	f := newRehomeFixture(t, []*nodepool.Node{pooledNode(1, slow.URL), pooledNode(2, spare.server.URL)}, "ffmpeg")
 	api := serveRehomeFixture(t, f)
 
-	status, body, _, _ := fetchSegment(t, api, f, "seg_00003.ts")
+	status, body, _ := fetchSegment(t, api, f, "seg_00003.ts")
 	if status != http.StatusOK || body != "slow:seg_00003.ts" {
 		t.Fatalf("status = %d, body = %q; want the slow node's answer", status, body)
 	}

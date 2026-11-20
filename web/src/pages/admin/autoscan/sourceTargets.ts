@@ -1,5 +1,4 @@
 import type { AutoscanScanSourceDescriptor, AutoscanSource, Library } from "@/api/types";
-import { t } from "@/i18n";
 
 import { configFields } from "./sourceDescriptor";
 
@@ -160,8 +159,8 @@ export function sourceTargets(
 
 /** Short human summary of what a source keeps fresh. */
 export function describeTargets(targets: SourceTargets): string {
-  if (targets.unresolvable) return t("web.admin.autoscan.sources.targets.noPaths");
-  if (targets.unknown) return t("web.admin.autoscan.sources.targets.unknown");
-  if (targets.libraries.length === 0) return t("web.admin.autoscan.sources.targets.noMatch");
+  if (targets.unresolvable) return "No paths configured";
+  if (targets.unknown) return "Determined at scan time";
+  if (targets.libraries.length === 0) return "No matching library";
   return targets.libraries.map((library) => library.name).join(", ");
 }

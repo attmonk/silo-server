@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import {
   type ProfileRequestContextSnapshot,
   StaleApiRequestContextError,
@@ -46,6 +45,6 @@ export async function queueNotificationEmailVerification(intent: EmailVerificati
   });
   requireNotificationAuthority(intent.authority);
   if (result.verification_id !== intent.body.verification_id)
-    throw new Error(t("web.common.errors.verificationReceiptMismatch"));
+    throw new Error("Verification receipt does not match the submitted request.");
   return result;
 }

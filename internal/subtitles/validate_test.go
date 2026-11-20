@@ -17,6 +17,38 @@ func utf16LEWithBOM(s string) []byte {
 	return out
 }
 
+func TestValidateSubtitleContentAcceptsReadableFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		format SubtitleFormat
+		data   []byte
+	}{
+		{"srt", FormatSRT, []byte("1\n00:00:01,000 --> 00:00:02,000\nHello\n")},
+		{"srt with BOM and CRLF", FormatSRT, []byte("\xef\xbb\xbf1\r\n00:00:01,000 --> 00:00:02,000\r\nHello\r\n")},
+		{"srt in Latin-1", FormatSRT, []byte("1\n00:00:01,000 --> 00:00:02,000\nCaf\xe9\n")},
+		{"srt in UTF-16", FormatSRT, utf16LEWithBOM("1\r\n00:00:01,000 --> 00:00:02,000\r\nHello\r\n")},
+		{"vtt", FormatVTT, []byte("WEBVTT\n\n00:01.000 --> 00:02.000\nHello\n")},
+		{"ass", FormatASS, []byte("[Script Info]\nTitle: x\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n")}, //nolint:misspell // ASS event keyword
+		{"ssa", FormatSSA, []byte("[Events]\nFormat: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: Marked=0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n")},                    //nolint:misspell // ASS event keyword
+		{"microdvd sub", FormatSUB, []byte("{25}{50}Hello|World\n")},
+		{"subviewer sub", FormatSUB, []byte("[INFORMATION]\n00:00:01.00,00:00:02.00\nHello\n")},
+		{"microdvd sub with BOM", FormatSUB, []byte("\xef\xbb\xbf{25}{50}Hello\n")},
+		{"subviewer sub with BOM", FormatSUB, []byte("\xef\xbb\xbf00:00:01.00,00:00:02.00\nHello\n")},
+		{"microdvd sub after frame rate", FormatSUB, []byte("{1}{1}25.000\n{25}{50}Hello\n")},
+		{"microdvd sub after zero-frame rate", FormatSUB, []byte("{0}{0}23.976\n{25}{50}Hello\n")},
+		{"microdvd numeric cue after three header lines", FormatSUB, []byte("{0}{0}23.976\n{0}{0}23.976\n{0}{0}23.976\n{0}{25}42\n")},
+		{"srt with CRCRLF line endings", FormatSRT, []byte("1\r\r\n00:00:01,000 --> 00:00:02,000\r\r\nHello\r\r\n")},
+		{"microdvd sub with CR line endings", FormatSUB, []byte("{1}{1}25.000\r{25}{50}Hello\r")},
+		{"subviewer sub with CR line endings", FormatSUB, []byte("00:00:01.00,00:00:02.00\rHello\r")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateSubtitleContent(tc.format, tc.data); err != nil {
+				t.Fatalf("ValidateSubtitleContent: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateSubtitleContentRejectsUnreadableFiles(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -74,6 +106,13 @@ func TestValidateSubtitleContentBoundsHugeASSFormat(t *testing.T) {
 	runtime.ReadMemStats(&stats)
 	if got := stats.TotalAlloc - before; got > 64<<20 {
 		t.Fatalf("validating %d bytes allocated %d bytes", len(data), got)
+	}
+}
+
+func TestParseCuesKeepsWebVTTDoubleCRAsBlockBreak(t *testing.T) {
+	cues, err := ParseCues([]byte("WEBVTT\n\n00:01.000 --> 00:02.000\nOne\r\r\n00:03.000 --> 00:04.000\nTwo\n"))
+	if err != nil || len(cues) != 2 {
+		t.Fatalf("ParseCues = %d cues, %v; want 2", len(cues), err)
 	}
 }
 

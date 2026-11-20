@@ -118,18 +118,11 @@ func NVENCSoftwareFallbackPixelFormat(sourceVideoBitDepth int) string {
 type SourceKind string
 
 const (
-	SourcePQ SourceKind = "pq"
-	// SourcePQFullRange is a PQ BT.2020 signal whose stream is tagged full
-	// (pc) range. A container can tag a stream full range while its bitstream
-	// codes limited levels, so its graphs take the range from the decoded
-	// frames instead of declaring one. Only executors whose filter reads that
-	// range convert it; read as limited range, full-range shadows and
-	// highlights come out stretched.
-	SourcePQFullRange SourceKind = "pq_full_range"
-	SourceHLG         SourceKind = DynamicRangeHLG
-	SourceHLGBT709    SourceKind = "hlg_bt709"
-	SourceSDRBT709    SourceKind = "sdr_bt709"
-	SourceSDRBT2020   SourceKind = "sdr_bt2020"
+	SourcePQ        SourceKind = "pq"
+	SourceHLG       SourceKind = DynamicRangeHLG
+	SourceHLGBT709  SourceKind = "hlg_bt709"
+	SourceSDRBT709  SourceKind = "sdr_bt709"
+	SourceSDRBT2020 SourceKind = "sdr_bt2020"
 	// SourceDolbyVision is a Dolby Vision base layer that is not a standard
 	// signal on its own: Profile 5's IPTPQc2, or a compatibility id of 0. Only
 	// an executor that applies the stream's RPU reshaping can convert it; read
@@ -148,12 +141,9 @@ type SourceMetadata struct {
 	DVBLPresent         bool
 	DVRPUPresent        bool
 	ColorRange          string
-	// FrameColorRange is the range on the first decoded frame, as the
-	// scanner recorded it: models.VideoTrack.FrameColorRange.
-	FrameColorRange string
-	ColorPrimaries  string
-	ColorTransfer   string
-	ColorSpace      string
+	ColorPrimaries      string
+	ColorTransfer       string
+	ColorSpace          string
 }
 
 // SourceResolution is the safe execution classification for one HDR source.
@@ -191,7 +181,6 @@ func MetadataForFile(file *models.MediaFile) SourceMetadata {
 		DVBLPresent:         track.DVBLPresent,
 		DVRPUPresent:        track.DVRPUPresent,
 		ColorRange:          track.ColorRange,
-		FrameColorRange:     track.FrameColorRange,
 		ColorPrimaries:      track.ColorPrimaries,
 		ColorTransfer:       track.ColorTransfer,
 		ColorSpace:          track.ColorSpace,
@@ -310,21 +299,6 @@ func ResolveSource(source SourceMetadata) SourceResolution {
 	if candidate == "" {
 		return SourceResolution{}
 	}
-	// The decoder takes the range from the bitstream before the container's
-	// tag, and the graphs see the decoder's value, so an explicit range on the
-	// first decoded frame overrides a stream tag that contradicts it. A track
-	// whose frame was not read yet keeps its tag until the scanner or the
-	// HDR10+ backfill reads it.
-	frameRange := normalizeColorValue(source.FrameColorRange)
-	if rangeIsFull(frameRange) || rangeIsLimited(frameRange) {
-		source.ColorRange = frameRange
-	}
-	// Graphs for this kind trust the decoded frames' range, so the frames
-	// must prove they carry one.
-	if candidate == SourcePQ && rangeIsFull(normalizeColorValue(source.ColorRange)) {
-		candidate = SourcePQFullRange
-		preflight = true
-	}
 	complete, compatible := sourceMetadataCompatibility(candidate, source)
 	if !compatible || !complete {
 		preflight = true
@@ -404,7 +378,7 @@ func sourceMetadataCompatibility(kind SourceKind, source SourceMetadata) (comple
 		}
 	}
 	rangeValue := normalizeColorValue(source.ColorRange)
-	if rangeValue != "" && rangeValue != colorUnknown && rangeValue != colorUnspecified && !colorRangeMatchesKind(kind, rangeValue) {
+	if rangeValue != "" && rangeValue != colorUnknown && rangeValue != colorUnspecified && !rangeIsLimited(rangeValue) {
 		return complete, false
 	}
 	primaries := normalizeColorValue(source.ColorPrimaries)
@@ -440,7 +414,7 @@ func colorValueMatchesTransfer(kind SourceKind, value string) bool {
 		return true
 	}
 	switch kind {
-	case SourcePQ, SourcePQFullRange:
+	case SourcePQ:
 		return transferIsPQ(value)
 	case SourceHLG, SourceHLGBT709:
 		return transferIsHLG(value)
@@ -497,21 +471,6 @@ func rangeIsLimited(value string) bool {
 	return value == "tv" || value == "mpeg" || value == "limited"
 }
 
-// rangeIsFull recognizes FFmpeg's names for full-range video levels.
-func rangeIsFull(value string) bool {
-	return value == "pc" || value == "jpeg" || value == "full"
-}
-
-// colorRangeMatchesKind accepts either explicit range for SourcePQFullRange,
-// whose graphs read it from the frame, and requires limited range for every
-// other kind.
-func colorRangeMatchesKind(kind SourceKind, value string) bool {
-	if kind == SourcePQFullRange {
-		return rangeIsFull(value) || rangeIsLimited(value)
-	}
-	return rangeIsLimited(value)
-}
-
 // SourceTransfer returns the FFmpeg transfer characteristic for a source kind.
 func SourceTransfer(kind SourceKind) string {
 	if kind == SourceHLG || kind == SourceHLGBT709 {
@@ -559,12 +518,12 @@ func SoftwareUploadFilter(kind SourceKind) string {
 
 // AllSourceKinds returns every base signal supported by capability probes.
 func AllSourceKinds() []SourceKind {
-	return append(StandardSourceKinds(), SourcePQFullRange, SourceDolbyVision)
+	return append(StandardSourceKinds(), SourceDolbyVision)
 }
 
 // StandardSourceKinds returns the base signals every executor class converts.
-// SourcePQFullRange and SourceDolbyVision are left out: only some filters
-// convert them, so their absence does not make every inventory incomplete.
+// SourceDolbyVision is left out: only some executors apply the RPU, so its
+// absence does not make an inventory incomplete.
 func StandardSourceKinds() []SourceKind {
 	return []SourceKind{SourcePQ, SourceHLG, SourceHLGBT709, SourceSDRBT709, SourceSDRBT2020}
 }
@@ -581,36 +540,13 @@ func FilterAppliesDolbyVision(filter string) bool {
 	return false
 }
 
-// FilterConvertsFullRange reports whether a probed tone-map filter reads each
-// frame's range, the only safe way to convert SourcePQFullRange. The software
-// graphs' zscale and Jellyfin FFmpeg's tonemapx do. The hardware filters stay
-// off until each is shown to convert a full-range source to the same picture
-// as its limited-range copy.
-func FilterConvertsFullRange(filter string) bool {
-	return filter == SoftwareFilterBT2390 || filter == SoftwareFilterHable
-}
-
-// softwareDolbyVisionOption makes RPU application explicit on tonemapx's
-// SourceDolbyVision graph instead of relying on the filter's default. Every
-// other kind keeps that default: tonemapx reshapes only through a Profile 5
-// style RPU, so a standard base already converts as declared.
-func softwareDolbyVisionOption(kind SourceKind) string {
+// dolbyVisionOption makes RPU application explicit on SourceDolbyVision
+// graphs instead of relying on the filters' default.
+func dolbyVisionOption(kind SourceKind) string {
 	if kind == SourceDolbyVision {
 		return ":apply_dovi=1"
 	}
 	return ""
-}
-
-// gpuDolbyVisionOption sets apply_dovi explicitly on tonemap_opencl and
-// tonemap_cuda. By default both reshape a standard base through any
-// single-layer RPU, tonemap_opencl depending on the GPU model, while every
-// other executor converts that base as declared. It is on only for
-// SourceDolbyVision, whose base only the RPU can map.
-func gpuDolbyVisionOption(kind SourceKind) string {
-	if kind == SourceDolbyVision {
-		return ":apply_dovi=1"
-	}
-	return ":apply_dovi=0"
 }
 
 // ValidSourceKind reports whether kind is a supported, serializable base signal.
@@ -688,13 +624,9 @@ func (c Capabilities) PreferredMode(policy Policy, kind SourceKind) Mode {
 // SourceParameters builds the FFmpeg setparams stage that declares the input
 // base signal before conversion. SourceDolbyVision is declared as the PQ
 // BT.2020 signal its RPU reshapes to; the RPU, not these tags, drives the
-// conversion. SourcePQFullRange keeps each frame's own range.
+// conversion.
 func SourceParameters(kind SourceKind) string {
-	rangeParameter := "range=tv:"
-	if kind == SourcePQFullRange {
-		rangeParameter = ""
-	}
-	return "setparams=" + rangeParameter + "color_primaries=" + SourcePrimaries(kind) + ":color_trc=" + SourceTransfer(kind) + ":colorspace=" + SourceMatrix(kind)
+	return "setparams=range=tv:color_primaries=" + SourcePrimaries(kind) + ":color_trc=" + SourceTransfer(kind) + ":colorspace=" + SourceMatrix(kind)
 }
 
 // SoftwareFilter builds the complete software conversion graph for a source
@@ -706,7 +638,7 @@ func SoftwareFilter(kind SourceKind, filterName string) string {
 	}
 	if filterName == SoftwareFilterBT2390 {
 		return SourceParameters(kind) +
-			",tonemapx=tonemap=bt2390" + toneMapPeakOption + softwareDolbyVisionOption(kind) +
+			",tonemapx=tonemap=bt2390" + toneMapPeakOption + dolbyVisionOption(kind) +
 			",zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p," + HDRMetadataRemovalFilter()
 	}
 	return SourceParameters(kind) +
@@ -810,7 +742,7 @@ const toneMapPeakOption = ":peak=100"
 
 // openCLToneMapFilter matches Jellyfin's BT.2390 GPU recipe.
 func openCLToneMapFilter(kind SourceKind) string {
-	return HardwareFilterOpenCL + "=format=nv12:p=bt709:t=bt709:m=bt709:tonemap=bt2390" + toneMapPeakOption + ":desat=0" + gpuDolbyVisionOption(kind)
+	return HardwareFilterOpenCL + "=format=nv12:p=bt709:t=bt709:m=bt709:tonemap=bt2390" + toneMapPeakOption + ":desat=0" + dolbyVisionOption(kind)
 }
 
 // vaapiToneMapFilter returns the HDR luminance and color conversion stage.
@@ -823,9 +755,15 @@ func vaapiSDRFilter() string {
 	return "scale_vaapi=format=nv12:out_color_primaries=bt709:out_color_transfer=bt709:out_color_matrix=bt709:out_range=tv"
 }
 
-// CUDAFilter returns the CUDA HDR-to-SDR conversion stage.
+// CUDAFilter returns the CUDA HDR-to-SDR conversion stage. Dolby Vision
+// processing stays off so a standard base layer converts as validated, except
+// for SourceDolbyVision, whose base only the RPU can map.
 func CUDAFilter(kind SourceKind) string {
-	return HardwareFilterCUDA + "=tonemap=bt2390:format=nv12:p=bt709:t=bt709:m=bt709:r=tv" + gpuDolbyVisionOption(kind)
+	applyDolbyVision := "0"
+	if kind == SourceDolbyVision {
+		applyDolbyVision = "1"
+	}
+	return HardwareFilterCUDA + "=tonemap=bt2390:format=nv12:p=bt709:t=bt709:m=bt709:r=tv:apply_dovi=" + applyDolbyVision
 }
 
 // VideoToolboxFilter builds Apple's HDR-to-SDR pixel-transfer conversion.

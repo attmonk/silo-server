@@ -1,6 +1,4 @@
 import type { WatchlistTitle } from "@/api/v2/watchlistTitles";
-import { appLanguage } from "@/lib/appLocale";
-import { t } from "@/i18n";
 import { parseCalendarDate, preferredDateLocale } from "@/lib/datetime";
 import {
   formatRequestDisplayState,
@@ -69,9 +67,9 @@ export function watchlistTitleStatus(
   const request = title.request;
   if (title.status === "needs_review") {
     return {
-      badge: t("web.library.watchlist.statusNeedsAttention"),
+      badge: "Needs attention",
       badgeIcon: "alert",
-      caption: t("web.library.watchlist.statusListedTwice"),
+      caption: "TMDB lists it twice",
       attention: true,
       requestable: false,
       rank: WATCHLIST_TITLE_RANK.attention,
@@ -79,9 +77,9 @@ export function watchlistTitleStatus(
   }
   if (title.status === "removed") {
     return {
-      badge: t("web.library.watchlist.statusNotOnTmdb"),
+      badge: "Not on TMDB",
       badgeIcon: "alert",
-      caption: t("web.library.watchlist.statusNoLongerListed"),
+      caption: "No longer listed on TMDB",
       attention: true,
       requestable: false,
       rank: WATCHLIST_TITLE_RANK.attention,
@@ -91,8 +89,7 @@ export function watchlistTitleStatus(
   const state = requestDisplayState(request.status, undefined, request.state);
   const release = parseCalendarDate(title.release_date);
   const upcoming = release !== null && release.getTime() > startOfDay(now).getTime();
-  const releaseDay = upcoming && release ? formatReleaseDay(release, now) : null;
-  const out = releaseDay ? t("web.library.watchlist.statusOut", { date: releaseDay }) : null;
+  const out = upcoming && release ? `Out ${formatReleaseDay(release, now)}` : null;
 
   if (request.download) {
     const percent = requestDownloadPercent(request.download);
@@ -100,7 +97,7 @@ export function watchlistTitleStatus(
     return {
       badge:
         downloading && percent !== undefined
-          ? t("web.library.watchlist.statusDownloading", { percent })
+          ? `Downloading ${percent}%`
           : formatRequestDownload(request.download, { now }).split(" · ")[0]!,
       badgeIcon: "download",
       caption: formatRequestDownload(request.download, { now }),
@@ -117,17 +114,13 @@ export function watchlistTitleStatus(
     case "cancelled":
     case "failed": {
       const refused = !request.requestable && request.reason ? request.reason : undefined;
-      const lower = (text: string) => text.toLocaleLowerCase(appLanguage());
+      const detail = refused ? formatRequestReason(refused).toLowerCase() : null;
       return {
-        badge: t("web.library.watchlist.statusNotRequested"),
+        badge: "Not requested",
         badgeIcon: null,
-        caption: refused
-          ? t("web.library.watchlist.statusNotRequestedReason", {
-              reason: lower(formatRequestReason(refused)),
-            })
-          : releaseDay
-            ? t("web.library.watchlist.statusNotRequestedOut", { date: lower(releaseDay) })
-            : t("web.library.watchlist.statusNotRequested"),
+        caption: ["Not requested", detail ?? (out ? out.toLowerCase() : null)]
+          .filter(Boolean)
+          .join(" · "),
         attention: false,
         requestable: request.requestable,
         rank: WATCHLIST_TITLE_RANK.notRequested,
@@ -135,31 +128,27 @@ export function watchlistTitleStatus(
     }
     case "processing":
       return {
-        badge: t("web.requests.status.processing"),
+        badge: "Processing",
         badgeIcon: "download",
-        caption: t("web.requests.status.processing"),
+        caption: "Processing",
         attention: false,
         requestable: false,
         rank: WATCHLIST_TITLE_RANK.downloading,
       };
     case "pending":
       return {
-        badge: out ?? t("web.library.watchlist.statusAwaitingApproval"),
+        badge: out ?? "Awaiting approval",
         badgeIcon: out ? "calendar" : "clock",
-        caption: releaseDay
-          ? t("web.library.watchlist.statusOutAwaitingApproval", { date: releaseDay })
-          : t("web.library.watchlist.statusAwaitingApproval"),
+        caption: out ? `${out} · awaiting approval` : "Awaiting approval",
         attention: false,
         requestable: false,
         rank: out ? WATCHLIST_TITLE_RANK.dated : WATCHLIST_TITLE_RANK.awaitingApproval,
       };
     case "approved":
       return {
-        badge: out ?? t("web.requests.status.approved"),
+        badge: out ?? "Approved",
         badgeIcon: out ? "calendar" : "hourglass",
-        caption: releaseDay
-          ? t("web.library.watchlist.statusOutApproved", { date: releaseDay })
-          : t("web.library.watchlist.statusApprovedWaiting"),
+        caption: out ? `${out} · approved` : "Approved · waiting for a download",
         attention: false,
         requestable: false,
         rank: WATCHLIST_TITLE_RANK.dated,
@@ -222,11 +211,12 @@ export function parseWatchlistTab(value: string | null): WatchlistTab {
  * hold only while adds request: the notification comes from the request.
  */
 export function watchlistTitlesHint(watchlistRequests: boolean): string {
-  return t(
+  return [
+    "These titles aren't in the library yet, so they can't be played.",
     watchlistRequests
-      ? "web.library.watchlist.titlesHintRequested"
-      : "web.library.watchlist.titlesHint",
-  );
+      ? "They've been requested for you. When one arrives, it moves to In your library and you get a notification."
+      : "When one arrives, it moves to In your library.",
+  ].join(" ");
 }
 
 /**

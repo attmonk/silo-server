@@ -12,7 +12,7 @@ import {
 } from "@/lib/sectionLibraryFilter";
 import { FILTER_SECTION_TYPES } from "@/lib/sectionTypes";
 import { randomUUID } from "@/lib/uuid";
-import { rowKindName } from "./catalog";
+import { rowKindLabel } from "./catalog";
 import type { RowDraft } from "./rowDraft";
 import { stableJson } from "./stableJson";
 import type { PageRef, Surface } from "./types";
@@ -213,7 +213,6 @@ export function buildRowCreateRequest(
       page.kind,
       page.kind === "library" ? page.libraryId : null,
     ),
-    ...webOnlyMember(draft),
     position,
   };
 }
@@ -245,7 +244,6 @@ export function buildBulkCopyPayload(
 /** Kinds whose form edits the config itself: the picked collection's id key, the rules. */
 const FORM_OWNED_CONFIG_TYPES: ReadonlySet<string> = new Set([
   "collection",
-  "collection_posters",
   ...FILTER_SECTION_TYPES,
 ]);
 
@@ -254,18 +252,6 @@ function rowUpdateConfig(draft: RowDraft): Record<string, unknown> {
   return LIBRARY_FILTER_SECTION_TYPES.has(draft.sectionType)
     ? finalizeSectionLibraryFilter(draft.config)
     : { ...draft.config };
-}
-
-/**
- * The admin save's web_only, sent only when a hero row's choice differs from
- * `saved` (false for a new row). A server that predates web_only refuses the
- * member, so other saves leave it out; the server clears it on a row that is
- * not a hero.
- */
-function webOnlyMember(draft: RowDraft, saved = false): { web_only?: boolean } {
-  return draft.hero && draft.webOnly !== undefined && draft.webOnly !== saved
-    ? { web_only: draft.webOnly }
-    : {};
 }
 
 /**
@@ -286,11 +272,10 @@ export function buildRowUpdateRequest(
     ...(section.scope === "library" && section.library_id != null
       ? { library_id: section.library_id }
       : {}),
-    title: title.trim() || rowKindName(draft.sectionType),
+    title: title.trim() || rowKindLabel(draft.sectionType),
     section_type: draft.sectionType,
     item_limit: draft.itemLimit,
     featured: draft.hero,
-    ...webOnlyMember(draft, section.featured && section.web_only === true),
     enabled: section.enabled,
     config: rowUpdateConfig(draft),
   };
@@ -333,7 +318,7 @@ export function buildProfileRowUpdate(
   return {
     id: section.id,
     section_type: draft.sectionType,
-    title: title || rowKindName(draft.sectionType),
+    title: title || rowKindLabel(draft.sectionType),
     featured: draft.hero,
     item_limit: draft.itemLimit,
     hidden: section.hidden ?? false,
@@ -341,8 +326,6 @@ export function buildProfileRowUpdate(
     customized: section.customized ?? false,
     position: section.position ?? 0,
     default_title: section.default_title,
-    default_title_key: section.default_title_key,
-    default_title_args: section.default_title_args,
     config,
   };
 }

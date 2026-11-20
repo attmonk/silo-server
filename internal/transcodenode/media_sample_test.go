@@ -2,6 +2,8 @@ package transcodenode
 
 import (
 	"bytes"
+	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -13,19 +15,14 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/mediasample"
 	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
-	"github.com/Silo-Server/silo-server/internal/nodesource"
 )
-
-// mediaSampleInput is the input, and the grant, of speechRequestBody.
-const mediaSampleInput = "/media/film.mkv"
 
 func speechRequestBody(t *testing.T, mutate func(*mediasample.Request)) []byte {
 	t.Helper()
 	req := mediasample.Request{
-		Input:       mediaSampleInput,
-		SourceGrant: mediaSampleInput,
-		Window:      &mediasample.Window{StartSeconds: 60, DurationSeconds: 0.05},
-		Audio:       &mediasample.AudioOutput{Speech: &mediasample.SpeechParams{}},
+		Input:  "/media/film.mkv",
+		Window: &mediasample.Window{StartSeconds: 60, DurationSeconds: 0.05},
+		Audio:  &mediasample.AudioOutput{Speech: &mediasample.SpeechParams{}},
 	}
 	if mutate != nil {
 		mutate(&req)
@@ -40,11 +37,41 @@ func speechRequestBody(t *testing.T, mutate func(*mediasample.Request)) []byte {
 func postMediaSample(t *testing.T, server *Server, body []byte, authorized bool) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, mediasample.RemotePath, bytes.NewReader(body))
 	if authorized {
-		nodeauthtest.Sign(t, req, testNodeKey)
+		nodeauthtest.Sign(t, req, testSecret)
 	}
 	rec := httptest.NewRecorder()
 	server.router().ServeHTTP(rec, req)
 	return rec
+}
+
+func TestMediaSampleRunsSpeechRequest(t *testing.T) {
+	server := newTestServer(t)
+	// A stand-in ffmpeg that writes 5 frames of full-scale samples.
+	samples := make([]byte, 2*400)
+	for i := 0; i < len(samples); i += 2 {
+		binary.LittleEndian.PutUint16(samples[i:], 20000)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pcm"), samples, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ffmpeg := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\ncat "+filepath.Join(dir, "pcm")+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.watcher.Config().Playback.FFmpegPath = ffmpeg
+
+	rec := postMediaSample(t, server, speechRequestBody(t, nil), true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var result mediasample.Result
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Speech == nil || len(result.Speech.Levels) != 5 || result.Speech.StartSeconds != 60 {
+		t.Fatalf("speech %+v", result.Speech)
+	}
 }
 
 func TestMediaSampleRefusals(t *testing.T) {
@@ -52,7 +79,7 @@ func TestMediaSampleRefusals(t *testing.T) {
 	cases := map[string]struct {
 		body       []byte
 		authorized bool
-		refuse     error
+		paths      InputPathAuthorizer
 		status     int
 		reason     mediasample.Reason
 	}{
@@ -66,18 +93,13 @@ func TestMediaSampleRefusals(t *testing.T) {
 			r.Stats = &mediasample.StatsOutput{CropWidth: 1, CropHeight: 1, Width: 64}
 			r.Attempts = []mediasample.Attempt{{Hardware: true}}
 		}), authorized: true, status: http.StatusBadRequest, reason: mediasample.ReasonInvalidRequest},
-		"refused grant": {body: speechRequestBody(t, nil), authorized: true, refuse: &nodesource.StatusError{Op: "open", Status: http.StatusForbidden},
-			status: http.StatusBadRequest, reason: mediasample.ReasonNodeUnavailable},
-		"mount mismatch": {body: speechRequestBody(t, nil), authorized: true, refuse: &nodesource.MountMismatchError{Path: "/m.mkv", NodeErr: os.ErrNotExist},
-			status: http.StatusConflict, reason: mediasample.ReasonNodeUnavailable},
-		"core unreachable": {body: speechRequestBody(t, nil), authorized: true, refuse: errors.New("connection refused"),
-			status: http.StatusServiceUnavailable, reason: mediasample.ReasonNodeUnavailable},
+		"unapproved path": {body: speechRequestBody(t, nil), authorized: true, paths: denyInputPaths{}, status: http.StatusBadRequest},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			server.opener = &pathSources{}
-			if tc.refuse != nil {
-				sourcesOf(server).refuse(mediaSampleInput, tc.refuse)
+			server.inputPaths = allowInputPaths{}
+			if tc.paths != nil {
+				server.inputPaths = tc.paths
 			}
 			rec := postMediaSample(t, server, tc.body, tc.authorized)
 			if rec.Code != tc.status {
@@ -90,6 +112,60 @@ func TestMediaSampleRefusals(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMediaSampleReportsSamplingFailure(t *testing.T) {
+	server := newTestServer(t)
+	ffmpeg := filepath.Join(t.TempDir(), "ffmpeg")
+	if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\necho 'Stream map 0:a:0 matches no streams.' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.watcher.Config().Playback.FFmpegPath = ffmpeg
+	rec := postMediaSample(t, server, speechRequestBody(t, nil), true)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+
+	// The client turns the refusal into a RemoteError the caller can classify.
+	node := httptest.NewServer(server.router())
+	defer node.Close()
+	_, err := mediasample.RemoteClient{}.Run(context.Background(), node.URL+mediasample.RemotePath, testSecret,
+		mediasample.Request{Input: "/m.mkv", Window: &mediasample.Window{DurationSeconds: 1}, Audio: &mediasample.AudioOutput{Speech: &mediasample.SpeechParams{}}})
+	var remoteErr *mediasample.RemoteError
+	if !errors.As(err, &remoteErr) || remoteErr.Status != http.StatusUnprocessableEntity || remoteErr.Infrastructure() {
+		t.Fatalf("remote error %#v", err)
+	}
+	if remoteErr.Reason != mediasample.ReasonNoStream {
+		t.Fatalf("reason %q", remoteErr.Reason)
+	}
+}
+
+func TestMediaSampleRefusalsClassifyForFallback(t *testing.T) {
+	server := newTestServer(t)
+	node := httptest.NewServer(server.router())
+	defer node.Close()
+	run := func(req mediasample.Request) *mediasample.RemoteError {
+		_, err := mediasample.RemoteClient{}.Run(context.Background(), node.URL+mediasample.RemotePath, testSecret, req)
+		var remoteErr *mediasample.RemoteError
+		if !errors.As(err, &remoteErr) {
+			t.Fatalf("error %#v", err)
+		}
+		return remoteErr
+	}
+	speech := mediasample.Request{Input: "/m.mkv", Window: &mediasample.Window{DurationSeconds: 1}, Audio: &mediasample.AudioOutput{Speech: &mediasample.SpeechParams{}}}
+
+	// A node that cannot read the file is another node's problem, not the file's.
+	server.inputPaths = denyInputPaths{}
+	if refused := run(speech); refused.Status != http.StatusBadRequest || !refused.Infrastructure() {
+		t.Fatalf("unapproved path: %#v", refused)
+	}
+	// A malformed request fails the same way anywhere.
+	server.inputPaths = allowInputPaths{}
+	bad := speech
+	bad.Window = nil
+	if refused := run(bad); refused.Status != http.StatusBadRequest || refused.Infrastructure() {
+		t.Fatalf("invalid request: %#v", refused)
 	}
 }
 

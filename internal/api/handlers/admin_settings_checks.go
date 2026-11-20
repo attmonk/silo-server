@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/go-chi/chi/v5"
 	"golang.org/x/net/idna"
 
 	"github.com/Silo-Server/silo-server/internal/ai/chatgpt"
@@ -30,35 +33,7 @@ import (
 // that was redirected to another scheme, host or port, which it does not follow.
 const adminMeilisearchRedirectMessage = "Meilisearch redirected the check to another address. Enter the address it redirects to, such as its https:// URL, and enter the API key again."
 
-// adminMeilisearchKeyRejectedMessage answers a check whose key, or missing
-// key, Meilisearch refused for an authenticated request.
-const adminMeilisearchKeyRejectedMessage = "Meilisearch refused the API key, or requires one. Enter a key that can manage indexes and documents, such as the Default Admin API Key."
-
-const adminTextAIConnectionFailureMessage = "Text AI connection failed. Check the model, reasoning level, service tier, account connection, and provider usage limits."
-
-// checkMessage is a check result's English authored here, with the key of
-// its translation catalog entry and the values of the entry's placeholders.
-// The web admin shows the catalog's translation in a non-English interface.
-type checkMessage struct {
-	key  string
-	text string
-	args map[string]string
-}
-
-const checkMessageKeyPrefix = "web.admin.common.connectionCheck.result."
-
-func newCheckMessage(name, text string) checkMessage {
-	return checkMessage{key: checkMessageKeyPrefix + name, text: text}
-}
-
-var (
-	checkMessageFailed                = newCheckMessage("failed", "Connection check failed. Verify the submitted settings and provider availability.")
-	checkMessageChatGPTSignInRequired = newCheckMessage("chatGPTSignInRequired", adminChatGPTSignInRequiredMessage)
-	checkMessageTextAIFailed          = newCheckMessage("textAIFailed", adminTextAIConnectionFailureMessage)
-	checkMessageMeilisearchRedirected = newCheckMessage("meilisearchRedirected", adminMeilisearchRedirectMessage)
-	checkMessageMeilisearchKey        = newCheckMessage("meilisearchKeyRejected", adminMeilisearchKeyRejectedMessage)
-	checkMessageS3Verified            = newCheckMessage("s3Verified", "S3 connection and object read/write/delete permissions verified.")
-)
+const adminTextAIConnectionFailureMessage = "Text AI connection failed. Check the model, reasoning level, account connection, and provider usage limits."
 
 type adminSettingsConnectionCheckRequest struct {
 	Values    map[string]string `json:"values"`
@@ -70,18 +45,6 @@ type connectionCheckResponse struct {
 	Message string `json:"message"`
 	// safeMessage contains only diagnostics authored here, never provider text.
 	safeMessage string
-	// messageKey and messageArgs name the catalog entry of the message the
-	// native API returns: Message on success, safeMessage on failure.
-	messageKey  string
-	messageArgs map[string]string
-}
-
-func checkPassed(m checkMessage) connectionCheckResponse {
-	return connectionCheckResponse{Success: true, Message: m.text, messageKey: m.key, messageArgs: m.args}
-}
-
-func checkFailed(m checkMessage) connectionCheckResponse {
-	return connectionCheckResponse{Message: m.text, safeMessage: m.text, messageKey: m.key, messageArgs: m.args}
 }
 
 type s3SettingsCheckClient interface {
@@ -127,6 +90,47 @@ var checkAdminMeilisearchSettingsConnection = func(ctx context.Context, settings
 	return catalog.NewCatalogSearchIndexer(nil, nil).CheckConnection(ctx, settings)
 }
 
+func (h *AdminHandler) HandleCheckSettingsConnection(w http.ResponseWriter, r *http.Request) {
+	if h.SettingsRepo == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Settings store not configured")
+		return
+	}
+
+	kind := chi.URLParam(r, "kind")
+	if strings.TrimSpace(kind) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "Check kind is required")
+		return
+	}
+
+	var req adminSettingsConnectionCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
+		return
+	}
+	if req.Values == nil {
+		req.Values = map[string]string{}
+	}
+
+	effectiveSettings, err := h.effectiveSettingsForConnectionCheck(r.Context(), kind, req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load settings")
+		return
+	}
+
+	cfg, err := config.LoadFromDB(effectiveSettings)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+
+	response, err := h.runAdminSettingsConnectionCheck(r.Context(), kind, cfg, effectiveSettings)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "Unsupported connection check kind")
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func (h *AdminHandler) runAdminSettingsConnectionCheck(ctx context.Context, kind string, cfg *config.Config, effectiveSettings map[string]string) (connectionCheckResponse, error) {
 	var response connectionCheckResponse
 	switch kind {
@@ -141,7 +145,7 @@ func (h *AdminHandler) runAdminSettingsConnectionCheck(ctx context.Context, kind
 	case "ai_chat":
 		if cfg.AI.AuthMode == llm.AuthModeChatGPT {
 			if h.ChatGPT == nil {
-				return checkFailed(checkMessageChatGPTSignInRequired), nil
+				return connectionCheckResponse{Message: adminChatGPTSignInRequiredMessage, safeMessage: adminChatGPTSignInRequiredMessage}, nil
 			}
 			response = checkAIChatConnectionWithToken(ctx, cfg, h.ChatGPT)
 		} else {
@@ -169,14 +173,13 @@ func checkMDBListConnection(ctx context.Context, cfg *config.Config) connectionC
 	if err := newAdminMDBListSettingsCheckClient(cfg.MDBListAPIKey).Check(checkCtx); err != nil {
 		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("MDBList connection check failed: %v", err)}
 	}
-	return checkPassed(newCheckMessage("mdblistVerified", "MDBList API key verified."))
+	return connectionCheckResponse{Success: true, Message: "MDBList API key verified."}
 }
 
 func aiClientConfig(cfg *config.Config) llm.Config {
 	return llm.Config{
 		AuthMode:        cfg.AI.AuthMode,
 		ReasoningEffort: cfg.AI.ReasoningEffort,
-		ServiceTier:     cfg.AI.ServiceTier,
 		BaseURL:         strings.TrimSpace(cfg.AI.BaseURL),
 		APIKey:          cfg.AI.APIKey,
 		ChatModel:       strings.TrimSpace(cfg.AI.ChatModel),
@@ -192,7 +195,7 @@ func checkAIChatConnection(ctx context.Context, cfg *config.Config) connectionCh
 
 func checkAIChatConnectionWithToken(ctx context.Context, cfg *config.Config, connection *chatgpt.Service) connectionCheckResponse {
 	if cfg.AI.AuthMode != llm.AuthModeChatGPT && strings.TrimSpace(cfg.AI.BaseURL) == "" {
-		return connectionCheckResponse{Success: false, Message: "Choose a text provider."}
+		return connectionCheckResponse{Success: false, Message: "Text AI base URL is required."}
 	}
 	if strings.TrimSpace(cfg.AI.ChatModel) == "" {
 		return connectionCheckResponse{Success: false, Message: "Chat model is required."}
@@ -202,7 +205,7 @@ func checkAIChatConnectionWithToken(ctx context.Context, cfg *config.Config, con
 	if connection != nil {
 		checkConfig, err := connection.CheckTextConfig(ctx)
 		if err != nil {
-			return checkFailed(checkMessageTextAIFailed)
+			return connectionCheckResponse{Message: adminTextAIConnectionFailureMessage, safeMessage: adminTextAIConnectionFailureMessage}
 		}
 		checkConfig.ChatModel = clientCfg.ChatModel
 		checkConfig.ReasoningEffort = clientCfg.ReasoningEffort
@@ -215,19 +218,25 @@ func checkAIChatConnectionWithToken(ctx context.Context, cfg *config.Config, con
 		{Role: "system", Content: "Return a JSON object with status set to ok."},
 		{Role: "user", Content: "Check this Silo text translation connection."},
 	}, true); err != nil {
-		response := checkFailed(checkMessageTextAIFailed)
-		response.Message = fmt.Sprintf("Text AI connection check failed: %v", err)
-		return response
+		return connectionCheckResponse{
+			Success:     false,
+			Message:     fmt.Sprintf("Text AI connection check failed: %v", err),
+			safeMessage: adminTextAIConnectionFailureMessage,
+		}
 	}
 
-	return checkPassed(newCheckMessage("textAIConnected", "Text AI connection successful."))
+	return connectionCheckResponse{Success: true, Message: "Text AI connection successful."}
 }
 
 func checkAITranscriptionConnection(ctx context.Context, cfg *config.Config) connectionCheckResponse {
-	if strings.TrimSpace(cfg.AI.ASRBaseURL) == "" {
+	effectiveBaseURL := strings.TrimSpace(cfg.AI.ASRBaseURL)
+	if effectiveBaseURL == "" {
+		effectiveBaseURL = strings.TrimSpace(cfg.AI.BaseURL)
+	}
+	if effectiveBaseURL == "" {
 		return connectionCheckResponse{
 			Success: false,
-			Message: "Choose a speech-to-text provider.",
+			Message: "Speech-to-text base URL is required.",
 		}
 	}
 	if strings.TrimSpace(cfg.AI.ASRModel) == "" {
@@ -248,18 +257,18 @@ func checkAITranscriptionConnection(ctx context.Context, cfg *config.Config) con
 	})
 	if err != nil {
 		message := transcriptionCheckFailureMessage(err)
-		if message.key == "" {
-			message = checkMessageFailed
+		if message == "" {
+			message = "Connection check failed. Verify the submitted settings and provider availability."
 		}
 		// Both the legacy handler and native service consume this result.
 		// Never put provider-controlled error text in the response.
-		return checkFailed(message)
+		return connectionCheckResponse{Success: false, Message: message, safeMessage: message}
 	}
 
 	if result != nil {
 		for _, segment := range result.Segments {
 			if strings.TrimSpace(segment.Text) != "" && segment.Start >= 0 && segment.End > segment.Start {
-				return checkPassed(newCheckMessage("speechConnected", "Speech-to-text connection successful: timestamped speech received."))
+				return connectionCheckResponse{Success: true, Message: "Speech-to-text connection successful: timestamped speech received."}
 			}
 		}
 	}
@@ -269,31 +278,31 @@ func checkAITranscriptionConnection(ctx context.Context, cfg *config.Config) con
 	}
 }
 
-// transcriptionCheckFailureMessage explains a classified provider failure, or
-// returns the zero message for one it cannot explain.
-func transcriptionCheckFailureMessage(err error) checkMessage {
-	if errors.Is(err, llm.ErrTimedSegmentsUnsupported) {
-		return newCheckMessage("speechNoTimestamps", "Speech-to-text model does not return timestamped segments, which Silo needs to make subtitles. Choose a model that supports segment timestamps, such as whisper-1 on OpenAI.")
+func transcriptionCheckFailureMessage(err error) string {
+	if errors.Is(err, llm.ErrQuotaExhausted) {
+		return "Speech-to-text provider quota is exhausted. Check your provider balance and limits."
 	}
-	switch llm.Classify(err) {
-	case llm.FailureQuotaExhausted:
-		return newCheckMessage("speechQuotaExhausted", "Speech-to-text provider quota is exhausted. Check your provider balance and limits.")
-	case llm.FailureUnauthorized:
-		return newCheckMessage("speechUnauthorized", "Speech-to-text authentication failed. Replace the provider's API key in AI Services.")
-	case llm.FailureForbidden:
-		return newCheckMessage("speechForbidden", "Speech-to-text access was denied. Check your API key permissions and allowed providers.")
-	case llm.FailurePaymentRequired:
-		return newCheckMessage("speechPaymentRequired", "Speech-to-text provider requires payment. Check your provider balance and spending limit.")
-	case llm.FailureNotFound:
-		return newCheckMessage("speechNotFound", "Speech-to-text endpoint or model is unavailable. Check the provider's base URL, the model, and allowed providers.")
-	case llm.FailureRateLimited:
-		return newCheckMessage("speechRateLimited", "Speech-to-text provider is rate limiting requests. Try again later.")
-	case llm.FailureUnavailable:
-		return newCheckMessage("speechUnavailable", "Speech-to-text provider is temporarily unavailable. Try again later.")
-	case llm.FailureTimeout:
-		return newCheckMessage("speechTimedOut", "Speech-to-text connection check timed out. Check provider availability and try again.")
+	if status, ok := errors.AsType[*llm.HTTPError](err); ok {
+		switch status.StatusCode {
+		case http.StatusUnauthorized:
+			return "Speech-to-text authentication failed. Replace the speech-to-text API key, or clear it to use the Text AI key."
+		case http.StatusForbidden:
+			return "Speech-to-text access was denied. Check your API key permissions and allowed providers."
+		case http.StatusPaymentRequired:
+			return "Speech-to-text provider requires payment. Check your provider balance and spending limit."
+		case http.StatusNotFound:
+			return "Speech-to-text endpoint or model is unavailable. Check the base URL, model, and allowed providers."
+		case http.StatusTooManyRequests:
+			return "Speech-to-text provider is rate limiting requests. Try again later."
+		}
+		if status.StatusCode >= 500 {
+			return "Speech-to-text provider is temporarily unavailable. Try again later."
+		}
 	}
-	return checkMessage{}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "Speech-to-text connection check timed out. Check provider availability and try again."
+	}
+	return ""
 }
 
 // transcriptionCheckWAV contains synthetic speech: "This is a subtitle test."
@@ -313,14 +322,11 @@ func checkMeilisearchConnection(ctx context.Context, settings map[string]string)
 	searchSettings.Provider = catalog.SearchProviderMeilisearch
 	if err := checkAdminMeilisearchSettingsConnection(ctx, searchSettings); err != nil {
 		if errors.Is(err, catalog.ErrMeilisearchCheckRedirected) {
-			return checkFailed(checkMessageMeilisearchRedirected)
-		}
-		if errors.Is(err, catalog.ErrMeilisearchCheckKeyRejected) {
-			return checkFailed(checkMessageMeilisearchKey)
+			return connectionCheckResponse{Message: adminMeilisearchRedirectMessage, safeMessage: adminMeilisearchRedirectMessage}
 		}
 		return connectionCheckResponse{Success: false, Message: err.Error()}
 	}
-	return checkPassed(newCheckMessage("meilisearchConnected", "Meilisearch connection successful"))
+	return connectionCheckResponse{Success: true, Message: "Meilisearch connection successful"}
 }
 
 func (h *AdminHandler) effectiveSettingsForConnectionCheck(
@@ -345,15 +351,38 @@ func (h *AdminHandler) effectiveSettingsForConnectionCheck(
 	}
 
 	storedMeilisearchURL := merged[catalog.SearchSettingMeilisearchURL]
+	var storedAIConfig *config.Config
+	if kind == "ai_chat" || kind == "ai_transcription" {
+		storedAIConfig, err = config.LoadFromDB(merged)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// A stored configuration that does not load has no base URL its
+	// embedding token may go to.
+	storedEmbeddingBaseURL := ""
+	if kind == "recommendations_embedding" {
+		if stored, loadErr := config.LoadFromDB(merged); loadErr == nil {
+			storedEmbeddingBaseURL = stored.Recommendations.EmbeddingBaseURL
+		}
+	}
 	for _, key := range req.DirtyKeys {
-		// The lock is server state the embedding check compares a draft
-		// against, and the provider registry holds stored keys a draft could
-		// otherwise send elsewhere. AI and embedding drafts select a provider
-		// by id, which reaches only that provider's own address.
-		if key == recommendations.EmbeddingLockSettingKey || machineManagedSettingKeys[key] {
+		if key == recommendations.EmbeddingLockSettingKey {
+			// The lock is server state the embedding check compares a draft
+			// against, not a value a draft can replace.
 			continue
 		}
 		merged[key] = req.Values[key]
+	}
+	if storedAIConfig != nil {
+		draftAIConfig, loadErr := config.LoadFromDB(merged)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		protectAIConnectionCheckSecrets(kind, req, storedAIConfig, draftAIConfig, merged)
+	}
+	if kind == "recommendations_embedding" {
+		protectEmbeddingConnectionCheckSecret(req, storedEmbeddingBaseURL, merged)
 	}
 	if kind == "meilisearch" &&
 		(storedMeilisearchURL == "" || endpointAuthority(storedMeilisearchURL) != endpointAuthority(merged[catalog.SearchSettingMeilisearchURL])) &&
@@ -362,6 +391,57 @@ func (h *AdminHandler) effectiveSettingsForConnectionCheck(
 	}
 
 	return merged, nil
+}
+
+// embeddingTokenSettingKeys hold the embedding provider's token: the token,
+// then the legacy OpenAI key it falls back to.
+var embeddingTokenSettingKeys = []string{"recommendations.embedding_auth_token", "recommendations.openai_api_key"}
+
+// protectEmbeddingConnectionCheckSecret sends the stored embedding token only
+// to the base URL it was saved for (same scheme, host and port). A draft that
+// points the check elsewhere, by its base URL or a legacy provider setting,
+// is checked with the token it carries itself, or none, so a check cannot
+// hand the saved token to another server.
+func protectEmbeddingConnectionCheckSecret(req adminSettingsConnectionCheckRequest, storedBaseURL string, settings map[string]string) {
+	draft, err := config.LoadFromDB(settings)
+	if err == nil && storedBaseURL != "" && endpointAuthority(draft.Recommendations.EmbeddingBaseURL) == endpointAuthority(storedBaseURL) {
+		return
+	}
+	for _, key := range embeddingTokenSettingKeys {
+		if !hasExplicitDraftSecret(req, key) {
+			settings[key] = ""
+		}
+	}
+}
+
+func protectAIConnectionCheckSecrets(
+	kind string,
+	req adminSettingsConnectionCheckRequest,
+	storedCfg *config.Config,
+	draftCfg *config.Config,
+	settings map[string]string,
+) {
+	storedEndpoint := storedCfg.AI.BaseURL
+	draftEndpoint := draftCfg.AI.BaseURL
+	if kind == "ai_transcription" {
+		if strings.TrimSpace(storedCfg.AI.ASRBaseURL) != "" {
+			storedEndpoint = storedCfg.AI.ASRBaseURL
+		}
+		if strings.TrimSpace(draftCfg.AI.ASRBaseURL) != "" {
+			draftEndpoint = draftCfg.AI.ASRBaseURL
+		}
+	}
+	if endpointAuthority(storedEndpoint) == endpointAuthority(draftEndpoint) {
+		return
+	}
+
+	if kind == "ai_transcription" && !hasExplicitDraftSecret(req, "ai.asr_api_key") {
+		settings["ai.asr_api_key"] = ""
+	}
+	if !hasExplicitDraftSecret(req, "ai.api_key") {
+		settings["ai.api_key"] = ""
+		settings["subtitle_ai.api_key"] = ""
+	}
 }
 
 func hasExplicitDraftSecret(req adminSettingsConnectionCheckRequest, key string) bool {
@@ -470,7 +550,10 @@ func checkS3PublicConnection(ctx context.Context, cfg *config.Config) connection
 		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("S3 object permission check failed: %v", err)}
 	}
 
-	return checkPassed(checkMessageS3Verified)
+	return connectionCheckResponse{
+		Success: true,
+		Message: "S3 connection and object read/write/delete permissions verified.",
+	}
 }
 
 func checkS3PrivateConnection(ctx context.Context, cfg *config.Config) connectionCheckResponse {
@@ -503,7 +586,10 @@ func checkS3PrivateConnection(ctx context.Context, cfg *config.Config) connectio
 		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("S3 object permission check failed: %v", err)}
 	}
 
-	return checkPassed(checkMessageS3Verified)
+	return connectionCheckResponse{
+		Success: true,
+		Message: "S3 connection and object read/write/delete permissions verified.",
+	}
 }
 
 func checkS3ObjectPermissions(
@@ -560,7 +646,10 @@ func checkRedisConnection(ctx context.Context, cfg *config.Config) connectionChe
 		}
 	}
 
-	return checkPassed(newCheckMessage("redisConnected", "Redis connection successful."))
+	return connectionCheckResponse{
+		Success: true,
+		Message: "Redis connection successful.",
+	}
 }
 
 // errRedisChannelsRefused wraps the error Redis answers a subscription to the
@@ -613,7 +702,7 @@ func checkRecommendationsEmbeddingConnection(
 	if strings.TrimSpace(cfg.Recommendations.EmbeddingBaseURL) == "" {
 		return connectionCheckResponse{
 			Success: false,
-			Message: "Choose an embedding provider.",
+			Message: "Embedding base URL is required.",
 		}
 	}
 	if strings.TrimSpace(cfg.Recommendations.EmbeddingModel) == "" {
@@ -638,27 +727,28 @@ func checkRecommendationsEmbeddingConnection(
 			Message: fmt.Sprintf("Embedding connection check failed: %v", err),
 		}
 	}
+	failed := func(message string) connectionCheckResponse {
+		return connectionCheckResponse{Success: false, Message: message, safeMessage: message}
+	}
 	if len(vectors) == 0 || len(vectors[0]) == 0 {
-		return checkFailed(newCheckMessage("embeddingNoVector", "The embedding provider returned no vector for the test text."))
+		return failed("The embedding provider returned no vector for the test text.")
 	}
 	dimensions := len(vectors[0])
 	if dimensions > embeddingvectors.CanonicalDimensions {
-		message := newCheckMessage("embeddingTooManyDimensions", fmt.Sprintf("The model returns %d dimensions; Silo stores at most %d.", dimensions, embeddingvectors.CanonicalDimensions))
-		message.args = map[string]string{"dimensions": strconv.Itoa(dimensions), "max": strconv.Itoa(embeddingvectors.CanonicalDimensions)}
-		return checkFailed(message)
+		return failed(fmt.Sprintf("The model returns %d dimensions; Silo stores at most %d.", dimensions, embeddingvectors.CanonicalDimensions))
 	}
 	lock, err := recommendations.ParseEmbeddingLock(rawLock)
 	if err != nil {
-		return checkFailed(newCheckMessage("embeddingLockUnreadable", "The stored embedding lock cannot be read. Reset embeddings to clear it."))
+		return failed("The stored embedding lock cannot be read. Reset embeddings to clear it.")
 	}
 	if lock != nil {
-		conflict, key, args := recommendations.DescribeEmbeddingLockConflict(*lock, cfg.Recommendations.EmbeddingBaseURL, cfg.Recommendations.EmbeddingModel, dimensions)
-		if conflict != "" {
-			return checkFailed(checkMessage{key: key, text: conflict, args: args})
+		if conflict := recommendations.DescribeEmbeddingLockConflict(*lock, cfg.Recommendations.EmbeddingBaseURL, cfg.Recommendations.EmbeddingModel, dimensions); conflict != "" {
+			return failed(conflict)
 		}
 	}
 
-	message := newCheckMessage("embeddingConnected", fmt.Sprintf("Embedding connection successful. The model returns %d dimensions.", dimensions))
-	message.args = map[string]string{"dimensions": strconv.Itoa(dimensions)}
-	return checkPassed(message)
+	return connectionCheckResponse{
+		Success: true,
+		Message: fmt.Sprintf("Embedding connection successful. The model returns %d dimensions.", dimensions),
+	}
 }

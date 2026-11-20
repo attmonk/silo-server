@@ -10,7 +10,6 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
-	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
 	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
 )
 
@@ -25,7 +24,6 @@ type Client struct {
 	startSeq       uint64
 	ingressToken   string
 	manifest       *pluginv1.PluginManifest
-	activity       *activity
 	rpc            *sdkruntime.Client
 	capabilities   map[string]*pluginv1.CapabilityDescriptor
 
@@ -75,14 +73,6 @@ type EventConsumerClient struct {
 	timeout time.Duration
 }
 
-// NotificationChannelClient drives one plugin's notification_channel.v1
-// capabilities. The caller bounds each call; the notification system sets
-// the timeouts the SDK documents.
-type NotificationChannelClient struct {
-	client       pluginv1.NotificationChannelClient
-	capabilityID string
-}
-
 type AuthProviderClient struct {
 	client  pluginv1.AuthProviderClient
 	checks  pluginv1.AuthProviderChecksClient
@@ -91,9 +81,8 @@ type AuthProviderClient struct {
 }
 
 type HTTPRoutesClient struct {
-	activity *activity
-	client   pluginv1.HttpRoutesClient
-	timeout  time.Duration
+	client  pluginv1.HttpRoutesClient
+	timeout time.Duration
 }
 
 type WatchSyncProviderClient struct {
@@ -112,7 +101,7 @@ type NetworkAccessProviderClient struct {
 // IngressToken identifies the process that answers these provider RPCs.
 func (c *NetworkAccessProviderClient) IngressToken() string { return c.ingressToken }
 
-func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.PluginManifest, startSeq uint64, used *activity) *Client {
+func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.PluginManifest, startSeq uint64) *Client {
 	capabilities := make(map[string]*pluginv1.CapabilityDescriptor, len(manifest.GetCapabilities()))
 	for _, capability := range manifest.GetCapabilities() {
 		capabilities[capabilityKey(capability.GetType(), capability.GetId())] = capability
@@ -120,7 +109,6 @@ func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.Pl
 
 	return &Client{
 		installationID: installationID,
-		activity:       used,
 		startSeq:       startSeq,
 		manifest:       proto.CloneOf(manifest),
 		rpc:            rpc,
@@ -130,22 +118,6 @@ func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.Pl
 
 func (c *Client) Manifest() *pluginv1.PluginManifest {
 	return proto.CloneOf(c.manifest)
-}
-
-// TestConfiguration tests the draft without configuring the plugin process.
-func (c *Client) TestConfiguration(ctx context.Context, req *pluginv1.TestConfigurationRequest) (*pluginv1.TestConfigurationResponse, error) {
-	c.mu.RLock()
-	unhealthy := c.unhealthy
-	c.mu.RUnlock()
-	if unhealthy {
-		return nil, ErrPluginUnhealthy
-	}
-	if !manifest.SupportsConfigurationCheck(c.manifest) {
-		return nil, ErrCapabilityNotFound
-	}
-	callCtx, cancel := ensureDeadline(ctx, 20*time.Second)
-	defer cancel()
-	return c.rpc.ConfigurationChecks().TestConfiguration(callCtx, req)
 }
 
 func (c *Client) Capabilities() []*pluginv1.CapabilityDescriptor {
@@ -245,13 +217,6 @@ func (c *Client) EventConsumer(capabilityID string) (*EventConsumerClient, error
 	}, nil
 }
 
-func (c *Client) NotificationChannel(capabilityID string) (*NotificationChannelClient, error) {
-	if err := c.requireCapability("notification_channel.v1", capabilityID); err != nil {
-		return nil, err
-	}
-	return &NotificationChannelClient{client: c.rpc.NotificationChannel(), capabilityID: capabilityID}, nil
-}
-
 func (c *Client) AuthProvider(capabilityID string) (*AuthProviderClient, error) {
 	if err := c.requireCapability("auth_provider.v1", capabilityID); err != nil {
 		return nil, err
@@ -269,9 +234,8 @@ func (c *Client) HTTPRoutes(capabilityID string) (*HTTPRoutesClient, error) {
 		return nil, err
 	}
 	return &HTTPRoutesClient{
-		activity: c.activity,
-		client:   c.rpc.HttpRoutes(),
-		timeout:  DefaultRouteTimeout,
+		client:  c.rpc.HttpRoutes(),
+		timeout: DefaultRouteTimeout,
 	}, nil
 }
 
@@ -456,20 +420,6 @@ func (c *RequestRouterClient) Validate(ctx context.Context, req *pluginv1.Valida
 	return c.client.Validate(callCtx, req)
 }
 
-// ValidateDestination asks the plugin whether a destination's settings
-// work. The request names this client's capability.
-func (c *NotificationChannelClient) ValidateDestination(ctx context.Context, req *pluginv1.ValidateNotificationDestinationRequest) (*pluginv1.ValidateNotificationDestinationResponse, error) {
-	req.CapabilityId = c.capabilityID
-	return c.client.ValidateDestination(ctx, req)
-}
-
-// SendNotification asks the plugin to deliver one message. The request
-// names this client's capability.
-func (c *NotificationChannelClient) SendNotification(ctx context.Context, req *pluginv1.SendNotificationRequest) (*pluginv1.SendNotificationResponse, error) {
-	req.CapabilityId = c.capabilityID
-	return c.client.SendNotification(ctx, req)
-}
-
 func (c *EventConsumerClient) HandleEvent(ctx context.Context, req *pluginv1.HandleEventRequest) (*pluginv1.HandleEventResponse, error) {
 	callCtx, cancel := ensureDeadline(ctx, c.timeout)
 	defer cancel()
@@ -525,20 +475,6 @@ func (c *AuthProviderClient) EndSessionUrl(ctx context.Context, req *pluginv1.Au
 	callCtx, cancel := ensureDeadline(ctx, c.timeout)
 	defer cancel()
 	return c.checks.EndSessionUrl(callCtx, req)
-}
-
-// Retain keeps this process active while an HTTP response is delivered outside
-// the RPC, including loopback streams. The caller releases it on every exit.
-// Admission shares the idle-stop lock so a stopping process cannot be revived.
-func (c *HTTPRoutesClient) Retain() (func(), error) {
-	c.activity.mu.Lock()
-	defer c.activity.mu.Unlock()
-	if c.activity.stopping {
-		return nil, ErrClientNotFound
-	}
-	c.activity.inFlight++
-	c.activity.last = c.activity.now()
-	return sync.OnceFunc(c.activity.end), nil
 }
 
 func (c *HTTPRoutesClient) Handle(ctx context.Context, req *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {

@@ -2,24 +2,19 @@ package ebookconvert
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
-	"github.com/Silo-Server/silo-server/internal/privatedir"
 )
 
 // moduleVersion is a short fingerprint of the embedded wasm, mixed into every
@@ -58,8 +53,7 @@ func (k SourceKey) CacheKey() string { return k.hash() }
 
 // CacheOptions configures a Cache.
 type CacheOptions struct {
-	// Dir is the on-disk cache root for converted EPUBs (required). NewCache
-	// refuses a directory another local account could control.
+	// Dir is the on-disk cache root for converted EPUBs (required).
 	Dir string
 	// MaxBytes bounds total cached EPUB size; oldest are evicted past it.
 	// Zero uses DefaultCacheMaxBytes.
@@ -79,10 +73,6 @@ const (
 type Cache struct {
 	conv *Converter
 	opts CacheOptions
-	// root is opts.Dir, opened once it was verified private. Every cache read
-	// and write goes through it, so neither a symlinked entry nor a later swap
-	// of the dir's path can redirect them outside the verified dir.
-	root *os.Root
 
 	group singleflight.Group
 
@@ -95,8 +85,7 @@ type negEntry struct {
 	expiry time.Time
 }
 
-// NewCache creates the cache dir, or verifies an existing one is private to
-// this process's user, and returns a ready Cache.
+// NewCache creates the cache dir and returns a ready Cache.
 func NewCache(conv *Converter, opts CacheOptions) (*Cache, error) {
 	if conv == nil {
 		return nil, ErrUnavailable
@@ -110,31 +99,33 @@ func NewCache(conv *Converter, opts CacheOptions) (*Cache, error) {
 	if opts.NegativeTTL <= 0 {
 		opts.NegativeTTL = DefaultNegativeTTL
 	}
-	root, err := privatedir.OpenRoot(opts.Dir)
-	if err != nil {
-		return nil, fmt.Errorf("ebookconvert: cache dir %w", err)
+	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
+		return nil, fmt.Errorf("ebookconvert: create cache dir: %w", err)
 	}
-	return &Cache{conv: conv, opts: opts, root: root, neg: make(map[string]negEntry)}, nil
+	return &Cache{conv: conv, opts: opts, neg: make(map[string]negEntry)}, nil
 }
 
-// GetOrConvert returns the cached EPUB for srcPath/key, open for reading,
-// converting on miss; the caller closes it. Concurrent calls for the same key
-// collapse to a single conversion. Returns ErrDRMProtected /
-// ErrConversionFailed (also served from the negative cache),
-// ErrConversionTimedOut, ErrSourceTooLarge, or the caller's context error if it
-// cancels while waiting.
-func (c *Cache) GetOrConvert(ctx context.Context, srcPath string, key SourceKey) (*os.File, error) {
+// GetOrConvert returns the path to a cached EPUB for srcPath/key, converting on
+// miss. Concurrent calls for the same key collapse to a single conversion.
+// Returns ErrDRMProtected / ErrConversionFailed (also served from the negative
+// cache), ErrConversionTimedOut, ErrSourceTooLarge, or the caller's context
+// error if it cancels while waiting.
+func (c *Cache) GetOrConvert(ctx context.Context, srcPath string, key SourceKey) (string, error) {
 	kh := key.hash()
-	name := kh + ".epub"
+	dst := filepath.Join(c.opts.Dir, kh+".epub")
 
-	// Fast path: already converted.
-	if f, ok := c.openEntry(name); ok {
-		return f, nil
+	// Fast path: already converted. Refresh mtime so the mtime-ordered budget
+	// eviction behaves as a real LRU — recently-read entries sort newest and
+	// survive eviction.
+	if fi, err := os.Stat(dst); err == nil && fi.Size() > 0 {
+		now := time.Now()
+		_ = os.Chtimes(dst, now, now)
+		return dst, nil
 	}
 
 	// Negative cache: known DRM/deterministically-bad source.
 	if err := c.negativeLookup(kh); err != nil {
-		return nil, err
+		return "", err
 	}
 
 	// Singleflight via DoChan with a *detached* context: coalesced callers share
@@ -145,109 +136,62 @@ func (c *Cache) GetOrConvert(ctx context.Context, srcPath string, key SourceKey)
 	// Converter's own timeout + concurrency semaphore; the caller's context only
 	// governs how long *this* caller waits (the select below). A caller that
 	// gives up still leaves the conversion running to populate the cache.
-	ch := c.group.DoChan(kh, func() (any, error) {
+	ch := c.group.DoChan(kh, func() (interface{}, error) {
 		// Re-check after acquiring the singleflight slot (another caller may
 		// have just produced it).
-		if f, ok := c.openEntry(name); ok {
-			_ = f.Close()
-			return nil, nil
+		if fi, statErr := os.Stat(dst); statErr == nil && fi.Size() > 0 {
+			return dst, nil
 		}
-		// Convert into a private scratch dir, then install through the root.
-		scratch, scratchErr := os.MkdirTemp(c.conv.opts.WorkRoot, "ebookconvert-out-")
-		if scratchErr != nil {
-			return nil, fmt.Errorf("%w: cache temp: %v", ErrConversionFailed, scratchErr) //nolint:errorlint // callers classify by the verdict sentinel; the filesystem error is only reported
+		// Convert to a temp file in the cache dir, then atomically rename in.
+		tmp, tmpErr := os.CreateTemp(c.opts.Dir, "converting-*.epub")
+		if tmpErr != nil {
+			return "", fmt.Errorf("%w: cache temp: %v", ErrConversionFailed, tmpErr) //nolint:errorlint // callers classify by the verdict sentinel; the filesystem error is only reported
 		}
-		defer func() { _ = os.RemoveAll(scratch) }()
-		out := filepath.Join(scratch, "out.epub")
+		tmpPath := tmp.Name()
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath) // Convert recreates it
 
-		if convErr := c.conv.Convert(context.WithoutCancel(ctx), srcPath, out); convErr != nil {
+		if convErr := c.conv.Convert(context.WithoutCancel(ctx), srcPath, tmpPath); convErr != nil {
+			_ = os.Remove(tmpPath)
 			c.remember(kh, convErr)
-			return nil, convErr
+			return "", convErr
 		}
-		if installErr := c.install(out, name); installErr != nil {
-			return nil, fmt.Errorf("%w: cache install: %v", ErrConversionFailed, installErr) //nolint:errorlint // callers classify by the verdict sentinel; the filesystem error is only reported
+		if renErr := os.Rename(tmpPath, dst); renErr != nil {
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("%w: cache rename: %v", ErrConversionFailed, renErr) //nolint:errorlint // callers classify by the verdict sentinel; the filesystem error is only reported
 		}
-		c.enforceBudget(name)
-		return nil, nil
+		c.enforceBudget(dst)
+		return dst, nil
 	})
 
 	select {
 	case res := <-ch:
 		if res.Err != nil {
-			return nil, res.Err
+			return "", res.Err
 		}
-		// Each caller opens its own descriptor: coalesced callers cannot share
-		// one file offset.
-		f, ok := c.openEntry(name)
-		if !ok {
-			return nil, fmt.Errorf("%w: converted entry vanished", ErrConversionFailed)
-		}
-		return f, nil
+		return res.Val.(string), nil //nolint:errcheck,forcetypeassert // c.group's only DoChan closure returns a string
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return "", ctx.Err()
 	}
 }
 
 // Lookup returns a cached conversion result WITHOUT converting on miss. It lets
 // cheap callers (e.g. HEAD requests) avoid kicking off a full conversion:
-//   - ok == true, err == nil: f is the ready EPUB, open for reading; the
-//     caller closes it.
-//   - err != nil: the source is negatively cached (DRM/failed); f is nil.
+//   - ok == true, err == nil: a ready EPUB exists at path.
+//   - err != nil: the source is negatively cached (DRM/failed); path is empty.
 //   - ok == false, err == nil: cache miss — caller must decide whether to convert.
-func (c *Cache) Lookup(key SourceKey) (f *os.File, err error, ok bool) {
+func (c *Cache) Lookup(key SourceKey) (path string, err error, ok bool) {
 	kh := key.hash()
-	if f, ok := c.openEntry(kh + ".epub"); ok {
-		return f, nil, true // a HEAD hit counts as access for LRU
+	dst := filepath.Join(c.opts.Dir, kh+".epub")
+	if fi, statErr := os.Stat(dst); statErr == nil && fi.Size() > 0 {
+		now := time.Now()
+		_ = os.Chtimes(dst, now, now) // a HEAD hit counts as access for LRU
+		return dst, nil, true
 	}
 	if negErr := c.negativeLookup(kh); negErr != nil {
-		return nil, negErr, false
+		return "", negErr, false
 	}
-	return nil, nil, false
-}
-
-// openEntry opens a finished cache entry through the cache root, so a symlink
-// cannot redirect the read outside the cache dir, and accepts only a non-empty
-// regular file. A hit refreshes the entry's mtime so the mtime-ordered budget
-// eviction behaves as a real LRU: recently read entries sort newest and survive.
-func (c *Cache) openEntry(name string) (*os.File, bool) {
-	f, err := c.root.Open(name)
-	if err != nil {
-		return nil, false
-	}
-	if fi, statErr := f.Stat(); statErr != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
-		_ = f.Close()
-		return nil, false
-	}
-	now := time.Now()
-	_ = c.root.Chtimes(name, now, now)
-	return f, true
-}
-
-// install copies the finished conversion at src into the cache as name. The
-// temp file, the rename, and every other cache write go through the root, so
-// they stay in the verified cache dir even if its path is later replaced.
-func (c *Cache) install(src, name string) error {
-	in, err := os.Open(src) //nolint:gosec // src is the converter's output in this conversion's private scratch dir
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-	tmpName := "converting-" + rand.Text() + ".epub"
-	out, err := c.root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(out, in)
-	if closeErr := out.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = c.root.Rename(tmpName, name)
-	}
-	if err != nil {
-		_ = c.root.Remove(tmpName)
-	}
-	return err
+	return "", nil, false
 }
 
 func (c *Cache) negativeLookup(kh string) error {
@@ -283,20 +227,15 @@ func (c *Cache) remember(kh string, err error) {
 // enforceBudget evicts the oldest (by mtime) finished cache entries until the
 // total is within MaxBytes. It never evicts keep (the entry the caller is about
 // to return) and ignores in-flight "converting-*" temp files, since deleting
-// either would hand back a vanished entry or corrupt a concurrent conversion.
+// either would hand back a vanished path or corrupt a concurrent conversion.
 // Best-effort; logs nothing (caller has no logger here).
 func (c *Cache) enforceBudget(keep string) {
-	dir, err := c.root.Open(".")
-	if err != nil {
-		return
-	}
-	entries, err := dir.ReadDir(-1)
-	_ = dir.Close()
+	entries, err := os.ReadDir(c.opts.Dir)
 	if err != nil {
 		return
 	}
 	type item struct {
-		name string
+		path string
 		size int64
 		mod  time.Time
 	}
@@ -307,35 +246,34 @@ func (c *Cache) enforceBudget(keep string) {
 		if e.IsDir() || filepath.Ext(name) != ".epub" || strings.HasPrefix(name, "converting-") {
 			continue // skip dirs, non-epubs, and other conversions' in-flight temps
 		}
-		fi, statErr := c.root.Lstat(name)
-		if statErr != nil || !fi.Mode().IsRegular() {
+		fi, statErr := e.Info()
+		if statErr != nil {
 			continue
 		}
-		items = append(items, item{name, fi.Size(), fi.ModTime()})
+		items = append(items, item{filepath.Join(c.opts.Dir, name), fi.Size(), fi.ModTime()})
 		total += fi.Size()
 	}
 	if total <= c.opts.MaxBytes {
 		return
 	}
-	slices.SortFunc(items, func(a, b item) int { return a.mod.Compare(b.mod) })
+	sort.Slice(items, func(i, j int) bool { return items[i].mod.Before(items[j].mod) })
 	for _, it := range items {
 		if total <= c.opts.MaxBytes {
 			break
 		}
-		if it.name == keep {
+		if it.path == keep {
 			continue // never evict the entry we're about to return
 		}
-		if c.root.Remove(it.name) == nil {
+		if os.Remove(it.path) == nil {
 			total -= it.size
 		}
 	}
 }
 
 // SourceKeyFromStat builds a SourceKey from a file path + fileID, reading
-// size/mtime via stat. path is fspath-encoded. Checksum is left empty (pass
-// one explicitly if known).
+// size/mtime via stat. Checksum is left empty (pass one explicitly if known).
 func SourceKeyFromStat(fileID int, path string) (SourceKey, error) {
-	fi, err := fspath.Stat(path)
+	fi, err := os.Stat(path)
 	if err != nil {
 		return SourceKey{}, err
 	}

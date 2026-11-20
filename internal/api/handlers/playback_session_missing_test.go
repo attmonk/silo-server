@@ -17,7 +17,7 @@ func TestPlaybackSessionMissingResponsesUseStableErrorCode(t *testing.T) {
 	const missingSessionID = "missing-session"
 
 	sessionMgr := playback.NewSessionManager(0, 0)
-	playbackHandler := newKeyedPlaybackHandler(sessionMgr)
+	playbackHandler := NewPlaybackHandler(sessionMgr)
 	playbackHandler.RealtimeHub = playback.NewRealtimeHub()
 	streamHandler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{})
 

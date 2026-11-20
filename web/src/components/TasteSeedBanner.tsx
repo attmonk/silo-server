@@ -3,7 +3,6 @@ import { Link } from "react-router";
 import { Sparkles, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/useAuth";
-import { useT } from "@/i18n";
 import { useHasFavorites } from "@/hooks/queries/favorites";
 import {
   isTasteSeedBannerDismissed,
@@ -25,7 +24,6 @@ import {
  * profile.
  */
 export default function TasteSeedBanner() {
-  const t = useT();
   const { profile } = useAuth();
   const { data: hasFavorites, isPending } = useHasFavorites();
   const [hidden, setHidden] = useState(false);
@@ -47,21 +45,19 @@ export default function TasteSeedBanner() {
           <Sparkles className="h-5 w-5" aria-hidden="true" />
         </div>
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-semibold sm:text-base">
-            {t("web.home.tasteSeed.bannerTitle")}
-          </p>
+          <p className="text-sm font-semibold sm:text-base">Personalize your home</p>
           <p className="text-muted-foreground text-xs sm:text-sm">
-            {t("web.home.tasteSeed.bannerBody")}
+            Pick a few titles you love and we'll tailor your recommendations.
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <Button asChild size="sm">
-            <Link to="/taste-seed?from=settings">{t("web.home.tasteSeed.bannerAction")}</Link>
+            <Link to="/taste-seed?from=settings">Personalize</Link>
           </Button>
           <button
             type="button"
             onClick={handleDismiss}
-            aria-label={t("web.home.tasteSeed.bannerDismiss")}
+            aria-label="Dismiss personalization prompt"
             className="text-muted-foreground hover:text-foreground inline-flex h-8 w-8 items-center justify-center rounded-full transition-colors"
           >
             <X className="h-4 w-4" />

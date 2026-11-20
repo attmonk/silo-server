@@ -16,7 +16,6 @@ import type {
   OperationalLogEntry,
 } from "@/api/types";
 import type { AdminLogQuery } from "@/hooks/queries/admin/logs";
-import { t } from "@/i18n";
 
 type StreamEntryMap = {
   app: OperationalLogEntry;
@@ -43,7 +42,11 @@ export function applyAdminLogAppend<T extends { id: number }>(rows: T[], entry: 
   return next.slice(0, limit);
 }
 
-function applyAdminLogAppends<T extends { id: number }>(rows: T[], entries: T[], limit: number) {
+export function applyAdminLogAppends<T extends { id: number }>(
+  rows: T[],
+  entries: T[],
+  limit: number,
+) {
   return entries.reduce((current, entry) => applyAdminLogAppend(current, entry, limit), rows);
 }
 
@@ -126,7 +129,7 @@ export function useAdminLogStream<TStream extends AdminLogStream>(
       const authority = captureProfileRequestContext();
       if (!authority) {
         setConnectionState("disconnected");
-        setError(t("web.admin.logs.stream.selectProfile"));
+        setError("Select an administrator profile to stream logs.");
         return;
       }
       const authorityActive = () => isCapturedProfileAuthorityActive(authority);
@@ -138,7 +141,7 @@ export function useAdminLogStream<TStream extends AdminLogStream>(
             ws = new WebSocket(url, adminLogsSocketProtocols(ticket.ticket));
           } catch {
             setConnectionState("disconnected");
-            setError(t("web.admin.logs.stream.openFailed"));
+            setError("Unable to open log stream.");
             return;
           }
           const socket = ws;
@@ -176,7 +179,7 @@ export function useAdminLogStream<TStream extends AdminLogStream>(
           socket.onerror = () => {
             if (closedByEffect) return;
             setConnectionState("disconnected");
-            setError(t("web.admin.logs.stream.disconnected"));
+            setError("Log stream disconnected.");
           };
           socket.onclose = () => {
             if (closedByEffect) return;
@@ -186,7 +189,7 @@ export function useAdminLogStream<TStream extends AdminLogStream>(
         .catch(() => {
           if (closedByEffect || !authorityActive()) return;
           setConnectionState("disconnected");
-          setError(t("web.admin.logs.stream.openFailed"));
+          setError("Unable to open log stream.");
         });
     }, connectDelay);
 

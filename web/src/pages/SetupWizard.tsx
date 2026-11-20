@@ -4,7 +4,6 @@ import { SiloBrand } from "@/components/SiloBrand";
 import { useAuth } from "@/hooks/useAuth";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useHasUnsavedChanges } from "@/hooks/useUnsavedChanges";
-import { useAdminMessages, useT } from "@/i18n";
 import "@/styles/admin-settings.css";
 import "@/styles/setup-wizard.css";
 
@@ -49,13 +48,15 @@ function StepContent({ step }: { step: WizardStepId }) {
 function WizardContent() {
   const { summaries, visit } = useWizardContext();
   const { steps, currentStep } = useWizardSteps();
-  const t = useT();
   // The setup route mounts no router guard, so unsaved edits on the current
   // step would be lost silently on a rail click. Ask first, the way the admin
   // pages do through their guard.
   const hasUnsavedChanges = useHasUnsavedChanges();
   function visitStep(id: SkippableStep) {
-    if (hasUnsavedChanges && !window.confirm(t("web.setup.wizard.leaveConfirm"))) {
+    if (
+      hasUnsavedChanges &&
+      !window.confirm("Leave this step? Your unsaved changes will be lost.")
+    ) {
       return;
     }
     visit(id);
@@ -68,9 +69,8 @@ function WizardContent() {
           <div className="setup-brand">
             <SiloBrand variant="mark" className="size-9" />
             <span>
-              {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- brand wordmark */}
               <span className="setup-brand-name">Silo</span>
-              <span className="setup-brand-sub">{t("web.setup.wizard.brandSubtitle")}</span>
+              <span className="setup-brand-sub">First-run setup</span>
             </span>
           </div>
           <StepRail steps={steps} summaries={summaries} onVisit={visitStep} />
@@ -88,13 +88,10 @@ function WizardContent() {
 
 export default function SetupWizard() {
   const { user, loading, setupLoading, setupRequired, setupCompleted } = useAuth();
-  const t = useT();
-  useDocumentTitle(t("web.setup.wizard.documentTitle"));
-  // The steps reuse admin settings, library and provider forms.
-  const adminMessagesReady = useAdminMessages();
+  useDocumentTitle("Setup");
 
-  if (loading || setupLoading || !adminMessagesReady) {
-    return <div className="text-muted-foreground p-8 text-sm">{t("web.ui.loading")}</div>;
+  if (loading || setupLoading) {
+    return <div className="text-muted-foreground p-8 text-sm">Loading...</div>;
   }
 
   if (!setupRequired && !user) {

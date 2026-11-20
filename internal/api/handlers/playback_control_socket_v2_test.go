@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
 	"github.com/Silo-Server/silo-server/internal/access"
@@ -49,7 +47,7 @@ func newControlSocketFixture(t *testing.T) *controlSocketFixture {
 	hub := playback.NewRealtimeHub()
 	tracker := playback.NewCommandTracker()
 	t.Cleanup(tracker.Close)
-	pb := newKeyedPlaybackHandler(manager)
+	pb := NewPlaybackHandler(manager)
 	pb.RealtimeHub = hub
 	pb.CommandTracker = tracker
 	pb.CommandDispatcher = playback.NewCommandDispatcher(manager, hub, tracker)
@@ -357,40 +355,26 @@ func TestControlSocketAckAndResultRouteToRegistrationOwner(t *testing.T) {
 }
 
 func TestControlSocketClosesOnAuthorityOrSessionLoss(t *testing.T) {
-	for _, loss := range []string{"login", "session", "deadline"} {
+	for _, loss := range []string{"login", "session"} {
 		t.Run(loss, func(t *testing.T) {
 			f := newControlSocketFixture(t)
-			identity := f.identity(7, "profile-7")
-			if loss == "deadline" {
-				// Authority stays valid; only the access expiry ends the socket.
-				identity.AccessExpiresAt = time.Now().Add(time.Second)
-			}
-			ticket, _, err := f.handler.Mint(t.Context(), identity, f.session.ID, controlInstallation)
-			if err != nil {
-				t.Fatal(err)
-			}
-			conn, _, err := f.dial(t, ticket, nil) //nolint:bodyclose // dial registers t.Cleanup to close the response body
+			conn, _, err := f.dial(t, f.mint(t, controlInstallation), nil) //nolint:bodyclose // dial registers t.Cleanup to close the response body
 			if err != nil {
 				t.Fatal(err)
 			}
 			f.hello(t, conn)
-			switch loss {
-			case "login":
+			if loss == "login" {
 				f.invalid.Store(true)
-			case "session":
-				if err := f.manager.StopSession(f.session.ID); err != nil {
-					t.Fatal(err)
-				}
+			} else if err := f.manager.StopSession(f.session.ID); err != nil {
+				t.Fatal(err)
 			}
 			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 				t.Fatal(err)
 			}
-			// A read timeout means the server never closed the socket.
-			var netErr net.Error
-			if _, _, err := conn.ReadMessage(); err == nil || (errors.As(err, &netErr) && netErr.Timeout()) {
-				t.Fatalf("connection survived authority loss: %v", err)
+			if _, _, err := conn.ReadMessage(); err == nil {
+				t.Fatal("connection survived authority loss")
 			}
-			if loss != "session" {
+			if loss == "login" {
 				waitForCondition(t, func() bool {
 					s, err := f.manager.GetSession(f.session.ID)
 					return err == nil && !s.HasRealtimeConnection
@@ -433,73 +417,5 @@ func TestControlSocketTicketStoreBoundsAndValidation(t *testing.T) {
 	}
 	if _, err := store.Consume(ctx, value); !errors.Is(err, evt.ErrSocketTicket) {
 		t.Fatal("credential consumed twice")
-	}
-}
-
-// failingAttemptStore reads no attempt: the durable store is unreachable.
-type failingAttemptStore struct{ playback.PlanStoreV3 }
-
-func (failingAttemptStore) GetAttemptIdentity(context.Context, string) (*playback.AttemptIdentityV3, error) {
-	return nil, errors.New("store unreachable")
-}
-
-// A restart empties the in-memory session map. A mint that misses there reads
-// the durable attempt, so the client can tell a session that will be rebuilt
-// from one that ended for good, and only the owner is told which.
-func TestControlSocketMintReadsTheDurableAttemptOnAMemoryMiss(t *testing.T) {
-	f := newControlSocketFixture(t)
-	ctx := t.Context()
-	store := playback.NewMemoryPlanStoreV3()
-	f.pb.PlanStoreV3 = store
-	save := func(sessionID string, stop bool) {
-		t.Helper()
-		record := playback.AttemptRecordV3{PlaybackAttemptID: "attempt-" + sessionID, SessionID: sessionID, UserID: 7, ProfileID: "profile-7", ExpiresAt: time.Now().Add(time.Hour)}
-		if err := store.SaveAttempt(ctx, record); err != nil {
-			t.Fatal(err)
-		}
-		if stop {
-			if _, _, err := store.StopAttempt(ctx, sessionID, uuid.NewString(), nil); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	liveID, endedID, absentID := uuid.NewString(), uuid.NewString(), uuid.NewString()
-	save(liveID, false)
-	save(endedID, true)
-
-	for name, tc := range map[string]struct {
-		identity evt.SocketIdentity
-		session  string
-		want     error
-	}{
-		"ended attempt is gone for good":       {f.identity(7, "profile-7"), endedID, ErrPlaybackControlSocketSessionEnded},
-		"live attempt is not rebuilt here yet": {f.identity(7, "profile-7"), liveID, ErrPlaybackControlSocketSessionResuming},
-		"no attempt stays not found":           {f.identity(7, "profile-7"), absentID, playback.ErrSessionNotFound},
-		"other account sees not found":         {f.identity(8, "profile-7"), endedID, playback.ErrSessionNotFound},
-		"other profile sees not found":         {f.identity(7, "profile-8"), liveID, playback.ErrSessionNotFound},
-	} {
-		if _, _, err := f.handler.Mint(ctx, tc.identity, tc.session, controlInstallation); !errors.Is(err, tc.want) {
-			t.Errorf("%s: err = %v, want %v", name, err, tc.want)
-		}
-	}
-
-	// An unreadable store is a retryable outage, not a verdict on the session.
-	// An id that is not a UUID never reaches the store: a durable one would
-	// fail the query instead of missing.
-	f.pb.PlanStoreV3 = failingAttemptStore{store}
-	if _, _, err := f.handler.Mint(ctx, f.identity(7, "profile-7"), liveID, ""); !errors.Is(err, ErrPlaybackControlSocketUnavailable) {
-		t.Fatalf("store failure err = %v", err)
-	}
-	for _, malformed := range []string{
-		"not-a-uuid",
-		"x" + liveID + "x",
-		"{" + liveID + "}",
-		"urn:uuid:" + liveID,
-		strings.ReplaceAll(liveID, "-", ""),
-		strings.ToUpper(liveID),
-	} {
-		if _, _, err := f.handler.Mint(ctx, f.identity(7, "profile-7"), malformed, ""); !errors.Is(err, playback.ErrSessionNotFound) {
-			t.Fatalf("malformed id %q err = %v", malformed, err)
-		}
 	}
 }

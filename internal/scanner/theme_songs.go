@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/librarykind"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/themesongs"
@@ -20,7 +19,7 @@ func (s *Scanner) scanThemeSongs(ctx context.Context, folder *models.MediaFolder
 	if !supportsThemeSongs(folder.Type) {
 		return nil
 	}
-	discovery := themeDiscovery{roots: compactScanRoots(folder.Paths), ffprobe: s.ffprobePath, ancestors: make(map[themeIgnoreKey]themeIgnoreState), readDir: fspath.ReadDir}
+	discovery := themeDiscovery{roots: folder.Paths, ffprobe: s.ffprobePath, ancestors: make(map[themeIgnoreKey]themeIgnoreState), readDir: os.ReadDir}
 	return discovery.scan(ctx, themesongs.NewRepository(s.fileRepo.Pool()), folder.ID, scope, exact)
 }
 
@@ -56,6 +55,9 @@ func (d *themeDiscovery) scan(ctx context.Context, repo *themesongs.Repository, 
 		return err
 	}
 	for _, directory := range directories {
+		if scope != "" && !pathWithinAnyRoot(directory, []string{scope}) && !pathWithinAnyRoot(scope, []string{directory}) {
+			continue
+		}
 		root := scopeLibraryRoot(directory, d.roots)
 		if root == "" {
 			continue
@@ -101,9 +103,6 @@ type themeIgnoreState struct {
 	err     error
 }
 
-// themeDiscovery's roots are compacted (compactScanRoots): a full scan walks a
-// root nested in another as part of the outer one, so the outer root's ignore
-// files and skipped folder names apply below the nested root too.
 type themeDiscovery struct {
 	roots     []string
 	ffprobe   string
@@ -125,14 +124,14 @@ func (d *themeDiscovery) ancestorRules(directory, root string) themeIgnoreState 
 		state = d.ancestorRules(filepath.Dir(directory), root)
 	}
 	if state.err == nil && !state.ignored {
-		if (directory != root && SkippedDirName(filepath.Base(directory))) || ignoreRulesMatch(state.rules, directory, true) {
+		if ignoreRulesMatch(state.rules, directory, true) {
 			state.ignored = true
 		} else {
 			var entries []os.DirEntry
 			entries, state.err = d.readDir(directory)
 			if state.err == nil {
 				inherited := append([]ignoreRules(nil), state.rules...)
-				state.rules, state.ignored, state.err = dirIgnoreRules(inherited, directory, directory, entries)
+				state.rules, state.ignored = dirIgnoreRules(inherited, directory, directory, entries)
 			}
 		}
 	}
@@ -143,7 +142,7 @@ func (d *themeDiscovery) ancestorRules(directory, root string) themeIgnoreState 
 // discoverThemeSongs follows the local conventions theme.<audio-extension> and
 // theme-music/<audio-file>. It never imports these files into media_files.
 func discoverThemeSongs(ctx context.Context, directory string, roots []string, ffprobe string, cached map[string]themesongs.File) ([]themesongs.File, error) {
-	d := themeDiscovery{roots: compactScanRoots(roots), ffprobe: ffprobe, ancestors: make(map[themeIgnoreKey]themeIgnoreState), readDir: fspath.ReadDir}
+	d := themeDiscovery{roots: roots, ffprobe: ffprobe, ancestors: make(map[themeIgnoreKey]themeIgnoreState), readDir: os.ReadDir}
 	return d.discover(ctx, directory, cached)
 }
 
@@ -154,9 +153,6 @@ func (d *themeDiscovery) discover(ctx context.Context, directory string, cached 
 	root := scopeLibraryRoot(directory, d.roots)
 	var state themeIgnoreState
 	if root != "" && root != directory {
-		if SkippedDirName(filepath.Base(directory)) {
-			return []themesongs.File{}, nil
-		}
 		state = d.ancestorRules(filepath.Dir(directory), root)
 	}
 	rules, ignored, err := state.rules, state.ignored, state.err
@@ -170,10 +166,7 @@ func (d *themeDiscovery) discover(ctx context.Context, directory string, cached 
 	if err != nil {
 		return nil, err
 	}
-	rules, ignored, err = dirIgnoreRules(append([]ignoreRules(nil), rules...), directory, directory, entries)
-	if err != nil {
-		return nil, err
-	}
+	rules, ignored = dirIgnoreRules(append([]ignoreRules(nil), rules...), directory, directory, entries)
 	if ignored {
 		return []themesongs.File{}, nil
 	}
@@ -214,14 +207,14 @@ func (d *themeDiscovery) discover(ctx context.Context, directory string, cached 
 		if len(probe.AudioTracks) == 0 || len(probe.VideoTracks) > 0 {
 			return nil
 		}
-		after, err := fspath.Stat(path)
+		after, err := os.Stat(path)
 		if err != nil {
 			return err
 		}
-		if !fspath.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
+		if !os.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
 			return themesongs.ErrUnavailable
 		}
-		title := fspath.Display(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+		title := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 		if strings.EqualFold(title, "theme") {
 			title = "Theme"
 		}
@@ -245,10 +238,7 @@ func (d *themeDiscovery) discover(ctx context.Context, directory string, cached 
 		if err != nil {
 			return nil, err
 		}
-		childRules, skip, err := dirIgnoreRules(rules, path, path, children)
-		if err != nil {
-			return nil, err
-		}
+		childRules, skip := dirIgnoreRules(rules, path, path, children)
 		if skip {
 			continue
 		}

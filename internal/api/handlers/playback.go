@@ -21,10 +21,10 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/config"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
-	"github.com/Silo-Server/silo-server/internal/keptsub"
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -32,7 +32,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/nodeauth"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/noderouting"
-	"github.com/Silo-Server/silo-server/internal/nodesource"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/playback/connectionstore"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
@@ -62,7 +61,6 @@ type SessionManagerInterface interface {
 	UpdateProgress(sessionID string, position float64, isPaused bool) error
 	UpdateAudioTrack(sessionID string, audioTrackIndex int, method playback.PlayMethod) error
 	UpdateStreamState(sessionID string, state playback.SessionStreamState) error
-	MarkPlanCommitted(sessionID string) error
 	TouchActivity(sessionID string) error
 	BeginTransport(sessionID string) error
 	EndTransport(sessionID string) error
@@ -85,6 +83,26 @@ type SessionManagerInterface interface {
 
 type transcodePermissionChecker interface {
 	CheckTranscodingAllowed(ctx context.Context, userID int, requiresVideoTranscode bool) error
+}
+
+func (h *PlaybackHandler) ensureUserTranscodingAllowed(w http.ResponseWriter, r *http.Request, userID int, requiresVideoTranscode bool) bool {
+	checker, ok := h.sessionMgr.(transcodePermissionChecker)
+	if !ok {
+		return true
+	}
+	if err := checker.CheckTranscodingAllowed(r.Context(), userID, requiresVideoTranscode); err != nil {
+		if errors.Is(err, playback.ErrTranscodingDisabled) {
+			writeError(w, http.StatusForbidden, "transcoding_disabled", "Transcoding is disabled for your user")
+			return false
+		}
+		if errors.Is(err, playback.ErrAudioTranscodingDisabled) {
+			writeError(w, http.StatusForbidden, "audio_transcoding_disabled", "Audio transcoding is disabled for your user")
+			return false
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to verify transcoding access")
+		return false
+	}
+	return true
 }
 
 type PlaybackItemAccessChecker interface {
@@ -152,19 +170,6 @@ type PlaybackChapterThumbnailQueuer interface {
 	QueuePriorityFileAtPosition(ctx context.Context, fileID int, targetSeconds float64)
 }
 
-// SubtitleTrackFactsLoaderV3 loads, for one plan, what reading a file's
-// embedded subtitle tracks taught the server (keptsub.Store).
-type SubtitleTrackFactsLoaderV3 interface {
-	SubtitleTrackFacts(ctx context.Context, file *models.MediaFile) playback.SubtitleTrackFactsV3
-}
-
-// SubtitlePrefetcherV3 reads, when a playback starts, the embedded subtitle
-// tracks it will likely want (keptsub.Prefetcher).
-type SubtitlePrefetcherV3 interface {
-	SessionStarted(req keptsub.PrefetchRequest)
-	SessionEnded(sessionID string)
-}
-
 // PlaybackOriginalLanguageLookup fetches the original language for a content item.
 type PlaybackOriginalLanguageLookup interface {
 	GetOriginalLanguage(ctx context.Context, contentID string) (string, error)
@@ -195,23 +200,10 @@ type PlaybackHandler struct {
 	AdminStore             PlaybackAdminStore    // optional; enables admin playback history/live session cleanup
 	SessionSyncer          PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
 	EventsHub              *evt.Hub
-	// LifecycleEncoder and LifecycleViews render and read the session.*
-	// events on the admin sessions channel; without both, no lifecycle
-	// transition is announced.
-	LifecycleEncoder PlaybackLifecycleEncoder
-	LifecycleViews   PlaybackLifecycleViews
-	// LiveRowJSON renders a session as the live row a sync would store for
-	// it (worker.SessionSyncRowJSON), for a start announced before a sync.
-	LiveRowJSON   func(*playback.Session) (json.RawMessage, error)
-	MissingMarker MissingFileMarker
-	NodePlanner   nodepool.SessionPlanner // optional; enables proxy/transcode node selection
-	JWTSecret     string                  // needed for signing stream tokens
-	// NodeKeys signs calls to transcode nodes with each node's own key.
-	NodeKeys nodeauth.Keyring
-	// SourceGrants grants transcode nodes the source of each start and move;
-	// nil sends none.
-	SourceGrants    nodesource.FileGranter
-	StreamTelemetry *streamtelemetry.Registry // local observation-only telemetry
+	MissingMarker          MissingFileMarker
+	NodePlanner            nodepool.SessionPlanner   // optional; enables proxy/transcode node selection
+	JWTSecret              string                    // needed for signing stream tokens
+	StreamTelemetry        *streamtelemetry.Registry // local observation-only telemetry
 	// StreamDeny revokes a session's stream tokens before they expire (see
 	// docs/architecture/restart-resilient-playback.md). Nil-safe: without Redis
 	// a stopped session keeps serving from a valid token until the token expires.
@@ -247,12 +239,8 @@ type PlaybackHandler struct {
 	// 404 after a restart and the client starts a new attempt, as before.
 	SessionRecipeStore sessionRecipeStoreV3
 	ItemAccess         PlaybackItemAccessChecker // optional; enables file authorization checks
-	// FileNamesVisible reports whether the caller may see file names
-	// (ItemsHandler.CanViewFilePaths). Optional: without it no caller does, and
-	// an untitled external subtitle is labeled by its language.
-	FileNamesVisible   func(context.Context) bool
-	EpisodeLookup      PlaybackEpisodeLookup // optional; resolves episode files to their series
-	ExtraLookup        PlaybackExtraLookup   // optional; resolves extras files to their parent item
+	EpisodeLookup      PlaybackEpisodeLookup     // optional; resolves episode files to their series
+	ExtraLookup        PlaybackExtraLookup       // optional; resolves extras files to their parent item
 	OriginalLangLookup PlaybackOriginalLanguageLookup
 	SettingsRepo       PlaybackSettingsReader     // optional; reads server settings (e.g., allow_4k_transcode)
 	FileVersionFetcher PlaybackFileVersionFetcher // optional; queries sibling file versions for 4K guard
@@ -269,9 +257,7 @@ type PlaybackHandler struct {
 	MarkerUpdateNotifier   PlaybackMarkerUpdateNotifier
 	MarkerLazyContext      context.Context
 	MarkerLazyInFlight     sync.Map
-	SubtitleRepo           subtitles.Repository       // optional; enables downloaded subtitles in playback
-	SubtitleTrackFacts     SubtitleTrackFactsLoaderV3 // optional; what reading embedded tracks taught the server, for native_embedded limitations
-	SubtitlePrefetch       SubtitlePrefetcherV3       // optional; reads the subtitle tracks a playback will likely want, at its start
+	SubtitleRepo           subtitles.Repository // optional; enables downloaded subtitles in playback
 	RealtimeHub            *playback.RealtimeHub
 	CommandTracker         *playback.CommandTracker
 	CommandDispatcher      *playback.CommandDispatcher
@@ -303,7 +289,7 @@ type PlaybackHandler struct {
 	v3ToneMapProbe       func(context.Context, string, string, string) (tonemap.Capabilities, error)
 	v3RouteNodeProbe     func(context.Context, string) bool // nil: probeRouteNodeV3
 	v3NodeCapabilitiesMu sync.Mutex
-	v3NodeCapabilities   map[v3NodeCapabilityKey]v3NodeCapabilityCache
+	v3NodeCapabilities   map[string]v3NodeCapabilityCache
 	// v3NodeProbeBudgets holds what each node last said a capability read of it
 	// costs, guarded by v3NodeCapabilitiesMu. It is kept apart from the
 	// inventory above because the two are invalidated for different reasons: an
@@ -320,7 +306,7 @@ type PlaybackHandler struct {
 	// flight, one at a time each. Guarded by v3NodeCapabilitiesMu, the same
 	// lock as the invalidation counter, so a refresh cannot release its slot in
 	// between an invalidation and that invalidation's claim on it.
-	v3NodeCapabilityRefresh map[v3NodeCapabilityKey]struct{}
+	v3NodeCapabilityRefresh map[string]struct{}
 	v3EventOnce             sync.Once
 	v3EventQueue            chan playback.RouteEventRecordV3
 	v3StartEffectsOnce      sync.Once
@@ -366,11 +352,7 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 	// Wire the shared transcode manager with closures so it reads the handler's
 	// (often late-set) config/store/secret fields lazily at call time, avoiding a
 	// field-ordering hazard during router setup.
-	h.tm.NodeKeysFn = func() nodeauth.Keyring { return h.NodeKeys }
-	h.tm.NodeRecipesFn = func() playback.NodeRecipeDeleter {
-		deleter, _ := h.NodeRecipeStore.(playback.NodeRecipeDeleter)
-		return deleter
-	}
+	h.tm.JWTSecretFn = func() string { return h.JWTSecret }
 	h.tm.LogSinkFn = func() playback.FFmpegLogSink { return h.FFmpegLogSink }
 	h.tm.Config = func() playback.TranscodeRuntimeConfig {
 		c := h.playbackConfig()
@@ -385,7 +367,6 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 	h.tm.StartThrottler = func(ctx context.Context, ts *playback.TranscodeSession) {
 		h.maybeStartThrottler(ctx, ts)
 	}
-	h.tm.RestoreReconstructedClient = h.restoreReconstructedClient
 	h.tm.OnFFmpegCrash = func(ctx context.Context, sessionID string, dead *playback.TranscodeSession) {
 		// ffmpeg crash — tear the session down; a client holding a valid stream
 		// token can reconstruct it on the next request.
@@ -410,12 +391,12 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 		// under the same id between the pre-check above and here. We only tear down the
 		// upstream playback session when the compare-and-delete actually matched the
 		// dead transcode. When it returns false a successor owns the session — do
-		// nothing further, or finalizeSessionStopWithResult's unconditional CloseTranscodeSession
+		// nothing further, or finalizeSessionStop's unconditional CloseTranscodeSession
 		// would reap the live successor's output dir mid-serve.
 		if !h.tm.CloseTranscodeSessionIf(sessionID, dead, nodeURL) {
 			return
 		}
-		if err := h.stopPlaybackSessionByID(ctx, sessionID, ""); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
+		if err := h.stopPlaybackSessionByID(ctx, sessionID, false); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
 			slog.ErrorContext(ctx, "failed to stop playback after local transcode exit", "component", "api", "session", sessionID, "error", err, "playback_session_id", sessionID)
 		}
 	}
@@ -430,9 +411,6 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 	}
 	if adder, ok := sessionMgr.(sessionFinishHookAdder); ok {
 		adder.AddFinishHook(h.handleFinishedSession)
-	}
-	if adder, ok := sessionMgr.(interface{ AddLifecycleHooks(playback.LifecycleHooks) }); ok {
-		adder.AddLifecycleHooks(playback.LifecycleHooks{Started: h.SessionStarted, PauseReported: h.SessionPauseReported})
 	}
 	return h
 }
@@ -492,6 +470,12 @@ func (h *PlaybackHandler) playbackThresholds(ctx context.Context) userstore.Prog
 }
 
 // --- Request/Response types ---
+
+// progressRequest represents the JSON body for POST /playback/{session_id}/progress.
+type progressRequest struct {
+	Position float64 `json:"position"`
+	IsPaused bool    `json:"is_paused"`
+}
 
 func semanticPlayMethod(s *playback.Session) playback.PlayMethod {
 	if s == nil {
@@ -612,7 +596,6 @@ func (h *PlaybackHandler) loadTranscodeServeSession(r *http.Request, sessionID s
 			// reconstruction; plain cards just respawn the encode. Either way the
 			// atomic playback+runtime operation is the same front door.
 			card, claims := verifiedStreamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
-			h.withRecordedRenditionTracksV3(r.Context(), card)
 			if card == nil && session.RequireMediaAuthorization {
 				var recipeErr error
 				if card, recipeErr = h.storedSessionRecipeV3(r.Context(), sessionID, requestUserID); recipeErr != nil {
@@ -642,7 +625,6 @@ func (h *PlaybackHandler) loadTranscodeServeSession(r *http.Request, sessionID s
 	// decode so the recipe is available for reconstruction. A header-authenticated
 	// session carries no token; its recipe is the server-side recovery card.
 	card, claims := verifiedStreamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
-	h.withRecordedRenditionTracksV3(r.Context(), card)
 	if card == nil {
 		var recipeErr error
 		if card, recipeErr = h.storedSessionRecipeV3(r.Context(), sessionID, requestUserID); recipeErr != nil {
@@ -666,12 +648,7 @@ func (h *PlaybackHandler) loadTranscodeServeSession(r *http.Request, sessionID s
 	if videoCopyReconstructRefused(r.Context(), h.fileResolver, h.CopySafetyRacer, card) {
 		return nil, playback.SessionMissing, nil, nil, nil
 	}
-	// A tone-mapped or keyframe-planned rebuild can fail for a reason the
-	// player has to hear (a terminal tone-map verdict, a playlist that can no
-	// longer be rebuilt). The atomic path rebuilds the runtime with the
-	// session and removes the session again when it can't, so a failed
-	// rebuild doesn't hold a stream slot and its error reaches the client.
-	if card != nil && (card.ToneMapMode != "" || card.KeyframePlaylist) {
+	if card != nil && card.ToneMapMode != "" {
 		session, _, status, reconstructErr := h.tm.LoadOrReconstructTranscodeWithError(r.Context(), h.sessionMgr.GetSession, sessionID, requestUserID, requestedSegment, card)
 		return session, status, card, claims, reconstructErr
 	}
@@ -1111,14 +1088,6 @@ func (h *PlaybackHandler) persistStopAndHistory(ctx context.Context, session *pl
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to persist playback stop", "component", "api", "session", session.ID, "error", err)
 	}
-	// A completed play marks the rest of a multi-episode file's range. A
-	// repeated stop of a play already in history marks it again, so a range
-	// an earlier stop failed to mark is not lost; the mark skips episodes
-	// already completed.
-	if result.Completed || (result.AlreadyRecorded && duration > 0 &&
-		session.Position/duration > userstore.WatchedFraction(thresholds.WatchedPct)) {
-		h.markSpannedEpisodesWatched(ctx, watchSvc, session, file, stoppedAt)
-	}
 	// A history row this stop wrote still counts when a later write failed:
 	// no later stop of a once-recorded play refreshes the profile for it.
 	if (err == nil && !result.AlreadyRecorded) || result.HistoryID != "" {
@@ -1182,17 +1151,8 @@ func (h *PlaybackHandler) buildAdminHistoryEntry(
 		return nil, nil
 	}
 
-	// A play whose file left the catalog (a library deleted before the play
-	// was recorded) is still recorded, without the item and duration only
-	// the file gave.
 	file, err := h.loadFileByPreferredID(ctx, requestedMediaFileID(session), session.MediaFileID)
-	switch {
-	case isPlaybackFileLookupMissing(err):
-		slog.WarnContext(ctx, "recording admin history without its media file", "component", "api", "session", session.ID, "error", err)
-		file = nil
-	case err != nil:
-		// A lookup that failed for another reason may succeed on a retry,
-		// and the history upsert never repairs the item it lacks.
+	if err != nil {
 		return nil, fmt.Errorf("loading media file: %w", err)
 	}
 
@@ -1216,9 +1176,6 @@ func (h *PlaybackHandler) buildAdminHistoryEntry(
 	completed := false
 	if file != nil {
 		duration := float64(file.Duration)
-		if session.TimelineDuration > 0 {
-			duration = session.TimelineDuration
-		}
 		durationPtr = &duration
 		if duration > 0 && session.Position/duration > userstore.WatchedFraction(h.playbackThresholds(ctx).WatchedPct) {
 			completed = true
@@ -1238,16 +1195,9 @@ func (h *PlaybackHandler) buildAdminHistoryEntry(
 		WatchedSeconds:  session.Position,
 		DurationSeconds: durationPtr,
 		Completed:       completed,
-		ClientIP:        session.ClientIP,
+		ClientIP:        clientip.FromContext(ctx),
 		Watch:           session.Watch,
-		DeviceID:        session.DeviceID,
-		DevicePlatform:  session.DevicePlatform,
-		ClientName:      session.ClientName,
-		ClientVersion:   session.ClientVersion,
 	}
-	// The decisions the live admin row showed for the transport the play
-	// ended on.
-	entry.VideoDecision, entry.AudioDecision = sessionComponentDecision(string(session.PlayMethod), session.TranscodeAudio, session.TargetVideoCodec)
 	return entry, nil
 }
 
@@ -1279,11 +1229,26 @@ func (h *PlaybackHandler) touchSessionActivity(sessionID string) {
 	}
 }
 
-// finalizeSessionStopWithResult ends a playback session and reports the
-// history writer's result, which the v2 stop receipt carries. reason is why the
-// attempt ended; a system teardown the client can rebuild under the same id
-// passes none.
-func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, reason PlaybackEndReason) watchstate.PlaybackStopResult {
+func (h *PlaybackHandler) finalizeSessionStop(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, userInitiated bool) {
+	h.finalizeSessionStopWithResult(ctx, session, syncNow, syncReason, userInitiated, false)
+}
+
+// finalizeExpiredSession finalizes a session the liveness reaper expired. The
+// reaper then marks its attempt stopped, so a client starts a new session
+// rather than resuming this one, and watch providers that mirror live
+// sessions hear this one ended. A Jellyfin play's upstream session is the
+// exception: jellycompat can revive it under the same id and sends that
+// play's own stop, so its expiry stays a plain pause.
+func (h *PlaybackHandler) finalizeExpiredSession(ctx context.Context, session *playback.Session) {
+	h.finalizeSessionStopWithResult(ctx, session, false, "", false, !session.IsJellyfinCompat)
+}
+
+// finalizeSessionStopWithResult is finalizeSessionStop reporting the history
+// writer's result, which the v2 stop receipt carries.
+// sessionEnded is true when the attempt ends for good without a user stop,
+// as on expiry; a system teardown the client can rebuild under the same id
+// passes false.
+func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, userInitiated, sessionEnded bool) watchstate.PlaybackStopResult {
 	if h == nil || session == nil || session.ID == "" {
 		return watchstate.PlaybackStopResult{}
 	}
@@ -1292,7 +1257,7 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 	}
 	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
 	h.cleanupStoppedSessionTransport(ctx, session)
-	if reason.userInitiated() || session.TranscodeNodeURL != "" {
+	if userInitiated || session.TranscodeNodeURL != "" {
 		// A system teardown (an FFmpeg exit, a copy-safety stop) leaves the
 		// attempt live for the client's next request to rebuild, as a stream
 		// token would; only a real stop retires the recovery card. A remote
@@ -1301,32 +1266,27 @@ func (h *PlaybackHandler) finalizeSessionStopWithResult(ctx context.Context, ses
 		// session the node refuses.
 		h.deleteSessionRecipeV3(ctx, session.ID)
 	}
-	stopResult := h.recordStoppedSession(ctx, session, reason)
+	stopResult := h.recordStoppedSession(ctx, session, userInitiated, sessionEnded)
 	if syncNow {
 		h.syncSessionsNow(ctx, syncReason)
 	}
 	return stopResult
 }
 
-func (h *PlaybackHandler) recordStoppedSession(ctx context.Context, session *playback.Session, reason PlaybackEndReason) watchstate.PlaybackStopResult {
-	stopResult := h.recordStopHistory(ctx, session, reason)
-	h.notifyStoppedSession(ctx, session, stopResult, reason)
+func (h *PlaybackHandler) recordStoppedSession(ctx context.Context, session *playback.Session, userInitiated, sessionEnded bool) watchstate.PlaybackStopResult {
+	stopResult := h.recordStopHistory(ctx, session)
+	h.notifyStoppedSession(ctx, session, stopResult, userInitiated, sessionEnded)
 	return stopResult
 }
 
-// notifyStoppedSession tells watch providers and the live admin view that the
-// session stopped. An abort or an expiry ends the attempt for good, except
-// for a Jellyfin play's upstream session: its client's Stopped report still
-// finds the play after an expiry and sends that play's own stop, so its
-// expiry stays a plain pause.
-func (h *PlaybackHandler) notifyStoppedSession(ctx context.Context, session *playback.Session, stopResult watchstate.PlaybackStopResult, reason PlaybackEndReason) {
+func (h *PlaybackHandler) notifyStoppedSession(ctx context.Context, session *playback.Session, stopResult watchstate.PlaybackStopResult, userInitiated, sessionEnded bool) {
 	if h.WatchScrobbler != nil {
-		if event, ok := h.scrobbleEventForStoppedSession(ctx, session, stopResult); ok && (reason.userInitiated() || stopResult.Completed) {
+		if event, ok := h.scrobbleEventForStoppedSession(ctx, session, stopResult); ok && (userInitiated || stopResult.Completed) {
 			if err := h.WatchScrobbler.ScrobbleStop(ctx, event); err != nil {
 				slog.WarnContext(ctx, "failed to queue watch provider stop scrobble", "component", "api", "session", session.ID, "error", err)
 			}
 		} else if ok {
-			event.SessionEnded = reason == PlaybackEndAborted || (reason == PlaybackEndExpired && !session.IsJellyfinCompat)
+			event.SessionEnded = sessionEnded
 			if err := h.WatchScrobbler.ScrobblePause(ctx, event); err != nil {
 				slog.WarnContext(ctx, "failed to queue watch provider pause scrobble", "component", "api", "session", session.ID, "error", err)
 			}
@@ -1354,47 +1314,27 @@ func (h *PlaybackHandler) cleanupStoppedSessionTransport(ctx context.Context, se
 
 // recordStopHistory writes a stopped session to watch history and the admin
 // playback log. The admin log keeps one row per session.
-//
-// An aborted or replaced play goes to the admin log only: an abort never
-// wrote watch history, and a replaced play continues under the session that
-// replaced it.
-func (h *PlaybackHandler) recordStopHistory(ctx context.Context, session *playback.Session, reason PlaybackEndReason) watchstate.PlaybackStopResult {
-	if compatCopyWithoutProgress(session) {
-		return watchstate.PlaybackStopResult{}
-	}
-	if reason == PlaybackEndAborted || reason == PlaybackEndReplaced {
-		h.recordAdminStopHistory(ctx, session, reason)
+func (h *PlaybackHandler) recordStopHistory(ctx context.Context, session *playback.Session) watchstate.PlaybackStopResult {
+	// A Jellyfin session copy without a position never saw the play's
+	// progress: a start that failed to route, or a replica that only served
+	// media while another replica took the reports. It must not record the
+	// play in place of a copy that did.
+	if session.IsJellyfinCompat && session.Position <= 0 {
 		return watchstate.PlaybackStopResult{}
 	}
 	result := h.persistStopAndHistory(ctx, session)
-	h.recordAdminStopHistory(ctx, session, reason)
+	h.recordAdminStopHistory(ctx, session)
 	return result
 }
 
-// recordAdminStopHistory logs a failed write itself and also returns it, so
-// the lifecycle sweep can hold back its next attempt.
-func (h *PlaybackHandler) recordAdminStopHistory(ctx context.Context, session *playback.Session, reason PlaybackEndReason) error {
-	entry, err := h.buildAdminHistoryEntry(ctx, session)
-	if err != nil {
+func (h *PlaybackHandler) recordAdminStopHistory(ctx context.Context, session *playback.Session) {
+	if entry, err := h.buildAdminHistoryEntry(ctx, session); err != nil {
 		slog.ErrorContext(ctx, "failed to build admin history", "component", "api", "session", session.ID, "error", err)
-		return err
-	}
-	if entry == nil || h.AdminStore == nil {
-		return nil
-	}
-	entry.EndReason = reason
-	// An end goes through the session's lifecycle, which announces it;
-	// a teardown the client can recover from records its stretch only.
-	if reason != "" {
-		if handled, err := h.recordEnd(ctx, session, *entry); handled {
-			return err
+	} else if entry != nil && h.AdminStore != nil {
+		if err := h.AdminStore.RecordHistory(ctx, *entry); err != nil {
+			slog.ErrorContext(ctx, "failed to record admin history", "component", "api", "session", session.ID, "error", err)
 		}
 	}
-	if err := h.AdminStore.RecordHistory(ctx, *entry); err != nil {
-		slog.ErrorContext(ctx, "failed to record admin history", "component", "api", "session", session.ID, "error", err)
-		return err
-	}
-	return nil
 }
 
 // compatPlayHistoryNamespace derives a Jellyfin play's watch-history row ID
@@ -1433,10 +1373,7 @@ func (h *PlaybackHandler) scrobbleAbortedSession(ctx context.Context, session *p
 	}
 }
 
-// finalizeSessionAbort tears down an aborted session. Its watch-provider
-// event and admin history row are written only when claim owns the end:
-// another stop that already won the attempt row records the play itself.
-func (h *PlaybackHandler) finalizeSessionAbort(ctx context.Context, session *playback.Session, syncNow bool, syncReason string, claim nativeEndClaim) {
+func (h *PlaybackHandler) finalizeSessionAbort(ctx context.Context, session *playback.Session, syncNow bool, syncReason string) {
 	if h == nil || session == nil || session.ID == "" {
 		return
 	}
@@ -1445,13 +1382,7 @@ func (h *PlaybackHandler) finalizeSessionAbort(ctx context.Context, session *pla
 	}
 	h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
 
-	if claim.owned {
-		h.scrobbleAbortedSession(ctx, session)
-		// An abort writes no watch history, but the play happened: the admin
-		// log records it as aborted, unless it is a Jellyfin copy that never
-		// saw it.
-		h.recordStopHistory(ctx, session, claim.reason(session.ID, PlaybackEndAborted))
-	}
+	h.scrobbleAbortedSession(ctx, session)
 
 	if h.AdminStore != nil {
 		if err := h.AdminStore.DeleteSession(ctx, session.ID); err != nil {
@@ -1500,20 +1431,14 @@ func (h *PlaybackHandler) expireSessionCopy(ctx context.Context, session *playba
 	// progress after this copy went idle, or that is already stopped,
 	// means this copy is stale, not the session. Drop it without writing
 	// history, the deny marker, or a stop over the other replica's.
-	//
-	// A stopped row goes to the claim below when the store arbitrates ends:
-	// a stop whose finalizer died before finishing is finished here as that
-	// stop once its lease lapses, and a finished one drops this copy.
-	_, arbitrated := h.PlanStoreV3.(playback.ProgressStoreV3)
-	stopped := h.attemptStoppedElsewhere(ctx, session.ID)
-	if stopped && !arbitrated {
+	if h.attemptStoppedElsewhere(ctx, session.ID) {
 		slog.InfoContext(ctx, "dropped stale local playback session copy", "session", session.ID, "playback_session_id", session.ID)
 		// The attempt is over, so nothing still serves this copy's transport,
 		// and the replica that recorded the stop may not have known it.
 		h.closeTranscodeForSession(session)
 		return
 	}
-	if !stopped && h.attemptActiveElsewhere(ctx, session) {
+	if h.attemptActiveElsewhere(ctx, session) {
 		slog.InfoContext(ctx, "dropped stale local playback session copy", "session", session.ID, "playback_session_id", session.ID)
 		// Only this replica's own transcode goes. The remote transport is the
 		// other replica's to keep or stop: a stop here would kill the job it is
@@ -1521,66 +1446,18 @@ func (h *PlaybackHandler) expireSessionCopy(ctx context.Context, session *playba
 		h.tm.CloseTranscodeSession(session.ID, "")
 		return
 	}
-	if session.IsJellyfinCompat && h.playEndedElsewhere(ctx, session.ID) {
-		// A Jellyfin play has no attempt row; its history row says another
-		// replica already ended it (a stop, a method switch), so this copy
-		// must not record a later expiry over that end.
-		slog.InfoContext(ctx, "dropped stale local playback session copy", "session", session.ID, "playback_session_id", session.ID)
-		h.closeTranscodeForSession(session)
-		return
-	}
-	// Expiry is a liveness reap, not a user stop, but it ends the attempt all
-	// the same: the row is stopped under a server-minted stop id first, so a
-	// start replay reports session_expired on every replica and no replica
-	// serves or reconstructs the session again. A stop that won the row
-	// before this expiry owns the play's history instead.
-	claim := claimNativeEnd(ctx, h.PlanStoreV3, h.StreamDeny, session.ID, expiredStopID(session.ID))
-	defer h.forgetProgressSideEffectLock(session.ID)
-	// A row already stopped has its own end; one this copy cannot confirm it
-	// owns through the store is left to that end, never recorded again here.
-	if !claim.owned || (stopped && !claim.leased()) {
-		slog.InfoContext(ctx, "dropped stale local playback session copy", "session", session.ID, "playback_session_id", session.ID)
-		h.closeTranscodeForSession(session)
-		return
-	}
-	if !claim.ownEnd(expiredStopID(session.ID)) {
-		h.FinishOtherEnd(ctx, claim, session.ID)
-		h.closeTranscodeForSession(session)
-		return
-	}
-	claim.applyAccepted(session)
-	result := h.finalizeSessionStopWithResult(ctx, session, false, "", PlaybackEndExpired)
-	claim.finish(ctx, session.ID, result.HistoryID)
-}
-
-// historyEndReader reads the end reason the admin log recorded for a session.
-type historyEndReader interface {
-	HistoryEndReason(ctx context.Context, sessionID string) (PlaybackEndReason, error)
-}
-
-// playEndedElsewhere reports whether the admin log already holds a definite
-// end for the session: a stop, a replacement, a termination or an abort.
-// A failed read reports false: the expiry then records as before.
-func (h *PlaybackHandler) playEndedElsewhere(ctx context.Context, sessionID string) bool {
-	reader, ok := h.AdminStore.(historyEndReader)
-	if !ok {
-		return false
-	}
-	reason, err := reader.HistoryEndReason(ctx, sessionID)
-	if err != nil {
-		slog.WarnContext(ctx, "failed to read a session's recorded end", "component", "api", "session", sessionID, "error", err)
-		return false
-	}
-	// An earlier expiry is not the play's end: an older copy may have expired
-	// first, and this copy can still record further progress over it.
-	return reason != "" && reason != PlaybackEndExpired
+	// Expiry is a liveness reap, not a user stop, but it ends the attempt
+	// all the same (below), so nothing can reconstruct the session afterwards.
+	h.finalizeExpiredSession(ctx, session)
+	// The attempt is over: mark its row stopped under a server-minted stop
+	// id so a start replay reports session_expired on every replica, and
+	// deny its tokens so no replica serves it again.
+	h.markAttemptStoppedServerSide(ctx, session.ID)
 }
 
 // handleFinishedSession records a play that another playback frontend ended
-// through FinishSession or FinishDetached. That frontend owns the rest of its
-// stop: transcode and transport teardown, watch-provider scrobbles, and the
-// live-session sync. The end reason travels in ctx; without one the client
-// stopped the play.
+// through FinishSession. That frontend owns the rest of its stop: transcode
+// and transport teardown, watch-provider scrobbles, and the live-session sync.
 func (h *PlaybackHandler) handleFinishedSession(ctx context.Context, session *playback.Session) {
 	if h == nil || session == nil || session.ID == "" {
 		return
@@ -1589,199 +1466,7 @@ func (h *PlaybackHandler) handleFinishedSession(ctx context.Context, session *pl
 		ctx = context.Background()
 	}
 	// Clients often drop the connection right after reporting a stop.
-	ctx = context.WithoutCancel(ctx)
-	reason := PlaybackEndReason(playback.EndReasonFromContext(ctx))
-	if reason == "" {
-		reason = PlaybackEndStopped
-	}
-	if playback.IsDetachedFinish(ctx) {
-		h.fillDetachedSession(ctx, session, time.Time{})
-		if session.UserID == 0 {
-			return // nothing left that says whose play it was
-		}
-	}
-	h.recordStopHistory(ctx, session, reason)
-}
-
-// detachedFinisher runs the session manager's finish hooks for a play this
-// replica no longer holds (playback.SessionManager.FinishDetached).
-type detachedFinisher interface {
-	FinishDetached(ctx context.Context, s playback.Session)
-}
-
-// liveSessionReader reads the shared live row a replica synced for a
-// session, which outlives the replica's copy of it.
-type liveSessionReader interface {
-	LiveSession(ctx context.Context, sessionID string) (*playback.Session, error)
-}
-
-// fillDetachedSession completes a session synthesized for a play this
-// replica does not hold, so its admin history row carries what the play's
-// own copy would have: the start time, client, device and stream facts come
-// from the shared live row when one is left, whatever the snapshot already
-// carries (an Audiobookshelf close knows its start but not its client).
-// Fields the snapshot already has are kept, and so is a reported position,
-// zero included; only a
-// playback.PositionUnknown is filled. A snapshot that names no account (one
-// built from a Jellyfin play row, which keeps only a pseudo-account) takes
-// the live row's. A start time still unknown after that is startedAt, then
-// now.
-func (h *PlaybackHandler) fillDetachedSession(ctx context.Context, session *playback.Session, startedAt time.Time) {
-	if reader, ok := h.AdminStore.(liveSessionReader); ok {
-		live, err := reader.LiveSession(ctx, session.ID)
-		if err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
-			slog.WarnContext(ctx, "failed to read the live row of a detached session", "component", "api", "session", session.ID, "error", err)
-		}
-		if live != nil && session.UserID == 0 {
-			session.UserID, session.ProfileID = live.UserID, live.ProfileID
-		}
-		if live != nil && live.UserID == session.UserID {
-			fillEmptySessionFacts(session, live)
-		}
-	}
-	if session.Position < 0 {
-		session.Position = 0
-	}
-	if session.StartedAt.IsZero() {
-		session.StartedAt = startedAt
-	}
-	if session.StartedAt.IsZero() {
-		session.StartedAt = time.Now()
-	}
-}
-
-func fillEmptySessionFacts(session, live *playback.Session) {
-	fill := func(dst *string, src string) {
-		if *dst == "" {
-			*dst = src
-		}
-	}
-	if session.StartedAt.IsZero() {
-		session.StartedAt = live.StartedAt
-	}
-	if session.PlayMethod == "" {
-		session.PlayMethod = live.PlayMethod
-		session.TranscodeAudio = live.TranscodeAudio
-		session.TargetVideoCodec = live.TargetVideoCodec
-	}
-	fill(&session.ClientIP, live.ClientIP)
-	fill(&session.ClientName, live.ClientName)
-	fill(&session.ClientVersion, live.ClientVersion)
-	fill(&session.ClientBuild, live.ClientBuild)
-	fill(&session.ClientChannel, live.ClientChannel)
-	fill(&session.ClientUserAgent, live.ClientUserAgent)
-	fill(&session.DeviceID, live.DeviceID)
-	fill(&session.DevicePlatform, live.DevicePlatform)
-	session.IsJellyfinCompat = session.IsJellyfinCompat || live.IsJellyfinCompat
-	if session.Position < 0 {
-		session.Position = live.Position
-	}
-	if session.MediaFileID == 0 {
-		session.MediaFileID = live.MediaFileID
-	}
-	if session.RequestedMediaFileID == 0 {
-		session.RequestedMediaFileID = live.RequestedMediaFileID
-	}
-	if session.TimelineDuration <= 0 {
-		session.TimelineDuration = live.TimelineDuration
-	}
-}
-
-// reconstructedClientTimeout bounds the live-row read a rebuild makes, so a
-// stalled database delays a recovering stream by at most this much.
-const reconstructedClientTimeout = 2 * time.Second
-
-// restoreReconstructedClient fills the client of a session rebuilt from a
-// stream token, whose recipe card leaves client metadata out to keep stream
-// URLs short. The client comes from the session's shared live row, or from
-// its start row once no live row is left, and only from a row of the card's
-// own account and profile. A failed read costs the session its client label,
-// never its playback.
-func (h *PlaybackHandler) restoreReconstructedClient(ctx context.Context, card *playback.RecipeCard) {
-	reader, ok := h.AdminStore.(liveSessionReader)
-	if !ok || card == nil {
-		return
-	}
-	// The rebuild registers the session even when the player abandons the
-	// request that started it, so the read must not end with that request.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reconstructedClientTimeout)
-	defer cancel()
-	live, err := reader.LiveSession(ctx, card.SessionID)
-	if err != nil {
-		if !errors.Is(err, playback.ErrSessionNotFound) {
-			slog.WarnContext(ctx, "failed to restore the client of a rebuilt playback session", "component", "api",
-				"session", card.SessionID, "playback_session_id", card.SessionID, "error", err)
-		}
-		return
-	}
-	if live.UserID != card.UserID || live.ProfileID != card.ProfileID {
-		return
-	}
-	fill := func(dst *string, src string) {
-		if *dst == "" {
-			*dst = src
-		}
-	}
-	fill(&card.ClientName, live.ClientName)
-	fill(&card.ClientVersion, live.ClientVersion)
-	fill(&card.ClientBuild, live.ClientBuild)
-	fill(&card.ClientChannel, live.ClientChannel)
-	fill(&card.ClientUserAgent, live.ClientUserAgent)
-	fill(&card.DeviceID, live.DeviceID)
-	fill(&card.DevicePlatform, live.DevicePlatform)
-	if len(card.AdaptationReasons) == 0 {
-		card.AdaptationReasons = live.AdaptationReasons
-	}
-}
-
-// compatCopyWithoutProgress reports a Jellyfin session copy that never saw
-// the play's progress: a start that failed to route, or a replica that only
-// served media while another replica took the reports. It must not record
-// the play in place of a copy that did.
-func compatCopyWithoutProgress(session *playback.Session) bool {
-	return session.IsJellyfinCompat && session.Position <= 0
-}
-
-// playbackSeasonEpisodeLister lists a season's available episodes. The
-// catalog episode repository behind EpisodeLookup implements it.
-type playbackSeasonEpisodeLister interface {
-	ListBySeason(ctx context.Context, seriesID string, seasonNum int) ([]*models.Episode, error)
-}
-
-// markSpannedEpisodesWatched marks the later episodes of a completed
-// multi-episode file watched. Playback records the file against its first
-// episode only, and each later episode of the range resolves to the same file,
-// so leaving them unwatched would offer the file again as the next episode.
-func (h *PlaybackHandler) markSpannedEpisodesWatched(ctx context.Context, watchSvc *watchstate.Service, session *playback.Session, file *models.MediaFile, watchedAt time.Time) {
-	if file.EpisodeID == "" || file.MultiEpisodeEnd <= file.MultiEpisodeStart {
-		return
-	}
-	lister, ok := h.EpisodeLookup.(playbackSeasonEpisodeLister)
-	if !ok {
-		return
-	}
-	first, err := h.EpisodeLookup.GetByID(ctx, file.EpisodeID)
-	if err != nil || first == nil {
-		return
-	}
-	season, err := lister.ListBySeason(ctx, first.SeriesID, first.SeasonNumber)
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to list multi-episode file episodes", "component", "api", "session", session.ID, "error", err)
-		return
-	}
-	// Only the episodes the file serves: lookups stop catalog.MaxEpisodeSpan
-	// episodes past the first.
-	last := min(file.MultiEpisodeEnd, first.EpisodeNumber+catalog.MaxEpisodeSpan)
-	var targets []watchstate.LeafWatchTarget
-	for _, episode := range season {
-		if episode.EpisodeNumber > first.EpisodeNumber &&
-			episode.EpisodeNumber >= file.MultiEpisodeStart && episode.EpisodeNumber <= last {
-			targets = append(targets, watchstate.LeafWatchTarget{MediaItemID: episode.ContentID})
-		}
-	}
-	if err := watchSvc.RecordSpannedEpisodesWatched(ctx, session.UserID, session.ProfileID, targets, watchedAt); err != nil {
-		slog.ErrorContext(ctx, "failed to mark multi-episode file episodes watched", "component", "api", "session", session.ID, "error", err)
-	}
+	h.recordStopHistory(context.WithoutCancel(ctx), session)
 }
 
 func playbackProgressTarget(file *models.MediaFile) string {
@@ -1868,6 +1553,160 @@ func (h *PlaybackHandler) persistAudioPreference(
 }
 
 // --- Handler methods ---
+
+// HandleStartPlayback starts playback. Protocol v3 is the only protocol this
+// endpoint speaks: a start that does not declare it comes from a build that
+// predates the contract and cannot interpret a plan, so it is refused with
+// 426 rather than served something it would misread.
+func (h *PlaybackHandler) HandleStartPlayback(w http.ResponseWriter, r *http.Request) {
+	if apimw.GetUserID(r.Context()) == 0 {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPlaybackV3BodyBytes))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
+		return
+	}
+	var envelope struct {
+		ProtocolVersion        *int            `json:"protocol_version"`
+		AllowAlternateVersions json.RawMessage `json:"allow_alternate_versions"`
+		Capabilities           *struct {
+			VideoEvidence *string `json:"video_evidence"`
+			AudioEvidence *string `json:"audio_evidence"`
+		} `json:"client_capabilities"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
+		return
+	}
+	if envelope.ProtocolVersion == nil || *envelope.ProtocolVersion != playback.ProtocolV3 ||
+		envelope.Capabilities == nil || envelope.Capabilities.VideoEvidence == nil || envelope.Capabilities.AudioEvidence == nil {
+		upgrade := playback.LegacyUpgradeErrorV3()
+		writeError(w, http.StatusUpgradeRequired, upgrade.Error, upgrade.Message)
+		return
+	}
+	// V1 remains frozen: ignore the v2-only fixed-source control just as the
+	// legacy decoder ignored this unknown field before it was introduced.
+	if len(envelope.AllowAlternateVersions) > 0 {
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(body, &fields) // The envelope was validated above.
+		delete(fields, "allow_alternate_versions")
+		body, _ = json.Marshal(fields)
+	}
+	h.handleStartPlaybackV3(w, r, body)
+}
+
+// HandleUpdateProgress handles POST /playback/{session_id}/progress.
+func (h *PlaybackHandler) HandleUpdateProgress(w http.ResponseWriter, r *http.Request) {
+	userID := apimw.GetUserID(r.Context())
+	if userID == 0 {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
+		return
+	}
+
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "Session ID is required")
+		return
+	}
+	setPlaybackSessionLogContext(r, sessionID)
+	session, err := h.sessionMgr.GetSession(sessionID)
+	if err != nil {
+		if errors.Is(err, playback.ErrSessionNotFound) {
+			writePlaybackSessionNotFound(w)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load playback session")
+		return
+	}
+	if session.UserID != userID {
+		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
+		return
+	}
+	wasPaused := session.IsPaused
+
+	var req progressRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
+		return
+	}
+
+	err = h.sessionMgr.UpdateProgress(sessionID, req.Position, req.IsPaused)
+	if err != nil {
+		if errors.Is(err, playback.ErrSessionNotFound) {
+			writePlaybackSessionNotFound(w)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update progress")
+		return
+	}
+	h.syncSessionsOnPauseChange(r.Context(), wasPaused, req.IsPaused)
+
+	// Persist progress to UserStore (best-effort).
+	if sess, getErr := h.sessionMgr.GetSession(sessionID); getErr == nil {
+		h.persistProgress(r.Context(), sess)
+		if !sess.DisableProgressPersistence && h.WatchScrobbler != nil && wasPaused != sess.IsPaused {
+			if file, loadErr := h.loadFileByPreferredID(r.Context(), requestedMediaFileID(sess), sess.MediaFileID); loadErr == nil && file != nil {
+				targetID := playbackProgressTarget(file)
+				if targetID != "" {
+					event := h.scrobbleEventForSession(r.Context(), sess, targetID, float64(file.Duration), sess.Position)
+					if sess.IsPaused {
+						if err := h.WatchScrobbler.ScrobblePause(r.Context(), event); err != nil {
+							slog.WarnContext(r.Context(), "failed to queue watch provider pause scrobble", "component", "api", "session", sessionID, "error", err)
+						}
+					} else if err := h.WatchScrobbler.ScrobbleStart(r.Context(), event); err != nil {
+						slog.WarnContext(r.Context(), "failed to queue watch provider resume scrobble", "component", "api", "session", sessionID, "error", err)
+					}
+				}
+			}
+		}
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleStopPlayback handles DELETE /playback/{session_id}.
+func (h *PlaybackHandler) HandleStopPlayback(w http.ResponseWriter, r *http.Request) {
+	userID := apimw.GetUserID(r.Context())
+	if userID == 0 {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
+		return
+	}
+
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "Session ID is required")
+		return
+	}
+	setPlaybackSessionLogContext(r, sessionID)
+
+	session, err := h.sessionMgr.GetSession(sessionID)
+	if err != nil {
+		if errors.Is(err, playback.ErrSessionNotFound) {
+			writePlaybackSessionNotFound(w)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load playback session")
+		return
+	}
+	if session.UserID != userID {
+		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
+		return
+	}
+
+	err = h.stopPlaybackSession(r.Context(), session, true)
+	if err != nil {
+		if errors.Is(err, playback.ErrSessionNotFound) {
+			writePlaybackSessionNotFound(w)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to stop playback session")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
 
 func (h *PlaybackHandler) loadAuthorizedFile(r *http.Request, fileID int) (*models.MediaFile, error) {
 	if h.fileResolver == nil || h.ItemAccess == nil {
@@ -1961,8 +1800,7 @@ func alignedSeekSeconds(seekSeconds float64, segmentDuration int, targetVideoCod
 	return float64(computeStartSegment(seekSeconds, segmentDuration) * segmentDuration)
 }
 
-// HandleGetTranscodeManifest handles GET /playback/transcode/{session_id}/master.m3u8,
-// and HEAD, whose body net/http drops.
+// HandleGetTranscodeManifest handles GET /playback/transcode/{session_id}/master.m3u8.
 // Legacy transports allow the session UUID to act as the access capability.
 // Header-authenticated V3 transports require the live session owner on every
 // request; their UUID is only a route identifier.
@@ -2049,32 +1887,15 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 	h.touchSessionActivity(sessionID)
 
 	manifest, err := transcodeSession.BuildPlaybackManifest("segment/", r.URL.RawQuery)
-	if errors.Is(err, playback.ErrManifestQueryTooLong) {
-		writeError(w, http.StatusBadRequest, "bad_request", "Playlist request query is too long")
-		return
-	}
-	if errors.Is(err, playback.ErrSubtitleRenditionNotFound) {
-		writeError(w, http.StatusNotFound, "not_found", "Subtitle rendition not found")
-		return
-	}
 	if err != nil {
 		slog.ErrorContext(r.Context(), "build transcode manifest", "component", "api", "error", err, "session", sessionID, "playback_session_id", sessionID)
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode manifest not ready")
 		return
 	}
-	playback.WarnIfPlaylistOversized(r.Context(), "api", sessionID, manifest)
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	// no-transform keeps proxies and CDNs from re-encoding the playlist,
-	// which drops the Content-Length below (Cloudflare does).
-	w.Header().Set("Cache-Control", "no-store, no-transform, max-age=0")
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
-	// The playlist is complete in memory, so state its length. Without it a
-	// playlist past net/http's small write buffer goes out chunked, and a
-	// player that opens HLS sources with a ranged byte reader (AetherEngine
-	// on Apple platforms) takes the length-less 200 for a non-seekable stream
-	// and misreads the playlist as media.
-	w.Header().Set("Content-Length", strconv.Itoa(len(manifest)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(manifest)
 }
@@ -2188,9 +2009,8 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	segmentName := chi.URLParam(r, "name")
 	if isSubtitleSegment {
 		// Subtitle rendition segments never wait out or restart the video
-		// pipeline: they are answered from the cues already on disk, or read
-		// through the source's index.
-		transcodeSession.ServeSubtitleSegment(w, r, segmentName)
+		// pipeline: they are answered from the cues already on disk.
+		transcodeSession.ServeSubtitleSegment(w, r, subtitleSegment)
 		return
 	}
 	segmentLease, err := transcodeSession.OpenSegment(segmentName)
@@ -2230,7 +2050,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					"session", sessionID,
 					"playback_session_id", sessionID,
 				)
-				segmentLease, err = transcodeSession.WaitForOpenSegmentContext(r.Context(), segmentName, decision.WaitTimeout)
+				segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "api",
 						"segment", segmentName,
@@ -2258,10 +2078,8 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					sessionID,
 					transcodeSession,
 					segNum,
-					decision.Progress.GenerationStartedAt,
 				)
-				// A restart skipped because the request ended is not a failure.
-				if restartErr != nil && !errors.Is(restartErr, playback.ErrManifestNotReady) && !errors.Is(restartErr, r.Context().Err()) {
+				if restartErr != nil && !errors.Is(restartErr, playback.ErrManifestNotReady) {
 					slog.ErrorContext(r.Context(), "restart transcode at missing segment", "component", "api", "error", restartErr, "segment", segmentName, "session", sessionID, "playback_session_id", sessionID)
 				}
 
@@ -2296,7 +2114,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					)
 					// Throttler + exit monitor re-arm via the session's
 					// restart hook.
-					segmentLease, err = transcodeSession.WaitForOpenSegmentContext(r.Context(), segmentName, 30*time.Second)
+					segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, 30*time.Second)
 					if err == nil && strings.EqualFold(transcodeSession.Opts().TargetCodecVideo, "copy") {
 						// Copy-mode seeks can resume as soon as the target segment
 						// exists, but that sometimes leaves the player one segment
@@ -2304,7 +2122,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 						// for a single lookahead fragment when available so the
 						// first resumed playback window is less brittle.
 						nextSegmentName := fmt.Sprintf("seg_%05d%s", segNum+1, filepath.Ext(segmentName))
-						if nextSegment, nextErr := transcodeSession.WaitForOpenSegmentContext(r.Context(), nextSegmentName, 1200*time.Millisecond); nextErr == nil {
+						if nextSegment, nextErr := transcodeSession.WaitForOpenSegment(nextSegmentName, 1200*time.Millisecond); nextErr == nil {
 							_ = nextSegment.Close()
 						}
 					}
@@ -2313,16 +2131,10 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		} else if transcodeSession.IsRunning() {
 			// Non-numbered segment (e.g., init.mp4 for fMP4 HLS).
 			// Wait briefly — the init segment is written almost immediately.
-			segmentLease, err = transcodeSession.WaitForOpenSegmentContext(r.Context(), segmentName, 10*time.Second)
+			segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, 10*time.Second)
 		}
 	}
 	if err != nil {
-		if r.Context().Err() != nil {
-			// net/http also ends the context of a client that only
-			// half-closed and is still reading. Answer it as a timed-out
-			// wait would: writing nothing reaches it as an empty 200.
-			err = playback.ErrSegmentNotFound
-		}
 		if writePlaybackToneMapExecutionError(w, err) {
 			return
 		}
@@ -2394,9 +2206,7 @@ func (h *PlaybackHandler) relayToTranscodeNode(w http.ResponseWriter, r *http.Re
 	stToken := r.URL.Query().Get("st")
 	// Strip the signed stream token ("st") before forwarding/logging: it is a
 	// 24h bearer reconstruction descriptor exposing media path + recipe claims.
-	// Other query params are preserved, including an account "token" the node
-	// echoes into segment URIs for players that cannot send headers, so log
-	// targetURL only through logredact.
+	// Other query params are preserved.
 	query := r.URL.Query()
 	query.Del("st")
 	if encoded := query.Encode(); encoded != "" {
@@ -2408,18 +2218,7 @@ func (h *PlaybackHandler) relayToTranscodeNode(w http.ResponseWriter, r *http.Re
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return nil
 	}
-	if err := nodeauth.SignTranscode(req, transcodeNodeURL, h.NodeKeys); err != nil {
-		if transcodeproxy.NodeUnsignable(err) {
-			// A node without a key, or no longer registered at the URL, is
-			// unavailable to this server. It is not moved off: a registry
-			// that is empty or stale here could sign for no node at all, and
-			// moving would restart a healthy transcode on every hop.
-			transcodeproxy.WarnNodeUnsignable(r.Context(), "api", transcodeNodeURL, err)
-			writeTranscodeNodeUnavailable(w)
-			return nil
-		}
-		slog.WarnContext(r.Context(), "cannot sign the relay to a transcode node", "component", "playback",
-			"node", logredact.SanitizeURL(transcodeNodeURL), "error", err)
+	if err := nodeauth.Sign(req, transcodeNodeURL, h.JWTSecret); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return nil
 	}
@@ -2438,13 +2237,11 @@ func (h *PlaybackHandler) relayToTranscodeNode(w http.ResponseWriter, r *http.Re
 	// the same verified token can be re-injected into the node's manifest segment
 	// URIs below.
 	var validToken string
-	var validClaims *streamtoken.Claims
 	if stToken != "" && h.JWTSecret != "" {
 		claims, verifyErr := streamtoken.Verify(stToken, h.JWTSecret)
 		if verifyErr == nil && claims.SessionID == sessionID {
 			req.Header.Set("X-Silo-Stream-Token", stToken)
 			validToken = stToken
-			validClaims = claims
 		} else if verifyErr != nil {
 			slog.WarnContext(r.Context(), "stream token not forwarded to transcode node", "component", "api", "error", verifyErr, "playback_session_id", sessionID)
 		}
@@ -2457,49 +2254,26 @@ func (h *PlaybackHandler) relayToTranscodeNode(w http.ResponseWriter, r *http.Re
 			slog.WarnContext(r.Context(), "transcode node unreachable from the relay", "component", "api", "error", logredact.SanitizeText(err.Error()), "url", logredact.SanitizeURL(targetURL), "playback_session_id", sessionID)
 			return fmt.Errorf("%w: %w", errTranscodeNodeUnreachable, err)
 		}
-		slog.ErrorContext(r.Context(), "proxy to transcode node", "component", "api", "error", logredact.SanitizeURLError(err), "url", logredact.SanitizeURL(targetURL), "playback_session_id", sessionID)
+		slog.ErrorContext(r.Context(), "proxy to transcode node", "component", "api", "error", err, "url", targetURL, "playback_session_id", sessionID)
 		writeTranscodeNodeUnavailable(w)
 		return nil
 	}
 	defer func() { _ = resp.Body.Close() }()
-
-	if isRedirectStatus(resp.StatusCode) && refusesRelayRedirects(r.Context()) {
-		// The Location is not logged: it may carry a signed token.
-		slog.WarnContext(r.Context(), "transcode node answered a redirect; not relayed", "component", "api", "status", resp.StatusCode, "playback_session_id", sessionID)
-		writeTranscodeNodeUnavailable(w)
-		return nil
-	}
-	if transcodeproxy.NodeRefusedRelay(resp.StatusCode) {
-		// The client authenticated with this server; the node refused this
-		// server's signature or the token it forwarded.
-		transcodeproxy.WarnNodeRefusedRelay(r.Context(), "api", transcodeNodeURL, resp.StatusCode, h.NodeKeys)
-		writeTranscodeNodeUnavailable(w)
-		return nil
-	}
 
 	// The node strips "st" from the request query (kept out of node URLs/logs),
 	// so the segment/init URIs in the manifest it builds carry no token. Without
 	// it, a segment fetched after a node or API restart cannot reconstruct the
 	// session and 404s. Re-inject the client-facing token into every URI at this
 	// boundary so the client's later segment requests carry "st" again. Only the
-	// manifest body is rewritten; segments stream through untouched. For a
-	// client that negotiated hls_variable_substitution_v1, a long title's
-	// playlist carries the token once (EXT-X-DEFINE) instead of on every segment
-	// URI, which would put it over the 4 MiB some players accept.
+	// manifest body is rewritten; segments stream through untouched.
 	if validToken != "" && resp.StatusCode == http.StatusOK && strings.HasSuffix(path, ".m3u8") {
 		body, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			slog.ErrorContext(r.Context(), "read transcode node manifest", "component", "api", "error", readErr, "url", logredact.SanitizeURL(targetURL), "playback_session_id", sessionID)
+			slog.ErrorContext(r.Context(), "read transcode node manifest", "component", "api", "error", readErr, "url", targetURL, "playback_session_id", sessionID)
 			writeTranscodeNodeUnavailable(w)
 			return nil
 		}
-		var rewritten []byte
-		if validClaims.HLSVariableSubstitution {
-			rewritten = playback.AppendManifestQueryParamWithSubstitution(body, streamTokenParam, validToken)
-		} else {
-			rewritten = playback.AppendManifestQueryParam(body, streamTokenParam, validToken)
-		}
-		playback.WarnIfPlaylistOversized(r.Context(), "api", sessionID, rewritten)
+		rewritten := playback.AppendManifestQueryParam(body, streamTokenParam, validToken)
 		for k, vv := range resp.Header {
 			if http.CanonicalHeaderKey(k) == "Content-Length" {
 				continue
@@ -2521,19 +2295,12 @@ func (h *PlaybackHandler) relayToTranscodeNode(w http.ResponseWriter, r *http.Re
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	sw.WriteHeader(resp.StatusCode)
 	if _, copyErr := io.Copy(sw, resp.Body); copyErr != nil {
-		if r.Context().Err() == nil && errors.Is(copyErr, nodepool.ErrNodeNotAnswering) {
-			slog.WarnContext(r.Context(), "transcode node stopped answering during relay body read", "component", "api", "error", logredact.SanitizeText(copyErr.Error()), "node", logredact.SanitizeURL(transcodeNodeURL), "playback_session_id", sessionID)
-		}
-		if r.Context().Err() == nil {
-			// A clean end would let a chunked client accept the short body as complete.
-			panic(http.ErrAbortHandler)
-		}
 		return nil
 	}
 	fullSize := transcodeproxy.FullRepresentationSize(resp)
 	if isMediaSegment && generation != "" && r.Method == http.MethodGet &&
 		sw.CompletedFullResponse(fullSize) {
-		if ackErr := transcodeproxy.Acknowledge(r.Context(), transcodeproxy.NodeClient(), transcodeNodeURL, path, h.NodeKeys, generation); ackErr != nil {
+		if ackErr := transcodeproxy.Acknowledge(r.Context(), transcodeproxy.NodeClient(), transcodeNodeURL, path, h.JWTSecret, generation); ackErr != nil {
 			slog.WarnContext(r.Context(), "acknowledge transcode segment completion", "component", "api", "error", ackErr, "playback_session_id", sessionID)
 		}
 	}
@@ -2545,12 +2312,24 @@ func (h *PlaybackHandler) maybeStartThrottler(ctx context.Context, session *play
 	playback.StartConfiguredTranscodeThrottler(ctx, h.SettingsRepo, session)
 }
 
+// findAlternateFile finds another file version for the same content. It
+// prefers non-4K versions because they can escape a disabled-4K-transcode
+// terminal, but when none exist it returns a 4K candidate so the planner can
+// still accept one that direct-plays or remuxes without forbidden video
+// encoding.
+// Within each class it prefers SDR, then resolution, then bitrate.
+func (h *PlaybackHandler) findAlternateFile(ctx context.Context, source *models.MediaFile, filter catalog.AccessFilter) (*models.MediaFile, error) {
+	candidates, err := h.findAlternateFiles(ctx, source, filter)
+	if err != nil || len(candidates) == 0 {
+		return nil, err
+	}
+	return candidates[0], nil
+}
+
 // findAlternateFiles returns every compatible edition/version candidate in
-// fallback order. Non-4K versions come first because they can escape a
-// disabled-4K-transcode terminal; within each class SDR comes first, then
-// resolution, then bitrate. Callers that plan candidates must keep trying
-// after a terminal: a lower-resolution candidate can still fail while a later
-// 4K candidate direct-plays or remuxes without forbidden video encoding.
+// fallback order. Callers that plan candidates must keep trying after a
+// terminal: a lower-resolution candidate can still fail while a later 4K
+// candidate direct-plays or remuxes without forbidden video encoding.
 //
 // Only versions the viewer may play are returned: the per-file checks
 // loadAuthorizedFile applies to a requested file (library access and the

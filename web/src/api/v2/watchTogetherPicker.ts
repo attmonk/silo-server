@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import type { components } from "./schema";
 import {
   captureProfileRequestContext,
@@ -40,7 +39,7 @@ export interface RoomPickerResponse {
 function numericID(value: string): number {
   const id = Number(value);
   if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(id))
-    throw new Error(t("web.common.errors.memberIdentityInvalid"));
+    throw new Error("Invalid member identity.");
   return id;
 }
 

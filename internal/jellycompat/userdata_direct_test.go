@@ -3,10 +3,14 @@ package jellycompat
 import (
 	"context"
 	"database/sql"
+	"net/url"
 	"testing"
+	"time"
 
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/userdb"
 	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/watchstate"
 )
 
 type compatTestUserStoreProvider struct {
@@ -19,6 +23,100 @@ func (p compatTestUserStoreProvider) ForUser(context.Context, int) (userstore.Us
 
 func (p compatTestUserStoreProvider) Close() error {
 	return nil
+}
+
+func TestDirectUserDataServiceProgressUsesCompletedHistory(t *testing.T) {
+	store := newJellycompatUserStore(t)
+	addCompletedHistoryForJellycompatTest(t, store, "movie-history-only")
+	service := &directUserDataService{storeProvider: compatTestUserStoreProvider{store: store}}
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+
+	progress, err := service.GetProgress(context.Background(), session, "movie-history-only")
+	if err != nil {
+		t.Fatalf("GetProgress: %v", err)
+	}
+	if progress == nil || !progress.Completed {
+		t.Fatalf("GetProgress = %+v, want synthetic completed progress", progress)
+	}
+
+	progressMap, err := service.ListProgressByMediaItems(context.Background(), session, []string{"movie-history-only"})
+	if err != nil {
+		t.Fatalf("ListProgressByMediaItems: %v", err)
+	}
+	if progressMap["movie-history-only"] == nil || !progressMap["movie-history-only"].Completed {
+		t.Fatalf("ListProgressByMediaItems = %+v, want completed history overlay", progressMap)
+	}
+}
+
+// Filters=IsPlayed lists read completed progress pages; each row must carry
+// the stored play date, not the time the row was last written (#2885).
+func TestDirectUserDataServiceCompletedListsReportPlayDate(t *testing.T) {
+	store := newJellycompatUserStore(t)
+	provider := compatTestUserStoreProvider{store: store}
+	service := &directUserDataService{storeProvider: provider, watchState: watchstate.NewService(provider)}
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	played := time.Date(2019, 3, 14, 20, 15, 0, 0, time.UTC)
+	if err := service.MarkPlayedBatchAt(t.Context(), session, []string{"movie-1"}, played); err != nil {
+		t.Fatal(err)
+	}
+
+	lists := map[string]func() ([]upstreamProgress, error){
+		"ListProgress": func() ([]upstreamProgress, error) {
+			return service.ListProgress(t.Context(), session, "completed", 10, 0)
+		},
+		"ListProgressFiltered": func() ([]upstreamProgress, error) {
+			return service.ListProgressFiltered(t.Context(), session, "completed", []string{"movie"}, nil, 10, 0)
+		},
+	}
+	for name, list := range lists {
+		t.Run(name, func(t *testing.T) {
+			entries, err := list()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("entries = %+v, want one", entries)
+			}
+			got, err := time.Parse(time.RFC3339Nano, entries[0].UpdatedAt)
+			if err != nil || !got.Equal(played) {
+				t.Fatalf("UpdatedAt = %q, want play date %s", entries[0].UpdatedAt, played.Format(time.RFC3339))
+			}
+		})
+	}
+}
+
+func TestBrowseItemsPlayedFilterUsesCompletedHistory(t *testing.T) {
+	store := newJellycompatUserStore(t)
+	addCompletedHistoryForJellycompatTest(t, store, "movie-history-only")
+	browse := &stubBrowseSource{
+		items: []*models.MediaItem{
+			{ContentID: "movie-history-only", Type: "movie", Title: "Imported"},
+			{ContentID: "movie-unplayed", Type: "movie", Title: "Unplayed"},
+		},
+		total: 2,
+	}
+	service := newDirectContentServiceForTest(browse, compatTestUserStoreProvider{store: store})
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+
+	playedParams := url.Values{}
+	playedParams.Set("is_played", "true")
+	played, err := service.BrowseItems(context.Background(), session, playedParams)
+	if err != nil {
+		t.Fatalf("BrowseItems played: %v", err)
+	}
+	if len(played.Items) != 1 || played.Items[0].ContentID != "movie-history-only" {
+		t.Fatalf("played filter items = %+v, want history-only movie", played.Items)
+	}
+
+	unplayedParams := url.Values{}
+	unplayedParams.Set("is_played", "false")
+	unplayed, err := service.BrowseItems(context.Background(), session, unplayedParams)
+	if err != nil {
+		t.Fatalf("BrowseItems unplayed: %v", err)
+	}
+	if len(unplayed.Items) != 1 || unplayed.Items[0].ContentID != "movie-unplayed" {
+		t.Fatalf("unplayed filter items = %+v, want only unplayed movie", unplayed.Items)
+	}
 }
 
 func newJellycompatUserStore(t *testing.T) userstore.UserStore {
@@ -38,4 +136,18 @@ func newJellycompatUserStore(t *testing.T) userstore.UserStore {
 		t.Fatalf("CreateProfile: %v", err)
 	}
 	return store
+}
+
+func addCompletedHistoryForJellycompatTest(t *testing.T, store userstore.UserStore, mediaItemID string) {
+	t.Helper()
+	if err := store.AddHistory(context.Background(), userstore.WatchHistoryEntry{
+		ProfileID:       "profile-1",
+		MediaItemID:     mediaItemID,
+		WatchedAt:       "2026-05-04T12:00:00Z",
+		DurationSeconds: 7200,
+		Completed:       true,
+		Source:          userstore.WatchHistorySourceTrakt,
+	}); err != nil {
+		t.Fatalf("AddHistory: %v", err)
+	}
 }

@@ -1,5 +1,4 @@
 import type { AdminSession } from "@/api/types";
-import { t } from "@/i18n";
 
 export type AdminSessionActionName = "pause" | "resume";
 
@@ -12,7 +11,7 @@ export function getPrimaryPlaybackAction(session: AdminSession): {
   label: string;
 } {
   if (isSessionPaused(session)) {
-    return { action: "resume", label: t("web.admin.sessions.playback.action.resume") };
+    return { action: "resume", label: "Resume" };
   }
-  return { action: "pause", label: t("web.admin.sessions.playback.action.pause") };
+  return { action: "pause", label: "Pause" };
 }

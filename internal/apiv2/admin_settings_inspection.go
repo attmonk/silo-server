@@ -33,9 +33,6 @@ type AdminRestartKeysOutput struct{ Body AdminRestartKeys }
 type AdminSensitiveStatus struct {
 	Configured   []string `json:"configured"`
 	ManagedByEnv []string `json:"managed_by_env"`
-	// ManagedByEnvVars names, for each key in ManagedByEnv, the environment
-	// variable that sets it on the server that answered.
-	ManagedByEnvVars map[string]string `json:"managed_by_env_vars" doc:"The environment variable that sets each key in managed_by_env, keyed by setting key."`
 }
 type AdminSensitiveStatusOutput struct{ Body AdminSensitiveStatus }
 
@@ -97,5 +94,5 @@ func (reg *Registry) inspectAdminSensitiveSettings(ctx context.Context, _ *struc
 	if err != nil {
 		return nil, adminSettingsInspectionProblem(err)
 	}
-	return &AdminSensitiveStatusOutput{Body: AdminSensitiveStatus{Configured: NonNil(status.Configured), ManagedByEnv: NonNil(status.ManagedByEnv), ManagedByEnvVars: NonNilMap(status.ManagedByEnvVars)}}, nil
+	return &AdminSensitiveStatusOutput{Body: AdminSensitiveStatus{Configured: NonNil(status.Configured), ManagedByEnv: NonNil(status.ManagedByEnv)}}, nil
 }

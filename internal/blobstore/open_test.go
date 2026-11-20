@@ -74,6 +74,29 @@ func newTestS3Client(t *testing.T, bucket string) *s3client.Client {
 	})
 }
 
+// A local backend has one root, so every caller shares the recorded store: a
+// first write through Operational must record the identity just as one through
+// Assets does.
+func TestOpenLocalSharesOneRecordedStore(t *testing.T) {
+	settings := &testSettings{values: map[string]string{}}
+	stores, backend, err := Open(context.Background(), Options{Backend: BackendLocal, LocalPath: t.TempDir(), Settings: settings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend != BackendLocal {
+		t.Fatalf("backend=%q", backend)
+	}
+	if !stores.Local() || stores.Operational != stores.Assets {
+		t.Fatal("local backend did not share one store")
+	}
+	if err = stores.Operational.Put(context.Background(), "diagnostics/1/report.tar.gz", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if settings.values[IdentitySettingKey] != stores.Assets.Identity() {
+		t.Fatalf("operational write did not record identity: %#v", settings.values)
+	}
+}
+
 // recordingStore must forward every write method. A diagnostic bundle or job
 // artifact is often the first thing a local install writes, and those arrive
 // through PutStream; if it reached the embedded store directly the identity
@@ -139,6 +162,64 @@ func TestOpenS3KeepsBucketIdentitiesSeparate(t *testing.T) {
 	}
 }
 
+// Avatars have always lived in the private bucket, whatever backed artwork. An
+// install that configured one and then moved artwork to disk must keep reading
+// its existing profile-avatars keys, so a configured private bucket owns the
+// operational store even on a local backend.
+func TestOpenLocalStillPrefersAConfiguredPrivateBucket(t *testing.T) {
+	private := newTestS3Client(t, "operational")
+	stores, backend, err := Open(context.Background(), Options{
+		Backend: BackendLocal, LocalPath: t.TempDir(), S3Private: private,
+		Settings: &testSettings{values: map[string]string{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend != BackendLocal {
+		t.Fatalf("backend=%q", backend)
+	}
+	if stores.Operational == stores.Assets || stores.Local() {
+		t.Fatal("local backend overrode the configured private bucket")
+	}
+	if !strings.Contains(stores.Operational.Identity(), "operational") {
+		t.Fatalf("operational identity = %q", stores.Operational.Identity())
+	}
+}
+
+// An S3 backend without a private bucket leaves Operational nil, which is how
+// callers detect that diagnostics and job artifacts have nowhere to go.
+func TestOpenS3WithoutPrivateBucketLeavesOperationalNil(t *testing.T) {
+	stores, _, err := Open(context.Background(), Options{
+		Backend: BackendS3, S3: newTestS3Client(t, "assets"), Settings: &testSettings{values: map[string]string{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stores.Assets == nil || stores.Operational != nil {
+		t.Fatal("missing private bucket did not leave operational nil")
+	}
+}
+
+func TestOpenLocalRecordsBackendOnFirstPut(t *testing.T) {
+	settings := &testSettings{values: map[string]string{}}
+	stores, backend, err := Open(context.Background(), Options{Backend: "auto", LocalPath: filepath.Join(t.TempDir(), "artwork"), Settings: settings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := stores.Assets
+	if backend != BackendLocal {
+		t.Fatalf("backend=%q", backend)
+	}
+	if settings.writes != 0 {
+		t.Fatal("recorded before write")
+	}
+	if err = store.Put(context.Background(), "a.webp", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if settings.values[IdentitySettingKey] != store.Identity() || settings.writes != 1 {
+		t.Fatalf("settings=%#v writes=%d", settings.values, settings.writes)
+	}
+}
 func TestOpenRejectsRecordedStorageMismatch(t *testing.T) {
 	root := t.TempDir()
 	current, err := NewFilesystem(root)
@@ -157,78 +238,6 @@ func TestOpenRejectsRecordedStorageMismatch(t *testing.T) {
 	settings := &testSettings{values: map[string]string{IdentitySettingKey: current.Identity()}}
 	if _, _, err := Open(context.Background(), Options{Backend: BackendLocal, LocalPath: root, Settings: settings}); err != nil {
 		t.Fatalf("same root rejected: %v", err)
-	}
-}
-
-// An image that keeps its state under a linked directory resolves the root
-// the regular image recorded at another path. The catalog keeps its recorded
-// identity, without the row being rewritten, so a rollback still opens it.
-func TestOpenKeepsRecordedIdentityForLinkedRoot(t *testing.T) {
-	base := t.TempDir()
-	state := filepath.Join(base, "config", "silo")
-	if err := os.MkdirAll(filepath.Join(state, "artwork"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	other := filepath.Join(base, "other")
-	if err := os.MkdirAll(filepath.Join(other, "artwork"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// The path the regular image recorded, now a link into the image's state.
-	linked := filepath.Join(base, "var-lib-silo")
-	if err := os.Symlink(state, linked); err != nil {
-		t.Fatal(err)
-	}
-	recorded := BackendLocal + "|" + filepath.Join(linked, "artwork")
-
-	settings := &testSettings{values: map[string]string{IdentitySettingKey: recorded}}
-	stores, _, err := Open(context.Background(), Options{Backend: BackendLocal, LocalPath: filepath.Join(linked, "artwork"), Settings: settings})
-	if err != nil {
-		t.Fatalf("same directory by another path rejected: %v", err)
-	}
-	if got := stores.Assets.Identity(); got != recorded {
-		t.Fatalf("Identity = %q, want the recorded %q", got, recorded)
-	}
-	if err := stores.Assets.Put(context.Background(), "a.webp", []byte("x")); err != nil {
-		t.Fatal(err)
-	}
-	if settings.values[IdentitySettingKey] != recorded {
-		t.Fatalf("identity row rewritten to %q", settings.values[IdentitySettingKey])
-	}
-	if _, err := os.Stat(filepath.Join(state, "artwork", "a.webp")); err != nil {
-		t.Fatalf("write did not land in the linked directory: %v", err)
-	}
-
-	// The link moved to another directory: that is another location.
-	if err := os.Remove(linked); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(other, linked); err != nil {
-		t.Fatal(err)
-	}
-	settings = &testSettings{values: map[string]string{IdentitySettingKey: BackendLocal + "|" + filepath.Join(state, "artwork")}}
-	if _, _, err := Open(context.Background(), Options{Backend: BackendLocal, LocalPath: filepath.Join(linked, "artwork"), Settings: settings}); err == nil {
-		t.Fatal("a different directory reached through the link was accepted")
-	}
-	if SameLocalRoot(BackendS3+"|https://s3.example|artwork|", BackendLocal+"|"+filepath.Join(state, "artwork")) {
-		t.Fatal("an S3 identity matched a local root")
-	}
-
-	// The recorded root itself replaced by a link to where it moved: a store
-	// refuses a linked root, so the moved directory is another location.
-	recordedRoot := filepath.Join(base, "data", "artwork")
-	moved := filepath.Join(base, "mnt", "artwork")
-	if err := os.MkdirAll(moved, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(recordedRoot), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(moved, recordedRoot); err != nil {
-		t.Fatal(err)
-	}
-	settings = &testSettings{values: map[string]string{IdentitySettingKey: BackendLocal + "|" + recordedRoot}}
-	if _, _, err := Open(context.Background(), Options{Backend: BackendLocal, LocalPath: moved, Settings: settings}); err == nil {
-		t.Fatal("a recorded root that is itself a link matched the directory it points to")
 	}
 }
 
@@ -385,6 +394,24 @@ func TestOpenLocalFencesSharedOperationalStore(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("operational write did not resume after the fence was released")
+	}
+}
+
+func TestLocalIdentityMatchesFilesystemWithoutCreatingRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not", "yet")
+	identity, err := LocalIdentity(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("LocalIdentity touched the root: %v", err)
+	}
+	fs, err := NewFilesystem(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity != fs.Identity() {
+		t.Fatalf("LocalIdentity = %q, Filesystem.Identity = %q", identity, fs.Identity())
 	}
 }
 

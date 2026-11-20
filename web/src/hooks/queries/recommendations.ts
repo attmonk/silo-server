@@ -7,7 +7,6 @@ import {
   recommendationSectionFromV2,
 } from "@/api/v2/recommendations";
 import { v2, type V2PathParams, type V2Result } from "@/api/v2/request";
-import { artworkQuery } from "@/lib/artworkWidths";
 import { recKeys } from "./keys";
 
 const SIMILAR_ITEMS_LIMIT = 12;
@@ -31,7 +30,7 @@ export function useSimilarItems(itemId: string) {
     queryFn: ({ signal }): Promise<RecommendationResponse> =>
       v2("GET /api/v2/recommendations/similar/{item_id}", {
         path: { item_id: itemId },
-        query: { limit: SIMILAR_ITEMS_LIMIT, ...artworkQuery("row") },
+        query: { limit: SIMILAR_ITEMS_LIMIT },
         signal,
       }).then(cardList),
     staleTime: 3600_000,

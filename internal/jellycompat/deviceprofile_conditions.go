@@ -99,10 +99,7 @@ func (p DeviceProfile) codecProfileCompatibility(version catalog.FileVersion, au
 	)
 }
 
-// hlsRemuxCodecProfileCompatibilityIn evaluates codec profiles for a video
-// copy into container. Only fMP4 writes a sample entry Silo chooses, so the
-// promised VideoCodecTag is set for mp4 alone.
-func (p DeviceProfile) hlsRemuxCodecProfileCompatibilityIn(version catalog.FileVersion, audioStreamIndex *int, container string) codecProfileCompatibility {
+func (p DeviceProfile) hlsRemuxCodecProfileCompatibility(version catalog.FileVersion, audioStreamIndex *int) codecProfileCompatibility {
 	values := buildConditionValues(version, audioStreamIndex)
 	// Derive the promised sample entry from the same value the serve paths use
 	// (PrimaryDVProfile, the probed integer field) — not from
@@ -112,10 +109,10 @@ func (p DeviceProfile) hlsRemuxCodecProfileCompatibilityIn(version catalog.FileV
 	if tag == "" {
 		tag = playback.VideoSampleEntryForDVCopy(compatPrimaryVideoTrack(version).DVProfile)
 	}
-	if tag != "" && container == compatContainerMP4 {
+	if tag != "" {
 		values["videocodectag"] = conditionValue{text: tag}
 	}
-	return p.codecProfileCompatibilityWithMatcher(version, audioStreamIndex, values, container, true,
+	return p.codecProfileCompatibilityWithMatcher(version, audioStreamIndex, values, "mp4", true,
 		func(conditions []ProfileCondition, values conditionValues) bool {
 			return hlsRemuxConditionsMatch(conditions, values, version)
 		})
@@ -298,10 +295,6 @@ func codecProfileApplies(
 		profileContainers = profile.SubContainer
 	}
 	if !matchesCodecProfileContainer(profileContainers, container) {
-		return false
-	}
-	// Jellyfin evaluates audio codec profiles only against an audio stream.
-	if codecProfileTarget(profile) == "audio" && compatHasNoAudio(version) {
 		return false
 	}
 	if strings.TrimSpace(profile.Codec) == "" {
@@ -549,8 +542,7 @@ func buildConditionValues(version catalog.FileVersion, audioStreamIndex *int) co
 		rounded := int(math.Round(frameRate))
 		values["videoframerate"] = conditionValue{text: strconv.Itoa(rounded), number: rounded, hasNum: true}
 	}
-	// Track and file bitrates are kbps; profile conditions are bits per second.
-	videoBitrate := video.Bitrate * 1000
+	videoBitrate := video.Bitrate
 	if videoBitrate == 0 && version.Bitrate > 0 {
 		videoBitrate = version.Bitrate * 1000
 	}
@@ -558,7 +550,7 @@ func buildConditionValues(version catalog.FileVersion, audioStreamIndex *int) co
 		values["videobitrate"] = intConditionValue(videoBitrate)
 	}
 	if audio.Bitrate > 0 {
-		values["audiobitrate"] = intConditionValue(audio.Bitrate * 1000)
+		values["audiobitrate"] = intConditionValue(audio.Bitrate)
 	}
 	if audio.SampleRate > 0 {
 		values["audiosamplerate"] = intConditionValue(audio.SampleRate)
@@ -631,25 +623,6 @@ func compatAudioTrack(version catalog.FileVersion, streamIndex *int) models.Audi
 	return models.AudioTrack{Codec: version.CodecAudio}
 }
 
-// compatHasNoAudio reports a video-only source, using the same test as the
-// native planner. A track the probe could not name is still audio and keeps
-// the strict checks.
-func compatHasNoAudio(version catalog.FileVersion) bool {
-	return len(version.AudioTracks) == 0 && strings.TrimSpace(version.CodecAudio) == ""
-}
-
-// compatAudioExceedsChannels reports whether a channel ceiling rejects the
-// selected audio track: it has more channels than maxChannels, or an unknown
-// count. A ceiling of zero or less is no ceiling, and a video-only source has
-// no channels to exceed.
-func compatAudioExceedsChannels(version catalog.FileVersion, streamIndex *int, maxChannels int) bool {
-	if maxChannels <= 0 || compatHasNoAudio(version) {
-		return false
-	}
-	channels := compatAudioTrack(version, streamIndex).Channels
-	return channels <= 0 || channels > maxChannels
-}
-
 func compatAudioCodec(version catalog.FileVersion, streamIndex *int) string {
 	if track := compatAudioTrack(version, streamIndex); track.Codec != "" {
 		return track.Codec
@@ -662,8 +635,8 @@ func compatVideoRange(track models.VideoTrack, versionHDR bool) string {
 	switch rangeType {
 	case "SDR":
 		return "SDR"
-	case compatRangeUnknown:
-		return compatRangeUnknown
+	case "Unknown":
+		return "Unknown"
 	default:
 		return "HDR"
 	}

@@ -9,13 +9,13 @@ import { useDebounce } from "@/hooks/useDebounce";
 import { useMDBListSearch } from "@/hooks/queries/userCollectionImports";
 import type { CollectionTemplate, CollectionTemplateGroup } from "@/lib/collectionTemplates";
 import {
-  fromMdblist,
-  fromMdblistHelp,
-  mdblistLinkInvalid,
-  mdblistSearchOffProfile,
-  pasteMdblistLink,
-  popularPicks,
-  popularPicksHelp,
+  FROM_MDBLIST,
+  FROM_MDBLIST_HELP,
+  MDBLIST_LINK_INVALID,
+  MDBLIST_SEARCH_OFF_PROFILE,
+  PASTE_MDBLIST_LINK,
+  POPULAR_PICKS,
+  POPULAR_PICKS_HELP,
 } from "@/lib/collections/copy";
 import {
   cleanMDBListLink,
@@ -29,13 +29,8 @@ import type { ScopeKind } from "@/lib/collections/scope";
 import { cn } from "@/lib/utils";
 
 import { CollectionTemplateCard, PickRow } from "./CollectionTemplateCard";
-import { formatLocale } from "@/lib/appLocale";
-import { useT, type Translate } from "@/i18n";
 
 const ALL = "all";
-
-/** A link, not text: the same in every language. */
-const MDBLIST_LINK_PLACEHOLDER = "https://mdblist.com/lists/…";
 
 function matches(template: CollectionTemplate, term: string) {
   return [template.title, template.description, ...(template.tags ?? [])].some((text) =>
@@ -43,34 +38,23 @@ function matches(template: CollectionTemplate, term: string) {
   );
 }
 
-function listMeta(t: Translate, list: MDBListListSummary) {
-  const kind =
-    list.mediatype === "movie" || list.mediatype === "show"
-      ? t("web.collections.templateGallery.listKind", { kind: list.mediatype })
-      : null;
+function listMeta(list: MDBListListSummary) {
+  const kind = list.mediatype === "movie" ? "Movies" : list.mediatype === "show" ? "TV" : null;
   return [
-    t("web.collections.templateGallery.byUser", { user: list.user_name }),
+    `by ${list.user_name}`,
     kind,
-    t("web.collections.metaLine.titleCount", {
-      count: list.items,
-      shown: list.items.toLocaleString(formatLocale()),
-    }),
-    list.likes > 0 ? `♥ ${list.likes.toLocaleString(formatLocale())}` : null,
+    `${list.items.toLocaleString()} title${list.items === 1 ? "" : "s"}`,
+    list.likes > 0 ? `♥ ${list.likes.toLocaleString()}` : null,
   ]
     .filter(Boolean)
     .join(" · ");
 }
 
 function GroupHeading({ title, help }: { title: string; help: string }) {
-  const t = useT();
   return (
     <p className="px-3.5 pt-3 pb-1 text-[13px]">
-      {t("web.collections.templateGallery.groupHeading", {
-        title,
-        help,
-        b: (chunks) => <span className="font-semibold">{chunks}</span>,
-        muted: (chunks) => <span className="text-muted-foreground">{chunks}</span>,
-      })}
+      <span className="font-semibold">{title}</span>{" "}
+      <span className="text-muted-foreground">{help}</span>
     </p>
   );
 }
@@ -103,7 +87,6 @@ export function MDBListBrowser({
   link: string;
   onLinkChange: (raw: string) => void;
 }) {
-  const t = useT();
   const id = useId();
   const [query, setQuery] = useState("");
   const [theme, setTheme] = useState(ALL);
@@ -144,19 +127,15 @@ export function MDBListBrowser({
       <div className="relative">
         <Search
           aria-hidden
-          className="text-muted-foreground absolute start-3 top-1/2 size-4 -translate-y-1/2"
+          className="text-muted-foreground absolute top-1/2 left-3 size-4 -translate-y-1/2"
         />
         <Input
           type="search"
-          aria-label={t("web.collections.templateGallery.searchLists")}
+          aria-label="Search lists"
           aria-describedby={searchEnabled ? undefined : `${id}-off`}
-          placeholder={
-            searchEnabled
-              ? t("web.collections.templateGallery.searchPlaceholder")
-              : t("web.collections.templateGallery.searchOff")
-          }
+          placeholder={searchEnabled ? "Search MDBList and popular picks" : "Search is off"}
           disabled={!searchEnabled}
-          className="h-11 ps-9"
+          className="h-11 pl-9"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
         />
@@ -169,56 +148,48 @@ export function MDBListBrowser({
           <Info aria-hidden className="text-muted-foreground mt-0.5 size-4 shrink-0" />
           {scopeKind === "server" ? (
             <span>
-              {t("web.collections.templateGallery.searchNeedsKey", {
-                link: (chunks) => (
-                  <Link
-                    to="/admin/settings/providers"
-                    className="font-medium underline underline-offset-4"
-                  >
-                    {chunks}
-                  </Link>
-                ),
-              })}
+              Searching MDBList needs an API key in{" "}
+              <Link
+                to="/admin/settings/providers"
+                className="font-medium underline underline-offset-4"
+              >
+                Settings › Providers
+              </Link>
+              . Popular picks and pasted links still work.
             </span>
           ) : (
-            <span>{mdblistSearchOffProfile()}</span>
+            <span>{MDBLIST_SEARCH_OFF_PROFILE}</span>
           )}
         </p>
       )}
       {picks.length > 1 ? (
-        <div
-          role="group"
-          aria-label={t("web.collections.templateGallery.themes")}
-          className="flex flex-wrap gap-2"
-        >
-          {[{ category: ALL, label: t("web.collections.templateGallery.allThemes") }, ...picks].map(
-            (group) => (
-              <button
-                key={group.category}
-                type="button"
-                aria-pressed={theme === group.category}
-                onClick={() => setTheme(group.category)}
-                className={cn(
-                  "border-border hover:bg-accent h-8 rounded-full border px-3 text-[13px] font-medium",
-                  theme === group.category && "bg-foreground text-background hover:bg-foreground",
-                )}
-              >
-                {group.label}
-              </button>
-            ),
-          )}
+        <div role="group" aria-label="Themes" className="flex flex-wrap gap-2">
+          {[{ category: ALL, label: "All" }, ...picks].map((group) => (
+            <button
+              key={group.category}
+              type="button"
+              aria-pressed={theme === group.category}
+              onClick={() => setTheme(group.category)}
+              className={cn(
+                "border-border hover:bg-accent h-8 rounded-full border px-3 text-[13px] font-medium",
+                theme === group.category && "bg-foreground text-background hover:bg-foreground",
+              )}
+            >
+              {group.label}
+            </button>
+          ))}
         </div>
       ) : null}
 
       <RadioGroupPrimitive.Root
-        aria-label={t("web.collections.templateGallery.lists")}
+        aria-label="Lists"
         value={selectedId ?? ""}
         onValueChange={choose}
         className="border-border divide-border/60 grid max-h-[420px] overflow-y-auto rounded-xl border"
       >
         {shown.length > 0 ? (
           <div>
-            <GroupHeading title={popularPicks()} help={popularPicksHelp()} />
+            <GroupHeading title={POPULAR_PICKS} help={POPULAR_PICKS_HELP} />
             {shown.map((template) => (
               <CollectionTemplateCard key={template.id} template={template} />
             ))}
@@ -226,54 +197,50 @@ export function MDBListBrowser({
         ) : null}
         {settled ? (
           <div>
-            <GroupHeading title={fromMdblist()} help={fromMdblistHelp()} />
+            <GroupHeading title={FROM_MDBLIST} help={FROM_MDBLIST_HELP} />
             {found.map((list) => (
               <PickRow
                 key={list.id}
                 value={mdblistPickId(list)}
                 title={list.name}
-                meta={listMeta(t, list)}
+                meta={listMeta(list)}
               />
             ))}
             {search.isError ? (
               <p role="alert" className="text-destructive px-3.5 py-2.5 text-[13px]">
-                {t("web.collections.templateGallery.searchFailed", {
-                  detail: search.error instanceof Error ? search.error.message : "",
-                }).trim()}
+                {`Couldn't search MDBList. ${search.error instanceof Error ? search.error.message : ""}`.trim()}
               </p>
             ) : search.isFetching && found.length === 0 ? (
-              <p className="text-muted-foreground px-3.5 py-2.5 text-[13px]">
-                {t("web.collections.templateGallery.searching")}
-              </p>
+              <p className="text-muted-foreground px-3.5 py-2.5 text-[13px]">Searching…</p>
             ) : search.data && found.length === 0 ? (
               <p className="text-muted-foreground px-3.5 py-2.5 text-[13px]">
-                {t("web.collections.templateGallery.noMatches", { query: settled })}
+                No public lists match “{settled}”.
               </p>
             ) : null}
           </div>
         ) : null}
         {shown.length === 0 && !settled ? (
           <p className="text-muted-foreground px-3.5 py-3 text-[13px]">
-            {t("web.collections.templateGallery.noPicks")}
+            No popular picks here. Search MDBList or paste a link.
           </p>
         ) : null}
       </RadioGroupPrimitive.Root>
 
       <div className="grid gap-2">
         <label htmlFor={`${id}-link`} className="text-[14px] font-semibold">
-          {pasteMdblistLink()}
+          {PASTE_MDBLIST_LINK}
         </label>
         <div className="relative">
           <Link2
             aria-hidden
-            className="text-muted-foreground absolute start-3 top-1/2 size-4 -translate-y-1/2"
+            className="text-muted-foreground absolute top-1/2 left-3 size-4 -translate-y-1/2"
           />
           <Input
             id={`${id}-link`}
             type="url"
             inputMode="url"
-            placeholder={MDBLIST_LINK_PLACEHOLDER}
-            className="h-11 ps-9"
+            placeholder="https://mdblist.com/lists/…"
+            className="h-11 pl-9"
             aria-invalid={linkInvalid || undefined}
             aria-describedby={linkInvalid ? `${id}-link-error` : undefined}
             value={link}
@@ -282,7 +249,7 @@ export function MDBListBrowser({
         </div>
         {linkInvalid ? (
           <p id={`${id}-link-error`} className="text-destructive text-[12.5px]">
-            {mdblistLinkInvalid()}
+            {MDBLIST_LINK_INVALID}
           </p>
         ) : null}
       </div>

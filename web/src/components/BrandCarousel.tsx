@@ -3,8 +3,6 @@ import type { DiscoverBrandCard, DiscoverBrowseKind } from "@/api/types";
 import BrandCard from "@/components/BrandCard";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCarouselEmbla } from "@/hooks/useCarouselEmbla";
-import { useT } from "@/i18n";
-import { readingArrowKey } from "@/lib/direction";
 
 interface BrandCarouselProps {
   kind: DiscoverBrowseKind;
@@ -23,7 +21,6 @@ export default function BrandCarousel({
   isError,
   onRetry,
 }: BrandCarouselProps) {
-  const t = useT();
   const { emblaRef, canScrollPrev, canScrollNext, scrollPrev, scrollNext } = useCarouselEmbla();
 
   const slides = isLoading
@@ -43,26 +40,26 @@ export default function BrandCarousel({
             onClick={onRetry}
             className="text-muted-foreground hover:text-foreground text-xs underline-offset-2 hover:underline"
           >
-            {t("common.retry")}
+            Retry
           </button>
         ) : null}
       </div>
 
       {isError && !isLoading ? (
         <div className="text-muted-foreground flex h-28 items-center px-4 text-xs sm:px-6 lg:px-10 xl:px-12">
-          {t("web.common.ui.carousel.loadFailed", { title_lower: title.toLowerCase() })}
+          Could not load {title.toLowerCase()}.
         </div>
       ) : (
         <div className="relative">
           {canScrollPrev && (
-            <div className="from-background/80 pointer-events-none absolute start-0 top-0 bottom-0 z-[5] w-10 bg-gradient-to-r to-transparent rtl:bg-gradient-to-l" />
+            <div className="from-background/80 pointer-events-none absolute top-0 bottom-0 left-0 z-[5] w-10 bg-gradient-to-r to-transparent" />
           )}
           {canScrollPrev && (
             <button
               type="button"
               onClick={scrollPrev}
-              className="from-background/80 absolute start-0 top-0 bottom-0 z-10 flex h-11 w-11 items-center justify-center self-center bg-gradient-to-r to-transparent opacity-0 transition-opacity duration-(--duration-fast) group-hover/carousel:opacity-100 focus-visible:opacity-100 rtl:bg-gradient-to-l"
-              aria-label={t("web.common.ui.carousel.scrollLeft")}
+              className="from-background/80 absolute top-0 bottom-0 left-0 z-10 flex h-11 w-11 items-center justify-center self-center bg-gradient-to-r to-transparent opacity-0 transition-opacity duration-(--duration-fast) group-hover/carousel:opacity-100 focus-visible:opacity-100"
+              aria-label="Scroll left"
             >
               <ChevronLeft className="text-foreground h-6 w-6" />
             </button>
@@ -70,21 +67,20 @@ export default function BrandCarousel({
 
           <div
             ref={emblaRef}
-            className="embla__viewport overflow-hidden pe-4 sm:pe-6 lg:pe-10 xl:pe-12"
+            className="embla__viewport overflow-hidden pr-4 sm:pr-6 lg:pr-10 xl:pr-12"
             tabIndex={0}
-            aria-label={t("web.common.ui.carousel.label", { title })}
+            aria-label={`${title} carousel`}
             onKeyDown={(e) => {
-              const key = readingArrowKey(e);
-              if (key === "ArrowLeft") {
+              if (e.key === "ArrowLeft") {
                 scrollPrev();
-              } else if (key === "ArrowRight") {
+              } else if (e.key === "ArrowRight") {
                 scrollNext();
               }
             }}
           >
             <ul
               role="list"
-              className="embla__container flex cursor-grab list-none gap-4 py-2 ps-4 sm:ps-6 lg:ps-10 xl:ps-12"
+              className="embla__container flex cursor-grab list-none gap-4 py-2 pl-4 sm:pl-6 lg:pl-10 xl:pl-12"
             >
               {slides.map((slide, index) => (
                 <li key={index} className="embla__slide shrink-0">
@@ -98,8 +94,8 @@ export default function BrandCarousel({
             <button
               type="button"
               onClick={scrollNext}
-              className="from-background/80 absolute end-0 top-0 bottom-0 z-10 flex h-11 w-11 items-center justify-center self-center bg-gradient-to-l to-transparent opacity-0 transition-opacity duration-(--duration-fast) group-hover/carousel:opacity-100 focus-visible:opacity-100 rtl:bg-gradient-to-r"
-              aria-label={t("web.common.ui.carousel.scrollRight")}
+              className="from-background/80 absolute top-0 right-0 bottom-0 z-10 flex h-11 w-11 items-center justify-center self-center bg-gradient-to-l to-transparent opacity-0 transition-opacity duration-(--duration-fast) group-hover/carousel:opacity-100 focus-visible:opacity-100"
+              aria-label="Scroll right"
             >
               <ChevronRight className="text-foreground h-6 w-6" />
             </button>

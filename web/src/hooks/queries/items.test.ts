@@ -4,7 +4,6 @@ const mocks = vi.hoisted(() => ({
   api: vi.fn(),
   v2: vi.fn(),
   cancelItemDetailQueries: vi.fn(),
-  dropInactiveWatchDetail: vi.fn(),
   invalidateMediaSurfaceQueries: vi.fn(),
   scheduleMediaSurfaceInvalidation: vi.fn(),
   toastError: vi.fn(),
@@ -54,7 +53,6 @@ vi.mock("@/pages/ItemDetail/watchedState", async () => {
 
 vi.mock("./mediaSurfaceRefresh", () => ({
   cancelItemDetailQueries: (...args: unknown[]) => mocks.cancelItemDetailQueries(...args),
-  dropInactiveWatchDetail: (...args: unknown[]) => mocks.dropInactiveWatchDetail(...args),
   invalidateMediaSurfaceQueries: (...args: unknown[]) =>
     mocks.invalidateMediaSurfaceQueries(...args),
   scheduleMediaSurfaceInvalidation: (...args: unknown[]) =>
@@ -75,24 +73,22 @@ vi.mock("sonner", () => ({
   },
 }));
 
-import { V2ProblemError } from "@/api/v2/request";
-import { useRefreshItemMetadata, useUploadItemImage, useWatchedStateMutation } from "./items";
+import { useRefreshItemMetadata, useWatchedStateMutation } from "./items";
 
 type WatchedMutationOptions = {
   mutationFn: (nextPlayed: boolean) => Promise<unknown>;
   onMutate?: (nextPlayed: boolean) => Promise<unknown>;
-  onError?: (error: unknown, nextPlayed: boolean, context?: unknown) => void;
+  onError?: (error: unknown, nextPlayed: boolean) => void;
   onSuccess?: (data: unknown, nextPlayed: boolean) => void;
-  onSettled?: (data?: unknown, error?: unknown) => Promise<unknown>;
+  onSettled?: () => Promise<unknown>;
 };
 
 type RefreshMetadataVariables = {
   item: { content_id: string; type: string };
   mode: "quick" | "complete";
-  onReplaced?: (contentID: string) => void;
 };
 
-type RefreshMetadataContext = { toastID: string | number; startURL: string };
+type RefreshMetadataContext = { toastID: string | number };
 
 type RefreshMetadataMutationOptions = {
   onMutate?: (variables: RefreshMetadataVariables) => RefreshMetadataContext;
@@ -108,10 +104,7 @@ type RefreshMetadataMutationOptions = {
   ) => void;
 };
 
-afterEach(() => {
-  vi.unstubAllGlobals();
-  window.history.replaceState(null, "", "/");
-});
+afterEach(() => vi.unstubAllGlobals());
 
 describe("item query helpers", () => {
   beforeEach(() => {
@@ -144,43 +137,7 @@ describe("item query helpers", () => {
     mocks.useQueryClient.mockReturnValue({});
   });
 
-  it("shows why the server refused an uploaded image, not the generic summary", () => {
-    useUploadItemImage();
-    const options = mocks.useMutation.mock.calls[mocks.useMutation.mock.calls.length - 1]?.[0] as {
-      onError: (err: unknown) => void;
-    };
-
-    options.onError(
-      new V2ProblemError("uploadAdminItemImage", {
-        type: "https://silo.example/problems/validation_failed",
-        title: "Validation failed",
-        status: 422,
-        detail: "The request did not pass validation; see errors.",
-        errors: [
-          {
-            location: "body",
-            code: "invalid",
-            detail: "The file is not a JPEG, PNG or WebP image",
-          },
-        ],
-      } as ConstructorParameters<typeof V2ProblemError>[1]),
-    );
-
-    expect(mocks.toastError).toHaveBeenCalledWith("The file is not a JPEG, PNG or WebP image");
-  });
-
-  it.each([
-    // A job read through the API: the flag, with admin text that has not loaded formatting as "".
-    {
-      payload: { artwork_cache_incomplete: true, artwork_cache_warning: "" },
-      description: undefined,
-    },
-    // A job that arrived as a live event: only the server's own warning text.
-    {
-      payload: { artwork_cache_warning: "2 refreshed artwork image(s) failed to cache" },
-      description: "2 refreshed artwork image(s) failed to cache",
-    },
-  ])("warns when the refresh succeeded but artwork caching did not finish", async (shape) => {
+  it("warns when the refresh succeeded but artwork caching did not finish", async () => {
     const invalidateQueries = vi.fn().mockResolvedValue(undefined);
     mocks.useQueryClient.mockReturnValue({ invalidateQueries });
 
@@ -199,7 +156,7 @@ describe("item query helpers", () => {
         job: {
           result_payload: {
             refresh_content_id: "series-1",
-            ...shape.payload,
+            artwork_cache_warning: "2 refreshed artwork image(s) failed to cache",
           },
         },
       },
@@ -210,57 +167,13 @@ describe("item query helpers", () => {
     expect(mocks.toastSuccess).not.toHaveBeenCalled();
     expect(mocks.toastWarning).toHaveBeenCalledWith(
       "Metadata refreshed, but artwork caching did not finish",
-      { id: "refresh-toast", description: shape.description },
+      {
+        id: "refresh-toast",
+        description: "2 refreshed artwork image(s) failed to cache",
+      },
     );
     // The refresh still committed, so the caches must be invalidated anyway.
     expect(invalidateQueries).toHaveBeenCalled();
-  });
-
-  // A Complete Refresh can finish minutes later, after the admin has moved on.
-  // The page that started it may also have unmounted because the old ID now
-  // 404s, so following depends on the URL, not on that page still being mounted.
-  it.each([
-    { label: "still on the page that started it", laterURL: undefined, follows: true },
-    {
-      label: "after a skip link changed only the hash",
-      laterURL: "/item/movie-1?libraryId=5#main-content",
-      follows: true,
-    },
-    { label: "on another item", laterURL: "/item/movie-2?libraryId=5", follows: false },
-    { label: "on another library's page", laterURL: "/item/movie-1?libraryId=6", follows: false },
-    { label: "on another page", laterURL: "/search", follows: false },
-  ])("follows a replaced item only while $label", async ({ laterURL, follows }) => {
-    mocks.useQueryClient.mockReturnValue({
-      invalidateQueries: vi.fn().mockResolvedValue(undefined),
-    });
-    window.history.pushState(null, "", "/item/movie-1?libraryId=5");
-    const onReplaced = vi.fn();
-
-    useRefreshItemMetadata();
-    const options = mocks.useMutation.mock.calls[
-      mocks.useMutation.mock.calls.length - 1
-    ]?.[0] as RefreshMetadataMutationOptions;
-    const variables: RefreshMetadataVariables = {
-      item: { content_id: "movie-1", type: "movie" },
-      mode: "complete",
-      onReplaced,
-    };
-
-    const context = options.onMutate?.(variables);
-    if (laterURL) window.history.pushState(null, "", laterURL);
-    await options.onSuccess?.(
-      {
-        job: { result_payload: { refresh_content_id: "movie-1b", detail_content_id: "movie-1b" } },
-      },
-      variables,
-      context,
-    );
-
-    if (follows) {
-      expect(onReplaced).toHaveBeenCalledWith("movie-1b");
-    } else {
-      expect(onReplaced).not.toHaveBeenCalled();
-    }
   });
 
   it("optimistically flips played state and reverts only that field on failure", async () => {
@@ -318,44 +231,6 @@ describe("item query helpers", () => {
       user_state: { played: false, is_favorite: true, in_watchlist: true },
     });
     expect(mocks.toastError).toHaveBeenCalledWith("boom");
-  });
-
-  it("keeps a rewatch watched when marking it watched again fails", async () => {
-    mocks.cancelItemDetailQueries.mockResolvedValueOnce(undefined);
-    useWatchedStateMutation({ content_id: "movie-1", type: "movie", user_data: { played: true } });
-    const options = mocks.useMutation.mock.calls[
-      mocks.useMutation.mock.calls.length - 1
-    ]?.[0] as WatchedMutationOptions;
-
-    const context = await options.onMutate?.(true);
-    options.onError?.(new Error("boom"), true, context);
-    const revert = mocks.updateCatalogItemDetail.mock.calls.at(-1)?.[2] as (
-      detail: Record<string, unknown>,
-    ) => Record<string, unknown>;
-    expect(
-      revert({ user_data: { played: true }, user_state: { played: true, is_favorite: false } }),
-    ).toMatchObject({ user_data: { played: true }, user_state: { played: true } });
-  });
-
-  it("drops a closed player's cached position once a mark lands", () => {
-    const queryClient = {};
-    mocks.useQueryClient.mockReturnValue(queryClient);
-    const related = new Set(["series-1"]);
-    mocks.dropInactiveWatchDetail.mockReturnValueOnce(related);
-    useWatchedStateMutation({ content_id: "episode-1", type: "episode" });
-    const options = mocks.useMutation.mock.calls.at(-1)?.[0] as WatchedMutationOptions;
-
-    options.onSettled?.(undefined, null);
-    expect(mocks.dropInactiveWatchDetail).toHaveBeenCalledWith(queryClient, "episode-1");
-    expect(mocks.scheduleMediaSurfaceInvalidation).toHaveBeenLastCalledWith(
-      queryClient,
-      expect.objectContaining({ itemId: "episode-1", knownRelatedIds: related }),
-    );
-
-    // A failed mark left the position alone.
-    mocks.dropInactiveWatchDetail.mockClear();
-    options.onSettled?.(undefined, new Error("boom"));
-    expect(mocks.dropInactiveWatchDetail).not.toHaveBeenCalled();
   });
 
   it("uses read toast copy and refreshes surfaces for ebook watched toggles", async () => {

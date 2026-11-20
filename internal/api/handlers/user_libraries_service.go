@@ -7,7 +7,6 @@ import (
 	"slices"
 
 	"github.com/Silo-Server/silo-server/internal/access"
-	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -18,8 +17,6 @@ type UserLibraryView struct {
 	Type      string `json:"type"`
 	SortOrder int    `json:"sort_order"`
 	PosterURL string `json:"poster_url,omitempty"`
-	// BoxSetsEnabled is served by v2 only; the frozen v1 shape leaves it out.
-	BoxSetsEnabled bool `json:"-"`
 }
 
 // ListUserLibraries uses the resolved viewer scope, or the account policy when
@@ -71,11 +68,10 @@ func (h *LibraryHandler) ListUserLibraries(ctx context.Context, userID int, incl
 	resp := make([]UserLibraryView, 0, len(folders))
 	for _, f := range folders {
 		entry := UserLibraryView{
-			ID:             f.ID,
-			Name:           f.Name,
-			Type:           f.Type,
-			SortOrder:      f.SortOrder,
-			BoxSetsEnabled: f.BoxSetsEnabled && catalog.LibraryTypeSupportsBoxSets(f.Type),
+			ID:        f.ID,
+			Name:      f.Name,
+			Type:      f.Type,
+			SortOrder: f.SortOrder,
 		}
 		if f.PosterPath != "" && h.ArtworkResolver != nil {
 			entry.PosterURL = h.ArtworkResolver.ResolveURLs(ctx, []string{f.PosterPath})[f.PosterPath].URL

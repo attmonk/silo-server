@@ -10,10 +10,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useT } from "@/i18n";
 import { canonicalLanguageTag, getLanguageName } from "@/lib/languageNames";
 import type { SettingOption } from "@/lib/languageOptions";
-import { isImeComposing } from "@/lib/imeComposition";
 
 const OTHER_VALUE = "__other__";
 
@@ -67,7 +65,6 @@ export function LanguageSelect({
   "aria-describedby": ariaDescribedBy,
   children,
 }: LanguageSelectProps) {
-  const t = useT();
   // null = closed; otherwise the tag being typed.
   const [draft, setDraft] = useState<string | null>(null);
 
@@ -115,9 +112,7 @@ export function LanguageSelect({
           {allowOther && (
             <>
               <SelectSeparator />
-              <SelectItem value={OTHER_VALUE}>
-                {t("web.settings.languageSelect.otherChoice")}
-              </SelectItem>
+              <SelectItem value={OTHER_VALUE}>Other…</SelectItem>
             </>
           )}
         </SelectContent>
@@ -130,13 +125,12 @@ export function LanguageSelect({
               autoFocus
               value={draft}
               disabled={disabled}
-              placeholder={t("web.settings.languageSelect.codePlaceholder")}
-              aria-label={t("web.settings.languageSelect.codeLabel")}
+              placeholder="Language code, e.g. pt-BR"
+              aria-label="Language code"
               aria-invalid={draftInvalid || undefined}
               className="h-9 flex-1"
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={(event) => {
-                if (isImeComposing(event)) return;
                 if (event.key === "Enter") {
                   event.preventDefault();
                   commitDraft();
@@ -154,7 +148,7 @@ export function LanguageSelect({
               disabled={disabled || !draftTag}
               onClick={commitDraft}
             >
-              {t("web.settings.languageSelect.use")}
+              Use
             </Button>
             <Button
               type="button"
@@ -164,7 +158,7 @@ export function LanguageSelect({
               disabled={disabled}
               onClick={() => setDraft(null)}
             >
-              {t("common.cancel")}
+              Cancel
             </Button>
           </div>
           <p
@@ -172,10 +166,10 @@ export function LanguageSelect({
             role={draftInvalid ? "alert" : undefined}
           >
             {draftInvalid
-              ? t("web.settings.languageSelect.invalid")
+              ? "Not a valid language tag. Use an ISO code such as is, yue, or pt-BR."
               : draftTag
                 ? getLanguageName(trimmed)
-                : t("web.settings.languageSelect.hint")}
+                : "Type an ISO language code to use a language not in the list."}
           </p>
         </div>
       )}

@@ -19,7 +19,6 @@ import {
   signInBindingWrite,
 } from "@/lib/externalSignInAdmin";
 import { pluginPagePath } from "@/lib/pluginPresentation";
-import { useT } from "@/i18n";
 
 import { FieldGroup } from "./FieldGroup";
 import { SettingFieldRow } from "./SettingField";
@@ -30,15 +29,6 @@ const GRANT_EXAMPLE = `"grants": [
   {"src": ["autogroup:member", "autogroup:shared"], "dst": ["tag:silo"],
    "app": {"siloserver.org/cap/silo": [{"role": "user"}]}}
 ]`;
-
-// Code quoted in the explanation: the tailnet capability and the grants' JSON.
-const CAPABILITY = "siloserver.org/cap/silo";
-const ADMIN_ROLE = `{"role":"admin"}`;
-const USER_ROLE = `{"role":"user"}`;
-
-function code(chunks: React.ReactNode[]) {
-  return <code className="font-mono">{chunks}</code>;
-}
 
 /**
  * Settings → Sign-in: network sign-in plugins (such as Tailscale), which sign
@@ -56,13 +46,12 @@ export function NetworkSignInSection({
 }: {
   installations: readonly PluginInstallation[] | undefined;
 }) {
-  const t = useT();
   const network = networkSignInInstallations(installations);
   if (network.length === 0) return null;
   return (
     <FieldGroup
-      label={t("web.admin.settings.signIn.network.group")}
-      description={t("web.admin.settings.signIn.network.description")}
+      label="Network sign-in"
+      description="People whose device reaches this server over the network sign in as the device's owner, with no password. It can be on beside the provider above."
     >
       {network.map((installation) => (
         <NetworkSignInRow key={installation.id} installation={installation} />
@@ -72,7 +61,6 @@ export function NetworkSignInSection({
 }
 
 function NetworkSignInRow({ installation }: { installation: PluginInstallation }) {
-  const t = useT();
   const updateBinding = useUpdateSignInBinding();
   const bindingWrites = useIsMutating({ mutationKey: signInBindingMutationKey });
   const [feedback, setFeedback] = useState<Feedback>(null);
@@ -95,10 +83,7 @@ function NetworkSignInRow({ installation }: { installation: PluginInstallation }
         onError: (error) =>
           setFeedback({
             tone: "error",
-            text: adminSignInErrorText(
-              error,
-              t("web.admin.settings.signIn.network.changeFailed", { name: label }),
-            ),
+            text: adminSignInErrorText(error, `Couldn't change ${label}.`),
           }),
       },
     );
@@ -108,9 +93,9 @@ function NetworkSignInRow({ installation }: { installation: PluginInstallation }
     <div className="settings-field-note">
       <FeedbackLine feedback={feedback} focusRef={feedbackRef} />
       <SettingFieldRow
-        label={t("web.admin.settings.signIn.network.enableLabel", { name: label })}
+        label={`Sign in with ${label}`}
         htmlFor={enabledId}
-        description={t("web.admin.settings.signIn.network.enableDescription", { name: label })}
+        description={`Shows a "Continue as" button to people whose device reaches this server over ${label}.`}
       >
         <Switch
           id={enabledId}
@@ -120,18 +105,16 @@ function NetworkSignInRow({ installation }: { installation: PluginInstallation }
             write(
               { enabled: checked },
               checked
-                ? t("web.admin.settings.signIn.network.turnedOn", { name: label })
-                : t("web.admin.settings.signIn.network.turnedOff", { name: label }),
+                ? `${label} sign-in is on. Devices on ${label} can sign in now.`
+                : `${label} sign-in is off. Accounts and their ${label} connections stay.`,
             )
           }
         />
       </SettingFieldRow>
       <SettingFieldRow
-        label={t("web.admin.settings.signIn.network.autoProvisionLabel")}
+        label="Create accounts on first sign-in"
         htmlFor={autoProvisionId}
-        description={t("web.admin.settings.signIn.network.autoProvisionDescription", {
-          name: label,
-        })}
+        description={`Off: only accounts already connected to ${label} can sign in.`}
       >
         <Switch
           id={autoProvisionId}
@@ -141,45 +124,48 @@ function NetworkSignInRow({ installation }: { installation: PluginInstallation }
             write(
               { auto_provision: checked },
               checked
-                ? t("web.admin.settings.signIn.network.autoProvisionOn", { name: label })
-                : t("web.admin.settings.signIn.network.autoProvisionOff", { name: label }),
+                ? `New ${label} users get a Silo account at first sign-in.`
+                : `Only accounts already connected to ${label} can sign in.`,
             )
           }
         />
       </SettingFieldRow>
       <AdvancedSection
         id={`sign-in.network.${installation.plugin_id}`}
-        title={t("web.admin.settings.signIn.network.howTitle")}
+        title="How roles and sharing work"
       >
         <div className="settings-field-note text-muted-foreground space-y-2 py-3.5 text-xs leading-relaxed">
           <p>
-            {t("web.admin.settings.signIn.network.howWho", {
-              name: label,
-              capability: CAPABILITY,
-              code,
-            })}
+            Anyone whose device can reach this server over {label} can sign in, including people you
+            share the server with; tagged devices can&apos;t. To limit it, set the plugin&apos;s
+            &ldquo;Who can sign in&rdquo; to people granted{" "}
+            <code className="font-mono">siloserver.org/cap/silo</code>. {label} sign-in never
+            matches an existing account by email: its owner connects {label} from their own Sign-in
+            settings.
           </p>
           <p>
-            {t("web.admin.settings.signIn.network.howRoles", {
-              capability: CAPABILITY,
-              admin_role: ADMIN_ROLE,
-              user_role: USER_ROLE,
-              code,
-            })}
+            Roles come from grants in your tailnet policy: a{" "}
+            <code className="font-mono">siloserver.org/cap/silo</code> grant with{" "}
+            <code className="font-mono">{`{"role":"admin"}`}</code> makes someone a Silo admin, and{" "}
+            <code className="font-mono">{`{"role":"user"}`}</code> a regular user. Anyone who can
+            edit the tailnet policy can make themselves a Silo admin. Without a grant, a
+            person&apos;s role is left as it is, so removing someone&apos;s admin grant doesn&apos;t
+            demote them: grant them <code className="font-mono">{`{"role":"user"}`}</code> instead.
+            Policy changes apply at the next sign-in or access re-check. An account that also signs
+            in through your main sign-in provider takes its role from that provider.
           </p>
           <pre className="bg-muted overflow-x-auto rounded-md p-3 font-mono">{GRANT_EXAMPLE}</pre>
           <p>
-            {t("web.admin.settings.signIn.network.howSharedTv", {
-              name: label,
-              link: (chunks) => (
-                <Link
-                  to={pluginPagePath(installation.plugin_id)}
-                  className="text-foreground underline underline-offset-4"
-                >
-                  {chunks}
-                </Link>
-              ),
-            })}
+            Everyone using a shared TV signs in as whoever signed that TV in to {label}, with their
+            role, so sign shared TVs in as someone without an admin grant; profiles keep their
+            watching apart. Tag any device that relays other people&apos;s traffic to this server,
+            such as a reverse proxy, or everyone behind it signs in as its owner.{" "}
+            <Link
+              to={pluginPagePath(installation.plugin_id)}
+              className="text-foreground underline underline-offset-4"
+            >
+              {label} plugin settings
+            </Link>
           </p>
         </div>
       </AdvancedSection>

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -18,8 +20,6 @@ type fakeSubmitter struct {
 	result    SubmissionResult
 	err       error
 	required  []string
-	amend     bool
-	absent    bool
 	onSubmit  func()
 	deadline  chan time.Time
 }
@@ -51,7 +51,7 @@ func (f *fakeSubmitter) SubmitMarker(ctx context.Context, req SubmissionRequest)
 }
 func (f *fakeSubmitter) FetchUserStats(context.Context) (UserStats, error) { return UserStats{}, nil }
 func (f *fakeSubmitter) SubmissionRequirements() SubmissionRequirements {
-	return SubmissionRequirements{RequiredExternalIDs: f.required, SupportsAmend: f.amend, SupportsAbsent: f.absent}
+	return SubmissionRequirements{RequiredExternalIDs: f.required}
 }
 
 type fakeResolver struct{ ids ExternalIDs }
@@ -62,14 +62,7 @@ func (f fakeResolver) ResolveForFile(context.Context, *models.MediaFile) (Extern
 
 type fakeConfig map[string]ProviderConfig
 
-func (f fakeConfig) Load(context.Context) (map[string]ProviderConfig, error) { return f, nil }
-
-// unreadableConfig is provider config whose stored rows cannot be read.
-type unreadableConfig struct{}
-
-func (unreadableConfig) Load(context.Context) (map[string]ProviderConfig, error) {
-	return nil, errors.New("database unavailable")
-}
+func (f fakeConfig) Get(p string) (ProviderConfig, bool) { c, ok := f[p]; return c, ok }
 
 type fakeRecorder struct {
 	mu       sync.Mutex
@@ -132,35 +125,84 @@ func newContribService(sub *fakeSubmitter, cfg fakeConfig, rec *fakeRecorder) *C
 	return NewContributionService(reg, resolver, cfg, rec, nil)
 }
 
-// A manual clear says the item has no segment of the kind. It goes only to a
-// provider that accepts absent submissions, and a provider's own absent answer
-// is never passed on.
-func TestContributeSendsManualClearsAsAbsentOnlyWhereAccepted(t *testing.T) {
-	reg := NewRegistry(nil)
-	accepts, declines := &fakeSubmitter{id: "accepts", absent: true}, &fakeSubmitter{id: "declines"}
-	_ = reg.Register(accepts)
-	_ = reg.Register(declines)
-	cfg := fakeConfig{"accepts": {Provider: "accepts", ContributeEnabled: true}, "declines": {Provider: "declines", ContributeEnabled: true}}
-	resolver := fakeResolver{ids: ExternalIDs{Kind: ItemKindEpisode, TmdbID: "1234", SeasonNumber: 1, EpisodeNumber: 3}}
-	rec := &fakeRecorder{}
-	svc := NewContributionService(reg, resolver, cfg, rec, nil)
+func TestContributeSkipsOnlineSourced(t *testing.T) {
+	sub := &fakeSubmitter{id: "introdb"}
+	file := newContribIntroFile(models.MarkerSourceOnline) // came FROM introdb
+	svc := newContribService(sub, fakeConfig{"introdb": {Provider: "introdb", ContributeEnabled: true}}, &fakeRecorder{})
 
-	file := newContribFile()
-	file.IntroMarkersSource = strPtr(models.MarkerSourceManual)
-	file.CreditsMarkersSource, file.CreditsMarkersProvider = strPtr(models.MarkerSourcePlugin), strPtr("accepts")
-	if _, err := svc.ContributeFile(context.Background(), file, ContributeOptions{}); err != nil {
+	outcomes, err := svc.ContributeFile(context.Background(), file, ContributeOptions{})
+	if err != nil {
 		t.Fatalf("ContributeFile: %v", err)
 	}
-	if len(declines.submitted) != 0 || len(accepts.submitted) != 1 {
-		t.Fatalf("submissions: accepts %+v, declines %+v; want one clear to accepts", accepts.submitted, declines.submitted)
+	if len(sub.submitted) != 0 {
+		t.Errorf("online-sourced marker must not be submitted, got %d", len(sub.submitted))
 	}
-	got := accepts.submitted[0]
-	if got.Segment != MarkerKindIntro || !got.Absent || got.Start != nil || got.End != nil ||
-		got.Source != models.MarkerSourceManual || got.Algorithm != "manual:v1" || got.Confidence != 1 {
-		t.Fatalf("submission = %+v, want an absent manual intro", got)
+	if len(outcomes) != 0 {
+		t.Errorf("expected no outcomes, got %+v", outcomes)
 	}
-	if len(rec.recorded) != 1 || rec.recorded[0].SubmittedStartMs != nil || rec.recorded[0].SubmittedEndMs != nil {
-		t.Fatalf("recorded = %+v, want one row without times", rec.recorded)
+}
+
+func TestContributeSubmitsManualOnDemand(t *testing.T) {
+	sub := &fakeSubmitter{id: "introdb"}
+	file := newContribFile()
+	file.CreditsStart, file.CreditsEnd = floatPtr(1500), floatPtr(1800)
+	file.CreditsMarkersSource = strPtr(models.MarkerSourceManual)
+	rec := &fakeRecorder{}
+	svc := newContribService(sub, fakeConfig{"introdb": {Provider: "introdb", ContributeEnabled: true}}, rec)
+
+	outcomes, err := svc.ContributeFile(context.Background(), file, ContributeOptions{})
+	if err != nil {
+		t.Fatalf("ContributeFile: %v", err)
+	}
+	if len(sub.submitted) != 1 || sub.submitted[0].Segment != MarkerKindCredits {
+		t.Fatalf("expected 1 credits submission, got %+v", sub.submitted)
+	}
+	if len(rec.recorded) != 1 || rec.recorded[0].Status != SubmissionStatusPending {
+		t.Errorf("expected recorded pending, got %+v", rec.recorded)
+	}
+	if len(outcomes) != 1 || outcomes[0].Status != SubmissionStatusPending {
+		t.Errorf("outcomes = %+v", outcomes)
+	}
+}
+
+// Automatic contribution shares the two kinds the scanner detects, intros and
+// credits, each against the provider's minimum confidence. Other local
+// segments are submitted only on request.
+func TestContributeAutoSubmitsScannerIntrosAndCredits(t *testing.T) {
+	cfg := fakeConfig{"introdb": {Provider: "introdb", ContributeEnabled: true, ContributeAutoLocal: true, ContributeMinConfidence: 0.9}}
+	file := newContribIntroFile(models.MarkerSourceScanner)
+	file.IntroMarkersConfidence = floatPtr(0.92)
+	file.CreditsStart, file.CreditsEnd = floatPtr(1500), floatPtr(1800)
+	file.CreditsMarkersSource = strPtr(models.MarkerSourceScanner)
+	file.CreditsMarkersConfidence = floatPtr(0.95)
+	file.CreditsMarkersAlgorithm = strPtr("credits-chapter:v1")
+	file.PreviewStart, file.PreviewEnd = floatPtr(1790), floatPtr(1800)
+	file.PreviewMarkersSource = strPtr(models.MarkerSourceScanner)
+	file.PreviewMarkersConfidence = floatPtr(0.99)
+
+	sub := &fakeSubmitter{id: "introdb"}
+	if _, err := newContribService(sub, cfg, &fakeRecorder{}).ContributeFile(context.Background(), file, ContributeOptions{Auto: true}); err != nil {
+		t.Fatalf("ContributeFile: %v", err)
+	}
+	if len(sub.submitted) != 2 || sub.submitted[0].Segment != MarkerKindIntro || sub.submitted[1].Segment != MarkerKindCredits {
+		t.Fatalf("automatic contribution submitted %+v, want the scanner intro and credits", sub.submitted)
+	}
+
+	file.CreditsMarkersConfidence = floatPtr(0.85)
+	lowCredits := &fakeSubmitter{id: "introdb"}
+	if _, err := newContribService(lowCredits, cfg, &fakeRecorder{}).ContributeFile(context.Background(), file, ContributeOptions{Auto: true}); err != nil {
+		t.Fatalf("ContributeFile: %v", err)
+	}
+	if len(lowCredits.submitted) != 1 || lowCredits.submitted[0].Segment != MarkerKindIntro {
+		t.Fatalf("automatic contribution submitted %+v, want only the intro: the credits are below the minimum confidence", lowCredits.submitted)
+	}
+
+	onRequest := &fakeSubmitter{id: "introdb"}
+	if _, err := newContribService(onRequest, cfg, &fakeRecorder{}).ContributeFile(context.Background(), file, ContributeOptions{}); err != nil {
+		t.Fatalf("ContributeFile: %v", err)
+	}
+	if len(onRequest.submitted) != 3 {
+		t.Fatalf("contribution on request submitted %+v, want the intro, the credits and the preview", onRequest.submitted)
 	}
 }
 
@@ -188,6 +230,119 @@ func TestContributeSkipsChangedTimesForSubmittedTarget(t *testing.T) {
 	}
 	if rec.recorded[0].TargetKey != "episode|tmdb:1234|1|3" {
 		t.Fatalf("target key = %q", rec.recorded[0].TargetKey)
+	}
+}
+
+// A provider's terminal refusal is recorded once with its HTTP status, and
+// the target is skipped on later runs instead of being resubmitted.
+func TestContributeSettlesTerminalRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		want       string
+		httpStatus int
+	}{
+		{"conflict", &SubmissionConflictError{Provider: "introdb", HTTPStatus: 409, Message: "already submitted"}, OutcomeStatusConflict, 409},
+		{"invalid", &SubmissionInvalidError{Provider: "introdb", HTTPStatus: 400, Message: "season does not exist"}, OutcomeStatusInvalid, 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sub := &fakeSubmitter{id: "introdb", err: tc.err}
+			file := newContribIntroFile(models.MarkerSourceManual)
+			rec := &fakeRecorder{}
+			svc := newContribService(sub, fakeConfig{"introdb": {Provider: "introdb", ContributeEnabled: true}}, rec)
+
+			first, err := svc.ContributeFile(context.Background(), file, ContributeOptions{})
+			if err != nil {
+				t.Fatalf("first ContributeFile: %v", err)
+			}
+			second, err := svc.ContributeFile(context.Background(), file, ContributeOptions{})
+			if err != nil {
+				t.Fatalf("second ContributeFile: %v", err)
+			}
+			if len(sub.submitted) != 1 {
+				t.Fatalf("provider submissions = %d, want one", len(sub.submitted))
+			}
+			if len(first) != 1 || first[0].Status != tc.want {
+				t.Fatalf("first outcomes = %+v, want %s", first, tc.want)
+			}
+			if len(second) != 1 || second[0].Status != OutcomeStatusSkipped {
+				t.Fatalf("second outcomes = %+v, want skipped while the refusal holds the target", second)
+			}
+			if len(rec.recorded) != 1 || rec.recorded[0].Status != tc.want || rec.recorded[0].HTTPStatus == nil || *rec.recorded[0].HTTPStatus != tc.httpStatus {
+				t.Fatalf("recorded = %+v, want terminal HTTP %d %s", rec.recorded, tc.httpStatus, tc.want)
+			}
+		})
+	}
+}
+
+func TestContributeSubmitsSpecialsButSkipsUnnumberedEpisodes(t *testing.T) {
+	tests := []struct {
+		name            string
+		season, episode int
+		wantSubmitted   bool
+	}{
+		{name: "special", season: 0, episode: 3, wantSubmitted: true},
+		{name: "unnumbered episode", season: 1, episode: 0},
+		{name: "unknown season", season: -1, episode: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sub := &fakeSubmitter{id: "introdb"}
+			file := newContribIntroFile(models.MarkerSourceManual)
+			reg := NewRegistry(nil)
+			_ = reg.Register(sub)
+			resolver := fakeResolver{ids: ExternalIDs{
+				Kind: ItemKindEpisode, TvdbID: "121361", SeasonNumber: tt.season, EpisodeNumber: tt.episode,
+				Episode: EpisodeIDs{TvdbID: "4242"}, EpisodeTitle: "Inside the Episode",
+			}}
+			rec := &fakeRecorder{}
+			svc := NewContributionService(reg, resolver, fakeConfig{"introdb": {Provider: "introdb", ContributeEnabled: true}}, rec, nil)
+
+			outcomes, err := svc.ContributeFile(context.Background(), file, ContributeOptions{})
+			if err != nil {
+				t.Fatalf("ContributeFile: %v", err)
+			}
+			if !tt.wantSubmitted {
+				if len(sub.submitted) != 0 || len(rec.recorded) != 0 {
+					t.Fatalf("must not reach the provider or the ledger: submitted=%d recorded=%d", len(sub.submitted), len(rec.recorded))
+				}
+				if len(outcomes) != 1 || outcomes[0].Status != OutcomeStatusSkipped {
+					t.Fatalf("outcomes = %+v, want skipped", outcomes)
+				}
+				return
+			}
+			if len(sub.submitted) != 1 {
+				t.Fatalf("submitted = %d, want 1 (outcomes %+v)", len(sub.submitted), outcomes)
+			}
+			got := sub.submitted[0]
+			if got.SeasonNumber != tt.season || got.EpisodeNumber != tt.episode ||
+				got.EpisodeExternalIDs[ExternalIDKeyTVDB] != "4242" || got.EpisodeTitle != "Inside the Episode" {
+				t.Fatalf("submission = %+v, want the special with its episode identity", got)
+			}
+		})
+	}
+}
+
+func TestContributionTargetKey(t *testing.T) {
+	tests := []struct {
+		ids  ExternalIDs
+		want string
+	}{
+		{ExternalIDs{Kind: ItemKindEpisode, TmdbID: "1", TvdbID: "2", ImdbID: "tt3", SeasonNumber: 4, EpisodeNumber: 5}, "episode|tmdb:1|4|5"},
+		{ExternalIDs{Kind: ItemKindEpisode, TvdbID: "2", ImdbID: "tt3", SeasonNumber: 4, EpisodeNumber: 5}, "episode|tvdb:2|4|5"},
+		{ExternalIDs{Kind: ItemKindMovie, ImdbID: "tt3"}, "movie|imdb:tt3|0|0"},
+	}
+	for _, tt := range tests {
+		if got := contributionTargetKey(tt.ids, nil); got != tt.want {
+			t.Errorf("contributionTargetKey(%+v) = %q, want %q", tt.ids, got, tt.want)
+		}
+	}
+	both := ExternalIDs{Kind: ItemKindEpisode, TmdbID: "1", TvdbID: "2", SeasonNumber: 4, EpisodeNumber: 5}
+	if got := contributionTargetKey(both, []string{ExternalIDKeyTVDB}); got != "episode|tvdb:2|4|5" {
+		t.Errorf("TVDB-keyed provider target = %q, want the TVDB item", got)
+	}
+	if got := contributionTargetKey(both, []string{ExternalIDKeyTMDB}); got != "episode|tmdb:1|4|5" {
+		t.Errorf("TMDB-keyed provider target = %q, want the TMDB item", got)
 	}
 }
 
@@ -237,5 +392,139 @@ func TestContributeReleasesClaimAfterProviderCancelsRequest(t *testing.T) {
 	}
 	if len(sub.submitted) != 2 {
 		t.Fatalf("provider submissions = %d, want retry after canceled request", len(sub.submitted))
+	}
+}
+
+func TestContributeSkipsWhenProviderRequiredIDMissing(t *testing.T) {
+	sub := &fakeSubmitter{id: "introdb", required: []string{ExternalIDKeyTMDB}}
+	file := newContribIntroFile(models.MarkerSourceManual)
+	rec := &fakeRecorder{}
+
+	reg := NewRegistry(nil)
+	_ = reg.Register(sub)
+	resolver := fakeResolver{ids: ExternalIDs{Kind: ItemKindEpisode, TvdbID: "777", SeasonNumber: 1, EpisodeNumber: 3}}
+	svc := NewContributionService(reg, resolver, fakeConfig{"introdb": {Provider: "introdb", ContributeEnabled: true}}, rec, nil)
+
+	outcomes, err := svc.ContributeFile(context.Background(), file, ContributeOptions{})
+	if err != nil {
+		t.Fatalf("ContributeFile: %v", err)
+	}
+	if len(sub.submitted) != 0 || len(rec.recorded) != 0 {
+		t.Fatalf("tmdb-missing marker should be skipped before submit/record, submitted=%d recorded=%d", len(sub.submitted), len(rec.recorded))
+	}
+	if len(outcomes) != 1 || outcomes[0].Status != OutcomeStatusSkipped || outcomes[0].Reason != "tmdb id required" {
+		t.Fatalf("outcomes = %+v, want skipped tmdb id required", outcomes)
+	}
+}
+
+func TestContributeStopsOnRetryAfterError(t *testing.T) {
+	sub := &fakeSubmitter{
+		id:  "introdb",
+		err: &RetryAfterError{Provider: "introdb", RetryAfter: 45 * time.Second, Message: "usage limited"},
+	}
+	file := newContribIntroFile(models.MarkerSourceManual)
+	file.CreditsStart, file.CreditsEnd = floatPtr(1700), floatPtr(1800)
+	file.CreditsMarkersSource = strPtr(models.MarkerSourceManual)
+	rec := &fakeRecorder{}
+	svc := newContribService(sub, fakeConfig{"introdb": {Provider: "introdb", ContributeEnabled: true}}, rec)
+
+	outcomes, err := svc.ContributeFile(context.Background(), file, ContributeOptions{})
+	if err != nil {
+		t.Fatalf("ContributeFile: %v", err)
+	}
+	if len(sub.submitted) != 1 {
+		t.Fatalf("expected contribution loop to stop after first rate limit, submitted=%d", len(sub.submitted))
+	}
+	if len(outcomes) != 1 || outcomes[0].Status != OutcomeStatusRateLimited || outcomes[0].RetryAfter != 45*time.Second {
+		t.Fatalf("outcomes = %+v, want one rate_limited retry-after outcome", outcomes)
+	}
+	if len(rec.recorded) != 1 || rec.recorded[0].Status != OutcomeStatusError {
+		t.Fatalf("recorded = %+v, want one error audit row", rec.recorded)
+	}
+}
+
+func TestContributeDisabledProviderNoop(t *testing.T) {
+	sub := &fakeSubmitter{id: "introdb"}
+	file := newContribIntroFile(models.MarkerSourceManual)
+	// contribute_enabled defaults false
+	svc := newContribService(sub, fakeConfig{"introdb": {Provider: "introdb"}}, &fakeRecorder{})
+
+	outcomes, _ := svc.ContributeFile(context.Background(), file, ContributeOptions{})
+	if len(sub.submitted) != 0 || len(outcomes) != 0 {
+		t.Errorf("disabled provider must be a no-op, submitted=%d outcomes=%d", len(sub.submitted), len(outcomes))
+	}
+}
+
+// AutoContributors lists only registered submitters with automatic sharing on,
+// carrying each one's own minimum and required IDs.
+func TestAutoContributorsListsRegisteredAutoSubmitters(t *testing.T) {
+	reg := NewRegistry(nil)
+	for _, sub := range []*fakeSubmitter{
+		{id: "keyed", required: []string{ExternalIDKeyTVDB}},
+		{id: "manual-only"},
+		{id: "disabled"},
+	} {
+		_ = reg.Register(sub)
+	}
+	cfg := fakeConfig{
+		"keyed":       {Provider: "keyed", ContributeEnabled: true, ContributeAutoLocal: true, ContributeMinConfidence: 0.97},
+		"manual-only": {Provider: "manual-only", ContributeEnabled: true},
+		"disabled":    {Provider: "disabled", ContributeAutoLocal: true},
+		// A configured provider whose plugin is not loaded cannot submit.
+		"unregistered": {Provider: "unregistered", ContributeEnabled: true, ContributeAutoLocal: true},
+	}
+	svc := NewContributionService(reg, fakeResolver{}, cfg, &fakeRecorder{}, nil)
+
+	got := svc.AutoContributors()
+	want := []AutoContributor{{Provider: "keyed", MinConfidence: 0.97, RequiredExternalIDs: []string{ExternalIDKeyTVDB}}}
+	if fmt.Sprintf("%+v", got) != fmt.Sprintf("%+v", want) {
+		t.Fatalf("AutoContributors = %+v, want %+v", got, want)
+	}
+}
+
+func TestContentHashStableAndSensitive(t *testing.T) {
+	s, e, d := int64(0), int64(60000), int64(1800000)
+	target := contributionTargetParts(ExternalIDs{Kind: ItemKindEpisode, TmdbID: "1234", SeasonNumber: 1, EpisodeNumber: 3})
+	h1 := ContentHash("intro", &s, &e, &d, target...)
+	if h1 != ContentHash("intro", &s, &e, &d, target...) {
+		t.Error("hash not stable for identical input")
+	}
+	e2 := int64(61000)
+	if ContentHash("intro", &s, &e2, &d, target...) == h1 {
+		t.Error("changed end should change hash")
+	}
+	rematched := contributionTargetParts(ExternalIDs{Kind: ItemKindEpisode, TmdbID: "9999", SeasonNumber: 1, EpisodeNumber: 3})
+	if ContentHash("intro", &s, &e, &d, rematched...) == h1 {
+		t.Error("changed resolved target should change hash")
+	}
+}
+
+func TestContributionClaimConflictMatchesOnlyGlobalClaimIndex(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "global claim conflict",
+			err:  &pgconn.PgError{Code: "23505", ConstraintName: contributionClaimIndex},
+			want: true,
+		},
+		{
+			name: "other unique conflict",
+			err:  &pgconn.PgError{Code: "23505", ConstraintName: "marker_contributions_pkey"},
+		},
+		{
+			name: "other database error",
+			err:  &pgconn.PgError{Code: "23503", ConstraintName: contributionClaimIndex},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isContributionClaimConflict(tt.err); got != tt.want {
+				t.Fatalf("isContributionClaimConflict() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

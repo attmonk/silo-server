@@ -3,7 +3,6 @@ package markers
 import (
 	"context"
 	"fmt"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -66,11 +65,6 @@ type PluginProviderOptions struct {
 	PluginID            string
 	CacheRevision       string
 	RequiredExternalIDs []string
-	SupportsAmend       bool
-	SupportsAbsent      bool
-	// DefaultContributeEnabled records the manifest's
-	// default_contribute_enabled for the admin API.
-	DefaultContributeEnabled bool
 }
 
 // PluginProvider adapts a marker_provider.v1 plugin capability to Silo's
@@ -82,9 +76,6 @@ type PluginProvider struct {
 	pluginID            string
 	cacheRevision       string
 	requiredExternalIDs []string
-	supportsAmend       bool
-	supportsAbsent      bool
-	defaultContribute   bool
 	clientFactory       pluginMarkerClientFactory
 }
 
@@ -167,9 +158,6 @@ func NewPluginProviderWithClientFactory(opts PluginProviderOptions, clientFactor
 		pluginID:            strings.TrimSpace(opts.PluginID),
 		cacheRevision:       opts.CacheRevision,
 		requiredExternalIDs: requiredIDs,
-		supportsAmend:       opts.SupportsAmend,
-		supportsAbsent:      opts.SupportsAbsent,
-		defaultContribute:   opts.DefaultContributeEnabled,
 		clientFactory:       clientFactory,
 	}, nil
 }
@@ -199,25 +187,20 @@ func (p *PluginProvider) ProviderDescription() ProviderDescriptor {
 		return ProviderDescriptor{}
 	}
 	return ProviderDescriptor{
-		ID:                       p.ID(),
-		DisplayName:              p.displayName,
-		SourceType:               ProviderSourcePlugin,
-		PluginID:                 p.pluginID,
-		PluginInstallationID:     p.installationID,
-		CapabilityID:             p.capabilityID,
-		DefaultContributeEnabled: p.defaultContribute,
+		ID:                   p.ID(),
+		DisplayName:          p.displayName,
+		SourceType:           ProviderSourcePlugin,
+		PluginID:             p.pluginID,
+		PluginInstallationID: p.installationID,
+		CapabilityID:         p.capabilityID,
 	}
 }
 
 func (p *PluginProvider) SubmissionRequirements() SubmissionRequirements {
-	if p == nil {
+	if p == nil || len(p.requiredExternalIDs) == 0 {
 		return SubmissionRequirements{}
 	}
-	reqs := SubmissionRequirements{SupportsAmend: p.supportsAmend, SupportsAbsent: p.supportsAbsent}
-	if len(p.requiredExternalIDs) > 0 {
-		reqs.RequiredExternalIDs = append([]string(nil), p.requiredExternalIDs...)
-	}
-	return reqs
+	return SubmissionRequirements{RequiredExternalIDs: append([]string(nil), p.requiredExternalIDs...)}
 }
 
 func (p *PluginProvider) FetchMarkers(ctx context.Context, req Request) (Result, error) {
@@ -237,9 +220,6 @@ func (p *PluginProvider) FetchMarkers(ctx context.Context, req Request) (Result,
 		EpisodeExternalIds: episodeExternalIDsProto(req.EpisodeExternalIDs),
 		EpisodeNumbering:   req.EpisodeNumbering,
 		EpisodeTitle:       req.EpisodeTitle,
-		FileHash:           req.FileHash,
-		FileSize:           req.FileSize,
-		AcceptsAbsent:      true,
 	})
 	if err != nil {
 		return Result{}, pluginProviderError(p.ID(), err)
@@ -286,12 +266,6 @@ func (p *PluginProvider) SubmitMarker(ctx context.Context, req SubmissionRequest
 		EpisodeExternalIds: episodeExternalIDsProto(req.EpisodeExternalIDs),
 		EpisodeNumbering:   req.EpisodeNumbering,
 		EpisodeTitle:       req.EpisodeTitle,
-		FileHash:           req.FileHash,
-		FileSize:           req.FileSize,
-		Source:             req.Source,
-		Algorithm:          req.Algorithm,
-		Confidence:         req.Confidence,
-		Absent:             req.Absent,
 	}
 	if req.Start != nil {
 		start := req.Start.Seconds()
@@ -349,24 +323,6 @@ func markerFromPluginSegment(segment *pluginv1.MarkerSegment, duration time.Dura
 	if !ok {
 		return Marker{}, false
 	}
-	// Confidence decides between providers, so a value that is not a valid
-	// 0-1 score (NaN, infinite, or out of range) counts as unrated, on an
-	// absent answer too.
-	confidence := segment.GetConfidence()
-	if math.IsNaN(confidence) || confidence < 0 || confidence > 1 {
-		confidence = 0
-	}
-	// An absent answer has no bounds. Read as a segment, the missing bounds
-	// would default to the whole file.
-	if segment.GetAbsent() {
-		return Marker{
-			Kind:            kind,
-			Absent:          true,
-			Confidence:      confidence,
-			SubmissionCount: int(segment.GetSubmissionCount()),
-			Algorithm:       strings.TrimSpace(segment.GetAlgorithm()),
-		}, true
-	}
 	start := time.Duration(0)
 	end := duration
 	if segment.StartSeconds != nil {
@@ -388,7 +344,7 @@ func markerFromPluginSegment(segment *pluginv1.MarkerSegment, duration time.Dura
 		Kind:            kind,
 		Start:           start,
 		End:             end,
-		Confidence:      confidence,
+		Confidence:      segment.GetConfidence(),
 		SubmissionCount: int(segment.GetSubmissionCount()),
 		Algorithm:       strings.TrimSpace(segment.GetAlgorithm()),
 	}, true
@@ -610,79 +566,17 @@ func PluginDefaultFetchPriorityFromMetadata(metadata map[string]any) (int, bool)
 	}
 }
 
-// PluginContributionDefaults is the contribution configuration a marker
-// capability asks for when its provider config row is first created.
-type PluginContributionDefaults struct {
-	Enabled       bool
-	AutoLocal     bool
-	MinConfidence float64
-}
-
-// PluginContributionDefaultsFromMetadata reads default_contribute_enabled,
-// default_contribute_auto_local and default_contribute_min_confidence. Missing
-// or malformed keys keep contribution off with a 0.95 minimum, as before the
-// keys existed.
-func PluginContributionDefaultsFromMetadata(metadata map[string]any) PluginContributionDefaults {
-	defaults := PluginContributionDefaults{
-		Enabled:       pluginMetadataBool(metadata, "default_contribute_enabled", false),
-		AutoLocal:     pluginMetadataBool(metadata, "default_contribute_auto_local", false),
-		MinConfidence: 0.95,
-	}
-	if confidence, ok := pluginMetadataNumber(metadata, "default_contribute_min_confidence"); ok && confidence >= 0 && confidence <= 1 {
-		defaults.MinConfidence = confidence
-	}
-	return defaults
-}
-
 // PluginSupportsContributionFromMetadata reports whether a marker capability
 // accepts submissions. Existing manifests omit the key and keep the historical
 // submitter behavior; only an explicit false makes the provider fetch-only.
 func PluginSupportsContributionFromMetadata(metadata map[string]any) bool {
-	return pluginMetadataBool(metadata, "supports_contribution", true)
-}
-
-// PluginSupportsAmendFromMetadata reports whether a marker capability replaces
-// a server's earlier submission for the same file and kind, so the host may
-// resubmit a changed marker.
-func PluginSupportsAmendFromMetadata(metadata map[string]any) bool {
-	return pluginMetadataBool(metadata, "supports_amend", false)
-}
-
-// PluginSupportsAbsentFromMetadata reports whether a marker capability accepts
-// submissions saying an item has no segment of a kind.
-func PluginSupportsAbsentFromMetadata(metadata map[string]any) bool {
-	return pluginMetadataBool(metadata, "supports_absent", false)
-}
-
-func pluginMetadataNumber(metadata map[string]any, key string) (float64, bool) {
-	switch value := metadata[key].(type) {
-	case int:
-		return float64(value), true
-	case int32:
-		return float64(value), true
-	case int64:
-		return float64(value), true
-	case float64:
-		return value, true
-	case string:
-		parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
-		return parsed, err == nil
-	default:
-		return 0, false
-	}
-}
-
-func pluginMetadataBool(metadata map[string]any, key string, fallback bool) bool {
-	switch value := metadata[key].(type) {
+	switch value := metadata["supports_contribution"].(type) {
 	case bool:
 		return value
 	case string:
 		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return fallback
-		}
-		return parsed
+		return err != nil || parsed
 	default:
-		return fallback
+		return true
 	}
 }

@@ -1,70 +1,167 @@
 package handlers
 
 import (
-	"context"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"testing"
-	"time"
 
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
-// A lookup held up before it can see the deadline, as a stat on a stalled
-// mount is, still answers none by the deadline, so planning keeps the
-// pipeline rendition instead of waiting on it.
-func TestCueIndexReadsAnswerByTheDeadline(t *testing.T) {
-	release := make(chan struct{})
-	defer close(release)
-	reads := newCueIndexReadsV3()
-	reads.timeout = 20 * time.Millisecond
-	reads.lookup = func(context.Context, string) (playback.CueIndexedSubtitles, error) {
-		<-release
-		return playback.CueIndexedSubtitles{}, nil
-	}
-	ctx := context.WithValue(t.Context(), cueIndexReadsKeyV3{}, reads)
-	answered := make(chan *playback.CueIndexedSubtitles, 1)
-	go func() {
-		answered <- cueIndexedSubtitleTracksV3(ctx, &models.MediaFile{ID: 7, FilePath: "/media/stalled.mkv"})()
-	}()
-	select {
-	case got := <-answered:
-		if got != nil {
-			t.Fatalf("stalled lookup answered %+v, want none", got)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("planning waited on a stalled lookup past its deadline")
+func subtitleRenditionPlanV3(file *models.MediaFile, delivery playback.DeliveryV3, mode playback.SubtitleModeV3) *playback.PlanV3 {
+	return &playback.PlanV3{
+		Delivery: delivery,
+		Subtitle: playback.SubtitleDecisionV3{
+			Mode: mode, TrackID: playback.TrackIDV3(file.ID, "subtitle", 0),
+			HLSRendition: &playback.HLSSubtitleRenditionV3{GroupID: playback.SubtitleRenditionGroupID, Name: playback.SubtitleRenditionName, Format: "vtt", MIMEType: "text/vtt"},
+			Artifact:     &playback.SubtitleArtifactV3{URL: "/stale.vtt", Format: "vtt"},
+			Inventory:    playback.BuildSubtitleInventoryV3(file, nil),
+		},
 	}
 }
 
-func TestRehomeRestoresOnDemandRenditionNamesFromTheRecord(t *testing.T) {
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
-	source := playback.SubtitleRenditionSource{Size: 4096, ModTimeUnixNano: 1_800_000_000_000_000_000}
-	frozen := []playback.SubtitleRenditionTrack{
-		{StreamIndex: 2, TrackNumber: 3, Name: "English", Language: "eng"},
-		{StreamIndex: 3, TrackNumber: 4, Name: "English (2)", Language: "eng", Forced: true, Default: true},
-	}
-	if err := handler.PlanStoreV3.SaveAttempt(t.Context(), playback.AttemptRecordV3{
-		PlaybackAttemptID: "attempt-rehome", SessionID: "session-rehome", ExpiresAt: time.Now().Add(time.Hour),
-		FrozenRecipe: playback.ExecutableRecipeV3{SubtitleRendition: true, SubtitleRenditionTracks: frozen, SubtitleRenditionSource: source},
-	}); err != nil {
+func TestAttachSubtitleArtifactKeepsHLSSubtitleRendition(t *testing.T) {
+	file := &models.MediaFile{ID: 42, SubtitleTracks: []models.SubtitleTrack{{Index: 4, Codec: "subrip"}}}
+	plan := subtitleRenditionPlanV3(file, playback.DeliveryTranscodeHLSV3, playback.SubtitleRenderV3)
+	handler := &PlaybackHandler{}
+	if err := handler.attachSubtitleArtifactV3(t.Context(), "session", file, plan, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	session := &playback.Session{ID: "session-rehome", UserID: 7}
-	tokenCard := func(tracks []playback.SubtitleRenditionTrack) *playback.RecipeCard {
-		opts := playback.TranscodeOpts{SessionID: session.ID, InputPath: "/media/movie.mkv", TargetCodecVideo: "h264", SegmentDuration: 2,
-			SubtitleRendition: true, SubtitleTrackIndex: -1, SubtitleRenditionTracks: tracks, SubtitleRenditionSource: source}
-		claims := playback.NewRecipeCard(session.UserID, "profile", 42, "", opts).ToClaims()
-		card := playback.RecipeCardFromClaims(&claims)
-		return &card
+	if plan.Subtitle.HLSRendition == nil || plan.Subtitle.Artifact != nil {
+		t.Fatalf("an in-manifest subtitle publishes no sidecar artifact: %#v", plan.Subtitle)
 	}
-	card, stored := handler.rehomeRecipeCardV3(t.Context(), session, session.ID, tokenCard(frozen))
-	if card == nil || stored || !slices.Equal(card.SubtitleRenditionTracks, frozen) {
-		t.Fatalf("rehomed renditions = %+v", card)
+	if plan.Subtitle.Inventory[0].URL == "" {
+		t.Fatal("the inventory keeps its sidecar URL for other selections")
 	}
-	other := []playback.SubtitleRenditionTrack{{TrackNumber: 3}, {TrackNumber: 5}}
-	card, _ = handler.rehomeRecipeCardV3(t.Context(), session, session.ID, tokenCard(other))
-	if card == nil || card.SubtitleRenditionTracks[0].Name != "" || card.SubtitleRenditionTracks[1].TrackNumber != 5 {
-		t.Fatalf("renditions of another plan = %+v", card)
+}
+
+func TestAttachSubtitleArtifactRejectsOrClearsMisplacedRendition(t *testing.T) {
+	file := &models.MediaFile{ID: 42, SubtitleTracks: []models.SubtitleTrack{{Index: 4, Codec: "subrip"}}}
+	handler := &PlaybackHandler{}
+	for _, delivery := range []playback.DeliveryV3{playback.DeliveryRemuxHLSV3, playback.DeliveryOriginalHTTPV3} {
+		plan := subtitleRenditionPlanV3(file, delivery, playback.SubtitleRenderV3)
+		if err := handler.attachSubtitleArtifactV3(t.Context(), "session", file, plan, 0, nil, nil); err == nil {
+			t.Fatalf("%s accepted an HLS subtitle rendition", delivery)
+		}
+	}
+	plan := subtitleRenditionPlanV3(file, playback.DeliveryTranscodeHLSV3, playback.SubtitleOffV3)
+	if err := handler.attachSubtitleArtifactV3(t.Context(), "session", file, plan, -1, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Subtitle.HLSRendition != nil {
+		t.Fatalf("subtitles-off plan kept a rendition: %#v", plan.Subtitle)
+	}
+}
+
+func TestSidecarOnlyHLSReplanReusesTransportOnlyForAnUnchangedRendition(t *testing.T) {
+	rendition := &playback.HLSSubtitleRenditionV3{GroupID: "subs", Name: "Subtitles", Format: "vtt", MIMEType: "text/vtt"}
+	freeze := func(plan *playback.PlanV3, track int, withRendition bool) playback.ExecutableRecipeV3 {
+		return playback.FreezeExecutableRecipeV3(playback.PlannerResultV3{
+			Plan: plan, PlayMethod: playback.PlayTranscode, TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+			SubtitleTrackIndex: track, SubtitleTransportTrackIndex: track, SubtitleCodec: "subrip", SubtitleRendition: withRendition,
+		})
+	}
+	for _, tc := range []struct {
+		name                       string
+		current, candidate         bool
+		currentTrack, candidateTrk int
+		want                       bool
+	}{
+		{"sidecar to rendition", false, true, 0, 0, false},
+		{"rendition to another track", true, true, 0, 1, false},
+		{"rendition kept", true, true, 0, 0, true},
+		{"rendition dropped", true, false, 0, -1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			currentPlan := playback.PlanV3{PlanID: "current-plan", Delivery: playback.DeliveryTranscodeHLSV3,
+				Stream: playback.StreamV3{URL: "/stream/current.m3u8"}, RequestedMediaFileID: 1, EffectiveMediaFileID: 1}
+			candidatePlan := currentPlan
+			candidatePlan.PlanID = "candidate-plan"
+			if tc.current {
+				currentPlan.Subtitle.HLSRendition = rendition
+			}
+			if tc.candidate {
+				candidatePlan.Subtitle.HLSRendition = rendition
+			}
+			record := &playback.AttemptRecordV3{EffectiveMediaFileID: 1, CurrentPlan: currentPlan,
+				FrozenRecipe: freeze(&currentPlan, tc.currentTrack, tc.current)}
+			record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID = "output-context"
+			_, reused := sidecarOnlyHLSReplanV3(record, &candidatePlan, freeze(&candidatePlan, tc.candidateTrk, tc.candidate), "output-context")
+			if reused != tc.want {
+				t.Fatalf("reused = %t, want %t", reused, tc.want)
+			}
+		})
+	}
+}
+
+func TestHLSSubtitleRenditionsAreNegotiatedOnlyOnAPIV2(t *testing.T) {
+	if slices.Contains(playback.ServerFeaturesV3(), playback.FeatureHLSSubtitleRenditionsV3) {
+		t.Fatal("the frozen /api/v1 surface must not advertise hls_subtitle_renditions_v1")
+	}
+	if !slices.Contains(playback.NativeServerFeaturesV3(), playback.FeatureHLSSubtitleRenditionsV3) ||
+		!slices.Contains(playback.AttemptStickyFeaturesV3(), playback.FeatureHLSSubtitleRenditionsV3) {
+		t.Fatal("/api/v2 advertises hls_subtitle_renditions_v1 as an attempt-sticky feature")
+	}
+}
+
+func TestFailedHLSSubtitleRenditionStaysOffForTheAttempt(t *testing.T) {
+	negotiated := []string{playback.FeaturePlaybackPlanV3, playback.FeatureHLSSubtitleRenditionsV3}
+	features := withoutFailedSubtitleRoutesV3(negotiated, negotiated, playback.FailureSubtitleHLSRenditionFailedV3)
+	if playback.HasFeatureV3(features, playback.FeatureHLSSubtitleRenditionsV3) {
+		t.Fatal("a rendition the player could not select is offered again")
+	}
+	// Pinning on the next replan restores sticky features from the durable
+	// request, which no longer carries the rendition.
+	if playback.HasFeatureV3(playback.PinAttemptStickyFeaturesV3(negotiated, features), playback.FeatureHLSSubtitleRenditionsV3) {
+		t.Fatal("attempt-sticky pinning re-enabled the failed rendition")
+	}
+	for _, classification := range []string{"", "network_error", "subtitle_embedded_failed"} {
+		if !playback.HasFeatureV3(withoutFailedSubtitleRoutesV3(negotiated, negotiated, classification), playback.FeatureHLSSubtitleRenditionsV3) {
+			t.Fatalf("%q dropped the rendition", classification)
+		}
+	}
+}
+
+// A rendition plan is routable only when one node both emits renditions and
+// runs the plan's transformations; a pool that splits the two across nodes
+// must keep the sidecar, which the node without the feature can run.
+func TestSubtitleRenditionRoutableRequiresOneNodeForTheWholeRecipe(t *testing.T) {
+	aac := playback.TransformationV3{
+		Name: playback.TransformationAudioToAACV3, Executor: playback.ExecutorServerV3,
+		RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3,
+	}
+	node := func(info playback.HWAccelInfo) string {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusOK, info)
+		}))
+		t.Cleanup(server.Close)
+		return server.URL
+	}
+	renditionOnly := node(playback.HWAccelInfo{TransportFeatures: []string{playback.TransportFeatureHLSSubtitleRenditionV1}})
+	transformOnly := node(playback.HWAccelInfo{Transformations: []playback.TransformationV3{aac}})
+	both := node(playback.HWAccelInfo{
+		TransportFeatures: []string{playback.TransportFeatureHLSSubtitleRenditionV1},
+		Transformations:   []playback.TransformationV3{aac},
+	})
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	policy := config.DefaultPlaybackRoutingPolicy()
+	policy.VideoTranscodeExecution = config.PlaybackExecutionWorkerOnly
+	handler.PlaybackConfig = func() config.PlaybackConfig { return config.PlaybackConfig{Routing: policy} }
+	result := playback.PlannerResultV3{
+		Plan:              &playback.PlanV3{Delivery: playback.DeliveryTranscodeHLSV3, Transformations: []playback.TransformationV3{aac}},
+		SubtitleRendition: true,
+	}
+
+	handler.NodePlanner = predicateEnumeratingNodePlannerV3{enumeratingNodePlannerV3{urls: []string{renditionOnly, transformOnly}}}
+	if handler.subtitleRenditionRoutableV3(t.Context(), result, true) {
+		t.Fatal("a pool with no node running the whole recipe was routable")
+	}
+	handler.NodePlanner = predicateEnumeratingNodePlannerV3{enumeratingNodePlannerV3{urls: []string{renditionOnly, both}}}
+	if !handler.subtitleRenditionRoutableV3(t.Context(), result, true) {
+		t.Fatal("a node running the whole recipe was not counted")
 	}
 }

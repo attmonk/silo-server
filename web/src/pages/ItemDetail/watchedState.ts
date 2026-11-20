@@ -1,7 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import type { EpisodesResponse, ItemDetail, SeasonsResponse } from "@/api/types";
 import { catalogKeys, ebookKeys, episodeKeys, itemKeys, progressKeys } from "@/hooks/queries/keys";
-import { t } from "@/i18n";
 
 type WatchedStateItem = Pick<
   ItemDetail,
@@ -26,38 +25,30 @@ export function getWatchedActionLabel(item: Pick<ItemDetail, "type" | "user_data
 
   switch (item.type) {
     case "series":
-      return played
-        ? t("web.detail.actions.markSeriesUnwatched")
-        : t("web.detail.actions.markSeriesWatched");
+      return played ? "Mark Series Unwatched" : "Mark Series Watched";
     case "season":
-      return played
-        ? t("web.detail.actions.markSeasonUnwatched")
-        : t("web.detail.actions.markSeasonWatched");
+      return played ? "Mark Season Unwatched" : "Mark Season Watched";
     case "audiobook":
-      return played ? t("web.detail.actions.markUnlistened") : t("web.detail.actions.markListened");
+      return played ? "Mark Unlistened" : "Mark Listened";
     case "ebook":
     case "manga":
-      return played ? t("web.detail.actions.markUnread") : t("web.detail.actions.markRead");
+      return played ? "Mark Unread" : "Mark Read";
     case "episode":
-      return played ? t("web.detail.actions.markUnwatched") : t("web.detail.actions.markWatched");
+      return played ? "Mark Unwatched" : "Mark Watched";
     default:
-      return played ? t("web.detail.actions.markUnwatched") : t("web.detail.actions.markWatched");
+      return played ? "Mark Unwatched" : "Mark Watched";
   }
 }
 
 export function getWatchedToastMessage(item: Pick<ItemDetail, "type">, played: boolean): string {
   switch (item.type) {
     case "audiobook":
-      return played
-        ? t("web.detail.actions.markedListened")
-        : t("web.detail.actions.markedUnlistened");
+      return played ? "Marked as listened" : "Marked as unlistened";
     case "ebook":
     case "manga":
-      return played ? t("web.detail.actions.markedRead") : t("web.detail.actions.markedUnread");
+      return played ? "Marked as read" : "Marked as unread";
     default:
-      return played
-        ? t("web.detail.actions.markedWatched")
-        : t("web.detail.actions.markedUnwatched");
+      return played ? "Marked as watched" : "Marked as unwatched";
   }
 }
 
@@ -107,16 +98,6 @@ export function getWatchedInvalidationKeys(item: WatchedStateItem) {
   return keys;
 }
 
-// cachedListsInEveryLibrary returns a cached list for each library it was read
-// in. The key's last segment is the library, and a series page opened from a
-// library caches its season and episode lists under that library's ID.
-function cachedListsInEveryLibrary<T>(queryClient: QueryClient, key: readonly unknown[]): T[] {
-  return queryClient
-    .getQueriesData<T>({ queryKey: key.slice(0, -1) })
-    .filter(([queryKey]) => queryKey.length === key.length)
-    .flatMap(([, data]) => (data ? [data] : []));
-}
-
 export function getCachedWatchedInvalidationKeys(queryClient: QueryClient, item: WatchedStateItem) {
   const keys = [...getWatchedInvalidationKeys(item)];
 
@@ -124,12 +105,11 @@ export function getCachedWatchedInvalidationKeys(queryClient: QueryClient, item:
     return keys;
   }
 
-  const seasons = cachedListsInEveryLibrary<SeasonsResponse>(
-    queryClient,
+  const seasonsData = queryClient.getQueryData<SeasonsResponse>(
     catalogKeys.seriesSeasons(item.content_id),
-  ).flatMap((data) => data.seasons ?? []);
+  );
 
-  for (const season of seasons) {
+  for (const season of seasonsData?.seasons ?? []) {
     appendUniqueKey(keys, catalogKeys.itemDetail(season.content_id));
     appendUniqueKey(keys, itemKeys.detail(season.content_id));
     appendUniqueKey(keys, catalogKeys.itemEpisodes(season.content_id));
@@ -139,18 +119,13 @@ export function getCachedWatchedInvalidationKeys(queryClient: QueryClient, item:
     appendUniqueKey(keys, episodeKeys.seasonDetail(item.content_id, season.season_number));
     appendUniqueKey(keys, episodeKeys.bySeason(item.content_id, season.season_number));
 
-    const episodeLists = [
-      ...cachedListsInEveryLibrary<EpisodesResponse>(
-        queryClient,
-        catalogKeys.itemEpisodes(season.content_id),
-      ),
-      ...cachedListsInEveryLibrary<EpisodesResponse>(
-        queryClient,
+    const episodesData =
+      queryClient.getQueryData<EpisodesResponse>(catalogKeys.itemEpisodes(season.content_id)) ??
+      queryClient.getQueryData<EpisodesResponse>(
         catalogKeys.seasonEpisodes(item.content_id, season.season_number),
-      ),
-    ];
+      );
 
-    for (const episode of episodeLists.flatMap((data) => data.episodes ?? [])) {
+    for (const episode of episodesData?.episodes ?? []) {
       appendUniqueKey(keys, catalogKeys.itemDetail(episode.content_id));
       appendUniqueKey(keys, itemKeys.detail(episode.content_id));
     }

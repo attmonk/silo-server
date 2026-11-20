@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,10 +13,9 @@ import (
 )
 
 type contentTestService struct {
-	request  *pluginv1.HandleHTTPRequest
-	access   string
-	file     string
-	response *pluginv1.HandleHTTPResponse
+	request *pluginv1.HandleHTTPRequest
+	access  string
+	file    string
 }
 
 func (s *contentTestService) RouteDescriptors(context.Context, int) ([]*pluginv1.HttpRouteDescriptor, error) {
@@ -31,9 +32,6 @@ func (s *contentTestService) HTTPRoutesClient(context.Context, int, string) (htt
 }
 func (s *contentTestService) Handle(_ context.Context, r *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
 	s.request = r
-	if s.response != nil {
-		return s.response, nil
-	}
 	return &pluginv1.HandleHTTPResponse{StatusCode: 299, Body: []byte("<html>opaque</html>"), Headers: map[string]string{"Content-Type": "text/html", "Location": "/api/v1/plugins/1/absolute", "Set-Cookie": "must-not-forward"}}, nil
 }
 
@@ -86,60 +84,43 @@ func TestContentHandlerProxyAndAccess(t *testing.T) {
 	}
 }
 
-// TestContentHandlerRefusesOffOriginRedirects: a plugin redirect relayed on
-// the v2 mount stays on the origin the request arrived on; one that leaves
-// it, a scheme downgrade included, is a 502.
-func TestContentHandlerRefusesOffOriginRedirects(t *testing.T) {
-	service := &contentTestService{access: "authenticated"}
-	handler := NewContentHandler(NewHTTPProxy(service, profileTestInstallationStore{}), func(*http.Request) ContentAccess { return ContentAccess{Authenticated: true} }, nil)
-	for _, tc := range []struct {
-		name     string
-		status   int32
-		location string
-		want     int
-	}{
-		{"relative", http.StatusSeeOther, ContentPrefix + "/plugins/1/done", http.StatusSeeOther},
-		{"absolute same origin", http.StatusFound, "https://Silo.Test:443/elsewhere", http.StatusFound},
-		{"another host", http.StatusFound, "https://elsewhere.example/x", http.StatusBadGateway},
-		{"scheme relative", http.StatusTemporaryRedirect, "//elsewhere.example/x", http.StatusBadGateway},
-		{"downgrade", http.StatusPermanentRedirect, "http://silo.test/x", http.StatusBadGateway},
-		{"backslash", http.StatusFound, `/\elsewhere.example/x`, http.StatusBadGateway},
-		{"control character", http.StatusFound, "/\t/elsewhere.example/x", http.StatusBadGateway},
-		{"three slashes", http.StatusTemporaryRedirect, "///elsewhere.example/x", http.StatusBadGateway},
-		{"four slashes", http.StatusFound, "////elsewhere.example/x", http.StatusBadGateway},
-		{"scheme and three slashes", http.StatusFound, "https:///elsewhere.example/x", http.StatusBadGateway},
-		{"leading space before slashes", http.StatusFound, " ///elsewhere.example/x", http.StatusBadGateway},
-		{"newline", http.StatusFound, "/\n/elsewhere.example/x", http.StatusBadGateway},
-		{"not a redirect", http.StatusCreated, "https://elsewhere.example/x", http.StatusCreated},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			service.response = &pluginv1.HandleHTTPResponse{StatusCode: tc.status, Headers: map[string]string{"location": tc.location}}
-			rec := httptest.NewRecorder()
-			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "https://silo.test"+ContentPrefix+"/plugins/1/page", nil))
-			if rec.Code != tc.want {
-				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
-			}
-			wantLocation := tc.location
-			if tc.want == http.StatusBadGateway {
-				wantLocation = ""
-			}
-			if got := rec.Header().Get("Location"); got != wantLocation {
-				t.Fatalf("Location = %q, want %q", got, wantLocation)
-			}
-		})
+func TestContentHandlerCanonicalAndAssets(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "asset.txt")
+	if err := os.WriteFile(file, []byte("0123456789"), 0600); err != nil {
+		t.Fatal(err)
 	}
-
-	// Two spellings of Location: the guard must not check one and send the
-	// other, so the redirect is refused whichever one the map yields first.
-	service.response = &pluginv1.HandleHTTPResponse{StatusCode: http.StatusFound, Headers: map[string]string{
-		"Location": ContentPrefix + "/plugins/1/done",
-		"location": "https://elsewhere.example/x",
-	}}
+	service := &contentTestService{access: "authenticated", file: file}
+	proxy := NewHTTPProxy(service, profileTestInstallationStore{})
+	assetAccess := ContentAccess{}
+	h := NewContentHandler(proxy, func(*http.Request) ContentAccess { return ContentAccess{Authenticated: true} }, func(*http.Request) ContentAccess { return assetAccess })
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "https://silo.test"+ContentPrefix+"/plugins/1/page", nil))
-	if rec.Code != http.StatusBadGateway || rec.Header().Get("Location") != "" {
-		t.Fatalf("two Location spellings: status = %d, Location = %q; want 502 and none", rec.Code, rec.Header().Get("Location"))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, ContentPrefix+"/plugins/%31?x=%2F", nil))
+	if rec.Code != 308 || rec.Header().Get("Location") != ContentPrefix+"/plugins/%31/?x=%2F" || service.request != nil {
+		t.Fatal(rec.Code, rec.Header())
+	}
+	req := httptest.NewRequest(http.MethodGet, ContentPrefix+"/plugin-assets/1/asset.txt", nil)
+	req.Header.Set("Range", "bytes=2-4")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Fatal("route access leaked to assets", rec.Code)
+	}
+	assetAccess.Authenticated = true
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 206 || rec.Body.String() != "234" {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	for _, tc := range []struct {
+		path   string
+		status int
+	}{
+		{"/plugin-assets/1", 404}, {"/plugins/bad/", 400}, {"/unknown/1", 404},
+	} {
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, ContentPrefix+tc.path, nil))
+		if rec.Code != tc.status {
+			t.Fatal(tc, rec.Code)
+		}
 	}
 }
-
-func (*contentTestService) Retain() (func(), error) { return func() {}, nil }

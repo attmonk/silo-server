@@ -1,17 +1,16 @@
 import type { AdminSession } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
-import { useT, type Translate } from "@/i18n";
 import { classifyActivityMethod } from "@/pages/adminActivityPresentation";
 
 import { episodeCode, formatPlayMethod } from "../format";
 import { DetailCard, ListRow, ProgressBar } from "../ui";
 
-function sessionTitle(t: Translate, session: AdminSession): string {
+function sessionTitle(session: AdminSession): string {
   if (session.series_name) {
     const code = episodeCode(session.season_number, session.episode_number);
     return code ? `${session.series_name} · ${code}` : session.series_name;
   }
-  return session.media_title || t("web.admin.users.detail.common.unknownTitle");
+  return session.media_title || "Unknown title";
 }
 
 function minutes(seconds: number | null | undefined) {
@@ -20,14 +19,13 @@ function minutes(seconds: number | null | undefined) {
 
 /** What the account is playing right now; shown only while it plays something. */
 export function WatchingNowCard({ sessions }: { sessions: AdminSession[] }) {
-  const t = useT();
   const first = sessions[0];
   return (
     <DetailCard
       title={
         <span className="inline-flex items-center gap-2">
           <span aria-hidden="true" className="bg-success size-2 rounded-full" />
-          {t("web.admin.users.detail.common.watchingNow")}
+          Watching now
         </span>
       }
       actions={
@@ -39,9 +37,7 @@ export function WatchingNowCard({ sessions }: { sessions: AdminSession[] }) {
       {sessions.map((session) => {
         const duration = session.file_duration;
         const meta = [
-          session.profile_name
-            ? t("web.admin.users.detail.overview.watching.profile", { name: session.profile_name })
-            : "",
+          session.profile_name ? `Profile ${session.profile_name}` : "",
           session.client_label || session.client_name || "",
           session.client_ip ?? "",
         ]
@@ -50,7 +46,7 @@ export function WatchingNowCard({ sessions }: { sessions: AdminSession[] }) {
         return (
           <ListRow
             key={session.session_id}
-            title={sessionTitle(t, session)}
+            title={sessionTitle(session)}
             meta={
               <>
                 {meta}
@@ -64,10 +60,7 @@ export function WatchingNowCard({ sessions }: { sessions: AdminSession[] }) {
             }
             trailing={
               duration
-                ? t("web.admin.users.detail.overview.watching.position", {
-                    position: minutes(session.position_seconds),
-                    duration: Math.round(duration / 60),
-                  })
+                ? `${minutes(session.position_seconds)} of ${Math.round(duration / 60)} min`
                 : undefined
             }
           />

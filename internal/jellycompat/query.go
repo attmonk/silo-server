@@ -37,14 +37,13 @@ type itemsQuery struct {
 	totalOverride          *int
 	isFavorite             bool
 	isResumable            bool
-	isNotFolder            bool   // Filters=IsNotFolder or IsFolder=false: leaf items only
-	includesOnlyLeafTypes  bool   // IncludeItemTypes names Episode and no Series or Season
-	hasItemTypeFilter      bool   // true when IncludeItemTypes or ExcludeItemTypes was present in the request
-	wantsBoxSets           bool   // true when IncludeItemTypes contains BoxSet
-	wantsViews             bool   // true when IncludeItemTypes contains CollectionFolder
-	sortExplicit           bool   // true when SortBy was present in the request
-	sortByKey              string // the SortBy key parseSort selects, lowercased; "" when no key maps
-	needsDetailFields      bool   // true when requested Fields include detail-level data (e.g. MediaSources)
+	isNotFolder            bool // Filters=IsNotFolder or IsFolder=false: leaf items only
+	includesOnlyLeafTypes  bool // IncludeItemTypes names Episode and no Series or Season
+	hasItemTypeFilter      bool // true when IncludeItemTypes or ExcludeItemTypes was present in the request
+	wantsBoxSets           bool // true when IncludeItemTypes contains BoxSet
+	wantsViews             bool // true when IncludeItemTypes contains CollectionFolder
+	sortExplicit           bool // true when SortBy was present in the request
+	needsDetailFields      bool // true when requested Fields include detail-level data (e.g. MediaSources)
 	itemType               string
 	sort                   string
 	order                  string
@@ -71,17 +70,12 @@ type itemsQuery struct {
 	studios                 []string // decoded studio names from StudioIds
 	officialRatings         []string
 	minCommunityRating      float64
-	minCriticRating         float64 // minimum rt_critic score; set only while that source is shown
-	minPremiereDate         string  // YYYY-MM-DD
-	maxPremiereDate         string  // YYYY-MM-DD
-	countOnly               bool    // Limit=0 was sent: only TotalRecordCount is wanted
-	limitDefaulted          bool    // Limit was absent, so limit holds the default page size
+	minPremiereDate         string // YYYY-MM-DD
+	maxPremiereDate         string // YYYY-MM-DD
+	countOnly               bool   // Limit=0 was sent: only TotalRecordCount is wanted
+	limitDefaulted          bool   // Limit was absent, so limit holds the default page size
 }
 
-// parseItemsQuery parses a request with the Rotten Tomatoes critic score
-// hidden: CriticRating sorts as an unknown key and MinCriticRating is ignored.
-// Handlers that serve items use ItemsHandler.parseItemsQuery, which adds them
-// back while the administrator shows that score.
 func parseItemsQuery(r *http.Request, codec *ResourceIDCodec) itemsQuery {
 	q := newCaseInsensitiveQuery(r.URL.Query())
 	result := itemsQuery{
@@ -96,7 +90,7 @@ func parseItemsQuery(r *http.Request, codec *ResourceIDCodec) itemsQuery {
 		disableImages:   !parseBool(q.Get("EnableImages"), true),
 		disableUserData: !parseBool(q.Get("EnableUserData"), true),
 	}
-	result.sort, result.order = parseSort(q.Get("SortBy"), q.Get("SortOrder"), false)
+	result.sort, result.order = parseSort(q.Get("SortBy"), q.Get("SortOrder"))
 
 	result.genres = splitNonemptyGenres(q.Get("Genres"))
 	for year := range strings.SplitSeq(q.Get("Years"), ",") {
@@ -220,7 +214,6 @@ func parseItemsQuery(r *http.Request, codec *ResourceIDCodec) itemsQuery {
 	result.includesOnlyLeafTypes = itemTypesContain(includedTypes, "episode") &&
 		!itemTypesContain(includedTypes, "series") && !itemTypesContain(includedTypes, "season")
 	result.sortExplicit = strings.TrimSpace(q.Get("SortBy")) != ""
-	result.sortByKey = selectedSortKey(q.Get("SortBy"), false)
 	if result.sort == "latest_episode_added" && !itemTypesOnlySeries(result.itemTypes) {
 		result.sort = "created_at"
 	}
@@ -339,9 +332,6 @@ func buildLatestBrowseParams(query itemsQuery) url.Values {
 	// vs "created_at" which forces a full-library top-N heapsort.
 	params.Set("sort", "recently_added")
 	params.Set("order", "desc")
-	// Latest returns a bare array, so a total would be discarded. Counting it
-	// with an unplayed filter scanned the whole library: 27–42 s on a large one.
-	params.Set("include_total", "false")
 	return params
 }
 
@@ -397,9 +387,6 @@ func buildBrowseParams(query itemsQuery) url.Values {
 	}
 	if query.minCommunityRating > 0 {
 		params.Set("min_community_rating", strconv.FormatFloat(query.minCommunityRating, 'f', -1, 64))
-	}
-	if query.minCriticRating > 0 {
-		params.Set("min_critic_rating", strconv.FormatFloat(query.minCriticRating, 'f', -1, 64))
 	}
 	if query.minPremiereDate != "" {
 		params.Set("min_premiere_date", query.minPremiereDate)
@@ -672,15 +659,14 @@ func parseMediaTypes(rawValues []string) []string {
 // and order. The catalog sorts by one key, so the first key Silo maps wins and
 // takes the SortOrder entry at the same position. Jellyfin sorts ascending
 // when that entry is absent; without SortBy, Silo keeps its newest-first rail
-// default. Unmapped keys alone fall back to created_at. CriticRating maps only
-// while criticShown.
-func parseSort(sortBy, sortOrder string, criticShown bool) (sort, order string) {
+// default. Unmapped keys alone fall back to created_at.
+func parseSort(sortBy, sortOrder string) (sort, order string) {
 	keys := strings.Split(sortBy, ",")
 	orders := strings.Split(sortOrder, ",")
 	position := 0
 	sort = catalog.BrowseSortCreatedAt
 	for i, key := range keys {
-		if mapped, ok := requestSortKey(key, criticShown); ok {
+		if mapped, ok := sortKey(key); ok {
 			sort, position = mapped, i
 			break
 		}
@@ -690,6 +676,12 @@ func parseSort(sortBy, sortOrder string, criticShown bool) (sort, order string) 
 		orderRaw = orders[position]
 	}
 	return sort, mapSortOrder(orderRaw, strings.TrimSpace(sortBy) != "")
+}
+
+// mapSortBy returns the browse sort parseSort selects for a SortBy list.
+func mapSortBy(raw string) string {
+	sort, _ := parseSort(raw, "")
+	return sort
 }
 
 // sortKey maps one Jellyfin SortBy key. Episode-order keys map to "" — the
@@ -707,8 +699,6 @@ func sortKey(raw string) (string, bool) {
 		return catalog.BrowseSortYear, true
 	case "communityrating":
 		return catalog.BrowseSortRatingIMDB, true
-	case sortKeyCriticRating:
-		return catalog.BrowseSortRatingRTCritic, true
 	case "random":
 		return "random", true
 	case "dateplayed":
@@ -907,7 +897,7 @@ func (q caseInsensitiveQuery) Values(key string) []string {
 // path applies.
 func (q itemsQuery) hasCompatBrowseFilters() bool {
 	return q.nameLessThan != "" || q.nameStartsWithOrGreater != "" || len(q.excludeIDs) > 0 || len(q.studios) > 0 ||
-		len(q.officialRatings) > 0 || q.minCommunityRating > 0 || q.minCriticRating > 0 || q.minPremiereDate != "" || q.maxPremiereDate != ""
+		len(q.officialRatings) > 0 || q.minCommunityRating > 0 || q.minPremiereDate != "" || q.maxPremiereDate != ""
 }
 
 // parsePremiereDateBound converts a Jellyfin Min/MaxPremiereDate instant to
@@ -919,7 +909,11 @@ func parsePremiereDateBound(raw string, isMin bool) string {
 	if raw == "" {
 		return ""
 	}
-	if t, err := parseJellyfinDate(raw); err == nil {
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.999999999Z0700", "2006-01-02T15:04:05.999999999", "2006-01-02 15:04:05", "2006-01-02"} {
+		t, err := time.Parse(layout, raw)
+		if err != nil {
+			continue
+		}
 		t = t.UTC()
 		day := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 		if isMin && t.After(day) {

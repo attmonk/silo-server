@@ -2,9 +2,7 @@ package metadata
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -300,22 +298,15 @@ func (r *fakeSeasonRepo) Upsert(_ context.Context, s *models.Season) error {
 
 func (r *fakeSeasonRepo) applyUpsertLocked(s *models.Season) {
 	key := seasonKey(s.SeriesID, s.SeasonNumber)
-	existing, ok := r.seasons[key]
-	if ok {
+	if existing, ok := r.seasons[key]; ok {
 		// Preserve existing content_id (mirrors ON CONFLICT behavior).
 		s.ContentID = existing.ContentID
+		cp := *s
+		r.seasons[key] = &cp
+	} else {
+		cp := *s
+		r.seasons[key] = &cp
 	}
-	cp := *s
-	cp.WriteBackdrop, cp.BackdropFillOnly = false, false
-	// Like SeasonRepository, only a write marked WriteBackdrop changes the
-	// stored backdrop.
-	if !s.WriteBackdrop || (s.BackdropFillOnly && ok && existing.BackdropPath != "") {
-		cp.BackdropPath, cp.BackdropSourcePath, cp.BackdropThumbhash = "", "", ""
-		if ok {
-			cp.BackdropPath, cp.BackdropSourcePath, cp.BackdropThumbhash = existing.BackdropPath, existing.BackdropSourcePath, existing.BackdropThumbhash
-		}
-	}
-	r.seasons[key] = &cp
 }
 
 func (r *fakeSeasonRepo) BulkUpsert(_ context.Context, seasons []*models.Season) error {
@@ -327,17 +318,6 @@ func (r *fakeSeasonRepo) BulkUpsert(_ context.Context, seasons []*models.Season)
 	}
 	for _, s := range seasons {
 		r.applyUpsertLocked(s)
-	}
-	return nil
-}
-
-func (r *fakeSeasonRepo) ClearBackdropsExcept(_ context.Context, seriesID string, keep []int32) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, s := range r.seasons {
-		if s.SeriesID == seriesID && !slices.Contains(keep, int32(s.SeasonNumber)) {
-			s.BackdropPath, s.BackdropSourcePath, s.BackdropThumbhash = "", "", ""
-		}
 	}
 	return nil
 }
@@ -521,7 +501,7 @@ func (r *fakeEpisodeLinkerFileRepo) addFile(file *models.MediaFile) {
 	r.files[file.ID] = &cp
 }
 
-func (r *fakeEpisodeLinkerFileRepo) UpdateEpisodeLink(_ context.Context, fileID int, _ string, episodeID string, seasonNum, episodeNum int) error {
+func (r *fakeEpisodeLinkerFileRepo) UpdateEpisodeLink(_ context.Context, fileID int, episodeID string, seasonNum, episodeNum int) error {
 	r.fakeFileRepo.mu.Lock()
 	defer r.fakeFileRepo.mu.Unlock()
 	r.episodeLinks[fileID] = episodeID
@@ -636,6 +616,140 @@ func mustDate(t *testing.T, value string) *time.Time {
 // Tests
 // ---------------------------------------------------------------------------
 
+// TestFallbackEpisode_UnmatchedSeriesGetsFallbackStructure verifies that an
+// unmatched series with parseable S01E01-style files gets fallback season and
+// episode rows immediately, without waiting for a provider match.
+func TestFallbackEpisode_UnmatchedSeriesGetsFallbackStructure(t *testing.T) {
+	h := newFallbackTestHarness()
+	ctx := context.Background()
+
+	seriesID := "series-unmatched-1"
+
+	// Create the series item (status pending, no provider data).
+	h.itemRepo.Upsert(ctx, &models.MediaItem{
+		ContentID: seriesID,
+		Title:     "Niche Anime",
+		Type:      "series",
+		Status:    "pending",
+		Studios:   []string{},
+		Networks:  []string{},
+		Countries: []string{},
+		Genres:    []string{},
+	})
+
+	// Add files with parseable S01E01 patterns, linked to the series.
+	files := []*models.MediaFile{
+		{ID: 1, MediaFolderID: 10, FilePath: "/media/tv/Niche Anime/Season 01/Niche.Anime.S01E01.mkv", SeasonNumber: 1, EpisodeNumber: 1},
+		{ID: 2, MediaFolderID: 10, FilePath: "/media/tv/Niche Anime/Season 01/Niche.Anime.S01E02.mkv", SeasonNumber: 1, EpisodeNumber: 2},
+		{ID: 3, MediaFolderID: 10, FilePath: "/media/tv/Niche Anime/Season 02/Niche.Anime.S02E01.mkv", SeasonNumber: 2, EpisodeNumber: 1},
+	}
+	for _, f := range files {
+		h.fileRepo.addFile(f)
+		h.fileRepo.contentIDs[f.ID] = seriesID
+	}
+
+	// Call SynthesizeFallbackEpisodes — this is what the scanner/worker would
+	// call right after skeleton creation for an unmatched series.
+	if err := h.service.SynthesizeFallbackEpisodes(ctx, seriesID); err != nil {
+		t.Fatalf("SynthesizeFallbackEpisodes failed: %v", err)
+	}
+
+	// Verify: should have 2 seasons.
+	s1, err := h.seasonRepo.GetBySeriesAndNumber(ctx, seriesID, 1)
+	if err != nil {
+		t.Fatalf("season 1 not created: %v", err)
+	}
+	if s1.MetadataSource != "scanner_fallback" {
+		t.Errorf("season 1 metadata_source: want scanner_fallback, got %q", s1.MetadataSource)
+	}
+
+	s2, err := h.seasonRepo.GetBySeriesAndNumber(ctx, seriesID, 2)
+	if err != nil {
+		t.Fatalf("season 2 not created: %v", err)
+	}
+	if s2.MetadataSource != "scanner_fallback" {
+		t.Errorf("season 2 metadata_source: want scanner_fallback, got %q", s2.MetadataSource)
+	}
+
+	// Verify: should have 3 episodes.
+	episodes := h.episodeRepo.listBySeries(seriesID)
+	if len(episodes) != 3 {
+		t.Fatalf("expected 3 episodes, got %d", len(episodes))
+	}
+
+	// Check specific episodes exist with correct metadata source.
+	ep1, err := h.episodeRepo.GetBySeriesAndNumber(ctx, seriesID, 1, 1)
+	if err != nil {
+		t.Fatalf("S01E01 not created: %v", err)
+	}
+	if ep1.MetadataSource != "scanner_fallback" {
+		t.Errorf("S01E01 metadata_source: want scanner_fallback, got %q", ep1.MetadataSource)
+	}
+	if ep1.Title != "Episode 1" {
+		t.Errorf("S01E01 title: want %q, got %q", "Episode 1", ep1.Title)
+	}
+
+	ep2, err := h.episodeRepo.GetBySeriesAndNumber(ctx, seriesID, 1, 2)
+	if err != nil {
+		t.Fatalf("S01E02 not created: %v", err)
+	}
+	if ep2.MetadataSource != "scanner_fallback" {
+		t.Errorf("S01E02 metadata_source: want scanner_fallback, got %q", ep2.MetadataSource)
+	}
+
+	ep3, err := h.episodeRepo.GetBySeriesAndNumber(ctx, seriesID, 2, 1)
+	if err != nil {
+		t.Fatalf("S02E01 not created: %v", err)
+	}
+	if ep3.MetadataSource != "scanner_fallback" {
+		t.Errorf("S02E01 metadata_source: want scanner_fallback, got %q", ep3.MetadataSource)
+	}
+
+	// Verify: the series item should have EpisodeMetadataIncomplete = true.
+	item, err := h.itemRepo.GetByID(ctx, seriesID)
+	if err != nil {
+		t.Fatalf("series item not found: %v", err)
+	}
+	if !item.EpisodeMetadataIncomplete {
+		t.Error("expected EpisodeMetadataIncomplete=true after fallback synthesis")
+	}
+}
+
+func TestEnsureSeriesEpisodeLinks_SkipsMissingAirDateMatch(t *testing.T) {
+	h := newFallbackTestHarness()
+	ctx := context.Background()
+
+	seriesID := "series-daily-missing"
+	h.itemRepo.Upsert(ctx, &models.MediaItem{
+		ContentID: seriesID,
+		Title:     "Daily Show",
+		Type:      "series",
+		Status:    "matched",
+		Studios:   []string{},
+		Networks:  []string{},
+		Countries: []string{},
+		Genres:    []string{},
+	})
+	file := &models.MediaFile{
+		ID:            101,
+		MediaFolderID: 10,
+		FilePath:      "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-24.mkv",
+	}
+	h.fileRepo.addFile(file)
+	h.fileRepo.contentIDs[file.ID] = seriesID
+
+	if err := h.service.ensureSeriesEpisodeLinks(ctx, seriesID); err != nil {
+		t.Fatalf("ensureSeriesEpisodeLinks failed: %v", err)
+	}
+
+	if got := h.fileRepo.episodeLinks[file.ID]; got != "" {
+		t.Fatalf("unexpected episode link = %q", got)
+	}
+	if episodes := h.episodeRepo.listBySeries(seriesID); len(episodes) != 0 {
+		t.Fatalf("date-only file synthesized %d fallback episodes, want 0", len(episodes))
+	}
+}
+
 func TestEnsureSeriesEpisodeLinks_SkipsAmbiguousAirDateMatch(t *testing.T) {
 	h := newFallbackTestHarness()
 	ctx := context.Background()
@@ -683,6 +797,65 @@ func TestEnsureSeriesEpisodeLinks_SkipsAmbiguousAirDateMatch(t *testing.T) {
 
 	if got := h.fileRepo.episodeLinks[file.ID]; got != "" {
 		t.Fatalf("ambiguous date linked to %q, want no link", got)
+	}
+}
+
+func TestEnsureSeriesEpisodeLinks_PrefersSeriesProviderForAirDateMatch(t *testing.T) {
+	h := newFallbackTestHarness()
+	ctx := context.Background()
+
+	seriesID := "series-daily-provider-preference"
+	h.itemRepo.Upsert(ctx, &models.MediaItem{
+		ContentID: seriesID,
+		Title:     "Jeopardy!",
+		Type:      "series",
+		Status:    "matched",
+		TvdbID:    "77075",
+		Studios:   []string{},
+		Networks:  []string{},
+		Countries: []string{},
+		Genres:    []string{},
+	})
+	h.episodeRepo.Upsert(ctx, &models.Episode{
+		ContentID:      "ep-tmdb-season-42",
+		SeriesID:       seriesID,
+		SeasonID:       "season-42",
+		SeasonNumber:   42,
+		EpisodeNumber:  165,
+		Title:          "Show #9550",
+		AirDate:        mustDate(t, "2026-04-24"),
+		TmdbID:         "7178079",
+		MetadataSource: "provider",
+	})
+	h.episodeRepo.Upsert(ctx, &models.Episode{
+		ContentID:      "ep-tvdb-2026-82",
+		SeriesID:       seriesID,
+		SeasonID:       "season-2026",
+		SeasonNumber:   2026,
+		EpisodeNumber:  82,
+		Title:          "Jamie Ding, Zach Pollock, Nicco Martinez",
+		AirDate:        mustDate(t, "2026-04-24"),
+		TvdbID:         "11733849",
+		MetadataSource: "provider",
+	})
+	file := &models.MediaFile{
+		ID:            103,
+		MediaFolderID: 10,
+		FilePath:      "/media/tv/Jeopardy! (1984)/Season 2026/Jeopardy! (1984) - 2026-04-24 - Jamie Ding Zach Pollock Nicco Martinez.mkv",
+	}
+	h.fileRepo.addFile(file)
+	h.fileRepo.contentIDs[file.ID] = seriesID
+
+	if err := h.service.ensureSeriesEpisodeLinks(ctx, seriesID); err != nil {
+		t.Fatalf("ensureSeriesEpisodeLinks failed: %v", err)
+	}
+
+	if got := h.fileRepo.episodeLinks[file.ID]; got != "ep-tvdb-2026-82" {
+		t.Fatalf("episode link = %q, want ep-tvdb-2026-82", got)
+	}
+	linked := h.fileRepo.files[file.ID]
+	if linked.SeasonNumber != 2026 || linked.EpisodeNumber != 82 {
+		t.Fatalf("linked season/episode = S%dE%d, want S2026E82", linked.SeasonNumber, linked.EpisodeNumber)
 	}
 }
 
@@ -843,6 +1016,37 @@ var ensureSeriesEpisodeLinksAirDateCandidatesCases = func() []ensureSeriesEpisod
 	}
 }()
 
+// TestEnsureSeriesEpisodeLinks_AirDateCandidates links date-named files of a
+// daily show among the provider episodes that aired that day.
+func TestEnsureSeriesEpisodeLinks_AirDateCandidates(t *testing.T) {
+	for _, tc := range ensureSeriesEpisodeLinksAirDateCandidatesCases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFallbackTestHarness()
+			ctx := context.Background()
+			const seriesID = "series-daily-air-date"
+			episodes := make([]*models.Episode, 0, len(tc.episodes))
+			for _, episode := range tc.episodes {
+				episode := *episode
+				episodes = append(episodes, &episode)
+			}
+			seedAirDateSeries(ctx, t, h, seriesID, episodes...)
+			for _, f := range tc.files {
+				addAirDateFile(h, seriesID, f.id, f.path)
+			}
+
+			if err := h.service.ensureSeriesEpisodeLinks(ctx, seriesID); err != nil {
+				t.Fatalf("ensureSeriesEpisodeLinks failed: %v", err)
+			}
+
+			for _, f := range tc.files {
+				if got := h.fileRepo.episodeLinks[f.id]; got != f.want {
+					t.Errorf("file %d linked to %q, want %q", f.id, got, f.want)
+				}
+			}
+		})
+	}
+}
+
 // TestFallbackEpisode_PartialProviderCoverageKeepsScannerEpisodes verifies that
 // when a provider supplies metadata for some episodes but not all, the
 // scanner-derived fallback rows are preserved for the missing episodes.
@@ -937,6 +1141,81 @@ func TestFallbackEpisode_PartialProviderCoverageKeepsScannerEpisodes(t *testing.
 	}
 }
 
+// TestFallbackEpisode_WorkerSynthesizesFallbackOnEnrichmentFailure verifies the
+// end-to-end worker path: when the enrichment pipeline fails for a series file,
+// the worker still synthesizes fallback episodes so the content is browsable.
+func TestFallbackEpisode_WorkerSynthesizesFallbackOnEnrichmentFailure(t *testing.T) {
+	h := newFallbackTestHarness()
+	ctx := context.Background()
+
+	file := &models.MediaFile{
+		ID:            30,
+		MediaFolderID: 10,
+		FilePath:      "/media/tv/Obscure Show (2024)/Season 01/Obscure.Show.S01E01.mkv",
+	}
+
+	// Hook createOrFindSkeleton to return a series skeleton and set up
+	// the file linkage needed for ListBySeriesUnlinked to find this file.
+	seriesID := "series-worker-fallback"
+	h.service.hooks.createOrFindSkeleton = func(_ context.Context, f *models.MediaFile, _ int) (*skeletonResult, error) {
+		h.itemRepo.Upsert(ctx, &models.MediaItem{
+			ContentID: seriesID,
+			Title:     "Obscure Show",
+			Year:      2024,
+			Type:      "series",
+			Status:    "pending",
+			Studios:   []string{},
+			Networks:  []string{},
+			Countries: []string{},
+			Genres:    []string{},
+		})
+		h.fileRepo.addFile(f)
+		h.fileRepo.contentIDs[f.ID] = seriesID
+		return &skeletonResult{
+			ContentID: seriesID,
+			IsNew:     true,
+			Type:      "series",
+			Title:     "Obscure Show",
+			Year:      2024,
+		}, nil
+	}
+
+	// Simulate enrichment failure (no providers matched).
+	h.service.hooks.process = func(_ context.Context, _ ProcessRequest) (*ProcessResult, error) {
+		return &ProcessResult{Updated: false}, nil
+	}
+
+	worker := NewMatchWorker(h.service, h.fileRepo, 1, 10, 0)
+	worker.ProcessFile(ctx, file)
+
+	// The item should be marked "unmatched".
+	item, err := h.itemRepo.GetByID(ctx, seriesID)
+	if err != nil {
+		t.Fatalf("series item not found: %v", err)
+	}
+	if item.Status != "unmatched" {
+		t.Errorf("expected status=unmatched, got %q", item.Status)
+	}
+
+	// But a fallback episode should have been synthesized.
+	ep, err := h.episodeRepo.GetBySeriesAndNumber(ctx, seriesID, 1, 1)
+	if err != nil {
+		t.Fatalf("expected fallback S01E01 to exist after worker enrichment failure: %v", err)
+	}
+	if ep.MetadataSource != "scanner_fallback" {
+		t.Errorf("expected scanner_fallback source, got %q", ep.MetadataSource)
+	}
+
+	// Season should also exist.
+	s, err := h.seasonRepo.GetBySeriesAndNumber(ctx, seriesID, 1)
+	if err != nil {
+		t.Fatalf("expected fallback Season 1 to exist: %v", err)
+	}
+	if s.MetadataSource != "scanner_fallback" {
+		t.Errorf("expected scanner_fallback source for season, got %q", s.MetadataSource)
+	}
+}
+
 func TestEnsureSeriesEpisodeLinks_CoalescesConcurrentFallbackWork(t *testing.T) {
 	ctx := context.Background()
 
@@ -1020,96 +1299,4 @@ func TestEnsureSeriesEpisodeLinks_CoalescesConcurrentFallbackWork(t *testing.T) 
 	if ep.MetadataSource != "scanner_fallback" {
 		t.Fatalf("expected synthesized episode metadata source scanner_fallback, got %q", ep.MetadataSource)
 	}
-}
-
-// failingAirDateEpisodeRepo fails the air-date lookup the completeness sweep
-// runs for a series' unlinked by-date files.
-type failingAirDateEpisodeRepo struct {
-	*fakeEpisodeRepo
-}
-
-func (failingAirDateEpisodeRepo) ListBySeriesAndAirDates(context.Context, string, []string) (map[string][]*models.Episode, error) {
-	return nil, errors.New("air-date lookup failed")
-}
-
-// TestRefreshSeriesEpisodeMetadataState_KeepsSeriesDebtWhenByDateCheckFails
-// covers a failed by-date check: clearing the flag would let the refresh's
-// settle drop the series debt, the only trigger left for the unlinked file.
-func TestRefreshSeriesEpisodeMetadataState_KeepsSeriesDebtWhenByDateCheckFails(t *testing.T) {
-	h := newFallbackTestHarness()
-	debts := newFakeRefreshDebtRepo()
-	h.service.refreshDebtRepo = debts
-	ctx := context.Background()
-	const seriesID = "series-daily-check-fails"
-	seedAirDateSeries(ctx, t, h, seriesID,
-		&models.Episode{ContentID: "ep-1", SeasonNumber: 1, EpisodeNumber: 1, Title: "Friday", TvdbID: "1001", AirDate: mustDate(t, "2024-05-03")},
-	)
-	item, err := h.itemRepo.GetByID(ctx, seriesID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	item.EpisodeMetadataIncomplete = true
-	if err := h.itemRepo.Upsert(ctx, item); err != nil {
-		t.Fatal(err)
-	}
-	queued := &models.MetadataRefreshDebt{
-		TargetType:    RefreshTargetItem,
-		ContentID:     seriesID,
-		ReasonMask:    RefreshDebtReasonEpisodeIncomplete,
-		Priority:      refreshDebtPriority(RefreshDebtReasonEpisodeIncomplete),
-		AttemptCount:  1,
-		NextRefreshAt: time.Now().Add(24 * time.Hour).Truncate(time.Second),
-	}
-	debts.debts[fakeRefreshDebtKey(RefreshTargetItem, seriesID)] = queued
-	addAirDateFile(h, seriesID, 301, "/media/tv/Daily Show (2024)/Season 01/Daily Show (2024) - 2024-05-06 - Episode.mkv")
-	h.service.episodeRepo = failingAirDateEpisodeRepo{fakeEpisodeRepo: h.episodeRepo}
-
-	if h.service.refreshSeriesEpisodeMetadataState(ctx, seriesID, time.Now()) {
-		t.Error("sweep reported success after the by-date check failed")
-	}
-	item, err = h.itemRepo.GetByID(ctx, seriesID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !item.EpisodeMetadataIncomplete {
-		t.Error("EpisodeMetadataIncomplete cleared after the by-date check failed")
-	}
-	if debt := debts.debts[fakeRefreshDebtKey(RefreshTargetItem, seriesID)]; debt == nil || debt.AttemptCount != 1 ||
-		!debt.NextRefreshAt.Equal(queued.NextRefreshAt) {
-		t.Errorf("series debt = %+v, want it kept as queued", debt)
-	}
-}
-
-// ResetEdits empties a stored season's lockable fields and locks, as
-// catalog.SeasonRepository.ResetEdits does.
-func (r *fakeSeasonRepo) ResetEdits(_ context.Context, contentID string, keepText bool) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, s := range r.seasons {
-		if s.ContentID == contentID {
-			if !keepText {
-				s.Title, s.Overview = "", ""
-			}
-			s.AirDate, s.LockedFields = nil, []int{}
-			return nil
-		}
-	}
-	return fmt.Errorf("season %s not found", contentID)
-}
-
-// ResetEdits empties a stored episode's lockable fields and locks, as
-// catalog.EpisodeRepository.ResetEdits does.
-func (r *fakeEpisodeRepo) ResetEdits(_ context.Context, contentID string, keepText bool) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, ep := range r.episodes {
-		if ep.ContentID == contentID {
-			if !keepText {
-				ep.Title, ep.Overview = "", ""
-			}
-			ep.AirDate, ep.Runtime, ep.LockedFields = nil, 0, []int{}
-			return nil
-		}
-	}
-	return fmt.Errorf("episode %s not found", contentID)
 }

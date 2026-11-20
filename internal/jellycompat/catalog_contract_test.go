@@ -3,6 +3,7 @@ package jellycompat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"net/url"
 	"testing"
@@ -13,6 +14,15 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
+
+func TestItemsResponseImageAndUserDataControls(t *testing.T) {
+	q := parseItemsQuery(httptest.NewRequest("GET", "/Items?EnableImages=false&EnableUserData=false", nil), NewResourceIDCodec())
+	items := []baseItemDTO{{ImageTags: map[string]string{"Primary": "p"}, BackdropImageTags: []string{"b"}, ParentBackdropImageTags: []string{"b"}, SeriesPrimaryImageTag: "p", UserData: &itemUserDataDTO{}}}
+	applyItemsResponseOptions(items, q)
+	if len(items[0].ImageTags) != 0 || len(items[0].ParentBackdropImageTags) != 0 || items[0].SeriesPrimaryImageTag != "" || items[0].UserData != nil {
+		t.Fatalf("presentation controls lost: %+v", items[0])
+	}
+}
 
 func TestItemsQueryCombinedCatalogFilters(t *testing.T) {
 	q := parseItemsQuery(httptest.NewRequest("GET", "/Items?Genres=Drama%7CComedy&Years=2020,2024&SearchTerm=Film&Filters=IsFavorite,IsPlayed&StartIndex=2&Limit=1", nil), NewResourceIDCodec())
@@ -35,6 +45,39 @@ type composedBrowseContent struct {
 func (s *composedBrowseContent) BrowseItems(_ context.Context, _ *Session, params url.Values) (*upstreamBrowseResponse, error) {
 	s.params = params
 	return &upstreamBrowseResponse{Items: []upstreamListItem{}}, nil
+}
+func TestCombinedSearchPlayedFavoriteUsesBrowse(t *testing.T) {
+	svc := &composedBrowseContent{}
+	codec := NewResourceIDCodec()
+	h := &ItemsHandler{content: svc, codec: codec, mapper: newMapper(codec, &config.Config{}), userData: &mockUserDataService{}, images: NewImageCache(time.Hour, time.Now)}
+	performItemsRequest(t, h, "/Items?SearchTerm=Drama&IsPlayed=true&isFavorite=true&Limit=1&StartIndex=2")
+	if svc.params.Get("search_term") != "Drama" || svc.params.Get("is_favorite") != "true" || svc.params.Get("is_played") != "true" {
+		t.Fatalf("lost combined predicates: %v", svc.params)
+	}
+}
+
+func TestEpisodePageFiltersNumericSeasonBeforeHydration(t *testing.T) {
+	codec := NewResourceIDCodec()
+	svc := &countingContentService{}
+	h := &ItemsHandler{content: svc, codec: codec, mapper: newMapper(codec, &config.Config{}), userData: &mockUserDataService{}, images: NewImageCache(time.Hour, time.Now)}
+	q := parseItemsQuery(httptest.NewRequest("GET", "/Shows/s/Episodes?Season=2&StartIndex=1&Limit=1", nil), codec)
+	episodes := []*models.Episode{{ContentID: "a", SeasonNumber: 1, EpisodeNumber: 1}, {ContentID: "b", SeasonNumber: 2, EpisodeNumber: 1}, {ContentID: "c", SeasonNumber: 2, EpisodeNumber: 2}}
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	h.writeEpisodeModelsPage(rec, req, collectionsTestSession(), q, "s", nil, episodes, true)
+	if rec.Code != 200 {
+		t.Fatalf("response: %d %s", rec.Code, rec.Body.String())
+	}
+	var result queryResultDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.TotalRecordCount != 2 || result.StartIndex != 1 || result.Items[0].ID != codec.EncodeStringID(EncodedIDItem, "c") {
+		t.Fatalf("wrong season page: %+v", result)
+	}
+	if svc.getItemDetailCalls > 1 {
+		t.Fatalf("hydrated %d entries for one-item page", svc.getItemDetailCalls)
+	}
 }
 
 type upcomingContractRepo struct {
@@ -228,8 +271,84 @@ func TestParentEpisodesWithoutLimitReturnWholeSeries(t *testing.T) {
 	}
 }
 
+func TestUpcomingAvailabilityOnSelectedPage(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		available bool
+		detail    bool
+		err       error
+	}{
+		{name: "metadata only"},
+		{name: "downloaded", available: true},
+		{name: "metadata with details", detail: true},
+		{name: "availability failure", err: errors.New("catalog unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			codec := NewResourceIDCodec()
+			repo := &upcomingContractRepo{hasFiles: map[string]bool{"future": tc.available}, availabilityErr: tc.err}
+			h := &ItemsHandler{episodeRepo: repo, codec: codec, mapper: newMapper(codec, &config.Config{}), userData: &mockUserDataService{}, content: &countingContentService{}}
+			path := "/Shows/Upcoming?StartIndex=2&Limit=1"
+			if tc.detail {
+				path += "&Fields=MediaSources"
+			}
+			req := httptest.NewRequest("GET", path, nil)
+			req = req.WithContext(context.WithValue(req.Context(), compatSessionKey, collectionsTestSession()))
+			rec := httptest.NewRecorder()
+			h.HandleUpcoming(rec, req)
+			if len(repo.availabilityIDs) != 1 || repo.availabilityIDs[0] != "future" {
+				t.Fatalf("availability not page bounded: %v", repo.availabilityIDs)
+			}
+			if tc.err != nil {
+				if rec.Code < 500 {
+					t.Fatalf("availability error hidden: %d", rec.Code)
+				}
+				return
+			}
+			if rec.Code != 200 {
+				t.Fatalf("response: %d %s", rec.Code, rec.Body.String())
+			}
+			var result queryResultDTO
+			if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Items) != 1 || result.TotalRecordCount != 5 || result.StartIndex != 2 {
+				t.Fatalf("page: %+v", result)
+			}
+			item := result.Items[0]
+			if tc.available {
+				if item.LocationType != "FileSystem" || item.VideoType != "VideoFile" {
+					t.Fatalf("available: %+v", item)
+				}
+			} else if item.LocationType != "Virtual" || item.VideoType != "" {
+				t.Fatalf("fileless: %+v", item)
+			}
+		})
+	}
+}
+
 type presentationViewsContent struct{ countingContentService }
 
 func (*presentationViewsContent) ListUserLibraries(context.Context, *Session) ([]upstreamUserLibrary, error) {
 	return []upstreamUserLibrary{{ID: 3, Name: "Movies", Type: "movies", PosterPath: "poster.jpg", PosterURL: "https://example.com/poster.jpg"}}, nil
+}
+
+func TestItemsViewsPresentationControls(t *testing.T) {
+	for _, path := range []string{"/Items?"} {
+		for _, controls := range []string{"", "EnableImages=false&EnableUserData=false", "ImageTypeLimit=0", "EnableImageTypes=Backdrop"} {
+			t.Run(path+controls, func(t *testing.T) {
+				codec := NewResourceIDCodec()
+				h := &ItemsHandler{content: &presentationViewsContent{}, codec: codec, mapper: newMapper(codec, &config.Config{}), images: NewImageCache(time.Hour, time.Now)}
+				result := performItemsRequest(t, h, path+controls)
+				if len(result.Items) != 1 {
+					t.Fatalf("views: %+v", result)
+				}
+				if (len(result.Items[0].ImageTags) > 0) != (controls == "") {
+					t.Fatalf("image controls ignored: %+v", result.Items[0])
+				}
+				if controls == "EnableImages=false&EnableUserData=false" && result.Items[0].UserData != nil {
+					t.Fatal("user data controls ignored")
+				}
+			})
+		}
+	}
 }

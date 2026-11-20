@@ -79,17 +79,13 @@ func stampLiveRouteV3(card *playback.RecipeCard, current *playback.Session) {
 
 // sessionRecipeCardV3 is a builder's base card for the recovery copy, with the
 // client metadata stored cards carry so a rebuilt session keeps its label in
-// the admin views. The adaptation reasons come from the plan being committed:
-// the session still holds the previous plan's while its transport is built.
-func sessionRecipeCardV3(card playback.RecipeCard, session *playback.Session, adaptationReasons []string) *playback.RecipeCard {
+// the admin views.
+func sessionRecipeCardV3(card playback.RecipeCard, session *playback.Session) *playback.RecipeCard {
 	card.ClientName = session.ClientName
 	card.ClientVersion = session.ClientVersion
 	card.ClientBuild = session.ClientBuild
 	card.ClientChannel = session.ClientChannel
 	card.ClientUserAgent = session.ClientUserAgent
-	card.DeviceID = session.DeviceID
-	card.DevicePlatform = session.DevicePlatform
-	card.AdaptationReasons = adaptationReasons
 	return &card
 }
 
@@ -158,8 +154,6 @@ func (h *PlaybackHandler) followSessionRecipeMoveV3(ctx context.Context, session
 	next.ClientBuild = stored.ClientBuild
 	next.ClientChannel = stored.ClientChannel
 	next.ClientUserAgent = stored.ClientUserAgent
-	next.DeviceID = stored.DeviceID
-	next.DevicePlatform = stored.DevicePlatform
 	stampLiveRouteV3(&next, current)
 	h.putSessionRecipeV3(ctx, next)
 }

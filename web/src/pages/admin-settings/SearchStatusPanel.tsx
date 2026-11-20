@@ -4,22 +4,16 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCatalogSearchStatus } from "@/hooks/queries/admin/settings";
-import { useT, type Translate } from "@/i18n";
 import { formatDateTime } from "@/lib/datetime";
 
 import { SettingFieldStatus } from "./SettingField";
-import { formatLocale, joinList } from "@/lib/appLocale";
-import { formatDecimal } from "@/lib/numberFormat";
 
 /**
  * Read-only view of the catalog search index: which provider is answering
  * queries, how much of the catalog is indexed, and links to the rebuild/sync
  * tasks. Diagnostics, not settings — it lives behind a disclosure.
  */
-const MEILISEARCH = "Meilisearch";
-
 export function SearchStatusPanel() {
-  const t = useT();
   const { data: status, isLoading, isError, error } = useCatalogSearchStatus();
 
   if (isLoading) {
@@ -41,9 +35,7 @@ export function SearchStatusPanel() {
     return (
       <div className="space-y-3 py-3">
         <SettingFieldStatus tone="warn">
-          {error instanceof Error && error.message
-            ? t("web.admin.settings.search.status.loadErrorWithReason", { reason: error.message })
-            : t("web.admin.settings.search.status.loadError")}
+          {`Couldn't load search status${error instanceof Error && error.message ? `: ${error.message}` : "."}`}
         </SettingFieldStatus>
         <SearchTaskLinks />
       </div>
@@ -55,131 +47,87 @@ export function SearchStatusPanel() {
       {status.degraded && (
         <div className="py-3">
           <SettingFieldStatus tone="warn">
-            {status.degraded_reason ?? t("web.admin.settings.search.degradedFallback")}
+            {status.degraded_reason ?? "Search is running in a degraded mode."}
           </SettingFieldStatus>
         </div>
       )}
       <StatusRow
-        label={t("web.admin.settings.search.status.answering")}
+        label="Answering searches"
         value={
           status.active_provider === "meilisearch"
             ? status.index.rebuild_required
-              ? t("web.admin.settings.search.status.meiliKeywordOnly")
-              : MEILISEARCH
-            : t("web.admin.settings.search.status.postgresFullText")
+              ? "Meilisearch (keyword only)"
+              : "Meilisearch"
+            : "Postgres full-text"
         }
         badge={status.configured_provider}
       />
       <StatusRow
-        label={t("web.admin.settings.search.status.health")}
-        value={
-          status.meilisearch.healthy
-            ? t("web.admin.settings.search.status.healthy")
-            : status.meilisearch.circuit_state
-        }
-        badge={
-          status.meilisearch.configured
-            ? t("web.admin.settings.search.status.configured")
-            : t("web.admin.settings.search.status.notConfigured")
-        }
+        label="Health"
+        value={status.meilisearch.healthy ? "Healthy" : status.meilisearch.circuit_state}
+        badge={status.meilisearch.configured ? "configured" : "not configured"}
       />
       <StatusRow
-        label={t("web.admin.settings.search.status.activeIndex")}
-        value={status.index.active_index_uid || t("web.admin.settings.search.status.notBuilt")}
+        label="Active index"
+        value={status.index.active_index_uid || "Not built"}
         badge={
           status.index.rebuild_required
-            ? t("web.admin.settings.search.status.rebuildRequired")
-            : t("web.admin.settings.search.status.schema", {
-                version: status.index.schema_version,
-                expected: status.index.expected_schema_version,
-              })
+            ? "rebuild required"
+            : `schema ${status.index.schema_version}/${status.index.expected_schema_version}`
         }
       />
+      <StatusRow label="Documents" value={String(status.index.document_count)} />
+      <StatusRow label="Indexed types" value={formatIndexedTypes(status.meilisearch.index_types)} />
       <StatusRow
-        label={t("web.admin.settings.search.status.documents")}
-        value={String(status.index.document_count)}
+        label="Compressed vectors"
+        value={status.meilisearch.binary_quantized ? "Enabled" : "Disabled"}
       />
       <StatusRow
-        label={t("web.admin.settings.search.status.indexedTypes")}
-        value={formatIndexedTypes(t, status.meilisearch.index_types)}
-      />
-      <StatusRow
-        label={t("web.admin.settings.search.status.compressedVectors")}
-        value={
-          status.meilisearch.binary_quantized
-            ? t("web.admin.settings.search.status.enabled")
-            : t("web.admin.settings.search.status.disabled")
-        }
-      />
-      <StatusRow
-        label={t("web.admin.settings.search.status.semantic")}
-        value={
-          status.meilisearch.semantic_enabled
-            ? t("web.admin.settings.search.status.enabled")
-            : t("web.admin.settings.search.status.disabled")
-        }
+        label="Meaning-based search"
+        value={status.meilisearch.semantic_enabled ? "Enabled" : "Disabled"}
         badge={status.meilisearch.embedder}
       />
       <StatusRow
-        label={t("web.admin.settings.search.status.semanticRatio")}
+        label="Meaning-based share of results"
         value={formatSemanticRatio(status.meilisearch.semantic_ratio)}
       />
-      <StatusRow
-        label={t("web.admin.settings.search.status.itemsWithVectors")}
-        value={String(status.index.vector_document_count)}
-      />
+      <StatusRow label="Items with vectors" value={String(status.index.vector_document_count)} />
       {status.semantic && (
         <>
           <StatusRow
-            label={t("web.admin.settings.search.status.semanticReadiness")}
-            value={
-              status.semantic.ready
-                ? t("web.admin.settings.search.status.ready")
-                : t("web.admin.settings.search.status.notReady")
-            }
+            label="Meaning-based readiness"
+            value={status.semantic.ready ? "Ready" : "Not ready"}
             badge={status.semantic.ready ? undefined : status.semantic.disabled_reason}
           />
           <StatusRow
-            label={t("web.admin.settings.search.status.vectorCoverage")}
-            value={formatPercent(t, status.semantic.vector_coverage_ratio)}
+            label="Vector coverage"
+            value={formatPercent(status.semantic.vector_coverage_ratio)}
           />
           <StatusRow
-            label={t("web.admin.settings.search.status.coverageUpdated")}
-            value={
-              formatStatusDate(status.semantic.coverage_updated_at) ||
-              t("web.admin.settings.search.status.never")
-            }
+            label="Coverage updated"
+            value={formatStatusDate(status.semantic.coverage_updated_at) || "Never"}
           />
           <StatusRow
-            label={t("web.admin.settings.search.status.embeddingModel")}
+            label="Embedding model"
             value={
               status.semantic.capability.ok
-                ? t("web.admin.settings.search.status.ok")
-                : (status.semantic.capability.reason ??
-                  t("web.admin.settings.search.status.unavailable"))
+                ? "OK"
+                : (status.semantic.capability.reason ?? "Unavailable")
             }
             badge={status.semantic.capability.embedder}
           />
           {status.semantic.per_type && status.semantic.per_type.length > 0 && (
             <div className="flex flex-col gap-2 py-3">
-              <span className="text-sm font-medium">
-                {t("web.admin.settings.search.status.coverageByType")}
-              </span>
+              <span className="text-sm font-medium">Coverage by type</span>
               <div className="divide-border/60 divide-y">
-                {status.semantic.per_type.map((entry) => (
-                  <div key={entry.type} className="flex items-center justify-between gap-2 py-1.5">
+                {status.semantic.per_type.map((t) => (
+                  <div key={t.type} className="flex items-center justify-between gap-2 py-1.5">
                     <span className="text-muted-foreground min-w-0 truncate text-sm">
-                      {t("web.admin.settings.search.status.typeCoverage", {
-                        type: entry.type,
-                        vectorized: entry.vectorized,
-                        eligible: entry.eligible,
-                        percent: formatPercent(t, entry.vector_coverage_ratio),
-                      })}
+                      {t.type}: {t.vectorized}/{t.eligible} (
+                      {formatPercent(t.vector_coverage_ratio)})
                     </span>
-                    <Badge variant={entry.ready ? "secondary" : "outline"}>
-                      {entry.ready
-                        ? t("web.admin.settings.search.status.ready")
-                        : t("web.admin.settings.search.status.notReady")}
+                    <Badge variant={t.ready ? "secondary" : "outline"}>
+                      {t.ready ? "Ready" : "Not ready"}
                     </Badge>
                   </div>
                 ))}
@@ -188,28 +136,17 @@ export function SearchStatusPanel() {
           )}
         </>
       )}
-      <StatusRow
-        label={t("web.admin.settings.search.status.pendingEvents")}
-        value={String(status.index.pending_events)}
-      />
+      <StatusRow label="Pending events" value={String(status.index.pending_events)} />
       {status.index.dead_lettered_events > 0 && (
         <StatusRow
-          label={t("web.admin.settings.search.status.droppedEvents")}
+          label="Dropped events"
           value={String(status.index.dead_lettered_events)}
-          badge={t("web.admin.settings.search.status.staleUntilRebuild")}
+          badge="stale until rebuild"
         />
       )}
-      <StatusRow
-        label={t("web.admin.settings.search.status.lastSync")}
-        value={
-          formatStatusDate(status.index.last_sync_at) || t("web.admin.settings.search.status.never")
-        }
-      />
+      <StatusRow label="Last sync" value={formatStatusDate(status.index.last_sync_at) || "Never"} />
       {status.meilisearch.last_fallback && (
-        <StatusRow
-          label={t("web.admin.settings.search.status.lastFallback")}
-          value={status.meilisearch.last_fallback}
-        />
+        <StatusRow label="Last fallback" value={status.meilisearch.last_fallback} />
       )}
       <SearchTaskLinks />
     </div>
@@ -222,37 +159,25 @@ export function SearchStatusPanel() {
  * status query with the full panel.
  */
 export function SearchStatusSummary() {
-  const t = useT();
   const { data: status } = useCatalogSearchStatus();
   if (!status) return null;
-  const lastSync =
-    formatStatusDate(status.index.last_sync_at) ||
-    t("web.admin.settings.search.status.summaryNever");
+  const lastSync = formatStatusDate(status.index.last_sync_at) || "never";
   return (
     <SettingFieldStatus tone="muted">
-      {t("web.admin.settings.search.status.summary", {
-        last_sync: lastSync,
-        count: status.index.document_count,
-        count_text: status.index.document_count.toLocaleString(formatLocale()),
-      })}
+      {`Last sync ${lastSync} · ${status.index.document_count.toLocaleString()} items indexed`}
     </SettingFieldStatus>
   );
 }
 
 /** The two index maintenance tasks. Shown whether or not the status resolved. */
 function SearchTaskLinks() {
-  const t = useT();
   return (
     <div className="flex flex-wrap gap-2 py-3">
       <Button asChild size="sm" variant="outline">
-        <Link to="/admin/tasks/rebuild_catalog_search_index">
-          {t("web.admin.settings.search.status.rebuildIndex")}
-        </Link>
+        <Link to="/admin/tasks/rebuild_catalog_search_index">Rebuild index</Link>
       </Button>
       <Button asChild size="sm" variant="ghost">
-        <Link to="/admin/tasks/sync_catalog_search_index">
-          {t("web.admin.settings.search.status.automaticMaintenance")}
-        </Link>
+        <Link to="/admin/tasks/sync_catalog_search_index">Automatic maintenance</Link>
       </Button>
     </div>
   );
@@ -263,7 +188,7 @@ function StatusRow({ label, value, badge }: { label: string; value: string; badg
     <div className="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between">
       <span className="text-sm font-medium">{label}</span>
       <span className="text-muted-foreground flex min-w-0 flex-wrap items-center gap-2 text-sm">
-        <span className="max-w-full text-end break-words">{value}</span>
+        <span className="max-w-full text-right break-words">{value}</span>
         {badge ? <Badge variant="outline">{badge}</Badge> : null}
       </span>
     </div>
@@ -277,17 +202,17 @@ function formatStatusDate(value?: string) {
   return formatDateTime(date);
 }
 
-function formatIndexedTypes(t: Translate, value?: string[]) {
-  if (!value || value.length === 0) return t("web.admin.settings.search.status.allTypes");
-  return joinList(value);
+function formatIndexedTypes(value?: string[]) {
+  if (!value || value.length === 0) return "All";
+  return value.join(", ");
 }
 
 function formatSemanticRatio(value?: number) {
   if (typeof value !== "number" || Number.isNaN(value)) return "0";
-  return formatDecimal(value, 2);
+  return value.toFixed(2);
 }
 
-function formatPercent(t: Translate, value?: number) {
-  const percent = typeof value !== "number" || Number.isNaN(value) ? 0 : Math.round(value * 100);
-  return t("web.common.format.percent", { percent });
+function formatPercent(value?: number) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "0%";
+  return `${Math.round(value * 100)}%`;
 }

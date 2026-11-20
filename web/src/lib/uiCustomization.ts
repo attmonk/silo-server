@@ -1,6 +1,9 @@
 export type PosterSize = "compact" | "standard" | "large";
+export type CardCaption = "title_metadata" | "title" | "artwork";
+
 export interface CardPresentation {
   poster_size: PosterSize;
+  caption: CardCaption;
 }
 
 export type PrimaryMenuBuiltin =
@@ -48,15 +51,42 @@ export interface ShortcutDocument {
   items: ShortcutTarget[];
 }
 
-export const DEFAULT_CARD_PRESENTATION: CardPresentation = { poster_size: "standard" };
+export const DEFAULT_CARD_PRESENTATION: CardPresentation = {
+  poster_size: "standard",
+  caption: "title_metadata",
+};
 
-/**
- * The stored ui.card_presentation document. caption is retired and every card
- * shows its title and details, but the schema still requires the field.
- */
-export function cardPresentationValue(presentation: CardPresentation) {
-  return { poster_size: presentation.poster_size, caption: "title_metadata" } as const;
-}
+export const CARD_PRESENTATION_PRESETS = [
+  {
+    id: "balanced",
+    label: "Balanced",
+    description: "Standard posters with titles and metadata.",
+    value: DEFAULT_CARD_PRESENTATION,
+  },
+  {
+    id: "compact",
+    label: "Compact",
+    description: "More posters on screen with titles only.",
+    value: { poster_size: "compact", caption: "title" },
+  },
+  {
+    id: "cinema",
+    label: "Cinema",
+    description: "Large posters with titles only.",
+    value: { poster_size: "large", caption: "title" },
+  },
+  {
+    id: "artwork",
+    label: "Artwork only",
+    description: "Large artwork without caption rows.",
+    value: { poster_size: "large", caption: "artwork" },
+  },
+] as const satisfies ReadonlyArray<{
+  id: string;
+  label: string;
+  description: string;
+  value: CardPresentation;
+}>;
 
 const BUILTIN_DESTINATIONS = new Set<PrimaryMenuBuiltin>([
   "home",
@@ -68,6 +98,7 @@ const BUILTIN_DESTINATIONS = new Set<PrimaryMenuBuiltin>([
   "calendar",
 ]);
 const POSTER_SIZES = new Set<PosterSize>(["compact", "standard", "large"]);
+const CARD_CAPTIONS = new Set<CardCaption>(["title_metadata", "title", "artwork"]);
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -77,19 +108,8 @@ function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
-const MAX_LABEL_CODE_POINTS = 256;
-
 function isLabel(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.trim().length > 0 &&
-    [...value].length <= MAX_LABEL_CODE_POINTS
-  );
-}
-
-/** `text` trimmed and cut to the length a shortcut label may have. */
-export function shortcutLabel(text: string): string {
-  return [...text.trim()].slice(0, MAX_LABEL_CODE_POINTS).join("");
+  return typeof value === "string" && value.trim().length > 0 && [...value].length <= 256;
 }
 
 function isTargetId(value: unknown): value is string {
@@ -150,10 +170,16 @@ function parseMenuItem(value: unknown, allowBuiltin: boolean): PrimaryMenuItem |
 export function parseCardPresentation(value: unknown): CardPresentation {
   if (!isObject(value)) return DEFAULT_CARD_PRESENTATION;
   const posterSize = value.poster_size;
-  if (typeof posterSize !== "string" || !POSTER_SIZES.has(posterSize as PosterSize)) {
+  const caption = value.caption;
+  if (
+    typeof posterSize !== "string" ||
+    !POSTER_SIZES.has(posterSize as PosterSize) ||
+    typeof caption !== "string" ||
+    !CARD_CAPTIONS.has(caption as CardCaption)
+  ) {
     return DEFAULT_CARD_PRESENTATION;
   }
-  return { poster_size: posterSize as PosterSize };
+  return { poster_size: posterSize as PosterSize, caption: caption as CardCaption };
 }
 
 export function menuItemKey(item: PrimaryMenuItem): string {
@@ -240,27 +266,6 @@ export function cardGridClasses(size: PosterSize): string {
   }
 }
 
-const GRID_COLUMNS: Record<PosterSize, readonly number[]> = {
-  compact: [3, 5, 6, 8, 10],
-  standard: [3, 4, 5, 7, 8],
-  large: [2, 3, 4, 5, 6],
-};
-
-/**
- * The card width cardGridClasses resolves to at a viewport width, in a grid
- * `gridWidth` wide. Keep the two in step: artwork widths are requested from it.
- */
-export function gridCardWidthPx(
-  size: PosterSize,
-  viewportWidth: number,
-  gridWidth: number,
-): number {
-  const breakpoint = [640, 768, 1024, 1280].filter((width) => viewportWidth >= width).length;
-  const columns = GRID_COLUMNS[size][breakpoint]!;
-  const gap = size === "large" ? 16 : 12;
-  return (gridWidth - gap * (columns - 1)) / columns;
-}
-
 export function carouselCardWidthClasses(size: PosterSize): string {
   switch (size) {
     case "compact":
@@ -270,20 +275,6 @@ export function carouselCardWidthClasses(size: PosterSize): string {
     default:
       return "w-[140px] shrink-0 sm:w-[160px] lg:w-[185px]";
   }
-}
-
-/**
- * The poster size a row of square (audiobook) covers is drawn at: one step
- * under the profile's choice, because a square cover at a poster's width
- * covers half again its area and crowds the row.
- */
-export function squarePosterSize(size: PosterSize): PosterSize {
-  return size === "large" ? "standard" : "compact";
-}
-
-/** Width classes of square (audiobook cover) carousel cards. */
-export function squareCarouselCardWidthClasses(size: PosterSize): string {
-  return carouselCardWidthClasses(squarePosterSize(size));
 }
 
 /** Width classes of wide (16:9) carousel cards such as Continue Watching episodes. */
@@ -324,5 +315,7 @@ export function carouselIntrinsicHeight(size: PosterSize): string {
   }
 }
 
-/** Height of the title and details lines under a grid poster. */
-export const CARD_TEXT_AREA_HEIGHT = 44;
+export function cardTextAreaHeight(caption: CardCaption): number {
+  if (caption === "artwork") return 0;
+  return caption === "title" ? 28 : 44;
+}

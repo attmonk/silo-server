@@ -12,6 +12,17 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
+// fakeLocalImageCacheJobs is a fakeImageCacheJobs that also reports the
+// target's currently stored cached path, like the real repository.
+type fakeLocalImageCacheJobs struct {
+	fakeImageCacheJobs
+	currentCached string
+}
+
+func (f *fakeLocalImageCacheJobs) CurrentTargetCachedPath(context.Context, *models.MetadataImageCacheJob) (string, error) {
+	return f.currentCached, nil
+}
+
 // fakeByteImageCacher supports both remote and byte caching. CacheImageBytes
 // builds the base path the way the real cacher does so key assertions hold.
 type fakeByteImageCacher struct {
@@ -43,6 +54,18 @@ func (f *fakeLibraryRootResolver) LibraryRootsForContent(context.Context, string
 	return f.roots, f.err
 }
 
+type fakePrefixDeleter struct {
+	bucket   string
+	prefixes []string
+}
+
+func (f *fakePrefixDeleter) DeletePrefix(_ context.Context, prefix string) (int, error) {
+	f.prefixes = append(f.prefixes, prefix)
+	return 1, nil
+}
+
+func (f *fakePrefixDeleter) Bucket() string { return f.bucket }
+
 func localArtworkJob(sourcePath string) *models.MetadataImageCacheJob {
 	return &models.MetadataImageCacheJob{
 		ID:                7,
@@ -60,13 +83,19 @@ func localArtworkJob(sourcePath string) *models.MetadataImageCacheJob {
 func newLocalProcessorForTest(
 	job *models.MetadataImageCacheJob,
 	roots []string,
-) (*ImageCacheProcessor, *fakeImageCacheJobs, *fakeByteImageCacher, *fakeItemArtworkUpdater) {
-	jobs := &fakeImageCacheJobs{claimed: []*models.MetadataImageCacheJob{job}}
+	currentCached string,
+) (*ImageCacheProcessor, *fakeLocalImageCacheJobs, *fakeByteImageCacher, *fakeItemArtworkUpdater, *fakePrefixDeleter) {
+	jobs := &fakeLocalImageCacheJobs{
+		fakeImageCacheJobs: fakeImageCacheJobs{claimed: []*models.MetadataImageCacheJob{job}},
+		currentCached:      currentCached,
+	}
 	cacher := &fakeByteImageCacher{thumbhash: "th-new"}
 	items := &fakeItemArtworkUpdater{updated: true}
+	deleter := &fakePrefixDeleter{bucket: "images"}
 	p := NewImageCacheProcessorWithTargets(jobs, cacher, nil, ImageCacheProcessorTargets{Items: items})
 	p.SetLibraryRootResolver(&fakeLibraryRootResolver{roots: roots})
-	return p, jobs, cacher, items
+	p.SetImagePrefixDeleter(deleter)
+	return p, jobs, cacher, items, deleter
 }
 
 func writeLocalPoster(t *testing.T, dir string) string {
@@ -76,6 +105,41 @@ func writeLocalPoster(t *testing.T, dir string) string {
 		t.Fatalf("writing poster: %v", err)
 	}
 	return path
+}
+
+func TestProcessLocalImageCachesWithinLibraryRoots(t *testing.T) {
+	root := t.TempDir()
+	posterPath := writeLocalPoster(t, root)
+	job := localArtworkJob("file://" + posterPath)
+	p, jobs, cacher, items, deleter := newLocalProcessorForTest(job, []string{root}, "")
+
+	stats, err := p.RunOnce(context.Background(), "w1", 10, 1)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.Succeeded != 1 {
+		t.Fatalf("stats = %+v, want 1 succeeded (failed text %q)", stats, jobs.failedText)
+	}
+	if len(cacher.bytesReq) != 1 {
+		t.Fatalf("CacheImageBytes calls = %d, want 1", len(cacher.bytesReq))
+	}
+	req := cacher.bytesReq[0]
+	if req.ProviderID != "local" || req.ContentType != "movies" || req.ContentID != "movie-1" {
+		t.Fatalf("cache request = %+v", req)
+	}
+	if len(req.KeyDiscriminator) != 8 {
+		t.Fatalf("KeyDiscriminator = %q, want 8-char content hash", req.KeyDiscriminator)
+	}
+	wantCached := "local/movies/movie-1/" + req.KeyDiscriminator + "/poster/original.webp"
+	if items.cachedPath != wantCached {
+		t.Fatalf("cachedPath = %q, want %q", items.cachedPath, wantCached)
+	}
+	if items.thumbhash != "th-new" {
+		t.Fatalf("thumbhash = %q", items.thumbhash)
+	}
+	if len(deleter.prefixes) != 0 {
+		t.Fatalf("no stale prefix to delete on first cache, got %v", deleter.prefixes)
+	}
 }
 
 // A local source outside the library roots, through a ".." or a symlinked
@@ -119,7 +183,7 @@ func TestProcessLocalImageRejectsUnreadableSources(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			job := localArtworkJob(tc.source(t, root, t.TempDir()))
-			p, jobs, cacher, _ := newLocalProcessorForTest(job, []string{root})
+			p, jobs, cacher, _, _ := newLocalProcessorForTest(job, []string{root}, "")
 
 			stats, err := p.RunOnce(context.Background(), "w1", 10, 1)
 			if err != nil {
@@ -146,7 +210,7 @@ func TestProcessLocalImageAcceptsLogicalPathUnderSymlinkedRoot(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 	job := localArtworkJob("file://" + filepath.Join(linkedRoot, "poster.jpg"))
-	p, jobs, cacher, _ := newLocalProcessorForTest(job, []string{linkedRoot})
+	p, jobs, cacher, _, _ := newLocalProcessorForTest(job, []string{linkedRoot}, "")
 
 	stats, err := p.RunOnce(context.Background(), "w1", 10, 1)
 	if err != nil {
@@ -160,11 +224,63 @@ func TestProcessLocalImageAcceptsLogicalPathUnderSymlinkedRoot(t *testing.T) {
 	}
 }
 
+func TestProcessLocalImageDeletesStalePrefixOnRecache(t *testing.T) {
+	root := t.TempDir()
+	posterPath := writeLocalPoster(t, root)
+	job := localArtworkJob("file://" + posterPath)
+	stale := "local/movies/movie-1/00000000/poster/original.webp"
+	p, _, cacher, _, deleter := newLocalProcessorForTest(job, []string{root}, stale)
+
+	stats, err := p.RunOnce(context.Background(), "w1", 10, 1)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.Succeeded != 1 {
+		t.Fatalf("stats = %+v, want success", stats)
+	}
+	if len(cacher.bytesReq) != 1 {
+		t.Fatal("expected one cache call")
+	}
+	if len(deleter.prefixes) != 1 || deleter.prefixes[0] != "local/movies/movie-1/00000000/poster/" {
+		t.Fatalf("stale prefixes deleted = %v", deleter.prefixes)
+	}
+}
+
+func TestProcessLocalImageSkipsPrefixDeleteWhenUnchanged(t *testing.T) {
+	root := t.TempDir()
+	posterPath := writeLocalPoster(t, root)
+	job := localArtworkJob("file://" + posterPath)
+
+	// First pass discovers the hash for these bytes.
+	probe, _, probeCacher, probeItems, _ := newLocalProcessorForTest(job, []string{root}, "")
+	if _, err := probe.RunOnce(context.Background(), "w1", 10, 1); err != nil {
+		t.Fatalf("probe RunOnce: %v", err)
+	}
+	if len(probeCacher.bytesReq) != 1 {
+		t.Fatal("probe cache call missing")
+	}
+
+	// Second pass with the same stored cached path must not delete anything.
+	p, _, _, _, deleter := newLocalProcessorForTest(job, []string{root}, probeItems.cachedPath)
+	stats, err := p.RunOnce(context.Background(), "w1", 10, 1)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.Succeeded != 1 {
+		t.Fatalf("stats = %+v, want success", stats)
+	}
+	if len(deleter.prefixes) != 0 {
+		t.Fatalf("unchanged art must not delete prefixes, got %v", deleter.prefixes)
+	}
+}
+
 func TestProcessLocalImageFailsWithoutRootResolver(t *testing.T) {
 	root := t.TempDir()
 	posterPath := writeLocalPoster(t, root)
 	job := localArtworkJob("file://" + posterPath)
-	jobs := &fakeImageCacheJobs{claimed: []*models.MetadataImageCacheJob{job}}
+	jobs := &fakeLocalImageCacheJobs{
+		fakeImageCacheJobs: fakeImageCacheJobs{claimed: []*models.MetadataImageCacheJob{job}},
+	}
 	cacher := &fakeByteImageCacher{thumbhash: "th"}
 	p := NewImageCacheProcessorWithTargets(jobs, cacher, nil, ImageCacheProcessorTargets{Items: &fakeItemArtworkUpdater{updated: true}})
 
@@ -187,6 +303,70 @@ func fingerprintedSource(t *testing.T, path string) string {
 		t.Fatalf("lstat %s: %v", path, err)
 	}
 	return LocalImageSourceURL(path, info.Size(), info.ModTime())
+}
+
+func TestProcessLocalImageStripsFingerprintBeforeReading(t *testing.T) {
+	root := t.TempDir()
+	// A "?" in the file name must survive stripping the fingerprint.
+	posterPath := filepath.Join(root, "What If?-poster.jpg")
+	if err := os.WriteFile(posterPath, []byte("poster-bytes"), 0o644); err != nil {
+		t.Fatalf("writing poster: %v", err)
+	}
+	source := fingerprintedSource(t, posterPath)
+	job := localArtworkJob(source)
+	p, jobs, cacher, items, _ := newLocalProcessorForTest(job, []string{root}, "")
+
+	stats, err := p.RunOnce(context.Background(), "w1", 10, 1)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.Succeeded != 1 {
+		t.Fatalf("stats = %+v, want 1 succeeded (failed text %q)", stats, jobs.failedText)
+	}
+	if len(cacher.byteReqs) != 1 || string(cacher.byteReqs[0]) != "poster-bytes" {
+		t.Fatalf("read %q, want the poster bytes", cacher.byteReqs)
+	}
+	// The target update matches on the stored, fingerprinted source.
+	if items.sourcePath != source {
+		t.Fatalf("updated source = %q, want %q", items.sourcePath, source)
+	}
+}
+
+func TestProcessLocalImageSizeCapMatchesRemoteImages(t *testing.T) {
+	root := t.TempDir()
+	// Above the old 8 MiB local cap, within the 25 MiB remote cap.
+	large := filepath.Join(root, "poster.jpg")
+	if err := os.WriteFile(large, make([]byte, 9<<20), 0o644); err != nil {
+		t.Fatalf("writing poster: %v", err)
+	}
+	job := localArtworkJob(fingerprintedSource(t, large))
+	p, jobs, _, _, _ := newLocalProcessorForTest(job, []string{root}, "")
+	stats, err := p.RunOnce(context.Background(), "w1", 10, 1)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.Succeeded != 1 {
+		t.Fatalf("9 MiB poster: stats = %+v (failed text %q)", stats, jobs.failedText)
+	}
+
+	oversized := filepath.Join(root, "fanart.jpg")
+	f, err := os.Create(oversized)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := f.Truncate(MaxArtworkSourceBytes + 1); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	_ = f.Close()
+	job = localArtworkJob(fingerprintedSource(t, oversized))
+	p, jobs, cacher, _, _ := newLocalProcessorForTest(job, []string{root}, "")
+	stats, err = p.RunOnce(context.Background(), "w1", 10, 1)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if stats.Failed != 1 || len(cacher.byteReqs) != 0 || !isStableProviderImageFailure(jobs.failedText) {
+		t.Fatalf("oversized: stats = %+v failed text %q", stats, jobs.failedText)
+	}
 }
 
 // recordingRootResolver records which content the processor asked roots for.
@@ -225,7 +405,7 @@ func TestProcessLocalPersonPhotoConfinedToTitleRoots(t *testing.T) {
 		ContentType:       personImageContentType,
 		ImageType:         ImageCacheImageProfile,
 	}
-	jobs := &fakeImageCacheJobs{claimed: []*models.MetadataImageCacheJob{job}}
+	jobs := &fakeLocalImageCacheJobs{fakeImageCacheJobs: fakeImageCacheJobs{claimed: []*models.MetadataImageCacheJob{job}}}
 	cacher := &fakeByteImageCacher{thumbhash: "th"}
 	people := &fakePersonPhotoUpdater{updated: true}
 	roots := &recordingRootResolver{roots: []string{root}}

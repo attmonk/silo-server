@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/url"
 	"regexp"
-	"slices"
 	"strings"
 )
 
@@ -17,8 +16,8 @@ func SanitizeQuery(raw string) string {
 	if err != nil {
 		return "[query omitted: invalid encoding]"
 	}
-	for key, values := range query {
-		if diagnosticSecretKey(key) || slices.ContainsFunc(values, func(value string) bool { return playTagPair(key, value) }) {
+	for key := range query {
+		if diagnosticSecretKey(key) {
 			query[key] = []string{Placeholder}
 		}
 	}
@@ -37,7 +36,6 @@ func SanitizeRequestURL(raw string) string {
 	u.RawQuery = SanitizeQuery(u.RawQuery)
 	u.Fragment = ""
 	u.RawFragment = ""
-	redactURLPath(u)
 	return u.String()
 }
 
@@ -68,40 +66,18 @@ func SanitizeJSON(body []byte) []byte {
 }
 
 func diagnosticSecretKey(key string) bool {
-	// Pw is the Jellyfin login alias. PlaySessionId is the Jellyfin play
-	// session ID, which on its own authorizes that play's media requests.
-	key = normalizeDiagnosticKey(key)
-	return key == "pw" || key == "playsessionid" || SecretKey(key)
-}
-
-// normalizeDiagnosticKey covers the casing and separators used by
-// compatibility clients without changing auth parsing.
-func normalizeDiagnosticKey(key string) string {
+	// Pw is the Jellyfin login alias. Normalisation covers the casing and
+	// separators used by compatibility clients without changing auth parsing.
 	key = strings.ToLower(strings.TrimSpace(key))
-	return strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", "")
-}
-
-// playTagHexLen is the length of a Jellyfin per-play tag: the compact play
-// session ID followed by the source's 16-hex ETag.
-const playTagHexLen = 48
-
-// playTagPair reports a Jellyfin per-play tag: the MediaSources[].ETag that
-// PlaybackInfo returns and that a client echoes as the tag query parameter on
-// a static stream. It starts with the play session ID and authorizes that
-// stream, so it is masked like PlaySessionId. Other values under those keys,
-// such as image tags and item ETags, are harmless and stay readable.
-func playTagPair(key, value string) bool {
-	if key = normalizeDiagnosticKey(key); key != "tag" && key != "etag" {
-		return false
-	}
-	return len(value) == playTagHexLen && strings.Trim(value, "0123456789abcdefABCDEF") == ""
+	key = strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", "")
+	return key == "pw" || SecretKey(key)
 }
 
 func sanitizeDiagnosticValue(value any) any {
 	switch v := value.(type) {
 	case map[string]any:
 		for key, child := range v {
-			if text, ok := child.(string); diagnosticSecretKey(key) || ok && playTagPair(key, text) {
+			if diagnosticSecretKey(key) {
 				v[key] = Placeholder
 			} else {
 				v[key] = sanitizeDiagnosticValue(child)
@@ -114,9 +90,10 @@ func sanitizeDiagnosticValue(value any) any {
 	case string:
 		// Playback responses contain token-bearing relative and absolute URLs
 		// under ordinary keys such as DirectStreamUrl and MediaSources[].Path.
-		// A value with no part that can hold a credential is kept verbatim
-		// so on-disk file paths are not re-encoded as URLs.
-		if looksLikeDiagnosticURL(v) && URLMayHoldCredential(v) {
+		// Credentials can only sit in a query, fragment or userinfo; without
+		// those, keep the value verbatim so on-disk file paths are not
+		// re-encoded as URLs.
+		if looksLikeDiagnosticURL(v) && strings.ContainsAny(v, "?#@") {
 			return SanitizeRequestURL(v)
 		}
 	}
@@ -163,12 +140,11 @@ func RedactSecretAssignments(text string) string {
 	var out strings.Builder
 	last := 0
 	for _, m := range assignmentKey.FindAllStringIndex(text, -1) {
-		if m[0] < last {
+		if m[0] < last || !diagnosticSecretKey(text[m[0]:m[1]-1]) {
 			continue
 		}
-		key := text[m[0] : m[1]-1]
 		start, end := assignmentValue(text, m[1])
-		if start == end || !diagnosticSecretKey(key) && !playTagPair(key, text[start:end]) {
+		if start == end {
 			continue
 		}
 		out.WriteString(text[last:start])
@@ -205,10 +181,8 @@ func assignmentValue(text string, i int) (start, end int) {
 // non-secret outer assignment (desc = api_key=SECRET) cannot hide a nested one.
 var secretAssignmentPattern = regexp.MustCompile(`(?i)([\w.-]*(?:password|passwd|secret|token|api[_-]?key|authorization|cookie)[\w.-]*"?\s*[:=]\s*)(?:(?:bearer|basic)\s+)?(?:"[^"]*"|[^\s"&,;]+)`)
 
-// urlUserinfoPattern matches through the last @ before the URL's path, since
-// a password in free text may hold unescaped @, ? or # characters. It fails
-// closed: in a URL with no path, an @ in the query or fragment masks the host.
-var urlUserinfoPattern = regexp.MustCompile(`://[^/\s]+@`)
+// urlUserinfoPattern matches the userinfo of a URL embedded in free text.
+var urlUserinfoPattern = regexp.MustCompile(`://[^/\s@]+@`)
 
 // SanitizeText masks credential assignments and URL userinfo in free-form
 // diagnostic text, such as a stored error message, and keeps everything else.

@@ -2,8 +2,6 @@ package abs
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -155,11 +153,12 @@ func (h *Handler) buildFilterData(ctx context.Context, lib AudiobookLibrary, acc
 //
 //   - limit / page      — pagination
 //   - minified=1        — slim response (no tracks, flat author/series)
-//   - filter=<kind>.<b64value> — authors, series, narrators, genres, tags,
-//     languages, or progress, applied in SQL
-//   - sort / desc       — the real ABS sort keys Silo has data for (see
-//     audiobookItemsOrder in the store); others fall back to title order
+//   - filter=<kind>.<b64value> — local-side filter (authors, series, narrators, progress)
 //   - collapseseries=1  — fold books by series; returns one entry per series
+//
+// Note: sort pushdown is not yet implemented (returns insertion order from
+// the store). Filter is applied locally after fetching. These limitations
+// are consistent with the plugin at its initial launch.
 func (h *Handler) handleLibraryItems(w http.ResponseWriter, r *http.Request) {
 	lib, access, ok := h.resolveLibrary(w, r)
 	if !ok {
@@ -179,53 +178,77 @@ func (h *Handler) handleLibraryItems(w http.ResponseWriter, r *http.Request) {
 	collapseSeries := q.Get("collapseseries") == "1"
 	include := q.Get("include")
 
-	filter, _ := ParseFilter(filterBy)
-	// Real ABS does not collapse inside a series filter: the client is showing
-	// that series' books.
-	if filter.Kind == FilterSeries {
-		collapseSeries = false
-	}
-	a, _ := absAuthFrom(r)
-	query := ItemsQuery{Filter: filter, Sort: sortBy, Desc: sortDesc, UserID: a.UserID, ProfileID: a.ProfileID}
+	filter, hasFilter := ParseFilter(filterBy)
 
-	if limit == 0 && !collapseSeries {
-		// Real ABS reads limit=0 as the whole library. Stream it rather than
-		// building every book in memory before the first byte goes out.
-		h.streamLibraryItems(w, r, lib, access, query, minified, pagedEnvelope(nil, 0, limit, page, sortBy, sortDesc, filterBy, minified, include))
+	// authors/series/narrators filters push down into SQL (indexed) so we never
+	// load + hydrate the whole library. This applies even with collapseseries=1
+	// (the client's per-artist album sync): the SQL filter reduces to a handful
+	// of rows, then collapse + paging run in Go over that small set. Only
+	// progress/genre/tag/language filters still need the Go post-filter and the
+	// full fetch.
+	pushDown := hasFilter &&
+		(filter.Kind == FilterAuthors || filter.Kind == FilterSeries || filter.Kind == FilterNarrators)
+	sqlFilter := Filter{}
+	if pushDown {
+		sqlFilter = filter
+	}
+	goFilter := hasFilter && !pushDown
+
+	// SQL paginates only when nothing is post-processed in Go (no Go filter, no
+	// collapse) and the limit is positive; otherwise fetch the (now
+	// SQL-filtered, hence small) candidate set in full and slice in Go.
+	sqlPaginated := !goFilter && !collapseSeries && limit > 0
+	fetchLimit, fetchOffset := 0, 0
+	if sqlPaginated {
+		fetchLimit = limit
+		fetchOffset = page * limit
+	}
+
+	items, total, err := h.deps.MediaStore.ListAudiobooks(r.Context(), lib.ID, fetchLimit, fetchOffset, access, sqlFilter)
+	if err != nil {
+		http.Error(w, "list audiobooks: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// SQL filters, sorts, collapses, and pages every request.
-	fetchOffset := 0
-	if limit > 0 {
-		fetchOffset = page * limit
-	}
+	// Convert to ABS LibraryItem shape.
 	baseURL := h.absBaseURL(r)
-	var pageSlice []LibraryItem
-	var total int
+	all := make([]LibraryItem, 0, len(items))
+	for _, item := range items {
+		all = append(all, siloItemToLibraryItem(item, lib, baseURL))
+	}
+
+	// Local filter (post-fetch) — only for filters not pushed into SQL.
+	if goFilter {
+		filtered := make([]LibraryItem, 0, len(all))
+		for _, it := range all {
+			if filter.Matches(it, false, false, false) {
+				filtered = append(filtered, it)
+			}
+		}
+		all = filtered
+		total = len(all)
+	}
+
+	// Collapse-by-series before paging.
+	collapsed := all
 	if collapseSeries {
-		entries, n, err := h.deps.MediaStore.ListAudiobooksCollapsed(r.Context(), lib.ID, limit, fetchOffset, access, query)
-		if err != nil {
-			http.Error(w, "list audiobooks: "+err.Error(), http.StatusInternalServerError)
-			return
+		collapsed = CollapseBySeries(all)
+		total = len(collapsed)
+	}
+
+	// Slice for page/limit. When SQL already paginated we serve the rows as-is.
+	pageStart, pageEnd := 0, len(collapsed)
+	if limit > 0 && !sqlPaginated {
+		pageStart = page * limit
+		if pageStart > len(collapsed) {
+			pageStart = len(collapsed)
 		}
-		total = n
-		pageSlice = make([]LibraryItem, 0, len(entries))
-		for _, e := range entries {
-			pageSlice = append(pageSlice, collapsedLibraryItem(siloItemToLibraryItem(e.Item, lib, baseURL), e))
-		}
-	} else {
-		items, n, err := h.deps.MediaStore.ListAudiobooks(r.Context(), lib.ID, limit, fetchOffset, access, query)
-		if err != nil {
-			http.Error(w, "list audiobooks: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		total = n
-		pageSlice = make([]LibraryItem, 0, len(items))
-		for _, item := range items {
-			pageSlice = append(pageSlice, siloItemToLibraryItem(item, lib, baseURL))
+		pageEnd = pageStart + limit
+		if pageEnd > len(collapsed) {
+			pageEnd = len(collapsed)
 		}
 	}
+	pageSlice := collapsed[pageStart:pageEnd]
 
 	// Serialise.
 	var results any
@@ -256,13 +279,16 @@ func (h *Handler) handleItemCover(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id required", http.StatusBadRequest)
 		return
 	}
-	// Reads only the poster column: this route runs once per cover on every
-	// bookshelf page.
-	target, err := h.deps.MediaStore.AudiobookPosterPath(r.Context(), contentID)
-	if err != nil || target == "" {
+	item, err := h.deps.MediaStore.GetAudiobookByID(r.Context(), contentID, emptyAccessFilter())
+	if err != nil || item == nil {
 		http.NotFound(w, r)
 		return
 	}
+	if item.PosterPath == "" {
+		http.NotFound(w, r)
+		return
+	}
+	target := item.PosterPath
 	// Raw silo paths (e.g. "local/audiobooks/.../original.webp") need to
 	// be resolved into a real URL via the CoverResolver before redirect;
 	// otherwise the client follows a relative path that doesn't exist on
@@ -284,13 +310,13 @@ func (h *Handler) handleItemCover(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAuthorImage — GET /authors/{id}/image. Public unauthenticated
-// route (mounted outside bearerAuth in handler.go). Reads only the photo path
-// of an audiobook author, then CoverResolver mints a presigned URL and we
-// 302-redirect to it.
+// route (mounted outside bearerAuth in handler.go). Uses MediaStore
+// to resolve the people row, then CoverResolver to mint a presigned
+// URL and 302-redirect to it.
 func (h *Handler) handleAuthorImage(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	photo, err := h.deps.MediaStore.AuthorPhotoPath(r.Context(), id)
-	if err != nil || photo == "" {
+	author, err := h.deps.MediaStore.GetAuthorByID(r.Context(), id, emptyAccessFilter())
+	if err != nil || author.PosterPath == "" {
 		http.Error(w, "author image not found", http.StatusNotFound)
 		return
 	}
@@ -298,7 +324,7 @@ func (h *Handler) handleAuthorImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "image resolver not configured", http.StatusServiceUnavailable)
 		return
 	}
-	url := h.deps.CoverResolver(r.Context(), photo, "")
+	url := h.deps.CoverResolver(r.Context(), author.PosterPath, "")
 	if url == "" {
 		http.Error(w, "image resolution failed", http.StatusNotFound)
 		return
@@ -464,25 +490,39 @@ func (h *Handler) handleLibrarySearch(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// narrators/tags/genres have no backing aggregation query in silo's
-	// catalog today and stay empty-but-present.
+	// Best-effort author/series buckets: silo has no dedicated search-scoped
+	// store query for these yet, so we reuse the existing aggregate listers
+	// (capped, same pattern as buildFilterData/handleLibraryAuthors/
+	// handleLibrarySeries) and filter client-side on a case-insensitive
+	// substring match. narrators/tags/genres have no backing aggregation
+	// query at all in silo's catalog today and stay empty-but-present.
+	qLower := strings.ToLower(q)
+	const fetchCap = 5000
+
 	authorsOut := []any{}
-	if rows, err := h.deps.MediaStore.SearchLibraryAuthors(r.Context(), lib.ID, q, limit, access); err == nil {
+	if rows, _, err := h.deps.MediaStore.ListLibraryAuthors(r.Context(), lib.ID, fetchCap, 0, "name", false, access); err == nil {
 		for _, a := range rows {
+			if !strings.Contains(strings.ToLower(a.Name), qLower) {
+				continue
+			}
 			authorsOut = append(authorsOut, map[string]any{
 				"id":        a.ID,
 				"name":      a.Name,
 				"numBooks":  a.NumBooks,
 				"libraryId": libID,
 			})
+			if len(authorsOut) >= limit {
+				break
+			}
 		}
-	} else {
-		slog.WarnContext(r.Context(), "abs author search failed", "component", "audiobooks", "library", lib.ID, "err", err)
 	}
 
 	seriesOut := []any{}
-	if rows, err := h.deps.MediaStore.SearchLibrarySeries(r.Context(), lib.ID, q, limit, access); err == nil {
+	if rows, _, err := h.deps.MediaStore.ListLibrarySeries(r.Context(), lib.ID, fetchCap, 0, access); err == nil {
 		for _, s := range rows {
+			if !strings.Contains(strings.ToLower(s.Name), qLower) {
+				continue
+			}
 			// Real ABS wraps series search hits as { series, books } — the
 			// series sub-object is the plain Series.toOldJSON() shape (no
 			// numBooks field there; we add it anyway since an extra key is
@@ -515,9 +555,10 @@ func (h *Handler) handleLibrarySearch(w http.ResponseWriter, r *http.Request) {
 				},
 				"books": seriesBooks,
 			})
+			if len(seriesOut) >= limit {
+				break
+			}
 		}
-	} else {
-		slog.WarnContext(r.Context(), "abs series search failed", "component", "audiobooks", "library", lib.ID, "err", err)
 	}
 
 	out := empty
@@ -757,11 +798,7 @@ func siloItemToMetadata(item *models.MediaItem) Metadata {
 		if name == "" {
 			continue
 		}
-		id := membership.Key
-		if id == "" {
-			id = SeriesID(name)
-		}
-		obj := SeriesObj{ID: id, Name: name}
+		obj := SeriesObj{ID: name, Name: name}
 		if membership.Index != nil {
 			obj.Sequence = strconv.FormatFloat(*membership.Index, 'f', -1, 64)
 		}
@@ -1001,64 +1038,4 @@ func includeHas(raw, want string) bool {
 		}
 	}
 	return false
-}
-
-// streamLibraryItems writes a whole-library items response as the store hands
-// over batches: `{"results":[` then each item, then the rest of envelope with
-// its total. A store failure before the first byte is a 500; after it, the
-// response is cut short, which the client sees as a broken body.
-func (h *Handler) streamLibraryItems(w http.ResponseWriter, r *http.Request, lib AudiobookLibrary, access catalog.AccessFilter, query ItemsQuery, minified bool, envelope map[string]any) {
-	baseURL := h.absBaseURL(r)
-	enc := json.NewEncoder(w)
-	started, first := false, true
-	onTotal := func(total int) error {
-		envelope["total"] = total
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		started = true
-		_, err := io.WriteString(w, `{"results":[`)
-		return err
-	}
-	emit := func(items []*models.MediaItem) error {
-		for _, item := range items {
-			if !first {
-				if _, err := io.WriteString(w, ","); err != nil {
-					return err
-				}
-			}
-			first = false
-			it := siloItemToLibraryItem(item, lib, baseURL)
-			var v any = it
-			if minified {
-				v = Minify(it)
-			}
-			if err := enc.Encode(v); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	err := h.deps.MediaStore.StreamAudiobooks(r.Context(), lib.ID, access, query, onTotal, emit)
-	if err != nil && !started {
-		http.Error(w, "list audiobooks: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err != nil {
-		slog.WarnContext(r.Context(), "abs whole-library listing cut short", "component", "audiobooks", "library", lib.ID, "err", err)
-		return
-	}
-	if !started {
-		// Nothing matched: the store reports no total and emits nothing.
-		envelope["results"] = []any{}
-		writeJSON(w, http.StatusOK, envelope)
-		return
-	}
-	delete(envelope, "results")
-	tail, err := json.Marshal(envelope)
-	if err != nil {
-		return
-	}
-	_, _ = io.WriteString(w, "],")
-	_, _ = w.Write(tail[1:])
-	_, _ = io.WriteString(w, "\n")
 }

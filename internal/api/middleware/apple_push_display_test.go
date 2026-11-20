@@ -24,7 +24,7 @@ type fakeSessionValidator struct {
 	err    error
 }
 
-func (f *fakeSessionValidator) ActiveSession(_ context.Context, id string, _ int) (auth.SessionAuthority, bool, error) {
+func (f *fakeSessionValidator) ActiveSession(_ context.Context, id string) (auth.SessionAuthority, bool, error) {
 	if f.err != nil {
 		return auth.SessionAuthority{}, false, f.err
 	}
@@ -64,7 +64,7 @@ func TestRequireApplePushDisplayAuth(t *testing.T) {
 		return afterAuth(viewer.RequireViewerAccess(RequireProfile(next)))
 	}
 	fallback := func(next http.Handler) http.Handler { return am.RequireAuth(postAuth(next)) }
-	inner := am.RequireApplePushDisplayAuth(fallback, nil, postAuth)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	inner := am.RequireApplePushDisplayAuth(fallback, postAuth)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotProfile = GetProfileID(r.Context())
 		gotClaims = GetClaims(r.Context())
 		w.WriteHeader(http.StatusNoContent)

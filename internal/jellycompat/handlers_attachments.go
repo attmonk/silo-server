@@ -34,9 +34,6 @@ func (h *PlaybackHandler) HandleAttachment(w http.ResponseWriter, r *http.Reques
 	}
 	mediaSourceID := chiURLParam(r, "routeMediaSourceId")
 	negotiated, source, err := h.resolvePlaybackRoute(r, session, routeID, mediaSourceID)
-	if writeIfPlaySessionUnreadable(w, r, err) {
-		return
-	}
 	if err != nil || source == nil || negotiated == nil || !mediaSourceIDsEqual(negotiated.RouteItemID, routeID) || !mediaSourceIDsEqual(source.ID, mediaSourceID) {
 		writeError(w, 404, "NotFound", "Playback source not found")
 		return
@@ -73,7 +70,7 @@ func (h *PlaybackHandler) HandleAttachment(w http.ResponseWriter, r *http.Reques
 	}
 	file, err := h.fileResolver.GetByID(r.Context(), source.FileID)
 	if err != nil {
-		writeCompatFileLookupError(w, r, source.FileID, err)
+		writeError(w, 404, "NotFound", "Media file not found")
 		return
 	}
 	attachCompatStream(r.Context(), session, negotiated, source.FileID)

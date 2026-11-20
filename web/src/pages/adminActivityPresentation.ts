@@ -1,25 +1,20 @@
 import type { AdminSession } from "@/api/types";
-import { codeNumber, englishText, t, type TextValues } from "@/i18n";
-import type { MessageKey } from "@/locales/keys";
 import { formatCodecLabel } from "@/lib/mediaFormat";
-import { formatDecimal } from "@/lib/numberFormat";
-import { formatClock } from "@/pages/adminDownloadPreparationPresentation";
 
 export function formatDecisionLabel(decision?: string): string {
   switch (decision) {
     case "direct":
-      return t("web.admin.activity.decision.direct");
+      return "Direct";
     case "copy":
-      return t("web.admin.activity.decision.copy");
+      return "Copy";
     case "remux":
-      return t("web.admin.activity.decision.remux");
+      return "Remux";
     case "hls":
-      // A protocol name, the same in every language.
       return "HLS";
     case "transcode":
-      return t("web.admin.activity.decision.transcode");
+      return "Transcode";
     default:
-      return t("web.admin.activity.decision.unknown");
+      return "Unknown";
   }
 }
 
@@ -117,62 +112,47 @@ export interface ActivityMethodMeta {
   badgeClass: string;
 }
 
-interface ActivityMethodStyle {
-  label: MessageKey;
-  description: MessageKey;
-  swatchClass: string;
-  badgeClass: string;
-}
-
 // Single source for the bucket -> label/color mapping. Every surface that
 // renders method tags, distribution bars, or legend dots derives from this so
 // the Admin Activity page, the dashboard stream cards, and the Server Activity
-// popover cannot drift apart. Labels are message keys, resolved per call.
-const ACTIVITY_METHOD_META: Record<string, ActivityMethodStyle> = {
+// popover cannot drift apart.
+const ACTIVITY_METHOD_META: Record<string, ActivityMethodMeta> = {
   direct: {
-    label: "web.common.activity.method.direct.label",
-    description: "web.common.activity.method.direct.description",
+    label: "Direct Play",
+    description: "The original file is delivered without modification.",
     swatchClass: "bg-success",
     badgeClass: "bg-success/10 text-success border-success/15",
   },
   remux: {
-    label: "web.common.activity.method.remux.label",
-    description: "web.common.activity.method.remux.description",
+    label: "Remux",
+    description: "Audio and video are copied into a streaming container without re-encoding.",
     swatchClass: "bg-info",
     badgeClass: "bg-info/10 text-info border-info/15",
   },
   direct_stream: {
-    label: "web.common.activity.method.directStream.label",
-    description: "web.common.activity.method.directStream.description",
+    label: "Direct Stream",
+    description: "Video is copied without re-encoding; audio is transcoded.",
     swatchClass: "bg-warning",
     badgeClass: "bg-warning/10 text-warning border-warning/15",
   },
   transcode: {
-    label: "web.common.activity.method.transcode.label",
-    description: "web.common.activity.method.transcode.description",
+    label: "Transcode",
+    description: "Video is re-encoded; audio may be copied or transcoded.",
     swatchClass: "bg-destructive",
     badgeClass: "bg-destructive/10 text-destructive border-destructive/15",
   },
 };
 
-const UNKNOWN_ACTIVITY_METHOD_META: ActivityMethodStyle = {
-  label: "web.common.activity.method.unknown.label",
-  description: "web.common.activity.method.unknown.description",
+const UNKNOWN_ACTIVITY_METHOD_META: ActivityMethodMeta = {
+  label: "Unknown",
+  description: "The server has not reported a recognized playback method.",
   swatchClass: "bg-muted-foreground",
   badgeClass: "bg-surface text-muted-foreground border-border",
 };
 
 /** Presentation (label + colors) for an activity method bucket. */
 export function activityMethodMeta(method: string): ActivityMethodMeta {
-  const style =
-    (Object.hasOwn(ACTIVITY_METHOD_META, method) ? ACTIVITY_METHOD_META[method] : undefined) ??
-    UNKNOWN_ACTIVITY_METHOD_META;
-  return {
-    label: t(style.label),
-    description: t(style.description),
-    swatchClass: style.swatchClass,
-    badgeClass: style.badgeClass,
-  };
+  return ACTIVITY_METHOD_META[method] ?? UNKNOWN_ACTIVITY_METHOD_META;
 }
 
 /**
@@ -231,35 +211,33 @@ export function formatTranscodeModeSummary(session: AdminSession): string | null
   // client-side software capability instead of "the audio stream is being
   // re-encoded". Name the work, not an acceleration mode.
   if (videoDecision !== "transcode") {
-    return t("web.admin.activity.transcodeMode.audioTranscode");
+    return "Audio Transcode";
   }
 
   const hwAccel = session.transcode_hw_accel?.trim().toLowerCase();
   switch (hwAccel) {
     case "qsv":
-      return t("web.admin.activity.transcodeMode.hardware", { accel: "QSV" });
+      return "HW QSV";
     case "vaapi":
-      return t("web.admin.activity.transcodeMode.hardware", { accel: "VAAPI" });
+      return "HW VAAPI";
     case "videotoolbox":
-      return t("web.admin.activity.transcodeMode.hardware", { accel: "VideoToolbox" });
+      return "HW VideoToolbox";
     case "none":
-      return t("web.admin.activity.transcodeMode.software");
+      return "SW";
     case "auto":
-      return t("web.admin.activity.transcodeMode.pending");
+      return "HW/SW pending";
     case "":
     case undefined:
-      return t("web.admin.activity.transcodeMode.unknown");
+      return "HW/SW unknown";
     default:
-      return t("web.admin.activity.transcodeMode.hardware", { accel: hwAccel.toUpperCase() });
+      return `HW ${hwAccel.toUpperCase()}`;
   }
 }
 
 /** Labels for a confirmed HDR-to-SDR executor in compact and detailed views. */
 export interface ToneMapSummary {
-  /** "HW Tone map" / "SW Tone map" in English. */
-  badge: string;
-  /** "Hardware" / "Software" in English. */
-  detail: string;
+  badge: "HW Tone map" | "SW Tone map";
+  detail: "Hardware" | "Software";
   mode: "hardware" | "software";
 }
 
@@ -272,53 +250,22 @@ export function formatToneMapSummary(session: AdminSession): ToneMapSummary | nu
 
   switch (session.tone_map_mode?.trim().toLowerCase()) {
     case "hardware":
-      return {
-        badge: t("web.admin.activity.toneMap.hardwareBadge"),
-        detail: t("web.admin.activity.toneMap.hardware"),
-        mode: "hardware",
-      };
+      return { badge: "HW Tone map", detail: "Hardware", mode: "hardware" };
     case "software":
-      return {
-        badge: t("web.admin.activity.toneMap.softwareBadge"),
-        detail: t("web.admin.activity.toneMap.software"),
-        mode: "software",
-      };
+      return { badge: "SW Tone map", detail: "Software", mode: "software" };
     default:
       return null;
   }
 }
 
-// Bitrate units (Mbps, kbps) are written the same way in every language.
 export function formatSessionBitrate(kbps?: number | null): string | null {
   if (!kbps || kbps <= 0) {
     return null;
   }
   if (kbps >= 1000) {
-    return `${formatDecimal(kbps / 1000, 1)} Mbps`;
+    return `${(kbps / 1000).toFixed(1)} Mbps`;
   }
   return `${Math.round(kbps)} kbps`;
-}
-
-export interface SessionBitrate {
-  /** The rate the viewer receives now. */
-  live: string | null;
-  /** The source file's bitrate. */
-  source: string | null;
-  /** The ceiling a transcode encodes to. */
-  limit: string | null;
-  /** Delivered rate as a share of the source's, 0 to 1; null when either is unknown. */
-  share: number | null;
-}
-
-export function getSessionBitrate(session: AdminSession): SessionBitrate {
-  const live = session.stream_bitrate_kbps ?? 0;
-  const source = session.source_bitrate_kbps ?? 0;
-  return {
-    live: formatSessionBitrate(live),
-    source: formatSessionBitrate(source),
-    limit: formatSessionBitrate(session.target_bitrate_kbps),
-    share: live > 0 && source > 0 ? Math.min(1, live / source) : null,
-  };
 }
 
 export function getSessionClientLabel(session: AdminSession): string {
@@ -350,57 +297,31 @@ export function getSessionClientLabelFull(session: AdminSession): string {
 export interface ActivityRouteNode {
   key: string;
   kind: "transcode" | "proxy" | "server" | "legacy";
-  /** The node's role: "Transcode", "Proxy", "Server" or "Node" in English. */
-  label: string;
+  label: "Transcode" | "Proxy" | "Server" | "Node";
   name: string;
 }
 
-/** Formats a message id: `t` for display, `englishText` for search and sort keys. */
-type FormatText = (id: MessageKey, values?: TextValues) => string;
-
 function namedRouteNode(
-  format: FormatText,
   kind: "transcode" | "proxy",
   name: string | undefined,
   id: number | undefined,
 ): ActivityRouteNode {
-  const label =
-    kind === "transcode"
-      ? format("web.admin.activity.route.transcode")
-      : format("web.admin.activity.route.proxy");
+  const label = kind === "transcode" ? "Transcode" : "Proxy";
   const trimmedName = name?.trim();
-  const unknownName =
-    kind === "transcode"
-      ? format("web.admin.activity.route.unknownTranscodeNode")
-      : format("web.admin.activity.route.unknownProxyNode");
   return {
     key: `${kind}:${id ?? trimmedName ?? "unknown"}`,
     kind,
     label,
-    name:
-      trimmedName ||
-      (id !== undefined
-        ? format("web.admin.activity.route.nodeId", { id: String(id) })
-        : unknownName),
+    name: trimmedName || (id !== undefined ? `Node #${id}` : `Unknown ${kind} node`),
   };
 }
 
-function reportingServerRouteNode(format: FormatText, session: AdminSession): ActivityRouteNode {
+function reportingServerRouteNode(session: AdminSession): ActivityRouteNode {
   const reportedName = session.reporting_node?.trim();
   if (!reportedName || reportedName.toLowerCase() === "local") {
-    return {
-      key: "server:local",
-      kind: "server",
-      label: format("web.admin.activity.route.server"),
-      name: format("web.admin.activity.route.localServer"),
-    };
+    return { key: "server:local", kind: "server", label: "Server", name: "Local server" };
   }
-  return {
-    key: `server:${reportedName}`,
-    kind: "server",
-    label: format("web.admin.activity.route.server"),
-    name: reportedName,
-  };
+  return { key: `server:${reportedName}`, kind: "server", label: "Server", name: reportedName };
 }
 
 /**
@@ -408,44 +329,29 @@ function reportingServerRouteNode(format: FormatText, session: AdminSession): Ac
  * registered node identify the API server, while rows from
  * older servers fall back to their legacy node fields.
  */
-export function getSessionRouteNodes(
-  session: AdminSession,
-  format: FormatText = t,
-): ActivityRouteNode[] {
+export function getSessionRouteNodes(session: AdminSession): ActivityRouteNode[] {
   const execution = session.routing_execution?.trim();
   const egress = session.routing_egress?.trim();
   const hasResolvedRoute = Boolean(session.routing_workload?.trim() || execution || egress);
 
   if (!hasResolvedRoute) {
     const reportedName = session.node_display_name?.trim() || session.reporting_node?.trim();
-    const isLocal = !reportedName || reportedName.toLowerCase() === "local";
-    // The key must not follow the interface language: filters hold it.
-    return [
-      {
-        key: isLocal ? "legacy:local" : `legacy:${reportedName}`,
-        kind: "legacy",
-        label: format("web.admin.activity.route.node"),
-        name: isLocal ? format("web.admin.activity.route.localServer") : reportedName,
-      },
-    ];
+    const name =
+      !reportedName || reportedName.toLowerCase() === "local" ? "Local server" : reportedName;
+    return [{ key: `legacy:${name}`, kind: "legacy", label: "Node", name }];
   }
 
   const nodes: ActivityRouteNode[] = [];
   const executionNodeName =
     session.routing_execution_node_name?.trim() || session.node_display_name;
   if (execution === "transcode") {
-    nodes.push(
-      namedRouteNode(format, "transcode", executionNodeName, session.routing_execution_node_id),
-    );
+    nodes.push(namedRouteNode("transcode", executionNodeName, session.routing_execution_node_id));
   } else if (execution === "proxy") {
-    nodes.push(
-      namedRouteNode(format, "proxy", executionNodeName, session.routing_execution_node_id),
-    );
+    nodes.push(namedRouteNode("proxy", executionNodeName, session.routing_execution_node_id));
   }
 
   if (egress === "proxy") {
     const egressNode = namedRouteNode(
-      format,
       "proxy",
       session.routing_egress_node_name,
       session.routing_egress_node_id,
@@ -456,13 +362,13 @@ export function getSessionRouteNodes(
   }
 
   if (egress === "api" || (execution === "api" && nodes.length === 0)) {
-    nodes.push(reportingServerRouteNode(format, session));
+    nodes.push(reportingServerRouteNode(session));
   }
-  return nodes.length > 0 ? nodes : [reportingServerRouteNode(format, session)];
+  return nodes.length > 0 ? nodes : [reportingServerRouteNode(session)];
 }
 
 export function formatSourceContainerSummary(session: AdminSession): string {
-  return formatContainer(session.source_container) || t("web.admin.activity.summary.unknownSource");
+  return formatContainer(session.source_container) || "Unknown source";
 }
 
 export function formatDeliveredContainerSummary(session: AdminSession): string {
@@ -476,22 +382,35 @@ export function formatDeliveredContainerSummary(session: AdminSession): string {
         ? "fMP4"
         : container === "mpegts"
           ? "MPEG-TS"
-          : formatContainer(container) || t("web.admin.activity.summary.unknownOutputContainer");
-    return session.output_protocol === "hls"
-      ? t("web.admin.activity.summary.hlsOutput", { container: label })
-      : label;
+          : formatContainer(container) || "Unknown output container";
+    return session.output_protocol === "hls" ? `${label} (HLS)` : label;
   }
-  const unknown = t("web.admin.activity.summary.unknownOutputContainer");
   return session.output_protocol === "hls"
-    ? t("web.admin.activity.summary.hlsOutput", { container: unknown })
-    : unknown;
+    ? "Unknown output container (HLS)"
+    : "Unknown output container";
+}
+
+export function formatContainerDetail(session: AdminSession): string {
+  const source = formatSourceContainerSummary(session);
+  if (session.output_container && normalizeContainerDecision(session.play_method) !== "direct") {
+    return `${source} → ${formatDeliveredContainerSummary(session)}`;
+  }
+  switch (normalizeContainerDecision(session.play_method)) {
+    case "direct":
+      return "Original container";
+    case "remux":
+    case "hls":
+      return "Repackaged for streaming; output container not reported";
+    default:
+      return "—";
+  }
 }
 
 export function formatVideoSummary(session: AdminSession): string {
   return (
     [formatCodec(session.source_video_codec), session.source_video_resolution?.trim()]
       .filter(Boolean)
-      .join(" · ") || t("web.admin.activity.summary.unknownSource")
+      .join(" · ") || "Unknown source"
   );
 }
 
@@ -520,8 +439,37 @@ export function formatDeliveredVideoSummary(session: AdminSession): string {
   return (
     [formatCodec(session.target_video_codec), deliveredResolutionLabel(session)]
       .filter(Boolean)
-      .join(" · ") || t("web.admin.activity.detail.transcoding")
+      .join(" · ") || "Transcoding"
   );
+}
+
+export function formatVideoDetail(session: AdminSession): string {
+  const decision = normalizeStreamDecision(session.video_decision || session.play_method);
+  const requestedSource = formatRequestedVideoSource(session);
+  const target = [formatCodec(session.target_video_codec), deliveredResolutionLabel(session)]
+    .filter(Boolean)
+    .join(" · ");
+
+  if (hasRequestedSourceSwitch(session) && requestedSource) {
+    const parts = [`Auto-switched from ${requestedSource}`];
+    if (target) {
+      parts.push(`Output → ${target}`);
+    } else if (decision === "transcode") {
+      parts.push("Transcoding");
+    }
+    return parts.join(" · ");
+  }
+
+  if (decision === "transcode") {
+    return target ? `Output → ${target}` : "Transcoding";
+  }
+  if (decision === "copy") {
+    return "Copied without re-encoding";
+  }
+  if (decision === "direct") {
+    return "No video conversion";
+  }
+  return "—";
 }
 
 export function formatAudioSummary(session: AdminSession): string {
@@ -532,9 +480,7 @@ export function formatAudioSummary(session: AdminSession): string {
   ]
     .filter(Boolean)
     .join(" ");
-  return (
-    [lead, format].filter(Boolean).join(" · ") || t("web.admin.activity.summary.unknownSource")
-  );
+  return [lead, format].filter(Boolean).join(" · ") || "Unknown source";
 }
 
 /**
@@ -560,118 +506,24 @@ export function formatDeliveredAudioSummary(session: AdminSession): string {
     return formatAudioSummary(session);
   }
 
-  return formatTargetAudio(session) || t("web.admin.activity.transcodeMode.audioTranscode");
+  return formatTargetAudio(session) || "Audio Transcode";
 }
 
-/** One stream's source format and, when the server converts it, what it delivers. */
-export interface StreamConversion {
-  /** The source format, compact: "HEVC 2160p", "TrueHD 7.1". */
-  source: string;
-  /** The delivered format; null when the stream reaches the viewer untouched. */
-  delivered: string | null;
-}
-
-function compactFormat(parts: (string | null | undefined)[]): string {
-  return parts.filter(Boolean).join(" ");
-}
-
-/** The video's source format and, for a video transcode, its output. */
-export function getVideoConversion(session: AdminSession): StreamConversion {
-  const source =
-    compactFormat([
-      formatCodec(session.source_video_codec),
-      session.source_video_resolution?.trim(),
-    ]) || t("web.admin.activity.summary.unknownSource");
-  if (normalizeStreamDecision(session.video_decision || session.play_method) !== "transcode") {
-    return { source, delivered: null };
-  }
-  return {
-    source,
-    delivered:
-      compactFormat([formatCodec(session.target_video_codec), deliveredResolutionLabel(session)]) ||
-      t("web.admin.activity.detail.transcoding"),
-  };
-}
-
-/** The audio's source format and, when the audio is re-encoded, its output. */
-export function getAudioConversion(session: AdminSession): StreamConversion {
-  const source =
-    compactFormat([
-      formatCodec(session.source_audio_codec),
-      formatChannelLayout(session.source_audio_channels),
-    ]) || t("web.admin.activity.summary.unknownSource");
+export function formatAudioDetail(session: AdminSession): string {
   const decision = normalizeStreamDecision(
     session.audio_decision || (session.transcode_audio ? "transcode" : session.play_method),
   );
-  if (decision !== "transcode") {
-    return { source, delivered: null };
+  if (decision === "transcode") {
+    const target = formatTargetAudio(session);
+    return target ? `→ ${target}` : "Audio Transcode";
   }
-  return {
-    source,
-    delivered: formatTargetAudio(session) || t("web.admin.activity.transcodeMode.audioTranscode"),
-  };
-}
-
-/** How far through the title playback is, 0 to 1; null when the length is unknown. */
-export function getPlaybackProgress(session: AdminSession): number | null {
-  if (session.file_duration == null || session.file_duration <= 0) {
-    return null;
+  if (decision === "copy") {
+    return "Copied without re-encoding";
   }
-  return Math.min(1, Math.max(0, session.position_seconds / session.file_duration));
-}
-
-export interface ActivityTotals {
-  /** Sessions whose video is re-encoded. */
-  videoTranscodes: number;
-  /** The summed delivered bitrate of the sessions that report one. */
-  bitrateKbps: number;
-  remote: number;
-  paused: number;
-}
-
-/** The counts the page summary line reports. */
-export function summarizeActivity(sessions: AdminSession[]): ActivityTotals {
-  const totals: ActivityTotals = { videoTranscodes: 0, bitrateKbps: 0, remote: 0, paused: 0 };
-  for (const session of sessions) {
-    if (classifyActivityMethod(session) === "transcode") totals.videoTranscodes++;
-    if (session.stream_bitrate_kbps && session.stream_bitrate_kbps > 0) {
-      totals.bitrateKbps += session.stream_bitrate_kbps;
-    }
-    if (session.stream_location === "remote") totals.remote++;
-    if (session.is_paused) totals.paused++;
+  if (decision === "direct") {
+    return "No audio conversion";
   }
-  return totals;
-}
-
-/**
- * Whether the route column says anything a row's location doesn't: some
- * session uses a non-default network, or the sessions take different routes.
- * On a single server every row's route is the same, so the column is hidden.
- */
-export function sessionRoutesVary(sessions: AdminSession[]): boolean {
-  const routes = new Set<string>();
-  for (const session of sessions) {
-    if (session.routing_network_provider) {
-      return true;
-    }
-    routes.add(
-      getSessionRouteNodes(session, englishText)
-        .map((node) => node.key)
-        .join(","),
-    );
-  }
-  return routes.size > 1;
-}
-
-/**
- * "Auto-switched from HEVC · 2160p" when the server plays another version of
- * the title than the one the viewer picked; null otherwise.
- */
-export function formatRequestedSourceSwitch(session: AdminSession): string | null {
-  const source = formatRequestedVideoSource(session);
-  return hasRequestedSourceSwitch(session) && source
-    ? t("web.admin.activity.detail.autoSwitched", { source })
-    : null;
+  return "—";
 }
 
 function hasRequestedSourceSwitch(session: AdminSession): boolean {
@@ -703,25 +555,19 @@ export function getPlaybackSessionTitle(session: AdminSession): string {
   if (session.series_name && session.season_number != null && session.episode_number != null) {
     return session.episode_name || `S${session.season_number}E${session.episode_number}`;
   }
-  return session.media_title || t("web.common.activity.title.file", { id: session.media_file_id });
+  return session.media_title || `File #${session.media_file_id}`;
 }
 
 export function getPlaybackSessionSubtitle(session: AdminSession): string | null {
   if (session.series_name && session.season_number != null && session.episode_number != null) {
-    const code = t("web.detail.episodeCode", {
-      season: codeNumber(session.season_number),
-      episode: codeNumber(session.episode_number),
-    });
-    return t("web.common.activity.subtitle.episode", {
-      code,
-      series: session.series_name,
-    });
+    const episode = `S${session.season_number}E${session.episode_number}`;
+    return session.series_name ? `${episode} · ${session.series_name}` : episode;
   }
   if (session.media_type === "movie") {
-    return t("web.common.activity.subtitle.movie");
+    return "Movie";
   }
   if (session.media_type === "series") {
-    return t("web.common.activity.subtitle.series");
+    return "Series";
   }
   return null;
 }
@@ -743,13 +589,4 @@ function formatChannelLayout(channels?: number | null): string | null {
     return "7.1";
   }
   return `${channels}ch`;
-}
-
-/** Playback position as "47:12 / 2:29:40", or the position alone when the duration is unknown. */
-export function formatPlaybackPosition(session: AdminSession): string {
-  const position = formatClock(session.position_seconds);
-  if (session.file_duration == null || session.file_duration <= 0) {
-    return position;
-  }
-  return `${position} / ${formatClock(session.file_duration)}`;
 }

@@ -1,6 +1,5 @@
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 import type { BrowseItem } from "@/api/types";
 import { catalogItemFromV2 } from "@/api/v2/catalog";
 import {
@@ -144,13 +143,13 @@ export function useToggleNotInterested(itemId: string) {
     },
     onError: (err, { itemId: target, authority }) => {
       if (err instanceof UndoProfileChangedError) {
-        toast.error(t("web.common.toast.notInterested.undoOtherProfile"));
+        toast.error("Switch back to the profile that marked this to undo it");
         return;
       }
       if (isCapturedProfileAuthorityActive(authority)) {
         setDetailNotInterested(queryClient, target, true);
       }
-      toast.error(t("web.common.toast.notInterested.undoFailed"));
+      toast.error("Failed to undo Not interested");
     },
     onSettled: (_data, _err, { itemId: target, authority }) => {
       if (isCapturedProfileAuthorityActive(authority)) settle(target);
@@ -179,11 +178,11 @@ export function useToggleNotInterested(itemId: string) {
     },
     onError: (_err, { itemId: target, marked, authority }) => {
       if (isActive(authority)) setDetailNotInterested(queryClient, target, marked);
-      toast.error(t("web.common.toast.notInterested.updateFailed"));
+      toast.error("Failed to update Not interested");
     },
     onSuccess: (_data, { itemId: target, marked, authority }) => {
       if (marked) {
-        toast.success(t("web.common.toast.notInterested.restored"));
+        toast.success("Back in your recommendations");
         return;
       }
       if (isActive(authority)) {
@@ -191,11 +190,11 @@ export function useToggleNotInterested(itemId: string) {
         bumpHomeRefreshSignal(queryClient);
       }
       toast.success(
-        t("web.common.toast.notInterested.hidden"),
+        "We won't recommend this",
         authority
           ? {
               action: {
-                label: t("web.common.toast.notInterested.undo"),
+                label: "Undo",
                 onClick: () => undo.mutate({ itemId: target, authority }),
               },
             }

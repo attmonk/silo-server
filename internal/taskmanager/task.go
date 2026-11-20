@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"time"
 )
 
 var (
@@ -54,25 +53,6 @@ type ScheduledConditionalTask interface {
 // never accept scheduled triggers.
 type ManualOnlyTask interface {
 	ManualOnly() bool
-}
-
-// DefaultFollowingTask marks a task whose schedule is its DefaultTriggers until
-// an administrator saves one. The manager never saves those defaults, so a
-// task whose defaults change (a plugin task's binding trigger or manifest
-// default) runs the new ones the next time it registers, while a saved
-// schedule always wins.
-type DefaultFollowingTask interface {
-	FollowsDefaultTriggers() bool
-}
-
-// StartSpreader spreads a task's scheduled starts across servers that share a
-// remote service, so a fleet scheduled at the same local time does not arrive
-// at once. Each daily or weekly run starts at its configured time plus a
-// random offset in [0, StartSpread()), chosen each time the run is scheduled.
-// The spread applies to stored and administrator-edited schedules alike; it
-// is not part of TriggerConfig. Manual runs start immediately.
-type StartSpreader interface {
-	StartSpread() time.Duration
 }
 
 // LibraryScopedTask marks a task whose work exists only for one kind of

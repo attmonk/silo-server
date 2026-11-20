@@ -7,7 +7,6 @@ import { adminUserScope, getAdminUser, type AdminUserEditor } from "@/api/v2/adm
 import { V2ProblemError } from "@/api/v2/request";
 import { useUpdateUser } from "@/hooks/queries/admin/users";
 import { adminKeys } from "@/hooks/queries/keys";
-import { t } from "@/i18n";
 
 import { useCardEditing, type AccessCardId } from "../cardEditing";
 
@@ -67,15 +66,14 @@ export function rebaseDraft<D>(draft: D, oldBase: D, freshBase: D): D {
   return next as D;
 }
 
-/** `R` names a changed row: the cards use the row label's message id. */
-export interface AccountCardDraft<D, R extends string = string> {
+export interface AccountCardDraft<D> {
   editing: boolean;
   draft: D | undefined;
   setDraft(update: (d: D) => D): void;
   /** The account the edit started from (or was last reloaded as). */
   base: AdminUser | undefined;
-  /** The rows that differ from `base`. */
-  changed: R[];
+  /** Labels of the rows that differ from `base`. */
+  changed: string[];
   conflict: boolean;
   saving: boolean;
   error: string;
@@ -94,12 +92,12 @@ export interface AccountCardDraft<D, R extends string = string> {
  * reloads, which swaps in the newer account and rebases the draft onto it:
  * the admin's own edits stay, and every other field takes the newer value.
  */
-export function useAccountCardDraft<D, R extends string = string>(opts: {
+export function useAccountCardDraft<D>(opts: {
   id: AccessCardId;
   editor: AdminUserEditor | undefined;
   toDraft: (user: AdminUser) => D;
   toBody: (draft: D, base: AdminUser) => UpdateUserRequest;
-  changedRows: (draft: D, base: D) => R[];
+  changedRows: (draft: D, base: D) => string[];
   /** Refuses a save, on every path that saves, with the message to show. */
   validate?: (draft: D, base: AdminUser) => string | null;
   extra?: CardExtraWrite<D>;
@@ -108,7 +106,7 @@ export function useAccountCardDraft<D, R extends string = string>(opts: {
    * each); defaults to a field-by-field rebase.
    */
   rebase?: (draft: D, oldBase: D, freshBase: D) => D;
-}): AccountCardDraft<D, R> {
+}): AccountCardDraft<D> {
   const { begin, update, end } = useCardEditing();
   const updateUser = useUpdateUser();
   const queryClient = useQueryClient();
@@ -175,23 +173,17 @@ export function useAccountCardDraft<D, R extends string = string>(opts: {
       if (hasBody) await updateUser.mutateAsync({ editor: captured, body });
       reset();
       end(opts.id);
-      toast.success(t("web.admin.users.detail.access.card.saved"));
+      toast.success("Saved");
       return true;
     } catch (err) {
-      const part = extraSaved
-        ? (opts.extra?.savedLabel ?? t("web.admin.users.detail.access.card.partOfCard"))
-        : undefined;
+      const partly = extraSaved ? `${opts.extra?.savedLabel ?? "Part of this card"} saved. ` : "";
       if (isConflict(err)) {
         setConflict(true);
-        if (part) setError(t("web.admin.users.detail.access.card.partlySavedConflict", { part }));
+        if (partly)
+          setError(`${partly}The account change wasn't, because another admin changed it.`);
       } else {
-        const reason =
-          err instanceof Error ? err.message : t("web.admin.users.detail.access.card.saveFailed");
-        setError(
-          part
-            ? t("web.admin.users.detail.access.card.partlySavedFailed", { part, reason })
-            : reason,
-        );
+        const reason = err instanceof Error ? err.message : "Could not save this account.";
+        setError(partly ? `${partly}The account change wasn't: ${reason}` : reason);
       }
       return false;
     } finally {
@@ -241,9 +233,7 @@ export function useAccountCardDraft<D, R extends string = string>(opts: {
         queryKey: [...adminKeys.users(), adminUserScope(captured.profileContext)],
       });
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : t("web.admin.users.detail.access.card.reloadFailed"),
-      );
+      setError(err instanceof Error ? err.message : "Could not reload this account.");
     } finally {
       busy.current = false;
       setSaving(false);

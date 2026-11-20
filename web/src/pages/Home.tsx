@@ -1,12 +1,9 @@
 /* eslint-disable react-hooks/set-state-in-effect -- section state resets when the layout or cache changes, and the reveal gates follow sidebar transitions */
-import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSectionTitle } from "@/lib/sectionTitle";
-import { useT, type Translate } from "@/i18n";
+import { memo, startTransition, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
 import { LayoutDashboard } from "lucide-react";
 import HeroBanner from "@/components/HeroBanner";
-import { loadErrorDescription } from "@/components/loadErrorDescription";
 import SectionRow from "@/components/SectionRow";
 import TasteSeedBanner from "@/components/TasteSeedBanner";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -20,7 +17,6 @@ import {
   HOME_SECTION_STALE_TIME,
   useHomeLayout,
 } from "@/hooks/queries/sections";
-import { completeHomeRow, homeRowItemLimit, homeRowShownCount } from "@/hooks/queries/homeRowLimit";
 import { planNextHomeSectionBatch } from "./homeSectionQueue";
 import { buildHomeSectionViewModel, type HomeSectionSlot } from "./homeSectionState";
 import { collectCachedHomeSections } from "./homeSectionCache";
@@ -28,8 +24,11 @@ import { useDedupedSections } from "./sectionDedupe";
 import { useSectionRefreshSignal } from "./homeSurfaceRefresh";
 import { useUICustomization } from "@/hooks/useUICustomization";
 import { carouselIntrinsicHeight } from "@/lib/uiCustomization";
-import { isFirefoxEngine, isWebKitEngine } from "@/hooks/useImmediateSidebarCollapse";
-import { prefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
+import {
+  isFirefoxEngine,
+  isWebKitEngine,
+  prefersReducedMotion,
+} from "@/hooks/useImmediateSidebarCollapse";
 import { SIDEBAR_DETAILS_REVEAL_DEADLINE_MS } from "@/components/sidebarItemNavigation";
 import { markCriticalContentLoaded } from "@/lib/startupPriority";
 
@@ -44,16 +43,14 @@ const DESKTOP_SIDEBAR_QUERY = "(min-width: 64rem)";
 
 export default function Home() {
   const queryClient = useQueryClient();
-  const { data, isLoading, isError, error, refetch } = useHomeLayout();
+  const { data, isLoading, isError, refetch } = useHomeLayout();
   const { data: homeRefreshSignal = 0 } = useSectionRefreshSignal();
   const { cardPresentation } = useUICustomization();
-  const sectionTitle = useSectionTitle();
-  const t = useT();
   const [rowRestorationReady, setRowRestorationReady] = useState(
     () => !shouldWaitForSidebarReturn(),
   );
 
-  useDocumentTitle(t("web.home.page.title"));
+  useDocumentTitle("Home");
 
   const layout = useMemo(() => data?.sections ?? [], [data?.sections]);
   const layoutResetKey = layout
@@ -71,12 +68,6 @@ export default function Home() {
   const [inFlightIds, setInFlightIds] = useState<Set<string>>(new Set());
   const [completedIds, setCompletedIds] = useState<Set<string>>(() =>
     freshCachedHomeSectionIds(queryClient, layout),
-  );
-  // Rows that loaded the rest of their cards, in the order they did, each with
-  // how many cards it showed before (see dropCrossSectionDuplicates). Cached
-  // rows bring theirs back, so a return to Home filters as it did before.
-  const [shownCounts, setShownCounts] = useState<ReadonlyMap<string, number>>(() =>
-    cachedShownCounts(queryClient, layout),
   );
   // Every reset below starts a new load generation. A request only reports
   // back into the generation that started it.
@@ -125,12 +116,6 @@ export default function Home() {
     setLoadedSections((current) =>
       mapsHaveSameEntries(current, cachedSections) ? current : cachedSections,
     );
-    const cachedCounts = cachedShownCounts(queryClient, layout);
-    setShownCounts((current) => {
-      let next = current;
-      for (const [sectionId, shown] of cachedCounts) next = withShownCount(next, sectionId, shown);
-      return next;
-    });
     setFailedIds((current) => (current.size === 0 ? current : new Set()));
     setInFlightIds((current) => (current.size === 0 ? current : new Set()));
     const nextCompletedIds = cacheReset
@@ -141,8 +126,7 @@ export default function Home() {
     );
 
     return () => {
-      // Cancelling settles each in-flight request with the data last written
-      // to the cache, which keeps an edit made while it ran (a dismissal), or
+      // Cancelling settles each in-flight request with its pre-fetch data, or
       // a CancelledError when there was none. Neither answers the next
       // generation, which re-requests these sections itself.
       loadGenerationRef.current += 1;
@@ -171,28 +155,11 @@ export default function Home() {
       return next;
     });
 
-    const featuredIds = new Set(
-      layout.filter((section) => section.featured).map((section) => section.id),
-    );
     nextIds.forEach((sectionId) => {
-      const queryKey = sectionKeys.homeItems(sectionId);
-      const featured = featuredIds.has(sectionId);
       void queryClient
         .fetchQuery<HomeSectionItemsResponse>({
-          queryKey,
-          queryFn: async ({ signal }) => {
-            const cached = queryClient.getQueryData<HomeSectionItemsResponse>(queryKey);
-            const response = await fetchHomeSectionItems(sectionId, {
-              signal,
-              featured,
-              itemLimit: homeRowItemLimit(featured, cached),
-            });
-            // A row the viewer extended comes back whole; the duplicate
-            // filter keeps comparing the cards it showed before.
-            return cached?.shown === undefined || response.partial
-              ? response
-              : { ...response, shown: cached.shown, shownAt: cached.shownAt };
-          },
+          queryKey: sectionKeys.homeItems(sectionId),
+          queryFn: ({ signal }) => fetchHomeSectionItems(sectionId, { signal }),
           staleTime: HOME_SECTION_STALE_TIME,
           gcTime: HOME_SECTION_GC_TIME,
         })
@@ -204,8 +171,6 @@ export default function Home() {
             next.set(sectionId, response.section);
             return next;
           });
-          const shown = homeRowShownCount(featured, response);
-          setShownCounts((prev) => withShownCount(prev, sectionId, shown));
           setFailedIds((prev) => {
             if (!prev.has(sectionId)) return prev;
             const next = new Set(prev);
@@ -252,7 +217,7 @@ export default function Home() {
     if (hasFirstContent) markCriticalContentLoaded();
   }, [hasFirstContent]);
 
-  const visibleSections = useDedupedSections(layout, loadedSections, shownCounts);
+  const visibleSections = useDedupedSections(layout, loadedSections);
 
   const viewModel = buildHomeSectionViewModel({
     layout,
@@ -276,53 +241,6 @@ export default function Home() {
       );
   };
 
-  // Reads the whole of a row loaded in part, one the server said holds more
-  // cards than it answered (see homeRowResponse), once its carousel nears the
-  // last card, keeping the cards it shows in place. On failure the row keeps
-  // what it has, and scrolling near its end again retries.
-  const completingIdsRef = useRef(new Set<string>());
-  const completeSection = useCallback(
-    (sectionId: string) => {
-      const queryKey = sectionKeys.homeItems(sectionId);
-      const shown = queryClient.getQueryData<HomeSectionItemsResponse>(queryKey);
-      if (!shown?.partial || completingIdsRef.current.has(sectionId)) return;
-      completingIdsRef.current.add(sectionId);
-      const generation = loadGenerationRef.current;
-      void queryClient
-        .fetchQuery<HomeSectionItemsResponse>({
-          queryKey,
-          queryFn: ({ signal }) =>
-            fetchHomeSectionItems(sectionId, { signal }).then((whole) =>
-              completeHomeRow(
-                shown,
-                whole,
-                queryClient.getQueryData<HomeSectionItemsResponse>(queryKey) ?? shown,
-              ),
-            ),
-          staleTime: 0,
-          gcTime: HOME_SECTION_GC_TIME,
-        })
-        .then((response) => {
-          if (loadGenerationRef.current !== generation) return;
-          setLoadedSections((prev) => new Map(prev).set(sectionId, response.section));
-          setShownCounts((prev) => withShownCount(prev, sectionId, response.shown));
-        })
-        .catch(() => undefined)
-        .finally(() => completingIdsRef.current.delete(sectionId));
-    },
-    [queryClient],
-  );
-
-  // A row loaded in part that shows no cards, because the duplicate filter
-  // took every one or the viewer dismissed them, is hidden and has no
-  // carousel to report its end; it reads the rest at once, which may hold
-  // cards to show. A row the server answered empty is never loaded in part.
-  useEffect(() => {
-    for (const [sectionId, section] of visibleSections) {
-      if (section.items.length === 0) completeSection(sectionId);
-    }
-  }, [completeSection, visibleSections]);
-
   const retrySection = (sectionId: string) => {
     queryClient.removeQueries({ queryKey: sectionKeys.homeItems(sectionId) });
     setFailedIds((prev) => {
@@ -338,7 +256,7 @@ export default function Home() {
       return next;
     });
   };
-  const heroSlot = renderHeroSlot(viewModel.hero, retrySection, refreshSection, sectionTitle, t);
+  const heroSlot = renderHeroSlot(viewModel.hero, retrySection, refreshSection);
   const hasHeroSlot = heroSlot !== null;
   const rowPlaceholderHeight = carouselIntrinsicHeight(cardPresentation.poster_size);
   // Rows count toward the eager budget by layout position: a loading or
@@ -354,16 +272,16 @@ export default function Home() {
     return (
       <div className="page-shell flex min-h-[50vh] items-center justify-center py-12">
         <div className="surface-panel max-w-md rounded-[1.8rem] border-0 p-6 text-center shadow-none">
-          <p className="text-lg font-semibold">{t("web.home.page.loadFailedTitle")}</p>
+          <p className="text-lg font-semibold">Unable to load the homepage</p>
           <p className="text-muted-foreground mt-2 text-sm">
-            {loadErrorDescription(error, t("web.home.page.loadFailedBody"))}
+            We couldn&apos;t load your section layout right now.
           </p>
           <button
             type="button"
             onClick={() => void refetch()}
             className="border-border hover:bg-muted/40 mt-4 rounded-lg border px-4 py-2 text-sm font-medium"
           >
-            {t("common.retry")}
+            Retry
           </button>
         </div>
       </div>
@@ -372,7 +290,7 @@ export default function Home() {
 
   return (
     <>
-      <h1 className="sr-only">{t("web.home.page.title")}</h1>
+      <h1 className="sr-only">Home</h1>
       <div className={`space-y-10 ${hasHeroSlot ? "pb-2" : "pt-6 pb-2"}`}>
         {heroSlot}
         <TasteSeedBanner />
@@ -390,7 +308,6 @@ export default function Home() {
                 eager={rowIndex < EAGER_HOME_ROW_COUNT}
                 deferFirstCommit={initialCachedSections.has(slot.layout.id)}
                 priority={rowIndex === 0 && !hasHeroSlot}
-                onNearEnd={completeSection}
                 restorationReady={rowRestorationReady}
                 placeholderHeight={rowPlaceholderHeight}
                 restoreDelayMs={Math.min(
@@ -405,23 +322,25 @@ export default function Home() {
             return (
               <SectionErrorRow
                 key={slot.layout.id}
-                title={sectionTitle(slot.layout)}
+                title={slot.layout.title}
                 onRetry={() => retrySection(slot.layout.id)}
               />
             );
           }
-          return <SectionLoadingRow key={slot.layout.id} title={sectionTitle(slot.layout)} />;
+          return <SectionLoadingRow key={slot.layout.id} title={slot.layout.title} />;
         })}
 
         {layout.length === 0 && !isLoading && (
           <div className="surface-panel flex h-64 flex-col items-center justify-center gap-3 rounded-[1.8rem] border-0 px-6 text-center">
             <LayoutDashboard className="text-muted-foreground h-10 w-10" />
-            <p className="text-muted-foreground text-sm">{t("web.home.page.emptyLayout")}</p>
+            <p className="text-muted-foreground text-sm">
+              Your home screen is empty. Customize it by adding sections to display your media.
+            </p>
             <Link
               to="/settings/home-screen"
               className="text-primary text-sm font-medium hover:underline"
             >
-              {t("web.home.page.customize")}
+              Customize Home Screen
             </Link>
           </div>
         )}
@@ -435,7 +354,6 @@ const DeferredHomeSection = memo(function DeferredHomeSection({
   eager,
   deferFirstCommit,
   priority,
-  onNearEnd,
   restorationReady,
   placeholderHeight,
   restoreDelayMs,
@@ -446,8 +364,6 @@ const DeferredHomeSection = memo(function DeferredHomeSection({
   deferFirstCommit: boolean;
   /** The first row, on screen at first paint. */
   priority: boolean;
-  /** Loads the rest of a row loaded in part. */
-  onNearEnd: (sectionId: string) => void;
   restorationReady: boolean;
   placeholderHeight: string;
   restoreDelayMs: number;
@@ -506,7 +422,7 @@ const DeferredHomeSection = memo(function DeferredHomeSection({
     };
   }, [eager, rendered, restorationReady, restoreDelayMs]);
 
-  if (rendered) return <SectionRow section={section} priority={priority} onNearEnd={onNearEnd} />;
+  if (rendered) return <SectionRow section={section} priority={priority} />;
 
   return (
     <div
@@ -555,42 +471,6 @@ function freshCachedHomeSectionIds(
   );
 }
 
-// The cached rows' shownCounts entries, in the order they were completed. A
-// row read whole without a completion counts from its last write, which any
-// cache edit moves. Ties keep layout order.
-function cachedShownCounts(
-  queryClient: QueryClient,
-  layout: ResolvedSectionLayout[],
-): Map<string, number> {
-  const rows = layout.flatMap((section) => {
-    const state = queryClient.getQueryState<HomeSectionItemsResponse>(
-      sectionKeys.homeItems(section.id),
-    );
-    const shown = homeRowShownCount(section.featured, state?.data);
-    if (!state || shown === undefined) return [];
-    return [{ id: section.id, shown, at: state.data?.shownAt ?? state.dataUpdatedAt }];
-  });
-  return new Map(rows.sort((a, b) => a.at - b.at).map((row) => [row.id, row.shown]));
-}
-
-// counts with sectionId's entry set to shown, or removed when shown is
-// undefined. A new entry goes at the end; one it already has keeps its place,
-// so a cache edit that removes shown cards moves the count without
-// reordering the rows.
-function withShownCount(
-  counts: ReadonlyMap<string, number>,
-  sectionId: string,
-  shown: number | undefined,
-): ReadonlyMap<string, number> {
-  if (shown !== undefined) {
-    return counts.get(sectionId) === shown ? counts : new Map(counts).set(sectionId, shown);
-  }
-  if (!counts.has(sectionId)) return counts;
-  const next = new Map(counts);
-  next.delete(sectionId);
-  return next;
-}
-
 function mapsHaveSameEntries<K, V>(left: Map<K, V>, right: Map<K, V>): boolean {
   if (left.size !== right.size) return false;
   for (const [key, value] of left) {
@@ -611,8 +491,6 @@ function renderHeroSlot(
   hero: HomeSectionSlot | null,
   retrySection: (sectionId: string) => void,
   refreshSection: (sectionId: string) => void,
-  sectionTitle: (section: ResolvedSectionLayout) => string,
-  t: Translate,
 ) {
   if (!hero) return null;
 
@@ -629,19 +507,21 @@ function renderHeroSlot(
   if (hero.state === "error") {
     return (
       <div
-        className={`bg-muted relative flex flex-col ${HERO_BANNER_SIZE} w-full overflow-hidden rounded-[1.8rem]`}
+        className={`bg-muted relative ${HERO_BANNER_SIZE} w-full overflow-hidden rounded-[1.8rem]`}
       >
         <div className="from-background via-background/70 absolute inset-0 bg-gradient-to-t to-transparent" />
-        <div className="relative flex flex-1 items-end px-4 pb-10 sm:px-6 sm:pb-12 lg:px-12 lg:pb-16">
+        <div className="relative flex h-full items-end px-4 pb-10 sm:px-6 sm:pb-12 lg:px-12 lg:pb-16">
           <div className="max-w-xl space-y-3">
-            <p className="text-3xl font-bold">{sectionTitle(hero.layout)}</p>
-            <p className="text-muted-foreground text-sm">{t("web.home.page.heroFailed")}</p>
+            <p className="text-3xl font-bold">{hero.layout.title}</p>
+            <p className="text-muted-foreground text-sm">
+              This featured section could not be loaded right now.
+            </p>
             <button
               type="button"
               onClick={() => retrySection(hero.layout.id)}
               className="border-border hover:bg-muted/40 rounded-lg border px-4 py-2 text-sm font-medium"
             >
-              {t("web.home.page.retrySection")}
+              Retry section
             </button>
           </div>
         </div>
@@ -694,18 +574,17 @@ function SectionLoadingRow({ title }: { title: string }) {
 }
 
 function SectionErrorRow({ title, onRetry }: { title: string; onRetry: () => void }) {
-  const t = useT();
   return (
     <section className="space-y-3 px-4 sm:px-6 lg:px-12">
       <h2 className="text-foreground h-6 text-sm font-semibold">{title}</h2>
       <div className="surface-panel flex items-center justify-between rounded-[1.4rem] border-0 px-5 py-4">
-        <p className="text-muted-foreground text-sm">{t("web.home.page.sectionFailed")}</p>
+        <p className="text-muted-foreground text-sm">This section could not be loaded right now.</p>
         <button
           type="button"
           onClick={onRetry}
           className="border-border hover:bg-muted/40 rounded-lg border px-4 py-2 text-sm font-medium"
         >
-          {t("common.retry")}
+          Retry
         </button>
       </div>
     </section>

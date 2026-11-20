@@ -5,7 +5,6 @@ import { UnsavedChangesGuard } from "@/components/UnsavedChangesGuard";
 import { useAdminNodes } from "@/hooks/queries/admin/nodes";
 import { useRestartKeys } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
-import { useT, type MessageKey, type Translate } from "@/i18n";
 
 import { FieldGroup } from "./FieldGroup";
 import { SettingField, SettingFieldRow, SettingFieldStatus } from "./SettingField";
@@ -14,86 +13,55 @@ import { hasUsableTranscodeNode } from "./playbackSettings.utils";
 // is not one of them.
 import "@/styles/admin-settings.css";
 
-interface RoutingOption {
-  value: string;
-  label: MessageKey;
-}
-
-const executionOptions: readonly RoutingOption[] = [
-  { value: "prefer_worker", label: "web.admin.settings.nodeRouting.execution.preferWorker" },
-  { value: "prefer_transcode", label: "web.admin.settings.nodeRouting.execution.preferTranscode" },
-  { value: "worker_only", label: "web.admin.settings.nodeRouting.execution.workerOnly" },
-  { value: "prefer_api", label: "web.admin.settings.nodeRouting.option.preferApi" },
-  { value: "api_only", label: "web.admin.settings.nodeRouting.option.apiOnly" },
+const executionOptions = [
+  { value: "prefer_worker", label: "Prefer any worker" },
+  { value: "prefer_transcode", label: "Prefer transcode node" },
+  { value: "worker_only", label: "Any worker only" },
+  { value: "prefer_api", label: "Prefer API server" },
+  { value: "api_only", label: "API server only" },
 ];
 
-const egressOptions: readonly RoutingOption[] = [
-  { value: "prefer_proxy", label: "web.admin.settings.nodeRouting.egress.preferProxy" },
-  { value: "proxy_only", label: "web.admin.settings.nodeRouting.egress.proxyOnly" },
-  { value: "prefer_api", label: "web.admin.settings.nodeRouting.option.preferApi" },
-  { value: "api_only", label: "web.admin.settings.nodeRouting.option.apiOnly" },
+const egressOptions = [
+  { value: "prefer_proxy", label: "Prefer proxy" },
+  { value: "proxy_only", label: "Proxy only" },
+  { value: "prefer_api", label: "Prefer API server" },
+  { value: "api_only", label: "API server only" },
 ];
 
 type ExecutionWorkload = "remux" | "video_transcode";
 
-// A remux can fall back from a transcode node to any worker; a video
-// transcode runs only on transcode nodes.
-function executionPreview(t: Translate, value: string, workload: ExecutionWorkload) {
-  const remux = workload === "remux";
+function executionPreview(value: string, workload: ExecutionWorkload) {
+  const worker = workload === "remux" ? "Any worker" : "Transcode node";
   switch (value) {
     case "prefer_transcode":
-      return t(
-        remux
-          ? "web.admin.settings.nodeRouting.preview.remux.preferTranscode"
-          : "web.admin.settings.nodeRouting.preview.videoTranscode.preferTranscode",
-      );
+      return workload === "remux" ? "Transcode node → any worker → API" : "Transcode node → API";
     case "worker_only":
-      return t(
-        remux
-          ? "web.admin.settings.nodeRouting.preview.remux.workerOnly"
-          : "web.admin.settings.nodeRouting.preview.videoTranscode.workerOnly",
-      );
+      return `${worker} only`;
     case "prefer_api":
-      return t(
-        remux
-          ? "web.admin.settings.nodeRouting.preview.remux.preferApi"
-          : "web.admin.settings.nodeRouting.preview.videoTranscode.preferApi",
-      );
+      return `API → ${worker.toLowerCase()}`;
     case "api_only":
-      return t("web.admin.settings.nodeRouting.preview.apiOnly");
+      return "API only";
     default:
-      return t(
-        remux
-          ? "web.admin.settings.nodeRouting.preview.remux.preferWorker"
-          : "web.admin.settings.nodeRouting.preview.videoTranscode.preferTranscode",
-      );
+      return `${worker} → API`;
   }
 }
 
-function egressPreview(t: Translate, value: string) {
+function egressPreview(value: string) {
   switch (value) {
     case "proxy_only":
-      return t("web.admin.settings.nodeRouting.preview.egress.proxyOnly");
+      return "Proxy only";
     case "prefer_api":
-      return t("web.admin.settings.nodeRouting.preview.egress.preferApi");
+      return "API → proxy";
     case "api_only":
-      return t("web.admin.settings.nodeRouting.preview.apiOnly");
+      return "API only";
     default:
-      return t("web.admin.settings.nodeRouting.preview.egress.preferProxy");
+      return "Proxy → API";
   }
 }
 
 /** The whole path for a workload that needs an executor, e.g. "Worker → API · Proxy → API". */
-function routePreview(
-  t: Translate,
-  execution: string,
-  egress: string,
-  workload: ExecutionWorkload,
-) {
-  return t("web.admin.settings.nodeRouting.preview.route", {
-    execution: executionPreview(t, execution, workload),
-    egress: egressPreview(t, egress),
-  });
+function routePreview(execution: string, egress: string, workload: ExecutionWorkload) {
+  return `${executionPreview(execution, workload)} · ${egressPreview(egress)}`;
 }
 
 // A routing policy either picks who runs the work (execution) or who serves the
@@ -120,49 +88,43 @@ const FORM_KEYS: string[] = [...ROUTING_KEYS];
 
 interface RoutingField {
   key: RoutingKey;
-  label: MessageKey;
+  label: string;
   kind: RoutingKind;
-  description?: MessageKey;
+  description?: string;
 }
 
 // One row per key in ROUTING_KEYS, in the order they render.
 const ROUTING_FIELDS: readonly RoutingField[] = [
   {
     key: "playback.routing.direct_play_egress",
-    label: "web.admin.settings.nodeRouting.fields.directPlayEgress.label",
+    label: "Direct play egress",
     kind: "egress",
-    description: "web.admin.settings.nodeRouting.fields.directPlayEgress.description",
+    description: "Original bytes need no executor.",
   },
   {
     key: "playback.routing.remux_execution",
-    label: "web.admin.settings.nodeRouting.fields.remuxExecution.label",
+    label: "Remux execution",
     kind: "execution",
-    description: "web.admin.settings.nodeRouting.fields.remuxExecution.description",
+    description:
+      "A worker can be a proxy or transcode node. Prefer transcode node runs HLS or progressive remux there when supported; progressive output is relayed through the selected proxy.",
   },
-  {
-    key: "playback.routing.remux_egress",
-    label: "web.admin.settings.nodeRouting.fields.remuxEgress.label",
-    kind: "egress",
-  },
+  { key: "playback.routing.remux_egress", label: "Remux egress", kind: "egress" },
   {
     key: "playback.routing.video_transcode_execution",
-    label: "web.admin.settings.nodeRouting.fields.videoTranscodeExecution.label",
+    label: "Video transcode execution",
     kind: "execution",
-    description: "web.admin.settings.nodeRouting.fields.videoTranscodeExecution.description",
+    description: "Video transcode workers are transcode nodes; proxy nodes only provide egress.",
   },
   {
     key: "playback.routing.video_transcode_egress",
-    label: "web.admin.settings.nodeRouting.fields.videoTranscodeEgress.label",
+    label: "Video transcode egress",
     kind: "egress",
   },
 ];
 
-const ROUTING_PRESETS: Record<
-  string,
-  { label: MessageKey; values: Readonly<Record<RoutingKey, string>> }
-> = {
+const ROUTING_PRESETS = {
   standard: {
-    label: "web.admin.settings.nodeRouting.presets.standard",
+    label: "Silo Defaults",
     values: {
       "playback.routing.direct_play_egress": "prefer_proxy",
       "playback.routing.remux_execution": "prefer_transcode",
@@ -172,7 +134,7 @@ const ROUTING_PRESETS: Record<
     },
   },
   gpu: {
-    label: "web.admin.settings.nodeRouting.presets.gpu",
+    label: "GPU offload",
     values: {
       "playback.routing.direct_play_egress": "prefer_api",
       "playback.routing.remux_execution": "prefer_api",
@@ -182,7 +144,7 @@ const ROUTING_PRESETS: Record<
     },
   },
   central: {
-    label: "web.admin.settings.nodeRouting.presets.central",
+    label: "Central egress",
     values: {
       "playback.routing.direct_play_egress": "api_only",
       "playback.routing.remux_execution": "prefer_worker",
@@ -191,7 +153,7 @@ const ROUTING_PRESETS: Record<
       "playback.routing.video_transcode_egress": "api_only",
     },
   },
-};
+} as const;
 
 /** One line of the preferred-path summary: workload on the left, route on the right. */
 function PreferredPathRow({ label, route }: { label: string; route: string }) {
@@ -209,7 +171,6 @@ function PreferredPathRow({ label, route }: { label: string; route: string }) {
  * means anything once nodes exist, and it saves through its own bar.
  */
 export function NodeRoutingSettings() {
-  const t = useT();
   const form = useSettingsForm({ keys: FORM_KEYS });
   const restartKeys = useRestartKeys();
   const nodes = useAdminNodes();
@@ -250,14 +211,14 @@ export function NodeRoutingSettings() {
           own staged routing edits. */}
       <UnsavedChangesGuard />
       <FieldGroup
-        label={t("web.admin.settings.nodeRouting.group")}
-        description={t("web.admin.settings.nodeRouting.description")}
+        label="Where playback work runs"
+        description="Which machine runs a remux or transcode, and which one sends the stream to the player. A preferred route falls back to the API server; an “only” route never does."
         restartAll={ROUTING_KEYS.every((key) => restartKeys.has(key))}
         dirty={routingDirty}
       >
         <SettingFieldRow
-          label={t("web.admin.settings.nodeRouting.presets.label")}
-          description={t("web.admin.settings.nodeRouting.presets.description")}
+          label="Routing preset"
+          description="Sets all five routes under Advanced at once; Custom is not stored."
         >
           <div className="flex flex-wrap justify-end gap-2">
             {Object.entries(ROUTING_PRESETS).map(([id, preset]) => (
@@ -268,13 +229,11 @@ export function NodeRoutingSettings() {
                 variant={activeRoutingPreset === preset ? "default" : "outline"}
                 onClick={() => applyRoutingPreset(preset.values)}
               >
-                {t(preset.label)}
+                {preset.label}
               </Button>
             ))}
             {!activeRoutingPreset && (
-              <span className="text-muted-foreground self-center text-xs">
-                {t("web.admin.settings.nodeRouting.presets.custom")}
-              </span>
+              <span className="text-muted-foreground self-center text-xs">Custom</span>
             )}
           </div>
         </SettingFieldRow>
@@ -285,13 +244,10 @@ export function NodeRoutingSettings() {
           {ROUTING_FIELDS.map((field) => (
             <SettingField
               key={field.key}
-              label={t(field.label)}
+              label={field.label}
               type="select"
-              options={ROUTING_KINDS[field.kind].options.map((option) => ({
-                value: option.value,
-                label: t(option.label),
-              }))}
-              description={field.description && t(field.description)}
+              options={ROUTING_KINDS[field.kind].options}
+              description={field.description}
               value={routingValues[field.key] || ROUTING_KINDS[field.kind].serverDefault}
               onChange={(v) => form.setValue(field.key, v)}
               restartRequired={restartKeys.has(field.key)}
@@ -300,27 +256,25 @@ export function NodeRoutingSettings() {
         </AdvancedSection>
 
         <SettingFieldRow
-          label={t("web.admin.settings.nodeRouting.paths.label")}
-          description={t("web.admin.settings.nodeRouting.paths.description")}
+          label="Preferred paths"
+          description="Arrows show soft fallback order; only modes never cross that boundary."
         >
           <div className="grid min-w-64 gap-1 text-xs">
             <PreferredPathRow
-              label={t("web.admin.settings.nodeRouting.paths.directPlay")}
-              route={egressPreview(t, routingValues["playback.routing.direct_play_egress"])}
+              label="Direct play"
+              route={egressPreview(routingValues["playback.routing.direct_play_egress"])}
             />
             <PreferredPathRow
-              label={t("web.admin.settings.nodeRouting.paths.remux")}
+              label="Remux"
               route={routePreview(
-                t,
                 routingValues["playback.routing.remux_execution"],
                 routingValues["playback.routing.remux_egress"],
                 "remux",
               )}
             />
             <PreferredPathRow
-              label={t("web.admin.settings.nodeRouting.paths.videoTranscode")}
+              label="Video transcode"
               route={routePreview(
-                t,
                 routingValues["playback.routing.video_transcode_execution"],
                 routingValues["playback.routing.video_transcode_egress"],
                 "video_transcode",
@@ -331,12 +285,14 @@ export function NodeRoutingSettings() {
 
         {strandedRoute && (
           <SettingFieldStatus tone="warn">
-            {t("web.admin.settings.nodeRouting.warnings.stranded")}
+            An “only” route currently has no healthy supporting node. Saving is allowed so nodes can
+            join later.
           </SettingFieldStatus>
         )}
         {usesProxyOnlyEgress && (
           <SettingFieldStatus tone="warn">
-            {t("web.admin.settings.nodeRouting.warnings.proxyOnlyClients")}
+            Proxy-only egress requires every native client to support authorized media origins;
+            older clients may be unable to start that workload.
           </SettingFieldStatus>
         )}
       </FieldGroup>

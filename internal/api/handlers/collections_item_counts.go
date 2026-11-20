@@ -17,9 +17,8 @@ import (
 // result and keeps its stored count.
 //
 // Membership is read from the Postgres user store; callers skip stores that
-// keep collections elsewhere. memberCounts, when set, remembers the counts of
-// collections without a smart definition or display filter between reads.
-func visiblePersonalCollectionCounts(ctx context.Context, executor *catalog.QueryExecutor, memberCounts *catalog.PersonalCollectionMemberCounts, userID int, collections []catalog.PersonalCollectionDefinition, filter catalog.AccessFilter) map[string]int {
+// keep collections elsewhere.
+func visiblePersonalCollectionCounts(ctx context.Context, executor *catalog.QueryExecutor, userID int, collections []catalog.PersonalCollectionDefinition, filter catalog.AccessFilter) map[string]int {
 	counts := make(map[string]int, len(collections))
 	if executor == nil || executor.Pool == nil || len(collections) == 0 {
 		return counts
@@ -45,13 +44,7 @@ func visiblePersonalCollectionCounts(ctx context.Context, executor *catalog.Quer
 	if len(memberIDs) == 0 {
 		return counts
 	}
-	var visible map[string]int
-	var err error
-	if memberCounts != nil {
-		visible, err = memberCounts.Count(ctx, userID, memberIDs, filter)
-	} else {
-		visible, err = catalog.NewItemRepository(executor.Pool).CountVisiblePersonalCollectionMembers(ctx, userID, memberIDs, filter)
-	}
+	visible, err := catalog.NewItemRepository(executor.Pool).CountVisiblePersonalCollectionMembers(ctx, userID, memberIDs, filter)
 	if err != nil {
 		slog.WarnContext(ctx, "counting personal collection members failed", "component", "collections", "error", err)
 		return counts
@@ -89,7 +82,7 @@ type ownedCollectionReads struct {
 // so each owner is resolved once per call. A collection whose owner cannot be
 // resolved has no count or collage and is listed in unavailable; callers drop
 // it rather than read it under the viewer's access alone.
-func ownerScopedCollectionReads(ctx context.Context, executor *catalog.QueryExecutor, memberCounts *catalog.PersonalCollectionMemberCounts, owners catalog.PersonalCollectionAccess, collages *catalog.PersonalCollectionCollages, userID int, viewerProfileID string, collections []ownedCollectionDefinition, viewer catalog.AccessFilter) ownedCollectionReads {
+func ownerScopedCollectionReads(ctx context.Context, executor *catalog.QueryExecutor, owners catalog.PersonalCollectionAccess, collages *catalog.PersonalCollectionCollages, userID int, viewerProfileID string, collections []ownedCollectionDefinition, viewer catalog.AccessFilter) ownedCollectionReads {
 	out := ownedCollectionReads{counts: make(map[string]int, len(collections)), posters: map[string]catalog.CollectionPoster{}, unavailable: make(map[string]bool)}
 	if executor == nil || executor.Pool == nil {
 		return out
@@ -120,7 +113,7 @@ func ownerScopedCollectionReads(ctx context.Context, executor *catalog.QueryExec
 				collaged = append(collaged, c.PersonalCollectionDefinition)
 			}
 		}
-		maps.Copy(out.counts, visiblePersonalCollectionCounts(ctx, executor, memberCounts, userID, definitions, filter))
+		maps.Copy(out.counts, visiblePersonalCollectionCounts(ctx, executor, userID, definitions, filter))
 		maps.Copy(out.posters, collages.Posters(ctx, userID, collaged, filter))
 	}
 	return out

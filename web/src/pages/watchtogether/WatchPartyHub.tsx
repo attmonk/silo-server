@@ -14,7 +14,6 @@ import { Input } from "@/components/ui/input";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useViewTransitionNavigate } from "@/hooks/useViewTransition";
 import { useOptionalAuth } from "@/hooks/useAuth";
-import { useT, type MessageKey, type Translate } from "@/i18n";
 import {
   createWatchTogetherRoom,
   getWatchTogetherRoom,
@@ -30,28 +29,13 @@ import {
   type RecentRoom,
 } from "./hooks/useRecentRooms";
 
-/** A join or create reply without the room proof the room page needs. */
-class MissingRoomTokenError extends Error {
-  constructor() {
-    super("Room access token was missing from the response.");
-  }
-}
-
-/** A failed join or create, kept raw so its text follows the interface language. */
-type HubError = { op: "join" | "create"; error: unknown };
-
-function describeHubError({ op, error }: HubError, t: Translate) {
-  if (error instanceof MissingRoomTokenError) return t("web.watchTogether.hub.missingToken");
-  if (op === "join" && error instanceof ApiClientError) {
-    if (error.status === 404) return t("web.watchTogether.common.roomNotFound");
-    if (error.status === 410 || error.status === 409)
-      return t("web.watchTogether.common.roomInactive");
+function describeJoinError(error: unknown) {
+  if (error instanceof ApiClientError) {
+    if (error.status === 404) return "Room not found.";
+    if (error.status === 410 || error.status === 409) return "That room is no longer active.";
     return error.message;
   }
-  if (error instanceof Error) return error.message;
-  return op === "join"
-    ? t("web.watchTogether.hub.joinFailed")
-    : t("web.watchTogether.hub.createFailed");
+  return error instanceof Error ? error.message : "Failed to join room.";
 }
 
 function roomHref(roomId: string, token: string) {
@@ -59,36 +43,25 @@ function roomHref(roomId: string, token: string) {
 }
 
 const modeOptions = [
-  {
-    value: "host_pick",
-    title: "web.watchTogether.common.hostPicks",
-    caption: "web.watchTogether.hub.hostPickCaption",
-  },
-  {
-    value: "vote",
-    title: "watchParty.options.everyoneVotes",
-    caption: "web.watchTogether.hub.voteCaption",
-  },
+  { value: "host_pick", title: "Host picks", caption: "You choose, everyone watches." },
+  { value: "vote", title: "Everyone votes", caption: "Anyone suggests, the room votes." },
 ] as const satisfies ReadonlyArray<{
   value: WatchTogetherSelectionMode;
-  title: MessageKey;
-  caption: MessageKey;
+  title: string;
+  caption: string;
 }>;
 
 const howItWorks = [
+  { title: "Open a room", caption: "Create one here, or start from any movie or episode page." },
   {
-    title: "web.watchTogether.hub.stepOpenTitle",
-    caption: "web.watchTogether.hub.stepOpenCaption",
+    title: "Share the code",
+    caption: "Send the invite link or the eight-letter code to whoever is watching.",
   },
   {
-    title: "web.watchTogether.hub.stepShareTitle",
-    caption: "web.watchTogether.hub.stepShareCaption",
+    title: "Watch in sync",
+    caption: "Play, pause, and seek together. The room ends two minutes after the host drops off.",
   },
-  {
-    title: "web.watchTogether.hub.stepSyncTitle",
-    caption: "web.watchTogether.hub.stepSyncCaption",
-  },
-] as const satisfies ReadonlyArray<{ title: MessageKey; caption: MessageKey }>;
+] as const;
 
 type RecentStatus = "checking" | "live" | "unknown" | "ended" | "gone";
 
@@ -109,8 +82,7 @@ function roomReadStatus(error: unknown): number | null {
  * unless they fail. Starting a party from a title lives on the title's page.
  */
 export default function WatchPartyHub() {
-  const t = useT();
-  useDocumentTitle(t("watchParty.title"));
+  useDocumentTitle("Watch Party");
   const navigate = useViewTransitionNavigate();
   const [searchParams] = useSearchParams();
   const token = searchParams.get("token")?.trim() ?? "";
@@ -120,7 +92,7 @@ export default function WatchPartyHub() {
   const profileId = auth?.profile?.id ?? null;
 
   const [code, setCode] = useState("");
-  const [error, setError] = useState<HubError | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   // ── Join ────────────────────────────────────────────────────────────
   const [pendingJoin, setPendingJoin] = useState<{
@@ -146,7 +118,8 @@ export default function WatchPartyHub() {
       response: Awaited<ReturnType<typeof joinWatchTogetherRoom>>,
       authority: NonNullable<ReturnType<typeof captureProfileRequestContext>>,
     ) => {
-      if (!response.room_access_token) throw new MissingRoomTokenError();
+      if (!response.room_access_token)
+        throw new Error("Room access token was missing from the response.");
       if (userId !== null && profileId !== null) {
         rememberRecentRoom({
           room: response.room,
@@ -178,7 +151,7 @@ export default function WatchPartyHub() {
         enterRoom(response, joinAuthority);
       } catch (joinError) {
         if (!active() || joinError instanceof StaleApiRequestContextError) return;
-        setError({ op: "join", error: joinError });
+        setError(describeJoinError(joinError));
       } finally {
         setPendingJoin((current) => (current?.run === run ? null : current));
       }
@@ -253,7 +226,7 @@ export default function WatchPartyHub() {
       enterRoom(response, draft.authority);
     } catch (createError) {
       if (!active() || createError instanceof StaleApiRequestContextError) return;
-      setError({ op: "create", error: createError });
+      setError(createError instanceof Error ? createError.message : "Failed to create room.");
     } finally {
       setPendingCreation((current) => (current?.run === run ? null : current));
     }
@@ -322,11 +295,9 @@ export default function WatchPartyHub() {
     return (
       <div className="mx-auto flex w-full max-w-5xl flex-col items-center gap-4 px-6 py-24 text-center">
         <Loader2 aria-hidden="true" className="text-muted-foreground size-8 animate-spin" />
-        <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
-          {t("web.watchTogether.hub.joiningTitle")}
-        </h1>
+        <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">Joining Watch Party</h1>
         <p className="text-muted-foreground max-w-sm text-sm" role="status">
-          {t("web.watchTogether.hub.joiningBody")}
+          Taking you into the room.
         </p>
       </div>
     );
@@ -336,13 +307,14 @@ export default function WatchPartyHub() {
     <div className="mx-auto flex w-full max-w-4xl flex-col gap-12 px-6 py-12 sm:px-8">
       <header className="flex flex-col gap-3">
         <p className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">
-          {t("watchParty.title")}
+          Watch Party
         </p>
         <h1 className="max-w-2xl text-3xl font-semibold tracking-tight text-balance sm:text-4xl">
-          {t("web.watchTogether.hub.headline")}
+          Watch together, wherever everyone is.
         </h1>
         <p className="text-muted-foreground max-w-xl text-base leading-7">
-          {t("web.watchTogether.hub.intro")}
+          Open a room, share the code, and everyone plays in sync. The host picks what's on, or the
+          whole room votes.
         </p>
       </header>
 
@@ -351,7 +323,7 @@ export default function WatchPartyHub() {
           role="alert"
           className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200"
         >
-          {describeHubError(error, t)}
+          {error}
         </div>
       ) : null}
 
@@ -362,7 +334,7 @@ export default function WatchPartyHub() {
         >
           <div
             aria-hidden="true"
-            className="from-primary/20 pointer-events-none absolute -end-24 -top-24 size-64 rounded-full bg-gradient-to-br to-transparent blur-3xl"
+            className="from-primary/20 pointer-events-none absolute -top-24 -right-24 size-64 rounded-full bg-gradient-to-br to-transparent blur-3xl"
           />
           <div className="relative">
             <div className="flex items-center gap-2">
@@ -370,16 +342,16 @@ export default function WatchPartyHub() {
                 <Sparkles className="size-4" />
               </span>
               <h2 id="hub-start" className="text-lg font-semibold">
-                {t("watchParty.page.start")}
+                Start a party
               </h2>
             </div>
             <p className="text-muted-foreground mt-2 text-sm leading-6">
-              {t("web.watchTogether.hub.startBody")}
+              Open an empty room now and pick what to watch once people arrive.
             </p>
           </div>
           <div
             role="radiogroup"
-            aria-label={t("web.watchTogether.hub.modeGroup")}
+            aria-label="How the room picks"
             className="relative grid gap-2 sm:grid-cols-2"
           >
             {modeOptions.map((option) => {
@@ -392,7 +364,7 @@ export default function WatchPartyHub() {
                   role="radio"
                   aria-checked={selected}
                   onClick={() => setSelectionMode(option.value)}
-                  className={`flex items-start gap-3 rounded-xl border px-3 py-3 text-start text-sm transition-colors ${
+                  className={`flex items-start gap-3 rounded-xl border px-3 py-3 text-left text-sm transition-colors ${
                     selected
                       ? "border-foreground/50 bg-accent"
                       : "border-border/60 text-muted-foreground hover:bg-muted/60"
@@ -400,9 +372,9 @@ export default function WatchPartyHub() {
                 >
                   <Icon className={`mt-0.5 size-4 shrink-0 ${selected ? "" : "opacity-60"}`} />
                   <span className="min-w-0">
-                    <span className="text-foreground block font-medium">{t(option.title)}</span>
+                    <span className="text-foreground block font-medium">{option.title}</span>
                     <span className="text-muted-foreground mt-0.5 block text-xs">
-                      {t(option.caption)}
+                      {option.caption}
                     </span>
                   </span>
                 </button>
@@ -416,12 +388,11 @@ export default function WatchPartyHub() {
               disabled={busy}
               className="h-12 rounded-lg text-base"
             >
-              {creating ? t("web.watchTogether.hub.creating") : t("web.watchTogether.hub.create")}
+              {creating ? "Creating..." : "Create Watch Party"}
             </Button>
             <p className="text-muted-foreground text-xs leading-5">
-              {t("web.watchTogether.hub.fromTitleHint", {
-                item: (chunks) => <span className="text-foreground">{chunks}</span>,
-              })}
+              Already know what you want to watch? Open its page and choose{" "}
+              <span className="text-foreground">Start a party with this</span> from the menu.
             </p>
           </div>
         </section>
@@ -436,11 +407,11 @@ export default function WatchPartyHub() {
                 <Ticket className="size-4" />
               </span>
               <h2 id="hub-join" className="text-lg font-semibold">
-                {t("web.watchTogether.hub.joinTitle")}
+                Join a party
               </h2>
             </div>
             <p className="text-muted-foreground mt-2 text-sm leading-6">
-              {t("web.watchTogether.hub.joinBody")}
+              Got a code from the host? Enter it here. Invite links open straight into the room.
             </p>
           </div>
           <form
@@ -451,7 +422,7 @@ export default function WatchPartyHub() {
             }}
           >
             <label htmlFor="watch-room-code" className="sr-only">
-              {t("web.watchTogether.hub.codeLabel")}
+              Room code
             </label>
             <div className="flex gap-2">
               <Input
@@ -465,7 +436,7 @@ export default function WatchPartyHub() {
                 autoCapitalize="characters"
                 autoCorrect="off"
                 spellCheck={false}
-                placeholder={t("web.watchTogether.hub.codePlaceholder")}
+                placeholder="ABCD1234"
                 disabled={busy}
                 className="h-12 font-mono text-lg tracking-[0.3em] uppercase"
               />
@@ -475,10 +446,10 @@ export default function WatchPartyHub() {
                 onClick={() => void pasteCode()}
                 disabled={busy}
                 className="h-12 gap-1.5"
-                aria-label={t("web.watchTogether.hub.pasteLabel")}
+                aria-label="Paste room code"
               >
                 <ClipboardPaste className="size-4" />
-                <span className="hidden sm:inline">{t("web.watchTogether.hub.paste")}</span>
+                <span className="hidden sm:inline">Paste</span>
               </Button>
             </div>
             <Button
@@ -487,7 +458,7 @@ export default function WatchPartyHub() {
               disabled={busy || code.trim() === ""}
               className="h-12 rounded-lg"
             >
-              {joining ? t("web.watchTogether.hub.joining") : t("web.watchTogether.hub.join")}
+              {joining ? "Joining..." : "Join Watch Party"}
             </Button>
           </form>
           {hasInviteToken ? (
@@ -498,7 +469,7 @@ export default function WatchPartyHub() {
               disabled={busy}
               className="self-start"
             >
-              {t("web.watchTogether.hub.retryInvite")}
+              Retry Invite Link
             </Button>
           ) : null}
         </section>
@@ -507,7 +478,7 @@ export default function WatchPartyHub() {
       {visibleRecent.length > 0 ? (
         <section className="flex flex-col gap-3">
           <h2 className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">
-            {t("web.watchTogether.hub.recentTitle")}
+            Your recent parties
           </h2>
           <ul className="flex flex-col gap-2">
             {visibleRecent.map((entry) => (
@@ -522,10 +493,7 @@ export default function WatchPartyHub() {
         </section>
       ) : null}
 
-      <section
-        aria-label={t("web.watchTogether.hub.howItWorks")}
-        className="border-border/60 border-t pt-8"
-      >
+      <section aria-label="How it works" className="border-border/60 border-t pt-8">
         <ol className="grid gap-6 sm:grid-cols-3">
           {howItWorks.map((step, index) => (
             <li key={step.title} className="flex gap-3">
@@ -533,9 +501,9 @@ export default function WatchPartyHub() {
                 {index + 1}
               </span>
               <span className="min-w-0">
-                <span className="block text-sm font-semibold">{t(step.title)}</span>
+                <span className="block text-sm font-semibold">{step.title}</span>
                 <span className="text-muted-foreground mt-1 block text-sm leading-6">
-                  {t(step.caption)}
+                  {step.caption}
                 </span>
               </span>
             </li>
@@ -555,7 +523,6 @@ function RecentRoomRow({
   status: RecentStatus;
   onRejoin: () => void;
 }) {
-  const t = useT();
   const live = status === "live";
   return (
     <li
@@ -567,37 +534,33 @@ function RecentRoomRow({
         <UsersRound className="text-muted-foreground size-4" />
       </div>
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-semibold">{entry.title ?? t("watchParty.title")}</div>
+        <div className="truncate text-sm font-semibold">{entry.title ?? "Watch Party"}</div>
         <div className="text-muted-foreground mt-0.5 flex items-center gap-2 text-xs">
           {live ? (
             <span className="flex items-center gap-1.5">
               <span aria-hidden="true" className="size-1.5 rounded-full bg-emerald-400" />
-              {t("web.watchTogether.hub.recentLive")}
+              Live
             </span>
           ) : status === "checking" ? (
-            t("web.watchTogether.hub.recentChecking")
+            "Checking…"
           ) : status === "unknown" ? (
-            t("web.watchTogether.hub.recentUnknown")
+            "Status unavailable"
           ) : (
-            t("web.watchTogether.hub.recentEnded")
+            "Ended"
           )}
-          <span aria-hidden="true">{t("web.watchTogether.common.separator")}</span>
-          <span>
-            {entry.role === "host"
-              ? t("web.watchTogether.hub.recentHosted")
-              : t("web.watchTogether.hub.recentJoined")}
-          </span>
-          <span aria-hidden="true">{t("web.watchTogether.common.separator")}</span>
+          <span aria-hidden="true">·</span>
+          <span>{entry.role === "host" ? "Your room" : "Joined"}</span>
+          <span aria-hidden="true">·</span>
           <span className="font-mono tracking-[0.15em]">{entry.code}</span>
         </div>
       </div>
       {live || status === "unknown" ? (
         <Button type="button" size="sm" onClick={onRejoin}>
-          {t("web.watchTogether.hub.rejoin")}
+          Rejoin
         </Button>
       ) : (
         <span className="text-muted-foreground text-[11px] font-semibold tracking-[0.14em] uppercase">
-          {status === "checking" ? "" : t("web.watchTogether.hub.recentEnded")}
+          {status === "checking" ? "" : "Ended"}
         </span>
       )}
     </li>

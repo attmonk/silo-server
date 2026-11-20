@@ -76,10 +76,7 @@ func (f *fakeAdminAccounts) ImpersonateAdminAccount(context.Context, int, string
 }
 func (*fakeAdminAccounts) ListAdminAccountProfiles(context.Context, int) ([]handlers.AdminProfileView, error) {
 	seen := fixedTime()
-	return []handlers.AdminProfileView{
-		{ID: "profile-1", Name: "Parent", Avatar: "preset:avatar-3", AvatarURL: "/profile-avatars/avatar-3.svg", AvatarSource: "preset", HasPIN: true, IsPrimary: true, LastSeenAt: &seen},
-		{ID: "profile-2", Name: "Guest", AvatarSource: "none", IsChild: true},
-	}, nil
+	return []handlers.AdminProfileView{{ID: "profile-1", Name: "Parent", LastSeenAt: &seen}, {ID: "profile-2", Name: "Guest"}}, nil
 }
 
 func TestAdminAccountEffectiveLibraryAccess(t *testing.T) {

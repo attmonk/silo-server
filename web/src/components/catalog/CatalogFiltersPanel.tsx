@@ -14,12 +14,10 @@ import {
 } from "@/components/collections/CollectionGuidedRulesEditor";
 import { isGuidedRepresentable } from "@/components/collections/guidedRepresentable";
 import { useCatalogFilters } from "@/hooks/queries/catalog";
-import { useAppLanguage, useT } from "@/i18n";
 import { querySortToSelectValue } from "@/lib/collectionSortConfig";
 import type { QuerySortRelevanceScope } from "@/lib/querySortOptions";
 import {
   catalogSourceSupportsSourceOrder,
-  searchSortsByRelevance,
   type CatalogSearchState,
 } from "@/pages/catalogSearchParams";
 
@@ -40,11 +38,6 @@ export interface CatalogFiltersPanelProps {
   resultCountLabel?: string;
   resultCountLoading?: boolean;
   libraryType?: string;
-  /**
-   * Offer Relevance as the sort, for a text search. It is the sort until the
-   * viewer picks another, and picking it again sends `sort=relevance`.
-   */
-  relevanceSort?: boolean;
 }
 
 export default function CatalogFiltersPanel({
@@ -59,11 +52,7 @@ export default function CatalogFiltersPanel({
   resultCountLabel,
   resultCountLoading = false,
   libraryType,
-  relevanceSort = false,
 }: CatalogFiltersPanelProps) {
-  const t = useT();
-  // Badge labels come from a plain helper; recompute them on a language change.
-  const language = useAppLanguage();
   const [sheetOpen, setSheetOpen] = useState(false);
   const [editorMode, setEditorMode] = useState<"guided" | "advanced">("guided");
 
@@ -81,13 +70,9 @@ export default function CatalogFiltersPanel({
   if (!guidedAvailable && editorMode === "guided") {
     setEditorMode("advanced");
   }
-  // Relevance borrows the toolbar's source-order entry: one extra choice above
-  // the field sorts, with no ascending or descending of its own.
-  const usesRelevance = relevanceSort && searchSortsByRelevance(state);
-  const toolbarGuidedState =
-    usesSourceOrder || usesRelevance
-      ? { ...guidedState, sortField: CATALOG_SOURCE_ORDER_SORT_FIELD }
-      : guidedState;
+  const toolbarGuidedState = usesSourceOrder
+    ? { ...guidedState, sortField: CATALOG_SOURCE_ORDER_SORT_FIELD }
+    : guidedState;
   const isAudiobookLibrary =
     libraryType === "audiobook" ||
     libraryType === "audiobooks" ||
@@ -97,8 +82,7 @@ export default function CatalogFiltersPanel({
   // without them, so the count comes from the rules and no badges show.
   const badges = useMemo(
     () => (guidedAvailable ? getActiveFilterBadges(guidedState, { isAudiobookLibrary }) : []),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- language: the labels' language
-    [guidedAvailable, guidedState, isAudiobookLibrary, language],
+    [guidedAvailable, guidedState, isAudiobookLibrary],
   );
   const activeCount = guidedAvailable
     ? badges.length
@@ -108,18 +92,14 @@ export default function CatalogFiltersPanel({
   if (isLocked) {
     return (
       <section className="bg-card space-y-2 rounded-lg border p-4">
-        <h2 className="text-sm font-medium">{t("web.catalog.filters.heading")}</h2>
-        <p className="text-muted-foreground text-sm">{t("web.catalog.filters.locked")}</p>
+        <h2 className="text-sm font-medium">Filters</h2>
+        <p className="text-muted-foreground text-sm">Filters are locked to this source.</p>
       </section>
     );
   }
 
   const libraryOptions =
-    libraries ??
-    state.query_definition.library_ids.map((id) => ({
-      id,
-      name: t("web.catalog.filters.libraryFallback", { id: id }),
-    }));
+    libraries ?? state.query_definition.library_ids.map((id) => ({ id, name: `Library ${id}` }));
 
   // The toolbar sets only the media type and sort, so it patches those onto
   // the definition and leaves the rules as they are. The one exception is
@@ -128,14 +108,9 @@ export default function CatalogFiltersPanel({
     const next = { ...toolbarGuidedState, ...patch };
     const nextUsesSourceOrder =
       supportsSourceOrder && next.sortField === CATALOG_SOURCE_ORDER_SORT_FIELD;
-    const nextUsesRelevance = relevanceSort && next.sortField === CATALOG_SOURCE_ORDER_SORT_FIELD;
     const mediaScope = next.mediaScope === "all" ? undefined : next.mediaScope;
-    // Leaving Relevance is a choice even when it lands on the Date Added
-    // placeholder a sortless search already carries.
-    const leftRelevance = usesRelevance && !nextUsesRelevance;
     onStateChange({
       ...state,
-      ...(leftRelevance ? { explicit_sort: true } : null),
       uses_source_order: nextUsesSourceOrder,
       query_definition: {
         ...qd,
@@ -144,11 +119,9 @@ export default function CatalogFiltersPanel({
           mediaScope === "ebook" && qd.media_scope !== "ebook"
             ? withoutNarratorRules(qd.groups)
             : qd.groups,
-        sort: nextUsesRelevance
-          ? { field: "relevance", order: "desc" }
-          : nextUsesSourceOrder
-            ? qd.sort
-            : { field: next.sortField as QuerySort["field"], order: next.sortOrder },
+        sort: nextUsesSourceOrder
+          ? qd.sort
+          : { field: next.sortField as QuerySort["field"], order: next.sortOrder },
       },
     });
   }
@@ -159,14 +132,10 @@ export default function CatalogFiltersPanel({
   function updateDefinition(nextQd: QueryDefinition) {
     const sortChanged =
       usesSourceOrder && querySortToSelectValue(nextQd.sort) !== querySortToSelectValue(qd.sort);
-    // The sheet's editors don't offer Relevance, so a media type change there
-    // swaps it for their first sort. The search keeps ranking by relevance.
-    const keepRelevance =
-      relevanceSort && qd.sort.field === "relevance" && nextQd.media_scope !== qd.media_scope;
     onStateChange({
       ...state,
       ...(sortChanged ? { uses_source_order: false } : null),
-      query_definition: keepRelevance ? { ...nextQd, sort: qd.sort } : nextQd,
+      query_definition: nextQd,
     });
   }
 
@@ -193,15 +162,13 @@ export default function CatalogFiltersPanel({
         resultCountLabel={resultCountLabel}
         resultCountLoading={resultCountLoading}
         sourceOrderLabel={
-          relevanceSort
-            ? t("web.catalog.sort.relevance")
-            : isCollectionSource
-              ? t("web.catalog.sort.collectionOrder")
-              : state.source === "history"
-                ? t("web.catalog.sort.watchHistory")
-                : supportsSourceOrder
-                  ? t("web.catalog.sort.listOrder")
-                  : undefined
+          isCollectionSource
+            ? "Collection Order"
+            : state.source === "history"
+              ? "Watch History"
+              : supportsSourceOrder
+                ? "List Order"
+                : undefined
         }
         allowEpisodeMediaScope={!isCollectionSource}
       />

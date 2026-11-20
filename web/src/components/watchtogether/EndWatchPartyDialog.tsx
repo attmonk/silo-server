@@ -1,5 +1,4 @@
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { useT } from "@/i18n";
 
 /** Shared confirmation for ending a watch party (lobby page + in-player panel). */
 export function EndWatchPartyDialog({
@@ -13,14 +12,13 @@ export function EndWatchPartyDialog({
   onConfirm: () => void;
   isPending?: boolean;
 }) {
-  const t = useT();
   return (
     <ConfirmDialog
       open={open}
       onOpenChange={onOpenChange}
-      title={t("web.watchTogether.endDialog.title")}
-      description={t("web.watchTogether.endDialog.description")}
-      confirmLabel={t("watchParty.end.confirm")}
+      title="End watch party?"
+      description="End the watch party for everyone?"
+      confirmLabel="End Party"
       variant="destructive"
       onConfirm={onConfirm}
       isPending={isPending}

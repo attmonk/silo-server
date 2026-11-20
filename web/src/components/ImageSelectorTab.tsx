@@ -1,69 +1,36 @@
-import { useState, useMemo, useCallback, useRef, type ChangeEvent } from "react";
-import { joinList } from "@/lib/appLocale";
-import { Check, Loader2, AlertCircle, Upload } from "lucide-react";
-import { toast } from "sonner";
+import { useState, useMemo, useCallback, useEffect } from "react";
+import { Check, Loader2, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { ItemDetail, RemoteImage } from "@/api/types";
-import { useItemImages, useApplyItemImage, useUploadItemImage } from "@/hooks/queries/items";
-import { numberText, useT, type MessageKey } from "@/i18n";
-
+import { useItemImages, useApplyItemImage } from "@/hooks/queries/items";
 import { cn } from "@/lib/utils";
 
 type ImageTab = "poster" | "backdrop" | "logo";
 
-const IMAGE_TABS: {
-  key: ImageTab;
-  label: MessageKey;
-  upload: MessageKey;
-  apply: MessageKey;
-  aspect: string;
-}[] = [
-  {
-    key: "poster",
-    label: "web.item.images.posters",
-    upload: "web.item.images.uploadPoster",
-    apply: "web.item.images.applyPoster",
-    aspect: "aspect-[2/3]",
-  },
-  {
-    key: "backdrop",
-    label: "web.item.images.backdrops",
-    upload: "web.item.images.uploadBackdrop",
-    apply: "web.item.images.applyBackdrop",
-    aspect: "aspect-video",
-  },
-  {
-    key: "logo",
-    label: "web.item.images.logos",
-    upload: "web.item.images.uploadLogo",
-    apply: "web.item.images.applyLogo",
-    aspect: "aspect-video",
-  },
+const IMAGE_TABS: { key: ImageTab; label: string; aspect: string }[] = [
+  { key: "poster", label: "Posters", aspect: "aspect-[2/3]" },
+  { key: "backdrop", label: "Backdrops", aspect: "aspect-video" },
+  { key: "logo", label: "Logos", aspect: "aspect-video" },
 ];
 
-// Seasons store a poster and a backdrop; the server rejects logos for them.
-const SEASON_TABS = IMAGE_TABS.filter((tab) => tab.key !== "logo");
-
-// The server takes JPEG, PNG and WebP uploads up to 10 MiB.
-const UPLOAD_TYPES = ["image/jpeg", "image/png", "image/webp"];
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-
-// An uploaded image is listed only while the item shows it, so it is always
-// the current one.
-function isUploadedImage(img: RemoteImage) {
-  return img.original_url.startsWith("upload://");
-}
+// Seasons only store a poster; the server rejects other image types for them.
+const SEASON_TABS = IMAGE_TABS.filter((tab) => tab.key === "poster");
 
 interface ImageSelectorTabProps {
   item: ItemDetail;
   enabled: boolean;
   onImageApplied?: () => void;
+  onApplyPendingChange?: (pending: boolean) => void;
 }
 
-export default function ImageSelectorTab({ item, enabled, onImageApplied }: ImageSelectorTabProps) {
-  const t = useT();
+export default function ImageSelectorTab({
+  item,
+  enabled,
+  onImageApplied,
+  onApplyPendingChange,
+}: ImageSelectorTabProps) {
   const availableTabs = item.type === "season" ? SEASON_TABS : IMAGE_TABS;
   const [activeTab, setActiveTab] = useState<ImageTab>("poster");
   const [textlessOnly, setTextlessOnly] = useState(false);
@@ -75,16 +42,18 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
 
   const { data, isLoading, isError } = useItemImages(item.content_id, enabled);
   const applyMutation = useApplyItemImage();
-  const uploadMutation = useUploadItemImage();
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const pending = applyMutation.isPending || uploadMutation.isPending;
 
   const images = useMemo(() => data?.images ?? [], [data]);
+
+  useEffect(() => {
+    onApplyPendingChange?.(applyMutation.isPending);
+    return () => onApplyPendingChange?.(false);
+  }, [applyMutation.isPending, onApplyPendingChange]);
 
   const current = data?.current;
   const providerErrors = data?.provider_errors;
 
-  const tabConfig = IMAGE_TABS.find((tab) => tab.key === activeTab)!;
+  const tabConfig = IMAGE_TABS.find((t) => t.key === activeTab)!;
 
   const { providers, visibleImages, filteredImages, activeProvider } = useMemo(() => {
     const ofType = images.filter((img) => img.type === activeTab);
@@ -149,55 +118,25 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
     );
   }, [selectedImage, applyMutation, item, onImageApplied]);
 
-  const handleUpload = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    // Clear the input so choosing the same file again uploads it again.
-    event.target.value = "";
-    if (!file) return;
-    // A browser that cannot name the type leaves it empty; the server checks
-    // those bytes itself.
-    if (file.type && !UPLOAD_TYPES.includes(file.type)) {
-      toast.error(t("web.item.images.wrongType"));
-      return;
-    }
-    if (file.size > MAX_UPLOAD_BYTES) {
-      toast.error(t("web.item.images.tooLarge"));
-      return;
-    }
-    const type = activeTab;
-    uploadMutation.mutate(
-      { item, type, file },
-      {
-        onSuccess: () => {
-          onImageApplied?.();
-          // The list marks the upload as current once it reloads.
-          setAppliedImages((prev) => {
-            const next = { ...prev };
-            delete next[type];
-            return next;
-          });
-          setSelectedImage(null);
-        },
-      },
-    );
-  };
-
   return (
     <div className="flex h-full flex-col gap-3">
       {/* Info banner */}
       <div className="bg-muted/50 text-muted-foreground shrink-0 rounded-lg px-3 py-2 text-[11px]">
-        {t("web.item.images.immediateNotice")}
+        Image changes apply immediately and are not affected by Cancel.
       </div>
 
       {item.type === "season" && (
         <div className="flex shrink-0 items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-1.5 text-[11px] text-amber-600 dark:text-amber-400">
           <AlertCircle className="size-3.5 shrink-0" />
-          <span>{t("web.item.images.seasonNotice")}</span>
+          <span>
+            Only seeing one poster? Check for plugin updates and update TMDB and TVDB to load full
+            season artwork galleries.
+          </span>
         </div>
       )}
 
-      {/* Image type tabs; the filter and upload controls wrap below them on narrow screens */}
-      <div className="flex shrink-0 flex-wrap items-center gap-1">
+      {/* Image type tabs */}
+      <div className="flex shrink-0 items-center gap-1">
         {availableTabs.map((tab) => (
           <button
             key={tab.key}
@@ -215,66 +154,36 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
                 : "text-muted-foreground hover:bg-muted hover:text-foreground",
             )}
           >
-            {t(tab.label)}
+            {tab.label}
           </button>
         ))}
 
-        <div className="ms-auto flex items-center gap-1">
-          {/* Textless filter, hidden for logos */}
-          {activeTab !== "logo" && (
-            <button
-              type="button"
-              onClick={() => {
-                setTextlessOnly(!textlessOnly);
-                // Don't leave a selection the filter hides ready to apply.
-                setSelectedImage(null);
-              }}
-              className={cn(
-                "rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors",
-                textlessOnly
-                  ? "bg-primary/10 text-primary"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {t("web.item.images.textless")}
-            </button>
-          )}
-
-          {/* Upload your own image; it is listed with the local choices. */}
+        {/* Textless filter — hidden for logos */}
+        {activeTab !== "logo" && (
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={pending}
-            aria-label={t(tabConfig.upload)}
-            className="text-muted-foreground hover:bg-muted hover:text-foreground flex items-center gap-1 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-50"
-          >
-            {uploadMutation.isPending ? (
-              <Loader2 className="size-3.5 animate-spin" />
-            ) : (
-              <Upload className="size-3.5" />
+            onClick={() => {
+              setTextlessOnly(!textlessOnly);
+              // Don't leave a selection the filter hides ready to apply.
+              setSelectedImage(null);
+            }}
+            className={cn(
+              "ml-auto rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors",
+              textlessOnly
+                ? "bg-primary/10 text-primary"
+                : "text-muted-foreground hover:text-foreground",
             )}
-            {uploadMutation.isPending
-              ? t("web.item.images.uploading")
-              : t("web.item.images.upload")}
+          >
+            Textless
           </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept={UPLOAD_TYPES.join(",")}
-            className="hidden"
-            tabIndex={-1}
-            aria-hidden="true"
-            data-testid="image-upload-input"
-            onChange={handleUpload}
-          />
-        </div>
+        )}
       </div>
 
       {/* Provider filter — only useful with more than one source */}
       {providers.length > 1 && (
         <div
           role="group"
-          aria-label={t("web.item.images.filterByProvider")}
+          aria-label="Filter by provider"
           className="flex shrink-0 flex-wrap items-center gap-1"
         >
           {[{ id: null, count: visibleImages.length }, ...providers].map((p) => (
@@ -290,8 +199,8 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
                   : "text-muted-foreground hover:bg-muted hover:text-foreground",
               )}
             >
-              {p.id === null ? t("web.item.images.allProviders") : p.id.toUpperCase()}
-              <span className="tabular-nums opacity-60">{numberText(p.count)}</span>
+              {p.id === null ? "All" : p.id.toUpperCase()}
+              <span className="tabular-nums opacity-60">{p.count}</span>
             </button>
           ))}
         </div>
@@ -302,9 +211,10 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
         <div className="flex shrink-0 items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-1.5 text-[11px] text-amber-600 dark:text-amber-400">
           <AlertCircle className="size-3.5 shrink-0" />
           <span>
-            {t("web.item.images.providerErrors", {
-              providers: joinList(Object.keys(providerErrors).map((k) => k.toUpperCase())),
-            })}
+            Could not load from{" "}
+            {Object.keys(providerErrors)
+              .map((k) => k.toUpperCase())
+              .join(", ")}
           </span>
         </div>
       )}
@@ -316,28 +226,26 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
         </div>
       ) : isError ? (
         <div className="flex flex-1 items-center justify-center">
-          <p className="text-muted-foreground text-sm">{t("web.item.images.loadFailed")}</p>
+          <p className="text-muted-foreground text-sm">Failed to load images.</p>
         </div>
       ) : filteredImages.length === 0 ? (
         <div className="flex flex-1 items-center justify-center">
           <p className="text-muted-foreground text-sm">
-            {textlessOnly ? t("web.item.images.noTextless") : t("web.item.images.noImages")}
+            {textlessOnly ? "No textless images available." : "No images available."}
           </p>
         </div>
       ) : (
         <ScrollArea className="min-h-0 flex-1">
           <div
             className={cn(
-              "grid gap-2 pe-3 pb-1",
+              "grid gap-2 pr-3 pb-1",
               activeTab === "poster" ? "grid-cols-3 sm:grid-cols-4" : "grid-cols-2 sm:grid-cols-3",
             )}
           >
             {filteredImages.map((img, index) => {
               const isSelected = selectedImage === img;
               const isCurrent =
-                isUploadedImage(img) ||
-                img.original_url === currentOriginalUrl ||
-                img.original_url === currentStoredPath;
+                img.original_url === currentOriginalUrl || img.original_url === currentStoredPath;
 
               return (
                 <button
@@ -367,21 +275,21 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
 
                   {/* Current indicator */}
                   {isCurrent && (
-                    <div className="bg-primary/90 text-primary-foreground absolute start-1 top-1 flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[9px] font-semibold">
+                    <div className="bg-primary/90 text-primary-foreground absolute top-1 left-1 flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[9px] font-semibold">
                       <Check className="size-2.5" />
-                      {t("web.item.images.current")}
+                      Current
                     </div>
                   )}
 
                   {/* Selected indicator */}
                   {isSelected && !isCurrent && (
-                    <div className="bg-primary text-primary-foreground absolute end-1 top-1 flex size-5 items-center justify-center rounded-full">
+                    <div className="bg-primary text-primary-foreground absolute top-1 right-1 flex size-5 items-center justify-center rounded-full">
                       <Check className="size-3" />
                     </div>
                   )}
 
                   {/* Provider badge */}
-                  <div className="absolute end-1 bottom-1">
+                  <div className="absolute right-1 bottom-1">
                     <Badge
                       variant="secondary"
                       className="bg-black/60 px-1 py-0 text-[9px] text-white backdrop-blur-sm"
@@ -399,14 +307,19 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
       {/* Apply button */}
       {selectedImage && (
         <div className="border-border/50 shrink-0 border-t pt-3">
-          <Button onClick={handleApply} disabled={pending} className="w-full" size="sm">
+          <Button
+            onClick={handleApply}
+            disabled={applyMutation.isPending}
+            className="w-full"
+            size="sm"
+          >
             {applyMutation.isPending ? (
               <>
                 <Loader2 className="size-4 animate-spin" />
-                {t("web.item.dialog.applying")}
+                Applying...
               </>
             ) : (
-              t(tabConfig.apply)
+              `Apply ${activeTab.charAt(0).toUpperCase() + activeTab.slice(1)}`
             )}
           </Button>
         </div>

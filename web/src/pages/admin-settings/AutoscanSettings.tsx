@@ -11,7 +11,6 @@ import { SettingsPageHeader } from "@/components/settings/SettingsPageHeader";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAutoscanSettings, useUpdateAutoscanSettings } from "@/hooks/queries/useAutoscan";
 import { useReportUnsavedChanges } from "@/hooks/useUnsavedChanges";
-import { useT } from "@/i18n";
 import ConnectionsPanel from "@/pages/admin/autoscan/ConnectionsPanel";
 
 import { FieldGroup } from "./FieldGroup";
@@ -29,7 +28,6 @@ type PollingDefaults = Pick<
  * draft, but it saves through the same save bar and unsaved-changes prompt.
  */
 export default function AutoscanSettings() {
-  const t = useT();
   const settings = useAutoscanSettings();
   const readAuthority = captureProfileRequestContext();
   const updateSettings = useUpdateAutoscanSettings();
@@ -93,46 +91,42 @@ export default function AutoscanSettings() {
 
   if (settings.isLoading)
     return (
-      <div
-        className="space-y-6"
-        role="status"
-        aria-label={t("web.admin.settings.fields.loadingSettings")}
-      >
+      <div className="space-y-6" role="status" aria-label="Loading settings">
         <Skeleton className="h-8 w-48" />
         <Skeleton className="h-10 w-full" />
         <Skeleton className="h-10 w-full" />
-        <span className="sr-only">{t("web.admin.settings.fields.loadingSettings")}</span>
+        <span className="sr-only">Loading settings</span>
       </div>
     );
 
   return (
     <div className="flex h-full flex-col">
-      <SettingsPageHeader title={t("web.admin.settings.autoscan.title")} />
+      <SettingsPageHeader title="Autoscan" />
 
       <div className="flex-1 space-y-5">
         {!effective || settings.isError ? (
           <p role="alert" className="text-sm">
-            {t("web.admin.settings.autoscan.loadError")}
+            Autoscan settings could not be loaded. Reload before editing.
           </p>
         ) : (
           <FieldGroup
-            label={t("web.admin.settings.autoscan.polling.group")}
-            description={t("web.admin.settings.autoscan.polling.description")}
+            label="Polling defaults"
+            description="Used by sources that don't set their own."
             dirty={dirtyCount > 0}
           >
             <SettingField
-              label={t("web.admin.settings.autoscan.polling.interval.label")}
+              label="Default check interval"
               type="number"
-              unit={t("web.admin.settings.autoscan.polling.unitSeconds")}
+              unit="seconds"
               dirty={intervalDirty}
               value={String(effective.default_poll_interval_seconds)}
               onChange={(value) => edit({ default_poll_interval_seconds: Number(value) || 300 })}
             />
             <SettingField
-              label={t("web.admin.settings.autoscan.polling.debounce.label")}
+              label="Debounce"
               type="number"
-              unit={t("web.admin.settings.autoscan.polling.unitSeconds")}
-              description={t("web.admin.settings.autoscan.polling.debounce.description")}
+              unit="seconds"
+              description="Skips repeat reports of an unchanged file within this window. Changed or deleted files still scan."
               dirty={debounceDirty}
               value={String(effective.debounce_seconds)}
               onChange={(value) => edit({ debounce_seconds: Number(value) || 0 })}

@@ -21,10 +21,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/mediaprobe"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/playback/dovirpu"
 	"github.com/Silo-Server/silo-server/internal/processmetrics"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
@@ -33,24 +31,15 @@ func init() {
 	// Register .m4s so http.ServeFile sets the correct Content-Type for
 	// fMP4 HLS segments. Go's default MIME database does not include it.
 	_ = mime.AddExtensionType(".m4s", "video/mp4")
-	// Pin .ts for MPEG-TS HLS segments: the system database Go reads first
-	// (shared-mime-info, as in the server image) lists .ts as Qt Linguist
-	// text before video/mp2t.
-	_ = mime.AddExtensionType(".ts", mimeVideoMPEGTS)
 }
 
 // TranscodeOpts holds configuration for an HLS transcode session.
 type TranscodeOpts struct {
 	InputPath string
 	OutputDir string // e.g., /tmp/silo-transcode/{session_id}/
-	// subtitleFilterInputPath is the libass subtitles filter's input: the
-	// burn-in track staged on its own (subtitleFilterFontsDir set), or a
-	// parser-safe local alias of the media file. FFmpeg still opens InputPath
-	// as the media input.
+	// subtitleFilterInputPath is a parser-safe local alias used only by the
+	// libass subtitles filter. FFmpeg still opens InputPath as the media input.
 	subtitleFilterInputPath string
-	// subtitleFilterFontsDir holds the source's attached fonts when the
-	// burn-in track is staged (stageBurnInSubtitle); empty otherwise.
-	subtitleFilterFontsDir string
 	// OutputSubdir is the signed, root-relative reconstruction directory. Empty
 	// retains the legacy flat {session_id} layout.
 	OutputSubdir         string
@@ -61,36 +50,15 @@ type TranscodeOpts struct {
 	SourceVideoBitDepth  int
 	VideoBitstreamFilter string // validated copy-mode BSF: DV7ToHDR10BitstreamFilter
 	VideoSampleEntry     string // allowlisted copy-HLS sample entry: dvh1 or hvc1
-	// VideoRange is the HLS VIDEO-RANGE a copy remux's subtitle rendition
-	// variant names (CopyHLSVideoRange): "", PQ, or HLG.
-	VideoRange string
 	// CopyVideoMPEGTS packages copied video in MPEG-TS instead of fMP4. It is
 	// durable because the segment extension and bytes must survive restarts.
 	CopyVideoMPEGTS bool
-	// CopyAudioCodec is the codec of the source audio track a "copy"
-	// TargetCodecAudio keeps. fMP4 segments add aac_adtstoasc for a copied AAC
-	// track; empty (older recipes and tokens) keeps the plain copy. It is
-	// durable because reconstruction must write the same segment bytes.
-	CopyAudioCodec string
-	// KeyframePlaylist serves a copy-video stream as one complete VOD
-	// playlist planned from the source's keyframe index, instead of FFmpeg's
-	// growing playlist (#1466): from the beginning, or from a resume's
-	// resolved origin. It is durable because a reconstructed session must
-	// keep serving the playlist the player already has.
+	// KeyframePlaylist serves a copy-video stream that starts at the
+	// beginning as one complete VOD playlist planned from the source's
+	// keyframe index, instead of FFmpeg's growing playlist (#1466). It is
+	// durable because a reconstructed session must keep serving the playlist
+	// the player already has.
 	KeyframePlaylist bool
-	// KeyframePlanned reports that the session serves a keyframe plan, which
-	// KeyframePlaylist only asks for: a copy that can't be planned keeps
-	// FFmpeg's playlist. StartTranscode sets it from the plan it resolved,
-	// whatever the caller passed. It is durable so a node-backed session's
-	// recipe records which playlist the node served (#4044).
-	KeyframePlanned bool
-	// KeyframePlanResume records that a resume serves a keyframe plan. A
-	// resume's plan numbers and cuts segments differently from FFmpeg's
-	// playlist, so a rebuild follows this rather than deciding afresh: a
-	// rebuilt resume without it keeps FFmpeg's playlist, and one with it that
-	// can no longer plan fails. The session sets it when it starts a resume's
-	// plan, so its recipe and its node's start response carry it.
-	KeyframePlanResume bool
 	// Reconstructed marks a session rebuilt from its recipe after its server
 	// or node lost it. It isn't durable: each rebuild sets it.
 	Reconstructed bool
@@ -133,16 +101,6 @@ type TranscodeOpts struct {
 	// stream tokens never freeze it: a reconstruct under auto rebuilds the
 	// pipeline and derives it again from live configuration.
 	nvencSoftwareDecode bool
-	// gpuDecodeFailed moves a running QSV or VAAPI session to CPU decode after
-	// its GPU-decoded generation failed (see gpuDecodeFailedFilterSetupLocked).
-	// On VAAPI it also stops FFmpeg rotating the CPU-decoded frames by the
-	// source's display matrix: FFmpeg never rotates hardware frames, so the
-	// segments already served are in coded orientation. QSV always passes
-	// -noautorotate. It is deliberately unexported and leaves
-	// SoftwareVideoDecode alone, so a recipe card or stream token written from
-	// the live options still records GPU decode and a reconstruct produces the
-	// same orientation.
-	gpuDecodeFailed bool
 	// softwareEncode retains a frozen GPU tone-map graph while its final
 	// SDR frames feed a software encoder: libx265 on a device without HEVC
 	// encoding, or either codec on a VAAPI device with no capped rate
@@ -154,12 +112,7 @@ type TranscodeOpts struct {
 	vaapiRateControl string
 	// preparedFileEncode marks a single-file download encode. Nothing waits on
 	// it in real time, so it trades encode speed for quality; HLS never sets it.
-	preparedFileEncode bool
-	// copyGroupPrefix is set for a keyframe-planned session's FFmpeg run: it
-	// cuts at every keyframe into <prefix>NNNNNN.m4s groups the session
-	// joins into the planned segments (copy_group_assembler.go). Derived per
-	// run, never frozen into a recipe.
-	copyGroupPrefix            string
+	preparedFileEncode         bool
 	ToneMapPolicy              tonemap.Policy
 	ToneMapMode                tonemap.Mode
 	ToneMapSourceKind          tonemap.SourceKind
@@ -181,20 +134,9 @@ type TranscodeOpts struct {
 	SubtitleCodec string
 	// SubtitleRendition emits the selected embedded text track
 	// (SubtitleTrackIndex, never burned in) from this same ffmpeg process as
-	// the WebVTT subtitle rendition of its HLS playlist, for a transcode or
-	// an HLS copy remux. See subtitle_rendition.go.
+	// the WebVTT subtitle rendition of the synthetic HLS playlist. See
+	// subtitle_rendition.go.
 	SubtitleRendition bool
-	// SubtitleRenditionTracks, with SubtitleRendition, lists every embedded
-	// text track as a rendition of its own, read on demand through the
-	// source's index instead of by this ffmpeg process; SubtitleTrackIndex then
-	// only names the selected one. See subtitle_rendition_tracks.go.
-	SubtitleRenditionTracks []SubtitleRenditionTrack
-	// SubtitleRenditionSource is the source version the on-demand renditions
-	// were planned from; segments are read from that version only.
-	SubtitleRenditionSource SubtitleRenditionSource
-	// MediaFileID is the catalog file InputPath is, or 0 when unknown. On-demand
-	// subtitle renditions find the file's kept tracks by it.
-	MediaFileID int
 	// subtitleCueFile is the per-generation cue file the rendition output
 	// writes. Process-local: every start and restart derives its own.
 	subtitleCueFile string
@@ -203,12 +145,6 @@ type TranscodeOpts struct {
 	// subtitle-free layout that older artifacts were encoded with.
 	PreparedTracks  *PreparedTracks
 	AudioTrackIndex int // -1 = default (first track), >= 0 = specific track
-	// RequireAudioTrack rejects sources missing the negotiated audio ordinal.
-	RequireAudioTrack bool
-	// AudioOnly marks a prepared download of an audiobook or podcast, whose
-	// only picture is cover art, so its prepared file maps no video
-	// (appendPreparedVideoMap). Streaming never sets it.
-	AudioOnly bool
 	// SourceAudioChannels is the selected source stream's channel count. Zero
 	// means unknown and deliberately disables stereo downmix gain: boosting an
 	// already-stereo stream would change its authored level.
@@ -221,11 +157,7 @@ type TranscodeOpts struct {
 	TargetAudioBitrateKbps int
 	TargetBitrateKbps      int     // max video bitrate in kbps; 0 = CRF-only (no cap)
 	TotalDuration          float64 // total media duration in seconds (for VOD manifest)
-	// SourceFrameRate is the source video's frame rate, which a prepared file
-	// keeps. A prepared download reads its progress from the frames encoded
-	// at this rate (see prepareProgressWriter). Zero when unknown.
-	SourceFrameRate float64
-	FastStart       bool // use superfast preset for faster first-segment production
+	FastStart              bool    // use superfast preset for faster first-segment production
 	// ThrottleSeconds is the resolved forward-buffer policy for this session.
 	// Zero disables throttling. It is durable so a remote executor can preserve
 	// the API server's policy across node reconstruction without reading settings.
@@ -233,12 +165,6 @@ type TranscodeOpts struct {
 	NodeType        string
 	ExecutionMode   string
 	FFmpegLogSink   FFmpegLogSink
-
-	// HLSVariableSubstitution is the client's hls_variable_substitution_v1
-	// delivery feature: FFmpeg's real playlist carries a credential-sized
-	// query once through EXT-X-DEFINE instead of on every segment URI. It
-	// changes playlist text only, never media bytes.
-	HLSVariableSubstitution bool
 	// PrepareProgressSink receives PrepareFile's live encode progress. Like
 	// the log sink it is process-local and never frozen into a recipe.
 	PrepareProgressSink PrepareProgressSink
@@ -250,12 +176,6 @@ type TranscodeOpts struct {
 // enhancement layer as NAL unit type 63 in the same video stream, which stream
 // mapping cannot separate, so filter_units removes those units.
 const DV7ToHDR10BitstreamFilter = "dovi_rpu=strip=1,filter_units=remove_types=63"
-
-// DV7ToDV81BitstreamFilter keeps a single-track Profile 7 stream's RPUs and
-// removes only its enhancement layer. The session then converts each served
-// fMP4 segment's RPUs to Profile 8.1 in place (see dovirpu), so a client that
-// takes Profile 8.1 gets Dolby Vision instead of the HDR10 strip.
-const DV7ToDV81BitstreamFilter = "filter_units=remove_types=63"
 
 // CopyFMP4RecipeVersion identifies the byte-affecting copy-video HLS recipe.
 // Remote starts attest it so rolling clusters never silently mix the old
@@ -287,7 +207,6 @@ const (
 	transcodeCodecH264       = "h264"
 	transcodeCodecHEVC       = "hevc"
 	HWAccelNone              = "none"
-	HWAccelAuto              = "auto"
 	transcodeHWQSV           = "qsv"
 	transcodeHWVAAPI         = "vaapi"
 	transcodeHWNVENC         = "nvenc"
@@ -330,24 +249,15 @@ type TranscodeSession struct {
 	copyTimeline         observedCopyTimeline
 	segmentGeneration    uint64
 	segmentIncarnation   string
-	// dv81Converted maps each media segment a DV7ToDV81BitstreamFilter
-	// session has rewritten to the segmentGeneration it was rewritten in, so
-	// a repeat request does not re-read it. dv81Mu guards it and serializes
-	// the rewrites; it is never held with mu. dv81Track is the video track
-	// read from init.mp4, which a restart of the same recipe does not change,
-	// so media segments never reopen init.mp4 once it is known.
-	dv81Mu             sync.Mutex
-	dv81Converted      map[string]uint64
-	dv81Track          dovirpu.Track
-	throttler          *TranscodeThrottler
-	stderrLinesLogged  int
-	stderrBytesLogged  int
-	stderrDroppedLines int
-	stderrCapLogged    bool
-	restartCount       int
-	stderrLineIndex    int
-	stderrWriter       *ffmpegStderrWriter
-	restartHook        func(context.Context)
+	throttler            *TranscodeThrottler
+	stderrLinesLogged    int
+	stderrBytesLogged    int
+	stderrDroppedLines   int
+	stderrCapLogged      bool
+	restartCount         int
+	stderrLineIndex      int
+	stderrWriter         *ffmpegStderrWriter
+	restartHook          func(context.Context)
 	// generationStartedAt is when the currently-owning ffmpeg process was
 	// spawned. Output in the shared directory older than this timestamp was
 	// written by a previous generation (or a previous session sharing the
@@ -366,17 +276,6 @@ type TranscodeSession struct {
 	// copyPlan is the planned segment list served instead of FFmpeg's
 	// playlist, or nil. It is fixed when the session starts.
 	copyPlan *copySegmentPlan
-	// copyGroups joins FFmpeg's keyframe groups into the planned segments;
-	// set with copyPlan.
-	copyGroups *copyGroupAssembler
-	// planStreamOrigin and planSeekAnchorResolved are the first run's copy
-	// seek anchor, which RecipeOpts restores for a planned session.
-	planStreamOrigin       float64
-	planSeekAnchorResolved bool
-	// planResumeSeconds is the position a resume's plan was asked for (the
-	// first run's requested seek), or 0 for a plan from the start. The
-	// source-aligned playlist starts the player there.
-	planResumeSeconds float64
 	// subtitleSpans lists each generation's subtitle rendition cue file,
 	// oldest first, including those an earlier session recorded in the same
 	// output directory. Guarded by mu.
@@ -392,9 +291,6 @@ type TranscodeSession struct {
 	// subtitleOriginMu serializes observations of a span's origin, so
 	// concurrent subtitle requests share one ffprobe run.
 	subtitleOriginMu sync.Mutex
-	// closing is set once Close or CloseProcess begins. It is terminal: from
-	// then on no restart publishes a generation and no throttler is armed.
-	closing bool
 }
 
 // NewTranscodeSessionForTest exposes only the output directory needed by tests
@@ -406,9 +302,7 @@ func NewTranscodeSessionForTest(outputDir string) *TranscodeSession {
 // SetRestartHook registers a callback fired after every successful Restart.
 // The owning handler uses it to re-arm the transcode throttler and the exit
 // monitor; firing it from Restart itself keeps every restart caller (web
-// segment recovery, audio switch, jellycompat seek) consistent. The callback's
-// context ends when the new FFmpeg process is closed or restartHookTimeout
-// passes, and anything in it that can block must honor that context.
+// segment recovery, audio switch, jellycompat seek) consistent.
 func (s *TranscodeSession) SetRestartHook(fn func(context.Context)) {
 	s.mu.Lock()
 	s.restartHook = fn
@@ -462,6 +356,16 @@ const DefaultSegmentDuration = defaultSegmentDuration
 // 100,000-second limit; shorter fragments reach the same bound sooner.
 const maxSyntheticManifestSegments = 50_000
 
+// Large synthetic playlists used to repeat the full access and reconstruction
+// query on every segment URI. For a feature-length title that turns a small
+// index into several megabytes of duplicate JWT text, delaying both transfer
+// and hls.js parsing. HLS variable substitution keeps the query once while
+// preserving the exact resolved segment URLs. Keep small playlists on the
+// simpler legacy form; below this byte threshold the saving is immaterial.
+const minManifestQuerySubstitutionSavings = 64 * 1024
+
+const manifestQueryVariable = "silo_query"
+
 // remountStartOffsetSeconds is a positive, effectively-zero HLS start offset.
 // Media3 suppresses live-edge position projection for EVENT playlists only
 // when EXT-X-START is positive. Anchoring one millisecond after the generation
@@ -493,16 +397,11 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 			(opts.VideoSampleEntry != VideoSampleEntryHVC1 || !strings.EqualFold(opts.TargetCodecVideo, transcodeCodecHEVC)) {
 		return nil, fmt.Errorf("unsupported video sample-entry recipe")
 	}
-	if !validCopyHLSVideoRange(opts) {
-		return nil, errors.New("unsupported HLS video range")
-	}
 	if opts.CopyVideoMPEGTS && !strings.EqualFold(opts.TargetCodecVideo, "copy") {
 		return nil, fmt.Errorf("copy-video MPEG-TS requires video copy")
 	}
 	if opts.VideoBitstreamFilter != "" &&
-		(opts.VideoBitstreamFilter != DV7ToHDR10BitstreamFilter && opts.VideoBitstreamFilter != DV7ToDV81BitstreamFilter ||
-			!strings.EqualFold(opts.TargetCodecVideo, "copy") ||
-			opts.VideoBitstreamFilter == DV7ToDV81BitstreamFilter && !copyVideoUsesFMP4(opts)) {
+		(opts.VideoBitstreamFilter != DV7ToHDR10BitstreamFilter || !strings.EqualFold(opts.TargetCodecVideo, "copy")) {
 		return nil, fmt.Errorf("unsupported video bitstream filter recipe")
 	}
 	if opts.SegmentDuration <= 0 {
@@ -543,36 +442,19 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 		releaseHWDevice()
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
-	if err := prepareSubtitleFilterInput(ctx, &opts); err != nil {
+	if err := prepareSubtitleFilterInput(&opts); err != nil {
 		releaseHWDevice()
-		// A start refused here wrote nothing. Drop the directory it made,
-		// which a node that hands the start back would otherwise keep until
-		// the orphan sweep; a directory that holds anything stays.
-		_ = os.Remove(opts.OutputDir)
 		return nil, err
 	}
-	copyPlan, err := resolveCopyPlan(ctx, opts)
-	if err != nil {
+	copyPlan := resolveCopyPlan(ctx, opts)
+	if copyPlan == nil && opts.Reconstructed && opts.KeyframePlaylist && ctx.Err() != nil {
+		// Rebuilding without the plan would serve FFmpeg's playlist to a
+		// player that may hold the planned one; a later request rebuilds.
 		releaseHWDevice()
-		return nil, fmt.Errorf("plan rebuilt keyframe playlist: %w", err)
+		return nil, fmt.Errorf("plan rebuilt keyframe playlist: %w", ctx.Err())
 	}
-	opts.KeyframePlanned = copyPlan != nil
-	var copyGroups *copyGroupAssembler
-	planResumeSeconds := 0.0
 	if copyPlan != nil {
 		log.Printf("playback: session %s serves a %d-segment keyframe playlist", opts.SessionID, len(copyPlan.durations))
-		if copyPlan.resumes() {
-			// A resume's first run starts at the plan's first segment, the
-			// way a restart for it does. Its segments are numbered from the
-			// plan, not from FFmpeg's start number.
-			planResumeSeconds = opts.SeekSeconds
-			opts.SeekSeconds = copyPlan.restartSeekSeconds(0)
-			opts.StartSegmentNumber = 0
-			opts.KeyframePlanResume = true
-		}
-		copyGroups = newCopyGroupAssembler(opts.OutputDir, copyPlan)
-		// The session starts at generation 0.
-		opts.copyGroupPrefix = copyGroups.startRun(opts.StartSegmentNumber, audioRecipeKey(opts), 0)
 	}
 
 	// The synchronous source guard above is bounded by the caller's startup
@@ -584,29 +466,25 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	var subtitleSpans []subtitleCueSpan
 	var subtitleCueBase uint64
 	if subtitleRenditionActive(opts) {
-		subtitleSpans, subtitleCueBase = loadSubtitleSpans(opts, copyPlan)
+		subtitleSpans, subtitleCueBase = loadSubtitleSpans(opts)
 		opts.subtitleCueFile = subtitleCueFileName(subtitleCueBase)
 	}
 	s := &TranscodeSession{
-		cancel:                 cancel,
-		opts:                   opts,
-		outputDir:              opts.OutputDir,
-		running:                true,
-		done:                   make(chan struct{}),
-		stderr:                 newBoundedTailBuffer(stderrTailMaxBytes),
-		lastRequestedSegment:   opts.StartSegmentNumber,
-		lastCompletedSegment:   opts.StartSegmentNumber - 1,
-		lastPruneFloor:         opts.StartSegmentNumber - 1,
-		lastPruneHighWater:     opts.StartSegmentNumber - 1,
-		segmentIncarnation:     uuid.NewString(),
-		hwWorkloadDevice:       hwWorkloadDevice,
-		copyPlan:               copyPlan,
-		copyGroups:             copyGroups,
-		planStreamOrigin:       opts.StreamOriginSeconds,
-		planSeekAnchorResolved: opts.CopySeekAnchorResolved,
-		planResumeSeconds:      planResumeSeconds,
-		subtitleSpans:          subtitleSpans,
-		subtitleCueBase:        subtitleCueBase,
+		cancel:               cancel,
+		opts:                 opts,
+		outputDir:            opts.OutputDir,
+		running:              true,
+		done:                 make(chan struct{}),
+		stderr:               newBoundedTailBuffer(stderrTailMaxBytes),
+		lastRequestedSegment: opts.StartSegmentNumber,
+		lastCompletedSegment: opts.StartSegmentNumber - 1,
+		lastPruneFloor:       opts.StartSegmentNumber - 1,
+		lastPruneHighWater:   opts.StartSegmentNumber - 1,
+		segmentIncarnation:   uuid.NewString(),
+		hwWorkloadDevice:     hwWorkloadDevice,
+		copyPlan:             copyPlan,
+		subtitleSpans:        subtitleSpans,
+		subtitleCueBase:      subtitleCueBase,
 	}
 
 	args := buildFFmpegArgs(opts)
@@ -615,10 +493,10 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 		bin = ffmpegBinary()
 	}
 
-	log.Printf("playback: ffmpeg cmd: %s %s", bin, fspath.RedactRelayed(strings.Join(args, " ")))
+	log.Printf("playback: ffmpeg cmd: %s %s", bin, strings.Join(args, " "))
 	s.logFFmpegEvent(ctx, "ffmpeg process starting", "")
 
-	cmd := fspath.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -656,47 +534,11 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 }
 
 func (s *TranscodeSession) monitorFFmpeg(ctx context.Context, cmd *exec.Cmd, done chan struct{}, releaseHWDevice func()) {
-	var processExited, assemblyFinished chan struct{}
-	var assemblyErr error
-	if groups := s.copyGroups; groups != nil {
-		processExited = make(chan struct{})
-		assemblyFinished = make(chan struct{})
-		go func() {
-			defer close(assemblyFinished)
-			// A run that stops assembling would copy on for nothing, so stop
-			// FFmpeg. s.cancel is this run's until done closes.
-			assemblyErr = groups.watch(processExited, func() {
-				s.mu.Lock()
-				cancel := s.cancel
-				s.mu.Unlock()
-				if cancel != nil {
-					cancel()
-				}
-			})
-		}()
-	}
 	waitErr := cmd.Wait()
-	if s.copyGroups != nil && ctx.Err() != nil {
-		// Stopped to replace or close the session, not finished: nothing
-		// waits for the groups it copied ahead.
-		s.copyGroups.stopRun()
-	}
 	// The child no longer owns the device once Wait returns. Release before
 	// flushing/logging so slow diagnostics cannot make the allocator count a
 	// process that has already exited.
 	releaseHWDevice()
-	if processExited != nil {
-		// The final groups remain to be assembled after FFmpeg exits. Keep
-		// waiters alive and prevent another run from replacing these groups
-		// until the watcher has finished its final scan and stopped.
-		close(processExited)
-		<-assemblyFinished
-		if assemblyErr != nil {
-			// The session failed even if FFmpeg was only stopped for it, so
-			// waiters get the transcode error rather than wait on.
-			waitErr = fmt.Errorf("keyframe playlist: %w", assemblyErr)
-		}
-	}
 	processmetrics.Record(processmetrics.Transcode, cmd.ProcessState, waitErr, ctx.Err())
 	s.flushStderr(ctx)
 	s.mu.Lock()
@@ -812,9 +654,6 @@ func normalizeTranscodeOptsContext(ctx context.Context, opts TranscodeOpts) Tran
 	opts.EncoderHWAccel = ""
 	opts.FFmpegPath = ResolveFFmpegPath(opts.FFmpegPath)
 	opts = resolveSoftwareVideoDecode(opts)
-	if opts.gpuDecodeFailed {
-		opts.SoftwareVideoDecode = true
-	}
 	if opts.ToneMapMode == tonemap.ModeSoftware {
 		opts.SoftwareVideoDecode = true
 		opts.HWAccel = HWAccelNone
@@ -917,7 +756,7 @@ func validateToneMapSource(ctx context.Context, opts TranscodeOpts) error {
 	if opts.ToneMapMode == "" {
 		return nil
 	}
-	if err := opts.ToneMapSourceRevision.ValidatePath(ctx, opts.InputPath); err != nil {
+	if err := opts.ToneMapSourceRevision.ValidatePath(opts.InputPath); err != nil {
 		if errors.Is(err, tonemap.ErrSourceRevisionChanged) {
 			return err
 		}
@@ -951,7 +790,7 @@ func validateToneMapSource(ctx context.Context, opts TranscodeOpts) error {
 		InputPath:           opts.InputPath,
 		DurationSeconds:     opts.TotalDuration,
 		SourceBitDepth:      opts.SourceVideoBitDepth,
-		SoftwareVideoDecode: opts.SoftwareVideoDecode || opts.gpuDecodeFailed,
+		SoftwareVideoDecode: opts.SoftwareVideoDecode,
 		Mode:                opts.ToneMapMode,
 		Backend:             backend,
 		Filter:              opts.ToneMapFilter,
@@ -1035,7 +874,7 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 		if strings.EqualFold(opts.SourceVideoCodec, transcodeCodecHEVC) || strings.EqualFold(opts.SourceVideoCodec, "h265") {
 			videoBitstreamFilter = "hevc_mp4toannexb"
 		}
-		if opts.VideoBitstreamFilter == DV7ToHDR10BitstreamFilter || opts.VideoBitstreamFilter == DV7ToDV81BitstreamFilter {
+		if opts.VideoBitstreamFilter == DV7ToHDR10BitstreamFilter {
 			if videoBitstreamFilter != "" {
 				videoBitstreamFilter += ","
 			}
@@ -1056,11 +895,6 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 	case VideoSampleEntryHVC1:
 		args = append(args, "-tag:v", VideoSampleEntryHVC1)
 	}
-	if opts.VideoBitstreamFilter == DV7ToDV81BitstreamFilter && opts.VideoSampleEntry != VideoSampleEntryDVH1 {
-		// FFmpeg writes the DOVI record only under -strict unofficial; the
-		// session relabels it as Profile 8.1 when it serves init.mp4.
-		args = append(args, "-strict", "unofficial")
-	}
 
 	// Copy-video sessions only do audio work on the filter/encode side.
 	// ffmpeg's default thread selection spawns one filter thread per CPU
@@ -1072,9 +906,6 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 
 	// Audio codec.
 	args = appendAudioArgs(args, opts)
-	if HLSCopiesAACIntoFMP4(opts) {
-		args = appendCopiedAACToMP4Args(args, opts.CopyAudioCodec)
-	}
 
 	// Subtitle burn-in and resolution scaling — only when encoding video.
 	if !isVideoCopy {
@@ -1098,27 +929,16 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 		segmentPattern = filepath.Join(opts.OutputDir, "seg_%05d.ts")
 	}
 	manifestPath := filepath.Join(opts.OutputDir, "stream.m3u8")
-	hlsTime := strconv.Itoa(opts.SegmentDuration)
-	// Bound real playlists as well as synthetic ones. Segment files remain on
-	// disk because delete_segments is not enabled, while the manifest itself
-	// cannot grow without limit during multi-day sessions.
-	hlsListSize := strconv.Itoa(maxSyntheticManifestSegments)
-	if opts.copyGroupPrefix != "" {
-		// A keyframe-planned run: a tiny target cuts at every keyframe, one
-		// group per file, and nothing reads FFmpeg's playlist, so it stays
-		// short instead of being rewritten whole after every group.
-		segmentPattern = filepath.Join(opts.OutputDir, opts.copyGroupPrefix+"%06d.m4s")
-		manifestPath = filepath.Join(opts.OutputDir, copyGroupPlaylist)
-		hlsTime = "0.001"
-		hlsListSize = "5"
-	}
 
 	args = append(args,
 		"-max_muxing_queue_size", "2048",
 		"-max_delay", strconv.Itoa(hlsMuxMaxDelayMicros),
 		"-f", "hls",
-		"-hls_time", hlsTime,
-		"-hls_list_size", hlsListSize,
+		"-hls_time", fmt.Sprintf("%d", opts.SegmentDuration),
+		// Bound real playlists as well as synthetic ones. Segment files remain on
+		// disk because delete_segments is not enabled, while the manifest itself
+		// cannot grow without limit during multi-day sessions.
+		"-hls_list_size", strconv.Itoa(maxSyntheticManifestSegments),
 		"-hls_segment_type", segmentType,
 		// Write segments to temp files first so the player never fetches a
 		// partially-written segment during a quality switch.
@@ -1133,7 +953,7 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 	if videoUsesFMP4 {
 		args = append(args, "-hls_segment_options", "movflags=+frag_discont")
 	}
-	if opts.StartSegmentNumber > 0 && opts.copyGroupPrefix == "" {
+	if opts.StartSegmentNumber > 0 {
 		args = append(args, "-start_number", fmt.Sprintf("%d", opts.StartSegmentNumber))
 	}
 	args = append(args, manifestPath)
@@ -1184,10 +1004,9 @@ func resolveEffectiveTranscodeHWAccelContext(ctx context.Context, opts Transcode
 	}
 	// An explicit NVENC setting keeps the established libx264 fallback for a
 	// source the CUDA decoder must not receive. Intel QSV/VAAPI have the
-	// explicit upload paths below and retain hardware encoding. Only an
-	// AutoTranscodePipeline's mixed stage (hw_accel=auto, or the
-	// NewSoftwareDecodeRetryPipeline fallback), which falls back to software
-	// itself if the CUDA upload fails, keeps NVENC encoding after a CPU decode.
+	// explicit upload paths below and retain hardware encoding. Only the
+	// automatic pipeline's mixed stage, which falls back to software itself if
+	// the CUDA upload fails, keeps NVENC encoding after a CPU decode.
 	if opts.SoftwareVideoDecode && hwAccel == transcodeHWNVENC &&
 		(!opts.nvencSoftwareDecode || opts.ToneMapMode != "") {
 		return HWAccelNone
@@ -1216,14 +1035,10 @@ func appendStreamSelectionArgs(args []string, opts TranscodeOpts) []string {
 	if bitmapBurnInActive(opts) {
 		args = append(args, "-map", "[vout]")
 	} else {
-		args = appendPreparedVideoMap(args, opts)
+		args = append(args, "-map", "0:v:0")
 	}
 	if audioTrackIndex >= 0 {
-		audioMap := fmt.Sprintf("0:a:%d", audioTrackIndex)
-		if !opts.RequireAudioTrack {
-			audioMap += "?"
-		}
-		args = append(args, "-map", audioMap)
+		args = append(args, "-map", fmt.Sprintf("0:a:%d?", audioTrackIndex))
 	} else {
 		args = append(args, "-map", "0:a:0?")
 	}
@@ -1239,16 +1054,6 @@ func HLSOutputContainer(opts TranscodeOpts) string {
 		return OutputContainerFMP4
 	}
 	return OutputContainerMPEGTS
-}
-
-// HLSCopiesAACIntoFMP4 reports whether an HLS run copies an AAC track into
-// fMP4 segments, the one case that adds aac_adtstoasc. MPEG-TS segments carry
-// ADTS as it is. Remote executors must confirm the copied codec for such a run
-// because an older one ignores it and fails after the first segment.
-func HLSCopiesAACIntoFMP4(opts TranscodeOpts) bool {
-	return !TranscodesAudio(opts.TargetCodecAudio) &&
-		HLSOutputContainer(opts) == OutputContainerFMP4 &&
-		copiedAudioIsAAC(opts.CopyAudioCodec)
 }
 
 // copyVideoUsesFMP4 reports whether copied video is packaged as fragmented MP4
@@ -1364,8 +1169,6 @@ func appendHWAccelArgs(args []string, opts TranscodeOpts) []string {
 		args = append(args, "-filter_hw_device", vaapiHWDeviceAlias)
 		if !opts.SoftwareVideoDecode {
 			args = append(args, "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi")
-		} else if opts.gpuDecodeFailed {
-			args = append(args, "-noautorotate")
 		}
 	case transcodeHWNVENC:
 		if opts.SoftwareVideoDecode {
@@ -1597,60 +1400,13 @@ func appendVideoToolboxRateControl(args []string, opts TranscodeOpts) []string {
 // appendVideoFilterArgs appends the -vf selection for an encoding (non-copy)
 // video stream: the subtitle burn-in chain (which includes scaling and hw
 // download/upload for QSV/VAAPI) or the hwaccel-appropriate standalone scale
-// filter, led by cpuDeinterlaceFilter when the video is decoded on the CPU.
-// The ONE home of this decision — the HLS builder and the single-file
+// filter. The ONE home of this decision — the HLS builder and the single-file
 // prepare builder must always produce identical filter chains (a fix landing
 // in only one of them silently ships wrong cached artifacts).
 func appendVideoFilterArgs(args []string, opts TranscodeOpts) []string {
 	if opts.ToneMapMode != "" {
 		return appendToneMapFilterArgs(args, opts)
 	}
-	start := len(args)
-	args = appendSDRVideoFilterArgs(args, opts)
-	// Only video decoded on the CPU is deinterlaced here. Frames a hardware
-	// decoder produced stay as they are, including in the burn-in graphs that
-	// download them for subtitles.
-	if opts.SoftwareVideoDecode || !isHardwareTranscodeBackend(opts.HWAccel) {
-		args = prependCPUDeinterlace(args, start)
-	}
-	return args
-}
-
-// cpuDeinterlaceFilter deinterlaces the frames a software decoder flags as
-// interlaced and passes every other frame through untouched, one output frame
-// per input frame, so progressive sources keep their pixels, frame rate and
-// timestamps. Without it both fields of an interlaced frame are encoded into
-// one picture that the output then labels progressive.
-const cpuDeinterlaceFilter = "bwdif=mode=send_frame:deint=interlaced"
-
-// The FFmpeg options that carry a video filter graph.
-const (
-	videoFilterOption        = "-vf"
-	videoFilterComplexOption = "-filter_complex"
-)
-
-// prependCPUDeinterlace makes cpuDeinterlaceFilter the first filter the
-// decoded video reaches in the graph appended at args[start:], or adds a graph
-// holding only that filter when none was appended.
-func prependCPUDeinterlace(args []string, start int) []string {
-	for i := start; i+1 < len(args); i++ {
-		switch args[i] {
-		case videoFilterOption:
-			args[i+1] = cpuDeinterlaceFilter + "," + args[i+1]
-			return args
-		case videoFilterComplexOption:
-			const video = "[0:v:0]"
-			args[i+1] = strings.Replace(args[i+1], video, video+cpuDeinterlaceFilter+"[vdeint];[vdeint]", 1)
-			return args
-		}
-	}
-	return append(args, videoFilterOption, cpuDeinterlaceFilter)
-}
-
-// appendSDRVideoFilterArgs appends the subtitle burn-in or scale graph of a
-// transcode that does no tone mapping, or nothing when the encoder takes the
-// decoded frames as they are.
-func appendSDRVideoFilterArgs(args []string, opts TranscodeOpts) []string {
 	switch {
 	case bitmapBurnInActive(opts):
 		return appendBitmapSubtitleBurnInArgs(args, opts)
@@ -1757,7 +1513,11 @@ func toneMapScaleFilter(opts TranscodeOpts) string {
 // toneMappedTextSubtitleFilter places CPU subtitle rendering after conversion
 // and downloads or uploads frames only where the selected backend requires it.
 func toneMappedTextSubtitleFilter(opts TranscodeOpts) string {
-	subFilter := textSubtitleFilter(opts)
+	subtitleInputPath := opts.InputPath
+	if opts.subtitleFilterInputPath != "" {
+		subtitleInputPath = opts.subtitleFilterInputPath
+	}
+	subFilter := fmt.Sprintf("subtitles='%s':si=%d", escapeFilterPath(subtitleInputPath), opts.SubtitleTrackIndex)
 	scale := resolutionToScale(opts.TargetResolution)
 	cpuTail := subFilter
 	if scale != "" {
@@ -2130,7 +1890,12 @@ func softwareDecodedBitmapBurnInGraph(opts TranscodeOpts, subInput string, qsv b
 // [scale,] subtitles → hwupload → hwmap.
 func appendSubtitleBurnInArgs(args []string, opts TranscodeOpts) []string {
 	scale := resolutionToScale(opts.TargetResolution)
-	subFilter := textSubtitleFilter(opts)
+	subtitleInputPath := opts.InputPath
+	if opts.subtitleFilterInputPath != "" {
+		subtitleInputPath = opts.subtitleFilterInputPath
+	}
+	subFilter := fmt.Sprintf("subtitles=filename='%s':si=%d",
+		escapeFilterPath(subtitleInputPath), opts.SubtitleTrackIndex)
 
 	// Build the CPU filter portion: scale (if any) then subtitle overlay.
 	// Scale must come before subtitles so text is rendered at target resolution.
@@ -2290,74 +2055,25 @@ func escapeFilterPath(path string) string {
 
 const subtitleFilterAliasName = "subtitle-source.media"
 
-// ErrRelayedSubtitleBurnIn refuses a text burn-in whose track could not be
-// staged when the input is relayed from the core (fspath.IsRelayed): the
-// libass fallback, which reads the whole media file, is not taken over the
-// relay. A transcode node answers it as work it cannot do, so the start runs
-// on a node that reads the file locally, or on the API server.
-var ErrRelayedSubtitleBurnIn = errors.New("subtitle burn-in: the track cannot be staged and a source read through the core cannot be handed to libass")
-
-// textSubtitleFilter is the libass subtitles filter of a text burn-in: the
-// staged track, the only stream of its file, with its fonts, or else the
-// track's index in the media file.
-func textSubtitleFilter(opts TranscodeOpts) string {
-	if opts.subtitleFilterFontsDir != "" {
-		return fmt.Sprintf("subtitles=filename='%s':fontsdir='%s'",
-			escapeFilterPath(opts.subtitleFilterInputPath), escapeFilterPath(opts.subtitleFilterFontsDir))
-	}
-	subtitleInputPath := opts.InputPath
-	if opts.subtitleFilterInputPath != "" {
-		subtitleInputPath = opts.subtitleFilterInputPath
-	}
-	return fmt.Sprintf("subtitles=filename='%s':si=%d", escapeFilterPath(subtitleInputPath), opts.SubtitleTrackIndex)
-}
-
-// prepareSubtitleFilterInput gives the libass subtitles filter of a text
-// burn-in its input. It stages the track on its own first
-// (stageBurnInSubtitle), because given the media file libass reads all of it
-// before the first frame. When the track can't be staged, the filter reads
-// the media file through a stable alias in the session directory, which
-// avoids passing the library filename through FFmpeg's nested filter
-// parsers: an apostrophe can be consumed by the filtergraph parser even after
-// it was escaped for the subtitles filter. Both are retained for seek
-// restarts with the rest of TranscodeOpts.
-func prepareSubtitleFilterInput(ctx context.Context, opts *TranscodeOpts) error {
+// prepareSubtitleFilterInput avoids passing the library filename through
+// FFmpeg's nested filter parsers. In particular, an apostrophe can be consumed
+// by the filtergraph parser even after it was escaped for the subtitles filter.
+// A stable alias in the session directory keeps the media input unchanged and
+// is retained for seek restarts with the rest of TranscodeOpts.
+func prepareSubtitleFilterInput(opts *TranscodeOpts) error {
 	if !opts.SubtitleBurnIn || opts.SubtitleTrackIndex < 0 || NeedsBurnIn(opts.SubtitleCodec) {
 		return nil
 	}
 
-	staged, err := stageBurnInSubtitle(ctx, *opts)
-	if err == nil {
-		opts.subtitleFilterInputPath = staged.trackPath
-		opts.subtitleFilterFontsDir = staged.fontsDir
-		return nil
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if fspath.IsRelayed(opts.InputPath) {
-		// libass opens its file with no protocol whitelist and reads all of
-		// it: over the relay that is the whole source through the core, past
-		// any startup budget. The start fails so it runs where the file is
-		// local.
-		slog.InfoContext(ctx, "burn-in subtitle not staged; a relayed source cannot be handed to libass",
-			"component", "playback", "playback_session_id", opts.SessionID, "subtitle_track", opts.SubtitleTrackIndex, "error", err)
-		return fmt.Errorf("%w: %w", ErrRelayedSubtitleBurnIn, err)
-	}
-	slog.InfoContext(ctx, "burn-in subtitle not staged; libass reads the media file",
-		"component", "playback", "playback_session_id", opts.SessionID, "subtitle_track", opts.SubtitleTrackIndex, "error", err)
-	opts.subtitleFilterFontsDir = ""
-
 	aliasPath := filepath.Join(opts.OutputDir, subtitleFilterAliasName)
-	// InputPath is fspath-encoded; the link must point at the real file name.
-	target, err := fspath.Readlink(aliasPath)
+	target, err := os.Readlink(aliasPath)
 	switch {
 	case err == nil:
 		if target != opts.InputPath {
 			return fmt.Errorf("prepare subtitle filter input: alias targets unexpected source")
 		}
 	case errors.Is(err, os.ErrNotExist):
-		if err := os.Symlink(fspath.Decode(opts.InputPath), aliasPath); err != nil {
+		if err := os.Symlink(opts.InputPath, aliasPath); err != nil {
 			return fmt.Errorf("prepare subtitle filter input: %w", err)
 		}
 	default:
@@ -2414,18 +2130,14 @@ func (s *TranscodeSession) GetManifest() ([]byte, error) {
 // output. The check compares file identity rather than timestamps, so a
 // filesystem whose clock differs from this host's cannot hide fresh output.
 func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
-	if s.copyGroups != nil {
-		return s.plannedManifestWhenReady()
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	manifestPath := filepath.Join(s.outputDir, "stream.m3u8")
-	var inherited os.FileInfo
-	if currentGeneration {
-		inherited = s.inheritedManifest
+	data, info, err := readManifestFile(manifestPath)
+	if err == nil && currentGeneration && s.inheritedManifest != nil && sameManifestFile(info, s.inheritedManifest) {
+		data, err = nil, os.ErrNotExist
 	}
-	data, err := readManifestFile(manifestPath, inherited)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if !s.running {
@@ -2433,9 +2145,9 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 					return nil, ErrManifestNotReady
 				}
 				if s.waitErr != nil {
-					retained := s.stderr.String()
-					if stderr := truncateStderr(retained); stderr != "" {
-						return nil, classifyFFmpegFailure(fmt.Errorf("%w: %w (stderr: %s)", ErrTranscodeFailed, s.waitErr, stderr), retained)
+					stderr := truncateStderr(s.stderr.String())
+					if stderr != "" {
+						return nil, fmt.Errorf("%w: %w (stderr: %s)", ErrTranscodeFailed, s.waitErr, stderr)
 					}
 					return nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, s.waitErr)
 				}
@@ -2478,26 +2190,25 @@ func statManifest(outputDir string) os.FileInfo {
 	return info
 }
 
-// readManifestFile reads a playlist. When the open file is still inherited,
-// it reports os.ErrNotExist without reading the old playlist, which a startup
-// wait would otherwise read in full on every check. The comparison uses the
-// open file: FFmpeg replaces the playlist by rename, so a separate Stat by path
-// could describe a newer file than the bytes returned and let an inherited
-// playlist pass as current.
-func readManifestFile(path string, inherited os.FileInfo) ([]byte, error) {
+// readManifestFile reads a playlist and describes the same open file. FFmpeg
+// replaces the playlist by rename, so a separate Stat by path could describe a
+// newer file than the bytes returned and let an inherited playlist pass as
+// current.
+func readManifestFile(path string) ([]byte, os.FileInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if inherited != nil && sameManifestFile(info, inherited) {
-		return nil, os.ErrNotExist
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, nil, err
 	}
-	return io.ReadAll(f)
+	return data, info, nil
 }
 
 // sameManifestFile reports whether current is still the inherited playlist.
@@ -2508,14 +2219,6 @@ func sameManifestFile(current, inherited os.FileInfo) bool {
 		current.Size() == inherited.Size() &&
 		current.ModTime().Equal(inherited.ModTime())
 }
-
-// outputPollInterval is the pause between checks while a request waits for
-// FFmpeg output. FFmpeg tells the server nothing when it renames a finished
-// segment into place or rewrites the playlist, so a finished file can go
-// unnoticed for up to one interval. Every transcoded startup and seek waits on
-// output at least once. A check opens or stats one file, or reads the playlist
-// and stats its startup segments, so a short interval costs little.
-const outputPollInterval = 10 * time.Millisecond
 
 // WaitForManifest polls until the manifest is ready for playback or the timeout
 // expires. It keeps the initial request open long enough for FFmpeg to write
@@ -2561,46 +2264,25 @@ func (s *TranscodeSession) waitForManifest(ctx context.Context, timeout time.Dur
 			return nil, ctx.Err()
 		case <-deadline:
 			return nil, s.manifestTimeoutError(timeout)
-		case <-time.After(outputPollInterval):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
 
 // BuildPlaybackManifest returns the manifest we should expose to clients.
 //
-// Copy-video sessions expose their keyframe plan or FFmpeg's real manifest, so
-// the playlist timing matches the variable-length fragments FFmpeg actually
-// writes and, without a plan, the seekable window reflects what FFmpeg has
-// produced so far. Encoded transcodes
+// Copy-video sessions always expose FFmpeg's real manifest so the playlist
+// timing matches the variable-length fragments FFmpeg actually writes and the
+// seekable window reflects what FFmpeg has produced so far. Encoded transcodes
 // use the synthetic full VOD manifest only while its segment count is bounded;
 // longer media uses FFmpeg's real sliding playlist.
-//
-// A session with a subtitle rendition answers its multivariant playlist, or
-// the media playlist rawQuery selects (see buildSubtitleRenditionPlaylist).
-//
-// A rawQuery longer than maxManifestQueryBytes is ErrManifestQueryTooLong.
 func (s *TranscodeSession) BuildPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
-	rawQuery, err := manifestQuery(rawQuery)
-	if err != nil {
-		return nil, err
-	}
-	return s.buildPlaybackManifest(segPrefix, rawQuery)
-}
-
-// buildPlaybackManifest is BuildPlaybackManifest for a query manifestQuery
-// has already accepted.
-func (s *TranscodeSession) buildPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
-	if s.HasSubtitleRendition() {
-		return s.buildSubtitleRenditionPlaylist(segPrefix, rawQuery)
-	}
-	return s.buildVideoPlaylist(segPrefix, rawQuery)
-}
-
-// buildVideoPlaylist is the session's video media playlist.
-func (s *TranscodeSession) buildVideoPlaylist(segPrefix, rawQuery string) ([]byte, error) {
 	opts := s.Opts()
 	if s.copyPlan != nil {
 		return s.copyPlan.manifest(opts, segPrefix, rawQuery), nil
+	}
+	if s.HasSubtitleRendition() {
+		return s.buildSubtitleRenditionPlaylist(segPrefix, rawQuery), nil
 	}
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") ||
 		!CanGenerateSyntheticManifest(opts.TotalDuration, opts.SegmentDuration) {
@@ -2611,9 +2293,6 @@ func (s *TranscodeSession) buildVideoPlaylist(segPrefix, rawQuery string) ([]byt
 			return nil, err
 		}
 		manifest = stabilizeCopyHLSRemountTimeline(manifest, opts)
-		if opts.HLSVariableSubstitution {
-			return RewriteManifestPathsWithSubstitution(manifest, segPrefix, rawQuery)
-		}
 		return RewriteManifestPaths(manifest, segPrefix, rawQuery)
 	}
 
@@ -2685,23 +2364,10 @@ const SourceTimelineQueryParam = "source_timeline"
 // first produced segment retains its source-time position. Synthetic manifests
 // already cover the full source timeline and need no adjustment.
 func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
-	rawQuery, err := manifestQuery(rawQuery)
-	if err != nil {
-		return nil, err
-	}
 	if s.copyPlan != nil {
-		// A planned playlist doesn't depend on FFmpeg's progress or
-		// restarts. One from the start is on the source's timeline already;
-		// a resume's starts at its origin, so it gets the gap before it that
-		// a seeked FFmpeg playlist gets.
-		manifest, err := s.buildPlaybackManifest(segPrefix, rawQuery)
-		if err != nil || !s.copyPlan.resumes() {
-			return manifest, err
-		}
-		opts := s.Opts()
-		opts.SeekSeconds, opts.StartSegmentNumber = s.planResumeSeconds, 0
-		opts.StreamOriginSeconds, opts.CopySeekAnchorResolved = s.planStreamOrigin, true
-		return AlignRealManifestToSourceTimeline(manifest, opts, sourceTimelineGapURI(manifest, opts, segPrefix, rawQuery))
+		// A planned playlist starts at the source's beginning and doesn't
+		// depend on FFmpeg's progress or restarts.
+		return s.BuildPlaybackManifest(segPrefix, rawQuery)
 	}
 	s.mu.Lock()
 	opts, generation, restarting := s.opts, s.segmentGeneration, s.restarting != nil
@@ -2709,7 +2375,7 @@ func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuer
 	if restarting {
 		return nil, ErrManifestNotReady
 	}
-	manifest, err := s.buildPlaybackManifest(segPrefix, rawQuery)
+	manifest, err := s.BuildPlaybackManifest(segPrefix, rawQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -2719,7 +2385,10 @@ func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuer
 		return manifest, nil
 	}
 
-	gapURI := sourceTimelineGapURI(manifest, opts, segPrefix, rawQuery)
+	gapURI := segPrefix + "source_timeline_gap" + hlsSegmentExtension(opts)
+	if rawQuery != "" {
+		gapURI += "?" + rawQuery
+	}
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") && opts.CopySeekAnchorResolved {
 		timeline, err := parseManifestTimeline(manifest)
 		if err != nil {
@@ -2737,20 +2406,6 @@ func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuer
 		return manifest, nil
 	}
 	return AlignRealManifestToSourceTimeline(manifest, opts, gapURI)
-}
-
-// sourceTimelineGapURI is the URI of the gap segments a source-aligned
-// playlist prepends. Gap URIs take the query form the real segment URIs got.
-func sourceTimelineGapURI(manifest []byte, opts TranscodeOpts, segPrefix, rawQuery string) string {
-	gapURI := segPrefix + "source_timeline_gap" + hlsSegmentExtension(opts)
-	if rawQuery != "" {
-		gapQuery := rawQuery
-		if definition, reference := manifestVariable(manifestQueryVariable, rawQuery, minRewrittenURISavings); definition != "" && bytes.Contains(manifest, []byte(definition)) {
-			gapQuery = reference
-		}
-		gapURI += "?" + gapQuery
-	}
-	return gapURI
 }
 
 // AlignRealManifestToSourceTimeline prepends bounded EXT-X-GAP segments to a
@@ -3135,9 +2790,6 @@ func staleProducedWindow(segmentDuration int) time.Duration {
 // SegmentProgress reports the highest manifest-referenced segment that exists
 // on disk with data. This is the produced media source of truth.
 func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
-	if s.copyGroups != nil {
-		return s.plannedSegmentProgress()
-	}
 	s.mu.Lock()
 	opts := s.opts
 	progress := SegmentProgress{
@@ -3323,6 +2975,20 @@ func (s *TranscodeSession) generateSyntheticPlaylist(segPrefix, rawQuery, namePr
 	return buf.Bytes()
 }
 
+func syntheticManifestQuery(segmentCount int, rawQuery string) (definition, suffix string, minVersion int) {
+	if rawQuery == "" {
+		return "", "", 0
+	}
+	legacySuffix := "?" + rawQuery
+	variableSuffix := "?{$" + manifestQueryVariable + "}"
+	savingsPerSegment := len(legacySuffix) - len(variableSuffix)
+	if savingsPerSegment <= 0 || int64(segmentCount)*int64(savingsPerSegment) < minManifestQuerySubstitutionSavings || strings.ContainsAny(rawQuery, "\"\r\n") {
+		return "", legacySuffix, 0
+	}
+	definition = fmt.Sprintf("#EXT-X-DEFINE:NAME=\"%s\",VALUE=\"%s\"\n", manifestQueryVariable, rawQuery)
+	return definition, variableSuffix, 8
+}
+
 // GetSegment returns the file path of a named segment if it exists.
 func (s *TranscodeSession) GetSegment(name string) (string, error) {
 	// Sanitize the name to prevent directory traversal.
@@ -3362,68 +3028,29 @@ func (l *SegmentLease) Close() error {
 
 // OpenSegment opens a completed segment for serving and captures its FFmpeg
 // generation atomically with the open.
-//
-// name must be a single file name inside the output directory. The open goes
-// through os.Root, so a symlink in the directory cannot lead outside it: the
-// subtitle filter alias points at the source media and must never be served as
-// a segment.
 func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
-	lease, dv81, sessionID, err := s.openSegment(name)
-	if err != nil || !dv81 {
-		return lease, err
-	}
-	if err := s.convertDV81(name, lease, sessionID); err != nil {
-		_ = lease.Close()
-		return nil, err
-	}
-	return lease, nil
-}
-
-// openSegment is OpenSegment under s.mu. dv81 reports a
-// DV7ToDV81BitstreamFilter session, whose file OpenSegment converts next;
-// sessionID is read here because a restart replaces s.opts under s.mu.
-func (s *TranscodeSession) openSegment(name string) (lease *SegmentLease, dv81 bool, sessionID string, err error) {
-	if !servableSegmentName(name) {
-		return nil, false, "", ErrSegmentNotFound
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.restarting != nil {
-		return nil, false, "", ErrSegmentNotFound
+		return nil, ErrSegmentNotFound
 	}
 
-	root, err := os.OpenRoot(s.outputDir)
+	clean := filepath.Base(name)
+	segment, err := os.Open(filepath.Join(s.outputDir, clean))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, false, "", ErrSegmentNotFound
+			return nil, ErrSegmentNotFound
 		}
-		return nil, false, "", fmt.Errorf("open segment directory: %w", err)
-	}
-	// Files opened through a Root hold their own descriptor and stay valid
-	// after the Root closes.
-	defer func() { _ = root.Close() }()
-	// A DV7ToDV81BitstreamFilter session rewrites the leased file itself, so
-	// a restart that replaces the name meanwhile cannot split what is
-	// converted from what is served.
-	flag := os.O_RDONLY
-	if s.opts.VideoBitstreamFilter == DV7ToDV81BitstreamFilter {
-		flag = os.O_RDWR
-	}
-	segment, err := root.OpenFile(name, flag, 0)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, "", ErrSegmentNotFound
-		}
-		return nil, false, "", fmt.Errorf("open segment: %w", err)
+		return nil, fmt.Errorf("open segment: %w", err)
 	}
 	info, err := segment.Stat()
 	if err != nil {
 		_ = segment.Close()
-		return nil, false, "", fmt.Errorf("stat segment: %w", err)
+		return nil, fmt.Errorf("stat segment: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Size() <= 0 {
+	if info.Size() <= 0 {
 		_ = segment.Close()
-		return nil, false, "", ErrSegmentNotFound
+		return nil, ErrSegmentNotFound
 	}
 	if s.segmentIncarnation == "" {
 		s.segmentIncarnation = uuid.NewString()
@@ -3433,96 +3060,7 @@ func (s *TranscodeSession) openSegment(name string) (lease *SegmentLease, dv81 b
 		Info:            info,
 		Generation:      s.segmentGeneration,
 		GenerationToken: s.segmentGenerationTokenLocked(),
-	}, s.opts.VideoBitstreamFilter == DV7ToDV81BitstreamFilter, s.opts.SessionID, nil
-}
-
-// forgetDV81Conversion drops a removed media file's conversion entry, so a
-// file written again under its name in the same generation, as a planned
-// session's assembler can, is converted again when served.
-func (s *TranscodeSession) forgetDV81Conversion(name string) {
-	s.dv81Mu.Lock()
-	defer s.dv81Mu.Unlock()
-	delete(s.dv81Converted, name)
-}
-
-// convertDV81 rewrites a served file of a DV7ToDV81BitstreamFilter session
-// in place before it is handed out: init.mp4's DOVI record, or a media
-// segment's RPUs. dv81Mu serializes it, so no request sees a file mid-rewrite,
-// without holding s.mu over the file I/O. It fails closed: a segment it cannot
-// convert is not served under the plan's Dolby Vision 8.1 claim, so the client
-// replans onto the next recipe. An init.mp4 that does not parse yet reads as
-// not ready, like an empty one; one that parses but cannot carry 8.1 fails.
-func (s *TranscodeSession) convertDV81(name string, lease *SegmentLease, sessionID string) error {
-	s.dv81Mu.Lock()
-	defer s.dv81Mu.Unlock()
-	if name != hlsInitSegmentName && (!strings.HasSuffix(name, ".m4s") || s.dv81Converted[name] == lease.Generation+1) {
-		return nil
-	}
-	// init.mp4 is converted only through its own lease. A media segment needs
-	// just its track id and NAL length size: from the init already served, or
-	// else read from the current init.mp4 without writing to it, which FFmpeg
-	// may be rewriting after a restart.
-	track := s.dv81Track
-	if name == hlsInitSegmentName || track.NALLength == 0 {
-		initTrack, err := s.dv81InitTrack(name, lease)
-		switch {
-		case errors.Is(err, dovirpu.ErrUnsupportedInit):
-			slog.Error("playback: dolby vision 8.1 init segment cannot be converted", "session", sessionID, "error", err)
-			return fmt.Errorf("convert init segment to dolby vision 8.1: %w", err)
-		case err != nil:
-			slog.Warn("playback: dolby vision 8.1 init segment not convertible yet", "session", sessionID, "error", err)
-			return ErrSegmentNotFound
-		}
-		track, s.dv81Track = initTrack, initTrack
-	}
-	if name == hlsInitSegmentName {
-		return nil
-	}
-	// A segment that cannot be converted, including one where no RPU
-	// converted (dovirpu.ErrNoRPUConverted), is left unchanged and fails
-	// every request.
-	stats, err := dovirpu.ConvertSegmentFile(lease.File, track)
-	if err != nil {
-		slog.Error("playback: dolby vision 8.1 segment conversion failed", "session", sessionID, "segment", name, "error", err)
-		return fmt.Errorf("convert segment to dolby vision 8.1: %w", err)
-	}
-	if stats.Dropped > 0 {
-		slog.Warn("playback: dolby vision 8.1 RPUs left as HDR10", "session", sessionID, "segment", name,
-			"dropped", stats.Dropped, "converted", stats.Converted)
-	}
-	if s.dv81Converted == nil {
-		s.dv81Converted = make(map[string]uint64)
-	}
-	// Stored as generation+1 so the zero value means "never converted".
-	s.dv81Converted[name] = lease.Generation + 1
-	return nil
-}
-
-// dv81InitTrack converts the leased init.mp4 in place and returns its video
-// track. For a media segment it reads the current init.mp4 read-only.
-func (s *TranscodeSession) dv81InitTrack(name string, lease *SegmentLease) (dovirpu.Track, error) {
-	if name == hlsInitSegmentName {
-		return dovirpu.ConvertInitFile(lease.File)
-	}
-	root, err := os.OpenRoot(s.outputDir)
-	if err != nil {
-		return dovirpu.Track{}, err
-	}
-	defer func() { _ = root.Close() }()
-	f, err := root.Open(hlsInitSegmentName)
-	if err != nil {
-		return dovirpu.Track{}, err
-	}
-	defer func() { _ = f.Close() }()
-	return dovirpu.InitTrack(f)
-}
-
-// servableSegmentName reports whether name is a plain file name the segment
-// route may open: local, a single path element, and not the subtitle filter
-// alias.
-func servableSegmentName(name string) bool {
-	return filepath.IsLocal(name) && filepath.Base(name) == name && name != "." &&
-		name != subtitleFilterAliasName
+	}, nil
 }
 
 // Close terminates the ffmpeg process and removes the temporary output directory.
@@ -3541,32 +3079,18 @@ func (s *TranscodeSession) CloseProcess() error {
 // shutdown kills the ffmpeg process and, when removeOutput is true, removes the
 // temporary output directory.
 func (s *TranscodeSession) shutdown(removeOutput bool) error {
-	// Closing is terminal: a restart that has not published its generation
-	// yet publishes none. A restart in flight swaps the generation's cancel
-	// and done, so wait for it before reading them.
-	s.mu.Lock()
-	s.closing = true
-	flight := s.restarting
-	s.mu.Unlock()
 	s.StopThrottler()
-	if flight != nil {
-		<-flight.done
-	}
-	s.mu.Lock()
-	cancel, done := s.cancel, s.done
-	s.mu.Unlock()
-
-	// Cancel the context to kill the process.
-	if cancel != nil {
-		cancel()
+	// Cancel the context to kill the process (no mutex needed for cancel).
+	if s.cancel != nil {
+		s.cancel()
 	}
 
 	// Wait for the monitor goroutine to finish reaping the process.
 	// This avoids a deadlock: the goroutine needs s.mu to mark running=false,
 	// so we must not hold s.mu while waiting.
 	// done is nil when no process was started (e.g. test-only sessions).
-	if done != nil {
-		<-done
+	if s.done != nil {
+		<-s.done
 	}
 
 	if removeOutput {
@@ -3615,47 +3139,11 @@ func (s *TranscodeSession) WaitError() error {
 	return s.waitErr
 }
 
-// SegmentAt returns the segment that holds positionSeconds of the stream: the
-// planned segment for a keyframe-planned session, whose segments vary in
-// length, else the fixed-length one.
-func (s *TranscodeSession) SegmentAt(positionSeconds float64) int {
-	if positionSeconds <= 0 {
-		return 0
-	}
-	if s.copyPlan != nil {
-		// A resume's plan starts at its origin, not at the source's start.
-		if s.copyPlan.resumes() {
-			positionSeconds = max(positionSeconds-s.planStreamOrigin, 0)
-		}
-		return s.copyPlan.segmentAt(positionSeconds)
-	}
-	if d := s.Opts().SegmentDuration; d > 0 {
-		return int(positionSeconds / float64(d))
-	}
-	return 0
-}
-
 // Opts returns the TranscodeOpts used to create this session (for testing).
 func (s *TranscodeSession) Opts() TranscodeOpts {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.opts
-}
-
-// RecipeOpts returns the opts to persist for rebuilding the session. A
-// keyframe-planned session's timeline is its plan, wherever a restart has
-// moved the current run, so its recipe starts where its first run did: from
-// the beginning, or at a resume's origin. The rebuild plans the same segments
-// again, and a segment request restarts FFmpeg at the player's position.
-func (s *TranscodeSession) RecipeOpts() TranscodeOpts {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	opts := s.opts
-	if s.copyPlan != nil {
-		opts.SeekSeconds, opts.StartSegmentNumber = s.planResumeSeconds, 0
-		opts.StreamOriginSeconds, opts.CopySeekAnchorResolved = s.planStreamOrigin, s.planSeekAnchorResolved
-	}
-	return opts
 }
 
 // SetAudioTrackIndex updates the audio track index in the session's opts.
@@ -3664,14 +3152,6 @@ func (s *TranscodeSession) SetAudioTrackIndex(index int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.opts.AudioTrackIndex = index
-}
-
-// SetRequireAudioTrack updates whether ffmpeg must fail rather than drop the
-// selected audio track. Must be called before Restart() to take effect.
-func (s *TranscodeSession) SetRequireAudioTrack(required bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.opts.RequireAudioTrack = required
 }
 
 // SetSourceAudioChannels updates the selected source track's channel count in
@@ -3786,31 +3266,9 @@ func (s *TranscodeSession) RestartWithCopySeekAnchor(
 // the manifest used for copy-anchor mapping cannot be replaced by another
 // restart before the resolved numbering is applied.
 func (s *TranscodeSession) RestartSegment(ctx context.Context, segNum int) (SegmentRecoveryTarget, bool, error) {
-	return s.RestartSegmentSince(ctx, segNum, time.Time{})
-}
-
-// RestartSegmentSince is RestartSegment for a request that decided to restart
-// while the FFmpeg started at seenGeneration (its decision's
-// Progress.GenerationStartedAt) was running. In a planned session, if another
-// restart has replaced that FFmpeg since, and the new one already has the
-// segment or is about to write it, the request waits for it instead of
-// replacing that run: two requests for nearby segments far ahead must not
-// restart one after the other, each discarding the other's run. A zero
-// seenGeneration always restarts.
-func (s *TranscodeSession) RestartSegmentSince(ctx context.Context, segNum int, seenGeneration time.Time) (SegmentRecoveryTarget, bool, error) {
-	// A request can wait on the lifecycle lock behind another restart, and a
-	// player that seeks again abandons it. Restarting for it would move FFmpeg
-	// to a position nobody wants and delay the restart the player now waits
-	// on. Once started, a restart runs to completion (see restart).
-	if err := ctx.Err(); err != nil {
-		return SegmentRecoveryTarget{}, false, err
-	}
 	target, ok, err := s.ResolveSegmentRecoveryTarget(ctx, segNum)
 	if err != nil || !ok {
 		return SegmentRecoveryTarget{}, ok, err
-	}
-	if !seenGeneration.IsZero() && s.plannedRunCoversSince(segNum, seenGeneration) {
-		return target, true, nil
 	}
 
 	if target.CopySeekAnchorResolved {
@@ -3826,10 +3284,6 @@ func (s *TranscodeSession) RestartSegmentSince(ctx context.Context, segNum int, 
 	return target, true, err
 }
 
-// errSessionClosing is a restart of a session whose Close has begun. It is
-// ErrSessionSuperseded to callers: the handle is no longer the live session.
-var errSessionClosing = fmt.Errorf("%w: the session is closing", ErrSessionSuperseded)
-
 // restartFlight carries the outcome of an in-flight restart so a concurrent
 // caller waits for it and receives the result instead of assuming success and
 // falling through to a stream the failed restart never produced.
@@ -3838,55 +3292,10 @@ type restartFlight struct {
 	err  error
 }
 
-// ffmpegFilterSetupFailure is the line FFmpeg prints when it cannot configure
-// a filter graph. Silo runs FFmpeg at -loglevel error, so FFmpeg's reason for
-// rebuilding a graph mid-stream (an info line) is never captured; this is.
-const ffmpegFilterSetupFailure = "Error reinitializing filters!"
-
-// gpuDecodeFailedFilterSetupLocked reports whether the last generation decoded
-// on an Intel GPU and exited by itself because FFmpeg could not configure its
-// filter graph. That is how a QSV or VAAPI transcode dies when the VAAPI
-// decoder replaces its frames context mid-stream: the rebuilt graph cannot
-// feed hardware frames to the encoder that is already open, and it fails at
-// the same frame on every restart. CPU-decoded frames reach the same graph
-// through an upload, so the restart takes that route once. The caller holds
-// s.mu.
-//
-// The line also follows unrelated graph failures. Those sessions were failing
-// anyway and lose only GPU decode. NVENC is left out: with CPU decode an
-// explicit NVENC setting encodes on libx264.
-func (s *TranscodeSession) gpuDecodeFailedFilterSetupLocked() bool {
-	if s.running || s.waitErr == nil || s.stderr == nil || s.opts.SoftwareVideoDecode || s.opts.gpuDecodeFailed {
-		return false
-	}
-	if s.opts.HWAccel != transcodeHWQSV && s.opts.HWAccel != transcodeHWVAAPI {
-		return false
-	}
-	return strings.Contains(s.stderr.String(), ffmpegFilterSetupFailure)
-}
-
-// crashState reports, in one read, whether FFmpeg exited with an error and has
-// not been restarted, and whether the next restart would then move the session
-// from GPU to CPU decode (see gpuDecodeFailedFilterSetupLocked).
-func (s *TranscodeSession) crashState() (crashed, restartsOnCPU bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.running || s.waitErr == nil {
-		return false, false
-	}
-	return true, s.gpuDecodeFailedFilterSetupLocked()
-}
-
 // restartToneMapValidationTimeout bounds the tone-map source recheck on a
 // restart. It is deliberately shorter than the caller's post-restart segment
 // wait (30s) so a slow validation cannot consume the entire recovery window.
 var restartToneMapValidationTimeout = 20 * time.Second
-
-// restartHookTimeout bounds a restart hook. A restart runs under the session
-// lifecycle lock, and a stop takes that lock before it closes the session, so
-// the close that cancels the hook's FFmpeg context cannot reach a hook that
-// waits on it, as the throttler's settings read does when the database stalls.
-var restartHookTimeout = 5 * time.Second
 
 func (s *TranscodeSession) restart(
 	ctx context.Context,
@@ -3906,23 +3315,12 @@ func (s *TranscodeSession) restart(
 		<-flight.done
 		return flight.err
 	}
-	if s.closing {
-		s.mu.Unlock()
-		return errSessionClosing
-	}
 	flight := &restartFlight{done: make(chan struct{})}
 	s.restarting = flight
 	opts := s.opts
-	decodeOnCPU := s.gpuDecodeFailedFilterSetupLocked()
 	cancelCurrent := s.cancel
 	done := s.done
 	s.mu.Unlock()
-	if decodeOnCPU {
-		// The same command would fail the same way at the same frame. Decide
-		// before the tone-map recheck below, so it validates the route this
-		// restart will run.
-		opts.gpuDecodeFailed = true
-	}
 	// A tone-map recipe is valid only for the frozen source revision. Recheck it
 	// while the current process is still serving so replacement bytes can never
 	// displace a valid generation or inherit its cached preflight verdict. The
@@ -3940,11 +3338,7 @@ func (s *TranscodeSession) restart(
 		return flight.err
 	}
 	cancelValidation()
-	previousThrottleSeconds := s.StopThrottler()
-	if s.copyGroups != nil && done != nil {
-		// Let the run being replaced set the session's timeline first.
-		s.copyGroups.awaitTimeline(ctx, done)
-	}
+	s.StopThrottler()
 
 	// Kill current process without removing output directory.
 	if cancelCurrent != nil {
@@ -3955,30 +3349,15 @@ func (s *TranscodeSession) restart(
 	}
 	s.closeSubtitleSpan()
 
-	// A planned stream restarts at the requested segment: its groups match
-	// the plan wherever FFmpeg starts. The seek aims before the segment's
-	// first keyframe, so the run covers all of it whatever caller asked.
+	// A planned stream's segments only match its playlist when FFmpeg cuts
+	// them from the beginning, so it always restarts there. The requested
+	// segment stays the throttler's target, so FFmpeg runs on to reach it.
 	requestedSegment := startSegment
 	if s.copyPlan != nil {
-		startSegment = min(max(startSegment, 0), len(s.copyPlan.durations)-1)
-		seekSeconds = s.copyPlan.restartSeekSeconds(startSegment)
-		// The plan's timeline doesn't move: a resume's stays at its origin.
-		streamOriginSeconds, copySeekAnchorResolved = 0, true
-		if s.copyPlan.resumes() {
-			streamOriginSeconds = s.planStreamOrigin
-		}
+		seekSeconds, startSegment, streamOriginSeconds, copySeekAnchorResolved = 0, 0, 0, true
 	}
 
 	s.mu.Lock()
-	if s.closing {
-		// Close began while this restart validated or stopped the previous
-		// generation: stop before touching the output or starting FFmpeg.
-		flight.err = errSessionClosing
-		s.restarting = nil
-		s.mu.Unlock()
-		close(flight.done)
-		return flight.err
-	}
 	s.running = false
 	s.waitErr = nil
 	if s.stderr != nil {
@@ -3986,7 +3365,6 @@ func (s *TranscodeSession) restart(
 	}
 	s.restartCount++
 	s.segmentGeneration++
-	generation := s.segmentGeneration
 	s.segmentPruneRunning = false
 	preStartRangePrunable := opts.SegmentRetentionSeconds > 0 && s.lastPruneFloor < startSegment
 	s.lastRequestedSegment = startSegment
@@ -4026,11 +3404,7 @@ func (s *TranscodeSession) restart(
 	// Old segments are only reusable when this generation emits the same recipe
 	// as the previous one; otherwise they, and the manifest describing them,
 	// have to go before the replacement process starts.
-	if s.copyGroups != nil {
-		// Segments already assembled belong to the plan, not to a run, so
-		// they stay; only the previous run's groups go.
-		opts.copyGroupPrefix = s.copyGroups.startRun(startSegment, audioRecipeKey(opts), generation)
-	} else if s.cleanStaleOutputForRestart(previousOpts, opts, startSegment) {
+	if s.cleanStaleOutputForRestart(previousOpts, opts, startSegment) {
 		log.Printf("playback: cleaned stale transcode output at/after segment %d before restart (video %q -> %q)",
 			startSegment, previousOpts.TargetCodecVideo, opts.TargetCodecVideo)
 	}
@@ -4041,20 +3415,13 @@ func (s *TranscodeSession) restart(
 		bin = ffmpegBinary()
 	}
 
-	log.Printf("playback: ffmpeg restart cmd: %s %s", bin, fspath.RedactRelayed(strings.Join(args, " ")))
-	if decodeOnCPU {
-		slog.WarnContext(ctx, "transcode could not configure its filter graph on GPU-decoded frames; restarting with CPU decoding",
-			"component", "playback",
-			"playback_session_id", opts.SessionID,
-			"hw_accel", opts.HWAccel,
-		)
-	}
+	log.Printf("playback: ffmpeg restart cmd: %s %s", bin, strings.Join(args, " "))
 	s.logFFmpegEvent(ctx, "ffmpeg process restart", "")
 
 	// As on initial start, the caller bounds synchronous validation; the new
 	// FFmpeg process keeps running after the segment request completes.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cmd := fspath.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -4096,20 +3463,6 @@ func (s *TranscodeSession) restart(
 	}
 
 	s.mu.Lock()
-	if s.closing {
-		// Close began while this generation started: end it here, before
-		// the flight lets Close read the session's generation.
-		s.mu.Unlock()
-		cancel()
-		_ = cmd.Wait()
-		releaseHWDevice()
-		s.mu.Lock()
-		flight.err = errSessionClosing
-		s.restarting = nil
-		s.mu.Unlock()
-		close(flight.done)
-		return flight.err
-	}
 	if s.stdinPipe != nil {
 		s.stdinPipe.Close()
 	}
@@ -4133,32 +3486,7 @@ func (s *TranscodeSession) restart(
 	go s.monitorFFmpeg(ctx, cmd, s.done, releaseHWDevice)
 
 	if hook != nil {
-		hookCtx, cancelHook := context.WithTimeout(ctx, restartHookTimeout)
-		hook(hookCtx)
-		if errors.Is(hookCtx.Err(), context.DeadlineExceeded) {
-			// A hook that gave up before it started a throttler leaves the new
-			// process unthrottled. Keep the threshold this session had instead.
-			// A first start that finished during this restart armed its
-			// throttler on the replaced process's pipe after StopThrottler
-			// ran, so its threshold is the newer one; re-arming also stops it.
-			s.mu.Lock()
-			armed := s.throttler
-			current := armed != nil && armed.stdinPipe == s.stdinPipe
-			s.mu.Unlock()
-			if !current {
-				threshold := previousThrottleSeconds
-				if armed != nil {
-					threshold = armed.thresholdSeconds
-				}
-				s.StartThrottler(threshold)
-			}
-			slog.WarnContext(ctx, "transcode restart hook timed out; the transcode throttle may not match its settings until the next restart",
-				"component", "playback",
-				"playback_session_id", opts.SessionID,
-				"timeout", restartHookTimeout,
-			)
-		}
-		cancelHook()
+		hook(ctx)
 	}
 
 	return nil
@@ -4192,7 +3520,7 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 			select {
 			case <-deadline:
 				return "", ErrSegmentNotFound
-			case <-time.After(outputPollInterval):
+			case <-time.After(100 * time.Millisecond):
 				continue
 			}
 		}
@@ -4209,7 +3537,7 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 		select {
 		case <-deadline:
 			return "", ErrSegmentNotFound
-		case <-time.After(outputPollInterval):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
@@ -4218,13 +3546,6 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 // closes the stat-to-open race for HTTP serving while preserving the same
 // restart and ffmpeg-exit error contract.
 func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration) (*SegmentLease, error) {
-	return s.WaitForOpenSegmentContext(context.Background(), name, timeout)
-}
-
-// WaitForOpenSegmentContext is WaitForOpenSegment that also returns ctx.Err()
-// as soon as ctx ends, so a request the client abandoned stops polling. It
-// does not stop FFmpeg.
-func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name string, timeout time.Duration) (*SegmentLease, error) {
 	deadline := time.After(timeout)
 	for {
 		segment, err := s.OpenSegment(name)
@@ -4243,11 +3564,9 @@ func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name s
 
 		if restarting {
 			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
 			case <-deadline:
 				return nil, ErrSegmentNotFound
-			case <-time.After(outputPollInterval):
+			case <-time.After(100 * time.Millisecond):
 				continue
 			}
 		}
@@ -4259,11 +3578,9 @@ func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name s
 		}
 
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
 		case <-deadline:
 			return nil, ErrSegmentNotFound
-		case <-time.After(outputPollInterval):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
@@ -4273,36 +3590,16 @@ func (s *TranscodeSession) WaitForOpenSegmentContext(ctx context.Context, name s
 // string. This ensures the HLS player's segment requests match server routes
 // and preserve any auth or cache-busting parameters from the manifest URL.
 func RewriteManifestPaths(manifest []byte, segPrefix, rawQuery string) ([]byte, error) {
-	return rewriteManifestPaths(manifest, segPrefix, rawQuery, false)
-}
-
-// RewriteManifestPathsWithSubstitution is RewriteManifestPaths for a session
-// whose client negotiated hls_variable_substitution_v1: a credential-sized
-// query (see minRewrittenURISavings) is carried once through variable
-// substitution.
-func RewriteManifestPathsWithSubstitution(manifest []byte, segPrefix, rawQuery string) ([]byte, error) {
-	return rewriteManifestPaths(manifest, segPrefix, rawQuery, true)
-}
-
-func rewriteManifestPaths(manifest []byte, segPrefix, rawQuery string, substitute bool) ([]byte, error) {
 	if err := validateManifestHeader(manifest); err != nil {
 		return nil, fmt.Errorf("invalid manifest: %w", err)
 	}
 
-	lines := bytes.Split(manifest, []byte("\n"))
-	var suffix, definition string
+	var suffix string
 	if rawQuery != "" {
 		suffix = "?" + rawQuery
 	}
-	// Never define a variable beside the input's own definitions.
-	if substitute && rawQuery != "" && !bytes.Contains(manifest, []byte("#EXT-X-DEFINE:")) {
-		var reference string
-		definition, reference = manifestVariable(manifestQueryVariable, rawQuery, minRewrittenURISavings)
-		if definition != "" {
-			suffix = "?" + reference
-		}
-	}
 
+	lines := bytes.Split(manifest, []byte("\n"))
 	for i, line := range lines {
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) == 0 {
@@ -4326,9 +3623,6 @@ func rewriteManifestPaths(manifest []byte, segPrefix, rawQuery string, substitut
 
 		// Segment filename line.
 		lines[i] = []byte(segPrefix + string(trimmed) + suffix)
-	}
-	if definition != "" {
-		lines = insertManifestDefinition(lines, definition)
 	}
 	return bytes.Join(lines, []byte("\n")), nil
 }
@@ -4370,34 +3664,11 @@ func rewriteMapURI(line []byte, segPrefix, suffix string) ([]byte, error) {
 // restart cannot reconstruct the session. Re-injecting the client-facing token
 // here keeps reconstruction working without ever exposing it to the node.
 func AppendManifestQueryParam(manifest []byte, key, value string) []byte {
-	return appendManifestQueryParam(manifest, key, value, false)
-}
-
-// AppendManifestQueryParamWithSubstitution is AppendManifestQueryParam for a
-// session whose client negotiated hls_variable_substitution_v1: in a media
-// playlist the value is carried once through variable substitution (a
-// "silo_<key>" EXT-X-DEFINE) under the same rule as
-// RewriteManifestPathsWithSubstitution. A multivariant playlist keeps the
-// literal value.
-func AppendManifestQueryParamWithSubstitution(manifest []byte, key, value string) []byte {
-	return appendManifestQueryParam(manifest, key, value, true)
-}
-
-func appendManifestQueryParam(manifest []byte, key, value string, substitute bool) []byte {
 	if key == "" || validateManifestHeader(manifest) != nil {
 		return manifest
 	}
 	param := key + "=" + value
 	lines := bytes.Split(manifest, []byte("\n"))
-	var definition string
-	name := manifestParamVariablePrefix + key
-	if substitute && isManifestVariableName(name) && isMediaPlaylist(lines) && !bytes.Contains(manifest, []byte(`NAME="`+name+`"`)) {
-		var reference string
-		definition, reference = manifestVariable(name, value, minRewrittenURISavings)
-		if definition != "" {
-			param = key + "=" + reference
-		}
-	}
 	for i, line := range lines {
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) == 0 {
@@ -4413,9 +3684,6 @@ func appendManifestQueryParam(manifest []byte, key, value string, substitute boo
 			continue
 		}
 		lines[i] = appendURIQueryParam(trimmed, param)
-	}
-	if definition != "" {
-		lines = insertManifestDefinition(lines, definition)
 	}
 	return bytes.Join(lines, []byte("\n"))
 }
@@ -4464,16 +3732,15 @@ func (s *TranscodeSession) manifestTimeoutError(timeout time.Duration) error {
 	s.mu.Lock()
 	running := s.running
 	waitErr := s.waitErr
-	retained := ""
+	stderr := ""
 	if s.stderr != nil {
-		retained = s.stderr.String()
+		stderr = truncateStderr(s.stderr.String())
 	}
 	s.mu.Unlock()
-	stderr := truncateStderr(retained)
 
 	switch {
 	case waitErr != nil && stderr != "":
-		return classifyFFmpegFailure(fmt.Errorf("%w after %s: ffmpeg exited: %w (stderr: %s)", ErrManifestNotReady, timeout, waitErr, stderr), retained)
+		return fmt.Errorf("%w after %s: ffmpeg exited: %w (stderr: %s)", ErrManifestNotReady, timeout, waitErr, stderr)
 	case waitErr != nil:
 		return fmt.Errorf("%w after %s: ffmpeg exited: %w", ErrManifestNotReady, timeout, waitErr)
 	case running:
@@ -4589,15 +3856,8 @@ type SegmentRecoveryTarget struct {
 // URI-to-source-time mapping across a missing-segment restart.
 func (s *TranscodeSession) ResolveSegmentRecoveryTarget(ctx context.Context, segNum int) (SegmentRecoveryTarget, bool, error) {
 	if s.copyPlan != nil {
-		if segNum < 0 || segNum >= len(s.copyPlan.durations) {
-			return SegmentRecoveryTarget{}, false, nil
-		}
-		// A planned stream restarts at the segment itself; see restart.
-		return SegmentRecoveryTarget{
-			SeekSeconds:            s.copyPlan.restartSeekSeconds(segNum),
-			StartSegmentNumber:     segNum,
-			CopySeekAnchorResolved: true,
-		}, true, nil
+		// restart regenerates a planned stream from the beginning.
+		return SegmentRecoveryTarget{StartSegmentNumber: segNum, CopySeekAnchorResolved: true}, true, nil
 	}
 	seekSeconds, ok, err := s.RestartSeekTarget(segNum)
 	if err != nil || !ok {
@@ -4724,38 +3984,29 @@ func (s *TranscodeSession) LastRequestedSegment() int {
 	return s.lastRequestedSegment
 }
 
-// StartThrottler creates and starts a throttler for this session, replacing
-// one already running: a first start can finish after a restart hook armed its
-// own. No-op if thresholdSeconds <= 0, stdinPipe is nil, or the session is
-// closing.
+// StartThrottler creates and starts a throttler for this session.
+// No-op if thresholdSeconds <= 0 or stdinPipe is nil.
 func (s *TranscodeSession) StartThrottler(thresholdSeconds int) {
 	s.mu.Lock()
-	if s.stdinPipe == nil || thresholdSeconds <= 0 || s.closing {
+	if s.stdinPipe == nil || thresholdSeconds <= 0 {
 		s.mu.Unlock()
 		return
 	}
-	replaced := s.throttler
 	t := NewTranscodeThrottler(s, s.stdinPipe, thresholdSeconds, s.opts.SegmentDuration)
 	s.throttler = t
 	s.mu.Unlock()
-	if replaced != nil {
-		replaced.Stop()
-	}
 	t.Start()
 }
 
-// StopThrottler stops the throttler if one is running and returns its
-// threshold in seconds, or zero when none was.
-func (s *TranscodeSession) StopThrottler() int {
+// StopThrottler stops the throttler if one is running.
+func (s *TranscodeSession) StopThrottler() {
 	s.mu.Lock()
 	t := s.throttler
 	s.throttler = nil
 	s.mu.Unlock()
-	if t == nil {
-		return 0
+	if t != nil {
+		t.Stop()
 	}
-	t.Stop()
-	return t.thresholdSeconds
 }
 
 type ffmpegStderrWriter struct {

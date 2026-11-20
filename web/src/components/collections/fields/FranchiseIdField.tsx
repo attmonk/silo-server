@@ -1,18 +1,14 @@
 import { useId } from "react";
 
 import { Input } from "@/components/ui/input";
-import { useAppLanguage } from "@/i18n";
 import {
-  findFranchiseId,
-  franchiseIdHelp,
-  franchiseIdInvalid,
-  franchiseIdLabel,
-  franchiseIdMissing,
+  FIND_FRANCHISE_ID,
+  FRANCHISE_ID_HELP,
+  FRANCHISE_ID_INVALID,
+  FRANCHISE_ID_LABEL,
+  FRANCHISE_ID_MISSING,
 } from "@/lib/collections/copy";
 import { franchiseIdOf } from "@/lib/collections/synced";
-
-/** An example TMDB collection ID, as the field's placeholder: a number, not text. */
-const EXAMPLE_ID = "119";
 
 /**
  * The TMDB collection a franchise list follows, by the number in its
@@ -28,16 +24,15 @@ export function FranchiseIdField({
   name: string;
   onChange: (value: string) => void;
 }) {
-  useAppLanguage();
   const id = useId();
   const invalid = value.trim() !== "" && franchiseIdOf(value) === null;
-  let note = franchiseIdHelp();
-  if (invalid) note = franchiseIdInvalid();
-  else if (value.trim() === "") note = franchiseIdMissing();
+  let note = FRANCHISE_ID_HELP;
+  if (invalid) note = FRANCHISE_ID_INVALID;
+  else if (value.trim() === "") note = FRANCHISE_ID_MISSING;
   return (
     <div className="grid gap-2">
       <label htmlFor={id} className="text-[14px] font-semibold">
-        {franchiseIdLabel()}
+        {FRANCHISE_ID_LABEL}
       </label>
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <Input
@@ -45,7 +40,7 @@ export function FranchiseIdField({
           inputMode="numeric"
           autoComplete="off"
           value={value}
-          placeholder={EXAMPLE_ID}
+          placeholder="119"
           aria-invalid={invalid || undefined}
           aria-describedby={`${id}-note`}
           onChange={(event) => onChange(event.target.value)}
@@ -57,7 +52,7 @@ export function FranchiseIdField({
           rel="noreferrer"
           className="text-[13.5px] font-medium underline underline-offset-4"
         >
-          {findFranchiseId()}
+          {FIND_FRANCHISE_ID}
         </a>
       </div>
       <p

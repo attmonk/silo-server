@@ -12,9 +12,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { languageOptions, getLanguageName } from "@/player/utils/languageNames";
+import { LANGUAGES, getLanguageName } from "@/player/utils/languageNames";
 
 function isCanceledSubtitleRequest(err: unknown): boolean {
   return (
@@ -53,6 +52,21 @@ function isAcceptedSubtitleFile(file: File): boolean {
   );
 }
 
+function detectionSourceLabel(source: SubtitleLanguageDetection["source"]): string {
+  switch (source) {
+    case "filename":
+      return "filename";
+    case "metadata":
+      return "file metadata";
+    case "content":
+      return "subtitle text";
+    case "manual":
+      return "manual selection";
+    default:
+      return "detection";
+  }
+}
+
 export function SubtitleUploadForm({
   mediaFileId,
   upload,
@@ -62,7 +76,6 @@ export function SubtitleUploadForm({
   variant = "default",
   defaultLanguage = "en",
 }: SubtitleUploadFormProps) {
-  const t = useT();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
   const detectRequestRef = useRef(0);
@@ -126,14 +139,14 @@ export function SubtitleUploadForm({
           return;
         }
         setDetectionSource(null);
-        reportError(err instanceof Error ? err.message : t("web.subtitles.upload.detectFailed"));
+        reportError(err instanceof Error ? err.message : "Failed to detect subtitle language");
       } finally {
         if (requestId === detectRequestRef.current) {
           setDetectingLanguage(false);
         }
       }
     },
-    [detectLanguage, reportError, t],
+    [detectLanguage, reportError],
   );
 
   const selectFile = useCallback(
@@ -142,14 +155,14 @@ export function SubtitleUploadForm({
         return;
       }
       if (!isAcceptedSubtitleFile(file)) {
-        reportError(t("web.subtitles.upload.unsupportedType"));
+        reportError("Unsupported file type. Use SRT, VTT, ASS, SSA, or SUB.");
         return;
       }
       setSelectedFile(file);
       setError(null);
       void runLanguageDetection(file, language);
     },
-    [language, reportError, runLanguageDetection, t],
+    [language, reportError, runLanguageDetection],
   );
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -200,7 +213,7 @@ export function SubtitleUploadForm({
 
   const handleUpload = async () => {
     if (!selectedFile) {
-      reportError(t("web.subtitles.upload.chooseFile"));
+      reportError("Choose a subtitle file to upload");
       return;
     }
 
@@ -226,7 +239,7 @@ export function SubtitleUploadForm({
       onSuccess();
     } catch (err) {
       if (requestId !== uploadRequestRef.current || isCanceledSubtitleRequest(err)) return;
-      reportError(err instanceof Error ? err.message : t("web.subtitles.upload.uploadFailed"));
+      reportError(err instanceof Error ? err.message : "Upload failed");
     } finally {
       if (requestId === uploadRequestRef.current) setUploading(false);
     }
@@ -241,10 +254,11 @@ export function SubtitleUploadForm({
     >
       <div className="space-y-1">
         <p className={cn("text-sm font-medium", isPlayer ? "text-white" : "text-foreground")}>
-          {t("web.subtitles.upload.heading")}
+          Upload subtitle
         </p>
         <p className={cn("text-xs", isPlayer ? "text-white/50" : "text-muted-foreground")}>
-          {t("web.subtitles.upload.help", { megabytes: 5 })}
+          Drag and drop or browse for SRT, VTT, ASS, SSA, or SUB files up to 5 MB. Language is
+          detected automatically when possible.
         </p>
       </div>
 
@@ -259,7 +273,7 @@ export function SubtitleUploadForm({
       <div
         role="button"
         tabIndex={0}
-        aria-label={t("web.subtitles.upload.dropZoneLabel")}
+        aria-label="Drop subtitle file here or browse"
         onClick={handleBrowseClick}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
@@ -288,10 +302,10 @@ export function SubtitleUploadForm({
         />
         <div className="space-y-1">
           <p className={cn("text-sm font-medium", isPlayer ? "text-white" : "text-foreground")}>
-            {isDragging ? t("web.subtitles.upload.dropFile") : t("web.subtitles.upload.dragFile")}
+            {isDragging ? "Drop subtitle file" : "Drag and drop a subtitle file"}
           </p>
           <p className={cn("text-xs", isPlayer ? "text-white/50" : "text-muted-foreground")}>
-            {t("web.subtitles.upload.orBrowse")}
+            or click to browse
           </p>
         </div>
       </div>
@@ -300,13 +314,13 @@ export function SubtitleUploadForm({
         <div className={cn("space-y-1", !isPlayer && "w-full sm:w-[220px]")}>
           {isPlayer ? (
             <select
-              aria-label={t("web.subtitles.upload.languageLabel")}
+              aria-label="Upload language"
               className="w-full rounded bg-neutral-800 px-2 py-1.5 text-sm text-white focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
               value={language}
               onChange={(event) => handleLanguageChange(event.target.value)}
               disabled={detectingLanguage}
             >
-              {languageOptions().map((lang) => (
+              {LANGUAGES.map((lang) => (
                 <option key={lang.code} value={lang.code}>
                   {lang.label}
                 </option>
@@ -319,10 +333,10 @@ export function SubtitleUploadForm({
               disabled={detectingLanguage}
             >
               <SelectTrigger>
-                <SelectValue placeholder={t("web.subtitles.upload.languagePlaceholder")} />
+                <SelectValue placeholder="Language" />
               </SelectTrigger>
               <SelectContent>
-                {languageOptions().map((lang) => (
+                {LANGUAGES.map((lang) => (
                   <SelectItem key={lang.code} value={lang.code}>
                     {lang.label}
                   </SelectItem>
@@ -332,14 +346,11 @@ export function SubtitleUploadForm({
           )}
           {detectingLanguage ? (
             <p className={cn("text-xs", isPlayer ? "text-white/50" : "text-muted-foreground")}>
-              {t("web.subtitles.upload.detecting")}
+              Detecting language…
             </p>
           ) : detectionSource && detectionSource !== "manual" ? (
             <p className={cn("text-xs", isPlayer ? "text-white/50" : "text-muted-foreground")}>
-              {t("web.subtitles.upload.detected", {
-                language: getLanguageName(language),
-                source: detectionSource,
-              })}
+              Detected {getLanguageName(language)} from {detectionSourceLabel(detectionSource)}
             </p>
           ) : null}
         </div>
@@ -352,7 +363,7 @@ export function SubtitleUploadForm({
               onChange={(event) => setHearingImpaired(event.target.checked)}
               className="rounded border-white/20 bg-neutral-800"
             />
-            {t("web.subtitles.upload.hearingImpaired")}
+            Hearing impaired (HI)
           </label>
         ) : (
           <div className="flex items-center gap-2">
@@ -362,7 +373,7 @@ export function SubtitleUploadForm({
               onCheckedChange={setHearingImpaired}
             />
             <Label htmlFor={`subtitle-upload-hi-${mediaFileId}`} className="text-sm font-normal">
-              {t("web.subtitles.upload.hearingImpaired")}
+              Hearing impaired (HI)
             </Label>
           </div>
         )}
@@ -379,27 +390,27 @@ export function SubtitleUploadForm({
             ) : (
               <Upload className="size-4" />
             )}
-            {uploading ? t("web.subtitles.upload.uploading") : t("web.subtitles.upload.upload")}
+            {uploading ? "Uploading…" : "Upload"}
           </button>
         ) : (
           <Button
             onClick={handleUpload}
             disabled={uploading || detectingLanguage || !selectedFile}
-            className="sm:ms-auto"
+            className="sm:ml-auto"
           >
             {uploading ? (
               <Loader2 className="size-4 animate-spin" />
             ) : (
               <Upload className="size-4" />
             )}
-            {uploading ? t("web.subtitles.upload.uploading") : t("web.subtitles.upload.upload")}
+            {uploading ? "Uploading…" : "Upload"}
           </Button>
         )}
       </div>
 
       {selectedFile && (
         <p className={cn("truncate text-xs", isPlayer ? "text-white/60" : "text-muted-foreground")}>
-          {t("web.subtitles.upload.selected", { name: selectedFile.name })}
+          Selected: {selectedFile.name}
         </p>
       )}
 

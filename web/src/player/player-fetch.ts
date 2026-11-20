@@ -4,7 +4,6 @@
  */
 
 import { V2_CLIENT_HEADERS } from "@/api/v2/request";
-import { t } from "@/i18n";
 import type { PlayerConfig } from "./context/PlayerConfigContext";
 
 interface PlayerErrorEnvelope {
@@ -153,7 +152,7 @@ export async function playerFetch<T>(
 
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    let message = res.statusText || t("web.player.error.requestFailed");
+    let message = res.statusText || "Request failed";
     let code: string | undefined;
 
     if (text) {

@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { useT } from "@/i18n";
 import { parseSubtitleAppearance, type SubtitleAppearance } from "@/lib/subtitleAppearance";
 import { SubtitleAppearancePanelView } from "@/components/settings/SubtitleAppearancePanelView";
 import type { AdminDeviceSetting } from "@/hooks/queries/admin/users";
@@ -48,7 +47,6 @@ export function AdminSubtitleAppearanceDialog({
   onReset,
   saving = false,
 }: AdminSubtitleAppearanceDialogProps) {
-  const t = useT();
   const settingKey = setting?.key;
   const settingValue = setting?.value ?? null;
 
@@ -86,12 +84,8 @@ export function AdminSubtitleAppearanceDialog({
 
   // Eyebrow gives admin context that the player panel lacks: which user +
   // device + profile the override is being scoped to.
-  const profileLabel =
-    setting.profile_name?.trim() ||
-    setting.profile_id ||
-    t("web.admin.common.subtitleAppearanceDialog.defaultProfile");
-  const deviceLabel =
-    setting.device_name?.trim() || t("web.admin.common.subtitleAppearanceDialog.unnamedDevice");
+  const profileLabel = setting.profile_name?.trim() || setting.profile_id || "default";
+  const deviceLabel = setting.device_name?.trim() || "device";
   const eyebrow = `${profileLabel} · ${deviceLabel}`;
 
   return (
@@ -102,14 +96,14 @@ export function AdminSubtitleAppearanceDialog({
       onClose={onClose}
       canReset={isOverride}
       onReset={handleReset}
-      resetLabel={t("web.admin.common.subtitleAppearanceDialog.resetOverride")}
+      resetLabel="Reset override"
       eyebrow={eyebrow}
       status={
         saving
-          ? t("web.admin.common.subtitleAppearanceDialog.saving")
+          ? "Saving…"
           : isOverride
-            ? t("web.admin.common.subtitleAppearanceDialog.savedAutomatically")
-            : t("web.admin.common.subtitleAppearanceDialog.createsOverride")
+            ? "Changes saved automatically"
+            : "Changing a value creates an override"
       }
     />
   );

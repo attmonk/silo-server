@@ -17,7 +17,6 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/config"
-	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
 	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/nodesessions"
@@ -36,7 +35,6 @@ const socketProxyMedia = "0123456789abcdefghijklmnopqrstuvwxyz"
 func newSocketProxyServer(t *testing.T, secret string, resolver *clientip.Resolver) *Server {
 	t.Helper()
 	srv := NewServer(testWatcher(secret), nodesessions.NewTracker(nil, "http://proxy", "proxy", "proxy"))
-	srv.SetNodeKeys(nodeauthtest.NodeKey(secret))
 	srv.SetClientIPResolver(resolver)
 	telemetryConfig := streamtelemetry.DefaultConfig("socket-proxy")
 	telemetryConfig.Enabled = true

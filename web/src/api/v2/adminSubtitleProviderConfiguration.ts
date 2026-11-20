@@ -4,7 +4,6 @@ import {
   StaleApiRequestContextError,
   type ProfileRequestContextSnapshot,
 } from "@/api/client";
-import { t } from "@/i18n";
 import { adminSubtitleListScope } from "./adminSubtitles";
 import { v2, type V2Body, type V2Result } from "./request";
 
@@ -36,7 +35,7 @@ function requireIntent(intent: ProviderEditIntent) {
 }
 function requireTag(tag: string | null): string {
   if (!tag || !/^"[\x21\x23-\x7e\x80-\xff]*"$/.test(tag))
-    throw new Error(t("web.common.subtitles.providers.validatorRequired"));
+    throw new Error("A strong edit validator is required. Reload saved configuration.");
   return tag;
 }
 export async function listSubtitleProviders(scope: string, signal?: AbortSignal) {
@@ -65,7 +64,7 @@ export async function getProviderEditor(intent: ProviderEditIntent): Promise<Pro
     typeof body.has_api_key !== "boolean" ||
     typeof body.has_credentials !== "boolean"
   )
-    throw new Error(t("web.common.subtitles.providers.invalidConfiguration"));
+    throw new Error("Invalid provider configuration. Reload saved configuration.");
   return { intent, body, etag: requireTag(etag) };
 }
 export async function saveProviderConfiguration(editor: ProviderEditor, body: ProviderChange) {
@@ -87,7 +86,9 @@ export async function saveProviderConfiguration(editor: ProviderEditor, body: Pr
         !/^(0|[1-9]\d*)$/.test(saved.local_applied_revision))) ||
     (saved.local_apply === "applied" && saved.local_applied_revision === undefined)
   )
-    throw new Error(t("web.common.subtitles.providers.saveUnconfirmed"));
+    throw new Error(
+      "Unable to confirm the save result. Reload saved configuration before retrying.",
+    );
   return saved;
 }
 export function providerSaveMessage(
@@ -98,8 +99,8 @@ export function providerSaveMessage(
 ) {
   if (saved.local_apply === "applied") {
     return saved.local_applied_revision === saved.saved_revision
-      ? t("web.common.subtitles.providers.savedApplied")
-      : t("web.common.subtitles.providers.savedDifferentRevision");
+      ? "Settings saved and applied on this server. Other servers may still use older settings."
+      : "Settings saved. This server applied a different saved revision; reload to review the current configuration.";
   }
-  return t("web.common.subtitles.providers.savedNotApplied");
+  return "Settings saved, but not applied on this server. Other servers may still use older settings.";
 }

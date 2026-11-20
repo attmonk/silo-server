@@ -42,18 +42,6 @@ func (m candidateMarker) present() bool {
 	return m.Start != nil && m.End != nil
 }
 
-// overlaps reports whether the present marker m shares any time with segment.
-func (m candidateMarker) overlaps(segment Segment) bool {
-	return *m.Start < segment.End && segment.Start < *m.End
-}
-
-// providerAbsent reports whether m is an online provider's answer that the
-// file has no segment of the kind: a provider source without bounds.
-func (m candidateMarker) providerAbsent() bool {
-	return m.Start == nil && m.End == nil && m.Source != nil &&
-		(*m.Source == models.MarkerSourcePlugin || *m.Source == models.MarkerSourceOnline)
-}
-
 // marker returns the candidate's stored marker of kind.
 func (c Candidate) marker(kind markerKind) candidateMarker {
 	switch kind {
@@ -93,11 +81,9 @@ func (c Candidate) effectiveSource(kind markerKind) string {
 }
 
 // hasHigherPriority reports whether the candidate's marker of kind came from
-// a source that outranks source. A provider's absent answer counts as its
-// marker, so local analysis leaves the kind alone as it would a provider
-// marker.
+// a source that outranks source.
 func (c Candidate) hasHigherPriority(kind markerKind, source string) bool {
-	if m := c.marker(kind); !m.present() && !m.providerAbsent() {
+	if !c.marker(kind).present() {
 		return false
 	}
 	return models.MarkerSourcePriority(c.effectiveSource(kind)) > models.MarkerSourcePriority(source)

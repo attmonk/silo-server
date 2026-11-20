@@ -2,13 +2,68 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
+
+type accountPasswordCapabilityResponse struct {
+	SchemaVersion           int  `json:"schema_version"`
+	ChangePassword          bool `json:"change_password"`
+	RequiresCurrentPassword bool `json:"requires_current_password"`
+	MinimumPasswordLength   int  `json:"minimum_password_length"`
+	MaximumPasswordBytes    int  `json:"maximum_password_bytes"`
+}
+
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// HandleAccountPasswordCapability reports whether this authenticated account
+// and active profile may use local self-service password changes.
+func (h *AuthHandler) HandleAccountPasswordCapability(w http.ResponseWriter, r *http.Request) {
+	view, err := h.AccountPasswordCapability(r.Context(), apimw.GetClaims(r.Context()), requestProfileID(r))
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, accountPasswordCapabilityResponse{
+		SchemaVersion:           1,
+		ChangePassword:          view.ChangePassword,
+		RequiresCurrentPassword: view.RequiresCurrentPassword,
+		MinimumPasswordLength:   view.MinimumPasswordLength,
+		MaximumPasswordBytes:    view.MaximumPasswordBytes,
+	})
+}
+
+// HandleChangePassword handles POST /auth/account/password. The password is
+// account-wide, so only the active primary profile may replace it. An admin
+// without a selected profile is also allowed, matching the app's acting-admin
+// policy, but selecting a secondary profile removes that authority.
+func (h *AuthHandler) HandleChangePassword(w http.ResponseWriter, r *http.Request) {
+	claims := apimw.GetClaims(r.Context())
+	if err := h.AuthorizePasswordChange(r.Context(), claims, requestProfileID(r)); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+
+	var req changePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
+		return
+	}
+	if err := h.ChangePassword(r.Context(), claims, req.CurrentPassword, req.NewPassword); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
 
 // AccountPasswordCapabilityView is the self-service password capability of
 // one account and active profile.
@@ -20,9 +75,6 @@ type AccountPasswordCapabilityView struct {
 	RequiresCurrentPassword bool
 	MinimumPasswordLength   int
 	MaximumPasswordBytes    int
-	// SignOutOtherSessions is whether ChangePassword can also sign the
-	// account out of its other sessions. v1 does not offer it.
-	SignOutOtherSessions bool
 }
 
 // AccountPasswordCapability answers the password capability for the caller
@@ -47,7 +99,6 @@ func (h *AuthHandler) AccountPasswordCapability(ctx context.Context, claims *aut
 		RequiresCurrentPassword: true,
 		MinimumPasswordLength:   auth.MinimumPasswordLength,
 		MaximumPasswordBytes:    auth.MaximumPasswordBytes,
-		SignOutOtherSessions:    h.passwords != nil,
 	}, nil
 }
 
@@ -71,14 +122,13 @@ func (h *AuthHandler) AuthorizePasswordChange(ctx context.Context, claims *auth.
 }
 
 // ChangePassword replaces the account password after AuthorizePasswordChange
-// allowed it, and with signOutOtherSessions signs the account out everywhere
-// except the caller's session. A rejected password names the member in Field
-// so v2 renders it as a validation problem there.
-func (h *AuthHandler) ChangePassword(ctx context.Context, claims *auth.Claims, currentPassword, newPassword string, signOutOtherSessions bool) error {
+// allowed it. A rejected password names the member in Field so v2 renders it
+// as a validation problem there.
+func (h *AuthHandler) ChangePassword(ctx context.Context, claims *auth.Claims, currentPassword, newPassword string) error {
 	if currentPassword == "" || newPassword == "" {
 		return apiError(http.StatusBadRequest, "bad_request", "Current password and new password are required")
 	}
-	err := h.passwords.ChangePassword(ctx, claims.UserID, claims.SessionID, currentPassword, newPassword, signOutOtherSessions)
+	err := h.passwords.ChangePassword(ctx, claims.UserID, claims.SessionID, currentPassword, newPassword)
 	switch {
 	case err == nil:
 		return nil

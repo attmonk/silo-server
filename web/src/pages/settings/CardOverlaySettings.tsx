@@ -5,8 +5,6 @@ import { toast } from "sonner";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
 import { SettingsSubheading } from "@/components/settings/SettingsSubheading";
-import { BadgeImagesControl } from "@/components/overlays/settings/BadgeImagesControl";
-import { OverlayLookControls } from "@/components/overlays/settings/OverlayLookControls";
 import {
   Accordion,
   AccordionContent,
@@ -19,67 +17,55 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Switch } from "@/components/ui/switch";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
 import { useShownRatingSources } from "@/hooks/queries/ratingsCapability";
-import { useT, type MessageKey } from "@/i18n";
 import type { EnabledCardQuickActionMode } from "@/lib/cardQuickActions";
 import {
   ACCENT_PALETTE,
+  buildDefaultPrefs,
   CATEGORY_GROUPS,
   getOverlayDef,
   getPreset,
   isOverlayOffered,
-  overlaySuppressedBy,
+  isOverlaySuppressed,
+  OVERLAY_PRESETS,
   OVERLAY_REGISTRY,
   POSITION_OPTIONS,
+  PRESET_IDS,
   type CardOverlayPrefs,
   type OverlayId,
-  type OverlayImage,
   type OverlayItemConfig,
   type OverlayPosition,
+  type PresetId,
 } from "@/lib/overlays";
 import { cn } from "@/lib/utils";
 
-import { ChoiceButtons } from "@/components/settings/ChoiceButtons";
+import { ChoiceButtons } from "./ChoiceButtons";
 import { ResetButton } from "./ResetButton";
 
 type ShortcutChoice = "off" | EnabledCardQuickActionMode;
 
-const SHORTCUT_CHOICES: readonly { value: ShortcutChoice; labelKey: MessageKey }[] = [
-  { value: "off", labelKey: "web.settings.cardOverlay.shortcutOff" },
-  { value: "watched", labelKey: "web.settings.cardOverlay.shortcutWatched" },
-  { value: "favorites", labelKey: "web.settings.cardOverlay.shortcutFavorite" },
-  { value: "both", labelKey: "web.settings.cardOverlay.shortcutBoth" },
+const SHORTCUT_CHOICES: readonly { value: ShortcutChoice; label: string }[] = [
+  { value: "off", label: "Off" },
+  { value: "watched", label: "Watched" },
+  { value: "favorites", label: "Favorite" },
+  { value: "both", label: "Both" },
 ];
 
-// Positions on the poster artwork, which doesn't mirror (CardOverlays.tsx).
-/* eslint-disable silo/no-physical-direction -- places on the artwork, not the layout */
-const POSITION_CLASSES: Record<OverlayPosition, string> = {
-  "top-left": "top-1 left-1 h-4 w-7",
-  "left-edge": "top-1/2 left-0 h-7 w-3 -translate-y-1/2 rounded-l-none",
-  "right-edge": "top-1/2 right-0 h-7 w-3 -translate-y-1/2 rounded-r-none",
-  "bottom-left": "bottom-1 left-1 h-4 w-7",
-  "bottom-right": "bottom-1 right-1 h-4 w-7",
+const CORNER_CLASSES: Record<OverlayPosition, string> = {
+  "top-left": "top-1 left-1",
+  "top-right": "top-1 right-1",
+  "bottom-left": "bottom-1 left-1",
+  "bottom-right": "bottom-1 right-1",
 };
-/* eslint-enable silo/no-physical-direction -- end of the artwork positions */
 
 interface BadgeAdjustProps {
   overlayId: OverlayId;
   prefs: CardOverlayPrefs;
   shortcutsOn: boolean;
-  images: readonly OverlayImage[];
-  supportsStyles: boolean;
   onChange: (next: Partial<OverlayItemConfig>) => void;
 }
 
-/** Where one badge sits, its color, its icon, and its images, behind one button. */
-function BadgeAdjust({
-  overlayId,
-  prefs,
-  shortcutsOn,
-  images,
-  supportsStyles,
-  onChange,
-}: BadgeAdjustProps) {
-  const t = useT();
+/** Where one badge sits, its color, and its icon, behind one button. */
+function BadgeAdjust({ overlayId, prefs, shortcutsOn, onChange }: BadgeAdjustProps) {
   const def = getOverlayDef(overlayId);
   const iconSwitchId = useId();
   if (!def) return null;
@@ -95,27 +81,21 @@ function BadgeAdjust({
           variant="ghost"
           size="sm"
           className="text-muted-foreground hover:text-foreground"
-          aria-label={t("web.settings.cardOverlay.adjustLabel", { badge: def.label })}
+          aria-label={`Adjust ${def.label}`}
         >
           <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
-          <span className="hidden sm:inline">{t("web.settings.cardOverlay.adjust")}</span>
+          <span className="hidden sm:inline">Adjust</span>
         </Button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="max-h-[80vh] w-80 space-y-4 overflow-y-auto p-4">
+      <PopoverContent align="end" className="w-72 space-y-4 p-4">
         <p className="text-sm font-semibold">{def.label}</p>
 
         <div className="flex items-start gap-4">
           <div
             role="radiogroup"
-            aria-label={t("web.settings.cardOverlay.position")}
+            aria-label="Corner"
             className="bg-muted/50 border-border/70 relative aspect-[2/3] w-20 shrink-0 rounded-md border"
           >
-            {/* The top-right corner is the watch-status indicator's. */}
-            <span
-              aria-hidden="true"
-              // eslint-disable-next-line silo/no-physical-direction -- a corner of the artwork
-              className="border-foreground/25 absolute top-1 right-1 h-3.5 w-3.5 rounded-full border border-dashed"
-            />
             {POSITION_OPTIONS.map((option) => {
               const active = config.position === option.value;
               return (
@@ -128,8 +108,8 @@ function BadgeAdjust({
                   title={option.label}
                   onClick={() => onChange({ position: option.value })}
                   className={cn(
-                    "focus-visible:ring-ring absolute rounded-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
-                    POSITION_CLASSES[option.value],
+                    "focus-visible:ring-ring absolute h-4 w-7 rounded-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                    CORNER_CLASSES[option.value],
                     active ? "bg-primary" : "bg-foreground/15 hover:bg-foreground/30",
                   )}
                 />
@@ -137,25 +117,21 @@ function BadgeAdjust({
             })}
           </div>
           <div className="space-y-1">
-            <p className="text-sm font-medium">{t("web.settings.cardOverlay.position")}</p>
+            <p className="text-sm font-medium">Corner</p>
             <p className="text-muted-foreground text-[13px] leading-relaxed">
-              {t("web.settings.cardOverlay.positionHint")}
+              Pick where it sits. Badges in the same corner stack.
             </p>
             {shortcutsOn && config.position.startsWith("bottom") ? (
               <p className="text-muted-foreground text-[13px] leading-relaxed">
-                {t("web.settings.cardOverlay.positionShortcutsHint")}
+                Shortcut buttons cover the bottom corners while they show.
               </p>
             ) : null}
           </div>
         </div>
 
         <div className="space-y-2">
-          <p className="text-sm font-medium">{t("web.settings.cardOverlay.color")}</p>
-          <div
-            className="flex flex-wrap gap-1.5"
-            role="radiogroup"
-            aria-label={t("web.settings.cardOverlay.color")}
-          >
+          <p className="text-sm font-medium">Color</p>
+          <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="Color">
             <button
               type="button"
               role="radio"
@@ -166,7 +142,7 @@ function BadgeAdjust({
                 !color && "border-primary text-foreground",
               )}
             >
-              {t("web.settings.cardOverlay.colorDefault")}
+              Default
             </button>
             {ACCENT_PALETTE.map((swatch) => (
               <button
@@ -195,7 +171,7 @@ function BadgeAdjust({
         {def.iconCapable ? (
           <div className="flex items-center justify-between gap-3">
             <Label htmlFor={iconSwitchId} className="text-sm font-medium">
-              {t("web.settings.cardOverlay.showIcon")}
+              Show icon
             </Label>
             <Switch
               id={iconSwitchId}
@@ -203,12 +179,6 @@ function BadgeAdjust({
               onCheckedChange={(checked) => onChange({ showIcon: checked })}
             />
           </div>
-        ) : null}
-
-        {/* Shown while the badge still names an image, even one since
-            deleted, so the reference can be cleared. */}
-        {supportsStyles && (images.length > 0 || config.image || config.valueImages) ? (
-          <BadgeImagesControl def={def} config={config} images={images} onChange={onChange} />
         ) : null}
       </PopoverContent>
     </Popover>
@@ -219,30 +189,17 @@ interface BadgeRowProps {
   overlayId: OverlayId;
   prefs: CardOverlayPrefs;
   shortcutsOn: boolean;
-  images: readonly OverlayImage[];
-  supportsStyles: boolean;
   onUpdate: (next: CardOverlayPrefs) => void;
 }
 
-function BadgeRow({
-  overlayId,
-  prefs,
-  shortcutsOn,
-  images,
-  supportsStyles,
-  onUpdate,
-}: BadgeRowProps) {
-  const t = useT();
+function BadgeRow({ overlayId, prefs, shortcutsOn, onUpdate }: BadgeRowProps) {
   const switchId = useId();
   const def = getOverlayDef(overlayId);
   if (!def) return null;
   const config = prefs.items[overlayId];
-  const suppressedBy = config.enabled ? overlaySuppressedBy(overlayId, prefs) : null;
-  const suppressor = suppressedBy ? getOverlayDef(suppressedBy) : undefined;
-  const hint = suppressedBy
-    ? t("web.settings.cardOverlay.suppressedHint", {
-        badge: suppressor ? (suppressor.shortLabel ?? suppressor.label) : "",
-      })
+  const suppressed = config.enabled && isOverlaySuppressed(overlayId, prefs);
+  const hint = suppressed
+    ? "Hidden while the combined Resolution + HDR badge is on."
     : def.availabilityNote;
   const update = (next: Partial<OverlayItemConfig>) =>
     onUpdate({ ...prefs, items: { ...prefs.items, [overlayId]: { ...config, ...next } } });
@@ -261,8 +218,6 @@ function BadgeRow({
           overlayId={overlayId}
           prefs={prefs}
           shortcutsOn={shortcutsOn}
-          images={images}
-          supportsStyles={supportsStyles}
           onChange={update}
         />
       ) : null}
@@ -275,18 +230,59 @@ function BadgeRow({
   );
 }
 
+function BadgeStylePicker({
+  value,
+  onChange,
+}: {
+  value: PresetId;
+  onChange: (next: PresetId) => void;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Badge style"
+      className="grid grid-cols-3 gap-2 sm:grid-cols-5"
+    >
+      {PRESET_IDS.map((id) => {
+        const preset = OVERLAY_PRESETS[id];
+        const active = value === id;
+        return (
+          <button
+            key={id}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(id)}
+            className={cn(
+              "focus-visible:ring-ring flex flex-col items-stretch gap-2 rounded-xl border p-2 text-left transition-colors focus-visible:ring-2 focus-visible:outline-none",
+              active ? "border-primary bg-primary/8" : "border-border/60 hover:border-border",
+            )}
+          >
+            <span className="flex h-10 items-center justify-center rounded-md bg-gradient-to-br from-slate-700 to-slate-900">
+              <span
+                className={preset.badgeClass}
+                style={preset.badgeStyle(preset.id === "vibrant" ? "#f5c518" : undefined)}
+              >
+                4K
+              </span>
+            </span>
+            <span className="text-center text-xs font-medium">{preset.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 /**
  * Shortcut buttons and badges on media cards. These preferences are
  * profile-wide and stored apart from the web card layout, so they render even
  * when that layout cannot be edited.
  */
 export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?: () => void }) {
-  const t = useT();
   const shownRatingSources = useShownRatingSources();
   const {
-    editablePrefs,
-    images,
-    supportsStyles,
+    prefs,
     setPrefs,
     quickActionPreference,
     setQuickActionMode,
@@ -311,7 +307,7 @@ export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?:
     try {
       await resetPrefs("quickActions");
     } catch {
-      toast.error(t("web.settings.cardOverlay.resetShortcutsFailed"));
+      toast.error("Couldn't reset shortcuts");
     }
   };
 
@@ -320,7 +316,7 @@ export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?:
       await resetPrefs("badges");
       setConfirmBadgeResetOpen(false);
     } catch {
-      toast.error(t("web.settings.cardOverlay.resetBadgesFailed"));
+      toast.error("Couldn't reset badges");
     }
   };
 
@@ -335,19 +331,17 @@ export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?:
   };
 
   if (isLoading) return null;
-  // The whole document, even while badges are off: the watch-status choice
-  // lives in it too, and saving it must keep the badge choices intact.
-  const displayPrefs = editablePrefs;
+  const displayPrefs = prefs ?? buildDefaultPrefs();
 
   return (
     <>
       <SettingsGroup
-        title={t("web.settings.cardOverlay.shortcutsTitle")}
-        description={t("web.settings.cardOverlay.shortcutsDescription")}
+        title="Shortcuts"
+        description="Buttons on a poster that mark it watched or add it to your favorites, without opening it."
         actions={
           hasQuickActionOverride ? (
             <ResetButton
-              label={t("web.settings.cardOverlay.resetShortcuts")}
+              label="Reset shortcuts"
               disabled={isResetting}
               onClick={() => void resetShortcuts()}
             />
@@ -355,24 +349,21 @@ export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?:
         }
       >
         <ChoiceButtons
-          label={t("web.settings.cardOverlay.shortcutButtons")}
+          label="Shortcut buttons"
           hideLabel
           value={quickActionsEnabled ? quickActionPreference : "off"}
-          options={SHORTCUT_CHOICES.map((choice) => ({
-            value: choice.value,
-            label: t(choice.labelKey),
-          }))}
+          options={SHORTCUT_CHOICES}
           onChange={pickShortcuts}
         />
       </SettingsGroup>
 
       <SettingsGroup
-        title={t("web.settings.cardOverlay.badgesTitle")}
-        description={t("web.settings.cardOverlay.badgesDescription")}
+        title="Badges"
+        description="Small labels on posters, such as 4K, Dolby Vision, or a rating."
         actions={
           hasBadgeOverride ? (
             <ResetButton
-              label={t("web.settings.cardOverlay.resetBadges")}
+              label="Reset badges"
               disabled={isResetting}
               onClick={() => setConfirmBadgeResetOpen(true)}
             />
@@ -381,7 +372,7 @@ export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?:
       >
         <div className="flex items-center justify-between gap-3">
           <Label htmlFor={badgesSwitchId} className="text-sm font-medium">
-            {t("web.settings.cardOverlay.showBadges")}
+            Show badges on posters
           </Label>
           <Switch
             id={badgesSwitchId}
@@ -393,11 +384,10 @@ export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?:
         {overlaysEnabled ? (
           <>
             <div>
-              <SettingsSubheading>{t("web.settings.cardOverlay.style")}</SettingsSubheading>
-              <OverlayLookControls
-                prefs={displayPrefs}
-                onChange={setPrefs}
-                supportsStyles={supportsStyles}
+              <SettingsSubheading>Style</SettingsSubheading>
+              <BadgeStylePicker
+                value={displayPrefs.preset}
+                onChange={(next) => setPrefs({ ...displayPrefs, preset: next })}
               />
             </div>
             {/* Folded by category, each saying how many are on, so the page
@@ -417,12 +407,7 @@ export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?:
                     <AccordionTrigger className="items-center hover:no-underline">
                       <span className="flex-1">{title}</span>
                       <span className="text-muted-foreground text-xs font-normal tabular-nums">
-                        {onCount === 0
-                          ? t("web.settings.cardOverlay.noneOn")
-                          : t("web.settings.cardOverlay.someOn", {
-                              on: onCount,
-                              total: overlays.length,
-                            })}
+                        {onCount === 0 ? "None on" : `${onCount} of ${overlays.length} on`}
                       </span>
                     </AccordionTrigger>
                     <AccordionContent className="pb-2">
@@ -432,8 +417,6 @@ export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?:
                           overlayId={def.id}
                           prefs={displayPrefs}
                           shortcutsOn={quickActionsEnabled}
-                          images={images}
-                          supportsStyles={supportsStyles}
                           onUpdate={setPrefs}
                         />
                       ))}
@@ -449,9 +432,9 @@ export function CardOverlaySettings({ onShortcutsPicked }: { onShortcutsPicked?:
       <ConfirmDialog
         open={confirmBadgeResetOpen}
         onOpenChange={setConfirmBadgeResetOpen}
-        title={t("web.settings.cardOverlay.resetBadgesConfirmTitle")}
-        description={t("web.settings.cardOverlay.resetBadgesConfirmDescription")}
-        confirmLabel={t("web.settings.cardOverlay.resetBadges")}
+        title="Reset badges?"
+        description="Your badge choices are cleared, and this profile follows your server's badge settings from then on."
+        confirmLabel="Reset badges"
         variant="destructive"
         isPending={isResetting}
         onConfirm={() => {

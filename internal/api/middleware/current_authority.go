@@ -34,8 +34,7 @@ func (am *AuthMiddleware) RevalidateCurrent(ctx context.Context, bearer string, 
 		if key == nil || key.ID != expected.APIKeyID || key.UserID != expected.UserID {
 			return ErrCurrentCredentialInvalid
 		}
-		if !apiKeyScopesAllow(key.Scopes, &http.Request{Method: method, URL: &url.URL{Path: path}}) ||
-			key.ProfileID != expected.APIKeyProfileID {
+		if !apiKeyScopesAllow(key.Scopes, &http.Request{Method: method, URL: &url.URL{Path: path}}) {
 			return ErrCurrentCredentialForbidden
 		}
 	} else {
@@ -49,7 +48,7 @@ func (am *AuthMiddleware) RevalidateCurrent(ctx context.Context, bearer string, 
 		// The bounded operations that recheck here do not depend on the
 		// account role, so only the session itself must still be active,
 		// and a remote-playback session must still admit the operation.
-		authority, active, err := am.sessionValidator.ActiveSession(ctx, current.SessionID, current.UserID)
+		authority, active, err := am.sessionValidator.ActiveSession(ctx, current.SessionID)
 		if err != nil {
 			return err
 		}

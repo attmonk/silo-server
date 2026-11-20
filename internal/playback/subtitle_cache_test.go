@@ -51,6 +51,22 @@ func TestServeExtractTextCacheVariants(t *testing.T) {
 	}
 }
 
+func TestServeExtractTextWindowDoesNotPoisonFullTrack(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", DurationSeconds: 600}
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, opts StreamExtractOpts) error {
+		_, err := io.WriteString(opts.Writer, "partial window")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if f, _, ok := c.lookup(source, 0, "vtt"); ok {
+		_ = f.Close()
+		t.Fatal("window was cached as a complete track")
+	}
+}
+
 func TestServeExtractConcurrentViewersShareOneFill(t *testing.T) {
 	for _, tc := range []struct {
 		codec, format string
@@ -66,7 +82,7 @@ func TestServeExtractConcurrentViewersShareOneFill(t *testing.T) {
 			c, source := newTestCache(t)
 			opts := StreamExtractOpts{InputPath: source, SourceCodec: tc.codec}
 			const track = "first cues, rest of the track"
-			secondGotCues := make(chan struct{})
+			started, secondGotCues := make(chan struct{}), make(chan struct{})
 			var calls atomic.Int32
 			extract := func(ctx context.Context, opts StreamExtractOpts) error {
 				if calls.Add(1) > 1 {
@@ -74,6 +90,7 @@ func TestServeExtractConcurrentViewersShareOneFill(t *testing.T) {
 					return err
 				}
 				fill := inflightFill(c)
+				close(started)
 				if _, err := io.WriteString(opts.Writer, "first cues, "); err != nil {
 					return err
 				}
@@ -91,7 +108,7 @@ func TestServeExtractConcurrentViewersShareOneFill(t *testing.T) {
 				return err
 			}
 			// The first viewer's client stops reading.
-			stalled := &stalledResponse{ResponseRecorder: httptest.NewRecorder(), wrote: make(chan struct{}), release: make(chan struct{})}
+			stalled := &stalledResponse{ResponseRecorder: httptest.NewRecorder(), release: make(chan struct{})}
 			firstCtx, leave := context.WithCancel(t.Context())
 			firstDone := make(chan error, 1)
 			go func() {
@@ -102,8 +119,7 @@ func TestServeExtractConcurrentViewersShareOneFill(t *testing.T) {
 				close(stalled.release)
 				<-firstDone
 			}()
-			// Stall the first viewer before the second can break the temp file.
-			<-stalled.wrote
+			<-started
 
 			second := &signalingResponse{ResponseRecorder: httptest.NewRecorder(), wrote: secondGotCues}
 			if err := c.ServeExtract(second, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/subtitle", nil), opts, extract); err != nil {
@@ -142,15 +158,13 @@ func inflightFill(c *SubtitleCache) *SubtitleCacheFill {
 	return nil
 }
 
-// stalledResponse signals its write, blocks until release is closed, then fails it.
+// stalledResponse blocks every write until release is closed, then fails it.
 type stalledResponse struct {
 	*httptest.ResponseRecorder
-	wrote   chan struct{}
 	release chan struct{}
 }
 
 func (s *stalledResponse) Write([]byte) (int, error) {
-	close(s.wrote)
 	<-s.release
 	return 0, errors.New("client stopped reading")
 }
@@ -293,6 +307,32 @@ func TestServeExtractOutlivesServerWriteTimeout(t *testing.T) {
 			}
 			_ = f.Close()
 		})
+	}
+}
+
+func TestServeExtractTextFailedFillRetries(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+	for _, fail := range []bool{true, false} {
+		err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, opts StreamExtractOpts) error {
+			if _, err := io.WriteString(opts.Writer, "partial track"); err != nil {
+				return err
+			}
+			if fail {
+				return errors.New("demux interrupted")
+			}
+			return nil
+		})
+		if (err != nil) != fail {
+			t.Fatalf("fail=%v extract error=%v", fail, err)
+		}
+		f, _, ok := c.lookup(source, 0, "vtt")
+		if ok {
+			_ = f.Close()
+		}
+		if ok == fail {
+			t.Fatalf("fail=%v cache hit=%v", fail, ok)
+		}
 	}
 }
 
@@ -505,6 +545,69 @@ func TestSubtitleCacheEvictionUnderCap(t *testing.T) {
 			t.Errorf("track %d cached = %v, want %v", track, ok, want)
 		}
 	}
+}
+
+func TestSubtitleCacheCoalescing(t *testing.T) {
+	c, source := newTestCache(t)
+
+	first := c.BeginFill(source, 0)
+	if first == nil {
+		t.Fatal("first BeginFill returned nil")
+	}
+	if second := c.BeginFill(source, 0); second != nil {
+		second.Discard()
+		t.Fatal("second BeginFill for in-flight track must return nil")
+	}
+	// A different track is independent.
+	other := c.BeginFill(source, 1)
+	if other == nil {
+		t.Fatal("BeginFill for a different track must not be blocked")
+	}
+	other.Discard()
+
+	if _, err := first.Tee(io.Discard).Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Slot released after commit.
+	if again := c.BeginFill(source, 0); again == nil {
+		t.Fatal("BeginFill must work again after Commit")
+	} else {
+		again.Discard()
+	}
+}
+
+func TestSubtitleCacheCoalescingConcurrent(t *testing.T) {
+	c, source := newTestCache(t)
+
+	const workers = 16
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		fills []*SubtitleCacheFill
+	)
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if f := c.BeginFill(source, 0); f != nil {
+				mu.Lock()
+				fills = append(fills, f)
+				mu.Unlock()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(fills) != 1 {
+		t.Fatalf("exactly one concurrent BeginFill must win, got %d", len(fills))
+	}
+	fills[0].Discard()
 }
 
 func TestServeSUPExtractCacheFlow(t *testing.T) {
@@ -730,6 +833,57 @@ func TestServeSUPExtractWindowedMissWarmsOnce(t *testing.T) {
 	}
 }
 
+// Warms beyond the server-wide slot budget are dropped, not queued, and a
+// dropped warm must not leave an in-flight reservation behind.
+func TestWarmInBackgroundSemaphoreDrop(t *testing.T) {
+	c, source := newTestCache(t)
+
+	release := make(chan struct{})
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		<-release
+		_, err := opts.Writer.Write([]byte("FULL TRACK"))
+		return err
+	}
+
+	// Occupy every warm slot (slots are acquired synchronously).
+	for track := 0; track < subtitleCacheWarmSlots; track++ {
+		c.WarmInBackground(supExtractOpts(source, track), extract)
+	}
+	// One more: dropped without reserving the track's in-flight slot.
+	overflow := subtitleCacheWarmSlots
+	c.WarmInBackground(supExtractOpts(source, overflow), extract)
+	if fill := c.BeginFill(source, overflow); fill == nil {
+		t.Fatal("dropped warm must not hold the in-flight slot")
+	} else {
+		fill.Discard()
+	}
+
+	close(release)
+	for track := 0; track < subtitleCacheWarmSlots; track++ {
+		waitForCacheEntry(t, c, source, track)
+	}
+	if _, _, ok := c.Lookup(source, overflow); ok {
+		t.Fatal("dropped warm must not populate the cache")
+	}
+
+	// A committed file is visible before the worker releases its warm slot.
+	// Acquire every slot to wait for those deferred releases, then return them.
+	for range subtitleCacheWarmSlots {
+		select {
+		case c.warmSem <- struct{}{}:
+		case <-time.After(5 * time.Second):
+			t.Fatal("completed warms did not release their slots")
+		}
+	}
+	for range subtitleCacheWarmSlots {
+		<-c.warmSem
+	}
+
+	// With slots free again, the overflow track's warm goes through.
+	c.WarmInBackground(supExtractOpts(source, overflow), extract)
+	waitForCacheEntry(t, c, source, overflow)
+}
+
 // A warm that races an already-in-flight client fill must skip (BeginFill
 // coalescing) and release its warm slot for other tracks.
 func TestWarmInBackgroundSkipsInFlightFill(t *testing.T) {
@@ -784,6 +938,33 @@ func TestServeSUPExtractDiscardsOnExtractError(t *testing.T) {
 	}
 	if n := countCacheFiles(t, c); n != 0 {
 		t.Fatalf("failed extract left %d files", n)
+	}
+}
+
+func TestServeSUPExtractNilCacheStreams(t *testing.T) {
+	var c *SubtitleCache
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		_, err := opts.Writer.Write([]byte("UNCACHED"))
+		return err
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sub.sup", nil)
+	if err := c.ServeSUPExtract(rec, req, supExtractOpts("/nonexistent.mkv", 0), extract); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Body.String() != "UNCACHED" {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+
+	// Windowed requests on a nil cache stream too (no lookup, no warm).
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1&position=10", nil)
+	if err := c.ServeSUPExtract(rec, req, windowedSupOpts("/nonexistent.mkv", 0, 10, 3600), extract); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Body.String() != "UNCACHED" {
+		t.Fatalf("windowed body = %q", rec.Body.String())
 	}
 }
 

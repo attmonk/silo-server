@@ -87,14 +87,14 @@ func (p *Planner) TranscodeNodeDrained(nodeURL string) bool {
 	return ok && node.DrainState.normalized() == DrainStateDrained
 }
 
-// TranscodeNodeURLsForNewWork is TranscodeNodeURLs without draining nodes or
-// nodes nothing can sign for. Neither accepts a new transport, so capability
-// planning for a new plan must not count what they advertise.
+// TranscodeNodeURLsForNewWork is TranscodeNodeURLs without draining nodes. A
+// draining node accepts no new transport, so capability planning for a new
+// plan must not count what it advertises.
 func (p *Planner) TranscodeNodeURLsForNewWork() []string {
 	if p == nil || p.transcodes == nil {
 		return nil
 	}
-	nodes := p.transcodes.KeyedNodes()
+	nodes := p.transcodes.Nodes()
 	urls := make([]string, 0, len(nodes))
 	for _, node := range nodes {
 		if node != nil && node.URL != "" && !node.Draining() {

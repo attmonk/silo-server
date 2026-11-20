@@ -3,7 +3,6 @@ package abs
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,7 +25,7 @@ func (noopMediaStore) GetAudiobookByID(context.Context, string, catalog.AccessFi
 func (noopMediaStore) GetAudiobooksByIDs(context.Context, []string, catalog.AccessFilter) (map[string]*models.MediaItem, error) {
 	return map[string]*models.MediaItem{}, nil
 }
-func (noopMediaStore) ListAudiobooks(context.Context, int64, int, int, catalog.AccessFilter, ItemsQuery) ([]*models.MediaItem, int, error) {
+func (noopMediaStore) ListAudiobooks(context.Context, int64, int, int, catalog.AccessFilter, Filter) ([]*models.MediaItem, int, error) {
 	return nil, 0, nil
 }
 func (noopMediaStore) GetMediaFiles(context.Context, string, catalog.AccessFilter) ([]*models.MediaFile, error) {
@@ -34,12 +33,6 @@ func (noopMediaStore) GetMediaFiles(context.Context, string, catalog.AccessFilte
 }
 func (noopMediaStore) ListAudiobookLibraries(context.Context, catalog.AccessFilter) ([]AudiobookLibrary, error) {
 	return nil, nil
-}
-func (noopMediaStore) StreamAudiobooks(context.Context, int64, catalog.AccessFilter, ItemsQuery, func(int) error, func([]*models.MediaItem) error) error {
-	return nil
-}
-func (noopMediaStore) ListAudiobooksCollapsed(context.Context, int64, int, int, catalog.AccessFilter, ItemsQuery) ([]CollapsedAudiobook, int, error) {
-	return nil, 0, nil
 }
 func (noopMediaStore) SearchAudiobooks(context.Context, int64, string, int, catalog.AccessFilter) ([]*models.MediaItem, error) {
 	return nil, nil
@@ -61,18 +54,6 @@ func (noopMediaStore) ListLibrarySeries(context.Context, int64, int, int, catalo
 }
 func (noopMediaStore) GetAuthorByID(context.Context, string, catalog.AccessFilter) (Author, error) {
 	return Author{}, ErrNotFound
-}
-func (noopMediaStore) SearchLibraryAuthors(context.Context, int64, string, int, catalog.AccessFilter) ([]AuthorSummary, error) {
-	return nil, nil
-}
-func (noopMediaStore) SearchLibrarySeries(context.Context, int64, string, int, catalog.AccessFilter) ([]SeriesSummary, error) {
-	return nil, nil
-}
-func (noopMediaStore) AudiobookPosterPath(context.Context, string) (string, error) {
-	return "", ErrNotFound
-}
-func (noopMediaStore) AuthorPhotoPath(context.Context, string) (string, error) {
-	return "", ErrNotFound
 }
 func (noopMediaStore) GetSeriesByName(context.Context, string, catalog.AccessFilter) (Series, error) {
 	return Series{}, ErrNotFound
@@ -113,30 +94,17 @@ func (m *memTokenStore) RevokeTokenByJTI(_ context.Context, jti string) error {
 	m.tokens[jti] = t
 	return nil
 }
-
-// IssueTokens checks a presented JTI, revoking it under Rotate, and stores
-// the tokens in one step. A login session is only required, not checked.
-func (m *memTokenStore) IssueTokens(_ context.Context, from TokenSource, tokens ...ABSToken) error {
+func (m *memTokenStore) RevokeTokenIfActive(_ context.Context, jti string) (ABSToken, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if from.JTI == "" && from.LoginSessionID == "" {
-		return errors.New("tokens issued with no source credential")
+	t, ok := m.tokens[jti]
+	if !ok || t.RevokedAt != nil {
+		return ABSToken{}, ErrNotFound
 	}
-	if from.JTI != "" {
-		t, ok := m.tokens[from.JTI]
-		if !ok || t.RevokedAt != nil {
-			return ErrNotFound
-		}
-		if from.Rotate {
-			now := time.Now()
-			t.RevokedAt = &now
-			m.tokens[from.JTI] = t
-		}
-	}
-	for _, tok := range tokens {
-		m.tokens[tok.JTI] = tok
-	}
-	return nil
+	now := time.Now()
+	t.RevokedAt = &now
+	m.tokens[jti] = t
+	return t, nil
 }
 func (m *memTokenStore) RevokeTokensForPrincipal(_ context.Context, userID, profileID string) error {
 	m.mu.Lock()
@@ -251,6 +219,41 @@ func TestHandleRefresh_RevokedTokenRejected(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", rec.Code)
+	}
+}
+
+// TestHandleRefresh_ResolvesUsername verifies that refresh responses expose
+// the resolved username instead of the internal user ID.
+func TestHandleRefresh_ResolvesUsername(t *testing.T) {
+	// Given
+	h, store, cfg := newRefreshTestHandler(t)
+	h.deps.UsernameResolver = func(context.Context, string, string) string { return "sara" }
+	refresh, _ := mintAndPersistRefresh(t, store, cfg, "15")
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/refresh", nil)
+	req.Header.Set("x-refresh-token", refresh)
+	rec := httptest.NewRecorder()
+
+	// When
+	h.handleRefresh(rec, req)
+
+	// Then
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	user, ok := resp["user"].(map[string]any)
+	if !ok {
+		t.Fatalf("user object missing")
+	}
+	if user["username"] != "sara" {
+		t.Errorf("username = %v, want sara", user["username"])
+	}
+	if user["id"] != "15" {
+		t.Errorf("id = %v, want 15", user["id"])
 	}
 }
 

@@ -1,10 +1,8 @@
 package jellycompat
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -16,8 +14,8 @@ import (
 // the full NewRouter/ServeHTTP stack — registration, chi static-vs-{id} ordering,
 // and auth-group placement that the per-handler tests cannot see. Auth-group
 // routes must answer 401 (registered + behind auth) rather than 404 (route
-// dropped) or 2xx (accidentally anonymous); /UserImage must reach its anonymous
-// handler; and an authenticated Filters2/Sessions request must reach the right
+// dropped) or 2xx (accidentally anonymous); /UserImage must serve its anonymous
+// avatar; and an authenticated Filters2/Sessions request must reach the right
 // handler with the right shape.
 func TestRouter_MissingEndpointsRegistered(t *testing.T) {
 	cfg, err := config.LoadFromDB(map[string]string{})
@@ -36,11 +34,9 @@ func TestRouter_MissingEndpointsRegistered(t *testing.T) {
 	// (route dropped/misordered) or 2xx (accidentally registered anonymous).
 	authGroup := []struct{ method, path string }{
 		{http.MethodGet, "/Items/Filters2"},
-		{http.MethodGet, "/Items/Counts"},
 		{http.MethodGet, "/Items/abc/LocalTrailers"},
 		{http.MethodGet, "/Users/u1/Items/abc/LocalTrailers"},
 		{http.MethodGet, "/Videos/abc/AdditionalParts"},
-		{http.MethodGet, "/items/abc/images"},
 		{http.MethodGet, "/Sessions"},
 		{http.MethodPost, "/ClientLog/Document"},
 		{http.MethodGet, "/System/Configuration/encoding"},
@@ -53,15 +49,15 @@ func TestRouter_MissingEndpointsRegistered(t *testing.T) {
 		}
 	}
 
-	// (2) /UserImage is anonymous by design: with no auth it reaches the
-	// handler, which answers a user without an uploaded avatar 404 as in
-	// Jellyfin, never 401. The handler's JSON body tells that 404 apart from
-	// an unregistered route's.
+	// (2) /UserImage is anonymous-by-design (PR #158 palette): serves with no auth.
 	{
 		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/UserImage?userId="+compatUserID(PseudoUserID(1, "p1")), nil))
-		if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), `"Error":"NotFound"`) {
-			t.Errorf("GET /UserImage = %d %q, want the handler's 404", rec.Code, rec.Body.String())
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/UserImage?userId=router-test", nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET /UserImage = %d, want 200", rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "image/png" {
+			t.Errorf("GET /UserImage Content-Type = %q, want image/png", ct)
 		}
 	}
 
@@ -105,17 +101,4 @@ func TestRouter_MissingEndpointsRegistered(t *testing.T) {
 			t.Errorf("authed GET %s body = %s, want an empty QueryResult", path, rec.Body.String())
 		}
 	}
-}
-
-// itemCountsContentService answers count-only browses with a fixed total per
-// type and records the params it was asked with.
-type itemCountsContentService struct {
-	countingContentService
-	totals map[string]int
-	params []url.Values
-}
-
-func (s *itemCountsContentService) BrowseItems(_ context.Context, _ *Session, params url.Values) (*upstreamBrowseResponse, error) {
-	s.params = append(s.params, params)
-	return &upstreamBrowseResponse{Total: s.totals[params.Get("type")], Items: []upstreamListItem{}}, nil
 }

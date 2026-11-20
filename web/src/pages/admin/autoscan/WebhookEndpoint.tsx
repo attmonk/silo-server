@@ -14,7 +14,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useT } from "@/i18n";
 
 import { useWebhookEndpoint, type WebhookEndpoint } from "./useWebhookEndpoint";
 
@@ -27,7 +26,6 @@ export function RotateWebhookDialog({
   /** Named when the dialog is opened away from the source, e.g. from a list row. */
   sourceName?: string;
 }) {
-  const t = useT();
   return (
     <AlertDialog
       open={endpoint.rotateTarget !== null}
@@ -38,19 +36,16 @@ export function RotateWebhookDialog({
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>
-            {sourceName
-              ? t("web.admin.autoscan.webhook.rotate.titleNamed", { name: sourceName })
-              : t("web.admin.autoscan.webhook.rotate.title")}
+            {sourceName ? `Rotate the webhook URL for ${sourceName}?` : "Rotate webhook URL?"}
           </AlertDialogTitle>
           <AlertDialogDescription>
-            {t("web.admin.autoscan.webhook.rotate.description")}
+            The current URL stops working immediately. Sonarr/Radarr keep sending to the old URL
+            until you paste the new one into their webhook settings.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
-          <AlertDialogAction onClick={endpoint.confirmRotate}>
-            {t("web.admin.autoscan.webhook.rotate.confirm")}
-          </AlertDialogAction>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={endpoint.confirmRotate}>Rotate</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
@@ -62,15 +57,12 @@ export function RotateWebhookDialog({
  * no endpoint yet. Used on the edit dialog's Connect tab.
  */
 export function WebhookEndpointSection({ source }: { source: AutoscanSource }) {
-  const t = useT();
   const endpoint = useWebhookEndpoint(source);
   const { view, url, active, uncertain } = endpoint;
 
   return (
     <div className="space-y-1.5">
-      <Label htmlFor={`webhook-url-${source.id}`}>
-        {t("web.admin.autoscan.webhook.endpoint.label")}
-      </Label>
+      <Label htmlFor={`webhook-url-${source.id}`}>Webhook URL</Label>
       {view.webhook_configured ? (
         <>
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -80,15 +72,12 @@ export function WebhookEndpointSection({ source }: { source: AutoscanSource }) {
               value={
                 active
                   ? uncertain
-                    ? t("web.admin.autoscan.webhook.endpoint.reloadBeforeUse")
-                    : url ||
-                      t("web.admin.autoscan.webhook.endpoint.unavailable", {
-                        suffix: view?.webhook_secret_suffix ?? "",
-                      })
-                  : t("web.admin.autoscan.webhook.endpoint.otherProfile")
+                    ? "Reload this page before using or replacing this URL"
+                    : url || `…${view?.webhook_secret_suffix ?? ""} (URL unavailable)`
+                  : "Select the original administrator profile to view this URL"
               }
               className="min-w-0 flex-1 font-mono text-xs"
-              aria-label={t("web.admin.autoscan.webhook.endpoint.fieldLabel")}
+              aria-label="Webhook delivery URL"
               onFocus={(e) => e.currentTarget.select()}
             />
             <div className="flex shrink-0 gap-2">
@@ -98,10 +87,10 @@ export function WebhookEndpointSection({ source }: { source: AutoscanSource }) {
                 size="sm"
                 onClick={() => endpoint.copy()}
                 disabled={!url}
-                aria-label={t("web.admin.autoscan.webhook.endpoint.copyLabel")}
+                aria-label="Copy webhook URL"
               >
                 <Copy />
-                {t("web.admin.autoscan.webhook.copyButton")}
+                Copy
               </Button>
               <Button
                 type="button"
@@ -109,16 +98,17 @@ export function WebhookEndpointSection({ source }: { source: AutoscanSource }) {
                 size="sm"
                 onClick={endpoint.requestRotate}
                 disabled={!active || uncertain}
-                aria-label={t("web.admin.autoscan.webhook.endpoint.rotateLabel")}
-                title={t("web.admin.autoscan.webhook.endpoint.rotateTitle")}
+                aria-label="Rotate webhook URL"
+                title="Replace the URL — the old one stops working immediately"
               >
                 <RefreshCw className={endpoint.rotating ? "animate-spin" : undefined} />
-                {t("web.admin.autoscan.webhook.endpoint.rotate")}
+                Rotate
               </Button>
             </div>
           </div>
           <p className="text-muted-foreground text-xs">
-            {t("web.admin.autoscan.webhook.endpoint.alreadySetUp")}
+            Already set up in your download manager? Nothing to change — the URL stays the same
+            unless you rotate it.
           </p>
         </>
       ) : (
@@ -132,13 +122,13 @@ export function WebhookEndpointSection({ source }: { source: AutoscanSource }) {
           >
             <Webhook />
             {endpoint.generating
-              ? t("web.admin.autoscan.webhook.endpoint.generating")
+              ? "Generating…"
               : endpoint.generateFailed
-                ? t("web.admin.autoscan.webhook.endpoint.reloadToCheck")
-                : t("web.admin.autoscan.webhook.endpoint.generate")}
+                ? "Reload this page to check the endpoint"
+                : "Generate webhook URL"}
           </Button>
           <p className="text-muted-foreground text-xs">
-            {t("web.admin.autoscan.webhook.endpoint.generateHelp")}
+            Creates the URL Sonarr/Radarr will POST import, rename, and delete events to.
           </p>
         </div>
       )}

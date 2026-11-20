@@ -14,19 +14,15 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/idgen"
 	"github.com/Silo-Server/silo-server/internal/metadata/tmdb"
-	"github.com/Silo-Server/silo-server/internal/requests/discoverrows"
-	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 type TMDBClient interface {
 	SearchMedia(ctx context.Context, mediaType, query string, page int) (*tmdb.MediaPage, error)
-	ChartPage(ctx context.Context, params tmdb.ChartParams, page int) (*tmdb.MediaPage, error)
+	DiscoverSection(ctx context.Context, section string, page int) (*tmdb.MediaPage, error)
 	GetMediaDetail(ctx context.Context, mediaType string, id int) (*tmdb.MediaDetail, error)
 	DiscoverPage(ctx context.Context, mediaType string, params tmdb.DiscoverParams, page int) (*tmdb.MediaPage, error)
 }
@@ -89,15 +85,12 @@ type Service struct {
 	entitlements      EntitlementResolver
 	groupProvider     access.GroupPolicyProvider
 	users             access.UserRepository
-	profiles          userstore.UserStoreProvider
 	requesterIdentity RequesterIdentityResolver
 	tvdbResolver      TVDBIDResolver
 	notifier          FulfillmentNotifier
 	lifecycle         LifecycleNotifier
 	watchlistPref     WatchlistPreference
 	titleObserver     TitleObserver
-	discoverSnapshots DiscoverSnapshots
-	discoverRefresher DiscoverListRefresher
 	Now               func() time.Time
 }
 
@@ -109,11 +102,10 @@ type DiscoverySection struct {
 	TotalResults int           `json:"total_results"`
 	Results      []MediaResult `json:"results"`
 	// NextPage is the cursor to request for the following page, needed when
-	// backfill (a rating ceiling, or a row hiding titles the library has)
-	// consumes more than one source page per request (page+1 would repeat
-	// consumed pages). 0 when there are no more pages; on the v2 layout, past
-	// TotalPages instead after a multi-page read reached the end. Additive v1
-	// field; absent (0) also when plain page+1 semantics apply.
+	// rating-filter backfill consumes more than one TMDB page per request
+	// (page+1 would repeat consumed pages). 0 when there are no more pages.
+	// Additive v1 field; absent (0) also when the viewer is unrestricted and
+	// plain page+1 semantics apply.
 	NextPage int `json:"next_page,omitempty"`
 }
 
@@ -135,10 +127,6 @@ func (s *Service) SetGroupPolicyProvider(p access.GroupPolicyProvider) { s.group
 // SetUserRepository wires the account loader so the per-user requests_allowed
 // override is honored on top of the access group's gate.
 func (s *Service) SetUserRepository(users access.UserRepository) { s.users = users }
-
-// SetProfileStores wires the profile loader so a profile's own requests block
-// applies on top of the account's switch. Without it no profile is blocked.
-func (s *Service) SetProfileStores(stores userstore.UserStoreProvider) { s.profiles = stores }
 
 func (s *Service) SetRequesterIdentityResolver(r RequesterIdentityResolver) {
 	s.requesterIdentity = r
@@ -247,39 +235,94 @@ func (s *Service) hydrateCertifications(ctx context.Context, raw *tmdb.MediaPage
 	return out, nil
 }
 
-// Row backfill: fail-closed filtering hides most of a TMDB page for a
-// restricted profile (typically 15+ of 20, since unrated titles are
-// dropped), which renders as a nearly empty carousel; a row that hides titles
-// the library has thins out the same way. To compensate, such a row page
-// consumes consecutive source pages, starting at the requested page, until
-// enough titles survive or the per-request page budget is spent (see
-// fillRowPage).
+// Section backfill: fail-closed filtering hides most of a TMDB section page
+// for a restricted profile (typically 15+ of 20, since unrated titles are
+// dropped), which renders as a nearly empty carousel. To compensate, a
+// restricted viewer's section page consumes consecutive TMDB pages, starting
+// at the requested page, until a page's worth of titles survives filtering or
+// the per-request budget (sectionBackfillMaxPagesPerRequest) is spent.
 //
-// Pagination stays honest through two properties: `page` keeps the source's
-// own cursor semantics (same as for unrestricted viewers), and the response's
-// next_page reports the cursor after the last source page actually consumed.
-// Every survivor from a consumed page is returned and no consumed page is
-// partially dropped, so resuming at next_page never skips or repeats an
-// allowed title. The one exception is the Discover page itself: a row there
-// shows at most its limit, and a row it trims loses its cursor (its see all
-// page starts again at page 1). The budget also bounds the cold-cache cost: a
-// permissive ceiling (R/TV-MA) fills from one page and stops immediately,
+// Pagination stays honest through two properties: `page` keeps plain TMDB
+// cursor semantics (same as for unrestricted viewers), and the response's
+// next_page reports the cursor after the last TMDB page actually consumed.
+// Every survivor from a consumed page is returned — nothing is trimmed and no
+// consumed page is partially dropped — so resuming at next_page never skips
+// or repeats an allowed title. The budget also bounds the cold-cache cost: a
+// permissive ceiling (R/TV-MA) fills from one TMDB page and stops immediately,
 // while a strict ceiling spends at most the budget per request.
 const (
-	// Per-request source page budgets. A single row's page (its see all
-	// page) can afford a deeper scan than the Discover page, which renders
-	// every row at once: on a cold certification cache each consumed page
-	// costs up to 20 cert lookups against the client's rate limiter. A
-	// Discover page row reads ceil(limit/20) pages, plus one when it filters
-	// (see firstRowPage), so its worst case is rows x that x 20 lookups; a
-	// layout preview reads sectionBackfillBudgetAggregate pages per row.
-	// Steady state is unaffected: certifications are cached for 7 days,
-	// shared across all profiles.
+	// Per-request TMDB page budgets. A single-section request can afford a
+	// deeper scan than the six-section DiscoverAll aggregate: on a cold
+	// certification cache each consumed page costs up to 20 cert lookups
+	// against the client's rate limiter, so DiscoverAll's worst case is
+	// 6 sections x sectionBackfillBudgetAggregate pages x 20. Keeping the
+	// aggregate budget small bounds the first-paint latency for a restricted
+	// profile; the per-section endpoint (carousel "load more") gets the
+	// deeper budget. Steady state is unaffected — certifications are cached
+	// for 7 days, shared across all profiles.
 	sectionBackfillBudgetSingle    = 5
 	sectionBackfillBudgetAggregate = 2
-	sectionResultsPerPage          = discoverrows.PageSize
+	sectionResultsPerPage          = 20
 	sectionBackfillMaxPage         = 500 // TMDB hard-caps page at 500
 )
+
+func (s *Service) backfillSectionPage(ctx context.Context, section string, page, pageBudget int, ceiling string) (result *tmdb.MediaPage, nextPage int, err error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageBudget <= 0 {
+		pageBudget = 1
+	}
+
+	out := &tmdb.MediaPage{Page: page}
+	var results []tmdb.MediaResult
+	// Trending/popular orderings shift between fetches, so consecutive TMDB
+	// pages can overlap; dedupe within the request.
+	seen := map[certKey]bool{}
+	totalPages := page // until TMDB tells us the real count, assume the current page exists
+	consumed := 0
+	for next := page; consumed < pageBudget && next <= totalPages && next <= sectionBackfillMaxPage; next++ {
+		// Enough survived — stop before spending another TMDB page. Titles on
+		// unconsumed pages are not lost: next_page points at the first page
+		// this request did not consume.
+		if len(results) >= sectionResultsPerPage {
+			break
+		}
+		raw, err := s.tmdb.DiscoverSection(ctx, section, next)
+		if err != nil {
+			return nil, 0, err
+		}
+		if raw == nil {
+			break
+		}
+		consumed++
+		nextPage = next + 1
+		if raw.TotalPages > 0 {
+			totalPages = raw.TotalPages
+			out.TotalResults = raw.TotalResults
+		}
+		filtered, err := s.filterPageByCeiling(ctx, raw, ceiling)
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, item := range filtered.Results {
+			key := certKey{mediaType: MediaType(item.MediaType), id: item.ID}
+			if !seen[key] {
+				seen[key] = true
+				results = append(results, item)
+			}
+		}
+	}
+	out.Results = results
+	// TotalPages/TotalResults stay TMDB's unfiltered counts — page keeps TMDB
+	// cursor semantics, and the filtered totals are unknowable without a full
+	// scan. next_page is the honest resume cursor.
+	out.TotalPages = totalPages
+	if nextPage > totalPages || nextPage > sectionBackfillMaxPage {
+		nextPage = 0 // exhausted
+	}
+	return out, nextPage, nil
+}
 
 // ensureCreateAllowedByCeiling rejects request submissions for titles above
 // the viewer's rating ceiling. List filtering alone is cosmetic — the create
@@ -498,12 +541,11 @@ func (s *Service) missingAPIKey(ctx context.Context, fc *fulfillContext, in Inte
 	return !features.APIKeyOptional, nil
 }
 
-// Reasons no router connection can take a submission, recorded in the
-// request's last_error.
+// Reasons a configured router connection cannot take a submission, recorded in
+// the request's last_error.
 const (
 	msgRouterUnbound = "request backend connection is not bound to a plugin installation; re-save it in admin"
 	msgRouterNoKey   = "request backend connection has no API key; add it in admin"
-	msgNoRouter      = "no request backend serves this media type; add one in admin"
 )
 
 // unusableRouterMessage explains why no configured connection could take a
@@ -586,7 +628,7 @@ func (s *Service) Search(ctx context.Context, viewer Viewer, query string, media
 	if s == nil || s.store == nil || s.tmdb == nil {
 		return nil, fmt.Errorf("request service is not configured")
 	}
-	if err := s.ensureDiscoveryAllowed(ctx, viewer); err != nil {
+	if err := s.ensureRequestsEnabled(ctx); err != nil {
 		return nil, err
 	}
 	mediaType, err := normalizeSearchMediaType(mediaType)
@@ -604,6 +646,89 @@ func (s *Service) Search(ctx context.Context, viewer Viewer, query string, media
 	return s.enrichPage(ctx, viewer, raw)
 }
 
+func (s *Service) Discover(ctx context.Context, viewer Viewer, section string, page int) (*DiscoverySection, error) {
+	if s == nil || s.store == nil || s.tmdb == nil {
+		return nil, fmt.Errorf("request service is not configured")
+	}
+	ceiling, err := s.viewerContentCeiling(ctx, viewer)
+	if err != nil {
+		return nil, err
+	}
+	return s.discover(ctx, viewer, section, page, sectionBackfillBudgetSingle, ceiling)
+}
+
+// discover renders one section for an already-resolved ceiling. Callers own
+// the ceiling lookup so a DiscoverAll fan-out resolves the viewer scope once,
+// not once per section per page.
+func (s *Service) discover(ctx context.Context, viewer Viewer, section string, page, backfillBudget int, ceiling string) (*DiscoverySection, error) {
+	if s == nil || s.store == nil || s.tmdb == nil {
+		return nil, fmt.Errorf("request service is not configured")
+	}
+	if err := s.ensureRequestsEnabled(ctx); err != nil {
+		return nil, err
+	}
+	section = strings.TrimSpace(section)
+	if _, ok := discoverySectionTitles[section]; !ok {
+		return nil, fmt.Errorf("%w: invalid discovery section", ErrInvalidInput)
+	}
+	var raw *tmdb.MediaPage
+	var err error
+	var nextPage int
+	if ceiling != "" {
+		raw, nextPage, err = s.backfillSectionPage(ctx, section, page, backfillBudget, ceiling)
+	} else {
+		raw, err = s.tmdb.DiscoverSection(ctx, section, page)
+	}
+	if err != nil {
+		return nil, err
+	}
+	enriched, err := s.enrichPageWithCeiling(ctx, viewer, raw, ceiling)
+	if err != nil {
+		return nil, err
+	}
+	return &DiscoverySection{
+		Key:          section,
+		Title:        discoverySectionTitles[section],
+		Page:         enriched.Page,
+		TotalPages:   enriched.TotalPages,
+		TotalResults: enriched.TotalResults,
+		Results:      enriched.Results,
+		NextPage:     nextPage,
+	}, nil
+}
+
+func (s *Service) DiscoverAll(ctx context.Context, viewer Viewer) ([]DiscoverySection, error) {
+	if s == nil || s.store == nil || s.tmdb == nil {
+		return nil, fmt.Errorf("request service is not configured")
+	}
+	ctx = withPolicyCache(ctx)
+	if err := s.ensureRequestsEnabled(ctx); err != nil {
+		return nil, err
+	}
+	ceiling, err := s.viewerContentCeiling(ctx, viewer)
+	if err != nil {
+		return nil, err
+	}
+	sections := make([]DiscoverySection, len(discoverySectionOrder))
+	group, gctx := errgroup.WithContext(ctx)
+	group.SetLimit(externalIDHydrationConcurrency)
+	for i, key := range discoverySectionOrder {
+		i, key := i, key
+		group.Go(func() error {
+			section, err := s.discover(gctx, viewer, key, 1, sectionBackfillBudgetAggregate, ceiling)
+			if err != nil {
+				return err
+			}
+			sections[i] = *section
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	return sections, nil
+}
+
 // GetDetail fetches a TMDB detail payload and overlays the same availability /
 // request-state signals used by search and discovery. Recommendations carry
 // their own per-item state so the detail page can render them as request cards.
@@ -612,7 +737,7 @@ func (s *Service) GetDetail(ctx context.Context, viewer Viewer, mediaType MediaT
 		return nil, fmt.Errorf("request service is not configured")
 	}
 	ctx = withPolicyCache(ctx)
-	if err := s.ensureDiscoveryAllowed(ctx, viewer); err != nil {
+	if err := s.ensureRequestsEnabled(ctx); err != nil {
 		return nil, err
 	}
 	mediaType, err := normalizeMediaType(mediaType)
@@ -777,7 +902,7 @@ func (s *Service) CreateRequest(ctx context.Context, viewer Viewer, input Create
 	if err := s.ensureRequestsEnabled(ctx); err != nil {
 		return nil, err
 	}
-	if err := s.ensureViewerRequestsAllowed(ctx, viewer); err != nil {
+	if err := s.ensureViewerRequestsAllowed(ctx, viewer.UserID); err != nil {
 		return nil, err
 	}
 	normalized, err := normalizeCreateInput(input)
@@ -921,19 +1046,7 @@ func (s *Service) ListMine(ctx context.Context, viewer Viewer, filter ListFilter
 	if err := s.ensureRequestsEnabled(ctx); err != nil {
 		return nil, err
 	}
-	filter = normalizeListFilter(filter)
-	// The account's list holds every profile's requests. A profile blocked
-	// from requests sees only its own: the others' titles come from TMDB,
-	// which the block keeps it out of.
-	blocked, err := s.profileRequestsBlocked(ctx, viewer)
-	if err != nil {
-		return nil, err
-	}
-	filter.RequestedByProfileID = ""
-	if blocked {
-		filter.RequestedByProfileID = viewer.ProfileID
-	}
-	reqs, err := s.store.ListMine(ctx, viewer.UserID, filter)
+	reqs, err := s.store.ListMine(ctx, viewer.UserID, normalizeListFilter(filter))
 	if err != nil {
 		return nil, err
 	}
@@ -1109,8 +1222,8 @@ func (s *Service) GetRequest(ctx context.Context, viewer Viewer, id string) (*Re
 	if err != nil {
 		return nil, err
 	}
-	if err := s.ensureViewerMayManage(ctx, viewer, req); err != nil {
-		return nil, err
+	if !viewer.IsAdmin && req.RequestedByUserID != viewer.UserID {
+		return nil, ErrForbidden
 	}
 	if err := s.attachTargets(ctx, req); err != nil {
 		return nil, err
@@ -1119,29 +1232,6 @@ func (s *Service) GetRequest(ctx context.Context, viewer Viewer, id string) (*Re
 		return nil, err
 	}
 	return req, nil
-}
-
-// ensureViewerMayManage lets a viewer read or withdraw a request: an admin
-// any, others their account's, and a profile blocked from requests only the
-// ones it made, as ListMine shows it.
-func (s *Service) ensureViewerMayManage(ctx context.Context, viewer Viewer, req *Request) error {
-	if viewer.IsAdmin {
-		return nil
-	}
-	if req.RequestedByUserID != viewer.UserID {
-		return ErrForbidden
-	}
-	if req.RequestedByProfileID == viewer.ProfileID {
-		return nil
-	}
-	blocked, err := s.profileRequestsBlocked(ctx, viewer)
-	if err != nil {
-		return err
-	}
-	if blocked {
-		return ErrForbidden
-	}
-	return nil
 }
 
 func (s *Service) Approve(ctx context.Context, viewer Viewer, id string) (*Request, error) {
@@ -1158,9 +1248,8 @@ func (s *Service) Approve(ctx context.Context, viewer Viewer, id string) (*Reque
 
 // Decline rejects a request nothing has been sent for: a pending one, or an
 // approved one still waiting for the library or backing off. Once a submission
-// is in flight or a target other than a failed one exists, declining could
-// leave the downstream service's state diverged from Silo's, so the guard
-// refuses it.
+// is in flight or a target exists, declining could leave the downstream
+// service's state diverged from Silo's, so the guard refuses it.
 func (s *Service) Decline(ctx context.Context, viewer Viewer, id, reason string) (*Request, error) {
 	if !viewer.IsAdmin {
 		return nil, ErrForbidden
@@ -1176,8 +1265,8 @@ func (s *Service) Decline(ctx context.Context, viewer Viewer, id, reason string)
 // Cancel withdraws a request that has not been sent to a downstream service:
 // pending, or approved but not yet sent (see guardWithdrawable). Owners can
 // withdraw their own; admins can withdraw any. Once a submission is in flight
-// or a target other than a failed one exists, the request stays in the
-// pipeline until it completes or fails.
+// or a target exists, the request stays in the pipeline until it completes or
+// fails.
 func (s *Service) Cancel(ctx context.Context, viewer Viewer, id, reason string) (*Request, error) {
 	return s.cancel(ctx, viewer, id, reason, false)
 }
@@ -1192,10 +1281,7 @@ func (s *Service) AdminCancel(ctx context.Context, viewer Viewer, id, reason str
 	return s.cancel(ctx, viewer, id, reason, true)
 }
 
-// ownedRequest loads a request the viewer may withdraw or remove: its own
-// account's, or any for an admin. Requesters are refused while requests are
-// turned off; admins are not.
-func (s *Service) ownedRequest(ctx context.Context, viewer Viewer, id string) (*Request, error) {
+func (s *Service) cancel(ctx context.Context, viewer Viewer, id, reason string, closeFailed bool) (*Request, error) {
 	if viewer.UserID == 0 {
 		return nil, ErrForbidden
 	}
@@ -1208,16 +1294,8 @@ func (s *Service) ownedRequest(ctx context.Context, viewer Viewer, id string) (*
 	if err != nil {
 		return nil, err
 	}
-	if err := s.ensureViewerMayManage(ctx, viewer, req); err != nil {
-		return nil, err
-	}
-	return req, nil
-}
-
-func (s *Service) cancel(ctx context.Context, viewer Viewer, id, reason string, closeFailed bool) (*Request, error) {
-	req, err := s.ownedRequest(ctx, viewer, id)
-	if err != nil {
-		return nil, err
+	if !viewer.IsAdmin && req.RequestedByUserID != viewer.UserID {
+		return nil, ErrForbidden
 	}
 	guard := guardWithdrawable
 	if closeFailed && req.Outcome == OutcomeFailed {
@@ -1230,18 +1308,6 @@ func (s *Service) cancel(ctx context.Context, viewer Viewer, id, reason string, 
 		return nil, err
 	}
 	return withdrawn, nil
-}
-
-// RemoveFailed deletes a failed request for good. Owners can remove their
-// own; admins can remove any. Nothing is sent downstream: a failed request has
-// nothing in flight, and the guarded delete refuses one an admin is retrying
-// or one that delivered a copy before failing.
-func (s *Service) RemoveFailed(ctx context.Context, viewer Viewer, id string) error {
-	req, err := s.ownedRequest(ctx, viewer, id)
-	if err != nil {
-		return err
-	}
-	return s.store.DeleteFailed(ctx, req.ID)
 }
 
 func (s *Service) Retry(ctx context.Context, viewer Viewer, id string) (*Request, error) {
@@ -1352,9 +1418,6 @@ func (s *Service) GetFeatureStatus(ctx context.Context, viewer Viewer) (FeatureS
 		// The account's own permission is left to the caller, which reads
 		// it for the request capability anyway.
 		status.WatchlistRequests = settings.WatchlistRequests && viewer.UserID != 0 && s.watchlistAutoRequest(ctx, viewer)
-		if status.ProfileRequestsBlocked, err = s.profileRequestsBlocked(ctx, viewer); err != nil {
-			return FeatureStatus{}, err
-		}
 	}
 	return status, nil
 }
@@ -1370,16 +1433,16 @@ func (s *Service) ensureRequestsEnabled(ctx context.Context) error {
 	return nil
 }
 
-// ensureViewerRequestsAllowed enforces the viewer's resolved requests gate:
-// the account override on top of the access group, then the profile's own
-// block. The account loader is required: without it the gate could only see
-// the group layer, which would silently ignore a per-user deny, so a missing
-// repository is a wiring error rather than a permissive fallback.
-func (s *Service) ensureViewerRequestsAllowed(ctx context.Context, viewer Viewer) error {
+// ensureViewerRequestsAllowed enforces the viewer's resolved requests gate
+// (account override on top of the access group). The account loader is
+// required: without it the gate could only see the group layer, which would
+// silently ignore a per-user deny, so a missing repository is a wiring error
+// rather than a permissive fallback.
+func (s *Service) ensureViewerRequestsAllowed(ctx context.Context, userID int) error {
 	if s.users == nil {
 		return fmt.Errorf("requests: user repository is not configured")
 	}
-	user, err := s.users.GetByID(ctx, viewer.UserID)
+	user, err := s.users.GetByID(ctx, userID)
 	if err != nil {
 		return ErrForbidden
 	}
@@ -1390,49 +1453,7 @@ func (s *Service) ensureViewerRequestsAllowed(ctx context.Context, viewer Viewer
 	if !effective.RequestsAllowed {
 		return ErrForbidden
 	}
-	return s.ensureProfileRequestsAllowed(ctx, viewer)
-}
-
-// ensureDiscoveryAllowed gates request discovery, which browses TMDB rather
-// than the library: requests must be on, and the viewer's profile must not be
-// blocked from requests. The library's parental controls reach discovery only
-// as a US certification filter, so a household manager blocks a profile to
-// keep it out entirely. An account denied requests keeps discovery; its
-// clients hide the feature on the capability's allowed flag.
-func (s *Service) ensureDiscoveryAllowed(ctx context.Context, viewer Viewer) error {
-	if err := s.ensureRequestsEnabled(ctx); err != nil {
-		return err
-	}
-	return s.ensureProfileRequestsAllowed(ctx, viewer)
-}
-
-// ensureProfileRequestsAllowed answers ErrForbidden when the household
-// manager has blocked the viewer's profile from requests, or the profile does
-// not exist. A viewer without a profile has no profile block.
-func (s *Service) ensureProfileRequestsAllowed(ctx context.Context, viewer Viewer) error {
-	blocked, err := s.profileRequestsBlocked(ctx, viewer)
-	if err != nil {
-		return err
-	}
-	if blocked {
-		return ErrForbidden
-	}
 	return nil
-}
-
-func (s *Service) profileRequestsBlocked(ctx context.Context, viewer Viewer) (bool, error) {
-	if s.profiles == nil || strings.TrimSpace(viewer.ProfileID) == "" {
-		return false, nil
-	}
-	store, err := s.profiles.ForUser(ctx, viewer.UserID)
-	if err != nil {
-		return false, fmt.Errorf("requests: opening user store: %w", err)
-	}
-	profile, err := store.GetProfile(ctx, viewer.ProfileID)
-	if err != nil {
-		return false, fmt.Errorf("requests: loading profile: %w", err)
-	}
-	return profile == nil || profile.RequestsBlocked, nil
 }
 
 func (s *Service) UpdateSettings(ctx context.Context, viewer Viewer, settings Settings) (Settings, error) {
@@ -1685,41 +1706,11 @@ func (s *Service) LoadIntegrationOptions(ctx context.Context, viewer Viewer, int
 		return nil, fmt.Errorf("no fulfillment backend configured")
 	}
 	conn := ResolvedRouterConnection{ID: integration.ID, BaseURL: integration.BaseURL, APIKey: strings.TrimSpace(integration.APIKeyRef), Config: integration.PluginConfig}
-	if integration.TestConnection {
-		if err := s.testIntegrationConnection(ctx, integration, conn); err != nil {
-			return nil, err
-		}
-	}
 	options, err := s.router.ListConfigOptions(ctx, *integration.InstallationID, integration.CapabilityID, conn)
 	if err != nil {
 		return nil, classifyIntegrationError(err, integration.CapabilityID)
 	}
 	return options, nil
-}
-
-// testIntegrationConnection asks the router whether it can reach and sign in
-// to the server, since a router may answer an empty option list for a server
-// it cannot reach. The test is sent without the plugin config: the options
-// probe runs while that config is being edited, and a stale choice in it (a
-// server the router no longer lists) must not stop the options that replace
-// it from loading; save-time validation checks the config. A router that does
-// not implement the test is judged by its options. A failed test is
-// classified like a failed options load.
-func (s *Service) testIntegrationConnection(ctx context.Context, integration Integration, conn ResolvedRouterConnection) error {
-	conn.Config = nil
-	ok, message, err := s.router.TestConnection(ctx, *integration.InstallationID, integration.CapabilityID, conn)
-	switch {
-	case status.Code(err) == codes.Unimplemented:
-		return nil
-	case err != nil:
-		return classifyIntegrationError(err, integration.CapabilityID)
-	case !ok:
-		if strings.TrimSpace(message) == "" {
-			message = "connection test failed"
-		}
-		return classifyIntegrationError(errors.New(message), integration.CapabilityID)
-	}
-	return nil
 }
 
 func (s *Service) EffectivePolicy(ctx context.Context, userID int) (EffectivePolicy, error) {
@@ -1757,17 +1748,26 @@ func withPolicyCache(ctx context.Context) context.Context {
 	return context.WithValue(ctx, policyCacheKey{}, &policyCache{byUser: map[int]EffectivePolicy{}})
 }
 
-// LayeredPolicy is the request policy an account gets, without its usage:
-// the server's settings, then its access group's limits, then its own, a
-// layer set to inherit deferring to the next; allowed is the account's
-// requests switch. Every reader of an account's request authority uses it.
-func LayeredPolicy(settings Settings, allowed bool, group *GroupLimit, limit *UserLimit) EffectivePolicy {
+func (s *Service) resolvePolicy(ctx context.Context, userID int) (EffectivePolicy, error) {
+	settings, err := s.store.GetSettings(ctx)
+	if err != nil {
+		return EffectivePolicy{}, err
+	}
+	limit, err := s.store.GetUserLimit(ctx, userID)
+	if err != nil {
+		return EffectivePolicy{}, err
+	}
+	viewerAccess, err := s.viewerRequestAccess(ctx, userID)
+	if err != nil {
+		return EffectivePolicy{}, err
+	}
+
 	policy := EffectivePolicy{
 		RequestsEnabled: settings.RequestsEnabled,
 		MaxRequests:     settings.GlobalMaxRequests,
 		WindowDays:      settings.GlobalWindowDays,
 		AutoApprove:     settings.GlobalAutoApprovalEnabled,
-		Blocked:         !allowed,
+		Blocked:         !viewerAccess.allowed,
 	}
 	if policy.WindowDays <= 0 {
 		policy.WindowDays = 7
@@ -1777,7 +1777,7 @@ func LayeredPolicy(settings Settings, allowed bool, group *GroupLimit, limit *Us
 	limitMode, maxRequests, windowDays := LimitModeInherit, (*int)(nil), (*int)(nil)
 	approval := ApprovalModeInherit
 	layers := []*UserLimit{}
-	if g := group; g != nil {
+	if g := viewerAccess.group; g != nil {
 		layers = append(layers, &UserLimit{LimitMode: g.LimitMode, MaxRequests: g.MaxRequests, WindowDays: g.WindowDays, ApprovalMode: g.ApprovalMode})
 	}
 	if limit != nil {
@@ -1813,28 +1813,6 @@ func LayeredPolicy(settings Settings, allowed bool, group *GroupLimit, limit *Us
 		policy.AutoApprove = true
 	}
 
-	return policy
-}
-
-func (s *Service) resolvePolicy(ctx context.Context, userID int) (EffectivePolicy, error) {
-	settings, err := s.store.GetSettings(ctx)
-	if err != nil {
-		return EffectivePolicy{}, err
-	}
-	limit, err := s.store.GetUserLimit(ctx, userID)
-	if err != nil {
-		return EffectivePolicy{}, err
-	}
-	viewerAccess, err := s.viewerRequestAccess(ctx, userID)
-	if err != nil {
-		return EffectivePolicy{}, err
-	}
-
-	var group *GroupLimit
-	if viewerAccess.group != nil {
-		group = viewerAccess.group
-	}
-	policy := LayeredPolicy(settings, viewerAccess.allowed, group, limit)
 	policy.WindowStart = s.now().AddDate(0, 0, -policy.WindowDays)
 	if !policy.Unlimited {
 		used, err := s.store.CountUserRequestsSince(ctx, userID, policy.WindowStart)
@@ -2233,21 +2211,10 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 		}
 		fc = built
 	}
-	noRouter := s.router == nil || !routerConfiguredFor(fc, req.MediaType)
-	if noRouter {
+	if s.router == nil || !routerConfiguredFor(fc, req.MediaType) {
 		// No router serves this media type: the request stays approved and
 		// the reconcile pass completes it when the title reaches the library.
-		// A retry of a request that delivered a quality is the exception: the
-		// library holds that copy and does not complete it (MarkAvailable), so
-		// the retry goes through the claim below and backs off, then fails,
-		// with the reason.
-		retrying, err := s.deliveredSome(ctx, req.ID)
-		if err != nil {
-			return nil, err
-		}
-		if !retrying {
-			return &req, nil
-		}
+		return &req, nil
 	}
 	missingSeasons := false
 	if req.MediaType == MediaTypeSeries && len(req.Seasons) > 0 {
@@ -2260,31 +2227,21 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 			return nil, err
 		}
 		if match := matches[req.TMDBID]; match.Available {
-			// A retry of a request that delivered one quality resends the
-			// others. The library holds the delivered copy, so its seasons
-			// say nothing about the tiers being resent, and only the servers
-			// those tiers go to need to take seasons (checked after the claim).
-			retrying, err := s.deliveredSome(ctx, req.ID)
+			// Seasons that reached the library since the request was made
+			// need no download: the reconcile pass completes the request.
+			fulfilled, _, err := s.requestFulfilled(ctx, req, match)
 			if err != nil {
 				return nil, err
 			}
-			if !retrying {
-				// Seasons that reached the library since the request was made
-				// need no download: the reconcile pass completes the request.
-				fulfilled, _, err := s.requestFulfilled(ctx, req, match)
-				if err != nil {
-					return nil, err
-				}
-				if fulfilled {
-					return &req, nil
-				}
-				deliverable, err := s.missingSeasonsDeliverable(ctx, fc, req)
-				if err != nil {
-					return nil, err
-				}
-				if !deliverable {
-					return &req, nil
-				}
+			if fulfilled {
+				return &req, nil
+			}
+			deliverable, err := s.missingSeasonsDeliverable(ctx, fc, req)
+			if err != nil {
+				return nil, err
+			}
+			if !deliverable {
+				return &req, nil
 			}
 			missingSeasons = true
 		}
@@ -2301,17 +2258,7 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 	// The claim reloads the row; keep this call's external-ID lookup result.
 	claimed.externalIDsResolved = req.externalIDsResolved
 	claimed.tvdbLookupFailed = req.tvdbLookupFailed
-	var submitted *Request
-	var submitErr error
-	if noRouter {
-		// A settling error backs off like any failed attempt.
-		submitted, submitErr = s.settleUnsendableRetry(ctx, *claimed, actor, fc)
-		if submitted == nil && submitErr == nil {
-			submitErr = errors.New(msgNoRouter)
-		}
-	} else {
-		submitted, submitErr = s.submitClaimed(ctx, *claimed, actor, fc, missingSeasons)
-	}
+	submitted, submitErr := s.submitClaimed(ctx, *claimed, actor, fc, missingSeasons)
 	if submitErr == nil {
 		return submitted, nil
 	}
@@ -2342,8 +2289,8 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 // holds. missingSeasons marks a request for seasons of a series already in the
 // library, which only a router that takes seasons may receive.
 func (s *Service) submitClaimed(ctx context.Context, req Request, actor Viewer, fc *fulfillContext, missingSeasons bool) (*Request, error) {
-	// Resolve before planSubmission drops failed targets for qualities no
-	// longer wanted, so a failed save leaves their error records in place.
+	// Resolve before planSubmission drops failed targets, so a failed save
+	// leaves their error records in place.
 	if err := s.ensureSeriesTVDBID(ctx, &req); err != nil {
 		return nil, err
 	}
@@ -2362,9 +2309,8 @@ func (s *Service) submitClaimed(ctx context.Context, req Request, actor Viewer, 
 		return nil, errors.New(s.unusableRouterMessage(ctx, fc, req.MediaType))
 	}
 	if missingSeasons {
-		// missingSeasonsDeliverable checked every series connection (except
-		// on a retry of a request that delivered a quality); this guards the
-		// plugin actually chosen.
+		// missingSeasonsDeliverable checked every series connection; this
+		// guards the plugin actually chosen.
 		ok, err := s.routerSupportsSeasons(ctx, fc, installationID, capabilityID)
 		if err != nil {
 			return nil, err
@@ -2544,11 +2490,29 @@ func (s *Service) routingRatingOf(ctx context.Context, req Request) (string, err
 // they were captured, or while TMDB was unreachable, and stores them. Routing
 // without them could send a title to the wrong server, so a TMDB failure is a
 // submission error and the submission retries. A request captured before its
-// rating (or, for a series, its status) was is given one, only when an
-// enabled route checks it.
+// rating was is given one, only when an enabled route checks ratings.
 func (s *Service) ensureRoutingFacts(ctx context.Context, req *Request, routes []Route) error {
 	if req.RoutingFacts.Captured() {
-		return s.recheckCapturedFacts(ctx, req, routes)
+		// A title TMDB had not rated yet (unreleased) is asked again a day
+		// later, so a rating route can still match it once it is rated.
+		stored := req.RoutingFacts.ContentRating
+		known := stored != nil && (*stored != "" || s.now().Sub(*req.RoutingFacts.CapturedAt) < unratedRecheck)
+		if known || !routesCheckRating(routes, req.MediaType) {
+			return nil
+		}
+		rating, err := s.routingRatingOf(ctx, *req)
+		if err != nil {
+			return fmt.Errorf("could not read the title's rating from TMDB to route it: %w", err)
+		}
+		facts := req.RoutingFacts
+		now := s.now()
+		facts.ContentRating, facts.CapturedAt = &rating, &now
+		updated, err := s.store.SetRoutingFacts(ctx, req.ID, facts)
+		if err != nil {
+			return err
+		}
+		req.RoutingFacts = updated.RoutingFacts
+		return nil
 	}
 	detail := s.requestDetail(ctx, req.MediaType, req.TMDBID)
 	if detail == nil {
@@ -2570,72 +2534,6 @@ func (s *Service) ensureRoutingFacts(ctx context.Context, req *Request, routes [
 		return err
 	}
 	req.RoutingFacts, req.IsAnime = updated.RoutingFacts, updated.IsAnime
-	// Another API server may have stored its capture first, without what
-	// this one reads (a server not yet upgraded has no series status).
-	return s.recheckCapturedFacts(ctx, req, routes)
-}
-
-// recheckCapturedFacts gives captured facts what an enabled route needs and
-// they lack: a rating TMDB had not given yet, or a series' status.
-func (s *Service) recheckCapturedFacts(ctx context.Context, req *Request, routes []Route) error {
-	if err := s.recheckRoutingRating(ctx, req, routes); err != nil {
-		return err
-	}
-	return s.ensureSeriesStatus(ctx, req, routes)
-}
-
-// recheckRoutingRating reads a captured request's rating again when it has
-// none and an enabled route checks ratings: a title TMDB had not rated yet
-// (unreleased) is asked again a day later, so a rating route can still match
-// it once it is rated. Only the rating and its capture time are written, so
-// the read never replaces a fact another API server stored meanwhile.
-func (s *Service) recheckRoutingRating(ctx context.Context, req *Request, routes []Route) error {
-	stored := req.RoutingFacts.ContentRating
-	known := stored != nil && (*stored != "" || s.now().Sub(*req.RoutingFacts.CapturedAt) < unratedRecheck)
-	if known || !routesCheckRating(routes, req.MediaType) {
-		return nil
-	}
-	rating, err := s.routingRatingOf(ctx, *req)
-	if err != nil {
-		return fmt.Errorf("could not read the title's rating from TMDB to route it: %w", err)
-	}
-	now := s.now()
-	updated, err := s.store.UpdateRoutingFacts(ctx, req.ID, RoutingFacts{ContentRating: &rating, CapturedAt: &now})
-	if err != nil {
-		return err
-	}
-	req.RoutingFacts = updated.RoutingFacts
-	return nil
-}
-
-// ensureSeriesStatus gives a series captured before status was one, only
-// when an enabled route checks status. It is read once, like the facts
-// captured with the request: a status TMDB has none for is not asked again,
-// and the capture time is left alone, since it times the rating's recheck.
-// A series TMDB no longer lists has no status, rather than a request that
-// can never be sent. The first status any API server stores wins, so every
-// server routes the request on the same one.
-func (s *Service) ensureSeriesStatus(ctx context.Context, req *Request, routes []Route) error {
-	if req.RoutingFacts.SeriesStatus != nil || !routesCheckSeriesStatus(routes, req.MediaType) {
-		return nil
-	}
-	if s.tmdb == nil {
-		return errors.New("could not read the series' status from TMDB to route it")
-	}
-	var status *string
-	switch detail, err := s.tmdb.GetMediaDetail(ctx, tmdbMediaType(req.MediaType), req.TMDBID); {
-	case errors.Is(err, tmdb.ErrNotFound):
-		status = new("")
-	case err != nil || detail == nil:
-		return fmt.Errorf("could not read the series' status from TMDB to route it: %w", err)
-	default:
-		status = seriesStatusOf(detail)
-	}
-	updated, err := s.store.FillRoutingFacts(ctx, req.ID, RoutingFacts{SeriesStatus: status})
-	if err != nil {
-		return err
-	}
-	req.RoutingFacts = updated.RoutingFacts
 	return nil
 }
 
@@ -2652,10 +2550,9 @@ type submissionPlan struct {
 // off, the requester lost 4K, the 4K destination removed), which would keep the
 // request failed forever, but only when allowed is certain: an entitlement
 // lookup error or a skipped connection also shrinks it, and a transient error
-// must not discard a failure an admin still needs to see. The failed targets
-// of the qualities it resends stay until RecordSubmission replaces them, so a
-// resend that errors keeps the failure. done is set when nothing is left to
-// send.
+// must not discard a failure an admin still needs to see. It also drops the
+// failed targets of the qualities it is about to resend. done is set when
+// nothing is left to send.
 func (s *Service) planSubmission(ctx context.Context, req Request, actor Viewer, allowed []Quality, certain bool) (submissionPlan, *Request, error) {
 	existing, err := s.store.ListTargets(ctx, req.ID)
 	if err != nil {
@@ -2670,14 +2567,7 @@ func (s *Service) planSubmission(ctx context.Context, req Request, actor Viewer,
 	if certain {
 		for _, t := range existing {
 			if t.Status == StatusFailed && !slices.Contains(allowed, t.Quality) {
-				err := s.store.DeleteTarget(ctx, req.ID, t.ID, claimLease(req))
-				if errors.Is(err, ErrInvalidState) {
-					// This attempt outlived its claim: a newer claim plans the
-					// request now, so leave its targets and status alone (#4184).
-					current, getErr := s.store.GetRequest(ctx, req.ID)
-					return submissionPlan{}, current, getErr
-				}
-				if err != nil && !errors.Is(err, ErrNotFound) {
+				if err := s.store.DeleteTarget(ctx, t.ID); err != nil && !errors.Is(err, ErrNotFound) {
 					return submissionPlan{}, nil, err
 				}
 			}
@@ -2690,9 +2580,8 @@ func (s *Service) planSubmission(ctx context.Context, req Request, actor Viewer,
 	}
 	if len(plan.want) == 0 {
 		// Nothing left to send: let the remaining targets decide the status so
-		// the request does not sit in approved. A request no longer approved,
-		// or claimed again since this attempt, is left as it is.
-		updated, err := s.store.RecomputeStatus(ctx, req.ID, claimLease(req), actor)
+		// the request does not sit in approved.
+		updated, err := s.store.RecomputeStatus(ctx, req.ID, actor)
 		if errors.Is(err, ErrInvalidState) {
 			updated, err = s.store.GetRequest(ctx, req.ID)
 		}
@@ -2700,6 +2589,13 @@ func (s *Service) planSubmission(ctx context.Context, req Request, actor Viewer,
 			return submissionPlan{}, nil, err
 		}
 		return submissionPlan{}, updated, nil
+	}
+	for _, t := range existing {
+		if t.Status == StatusFailed && slices.Contains(plan.want, t.Quality) {
+			if err := s.store.DeleteTarget(ctx, t.ID); err != nil {
+				return submissionPlan{}, nil, err
+			}
+		}
 	}
 	return plan, nil, nil
 }
@@ -2723,7 +2619,6 @@ func (s *Service) recordTargets(ctx context.Context, req Request, actor Viewer, 
 	validStatus := map[Status]bool{StatusQueued: true, StatusDownloading: true, StatusCompleted: true, StatusFailed: true}
 	returned := map[Quality]bool{}
 	var record []Target
-	completion := newCompletionCheck(req, nil)
 	for _, rt := range targets {
 		if !validQuality[rt.Quality] {
 			slog.WarnContext(ctx, "requests: plugin returned unknown quality; skipping", "component", "requests", "request_id", req.ID, "quality", string(rt.Quality))
@@ -2744,10 +2639,6 @@ func (s *Service) recordTargets(ctx context.Context, req Request, actor Viewer, 
 		if status == "" || !validStatus[status] {
 			status = StatusQueued // coerce unknown/empty status to the DB-valid default
 		}
-		// The plugin has already acted, so a completion that does not stand,
-		// or that could not be checked, is recorded as queued rather than
-		// dropped; reconcile completes it once the seasons are in.
-		status = completion.reported(ctx, s, StatusQueued, status)
 		message := rt.Message
 		if status == StatusFailed {
 			message = explainSubmissionFailure(req, message)
@@ -2758,10 +2649,6 @@ func (s *Service) recordTargets(ctx context.Context, req Request, actor Viewer, 
 			ExternalID: rt.ExternalID, ExternalStatus: rt.ExternalStatus, LastError: message,
 			RouteID: decision.RouteID, RouteName: decision.RouteName,
 		})
-	}
-	if completion.err != nil {
-		slog.WarnContext(ctx, "requests: could not check the requested seasons; holding the target", "component", "requests",
-			"request_id", req.ID, "err", completion.err)
 	}
 	for _, q := range plan.want {
 		if returned[q] {
@@ -2985,38 +2872,30 @@ func (s *Service) reconcileRequest(ctx context.Context, req Request, fc *fulfill
 		// no live target (pending, failed, waiting for the library without a
 		// router, or legacy); otherwise let per-target reconcile + aggregate drive
 		// completion.
-		targets, err := s.store.ListTargets(ctx, req.ID)
+		live, err := s.liveTargets(ctx, req.ID)
 		if err != nil {
 			return reconcileUnchanged, err
 		}
-		if !slices.ContainsFunc(targets, isLiveTarget) {
+		if len(live) == 0 {
 			if req.Status == StatusCompleted {
 				return reconcileUnchanged, nil
 			}
-			_, err = s.store.MarkAvailable(ctx, req.ID, Viewer{})
-			switch {
-			case err == nil:
-				return reconcileCompleted, nil
-			case !errors.Is(err, ErrInvalidState):
-				return reconcileUnchanged, err
-			case req.Status != StatusApproved:
-				// Another actor moved it first; a later pass completes it.
-				return reconcileUnchanged, nil
-			}
-			// A retry resending a quality the library can't vouch for is
-			// settled by the submission below. Anything else was refused for
-			// a submission holding the claim; a later pass completes it.
-			if !slices.ContainsFunc(targets, isDeliveredTarget) {
-				return reconcileUnchanged, nil
-			}
-		} else {
-			updated, retired, err := s.retireStalledTargets(ctx, req, targets)
-			if err != nil {
+			if _, err := s.store.MarkAvailable(ctx, req.ID, Viewer{}); err != nil {
+				if errors.Is(err, ErrInvalidState) {
+					// Another actor moved it first, or a submission holds the
+					// claim; a later pass completes it.
+					return reconcileUnchanged, nil
+				}
 				return reconcileUnchanged, err
 			}
-			if retired && updated != nil && updated.Status == StatusCompleted {
-				return reconcileCompleted, nil
-			}
+			return reconcileCompleted, nil
+		}
+		updated, retired, err := s.retireStalledTargets(ctx, req, live)
+		if err != nil {
+			return reconcileUnchanged, err
+		}
+		if retired && updated != nil && updated.Status == StatusCompleted {
+			return reconcileCompleted, nil
 		}
 	}
 
@@ -3047,9 +2926,9 @@ func (s *Service) reconcileRequest(ctx context.Context, req Request, fc *fulfill
 		return reconcileUnchanged, nil
 	}
 	statuses, checkErr := s.checkTargetStatuses(ctx, req, targets, fc)
-	change, err := s.applyTargetStatuses(ctx, newCompletionCheck(req, &present), targets, statuses)
+	change, err := s.applyTargetStatuses(ctx, targets, statuses)
 	if err != nil {
-		return reconcileUnchanged, errors.Join(err, checkErr)
+		return reconcileUnchanged, err
 	}
 	return change, checkErr
 }
@@ -3061,12 +2940,8 @@ func (s *Service) reconcileRequest(ctx context.Context, req Request, fc *fulfill
 // idle target costs no write per pass. A target with progress that got no
 // status back (its server was skipped or failed, or the call did) keeps it
 // until it goes stale; see settleUnansweredDownload. Both reconcile and the
-// download refresh pass apply statuses here. A completion the plugin reports
-// for a season request stands only once the requested seasons are in the
-// library (see completionCheck); until then the target keeps its status and
-// only the raw status is written. When the library cannot be read, the other
-// statuses are still applied and the error is returned afterwards.
-func (s *Service) applyTargetStatuses(ctx context.Context, check *completionCheck, targets []Target, statuses []RouterTargetStatus) (reconcileChange, error) {
+// download refresh pass apply statuses here.
+func (s *Service) applyTargetStatuses(ctx context.Context, targets []Target, statuses []RouterTargetStatus) (reconcileChange, error) {
 	change := reconcileUnchanged
 	answered := make([]bool, len(targets))
 	for _, st := range statuses {
@@ -3083,17 +2958,23 @@ func (s *Service) applyTargetStatuses(ctx context.Context, check *completionChec
 			continue
 		}
 		status := target.Status
-		if newStatus := check.reported(ctx, s, target.Status, st.Status); newStatus != "" && newStatus != target.Status {
-			_, err := s.store.UpdateTargetStatus(ctx, target.ID, newStatus, "", st.ExternalStatus, st.Message, Viewer{})
-			if errors.Is(err, ErrInvalidState) {
-				// Another pass finished the target since it was read.
-				continue
-			}
-			if err != nil {
+		if newStatus := st.Status; newStatus != "" && newStatus != target.Status {
+			if _, err := s.store.UpdateTargetStatus(ctx, target.ID, newStatus, "", st.ExternalStatus, st.Message, Viewer{}); err != nil {
 				return reconcileUnchanged, err
 			}
 			status = newStatus
-			change = mergeReconcileChange(change, newStatus)
+			switch newStatus {
+			case StatusCompleted:
+				change = reconcileCompleted
+			case StatusDownloading:
+				if change == reconcileUnchanged {
+					change = reconcileDownloading
+				}
+			case StatusFailed:
+				if change == reconcileUnchanged {
+					change = reconcileFailed
+				}
+			}
 		} else if st.ExternalStatus != "" && st.ExternalStatus != target.ExternalStatus {
 			// The server's own state moved without changing the target's
 			// status (say, a download went from importing to stalled). Keep
@@ -3116,23 +2997,7 @@ func (s *Service) applyTargetStatuses(ctx context.Context, check *completionChec
 			return reconcileUnchanged, err
 		}
 	}
-	return change, check.err
-}
-
-// mergeReconcileChange folds a target's new status into a pass's change: a
-// completion wins, and otherwise the first change seen stands.
-func mergeReconcileChange(change reconcileChange, status Status) reconcileChange {
-	switch {
-	case status == StatusCompleted:
-		return reconcileCompleted
-	case change != reconcileUnchanged:
-		return change
-	case status == StatusDownloading:
-		return reconcileDownloading
-	case status == StatusFailed:
-		return reconcileFailed
-	}
-	return change
+	return change, nil
 }
 
 // checkTargetStatuses asks each live target's plugin for its status. Targets
@@ -3270,49 +3135,20 @@ func integrationByID(fc *fulfillContext, id string) *Integration {
 	return nil
 }
 
-// settleUnsendableRetry settles a claimed retry that no router can send when
-// every quality it still wants has arrived, as a submission with nothing left
-// to send does: failed tiers it no longer wants are dropped and its targets
-// decide its status. It returns nil while a wanted tier is missing or the
-// wanted qualities are unknown, and then keeps the failed targets, since
-// nothing is sent in their place.
-func (s *Service) settleUnsendableRetry(ctx context.Context, claimed Request, actor Viewer, fc *fulfillContext) (*Request, error) {
-	allowed, resolved := s.allowedQualities(ctx, claimed, fc.settings)
-	if !resolved {
-		return nil, nil
-	}
-	targets, err := s.store.ListTargets(ctx, claimed.ID)
+// liveTargets returns the request's non-terminal (queued or downloading)
+// fulfillment targets.
+func (s *Service) liveTargets(ctx context.Context, requestID string) ([]Target, error) {
+	targets, err := s.store.ListTargets(ctx, requestID)
 	if err != nil {
 		return nil, err
 	}
-	for _, q := range allowed {
-		if !slices.ContainsFunc(targets, func(t Target) bool { return t.Quality == q && t.Status != StatusFailed }) {
-			return nil, nil
+	var live []Target
+	for _, t := range targets {
+		if t.Status == StatusQueued || t.Status == StatusDownloading {
+			live = append(live, t)
 		}
 	}
-	_, done, err := s.planSubmission(ctx, claimed, actor, allowed, true)
-	return done, err
-}
-
-// deliveredSome reports whether any of the request's targets completed. An
-// approved request that delivered a quality is a retry resending the rest.
-func (s *Service) deliveredSome(ctx context.Context, requestID string) (bool, error) {
-	targets, err := s.store.ListTargets(ctx, requestID)
-	if err != nil {
-		return false, err
-	}
-	return slices.ContainsFunc(targets, isDeliveredTarget), nil
-}
-
-// isLiveTarget reports whether a fulfillment target is still in flight
-// (queued or downloading).
-func isLiveTarget(t Target) bool {
-	return t.Status == StatusQueued || t.Status == StatusDownloading
-}
-
-// isDeliveredTarget reports whether a fulfillment target completed.
-func isDeliveredTarget(t Target) bool {
-	return t.Status == StatusCompleted
+	return live, nil
 }
 
 // stalledTargetHorizon is how long a queued target may go without a single
@@ -3321,14 +3157,6 @@ func isDeliveredTarget(t Target) bool {
 // real status change, so a target older than this has had many chances to move
 // and has not.
 const stalledTargetHorizon = 24 * time.Hour
-
-// stalledDownloadHorizon is the same horizon for a downloading target. A
-// router that says a download is under way is a stronger sign of work in
-// flight than one that says queued, so presence waits longer before it
-// overrules it. A router can still report downloading for good: Seerr keeps a
-// movie in PROCESSING when its own availability check never runs, even after
-// the file is imported.
-const stalledDownloadHorizon = 72 * time.Hour
 
 // ExternalStatusPresenceConfirmed marks a target closed out by the presence
 // backstop rather than by a router-reported completion. Exported so clients can
@@ -3342,47 +3170,20 @@ const ExternalStatusPresenceConfirmed = "presence_confirmed"
 // item — pins the request open permanently even though the media is sitting in
 // the library.
 //
-// A queued target is closed out once it has gone stalledTargetHorizon without
-// a status change. A downloading target can be stuck the same way (see
-// stalledDownloadHorizon), but it may also be a real download that the
-// quality-agnostic presence check must not orphan, so it is closed out only
-// when all of these hold (see downloadRetirable):
-//   - it has gone stalledDownloadHorizon without a status change;
-//   - it has no download progress on record, which only a plugin that
-//     reports progress keeps, and which an unanswered check clears;
-//   - the request is for a movie or for named seasons, never a whole series,
-//     whose presence any one episode satisfies (present already requires every
-//     requested season to be complete);
-//   - every other target of the request is at its quality, failed, or
-//     itself closed out by presence, since presence cannot tell a 1080p copy
-//     from a 2160p one.
-//
-// targets is every target of req. The request status follows from the usual
-// target aggregate. It returns the request as of the last retirement, if any.
-func (s *Service) retireStalledTargets(ctx context.Context, req Request, targets []Target) (*Request, bool, error) {
-	now := s.now()
-	queuedCutoff := now.Add(-stalledTargetHorizon)
-	downloadCutoff := now.Add(-stalledDownloadHorizon)
+// Targets that are actively downloading are never retired: those are exactly
+// the in-flight downloads the quality-agnostic presence check must not orphan.
+// Only targets stuck in queued past the horizon are closed out, and the request
+// status follows from the usual target aggregate. It returns the request as of
+// the last retirement, if any.
+func (s *Service) retireStalledTargets(ctx context.Context, req Request, live []Target) (*Request, bool, error) {
+	cutoff := s.now().Add(-stalledTargetHorizon)
 	var updated *Request
 	retired := false
-	for _, t := range targets {
-		switch t.Status {
-		case StatusQueued:
-			if t.UpdatedAt.After(queuedCutoff) {
-				continue
-			}
-		case StatusDownloading:
-			if !downloadRetirable(req, t, targets, downloadCutoff) {
-				continue
-			}
-		default:
+	for _, t := range live {
+		if t.Status != StatusQueued || t.UpdatedAt.After(cutoff) {
 			continue
 		}
 		next, err := s.store.UpdateTargetStatus(ctx, t.ID, StatusCompleted, "", ExternalStatusPresenceConfirmed, "", Viewer{})
-		if errors.Is(err, ErrInvalidState) {
-			// Another pass finished the target since it was read.
-			continue
-		}
 		if err != nil {
 			return updated, retired, err
 		}
@@ -3396,34 +3197,10 @@ func (s *Service) retireStalledTargets(ctx context.Context, req Request, targets
 			"integration_kind", t.IntegrationKind,
 			"external_id", t.ExternalID,
 			"external_status", t.ExternalStatus,
-			"target_status", t.Status,
 			"target_updated_at", t.UpdatedAt,
 		)
 	}
 	return updated, retired, nil
-}
-
-// downloadRetirable reports whether presence may close out a downloading
-// target t of req, whose targets are all, once it has gone without a status
-// change since cutoff; see retireStalledTargets.
-func downloadRetirable(req Request, t Target, all []Target, cutoff time.Time) bool {
-	if t.UpdatedAt.After(cutoff) || t.Download != nil {
-		return false
-	}
-	if req.MediaType != MediaTypeMovie && !isSeasonRequest(req) {
-		return false
-	}
-	for _, other := range all {
-		// A failed target fetched nothing, so the file is not its own. A
-		// quality no server could take is recorded as one (recordTargets).
-		// A target this backstop completed proved no file of its own either:
-		// presence closed it out on the title alone.
-		if other.Quality == t.Quality || other.Status == StatusFailed || other.ExternalStatus == ExternalStatusPresenceConfirmed {
-			continue
-		}
-		return false
-	}
-	return true
 }
 
 func (s *Service) now() time.Time {
@@ -3604,4 +3381,22 @@ func availabilityValue(available bool) Availability {
 		return AvailabilityAvailable
 	}
 	return AvailabilityMissing
+}
+
+var discoverySectionOrder = []string{
+	"trending_movies",
+	"trending_series",
+	"popular_movies",
+	"popular_series",
+	"upcoming_movies",
+	"on_air_series",
+}
+
+var discoverySectionTitles = map[string]string{
+	"trending_movies": "Trending Movies",
+	"trending_series": "Trending Series",
+	"popular_movies":  "Popular Movies",
+	"popular_series":  "Popular Series",
+	"upcoming_movies": "Upcoming Movies",
+	"on_air_series":   "On Air Series",
 }

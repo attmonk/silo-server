@@ -8,21 +8,20 @@ import MachineTranslatedLabel from "@/pages/ItemDetail/components/MachineTransla
 import { hasMachineTranslation } from "@/pages/ItemDetail/components/machineTranslation";
 import { decodeThumbhash } from "@/lib/thumbhash";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
-import { useT, type Translate } from "@/i18n";
 import type { ItemMemberState, MemberWatchState } from "@/api/v2/watchTogetherMemberState";
 import type { WatchTogetherRoomMember } from "@/lib/watchTogether";
 import { MemberAvatar } from "../MemberAvatar";
 import { memberKey, memberTints } from "../members";
 import type { PickerCard } from "./PickerRow";
 
-function stateLabel(state: MemberWatchState | undefined, t: Translate) {
-  if (!state || state.state === "unseen") return t("web.watchTogether.movie.notSeen");
-  if (state.state === "watched") return t("watchParty.whoSeen.watched");
+function stateLabel(state: MemberWatchState | undefined) {
+  if (!state || state.state === "unseen") return "Hasn't seen it";
+  if (state.state === "watched") return "Watched";
   if (state.position_seconds !== undefined && state.duration_seconds) {
     const pct = Math.round((state.position_seconds / state.duration_seconds) * 100);
-    return t("web.watchTogether.movie.percentIn", { percent: pct });
+    return `${pct}% in`;
   }
-  return t("watchParty.whoSeen.inProgress");
+  return "In progress";
 }
 
 /**
@@ -39,7 +38,6 @@ export function MemberWatchList({
   state: ItemMemberState | undefined;
   loading: boolean;
 }) {
-  const t = useT();
   const tints = memberTints(members);
   const byMember = new Map(state?.members.map((s) => [`${s.user_id}:${s.profile_id}`, s]) ?? []);
   const seen = members.filter((m) => byMember.get(memberKey(m))?.state === "watched").length;
@@ -51,23 +49,17 @@ export function MemberWatchList({
     <section className="flex flex-col gap-2">
       <div className="flex items-baseline justify-between">
         <h4 className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">
-          {t("watchParty.whoSeen.title")}
+          Who's seen it
         </h4>
         {!loading && members.length > 0 ? (
           <span className="text-muted-foreground text-[11px]">
             {started === 0
-              ? t("web.watchTogether.movie.newForEveryone")
+              ? "new for everyone"
               : seen === members.length
-                ? t("web.watchTogether.movie.rewatchForEveryone")
+                ? "a rewatch for everyone"
                 : seen === 0
-                  ? t("web.watchTogether.movie.startedOf", {
-                      started: started,
-                      total: members.length,
-                    })
-                  : t("web.watchTogether.movie.seenOf", {
-                      seen: seen,
-                      total: members.length,
-                    })}
+                  ? `${started} of ${members.length} started`
+                  : `${seen} of ${members.length}`}
           </span>
         ) : null}
       </div>
@@ -84,12 +76,9 @@ export function MemberWatchList({
               ) : (
                 <span className="text-muted-foreground flex items-center gap-1.5 text-xs">
                   {s?.on_watchlist ? (
-                    <Bookmark
-                      className="size-3"
-                      aria-label={t("web.watchTogether.movie.onWatchlist")}
-                    />
+                    <Bookmark className="size-3" aria-label="On their watchlist" />
                   ) : null}
-                  {stateLabel(s, t)}
+                  {stateLabel(s)}
                 </span>
               )}
             </li>
@@ -126,7 +115,6 @@ export function MovieDetailPanel({
   onConfirm: () => void;
   onClose: () => void;
 }) {
-  const t = useT();
   const detail = useCatalogItemDetail(card.content_id, card.library_id);
   const item = detail.data;
   const [backdropLoaded, setBackdropLoaded] = useState(false);
@@ -178,7 +166,7 @@ export function MovieDetailPanel({
           </div>
           <div className="min-w-0 flex-1 pb-0.5">
             <p className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">
-              {t("web.watchTogether.movie.eyebrow")}
+              Candidate
             </p>
             <h3 className="line-clamp-2 text-base leading-tight font-semibold">{card.title}</h3>
             {meta.length > 0 ? (
@@ -198,8 +186,8 @@ export function MovieDetailPanel({
           variant="ghost"
           size="icon-sm"
           onClick={onClose}
-          aria-label={t("web.watchTogether.movie.close")}
-          className="absolute end-2 top-2 bg-black/30 hover:bg-black/50"
+          aria-label="Close details"
+          className="absolute top-2 right-2 bg-black/30 hover:bg-black/50"
         >
           <X className="size-4" />
         </Button>
@@ -222,7 +210,7 @@ export function MovieDetailPanel({
           <p className="text-muted-foreground text-xs italic">
             {item.tagline}
             {hasMachineTranslation(item.machine_translated_fields, "tagline") && (
-              <MachineTranslatedLabel compact className="ms-1.5 align-middle not-italic" />
+              <MachineTranslatedLabel compact className="ml-1.5 align-middle not-italic" />
             )}
           </p>
         ) : null}
@@ -247,15 +235,13 @@ export function MovieDetailPanel({
 
       <div className="border-border/60 flex shrink-0 flex-wrap items-center justify-end gap-2 border-t px-4 py-3">
         {replaces ? (
-          <span className="text-muted-foreground me-auto text-xs">
-            {t("web.watchTogether.common.replaces", { title: replaces })}
-          </span>
+          <span className="text-muted-foreground mr-auto text-xs">Replaces {replaces}</span>
         ) : null}
         <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
-          {t("common.cancel")}
+          Cancel
         </Button>
         <Button type="button" onClick={onConfirm} disabled={busy}>
-          {busy ? t("web.watchTogether.common.working") : actionLabel}
+          {busy ? "Working…" : actionLabel}
         </Button>
       </div>
     </div>

@@ -1,6 +1,4 @@
 import type { components } from "@/api/v2/schema";
-import { t, type MessageKey } from "@/i18n";
-import { collectionRefsOf } from "@/lib/homeRows/collectionList";
 import { FILTER_SECTION_TYPES } from "@/lib/sectionTypes";
 
 // Home layout export and import: a profile's saved section overrides for the
@@ -149,26 +147,26 @@ function sanitizeOverride(raw: unknown): SectionOverrideWrite | null {
 /** Parses and validates the text of an export file. */
 export function parseHomeLayoutFile(text: string): HomeLayoutParseResult {
   if (text.length > HOME_LAYOUT_MAX_LENGTH) {
-    return { ok: false, error: t("web.home.layout.tooLarge") };
+    return { ok: false, error: "This file is too large to be a home layout export." };
   }
   let data: unknown;
   try {
     data = JSON.parse(text);
   } catch {
-    return { ok: false, error: t("web.home.layout.transfer.invalidJson") };
+    return { ok: false, error: "This isn't valid JSON." };
   }
   if (!isRecord(data) || data.format !== HOME_LAYOUT_FORMAT) {
-    return { ok: false, error: t("web.home.layout.transfer.notExport") };
+    return { ok: false, error: "This isn't a Silo home layout export." };
   }
   if (typeof data.version === "number" && data.version > HOME_LAYOUT_VERSION) {
-    return { ok: false, error: t("web.home.layout.transfer.newerVersion") };
+    return { ok: false, error: "This export comes from a newer version of Silo." };
   }
   if (
     data.version !== HOME_LAYOUT_VERSION ||
     typeof data.server_id !== "string" ||
     !Array.isArray(data.pages)
   ) {
-    return { ok: false, error: t("web.home.layout.transfer.damaged") };
+    return { ok: false, error: "This home layout export is incomplete or damaged." };
   }
 
   const libraries: HomeLayoutLibrary[] = [];
@@ -236,11 +234,7 @@ export function fileReferences(file: HomeLayoutFile): HomeLayoutReferences {
     for (const override of page.overrides) {
       for (const config of [override.config, override.user_config]) {
         if (!config) continue;
-        if (
-          nonEmptyString(config.user_collection_id) ||
-          collectionRefsOf(config).some((ref) => ref.source === "user")
-        )
-          refs.personalCollections = true;
+        if (nonEmptyString(config.user_collection_id)) refs.personalCollections = true;
         if (nonEmptyString(config.profile_id)) refs.profiles = true;
       }
     }
@@ -255,12 +249,12 @@ export type HomeLayoutSkipReason =
   | "collection"
   | "profile";
 
-export const HOME_LAYOUT_SKIP_REASON_LABELS: Record<HomeLayoutSkipReason, MessageKey> = {
-  unknown_recipe: "web.home.layout.transfer.skip.unknownRecipe",
-  custom_disabled: "web.home.layout.transfer.skip.customDisabled",
-  library: "web.home.layout.transfer.skip.library",
-  collection: "web.home.layout.transfer.skip.collection",
-  profile: "web.home.layout.transfer.skip.profile",
+export const HOME_LAYOUT_SKIP_REASON_LABELS: Record<HomeLayoutSkipReason, string> = {
+  unknown_recipe: "This server doesn't offer this section type",
+  custom_disabled: "Only an admin can add this kind of row",
+  library: "Uses a library this profile doesn't have here",
+  collection: "Uses a collection this profile can't see here",
+  profile: "Follows a profile outside this account",
 };
 
 export interface HomeLayoutImportTarget {
@@ -399,11 +393,7 @@ function sectionSkipReason(
 
   const config = effectiveConfig(override);
   if (sameServer) return sameServerReferenceProblem(config, target, libraries);
-  if (
-    nonEmptyString(config.library_collection_id) ||
-    nonEmptyString(config.user_collection_id) ||
-    collectionRefsOf(config).length > 0
-  ) {
+  if (nonEmptyString(config.library_collection_id) || nonEmptyString(config.user_collection_id)) {
     return "collection";
   }
   if (nonEmptyString(config.profile_id)) return "profile";
@@ -428,15 +418,6 @@ function sameServerReferenceProblem(
   if (
     nonEmptyString(config.user_collection_id) &&
     !target.personalCollectionIds.has(config.user_collection_id)
-  ) {
-    return "collection";
-  }
-  // A row of collections, like a collection row, needs every personal
-  // collection it lists to be one the profile sees.
-  if (
-    collectionRefsOf(config).some(
-      (ref) => ref.source === "user" && !target.personalCollectionIds.has(ref.id),
-    )
   ) {
     return "collection";
   }
@@ -479,7 +460,7 @@ function sectionTitle(override: SectionOverrideWrite): string {
     override.title ||
     override.user_section_type ||
     override.section_type ||
-    t("web.home.layout.transfer.untitledSection")
+    "Untitled section"
   );
 }
 
@@ -508,11 +489,9 @@ export function planHomeLayoutImport(
 
   for (const page of file.pages) {
     let planned: HomeLayoutPlannedPage;
-    let sourceLabel = t("web.home.rows.pages.home");
+    let sourceLabel = "Home";
     if (page.scope === "library") {
-      sourceLabel =
-        exportedLibraryNames.get(page.library_id!) ??
-        t("web.home.layout.transfer.libraryFallback", { id: String(page.library_id) });
+      sourceLabel = exportedLibraryNames.get(page.library_id!) ?? `Library ${page.library_id}`;
       const library = libraries.get(page.library_id!);
       if (!library) {
         plan.skippedPages.push(sourceLabel);
@@ -520,7 +499,7 @@ export function planHomeLayoutImport(
       }
       planned = { scope: "library", libraryId: library.id, label: library.name, overrides: [] };
     } else {
-      planned = { scope: "home", label: t("web.home.rows.pages.home"), overrides: [] };
+      planned = { scope: "home", label: "Home", overrides: [] };
     }
 
     for (const override of page.overrides) {
@@ -657,7 +636,7 @@ export async function importPage(
   const overrides = mergeImportedPage(page, await api.listSaved(), sameServer, newId);
   if (overrides.length > HOME_LAYOUT_MAX_PAGE_OVERRIDES) {
     throw new Error(
-      t("web.home.layout.transfer.pageTooLarge", { max: HOME_LAYOUT_MAX_PAGE_OVERRIDES }),
+      `this page would have more than ${HOME_LAYOUT_MAX_PAGE_OVERRIDES} saved section changes`,
     );
   }
   await api.save(overrides);

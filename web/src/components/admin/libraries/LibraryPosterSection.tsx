@@ -4,14 +4,9 @@ import { ImageIcon, Trash2 } from "lucide-react";
 import type { Library } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { useT } from "@/i18n";
 import { useDeleteLibraryPoster, useUploadLibraryPoster } from "@/hooks/queries/admin/libraries";
 
-// Shown on the upload button while a poster uploads.
-const UPLOADING = "...";
-
 export function LibraryPosterSection({ library }: { library: Library }) {
-  const t = useT();
   const uploadMutation = useUploadLibraryPoster();
   const deleteMutation = useDeleteLibraryPoster();
   const fileInputId = `poster-upload-${library.id}`;
@@ -25,12 +20,12 @@ export function LibraryPosterSection({ library }: { library: Library }) {
 
   return (
     <div className="space-y-1.5">
-      <Label>{t("web.admin.common.libraryEditor.poster.label")}</Label>
-      <div className="flex flex-wrap items-center gap-2">
+      <Label>Poster</Label>
+      <div className="flex items-center gap-2">
         {library.poster_url ? (
           <img
             src={library.poster_url}
-            alt={t("web.admin.common.libraryEditor.poster.alt", { name: library.name })}
+            alt={`${library.name} poster`}
             className="border-border h-14 flex-shrink-0 rounded border object-cover"
             style={{ aspectRatio: "16/9" }}
           />
@@ -53,26 +48,21 @@ export function LibraryPosterSection({ library }: { library: Library }) {
           type="button"
           variant="outline"
           size="sm"
-          className="h-11 text-xs sm:h-8"
+          className="h-8 text-xs"
           onClick={() => document.getElementById(fileInputId)?.click()}
           disabled={uploadMutation.isPending}
         >
-          {uploadMutation.isPending
-            ? UPLOADING
-            : library.poster_url
-              ? t("web.admin.common.libraryEditor.poster.replace")
-              : t("web.admin.common.libraryEditor.poster.upload")}
+          {uploadMutation.isPending ? "..." : library.poster_url ? "Replace" : "Upload"}
         </Button>
         {library.poster_url && (
           <Button
             type="button"
             variant="ghost"
             size="icon"
-            className="text-muted-foreground hover:text-destructive size-11 sm:size-8"
+            className="text-muted-foreground hover:text-destructive h-8 w-8"
             onClick={() => deleteMutation.mutate(library.id)}
             disabled={deleteMutation.isPending}
-            title={t("web.admin.common.libraryEditor.poster.remove")}
-            aria-label={t("web.admin.common.libraryEditor.poster.remove")}
+            title="Remove poster"
           >
             <Trash2 className="h-3 w-3" />
           </Button>

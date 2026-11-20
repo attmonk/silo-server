@@ -1,26 +1,23 @@
 import type { AutoscanPathRewrite, AutoscanWebhookProvider, Library } from "@/api/types";
-import type { MessageKey } from "@/i18n";
 
 /**
  * The arr notification triggers Silo actually consumes.
  *
  * Kept in sync with internal/autoscan/arrwebhook/parse.go: importEventTypes
- * ("Download"/"Import"/"Upgrade"/"DownloadComplete"), the "Rename" event,
- * deleteEventTypes ("EpisodeFileDelete"/"MovieFileDelete"), and
- * folderDeleteEventTypes ("SeriesDelete"/"MovieDelete"). Anything the host
+ * ("Download"/"Import"/"Upgrade"/"DownloadComplete"), the "Rename" event, and
+ * deleteEventTypes ("EpisodeFileDelete"/"MovieFileDelete"). Anything the host
  * ignores is deliberately absent — telling an operator to tick a box that does
  * nothing is how "I followed the steps and it didn't work" starts.
  *
  * Labels are the checkbox captions as they appear in Sonarr/Radarr's Connect →
  * Webhook screen (Sonarr v4, Radarr v5 and later), so they can be matched by
- * eye; they stay in English because the arr shows them in English. Reasons
- * are Silo's own text and are message ids, formatted when shown.
+ * eye without translation.
  */
 export interface WebhookTrigger {
   /** Caption in the arr UI. */
   label: string;
   /** Why Silo wants it, shown as helper text. */
-  reason: MessageKey;
+  reason: string;
   /** False for triggers that are useful but not needed for the basic case. */
   required: boolean;
 }
@@ -28,17 +25,17 @@ export interface WebhookTrigger {
 const SHARED_TRIGGERS: WebhookTrigger[] = [
   {
     label: "On File Import",
-    reason: "web.admin.autoscan.webhook.trigger.fileImport",
+    reason: "The main one — fires when a download finishes and is moved into your library.",
     required: true,
   },
   {
     label: "On File Upgrade",
-    reason: "web.admin.autoscan.webhook.trigger.fileUpgrade",
+    reason: "Fires when an existing file is replaced by a better quality version.",
     required: true,
   },
   {
     label: "On Rename",
-    reason: "web.admin.autoscan.webhook.trigger.rename",
+    reason: "Fires when files are renamed, so Silo does not lose track of them.",
     required: false,
   },
 ];
@@ -47,12 +44,7 @@ const SONARR_TRIGGERS: WebhookTrigger[] = [
   ...SHARED_TRIGGERS,
   {
     label: "On Episode File Delete",
-    reason: "web.admin.autoscan.webhook.trigger.episodeFileDelete",
-    required: false,
-  },
-  {
-    label: "On Series Delete",
-    reason: "web.admin.autoscan.webhook.trigger.seriesDelete",
+    reason: "Lets Silo drop episodes you removed, instead of leaving dead entries.",
     required: false,
   },
 ];
@@ -61,12 +53,7 @@ const RADARR_TRIGGERS: WebhookTrigger[] = [
   ...SHARED_TRIGGERS,
   {
     label: "On Movie File Delete",
-    reason: "web.admin.autoscan.webhook.trigger.movieFileDelete",
-    required: false,
-  },
-  {
-    label: "On Movie Delete",
-    reason: "web.admin.autoscan.webhook.trigger.movieDelete",
+    reason: "Lets Silo drop movies you removed, instead of leaving dead entries.",
     required: false,
   },
 ];
@@ -82,12 +69,7 @@ export function triggersFor(provider: AutoscanWebhookProvider | "auto"): Webhook
     ...SHARED_TRIGGERS,
     {
       label: "On Episode File Delete / On Movie File Delete",
-      reason: "web.admin.autoscan.webhook.trigger.anyFileDelete",
-      required: false,
-    },
-    {
-      label: "On Series Delete / On Movie Delete",
-      reason: "web.admin.autoscan.webhook.trigger.anyTitleDelete",
+      reason: "Whichever your service offers — lets Silo drop files you removed.",
       required: false,
     },
   ];

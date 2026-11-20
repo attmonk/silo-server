@@ -2,8 +2,6 @@ package abs
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -83,13 +81,7 @@ func (h *Handler) handlePlayStart(w http.ResponseWriter, r *http.Request) {
 	// that handleFileStream can reverse without a database lookup.
 	baseURL := h.absBaseURL(r)
 	sessionID := ulid.Make().String()
-	// The body is optional; Audiobookshelf clients send their deviceInfo in
-	// it, which names the client in the admin session views.
-	var body struct {
-		DeviceInfo absDeviceInfo `json:"deviceInfo"`
-	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body)
-	if nativeSession, err := h.startNativePlaybackSession(r, a, files, currentTime, body.DeviceInfo); err != nil {
+	if nativeSession, err := h.startNativePlaybackSession(r, a, files, currentTime); err != nil {
 		writeNativePlaybackStartError(w, err)
 		return
 	} else if nativeSession != nil {

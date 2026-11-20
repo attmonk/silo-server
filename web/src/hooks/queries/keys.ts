@@ -49,8 +49,6 @@ export const itemKeys = {
   details: () => ["items", "detail"] as const,
   detail: (id: string, libraryId?: number) =>
     ["items", "detail", id, libraryId ?? "default"] as const,
-  matchHints: (id: string, libraryId?: number) =>
-    ["items", "matchHints", id, libraryId ?? "default"] as const,
   watchDetail: (id: string, fileId?: number, libraryId?: number) =>
     ["items", "watchDetail", id, fileId ?? "default", libraryId ?? "default"] as const,
   watchTrickplay: (id: string, fileId: number) => ["items", "watchTrickplay", id, fileId] as const,
@@ -67,9 +65,6 @@ export const catalogKeys = {
   allLetters: ["catalog", "letters"] as const,
   letters: (params: Pick<CatalogParams, "library_id" | "type" | "query_fingerprint">) =>
     ["catalog", "letters", params] as const,
-  allCounts: ["catalog", "count"] as const,
-  count: (params: Pick<CatalogParams, "library_id" | "type" | "query_fingerprint">) =>
-    ["catalog", "count", params] as const,
   itemDetail: (id: string, libraryId?: number) =>
     ["catalog", "items", id, "detail", libraryId ?? "default"] as const,
   itemVersions: (id: string) => ["catalog", "items", id, "versions"] as const,
@@ -179,14 +174,6 @@ export const libraryCollectionKeys = {
     ["libraryCollections", "userContributed", libraryId] as const,
 };
 
-// The titles that name pinned collections, kept outside libraryCollectionKeys.all:
-// personal-collection writes and media changes invalidate that root, and
-// neither renames a library collection.
-export const libraryCollectionTitleKeys = {
-  all: ["libraryCollectionTitles"] as const,
-  library: (libraryId: number) => ["libraryCollectionTitles", libraryId] as const,
-};
-
 export const profileKeys = {
   all: ["profiles"] as const,
   list: () => ["profiles", "list"] as const,
@@ -263,17 +250,13 @@ export const settingsKeys = {
 export const notificationKeys = {
   all: ["notifications"] as const,
   list: (status: "all" | "unread" = "all") => ["notifications", "list", status] as const,
-  /** Every notified-series list; prefix of each status's key. */
-  seriesAll: () => ["notifications", "series"] as const,
-  series: (status: string) => ["notifications", "series", status] as const,
+  series: (status: "active" | "inactive") => ["notifications", "series", status] as const,
   unreadCount: () => ["notifications", "unread-count"] as const,
   preferences: () => ["notifications", "preferences"] as const,
   emailPreferences: () => ["notifications", "email-preferences"] as const,
   discordPreferences: () => ["notifications", "discord-preferences"] as const,
   capability: () => ["notifications", "capability"] as const,
   webhooks: () => ["notifications", "webhooks"] as const,
-  pluginChannels: () => ["notifications", "plugin-channels"] as const,
-  pluginDestinations: () => ["notifications", "plugin-destinations"] as const,
   webPushSubscriptions: () => ["notifications", "web-push-subscriptions"] as const,
 };
 
@@ -423,13 +406,10 @@ export const adminKeys = {
   libraryProviderDefaults: (libraryType: string) =>
     ["admin", "libraries", "provider-defaults", libraryType] as const,
   nodes: () => ["admin", "nodes"] as const,
-  // Outside "nodes": every node write refreshes the list, not what the build supports.
-  nodeCapabilities: () => ["admin", "nodeCapabilities"] as const,
   stats: () => ["admin", "stats"] as const,
   sessions: () => ["admin", "sessions"] as const,
   downloadPreparations: () => ["admin", "downloadPreparations"] as const,
   downloadStorage: () => ["admin", "downloadStorage"] as const,
-  backups: () => ["admin", "backups"] as const,
   serverSettings: () => ["admin", "serverSettings"] as const,
   serverStatus: () => ["admin", "serverStatus"] as const,
   dashboardLayout: () => ["admin", "dashboard", "layout"] as const,
@@ -444,10 +424,6 @@ export const adminKeys = {
   topActivity: (days: number) => ["admin", "dashboard", "top-activity", days] as const,
   downloadsStatsRoot: () => ["admin", "dashboard", "downloads-stats"] as const,
   downloadsStats: (limit: number) => ["admin", "dashboard", "downloads-stats", limit] as const,
-  apiClientsRoot: () => ["admin", "dashboard", "api-clients"] as const,
-  apiClients: (hours: number) => ["admin", "dashboard", "api-clients", hours] as const,
-  apiClientEndpoints: (sessionId: string, hours: number) =>
-    ["admin", "dashboard", "api-clients", "endpoints", sessionId, hours] as const,
   restartKeys: () => ["admin", "restartKeys"] as const,
   catalogSearchStatus: () => ["admin", "catalogSearchStatus"] as const,
   jellyfinCompatStatus: () => ["admin", "jellyfinCompatStatus"] as const,
@@ -482,12 +458,6 @@ export const adminKeys = {
   requestRouteTitles: (mediaType: string, q: string) =>
     ["admin", "requestRouteTitles", mediaType, q] as const,
   requestIntegrationOptionsRoot: () => ["admin", "requestIntegrationOptions"] as const,
-  // The Discover layout sits outside requestsRoot: a request or settings write
-  // changes nothing it holds.
-  requestDiscoverLayout: () => ["admin", "requestDiscover", "layout"] as const,
-  requestDiscoverPreview: (row: unknown) => ["admin", "requestDiscover", "preview", row] as const,
-  requestWatchProviders: (mediaType: string, region: string) =>
-    ["admin", "requestDiscover", "watchProviders", mediaType, region] as const,
   requestIntegrationOptions: (integrationId: string) =>
     ["admin", "requestIntegrationOptions", integrationId] as const,
   requestUserLimit: (userId: number) => ["admin", "requests", "users", userId, "limit"] as const,

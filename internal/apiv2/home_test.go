@@ -10,7 +10,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/sections"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/sections/recipes"
 )
 
@@ -119,21 +119,9 @@ func (f *fakeHome) HomeSectionItems(_ context.Context, sectionID string, viewer 
 	f.lastViewer = viewer
 	switch sectionID {
 	case "continue_watching":
-		row := handlers.SectionView{ID: sectionID, SectionType: "continue_watching", Title: "Continue Watching", ItemLimit: 20, TotalCount: 1, Items: []handlers.SectionItemView{fakeCard()}}
-		if viewer.ItemLimitCap > 0 {
-			// A capped read of a row that holds one card more.
-			row.ItemLimit, row.TotalCount, row.HasMore = min(row.ItemLimit, viewer.ItemLimitCap), 2, true
-		}
-		return row, nil
+		return handlers.SectionView{ID: sectionID, SectionType: "continue_watching", Title: "Continue Watching", ItemLimit: 20, TotalCount: 1, Items: []handlers.SectionItemView{fakeCard()}}, nil
 	case "next_up":
 		return handlers.SectionView{ID: sectionID, SectionType: "next_up", Title: "Next Up", ItemLimit: 20, TotalCount: 1, Customized: true, Items: []handlers.SectionItemView{fakeCard()}}, nil
-	case "franchises":
-		library, creator := 1, "p-owner"
-		return handlers.SectionView{ID: sectionID, SectionType: "collection_posters", Title: "Franchises", ItemLimit: 20, TotalCount: 2, Items: []handlers.SectionItemView{},
-			Collections: []sections.CollectionCard{
-				{ID: "01J9Z8C3W4R5T6Y7U8I9O0P1Q2", Source: sections.CollectionCardLibrary, Title: "Marvel", PosterURL: "https://s3.example.test/marvel.jpg", BackdropURL: "https://s3.example.test/marvel-backdrop.jpg", BackdropThumbhash: "3OcRJYB4d3h/iIeHeEh3eIhw+j2w", ItemCount: 12, LibraryID: &library},
-				{ID: "c-ghibli", Source: sections.CollectionCardUser, Title: "Ghibli nights", PosterURL: "https://s3.example.test/collage.jpg", PosterIsCollage: true, ItemCount: 5, CreatorProfileID: &creator},
-			}}, nil
 	}
 	return handlers.SectionView{}, &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Section not found"}
 }
@@ -171,10 +159,177 @@ func homeDeps(t *testing.T) (Dependencies, *fakeHome) {
 
 // --- tests ---
 
+func TestGetCalendar(t *testing.T) {
+	deps, fake := homeDeps(t)
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, "/api/v2/calendar?start=2026-01-05&end=2026-01-11&timezone=America/New_York&library_id=1", "", viewerHeaders())
+	if rec.Code != 200 {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`"date":"2026-01-09"`, `"air_at":"2026-01-10T02:00:00.000Z"`, `"badges":["season_premiere"]`, `"badges":[]`, `"watched":true`, `"local_air_date":"2026-01-09"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body lacks %s: %s", want, body)
+		}
+	}
+	if strings.Contains(body, `"air_time":null`) || strings.Contains(body, `"poster_url":""`) {
+		t.Errorf("absent members must be omitted: %s", body)
+	}
+	if fake.lastQuery.Filter != "all" || fake.lastQuery.Location.String() != "America/New_York" || fake.lastQuery.LibraryID == nil || *fake.lastQuery.LibraryID != 1 ||
+		fake.lastQuery.Start.Format("2006-01-02") != "2026-01-05" || fake.lastQuery.End.Format("2006-01-02") != "2026-01-11" {
+		t.Fatalf("query = %+v", fake.lastQuery)
+	}
+	rec = do(t, h, http.MethodGet, "/api/v2/calendar?start=2026-01-05&end=2026-01-05&filter=watchlist", "", viewerHeaders())
+	if rec.Code != 200 || rec.Body.String() != `{"events":[]}`+"\n" || fake.lastQuery.Location != nil && fake.lastQuery.Location.String() != "UTC" {
+		t.Fatal(rec.Code, rec.Body.String(), fake.lastQuery.Location)
+	}
+	for _, q := range []string{"end=2026-01-11", "start=2026-01-05", "start=2026-01-05&end=2026-01-04", "start=2026-01-05&end=2026-02-05", "start=2026-01-05&end=2026-01-11&filter=mine",
+		"start=2026-01-05&end=2026-01-11&timezone=Mars/Olympus", "start=2026-01-05&end=2026-01-11&library_id=x", "start=20260105&end=2026-01-11"} {
+		requireProblem(t, do(t, h, http.MethodGet, "/api/v2/calendar?"+q, "", viewerHeaders()), TypeValidationFailed)
+	}
+	p := requireProblem(t, do(t, h, http.MethodGet, "/api/v2/calendar?start=2026-01-05&end=2026-02-05", "", viewerHeaders()), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "query.end" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/calendar?start=2026-01-05&end=2026-01-11", "", bearer(memberToken)), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/calendar?start=2026-01-05&end=2026-01-11", "", nil), TypeAuthenticationRequired)
+	fake.err = &handlers.APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "failed to fetch calendar events"}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/calendar?start=2026-01-05&end=2026-01-11", "", viewerHeaders()), TypeInternalError)
+	deps.Calendar = nil
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/calendar?start=2026-01-05&end=2026-01-11", "", viewerHeaders()), TypeDependencyUnavailable)
+}
+
+func TestHomeDismissals(t *testing.T) {
+	deps, fake := homeDeps(t)
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodPut, "/api/v2/home/dismissals/continue_watching/movie:heat-1995", `{"progress_updated_at":"2026-01-02T03:04:05.678Z"}`, viewerHeaders())
+	if rec.Code != 204 || rec.Body.Len() != 0 {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	if fake.lastCmd.UserID != 1 || fake.lastCmd.ProfileID != "p-owner" || fake.lastCmd.Surface != "continue_watching" || fake.lastCmd.ItemID != "movie:heat-1995" || fake.lastCmd.ProgressUpdatedAt != "2026-01-02T03:04:05Z" {
+		t.Fatalf("cmd = %+v", fake.lastCmd)
+	}
+	rec = do(t, h, http.MethodPut, "/api/v2/home/dismissals/next_up/episode:severance-s02e01", `{"series_id":"series:severance"}`, viewerHeaders())
+	if rec.Code != 204 || fake.lastCmd.SeriesID != "series:severance" || fake.lastCmd.ProgressUpdatedAt != "" {
+		t.Fatal(rec.Code, rec.Body.String(), fake.lastCmd)
+	}
+	p := requireProblem(t, do(t, h, http.MethodPut, "/api/v2/home/dismissals/continue_watching/movie:heat-1995", `{}`, viewerHeaders()), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "body.progress_updated_at" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+	p = requireProblem(t, do(t, h, http.MethodPut, "/api/v2/home/dismissals/next_up/episode:x", `{"progress_updated_at":"2026-01-02T03:04:05Z"}`, viewerHeaders()), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "body.series_id" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/home/dismissals/recently_added/movie:heat-1995", `{}`, viewerHeaders()), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/home/dismissals/next_up/episode:x", `{"series_id":"s","extra":1}`, viewerHeaders()), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/home/dismissals/continue_watching/movie:heat-1995", `{"progress_updated_at":"yesterday"}`, viewerHeaders()), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/home/dismissals/next_up/episode:x", `{"series_id":"s"}`, bearer(memberToken)), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/home/dismissals/next_up/episode:x", `{"series_id":"s"}`, nil), TypeAuthenticationRequired)
+
+	rec = do(t, h, http.MethodDelete, "/api/v2/home/dismissals/next_up/episode:severance-s02e01", "", viewerHeaders())
+	if rec.Code != 204 || len(fake.undone) != 1 || fake.undone[0] != "p-owner/next_up/episode:severance-s02e01" {
+		t.Fatal(rec.Code, rec.Body.String(), fake.undone)
+	}
+	requireProblem(t, do(t, h, http.MethodDelete, "/api/v2/home/dismissals/recently_added/movie:heat-1995", "", viewerHeaders()), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodDelete, "/api/v2/home/dismissals/next_up/episode:x", "", nil), TypeAuthenticationRequired)
+	fake.err = &handlers.APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "Failed to save dismissal"}
+	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/home/dismissals/next_up/episode:x", `{"series_id":"s"}`, viewerHeaders()), TypeInternalError)
+	requireProblem(t, do(t, h, http.MethodDelete, "/api/v2/home/dismissals/next_up/episode:x", "", viewerHeaders()), TypeInternalError)
+	deps.HomeDismissals = nil
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodDelete, "/api/v2/home/dismissals/next_up/episode:x", "", viewerHeaders()), TypeDependencyUnavailable)
+}
+
+func TestGetHomeLayout(t *testing.T) {
+	deps, fake := homeDeps(t)
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, "/api/v2/home/layout", "", viewerHeaders())
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"next_up"`) || !strings.Contains(rec.Body.String(), `"customized":true`) || strings.Contains(rec.Body.String(), "items") {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/layout", "", bearer(memberToken)), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/layout", "", nil), TypeAuthenticationRequired)
+	fake.err = &handlers.APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "Failed to load sections"}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/layout", "", viewerHeaders()), TypeInternalError)
+	deps.HomeSections = nil
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/home/layout", "", viewerHeaders()), TypeDependencyUnavailable)
+}
+
+func TestListHomeSections(t *testing.T) {
+	deps, fake := homeDeps(t)
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, "/api/v2/home/sections?image_size=large&backdrop_width=2688", "", viewerHeaders())
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"continue_watching"`) || !strings.Contains(rec.Body.String(), `"total_count":1`) || !strings.Contains(rec.Body.String(), `"items":[{`) {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	if fake.lastViewer.ImageSize != imagesize.Large || fake.lastViewer.ImageWidths != (imagesize.Widths{Backdrop: 2688}) ||
+		fake.lastViewer.Access.UserID != 1 || fake.lastViewer.Access.ProfileID != "p-owner" {
+		t.Fatalf("viewer = %+v", fake.lastViewer)
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/sections?image_size=huge", "", viewerHeaders()), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/sections", "", bearer(memberToken)), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/sections", "", nil), TypeAuthenticationRequired)
+	fake.err = &handlers.APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "Failed to load sections"}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/sections", "", viewerHeaders()), TypeInternalError)
+	deps.HomeSections = nil
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/home/sections", "", viewerHeaders()), TypeDependencyUnavailable)
+}
+
+func TestGetHomeSectionItems(t *testing.T) {
+	deps, fake := homeDeps(t)
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, "/api/v2/home/sections/continue_watching/items", "", viewerHeaders())
+	if rec.Code != 200 || !strings.HasPrefix(rec.Body.String(), `{"id":"continue_watching"`) || !strings.Contains(rec.Body.String(), `"items":[{`) || strings.Contains(rec.Body.String(), `"section":`) {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	if fake.lastViewer.ImageSize != imagesize.Unset {
+		t.Fatalf("viewer = %+v", fake.lastViewer)
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/sections/nope/items", "", viewerHeaders()), TypeNotFound)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/sections/continue_watching/items", "", bearer(memberToken)), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/sections/continue_watching/items", "", nil), TypeAuthenticationRequired)
+	fake.err = &handlers.APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "Failed to load sections"}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/home/sections/continue_watching/items", "", viewerHeaders()), TypeInternalError)
+}
+
+func TestListSectionRecipes(t *testing.T) {
+	deps, _ := homeDeps(t)
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, "/api/v2/sections/recipes", "", viewerHeaders())
+	body := rec.Body.String()
+	if rec.Code != 200 || !strings.HasPrefix(body, `{"categories":[{"category":"library_staples"`) || !strings.Contains(body, `"presets":[]`) ||
+		!strings.Contains(body, `"default_params":{"genres":["comedy"],"mood":"cozy"}`) || !strings.Contains(body, `"key":"bare"`) || !strings.Contains(body, `"default_params":{}`) ||
+		strings.Contains(body, "hidden") {
+		t.Fatal(rec.Code, body)
+	}
+	if rec := do(t, h, http.MethodGet, "/api/v2/sections/recipes", "", bearer(memberToken)); rec.Code != 200 || rec.Body.String() != body {
+		t.Fatal("account-scoped gallery read:", rec.Code, rec.Body.String())
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/sections/recipes", "", nil), TypeAuthenticationRequired)
+	deps.Recipes = nil
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/sections/recipes", "", viewerHeaders()), TypeDependencyUnavailable)
+}
+
+func TestListSectionRecipeCandidates(t *testing.T) {
+	deps, fake := homeDeps(t)
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, "/api/v2/sections/recipes/custom_filter/candidates", "", viewerHeaders())
+	if rec.Code != 200 || rec.Body.String() != `{"candidates":[{"value":"action","display_name":"Action","subtitle":"12 titles"},{"value":"drama","display_name":"Drama","subtitle":""}]}`+"\n" {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/sections/recipes/nope/candidates", "", viewerHeaders()), TypeNotFound)
+	if rec2 := do(t, h, http.MethodGet, "/api/v2/sections/recipes/custom_filter/candidates", "", bearer(memberToken)); rec2.Code != 200 || rec2.Body.String() != rec.Body.String() {
+		t.Fatal("account-scoped candidates read:", rec2.Code, rec2.Body.String())
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/sections/recipes/custom_filter/candidates", "", nil), TypeAuthenticationRequired)
+	fake.err = &handlers.APIError{Status: http.StatusInternalServerError, Code: "candidate_error", Message: "boom"}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/sections/recipes/custom_filter/candidates", "", viewerHeaders()), TypeInternalError)
+}
+
 // TestHomeCapabilities pins the home capability document: available with
-// include_items_max and the item_limit maxima where the home sections
-// service is wired, revalidated by its ETag, not_configured without them, and
-// each advertised bound equal to the maximum its parameter validates.
+// include_items_max where the home sections service is wired, revalidated by
+// its ETag, not_configured without it, and include_items_max equal to the
+// include_items maximum getHomeLayout validates.
 func TestHomeCapabilities(t *testing.T) {
 	path := Prefix + "/home/capabilities"
 	deps, _ := homeDeps(t)
@@ -187,8 +342,7 @@ func TestHomeCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	if rec.Code != http.StatusOK || out.State != StateAvailable || out.Allowed == nil || !*out.Allowed || out.Revision == "" ||
-		out.IncludeItemsMax != handlers.MaxHomeLayoutIncludedSections || out.SectionItemLimitMax != handlers.MaxSectionItemLimitCap ||
-		out.RowItemLimitMax != handlers.MaxSectionItemLimitCap {
+		out.IncludeItemsMax != handlers.MaxHomeLayoutIncludedSections {
 		t.Fatalf("capabilities: %d %s", rec.Code, rec.Body.String())
 	}
 	if got := rec.Header().Get("Cache-Control"); got != cachePrivateNoCache {
@@ -201,7 +355,7 @@ func TestHomeCapabilities(t *testing.T) {
 
 	deps.HomeSections = nil
 	rec = do(t, newTestHandler(t, deps), http.MethodGet, path, "", viewerHeaders())
-	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "include_items_max") || strings.Contains(rec.Body.String(), "item_limit_max") {
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "include_items_max") {
 		t.Fatalf("unconfigured: %d %s", rec.Code, rec.Body.String())
 	}
 	out = HomeCapabilities{}
@@ -227,21 +381,14 @@ func TestHomeCapabilities(t *testing.T) {
 	if err := json.Unmarshal(data, &doc); err != nil {
 		t.Fatal(err)
 	}
-	paramMaximum := func(path, name string) *float64 {
-		for _, p := range doc.Paths[path]["get"].Parameters {
-			if p.Name == name {
-				return p.Schema.Maximum
-			}
+	var maximum *float64
+	for _, p := range doc.Paths[Prefix+"/home/layout"]["get"].Parameters {
+		if p.Name == "include_items" {
+			maximum = p.Schema.Maximum
 		}
-		return nil
 	}
-	if maximum := paramMaximum(Prefix+"/home/layout", "include_items"); maximum == nil || int(*maximum) != handlers.MaxHomeLayoutIncludedSections {
+	if maximum == nil || int(*maximum) != handlers.MaxHomeLayoutIncludedSections {
 		t.Fatalf("getHomeLayout include_items maximum = %v, want %d", maximum, handlers.MaxHomeLayoutIncludedSections)
-	}
-	for _, path := range []string{Prefix + "/home/sections", Prefix + "/library/{id}/sections", Prefix + "/home/sections/{id}/items", Prefix + "/home/layout"} {
-		if maximum := paramMaximum(path, "item_limit"); maximum == nil || int(*maximum) != handlers.MaxSectionItemLimitCap {
-			t.Fatalf("%s item_limit maximum = %v, want %d", path, maximum, handlers.MaxSectionItemLimitCap)
-		}
 	}
 	if rec := do(t, h, http.MethodGet, fmt.Sprintf("%s/home/layout?include_items=%d", Prefix, handlers.MaxHomeLayoutIncludedSections+1), "", viewerHeaders()); rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("include_items above the advertised maximum: %d", rec.Code)

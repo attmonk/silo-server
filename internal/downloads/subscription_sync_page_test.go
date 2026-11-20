@@ -28,11 +28,8 @@ func (p *syncEpisodePager) ListBySeries(context.Context, string) ([]*models.Epis
 	return p.rows, nil
 }
 
-// syncFileResolver gives each episode in files its own 10-byte file of
-// "series" with that id; other episodes have no file.
 type syncFileResolver struct {
 	FileResolver
-	files map[string]int
 	calls int
 }
 
@@ -40,32 +37,15 @@ func (f *syncFileResolver) ListByEpisodeIDs(_ context.Context, ids []string) (ma
 	f.calls++
 	out := map[string][]*models.MediaFile{}
 	for _, id := range ids {
-		if fileID, ok := f.files[id]; ok {
-			out[id] = []*models.MediaFile{f.file(id, fileID)}
-		}
+		out[id] = []*models.MediaFile{{ID: 42, ContentID: "series", EpisodeID: id, FileSize: 10}}
 	}
 	return out, nil
-}
-
-func (f *syncFileResolver) file(episodeID string, fileID int) *models.MediaFile {
-	return &models.MediaFile{ID: fileID, ContentID: "series", EpisodeID: episodeID, FileSize: 10}
 }
 
 type syncAccess struct{ err error }
 
 func (a *syncAccess) EnsureAccessible(context.Context, string, catalog.AccessFilter) error {
 	return a.err
-}
-
-func (a *syncAccess) EnsureAccessibleIDs(_ context.Context, ids []string, _ catalog.AccessFilter) (map[string]bool, error) {
-	if a.err != nil {
-		return nil, a.err
-	}
-	allowed := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		allowed[id] = true
-	}
-	return allowed, nil
 }
 
 func TestSubscriptionSyncPagePostgres(t *testing.T) {
@@ -90,10 +70,7 @@ func TestSubscriptionSyncPagePostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	pager := &syncEpisodePager{rows: []*models.Episode{{ContentID: "skipped", SeasonNumber: 1, EpisodeNumber: 1}}, more: true}
-	files := &syncFileResolver{files: map[string]int{"special": 42, "special-two": 43}}
-	for episodeID, fileID := range files.files {
-		seedSchemaFiles(t, repo, files.file(episodeID, fileID))
-	}
+	files := &syncFileResolver{}
 	access := &syncAccess{}
 	svc := NewService(repo, nil, nil, files, nil, pager, fakeUserRepo{&models.User{ID: 1, DownloadAllowed: new(true)}}, access, nil, &config.DownloadConfig{Enabled: true})
 	svc.subRepo = subRepo

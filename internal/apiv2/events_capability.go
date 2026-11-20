@@ -3,11 +3,8 @@ package apiv2
 import (
 	"context"
 	"net/http"
-	"slices"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
-	"github.com/Silo-Server/silo-server/internal/auth"
-	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 type EventsCapabilityService interface {
@@ -37,7 +34,7 @@ func registerEventsCapability(reg *Registry) {
 			return &EventsCapabilitiesOutput{Body: EventsCapabilities{Capability: Capability{State: StateNotConfigured}, Channels: []string{}}}, nil
 		}
 		value := reg.deps.EventsCapability.EventsCapability()
-		out := EventsCapabilities{Capability: Capability{Allowed: new(eventsSocketAllowed(ctx))}, SchemaVersion: value.SchemaVersion, SubscribeFrame: value.SubscribeFrame, DeclaredChannels: value.DeclaredChannels, SubscribeGracePeriodSeconds: value.SubscribeGracePeriodSeconds, MaxRequestedChannels: value.MaxRequestedChannels, Channels: make([]string, 0, len(value.Channels))}
+		out := EventsCapabilities{Capability: Capability{Allowed: new(capabilityLoginAllowed(ctx))}, SchemaVersion: value.SchemaVersion, SubscribeFrame: value.SubscribeFrame, DeclaredChannels: value.DeclaredChannels, SubscribeGracePeriodSeconds: value.SubscribeGracePeriodSeconds, MaxRequestedChannels: value.MaxRequestedChannels, Channels: make([]string, 0, len(value.Channels))}
 		for _, channel := range value.Channels {
 			out.Channels = append(out.Channels, string(channel))
 		}
@@ -45,27 +42,4 @@ func registerEventsCapability(reg *Registry) {
 	})
 }
 
-// eventsSocketAllowed reports whether the caller may mint an events socket
-// ticket: a current login session, or an administrator's admin:monitor:read
-// API key sent with no profile. This operation resolves no profile, so the
-// header itself is read.
-func eventsSocketAllowed(ctx context.Context) bool {
-	if capabilityLoginAllowed(ctx) {
-		return true
-	}
-	claims := claimsFrom(ctx)
-	if claims == nil || claims.TokenType != auth.TokenTypeAPIKey {
-		return false
-	}
-	if userKeyEventsSocket(ctx, claims) {
-		return true
-	}
-	return claims.Role == models.RoleAdmin && slices.Contains(claims.APIKeyScopes, auth.ScopeAdminMonitorRead) && !declaresProfile(ctx)
-}
-
 func (c EventsCapabilities) capabilityState() string { return StateAvailable }
-
-func declaresProfile(ctx context.Context) bool {
-	r := requestFrom(ctx)
-	return r != nil && r.Header.Get(profileHeader) != ""
-}

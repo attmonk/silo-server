@@ -6,7 +6,6 @@ import {
 } from "./adminAuthority";
 import type { components } from "./schema";
 import { v2, type V2Body } from "./request";
-import { t } from "@/i18n";
 
 export type AdminAPIKeyMetadata = components["schemas"]["AdminAPIKey"];
 export type AdminAPIKeyListItem = components["schemas"]["AdminAPIKeyListItem"];
@@ -25,7 +24,7 @@ export const adminApiKeyScope = adminAuthorityScope;
 const requireAuthority = requireAdminAuthority;
 function strongETag(etag: string | null) {
   if (!etag || !/^"[\x21\x23-\x7e\x80-\xff]*"$/.test(etag)) {
-    throw new Error(t("web.admin.errors.apiKeyReloadBeforeSaving"));
+    throw new Error("Reload this API key before saving: a strong ETag is required.");
   }
   return etag;
 }
@@ -70,7 +69,7 @@ export async function listAdminApiKeysPage(
       (typeof page.next_cursor !== "string" || !page.next_cursor || page.next_cursor === cursor)) ||
     (!page.has_more && !!page.next_cursor)
   ) {
-    throw new Error(t("web.admin.errors.apiKeyPaginationInvalid"));
+    throw new Error("Invalid API key pagination. Reload the list.");
   }
   return { items: body.items, page: { has_more: page.has_more, next_cursor: page.next_cursor } };
 }

@@ -1,7 +1,6 @@
 package tonemap
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -13,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -133,14 +131,14 @@ func DecodeSourceRevision(value string) (SourceRevision, error) {
 // 16-character OpenSubtitles format and are rechecked with size and mtime; older
 // catalog values still receive the filesystem checks they had before hashes were
 // validated at execution time.
-func (r SourceRevision) ValidatePath(ctx context.Context, path string) error {
+func (r SourceRevision) ValidatePath(path string) error {
 	if r.IsZero() {
 		return nil
 	}
 	if r.MediaFileID <= 0 {
 		return ErrSourceRevisionChanged
 	}
-	info, err := fspath.Stat(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%w: %w", ErrSourceRevisionChanged, err)
@@ -154,7 +152,7 @@ func (r SourceRevision) ValidatePath(ctx context.Context, path string) error {
 		return ErrSourceRevisionChanged
 	}
 	if isOpenSubtitlesHash(r.FileHash) {
-		currentHash, err := computeOpenSubtitlesHash(ctx, path, info.Size())
+		currentHash, err := computeOpenSubtitlesHash(path, info.Size())
 		if err != nil {
 			return fmt.Errorf("hash tone-map source: %w", err)
 		}
@@ -176,14 +174,11 @@ func isOpenSubtitlesHash(value string) bool {
 	return err == nil
 }
 
-func computeOpenSubtitlesHash(ctx context.Context, path string, size int64) (string, error) {
+func computeOpenSubtitlesHash(path string, size int64) (string, error) {
 	if size < 2*openSubtitlesHashBlockSize {
 		return "", fmt.Errorf("file is too small for OpenSubtitles hash")
 	}
-	// A relayed input (a transcode node reading through the core) reads the
-	// two blocks over HTTP, and stops when ctx ends; a library path reads
-	// its file.
-	file, err := fspath.OpenReader(ctx, path)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}

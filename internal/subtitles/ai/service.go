@@ -314,7 +314,7 @@ func (s *Service) Cancel(ctx context.Context, id int64) error {
 	// Canceling a context alone cannot acknowledge a job-state change: the
 	// provider may ignore it, and the process may exit before its cleanup runs.
 	if !job.Status.Terminal() {
-		err = s.repo.FailJob(ctx, id, JobStatusCancelled, storedCancelled)
+		err = s.repo.FailJob(ctx, id, JobStatusCancelled, "cancelled") //nolint:misspell // Preserve the existing persisted message.
 	}
 	// Still ask local work to stop if the database outcome is uncertain, but
 	// return that error rather than reporting a successful cancellation. This
@@ -331,7 +331,7 @@ func (s *Service) dispatch(job Job, textConfig *llm.Config) {
 		}
 		s.run(ctx, &job)
 	}, func(ctx context.Context) {
-		_ = s.repo.FailJob(ctx, job.ID, JobStatusCancelled, storedCancelledBeforeStart)
+		_ = s.repo.FailJob(ctx, job.ID, JobStatusCancelled, "cancelled before start")
 	})
 }
 
@@ -437,7 +437,7 @@ func (s *Service) runTranscribe(ctx context.Context, job *Job) {
 		audioIdx = playback.SelectAudioTrack(file.AudioTracks, "", nil)
 	}
 	if audioIdx >= len(file.AudioTracks) {
-		s.finishWithError(ctx, job, fmt.Errorf("%w: audio track index out of range", errSourceMissing))
+		s.finishWithError(ctx, job, fmt.Errorf("%w: audio track index out of range", ErrInvalidRequest))
 		return
 	}
 
@@ -612,9 +612,8 @@ func (s *Service) translateLiveChunk(
 	if err != nil {
 		state.err = err
 		if !state.failedNotified {
-			_, msg := failureOutcome(ctx, job.Kind, err)
 			s.notifierFor(job).TranslationFailed(ctx, job.SessionID, job.MediaFileID, job.ID,
-				trackKey, PublicFailureMessage(msg))
+				trackKey, llm.Truncate(err.Error(), 500))
 			state.failedNotified = true
 		}
 		return
@@ -676,15 +675,20 @@ func (s *Service) finishWithErrorNotify(ctx context.Context, job *Job, err error
 	if errors.Is(err, subtitles.ErrAIJobInactive) || errors.Is(err, subtitles.ErrAIPublicationUncertain) {
 		return
 	}
-	// The job keeps a viewer-facing reason; the raw error, which can carry
-	// provider responses, goes to the log below.
-	status, msg := failureOutcome(ctx, job.Kind, err)
+	status := JobStatusFailed
+	msg := llm.Truncate(err.Error(), 500)
+	// Only a genuine cancellation (user cancel, or shutdown via cancel) becomes
+	// "cancelled". A deadline/timeout (context.DeadlineExceeded) stays "failed".
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		status = JobStatusCancelled
+		msg = "cancelled"
+	}
 	if dbErr := s.repo.FailJob(context.WithoutCancel(ctx), job.ID, status, msg); dbErr != nil {
 		s.logger.WarnContext(ctx, "failed to record subtitle ai job failure", "job", job.ID, "error", dbErr)
 	}
 	if notify && job.SessionID != "" && s.notifierFor(job) != nil {
 		s.notifierFor(job).TranslationFailed(context.WithoutCancel(ctx), job.SessionID, job.MediaFileID, job.ID,
-			liveTrackKey(job.ID), PublicFailureMessage(msg))
+			liveTrackKey(job.ID), msg)
 	}
 	if status == JobStatusFailed {
 		s.logger.WarnContext(ctx, "subtitle ai job failed", "job", job.ID, "media_file", job.MediaFileID, "error", err)
@@ -717,7 +721,7 @@ func (s *Service) loadSource(ctx context.Context, job *Job) ([]SubtitleCue, stri
 
 	switch {
 	case idx < 0:
-		return nil, "", fmt.Errorf("%w: invalid source subtitle index", errSourceMissing)
+		return nil, "", fmt.Errorf("invalid source subtitle index")
 
 	case idx < externalCount:
 		ext := file.ExternalSubtitles[idx]
@@ -731,7 +735,7 @@ func (s *Service) loadSource(ctx context.Context, job *Job) ([]SubtitleCue, stri
 		}
 		cues, err := ParseCues(data)
 		if err != nil {
-			return nil, "", fmt.Errorf("%w: %w", errSourceEmpty, err)
+			return nil, "", err
 		}
 		return cues, ext.Language, nil
 
@@ -749,23 +753,14 @@ func (s *Service) loadSource(ctx context.Context, job *Job) ([]SubtitleCue, stri
 			return data, err
 		}
 		var data []byte
-		var sourced bool
 		if cached, ok := s.subtitleCache.LookupWebVTT(file.FilePath, embeddedIndex); ok {
 			// Native playback already demuxed this track as WebVTT; ParseCues
 			// reads it, so the source is not demuxed again.
 			data = cached
-		} else {
-			// A kept copy of the track, or one read through the file's index,
-			// saves demuxing the whole source.
-			data, sourced, err = s.subtitleCache.ExtractSourcedText(ctx, file.FilePath,
-				playback.EmbeddedSubtitleRefFor(file, embeddedIndex), embeddedIndex, "srt", s.ffmpegPath)
-		}
-		switch {
-		case data != nil || sourced || err != nil:
-		case s.subtitleCache != nil:
+		} else if s.subtitleCache != nil {
 			// ExtractSubtitle writes SRT for ffmpeg's 0:s:N, the cache's key.
 			data, err = s.subtitleCache.ExtractText(ctx, file.FilePath, embeddedIndex, "srt", extract)
-		default:
+		} else {
 			data, err = extract(ctx)
 		}
 		if err != nil {
@@ -773,7 +768,7 @@ func (s *Service) loadSource(ctx context.Context, job *Job) ([]SubtitleCue, stri
 		}
 		cues, err := ParseCues(data)
 		if err != nil {
-			return nil, "", fmt.Errorf("%w: %w", errSourceEmpty, err)
+			return nil, "", err
 		}
 		return cues, track.Language, nil
 
@@ -784,7 +779,7 @@ func (s *Service) loadSource(ctx context.Context, job *Job) ([]SubtitleCue, stri
 			return nil, "", fmt.Errorf("list downloaded subtitles: %w", err)
 		}
 		if downloadedIndex < 0 || downloadedIndex >= len(list) {
-			return nil, "", fmt.Errorf("%w: source subtitle index out of range", errSourceMissing)
+			return nil, "", fmt.Errorf("source subtitle index out of range")
 		}
 		dl := list[downloadedIndex]
 		if !isParsableTextFormat(string(dl.Format)) {
@@ -801,7 +796,7 @@ func (s *Service) loadSource(ctx context.Context, job *Job) ([]SubtitleCue, stri
 		}
 		cues, err := ParseCues(data)
 		if err != nil {
-			return nil, "", fmt.Errorf("%w: %w", errSourceEmpty, err)
+			return nil, "", err
 		}
 		return cues, dl.Language, nil
 	}

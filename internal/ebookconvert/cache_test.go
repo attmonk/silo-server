@@ -1,10 +1,11 @@
 package ebookconvert
 
 import (
+	"context"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,20 +20,7 @@ func newTestCache(t *testing.T, opts CacheOptions) *Cache {
 	if err != nil {
 		t.Fatalf("NewCache: %v", err)
 	}
-	t.Cleanup(func() { _ = c.root.Close() })
 	return c
-}
-
-// convertPath runs GetOrConvert and returns the cache entry's path, closing the
-// descriptor so the existing path-based assertions apply.
-func convertPath(t *testing.T, c *Cache, src string, key SourceKey) (string, error) {
-	t.Helper()
-	f, err := c.GetOrConvert(t.Context(), src, key)
-	if err != nil {
-		return "", err
-	}
-	_ = f.Close()
-	return f.Name(), nil
 }
 
 func keyFor(t *testing.T, fileID int, path string) SourceKey {
@@ -42,6 +30,68 @@ func keyFor(t *testing.T, fileID int, path string) SourceKey {
 		t.Fatal(err)
 	}
 	return k
+}
+
+func TestCache_MissThenHit(t *testing.T) {
+	c := newTestCache(t, CacheOptions{})
+	src := filepath.Join("testdata", "sample-ncx.mobi")
+	key := keyFor(t, 1, src)
+
+	p1, err := c.GetOrConvert(context.Background(), src, key)
+	if err != nil {
+		t.Fatalf("first GetOrConvert: %v", err)
+	}
+	assertValidEpub(t, p1)
+	fi1, err := os.Stat(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(p1, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	p2, err := c.GetOrConvert(context.Background(), src, key)
+	if err != nil {
+		t.Fatalf("second GetOrConvert: %v", err)
+	}
+	if p1 != p2 {
+		t.Fatalf("hit returned different path: %s vs %s", p1, p2)
+	}
+	fi2, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(fi2.ModTime()) > time.Minute {
+		t.Fatalf("cache hit did not refresh mtime for LRU; mtime is %v old", time.Since(fi2.ModTime()))
+	}
+	// A hit refreshes mtime for LRU but must NOT reconvert: the cached entry is
+	// the same underlying file, not a freshly converted+renamed replacement.
+	if !os.SameFile(fi1, fi2) {
+		t.Fatal("cache hit reconverted the file (replaced the cached entry)")
+	}
+}
+
+func TestCache_KeyChangesOnModTime(t *testing.T) {
+	c := newTestCache(t, CacheOptions{})
+	src := filepath.Join("testdata", "sample-ncx.mobi")
+	k1 := keyFor(t, 1, src)
+	k2 := k1
+	k2.ModTimeNano = k1.ModTimeNano + 1 // simulate a re-scanned/replaced file
+	if k1.hash() == k2.hash() {
+		t.Fatal("expected different cache keys for different mtime")
+	}
+	p1, err := c.GetOrConvert(context.Background(), src, k1)
+	if err != nil {
+		t.Fatalf("convert k1: %v", err)
+	}
+	p2, err := c.GetOrConvert(context.Background(), src, k2)
+	if err != nil {
+		t.Fatalf("convert k2: %v", err)
+	}
+	if p1 == p2 {
+		t.Fatal("different keys must map to different cache files")
+	}
 }
 
 // Eviction must ignore other conversions' in-flight temp files; deleting one
@@ -57,11 +107,65 @@ func TestCache_EvictionSkipsInFlightTemps(t *testing.T) {
 	_ = os.Chtimes(tmp, old, old)
 
 	src := filepath.Join("testdata", "sample-ncx.mobi")
-	if _, err := convertPath(t, c, src, keyFor(t, 1, src)); err != nil {
+	if _, err := c.GetOrConvert(context.Background(), src, keyFor(t, 1, src)); err != nil {
 		t.Fatalf("convert: %v", err)
 	}
 	if _, err := os.Stat(tmp); err != nil {
 		t.Fatalf("eviction deleted an in-flight temp file: %v", err)
+	}
+}
+
+// A single caller abandoning its request (cancellation) must not abort the
+// shared conversion for everyone else: the detached work still completes and
+// populates the cache.
+func TestCache_CallerCancelDoesNotAbortSharedWork(t *testing.T) {
+	c := newTestCache(t, CacheOptions{})
+	src := filepath.Join("testdata", "sample-ncx.mobi")
+	key := keyFor(t, 1, src)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // caller bails before the conversion can finish
+	_, _ = c.GetOrConvert(ctx, src, key)
+
+	dst := filepath.Join(c.opts.Dir, key.hash()+".epub")
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if fi, err := os.Stat(dst); err == nil && fi.Size() > 0 {
+			return // shared work completed despite the caller canceling — good
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("detached conversion did not populate the cache after the caller canceled")
+}
+
+func TestCache_Singleflight(t *testing.T) {
+	c := newTestCache(t, CacheOptions{})
+	src := filepath.Join("testdata", "sample-ncx.mobi")
+	key := keyFor(t, 3, src)
+
+	const n = 8
+	var wg sync.WaitGroup
+	var firstPath atomic.Value
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p, err := c.GetOrConvert(context.Background(), src, key)
+			if err != nil {
+				errs <- err
+				return
+			}
+			firstPath.Store(p)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent GetOrConvert: %v", err)
+	}
+	if p, _ := firstPath.Load().(string); p == "" {
+		t.Fatal("no path produced")
 	}
 }
 
@@ -74,7 +178,7 @@ func TestCache_BudgetEviction(t *testing.T) {
 	c := newTestCache(t, CacheOptions{Dir: dir, MaxBytes: budget})
 	src := filepath.Join("testdata", "sample-ncx.mobi")
 
-	p1, err := convertPath(t, c, src, keyFor(t, 1, src))
+	p1, err := c.GetOrConvert(context.Background(), src, keyFor(t, 1, src))
 	if err != nil {
 		t.Fatalf("convert 1: %v", err)
 	}
@@ -84,7 +188,7 @@ func TestCache_BudgetEviction(t *testing.T) {
 
 	k2 := keyFor(t, 2, src)
 	k2.FileID = 2
-	p2, err := convertPath(t, c, src, k2)
+	p2, err := c.GetOrConvert(context.Background(), src, k2)
 	if err != nil {
 		t.Fatalf("convert 2: %v", err)
 	}
@@ -105,91 +209,4 @@ func TestCache_BudgetEviction(t *testing.T) {
 	if total > budget {
 		t.Fatalf("budget not enforced: total=%d > %d (%d files)", total, budget, len(epubs))
 	}
-}
-
-// The default cache dir sits at a predictable path in the shared temp dir.
-// Another local account that creates it first must not get its entries served:
-// NewCache refuses a root it could control, and a symlinked entry is never a
-// hit, so a reader can never receive a file outside the cache.
-func TestCache_RefusesEntriesOthersControl(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("relies on Unix modes and unprivileged symlinks")
-	}
-	secret := filepath.Join(t.TempDir(), "secret")
-	if err := os.WriteFile(secret, []byte("PRIVATE-SERVICE-FILE"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Run("root writable by others", func(t *testing.T) {
-		dir := filepath.Join(t.TempDir(), "silo-ebook-epub")
-		if err := os.Mkdir(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(dir, 0o777|os.ModeSticky); err != nil { // Chmod: the umask would clear Mkdir's bits
-			t.Fatal(err)
-		}
-		_, err := NewCache(newTestConverter(t), CacheOptions{Dir: dir})
-		if err == nil || !strings.Contains(err.Error(), "writable by its group or other users") {
-			t.Fatalf("NewCache error = %v, want a refusal of the writable root", err)
-		}
-	})
-	t.Run("entry symlinked outside the cache", func(t *testing.T) {
-		c := newTestCache(t, CacheOptions{})
-		src := filepath.Join("testdata", "sample-ncx.mobi")
-		key := keyFor(t, 1, src)
-		entry := filepath.Join(c.opts.Dir, key.hash()+".epub")
-		if err := os.Symlink(secret, entry); err != nil {
-			t.Fatal(err)
-		}
-
-		if f, lookupErr, ok := c.Lookup(key); ok || lookupErr != nil {
-			if f != nil {
-				_ = f.Close()
-			}
-			t.Fatalf("Lookup = ok %v, err %v; want a miss", ok, lookupErr)
-		}
-		// A miss converts again and the rename replaces the symlink with the
-		// real conversion.
-		p, err := convertPath(t, c, src, key)
-		if err != nil {
-			t.Fatalf("GetOrConvert: %v", err)
-		}
-		assertValidEpub(t, p)
-		if fi, err := os.Lstat(entry); err != nil || !fi.Mode().IsRegular() {
-			t.Fatalf("entry after conversion: %v, %v; want a regular file", fi, err)
-		}
-	})
-	// A parent dir another account can write lets it rename the cache dir
-	// away after NewCache verified it and put a symlink in its place.
-	// Conversion and eviction must stay in the dir NewCache verified.
-	t.Run("cache dir replaced after start", func(t *testing.T) {
-		parent := t.TempDir()
-		dir := filepath.Join(parent, "silo-ebook-epub")
-		c := newTestCache(t, CacheOptions{Dir: dir, MaxBytes: 1})
-		victim := t.TempDir()
-		victimFile := filepath.Join(victim, "book.epub")
-		if err := os.WriteFile(victimFile, []byte("library book"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		moved := filepath.Join(parent, "moved")
-		if err := os.Rename(dir, moved); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(victim, dir); err != nil {
-			t.Fatal(err)
-		}
-
-		src := filepath.Join("testdata", "sample-ncx.mobi")
-		key := keyFor(t, 1, src)
-		if _, err := convertPath(t, c, src, key); err != nil {
-			t.Fatalf("GetOrConvert: %v", err)
-		}
-		if _, err := os.Stat(victimFile); err != nil {
-			t.Fatalf("eviction reached the swapped-in dir: %v", err)
-		}
-		if names, _ := filepath.Glob(filepath.Join(victim, "*")); len(names) != 1 {
-			t.Fatalf("swapped-in dir holds %v, want only book.epub", names)
-		}
-		assertValidEpub(t, filepath.Join(moved, key.hash()+".epub"))
-	})
 }

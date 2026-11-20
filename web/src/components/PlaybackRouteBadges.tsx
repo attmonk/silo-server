@@ -1,10 +1,6 @@
-import { useT } from "@/i18n";
 import { useNetworkAccessCapabilities } from "@/hooks/queries/admin/networkAccess";
 import type { AdminSession } from "@/api/types";
 import { getSessionRouteNodes, type ActivityRouteNode } from "@/pages/adminActivityPresentation";
-
-/** Decorative separator between values; not text, so not translated. */
-const SEPARATOR = "·";
 
 const BADGE_COLORS: Record<ActivityRouteNode["kind"], string> = {
   transcode: "border-warning/25 bg-warning/10 text-warning",
@@ -14,85 +10,58 @@ const BADGE_COLORS: Record<ActivityRouteNode["kind"], string> = {
 };
 
 function OverlayNetworkBadge({ provider }: { provider: string }) {
-  const t = useT();
   const capabilities = useNetworkAccessCapabilities();
   const name =
     capabilities.data?.providers.find((entry) => entry.provider === provider)?.display_name ||
     provider;
-  return <NetworkBadge name={name} title={t("web.player.routeBadge.networkTitle", { name })} />;
+  return <NetworkBadge name={name} title={`Playback uses the ${name} network.`} />;
 }
 
 function NetworkBadge({ name, title }: { name: string; title: string }) {
-  const t = useT();
   return (
     <span
       title={title}
-      aria-label={t("web.player.routeBadge.networkAria", { name })}
+      aria-label={`Network: ${name}`}
       className="border-primary/20 bg-primary/10 text-primary inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-semibold"
     >
-      <span className="opacity-70">{t("web.player.routeBadge.network")}</span>
-      <span aria-hidden="true">{SEPARATOR}</span>
+      <span className="opacity-70">Network</span>
+      <span aria-hidden="true">·</span>
       <span className="truncate">{name}</span>
     </span>
   );
 }
 
-/**
- * The selected access network and serving nodes, shared by all activity views.
- * showLocation={false} leaves out the Local/Remote badge for a view that shows
- * the location next to the client address instead.
- */
-export function PlaybackRouteBadges({
-  session,
-  showLocation = true,
-}: {
-  session: AdminSession;
-  showLocation?: boolean;
-}) {
-  const t = useT();
+/** The selected access network and serving nodes, shared by all activity views. */
+export function PlaybackRouteBadges({ session }: { session: AdminSession }) {
   const provider = session.routing_network_provider;
   return (
     <>
-      {showLocation && session.stream_location && (
+      {session.stream_location && (
         <span
-          title={t("web.player.routeBadge.locationTitle", { location: session.stream_location })}
-          aria-label={t("web.player.routeBadge.locationAria", {
-            location: session.stream_location,
-          })}
+          title={`The server classified this stream as ${session.stream_location} for bitrate policy.`}
+          aria-label={`Stream location: ${session.stream_location === "local" ? "Local" : "Remote"}`}
           className="border-primary/20 bg-primary/10 text-primary inline-flex items-center rounded border px-1.5 py-0.5 text-[9px] font-semibold"
         >
-          {session.stream_location === "local"
-            ? t("web.player.routeBadge.local")
-            : t("web.player.routeBadge.remote")}
+          {session.stream_location === "local" ? "Local" : "Remote"}
         </span>
       )}
       {provider ? (
         <OverlayNetworkBadge provider={provider} />
       ) : (
         <NetworkBadge
-          name={
-            provider === ""
-              ? t("web.player.routeBadge.defaultNetwork")
-              : t("web.player.routeBadge.unknownNetwork")
-          }
+          name={provider === "" ? "Default" : "Unknown"}
           title={
             provider === ""
-              ? t("web.player.routeBadge.defaultNetworkTitle")
-              : t("web.player.routeBadge.unknownNetworkTitle")
+              ? "Playback uses the default network (LAN, public URL, or reverse proxy)."
+              : "This session did not report its access network."
           }
         />
       )}
       {getSessionRouteNodes(session).map((node) => {
-        const serves = session.routing_egress === "api" ? "yes" : "no";
         const title =
-          node.kind !== "server"
-            ? t("web.player.routeBadge.nodeTitle", { label: node.label, name: node.name })
-            : session.reporting_node
-              ? t("web.player.routeBadge.apiServerNodeTitle", {
-                  serves,
-                  node: session.reporting_node,
-                })
-              : t("web.player.routeBadge.apiServerTitle", { serves });
+          node.kind === "server"
+            ? `API server${session.reporting_node ? `: ${session.reporting_node}` : ""}${session.routing_egress === "api" ? " (serves media)" : ""}`
+            : `${node.label}: ${node.name}`;
         return (
           <span
             key={node.key}
@@ -103,12 +72,10 @@ export function PlaybackRouteBadges({
             {node.kind === "transcode" || node.kind === "proxy" ? (
               <>
                 <span className="opacity-70">{node.label}</span>
-                <span aria-hidden="true">{SEPARATOR}</span>
+                <span aria-hidden="true">·</span>
               </>
             ) : null}
-            <span className="truncate">
-              {node.kind === "server" ? t("web.player.routeBadge.apiServer") : node.name}
-            </span>
+            <span className="truncate">{node.kind === "server" ? "API server" : node.name}</span>
           </span>
         );
       })}

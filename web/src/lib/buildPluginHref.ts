@@ -5,7 +5,6 @@ import {
   isSessionIdentityCurrent,
 } from "@/api/client";
 import { v2 } from "@/api/v2/request";
-import { t } from "@/i18n";
 import { toast } from "sonner";
 
 // Full-page plugin navigation needs the HttpOnly cookie scoped to the common
@@ -36,7 +35,7 @@ export async function navigateToPluginRoute(basePath: string): Promise<void> {
     window.location.href = buildPluginHref(basePath);
   } catch {
     if (authorityActive()) {
-      toast.error(t("web.common.shell.pluginOpenFailed"));
+      toast.error("Unable to open the plugin. Please try again.");
     }
   }
 }

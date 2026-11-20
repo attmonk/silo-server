@@ -4,68 +4,31 @@ import type {
   UserCollectionMediaFilter,
   UserCollectionWatchFilter,
 } from "@/api/types";
-import { t } from "@/i18n";
 
 export const COLLECTION_WATCH_FILTER_OPTIONS: Array<{
   value: UserCollectionWatchFilter;
   label: string;
 }> = [
-  {
-    value: "all",
-    get label() {
-      return t("web.collections.displayFilters.watch.all");
-    },
-  },
-  {
-    value: "unwatched",
-    get label() {
-      return t("web.collections.displayFilters.watch.unwatched");
-    },
-  },
-  {
-    value: "watched",
-    get label() {
-      return t("web.collections.displayFilters.watch.watched");
-    },
-  },
+  { value: "all", label: "All" },
+  { value: "unwatched", label: "Unwatched" },
+  { value: "watched", label: "Watched" },
 ];
 
 export const COLLECTION_MEDIA_FILTER_OPTIONS: Array<{
   value: UserCollectionMediaFilter;
   label: string;
 }> = [
-  {
-    value: "all",
-    get label() {
-      return t("web.collections.displayFilters.media.all");
-    },
-  },
-  {
-    value: "movie",
-    get label() {
-      return t("web.collections.displayFilters.media.movie");
-    },
-  },
-  {
-    value: "series",
-    get label() {
-      return t("web.collections.displayFilters.media.series");
-    },
-  },
+  { value: "all", label: "All" },
+  { value: "movie", label: "Movies" },
+  { value: "series", label: "Shows" },
 ];
 
 export function collectionWatchFilterLabel(value: UserCollectionWatchFilter): string {
-  return (
-    COLLECTION_WATCH_FILTER_OPTIONS.find((option) => option.value === value)?.label ??
-    t("web.collections.displayFilters.watch.all")
-  );
+  return COLLECTION_WATCH_FILTER_OPTIONS.find((option) => option.value === value)?.label ?? "All";
 }
 
 export function collectionMediaFilterLabel(value: UserCollectionMediaFilter): string {
-  return (
-    COLLECTION_MEDIA_FILTER_OPTIONS.find((option) => option.value === value)?.label ??
-    t("web.collections.displayFilters.media.all")
-  );
+  return COLLECTION_MEDIA_FILTER_OPTIONS.find((option) => option.value === value)?.label ?? "All";
 }
 
 // The display filters are persisted as a filter-only QueryDefinition fragment:

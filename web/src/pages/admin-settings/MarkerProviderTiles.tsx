@@ -2,12 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
-import type {
-  MarkerProviderConfig,
-  MarkerProviderUpdateRequest,
-  MarkerUserStats,
-  PluginInstallation,
-} from "@/api/types";
+import type { MarkerProviderConfig, MarkerUserStats, PluginInstallation } from "@/api/types";
 import {
   ProviderPanelActions,
   ProviderTile,
@@ -28,10 +23,8 @@ import {
   useValidateMarkerProvider,
 } from "@/hooks/queries/admin/markers";
 import { SETTINGS_NUMBER_WIDTH, SettingField, SettingFieldRow } from "./SettingField";
-import { MARKER_SHARING_DISCLOSURE_KEY } from "@/lib/markers";
 import { providerMonogram } from "@/lib/monogram";
 import { pluginPagePath } from "@/lib/pluginPresentation";
-import { useT, type Translate } from "@/i18n";
 
 const INTEGER_INPUT_PATTERN = /^[+-]?\d+$/;
 const CONFIDENCE_PERCENT_FORMAT = new Intl.NumberFormat("en-US", {
@@ -45,8 +38,8 @@ function markerTileID(provider: string): string {
   return `marker:${provider}`;
 }
 
-function formatRate(t: Translate, value: number) {
-  return t("web.common.format.percent", { percent: Math.round(value * 100) });
+function formatRate(value: number) {
+  return `${Math.round(value * 100)}%`;
 }
 
 /**
@@ -106,7 +99,6 @@ export function MarkerProviderTiles({
   onExpand: (id: string) => void;
   onCollapse: () => void;
 }) {
-  const t = useT();
   const providers = useMarkerProviders();
   // Installed plugins render the credential state; the tiles are useful before
   // that query lands, so they are never blocked on it.
@@ -126,16 +118,14 @@ export function MarkerProviderTiles({
   if (providerList.length === 0) {
     return (
       <p className="text-muted-foreground text-sm">
-        {t("web.admin.settings.markers.provider.empty", {
-          link: (chunks) => (
-            <Link
-              to="/admin/plugins?tab=catalog"
-              className="hover:text-foreground font-medium underline underline-offset-2 transition-colors"
-            >
-              {chunks}
-            </Link>
-          ),
-        })}
+        No marker provider plugins are installed. Install one from the{" "}
+        <Link
+          to="/admin/plugins?tab=catalog"
+          className="hover:text-foreground font-medium underline underline-offset-2 transition-colors"
+        >
+          plugin catalog
+        </Link>
+        .
       </p>
     );
   }
@@ -189,7 +179,6 @@ function MarkerProviderTile({
   result: MarkerValidation | undefined;
   onValidated: (result: MarkerValidation | undefined) => void;
 }) {
-  const t = useT();
   const updateProvider = useUpdateMarkerProvider();
   const validateProvider = useValidateMarkerProvider();
   const displayName = provider.display_name || provider.provider;
@@ -222,30 +211,25 @@ function MarkerProviderTile({
 
   function save() {
     if (!priorityValid) {
-      toast.error(t("web.admin.settings.markers.provider.priorityInvalid"));
+      toast.error("Provider priority must be a whole number.");
       return;
     }
     if (!confidenceValid) {
-      toast.error(t("web.admin.settings.markers.provider.confidenceInvalid"));
+      toast.error("Minimum confidence must be between 0% and 100%.");
       return;
     }
 
-    // Send only what the admin changed. The server keeps its stored value for
-    // every other field, so a stale copy of the sharing switches on this page
-    // cannot undo a sharing opt-out saved elsewhere.
-    const patch: MarkerProviderUpdateRequest = {};
-    if (fetchEnabled !== provider.fetch_enabled) patch.fetch_enabled = fetchEnabled;
-    if (parsedFetchPriority !== provider.fetch_priority) patch.fetch_priority = parsedFetchPriority;
-    if (fetchMinConfidence.edited) patch.fetch_min_confidence = fetchMinConfidence.value;
-    if (contributeEnabled !== provider.contribute_enabled) {
-      patch.contribute_enabled = contributeEnabled;
-    }
-    const nextAutoLocal = contributeEnabled && autoLocal;
-    if (nextAutoLocal !== provider.contribute_auto_local) {
-      patch.contribute_auto_local = nextAutoLocal;
-    }
-    if (minConfidence.edited) patch.contribute_min_confidence = minConfidence.value;
-    updateProvider.mutate({ provider: provider.provider, patch });
+    updateProvider.mutate({
+      provider: provider.provider,
+      patch: {
+        fetch_enabled: fetchEnabled,
+        fetch_priority: parsedFetchPriority,
+        fetch_min_confidence: fetchMinConfidence.value,
+        contribute_enabled: contributeEnabled,
+        contribute_auto_local: contributeEnabled && autoLocal,
+        contribute_min_confidence: minConfidence.value,
+      },
+    });
   }
 
   function validate() {
@@ -259,8 +243,8 @@ function MarkerProviderTile({
             test: {
               ok: response.valid,
               message: response.valid
-                ? t("web.admin.settings.markers.provider.testSucceeded")
-                : (response.error ?? t("web.admin.settings.markers.provider.testFailed")),
+                ? "Connection successful."
+                : (response.error ?? "Connection test failed."),
               at: Date.now(),
               durationMs: Date.now() - started,
             },
@@ -270,10 +254,7 @@ function MarkerProviderTile({
           onValidated({
             test: {
               ok: false,
-              message:
-                error instanceof Error
-                  ? error.message
-                  : t("web.admin.settings.markers.provider.testFailed"),
+              message: error instanceof Error ? error.message : "Connection test failed.",
               at: Date.now(),
               durationMs: Date.now() - started,
             },
@@ -291,10 +272,10 @@ function MarkerProviderTile({
   const statePill = expanded
     ? undefined
     : credentialsReady === false
-      ? t("web.admin.settings.markers.provider.needsSetup")
+      ? "Needs setup"
       : provider.fetch_enabled
         ? undefined
-        : t("web.admin.settings.markers.provider.connectedOff");
+        : "Connected · off";
   // Only a failure earns the extra line: the state word already says the rest.
   const meta = !expanded && test && !test.ok ? test.message : undefined;
   // The plugin's own page holds its API key and account settings.
@@ -303,7 +284,7 @@ function MarkerProviderTile({
   return (
     <ProviderTile
       name={displayName}
-      tagline={t("web.admin.settings.markers.provider.tagline")}
+      tagline="Skip markers"
       monogram={providerMonogram(displayName)}
       monogramClass="bg-teal-500/20 text-teal-700 dark:text-teal-300"
       state={state}
@@ -312,35 +293,32 @@ function MarkerProviderTile({
       busy={updateProvider.isPending || validateProvider.isPending}
       expanded={expanded}
       primaryAction={{
-        label:
-          test && !test.ok
-            ? t("web.admin.settings.markers.provider.fix")
-            : credentialsReady === false
-              ? t("web.admin.settings.markers.provider.setUp")
-              : t("web.admin.settings.markers.provider.manage"),
+        label: test && !test.ok ? "Fix" : credentialsReady === false ? "Set up" : "Manage",
         onClick: onExpand,
       }}
     >
       <p className="text-muted-foreground mb-1 text-xs">
-        {provider.source_type === "plugin" && provider.plugin_id
-          ? t("web.admin.settings.markers.provider.pluginPageNote", {
-              link: (chunks) => (
-                <Link to={pluginPage} className="underline underline-offset-2">
-                  {chunks}
-                </Link>
-              ),
-            })
-          : provider.provider}
+        {provider.source_type === "plugin" && provider.plugin_id ? (
+          <>
+            Manage this provider's account and API settings on its{" "}
+            <Link to={pluginPage} className="underline underline-offset-2">
+              plugin page
+            </Link>
+            .
+          </>
+        ) : (
+          provider.provider
+        )}
       </p>
 
       <SettingField
-        label={t("web.admin.settings.markers.provider.fetchEnabled")}
+        label="Get markers from this provider"
         type="toggle"
         value={fetchEnabled ? "true" : "false"}
         onChange={(value) => setFetchEnabled(value === "true")}
       />
       <SettingField
-        label={t("web.admin.settings.markers.provider.contributeEnabled")}
+        label="Allow sharing with this provider"
         type="toggle"
         value={provider.is_submitter && contributeEnabled ? "true" : "false"}
         onChange={(value) => {
@@ -350,21 +328,17 @@ function MarkerProviderTile({
         }}
         disabled={!provider.is_submitter}
         description={
-          !provider.is_submitter
-            ? t("web.admin.settings.markers.provider.notSubmitter")
-            : provider.default_contribute_enabled
-              ? t(MARKER_SHARING_DISCLOSURE_KEY)
-              : undefined
+          !provider.is_submitter ? "This provider does not accept shared markers." : undefined
         }
       />
-      <div className="border-border ms-3 border-s ps-4">
+      <div className="border-border ml-3 border-l pl-4">
         <SettingField
-          label={t("web.admin.settings.markers.provider.autoLocal")}
+          label="Automatically share detected intros and credits"
           type="toggle"
           value={provider.is_submitter && autoLocal ? "true" : "false"}
           onChange={(value) => setAutoLocal(value === "true")}
           disabled={!provider.is_submitter || !contributeEnabled}
-          description={t("web.admin.settings.markers.provider.autoLocalDescription")}
+          description="Share intros and credits detected on this server that meet the minimum confidence under Advanced."
         />
       </div>
       {/* Lookup order and the confidence thresholds have working defaults;
@@ -381,9 +355,9 @@ function MarkerProviderTile({
         }
       >
         <SettingFieldRow
-          label={t("web.admin.settings.markers.provider.priority")}
+          label="Provider priority"
           htmlFor={priorityID}
-          description={t("web.admin.settings.markers.provider.priorityDescription")}
+          description="If providers return markers for the same section, prefer the provider with the lower number."
         >
           <Input
             id={priorityID}
@@ -396,10 +370,10 @@ function MarkerProviderTile({
           />
         </SettingFieldRow>
         <SettingFieldRow
-          label={t("web.admin.settings.markers.provider.fetchMinConfidence")}
+          label="Minimum confidence to use markers"
           htmlFor={fetchMinConfidenceID}
-          description={t("web.admin.settings.markers.provider.fetchMinConfidenceDescription")}
-          unit={t("web.admin.common.units.percent")}
+          description="Skip markers this provider rates lower, so another provider or local detection can fill them. 0% uses every marker."
+          unit="%"
         >
           <Input
             id={fetchMinConfidenceID}
@@ -414,10 +388,10 @@ function MarkerProviderTile({
           />
         </SettingFieldRow>
         <SettingFieldRow
-          label={t("web.admin.settings.markers.provider.contributeMinConfidence")}
+          label="Minimum confidence for automatic sharing"
           htmlFor={minConfidenceID}
-          description={t("web.admin.settings.markers.provider.contributeMinConfidenceDescription")}
-          unit={t("web.admin.common.units.percent")}
+          description="Choose a value from 0% to 100%. Recommended: 95%."
+          unit="%"
         >
           <Input
             id={minConfidenceID}
@@ -438,39 +412,27 @@ function MarkerProviderTile({
         <div className="border-border bg-muted/20 mt-3.5 rounded-md border px-3 py-3">
           <dl className="grid gap-x-6 gap-y-2 text-xs sm:grid-cols-2">
             <div className="flex justify-between gap-3">
-              <dt className="text-muted-foreground">
-                {t("web.admin.settings.markers.provider.statsTotal")}
-              </dt>
+              <dt className="text-muted-foreground">Total submissions</dt>
               <dd className="font-medium">{stats.total}</dd>
             </div>
             <div className="flex justify-between gap-3">
-              <dt className="text-muted-foreground">
-                {t("web.admin.settings.markers.provider.statsAccepted")}
-              </dt>
+              <dt className="text-muted-foreground">Accepted</dt>
               <dd className="font-medium">{stats.accepted}</dd>
             </div>
             <div className="flex justify-between gap-3">
-              <dt className="text-muted-foreground">
-                {t("web.admin.settings.markers.provider.statsPending")}
-              </dt>
+              <dt className="text-muted-foreground">Pending</dt>
               <dd className="font-medium">{stats.pending}</dd>
             </div>
             <div className="flex justify-between gap-3">
-              <dt className="text-muted-foreground">
-                {t("web.admin.settings.markers.provider.statsRejected")}
-              </dt>
+              <dt className="text-muted-foreground">Rejected</dt>
               <dd className="font-medium">{stats.rejected}</dd>
             </div>
             <div className="flex justify-between gap-3">
-              <dt className="text-muted-foreground">
-                {t("web.admin.settings.markers.provider.statsAcceptanceRate")}
-              </dt>
-              <dd className="font-medium">{formatRate(t, stats.acceptance_rate)}</dd>
+              <dt className="text-muted-foreground">Acceptance rate</dt>
+              <dd className="font-medium">{formatRate(stats.acceptance_rate)}</dd>
             </div>
             <div className="flex justify-between gap-3">
-              <dt className="text-muted-foreground">
-                {t("web.admin.settings.markers.provider.statsBestStreak")}
-              </dt>
+              <dt className="text-muted-foreground">Best streak</dt>
               <dd className="font-medium">{stats.best_streak}</dd>
             </div>
           </dl>
@@ -484,16 +446,9 @@ function MarkerProviderTile({
           onClick={save}
           disabled={!dirty || !priorityValid || !confidenceValid || updateProvider.isPending}
         >
-          {updateProvider.isPending
-            ? t("web.admin.settings.markers.provider.saving")
-            : t("common.save")}
+          {updateProvider.isPending ? "Saving..." : "Save"}
         </Button>
-        {/* The test checks the provider account, which needs the plugin's
-            key. Reading markers can work without one, so a keyless plugin
-            gets no test that would call a working provider broken. Until the
-            plugin's config is known the button stays hidden; a plugin that
-            declares no config reads as ready and keeps it. */}
-        {provider.is_submitter && credentialsReady === true && (
+        {provider.is_submitter && (
           <Button
             type="button"
             size="sm"
@@ -501,13 +456,11 @@ function MarkerProviderTile({
             onClick={validate}
             disabled={validateProvider.isPending}
           >
-            {validateProvider.isPending
-              ? t("web.admin.settings.markers.provider.testing")
-              : t("web.admin.settings.markers.provider.testConnection")}
+            {validateProvider.isPending ? "Testing..." : "Test connection"}
           </Button>
         )}
         <Button type="button" size="sm" variant="outline" onClick={onCollapse}>
-          {t("web.admin.settings.markers.provider.close")}
+          Close
         </Button>
       </ProviderPanelActions>
     </ProviderTile>

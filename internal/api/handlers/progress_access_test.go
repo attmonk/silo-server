@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"slices"
+	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -51,25 +52,51 @@ func ids(entries []userstore.WatchProgress) []string {
 	return out
 }
 
-// pageProgressStore serves rows already in listing order, resuming after the
-// key's media item, and counts its reads.
-type pageProgressStore struct {
-	userstore.UserStore
-	rows  []userstore.WatchProgress
-	reads int
-}
-
-func (s *pageProgressStore) ListProgressPage(_ context.Context, _, _ string, after *userstore.ProgressKey, limit int) ([]userstore.WatchProgress, error) {
-	s.reads++
-	start := 0
-	if after != nil {
-		start = slices.IndexFunc(s.rows, func(r userstore.WatchProgress) bool { return r.MediaItemID == after.MediaItemID }) + 1
+func TestFilterProgressEntriesByAccess(t *testing.T) {
+	// access.Scope sets DisabledLibraryIDs only when AllowedLibraryIDs is nil
+	// (see access.Scope docs), so the two restriction shapes are tested
+	// separately rather than as one impossible combined scope.
+	cases := []struct {
+		name  string
+		scope access.Scope
+	}{
+		{
+			name:  "allowed libraries + rating",
+			scope: access.Scope{AllowedLibraryIDs: []int{1, 2}, MaturityLimits: access.MaturityLimits{MaxContentRating: "PG-13"}},
+		},
+		{
+			name:  "disabled libraries + rating",
+			scope: access.Scope{DisabledLibraryIDs: []int{9}, MaturityLimits: access.MaturityLimits{MaxContentRating: "PG-13"}},
+		},
 	}
-	return s.rows[start:min(start+limit, len(s.rows))], nil
-}
 
-func (s *pageProgressStore) ForUser(context.Context, int) (userstore.UserStore, error) {
-	return s, nil
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lookup := &fakeProgressLookup{accessible: map[string]bool{"a": true, "c": true}}
 
-func (s *pageProgressStore) Close() error { return nil }
+			got, err := filterProgressEntriesByAccess(context.Background(), entries("a", "b", "c"), tc.scope, lookup)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			want := []string{"a", "c"}
+			if g := ids(got); len(g) != len(want) || g[0] != want[0] || g[1] != want[1] {
+				t.Fatalf("filtered entries = %v, want %v", g, want)
+			}
+
+			// Scope must be forwarded verbatim to the lookup.
+			if !slices.Equal(lookup.gotAllowed, tc.scope.AllowedLibraryIDs) {
+				t.Errorf("allowed folders = %v, want %v", lookup.gotAllowed, tc.scope.AllowedLibraryIDs)
+			}
+			if !slices.Equal(lookup.gotDisabled, tc.scope.DisabledLibraryIDs) {
+				t.Errorf("disabled folders = %v, want %v", lookup.gotDisabled, tc.scope.DisabledLibraryIDs)
+			}
+			if len(lookup.gotContentIDs) != 3 {
+				t.Errorf("content ids = %v, want 3 entries", lookup.gotContentIDs)
+			}
+			if lookup.gotRating != tc.scope.MaxContentRating {
+				t.Errorf("max content rating = %q, want %q", lookup.gotRating, tc.scope.MaxContentRating)
+			}
+		})
+	}
+}

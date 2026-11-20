@@ -3,13 +3,12 @@ package playback
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // TextSubtitleTrack names one cached text rendition of an embedded subtitle
@@ -81,7 +80,7 @@ func ExtractTextSubtitlesToFiles(ctx context.Context, inputPath string, outputs 
 	if ffmpegPath == "" {
 		ffmpegPath = defaultFFmpegBinary
 	}
-	cmd := fspath.CommandContext(ctx, ffmpegPath, args...)
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -97,7 +96,7 @@ func ExtractTextSubtitlesToFiles(ctx context.Context, inputPath string, outputs 
 // would otherwise pay that again for every track. A request whose rendition
 // is already being filled waits for that fill instead of starting a second
 // demux. When the batch cannot produce want, want is extracted on its own
-// with single. Either demux runs in a demux slot (admitDemux).
+// with single.
 func (c *SubtitleCache) ExtractTextTracks(
 	ctx context.Context,
 	inputPath string,
@@ -113,7 +112,6 @@ func (c *SubtitleCache) ExtractTextTracks(
 	if want.Format == "" {
 		return nil, fmt.Errorf("unsupported cached subtitle format")
 	}
-	single = admittedText(single)
 	if data, found, err := c.lookupTextRendition(inputPath, want); found {
 		return data, err
 	}
@@ -138,12 +136,9 @@ func (c *SubtitleCache) ExtractTextTracks(
 		}
 		return c.ExtractText(ctx, inputPath, want.Ordinal, want.Format, single)
 	}
-	if err := commitTextFills(ctx, inputPath, fills, admittedBatch(batch)); err != nil {
+	if err := commitTextFills(ctx, inputPath, fills, batch); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
-		}
-		if errors.Is(err, ErrSubtitleReadsBusy) {
-			return nil, err
 		}
 		slog.WarnContext(ctx, "subtitle batch extraction failed; extracting the requested track alone",
 			"input", inputPath, "track", want.Ordinal, "tracks", len(fills), "error", err)
@@ -155,30 +150,6 @@ func (c *SubtitleCache) ExtractTextTracks(
 	// The batch ran but want could not be published (for example, the source
 	// changed during the demux).
 	return c.ExtractText(ctx, inputPath, want.Ordinal, want.Format, single)
-}
-
-// admittedBatch runs batch in a demux slot.
-func admittedBatch(batch TextSubtitleBatchFunc) TextSubtitleBatchFunc {
-	return func(ctx context.Context, inputPath string, outputs []TextSubtitleOutput) error {
-		release, err := admitDemux()
-		if err != nil {
-			return err
-		}
-		defer release()
-		return batch(ctx, inputPath, outputs)
-	}
-}
-
-// admittedText runs a single-track extract in a demux slot.
-func admittedText(extract func(context.Context) ([]byte, error)) func(context.Context) ([]byte, error) {
-	return func(ctx context.Context) ([]byte, error) {
-		release, err := admitDemux()
-		if err != nil {
-			return nil, err
-		}
-		defer release()
-		return extract(ctx)
-	}
 }
 
 // lookupTextRendition reads a cached rendition. A stream without cues is
@@ -216,22 +187,17 @@ func (c *SubtitleCache) WarmTextTracks(inputPath string, tracks []TextSubtitleTr
 	}
 	go func() {
 		defer func() { <-c.warmSem }()
-		c.runTextWarm(inputPath, fills, batch)
+		ctx, cancel := context.WithTimeout(context.Background(), subtitleCacheWarmTimeout)
+		defer cancel()
+		start := time.Now()
+		if err := commitTextFills(ctx, inputPath, fills, batch); err != nil {
+			slog.Warn("subtitle text warm failed", "input", inputPath, "tracks", len(fills),
+				"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+			return
+		}
+		slog.Info("subtitle text warm finished", "input", inputPath, "tracks", len(fills),
+			"elapsed_ms", time.Since(start).Milliseconds())
 	}()
-}
-
-// runTextWarm batch-extracts fills. The caller holds a warm slot.
-func (c *SubtitleCache) runTextWarm(inputPath string, fills []textFill, batch TextSubtitleBatchFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), subtitleCacheWarmTimeout)
-	defer cancel()
-	start := time.Now()
-	if err := commitTextFills(ctx, inputPath, fills, batch); err != nil {
-		slog.Warn("subtitle text warm failed", "input", inputPath, "tracks", len(fills),
-			"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
-		return
-	}
-	slog.Info("subtitle text warm finished", "input", inputPath, "tracks", len(fills),
-		"elapsed_ms", time.Since(start).Milliseconds())
 }
 
 type textFill struct {
@@ -294,7 +260,7 @@ func (c *SubtitleCache) waitForTextFill(ctx context.Context, inputPath string, t
 	if c.dir() == "" {
 		return false
 	}
-	src, err := fspath.Stat(inputPath)
+	src, err := os.Stat(inputPath)
 	if err != nil {
 		return false
 	}

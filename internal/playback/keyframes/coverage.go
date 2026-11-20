@@ -6,8 +6,6 @@ import (
 	"io"
 	"math"
 	"slices"
-
-	"github.com/Silo-Server/silo-server/internal/matroska"
 )
 
 // ErrIncompleteIndex means the file's Cues leave out some video keyframes.
@@ -17,13 +15,13 @@ import (
 var ErrIncompleteIndex = fmt.Errorf("%w: cues leave out video keyframes", ErrNoIndex)
 
 const (
-	idCueClusterPosition = matroska.IDCueClusterPosition
-	idClusterTimestamp   = matroska.IDClusterTimestamp
-	idSimpleBlock        = matroska.IDSimpleBlock
-	idBlockGroup         = matroska.IDBlockGroup
-	idBlock              = matroska.IDBlock
-	idReferenceBlock     = matroska.IDReferenceBlock
-	idBlockDuration      = matroska.IDBlockDuration
+	idCueClusterPosition = 0xF1
+	idClusterTimestamp   = 0xE7
+	idSimpleBlock        = 0xA3
+	idBlockGroup         = 0xA0
+	idBlock              = 0xA1
+	idReferenceBlock     = 0xFB
+	idBlockDuration      = 0x9B
 
 	// coverageSamples is how many cued clusters, spread through the file, have
 	// their keyframes checked against the Cues, each with the cluster after
@@ -33,9 +31,6 @@ const (
 	coverageSamples = 4
 	// maxClusterChildren bounds the elements read from one cluster.
 	maxClusterChildren = 20_000
-	// maxTailElements bounds the top-level elements, mostly clusters, read
-	// after the last cue's cluster (tailVideoEnd).
-	maxTailElements = 64
 )
 
 // checkCueCoverage reads the video keyframes of a few clusters spread
@@ -64,14 +59,7 @@ func checkCueCoverage(r io.ReaderAt, segStart, segEnd int64, video uint64, ticks
 					return ErrIncompleteIndex
 				}
 			}
-			if next >= segEnd {
-				break
-			}
-			id, _, _, err := matroska.ReadElementHeader(r, next)
-			if err != nil && !isShortRead(err) {
-				return fmt.Errorf("keyframes: read element at %d: %w", next, err)
-			}
-			if err != nil || id != idCluster {
+			if id, _, _, err := readElementHeader(r, next); next >= segEnd || err != nil || id != idCluster {
 				break
 			}
 			at = next
@@ -84,7 +72,7 @@ func checkCueCoverage(r io.ReaderAt, segStart, segEnd int64, video uint64, ticks
 // keyframes in the cluster at off, and where the next element starts. It
 // reads element headers and the first bytes of each block, never the frames.
 func clusterKeyframes(r io.ReaderAt, off, segEnd int64, video uint64, last *videoEnd) ([]uint64, int64, error) {
-	id, size, headerLen, err := matroska.ReadElementHeader(r, off)
+	id, size, headerLen, err := readElementHeader(r, off)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -105,7 +93,7 @@ func clusterKeyframes(r io.ReaderAt, off, segEnd int64, video uint64, last *vide
 	at := off + headerLen
 	n := 0
 	for ; at < end && n < maxClusterChildren; n++ {
-		id, size, headerLen, err := matroska.ReadElementHeader(r, at)
+		id, size, headerLen, err := readElementHeader(r, at)
 		if err != nil {
 			if isShortRead(err) {
 				break
@@ -121,13 +109,13 @@ func clusterKeyframes(r io.ReaderAt, off, segEnd int64, video uint64, last *vide
 		data := at + headerLen
 		switch id {
 		case idClusterTimestamp:
-			b, err := matroska.ReadElementData(r, data, size, 8)
+			b, err := readElementData(r, data, size, 8)
 			if err != nil {
 				return nil, 0, err
 			}
-			clusterTicks, haveTicks = matroska.Uint(b), true
+			clusterTicks, haveTicks = readUint(b), true
 		case idSimpleBlock:
-			track, rel, flags, _, err := readBlockHeader(r, data, size)
+			track, rel, flags, err := readBlockHeader(r, data, size)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -176,20 +164,19 @@ func clusterKeyframes(r io.ReaderAt, off, segEnd int64, video uint64, last *vide
 }
 
 // readBlockHeader reads a (Simple)Block's track number, timestamp relative
-// to its cluster, flags, and the header's length, after which the frame
-// data starts.
-func readBlockHeader(r io.ReaderAt, off, size int64) (track uint64, rel int64, flags byte, headerLen int64, err error) {
+// to its cluster, and flags.
+func readBlockHeader(r io.ReaderAt, off, size int64) (track uint64, rel int64, flags byte, err error) {
 	var buf [12]byte
 	n := min(int64(len(buf)), size)
 	if _, err := r.ReadAt(buf[:n], off); err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, err
 	}
-	track, trackLen, ok := matroska.ReadVint(buf[:n], false)
+	track, trackLen, ok := readVint(buf[:n], false)
 	if !ok || int64(trackLen+3) > n {
-		return 0, 0, 0, 0, fmt.Errorf("short block header at %d", off)
+		return 0, 0, 0, fmt.Errorf("short block header at %d", off)
 	}
 	rel = int64(int16(binary.BigEndian.Uint16(buf[trackLen:])))
-	return track, rel, buf[trackLen+2], int64(trackLen + 3), nil
+	return track, rel, buf[trackLen+2], nil
 }
 
 // readBlockGroup reads a BlockGroup's block header, whether it is a keyframe
@@ -200,7 +187,7 @@ func readBlockGroup(r io.ReaderAt, off, size int64) (track uint64, rel int64, ke
 	key = true
 	haveBlock := false
 	for at := off; at < end; {
-		id, childSize, headerLen, err := matroska.ReadElementHeader(r, at)
+		id, childSize, headerLen, err := readElementHeader(r, at)
 		if err != nil {
 			return 0, 0, false, 0, err
 		}
@@ -209,7 +196,7 @@ func readBlockGroup(r io.ReaderAt, off, size int64) (track uint64, rel int64, ke
 		}
 		switch id {
 		case idBlock:
-			track, rel, _, _, err = readBlockHeader(r, at+headerLen, childSize)
+			track, rel, _, err = readBlockHeader(r, at+headerLen, childSize)
 			if err != nil {
 				return 0, 0, false, 0, err
 			}
@@ -217,11 +204,11 @@ func readBlockGroup(r io.ReaderAt, off, size int64) (track uint64, rel int64, ke
 		case idReferenceBlock:
 			key = false
 		case idBlockDuration:
-			b, err := matroska.ReadElementData(r, at+headerLen, childSize, 8)
+			b, err := readElementData(r, at+headerLen, childSize, 8)
 			if err != nil {
 				return 0, 0, false, 0, err
 			}
-			if d := matroska.Uint(b); d <= math.MaxInt64 {
+			if d := readUint(b); d <= math.MaxInt64 {
 				duration = int64(d)
 			}
 		}
@@ -231,6 +218,25 @@ func readBlockGroup(r io.ReaderAt, off, size int64) (track uint64, rel int64, ke
 		return 0, 0, false, 0, nil
 	}
 	return track, rel, key, duration, nil
+}
+
+// VerifyMatroska reads a Matroska file's index like ReadMatroska and then
+// checks it against every cluster: each video keyframe must have a cue, and
+// each video cue must be a keyframe. Only then does the index list exactly
+// the keyframes FFmpeg cuts at. It reads every block's header, which on a
+// large file can take as long as reading the file, so callers run it once per
+// file in the background (see Load).
+func VerifyMatroska(r io.ReaderAt, size int64) (Index, error) {
+	m, err := readMatroska(r, size)
+	if err != nil {
+		return Index{}, err
+	}
+	end, err := verifyAllClusters(r, m)
+	if err != nil {
+		return Index{}, err
+	}
+	m.VideoEnd = end.seconds(m.timescale, m.frameSeconds)
+	return m.Index, nil
 }
 
 // videoEnd keeps the two latest distinct timestamps of a track's frames, and
@@ -280,70 +286,50 @@ func (v videoEnd) seconds(timescale int64, frame float64) float64 {
 	return float64(v.last)*scale + frame
 }
 
-// tailVideoEnd reads the clusters from the last cue's to the end of the
-// segment and returns where the video's last frame ends. FFmpeg's last
-// segment ends there, not at the container's duration. The clusters it reads
-// must have every video keyframe cued, and the last cue must be one of them:
-// a cue on a frame that isn't a keyframe would plan a boundary FFmpeg can't
-// cut at. A muxer that cues every keyframe leaves a few seconds after the
-// last cue, so more than maxTailElements elements means the Cues leave out
-// the end of the file.
-func tailVideoEnd(r io.ReaderAt, segStart, segEnd int64, video uint64, ticks []uint64, clusters []int64) (videoEnd, error) {
+func verifyAllClusters(r io.ReaderAt, m matroskaIndex) (videoEnd, error) {
 	var end videoEnd
-	lastCue := ticks[len(ticks)-1]
-	cued := false
-	start := segStart + clusters[len(clusters)-1]
-	// Count the elements first, one header read each, so Cues that stop
-	// early cost a few reads rather than every block of the clusters after
-	// them. An unknown-size element can't be skipped; the walk below counts
-	// what follows it.
-	for n, at := 0, start; at < segEnd; n++ {
-		if n == maxTailElements {
-			return end, ErrIncompleteIndex
-		}
-		_, size, headerLen, err := matroska.ReadElementHeader(r, at)
-		if err != nil || size == unknownSize {
-			break
-		}
-		at += headerLen + size
-	}
-	at := start
-	for n := 0; at < segEnd; n++ {
-		if n == maxTailElements {
-			return end, ErrIncompleteIndex
-		}
-		id, size, headerLen, err := matroska.ReadElementHeader(r, at)
+	// found marks the cues whose keyframe has been seen.
+	found := make([]bool, len(m.ticks))
+	nFound := 0
+	for at := m.segStart; at < m.segEnd; {
+		id, size, headerLen, err := readElementHeader(r, at)
 		if err != nil {
 			if isShortRead(err) {
 				break
 			}
-			return end, fmt.Errorf("keyframes: read the end of the file at %d: %w", at, err)
+			return end, err
 		}
-		if id != idCluster {
-			if size == unknownSize {
-				// It can't be skipped, so the clusters after it, if any,
-				// can't be read.
+		if id == idCluster {
+			keys, next, err := clusterKeyframes(r, at, m.segEnd, m.video, &end)
+			if err != nil {
+				return end, err
+			}
+			for _, k := range keys {
+				i, ok := slices.BinarySearch(m.ticks, k)
+				if !ok {
+					return end, ErrIncompleteIndex
+				}
+				if !found[i] {
+					found[i] = true
+					nFound++
+				}
+			}
+			if next <= at {
 				return end, ErrIncompleteIndex
 			}
-			at += headerLen + size
+			at = next
 			continue
 		}
-		keys, next, err := clusterKeyframes(r, at, segEnd, video, &end)
-		if err != nil {
-			return end, fmt.Errorf("keyframes: check cluster at %d: %w", at, err)
-		}
-		for _, k := range keys {
-			if _, ok := slices.BinarySearch(ticks, k); !ok {
-				return end, ErrIncompleteIndex
-			}
-			cued = cued || k == lastCue
-		}
-		if next <= at {
+		if size == unknownSize {
+			// An unknown-size element other than a cluster can't be
+			// skipped, so the rest of the file can't be checked.
 			return end, ErrIncompleteIndex
 		}
-		at = next
+		at += headerLen + size
 	}
-	if !cued {
+	if nFound != len(m.ticks) {
+		// A cue on a frame that isn't a keyframe would put a planned
+		// boundary where FFmpeg can't cut.
 		return end, ErrIncompleteIndex
 	}
 	return end, nil

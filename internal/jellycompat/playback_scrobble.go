@@ -368,13 +368,7 @@ func (h *PlaybackHandler) dispatchCompatScrobbleEventConfirmed(
 	if h == nil || h.WatchScrobbler == nil {
 		return nil
 	}
-	timeout := compatSessionSyncTimeout
-	if confirmStop {
-		// A confirmed stop waits for the provider, which needs watch-sync's
-		// whole confirmed-stop budget, not the quick-sync bound.
-		timeout = compatConfirmedStopTimeout
-	}
-	scrobbleCtx, cancel := compatDetachedContextFor(ctx, timeout)
+	scrobbleCtx, cancel := compatDetachedContext(ctx)
 	defer cancel()
 	var err error
 	switch action {

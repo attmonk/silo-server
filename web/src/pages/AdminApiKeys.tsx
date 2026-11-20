@@ -18,15 +18,11 @@ import {
   type AdminAPIKeyMetadata,
 } from "@/api/v2/adminApiKeys";
 import { isCapturedProfileAuthorityActive } from "@/api/client";
-import type { components } from "@/api/v2/schema";
 import { V2ProblemError } from "@/api/v2/request";
 import { PageHeader } from "@/components/page/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
-import { Checkbox } from "@/components/ui/checkbox";
-import { RadioCardItem, RadioGroup } from "@/components/ui/radio-group";
 import {
   Table,
   TableBody,
@@ -56,51 +52,27 @@ import { toast } from "sonner";
 import { canManageAccount } from "@/lib/accountOwner";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { formatDate } from "@/lib/datetime";
-import { formatLocale } from "@/lib/appLocale";
-import { useT, type MessageKey, type Translate } from "@/i18n";
 
 type Tier = AdminAPIKeyMetadata["rate_tier"];
-type Scope = components["schemas"]["APIKeyScope"];
 
 // `rate_tier` only selects which request rate limit the key's own counter
 // uses (Security & access → rate limits). It never changes what the key can
 // reach, so the page calls it a rate limit rather than a tier.
-const RATE_LIMIT_LABELS: Record<Tier, MessageKey> = {
-  standard: "web.admin.apiKeys.rateLimit.standard",
-  elevated: "web.admin.apiKeys.rateLimit.elevated",
+const RATE_LIMIT_LABELS: Record<Tier, string> = {
+  standard: "Standard",
+  elevated: "Elevated",
 };
 
-function rateLimitLabel(t: Translate, tier: Tier): string {
-  const key = RATE_LIMIT_LABELS[tier];
-  return key ? t(key) : tier;
+function rateLimitLabel(tier: Tier): string {
+  return RATE_LIMIT_LABELS[tier] ?? tier;
 }
 
-function formatRateLimit(
-  t: Translate,
-  limit: { requests_per_second: number; requests_per_minute: number },
-) {
-  const format = new Intl.NumberFormat(formatLocale());
-  return t("web.admin.apiKeys.rateLimit.values", {
-    per_second: format.format(limit.requests_per_second),
-    per_minute: format.format(limit.requests_per_minute),
-  });
+function formatRateLimit(limit: { requests_per_second: number; requests_per_minute: number }) {
+  const format = new Intl.NumberFormat();
+  return `${format.format(limit.requests_per_second)} requests/s, ${format.format(limit.requests_per_minute)}/min`;
 }
-// An empty scope list is how the server stores a full-access key.
-function KeyAccess({ scopes }: { scopes: string[] }) {
-  const t = useT();
-  if (!scopes.length) return <span>{t("web.admin.apiKeys.access.full")}</span>;
-  return (
-    <div className="flex max-w-xs flex-wrap gap-1">
-      {scopes.map((scope) => (
-        <Badge key={scope} variant="outline" className="font-mono">
-          {scope}
-        </Badge>
-      ))}
-    </div>
-  );
-}
-function message(t: Translate, error: unknown) {
-  return error instanceof Error ? error.message : t("web.admin.apiKeys.error.requestFailed");
+function message(error: unknown) {
+  return error instanceof Error ? error.message : "The request could not be completed.";
 }
 
 export default function AdminApiKeys() {
@@ -108,7 +80,6 @@ export default function AdminApiKeys() {
   return <ApiKeyManager key={adminApiKeyScope()} />;
 }
 function ApiKeyManager() {
-  const t = useT();
   const capability = useAdminApiKeyCapabilities();
   const viewerId = useAuth().user?.id;
   // Only the server Owner may change or revoke another admin's keys, and
@@ -149,7 +120,7 @@ function ApiKeyManager() {
       const editor = await getAdminApiKey(id);
       if (isCapturedProfileAuthorityActive(editor.profileContext)) setSelection({ editor, mode });
     } catch (e) {
-      setError(message(t, e));
+      setError(message(e));
     } finally {
       openingRef.current = false;
       setOpening(false);
@@ -158,8 +129,8 @@ function ApiKeyManager() {
   return (
     <div className="space-y-6 pb-4 sm:pb-6">
       <PageHeader
-        title={t("web.admin.apiKeys.title")}
-        subtitle={t("web.admin.apiKeys.subtitle")}
+        title="API Keys"
+        subtitle="Create and manage credentials for integrations and automation."
         actions={
           <Button
             size="sm"
@@ -167,66 +138,55 @@ function ApiKeyManager() {
             onClick={() => setCreateOpen(true)}
           >
             <Plus data-icon="inline-start" />
-            {t("web.admin.apiKeys.createKey")}
+            Create Key
           </Button>
         }
       />
       {capability.isPending ? (
-        <p role="status">{t("web.admin.apiKeys.checking")}</p>
+        <p role="status">Checking API key management…</p>
       ) : capability.isError ? (
         <div role="alert">
-          {t("web.admin.apiKeys.retryAvailability", {
-            error: message(t, capability.error),
-            retry: (chunks) => (
-              <Button variant="outline" onClick={() => void capability.refetch()}>
-                {chunks}
-              </Button>
-            ),
-          })}
+          {message(capability.error)}{" "}
+          <Button variant="outline" onClick={() => void capability.refetch()}>
+            Retry availability
+          </Button>
         </div>
       ) : !capability.data?.available ? (
-        <p role="alert">{t("web.admin.apiKeys.unavailable")}</p>
+        <p role="alert">API key management is unavailable.</p>
       ) : (
         <>
           {error && <p role="alert">{error}</p>}
           {keys.isError && (
             <div role="alert">
-              {t(
-                rows.length
-                  ? "web.admin.apiKeys.list.partialError"
-                  : "web.admin.apiKeys.list.loadError",
-                {
-                  error: message(t, keys.error),
-                  reload: (chunks) => (
-                    <Button variant="outline" onClick={() => void keys.restart()}>
-                      {chunks}
-                    </Button>
-                  ),
-                },
-              )}
+              {rows.length
+                ? "Some keys could not be loaded. The rows below may be out of date."
+                : "API keys could not be loaded."}{" "}
+              {message(keys.error)}{" "}
+              <Button variant="outline" onClick={() => void keys.restart()}>
+                Reload keys
+              </Button>
             </div>
           )}
           {keys.isPending ? (
-            <p role="status">{t("web.admin.apiKeys.list.loading")}</p>
+            <p role="status">Loading API keys…</p>
           ) : (
             <div className="surface-panel overflow-x-auto rounded-2xl">
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>{t("web.admin.apiKeys.list.column.label")}</TableHead>
-                    <TableHead>{t("web.admin.apiKeys.list.column.user")}</TableHead>
-                    <TableHead>{t("web.admin.apiKeys.list.column.prefix")}</TableHead>
-                    <TableHead>{t("web.admin.apiKeys.list.column.access")}</TableHead>
-                    <TableHead>{t("web.admin.apiKeys.list.column.rateLimit")}</TableHead>
-                    <TableHead>{t("web.admin.apiKeys.list.column.created")}</TableHead>
-                    <TableHead>{t("web.admin.apiKeys.list.column.lastUsed")}</TableHead>
-                    <TableHead>{t("web.admin.apiKeys.list.column.actions")}</TableHead>
+                    <TableHead>Label</TableHead>
+                    <TableHead>User</TableHead>
+                    <TableHead>Key prefix</TableHead>
+                    <TableHead>Rate limit</TableHead>
+                    <TableHead>Created</TableHead>
+                    <TableHead>Last Used</TableHead>
+                    <TableHead>Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {rows.length === 0 && !keys.isError && (
                     <TableRow>
-                      <TableCell colSpan={8}>{t("web.admin.apiKeys.list.empty")}</TableCell>
+                      <TableCell colSpan={7}>No API keys yet.</TableCell>
                     </TableRow>
                   )}
                   {rows.map((key) => (
@@ -234,21 +194,12 @@ function ApiKeyManager() {
                       <TableCell>{key.label}</TableCell>
                       <TableCell>{key.username}</TableCell>
                       <TableCell>
-                        <code>
-                          {key.key_prefix
-                            ? t("web.admin.apiKeys.list.prefix", { prefix: key.key_prefix })
-                            : t("web.admin.apiKeys.list.prefixUnavailable")}
-                        </code>
+                        <code>{key.key_prefix ? `${key.key_prefix}…` : "Unavailable"}</code>
                       </TableCell>
-                      <TableCell>
-                        <KeyAccess scopes={key.scopes} />
-                      </TableCell>
-                      <TableCell>{rateLimitLabel(t, key.rate_tier)}</TableCell>
+                      <TableCell>{rateLimitLabel(key.rate_tier)}</TableCell>
                       <TableCell>{formatDate(key.created_at)}</TableCell>
                       <TableCell>
-                        {key.last_used_at
-                          ? formatDate(key.last_used_at)
-                          : t("web.admin.apiKeys.list.neverUsed")}
+                        {key.last_used_at ? formatDate(key.last_used_at) : "Never"}
                       </TableCell>
                       <TableCell>
                         {!ownerLocked(key.user_id) && (
@@ -257,23 +208,16 @@ function ApiKeyManager() {
                               variant="outline"
                               size="sm"
                               disabled={opening}
-                              aria-label={t("web.admin.apiKeys.list.editRateLimitAriaLabel", {
-                                label: key.label,
-                              })}
+                              aria-label={`Edit rate limit for ${key.label}`}
                               onClick={() => void openEditor(key.id, "tier")}
                             >
-                              {t("web.admin.apiKeys.list.editRateLimit", {
-                                label: key.label,
-                                hidden: (chunks) => <span className="sr-only">{chunks}</span>,
-                              })}
+                              Edit rate limit<span className="sr-only"> for {key.label}</span>
                             </Button>
                             <Button
                               variant="ghost"
                               size="icon"
                               disabled={opening}
-                              aria-label={t("web.admin.apiKeys.list.revokeAriaLabel", {
-                                label: key.label,
-                              })}
+                              aria-label={`Revoke API key ${key.label}`}
                               onClick={() => void openEditor(key.id, "revoke")}
                             >
                               <Trash2 />
@@ -293,9 +237,7 @@ function ApiKeyManager() {
               disabled={keys.isFetching || keys.isError}
               onClick={() => void keys.fetchNextPage()}
             >
-              {keys.isFetchingNextPage
-                ? t("web.admin.apiKeys.list.loadingMore")
-                : t("web.admin.apiKeys.list.loadMore")}
+              {keys.isFetchingNextPage ? "Loading…" : "Load more keys"}
             </Button>
           )}
         </>
@@ -308,15 +250,11 @@ function ApiKeyManager() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t("web.admin.apiKeys.create.title")}</DialogTitle>
-            <DialogDescription>{t("web.admin.apiKeys.create.description")}</DialogDescription>
+            <DialogTitle>Create API Key</DialogTitle>
+            <DialogDescription>The full credential is shown only once.</DialogDescription>
           </DialogHeader>
           {createOpen && (
-            <CreateApiKeyForm
-              scopes={capability.data?.scopes ?? []}
-              onClose={() => setCreateOpen(false)}
-              onBusy={setCreating}
-            />
+            <CreateApiKeyForm onClose={() => setCreateOpen(false)} onBusy={setCreating} />
           )}
         </DialogContent>
       </Dialog>
@@ -340,7 +278,6 @@ function ApiKeyEditor({
   mode: "tier" | "revoke";
   onClose: () => void;
 }) {
-  const t = useT();
   const [editor, setEditor] = useState(initial);
   const [tier, setTier] = useState<Tier>(initial.body.rate_tier);
   const [error, setError] = useState("");
@@ -354,12 +291,7 @@ function ApiKeyEditor({
   const rateLimits = useRateLimitConfig();
   const optionLabel = (option: Tier) => {
     const limit = rateLimits.data?.tiers?.[option];
-    return limit
-      ? t("web.admin.apiKeys.rateLimit.option", {
-          name: rateLimitLabel(t, option),
-          limits: formatRateLimit(t, limit),
-        })
-      : rateLimitLabel(t, option);
+    return limit ? `${rateLimitLabel(option)} — ${formatRateLimit(limit)}` : rateLimitLabel(option);
   };
   async function act(reload: boolean) {
     if (lock.current) return;
@@ -379,8 +311,8 @@ function ApiKeyEditor({
       setReloadRequired(true);
       setError(
         e instanceof V2ProblemError && e.status === 412
-          ? t("web.admin.apiKeys.editor.conflict")
-          : t("web.admin.apiKeys.editor.failed", { error: message(t, e) }),
+          ? "This key changed. Your draft is preserved. Reload the current key before deciding whether to apply it."
+          : `${message(e)} Reload the current key to check whether the change was applied.`,
       );
     } finally {
       lock.current = false;
@@ -397,22 +329,18 @@ function ApiKeyEditor({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
-            {mode === "tier"
-              ? t("web.admin.apiKeys.editor.titleRateLimit")
-              : t("web.admin.apiKeys.editor.titleRevoke")}
+            {mode === "tier" ? "Edit API key rate limit" : "Revoke API key"}
           </DialogTitle>
           <DialogDescription>
+            {editor.body.label}
             {mode === "revoke"
-              ? t("web.admin.apiKeys.editor.descriptionRevoke", { label: editor.body.label })
-              : t("web.admin.apiKeys.editor.descriptionRateLimit", {
-                  label: editor.body.label,
-                  rate_limit: rateLimitLabel(t, editor.body.rate_tier),
-                })}
+              ? " — revocation cannot be undone."
+              : ` — current rate limit: ${rateLimitLabel(editor.body.rate_tier)}`}
           </DialogDescription>
         </DialogHeader>
         {mode === "tier" && (
           <div className="flex flex-col gap-2">
-            <Label htmlFor="key-tier">{t("web.admin.apiKeys.editor.newRateLimit")}</Label>
+            <Label htmlFor="key-tier">New rate limit</Label>
             <Select value={tier} onValueChange={(value) => setTier(value as Tier)} disabled={busy}>
               <SelectTrigger id="key-tier">
                 <SelectValue />
@@ -425,30 +353,27 @@ function ApiKeyEditor({
               </SelectContent>
             </Select>
             <p className="text-muted-foreground text-sm">
-              {t("web.admin.apiKeys.editor.rateLimitHelp")}
+              Sets how many requests this key can make. It doesn&apos;t change what the key can
+              access or its scopes.
             </p>
           </div>
         )}
         {error && <p role="alert">{error}</p>}
         {reloadRequired && (
           <Button variant="outline" disabled={busy} onClick={() => void act(true)}>
-            {t("web.admin.apiKeys.editor.reload")}
+            Reload current key
           </Button>
         )}
         <DialogFooter>
           <Button variant="outline" disabled={busy} onClick={onClose}>
-            {t("common.cancel")}
+            Cancel
           </Button>
           <Button
             variant={mode === "revoke" ? "destructive" : "default"}
             disabled={busy || reloadRequired}
             onClick={() => void act(false)}
           >
-            {busy
-              ? t("web.admin.apiKeys.editor.working")
-              : mode === "revoke"
-                ? t("web.admin.apiKeys.editor.revoke")
-                : t("web.admin.apiKeys.editor.save")}
+            {busy ? "Working…" : mode === "revoke" ? "Revoke" : "Save rate limit"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -456,51 +381,39 @@ function ApiKeyEditor({
   );
 }
 function CreateApiKeyForm({
-  scopes,
   onClose,
   onBusy,
 }: {
-  scopes: Scope[];
   onClose: () => void;
   onBusy: (busy: boolean) => void;
 }) {
-  const t = useT();
   const { user } = useAuth();
   const users = useAdminUsers();
   const viewerIsOwner = users.data?.some((u) => u.id === user?.id && u.is_owner) ?? false;
   const [profileContext] = useState(captureAdminApiKeyAuthority);
   const [label, setLabel] = useState("");
   const [userId, setUserId] = useState(String(user?.id ?? ""));
-  const [access, setAccess] = useState<"full" | "scoped">("full");
-  const [chosen, setChosen] = useState<string[]>([]);
-  // The server reads an empty list as full access, so a scoped key needs at
-  // least one scope before it can be created.
-  const scopedWithoutScopes = access === "scoped" && chosen.length === 0;
   const [secret, setSecret] = useState<string | null>(null);
   const [error, setError] = useState("");
   const lock = useRef(false);
   const create = useAdminCreateApiKey();
   async function submit(e: FormEvent) {
     e.preventDefault();
-    if (lock.current || scopedWithoutScopes) return;
+    if (lock.current) return;
     lock.current = true;
     onBusy(true);
     setError("");
     try {
       const result = await create.mutateAsync({
-        body: {
-          label,
-          ...(userId ? { user_id: userId } : {}),
-          ...(access === "scoped" ? { scopes: chosen } : {}),
-        },
+        body: { label, ...(userId ? { user_id: userId } : {}) },
         profileContext,
       });
       if (isCapturedProfileAuthorityActive(profileContext)) setSecret(result.key);
     } catch (e) {
       setError(
         e instanceof V2ProblemError && e.status < 500
-          ? message(t, e)
-          : t("web.admin.apiKeys.create.uncertain"),
+          ? message(e)
+          : "The creation result is uncertain. Reload the key list before deciding whether to create another key; its secret cannot be recovered from the list.",
       );
     } finally {
       lock.current = false;
@@ -515,32 +428,32 @@ function CreateApiKeyForm({
     try {
       await copyTextToClipboard(secret!);
     } catch {
-      setError(t("web.admin.apiKeys.create.copyFailed"));
+      setError("Couldn't copy — select the key and copy it manually");
       return;
     }
-    toast.success(t("web.admin.apiKeys.create.copied"));
+    toast.success("Copied to clipboard");
     onClose();
   }
   if (secret)
     return (
       <div className="flex flex-col gap-4">
-        <p>{t("web.admin.apiKeys.create.secretNotice")}</p>
+        <p>Copy your API key now. You cannot retrieve the full key again.</p>
         <code className="break-all">{secret}</code>
         {error && <p role="alert">{error}</p>}
         <Button onClick={() => void copy()}>
           <Copy data-icon="inline-start" />
-          {t("web.admin.apiKeys.create.copyAndClose")}
+          Copy &amp; Close
         </Button>
       </div>
     );
   return (
     <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-4">
       <div className="flex flex-col gap-2">
-        <Label htmlFor="key-label">{t("web.admin.apiKeys.create.label")}</Label>
+        <Label htmlFor="key-label">Label</Label>
         <Input id="key-label" value={label} onChange={(e) => setLabel(e.target.value)} required />
       </div>
       <div className="flex flex-col gap-2">
-        <Label htmlFor="key-user">{t("web.admin.apiKeys.create.user")}</Label>
+        <Label htmlFor="key-user">User</Label>
         <Select value={userId} onValueChange={setUserId}>
           <SelectTrigger id="key-user">
             <SelectValue />
@@ -558,70 +471,14 @@ function CreateApiKeyForm({
           </SelectContent>
         </Select>
       </div>
-      {scopes.length > 0 && (
-        <fieldset className="flex min-w-0 flex-col gap-2">
-          <legend className="mb-2 text-sm font-medium">
-            {t("web.admin.apiKeys.create.access")}
-          </legend>
-          <RadioGroup
-            value={access}
-            onValueChange={(value) => setAccess(value as "full" | "scoped")}
-            aria-label={t("web.admin.apiKeys.create.access")}
-          >
-            <RadioCardItem
-              value="full"
-              label={t("web.admin.apiKeys.access.full")}
-              hint={t("web.admin.apiKeys.create.accessFullHint")}
-            />
-            <RadioCardItem
-              value="scoped"
-              label={t("web.admin.apiKeys.create.accessScoped")}
-              hint={t("web.admin.apiKeys.create.accessScopedHint")}
-            />
-          </RadioGroup>
-          {access === "scoped" && (
-            <div className="flex flex-col gap-3 pt-1">
-              {scopes.map((scope) => {
-                const id = `key-scope-${scope.name}`;
-                return (
-                  <div key={scope.name} className="flex items-start gap-3">
-                    <Checkbox
-                      id={id}
-                      className="mt-0.5"
-                      checked={chosen.includes(scope.name)}
-                      onCheckedChange={(value) =>
-                        setChosen((current) =>
-                          value === true
-                            ? [...current, scope.name]
-                            : current.filter((name) => name !== scope.name),
-                        )
-                      }
-                      aria-describedby={`${id}-description`}
-                    />
-                    <div className="flex min-w-0 flex-col gap-0.5">
-                      <Label htmlFor={id} className="font-mono text-sm break-all">
-                        {scope.name}
-                      </Label>
-                      <p id={`${id}-description`} className="text-muted-foreground text-sm">
-                        {scope.description}
-                      </p>
-                    </div>
-                  </div>
-                );
-              })}
-              <p className="text-muted-foreground text-sm">
-                {t("web.admin.apiKeys.create.scopesHint")}
-              </p>
-            </div>
-          )}
-        </fieldset>
+      {users.isError && (
+        <p role="alert">
+          The user list could not be refreshed. The selected account remains unchanged.
+        </p>
       )}
-      {users.isError && <p role="alert">{t("web.admin.apiKeys.create.usersError")}</p>}
       {error && <p role="alert">{error}</p>}
-      <Button type="submit" disabled={create.isPending || scopedWithoutScopes}>
-        {create.isPending
-          ? t("web.admin.apiKeys.create.creating")
-          : t("web.admin.apiKeys.create.submit")}
+      <Button type="submit" disabled={create.isPending}>
+        {create.isPending ? "Creating…" : "Create"}
       </Button>
     </form>
   );

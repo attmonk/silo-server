@@ -7,7 +7,6 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 import type { ProfileRequestContextSnapshot } from "@/api/client";
 import { V2ProblemError } from "@/api/v2/request";
 import {
@@ -30,8 +29,6 @@ import type { components } from "@/api/v2/schema";
 import { v2, type V2Query } from "@/api/v2/request";
 import { sectionKeys } from "./keys";
 import { invalidateAdminCollectionQueries } from "./collectionSurfaceRefresh";
-import { artworkQuery, rowDrawsBackdrops, type ArtworkWidthQuery } from "@/lib/artworkWidths";
-import { HOME_ROW_ITEM_LIMIT, homeRowItemLimit, homeRowResponse } from "./homeRowLimit";
 import { runBulkDelete, type BulkDeleteProgress } from "./bulkDelete";
 
 /**
@@ -84,43 +81,26 @@ export function profileSectionOverridesFromV2(
  * trip; the server leaves out any row that is not ready in time and Home
  * fetches those, and every later row, on its own.
  */
-const HOME_LAYOUT_INCLUDED_ROWS = 3;
+export const HOME_LAYOUT_INCLUDED_ROWS = 3;
 
 /**
- * The home layout query. Rows the server included, capped at
- * HOME_ROW_ITEM_LIMIT cards, are written into their own item caches before the
- * layout resolves, so Home finds them already loaded and does not request them
- * again. A featured row that holds more cards than the cap is left out: the
- * hero shows every card of its row, so Home reads it whole.
+ * The home layout query. Rows the server included are written into their own
+ * item caches before the layout resolves, so Home finds them already loaded
+ * and does not request them again.
  */
 export function homeLayoutQueryOptions(queryClient: QueryClient) {
   return queryOptions({
     queryKey: sectionKeys.homeLayout(),
     queryFn: async ({ signal }): Promise<HomeLayoutResponse> => {
-      const artwork = artworkQuery("homeLayout");
-      const layout = await fetchHomeLayout(artwork, signal);
+      const layout = await fetchHomeLayout(signal);
       for (const section of layout.included_sections) {
-        // The layout's backdrops are hero-sized. A row of wide cards loads
-        // its own at card size rather than drawing those.
-        if (
-          artwork.backdrop_width &&
-          !section.featured &&
-          rowDrawsBackdrops(section.section_type)
-        ) {
-          continue;
-        }
-        const row = homeRowResponse(section);
-        if (row.partial && section.featured) continue;
         const queryKey = sectionKeys.homeItems(section.id);
-        // A row the viewer has already completed or read whole past the cap
-        // keeps that entry, left stale, so Home rereads it whole instead of
-        // shrinking it.
-        const cached = queryClient.getQueryData<HomeSectionItemsResponse>(queryKey);
-        if (!section.featured && homeRowItemLimit(false, cached) === undefined) continue;
         // setQueryData alone would create the entry with the client's default
         // gcTime, and Home never fetches a fresh row to raise it.
         queryClient.getQueryCache().build(queryClient, { queryKey, gcTime: HOME_SECTION_GC_TIME });
-        queryClient.setQueryData<HomeSectionItemsResponse>(queryKey, row);
+        queryClient.setQueryData<HomeSectionItemsResponse>(queryKey, {
+          section: sectionFromV2(section),
+        });
       }
       return { sections: layout.sections };
     },
@@ -130,40 +110,21 @@ export function homeLayoutQueryOptions(queryClient: QueryClient) {
 }
 
 /**
- * Reads the home layout with its first rows' items, capped at
- * HOME_ROW_ITEM_LIMIT cards. A server that predates item_limit (an older node
- * during a rolling upgrade) answers 422 and is asked again without it, so its
- * included rows come whole. One that also predates include_items, or allows
- * fewer rows, answers 422 again; the layout is then read alone and Home loads
- * every row itself. The layout alone carries no artwork, so that read sends no
- * widths either.
+ * Reads the home layout with its first rows' items. A server that predates
+ * include_items (an older node during a rolling upgrade) or allows fewer rows
+ * answers 422; the layout is then read alone and Home loads every row itself.
  */
-async function fetchHomeLayout(
-  artwork: ArtworkWidthQuery,
-  signal?: AbortSignal,
-): Promise<V2HomeLayout> {
-  const included = { include_items: HOME_LAYOUT_INCLUDED_ROWS, ...artwork };
+async function fetchHomeLayout(signal?: AbortSignal) {
   try {
     return await v2("GET /api/v2/home/layout", {
-      query: { ...included, item_limit: HOME_ROW_ITEM_LIMIT },
+      query: { include_items: HOME_LAYOUT_INCLUDED_ROWS },
       signal,
     });
   } catch (error) {
-    if (!isUnprocessable(error)) throw error;
+    if (!(error instanceof V2ProblemError) || error.status !== 422) throw error;
+    const layout = await v2("GET /api/v2/home/layout", { signal });
+    return { ...layout, included_sections: [] };
   }
-  try {
-    return await v2("GET /api/v2/home/layout", { query: included, signal });
-  } catch (error) {
-    if (!isUnprocessable(error)) throw error;
-  }
-  const layout = await v2("GET /api/v2/home/layout", { signal });
-  return { ...layout, included_sections: [] };
-}
-
-type V2HomeLayout = components["schemas"]["HomeLayout"];
-
-function isUnprocessable(error: unknown): boolean {
-  return error instanceof V2ProblemError && error.status === 422;
 }
 
 export function useHomeLayout(enabled = true) {
@@ -171,41 +132,19 @@ export function useHomeLayout(enabled = true) {
   return useQuery({ ...homeLayoutQueryOptions(queryClient), enabled });
 }
 
-interface SectionItemsOptions {
-  signal?: AbortSignal;
-  /** The section draws as the hero, so its backdrops load at hero size. */
-  featured?: boolean;
-  /** Read at most this many cards (see homeRowLimit). */
-  itemLimit?: number;
-}
-
 /**
- * Fetches one home section with its items, at most `itemLimit` of them when
- * set (see homeRowLimit). Answers in the same `{ section }` shape as the
- * library section fetch so the section caches and refresh helpers treat both
- * alike. A server that predates item_limit (an older node during a rolling
- * upgrade) answers 422; the row is then read whole.
+ * Fetches one home section with its items. Answers in the same `{ section }`
+ * shape as the library section fetch so the section caches and refresh
+ * helpers treat both alike.
  */
-export async function fetchHomeSectionItems(
+export function fetchHomeSectionItems(
   sectionId: string,
-  options?: SectionItemsOptions,
+  options?: { signal?: AbortSignal },
 ): Promise<HomeSectionItemsResponse> {
-  const read = (itemLimit?: number) =>
-    v2("GET /api/v2/home/sections/{id}/items", {
-      path: { id: sectionId },
-      query: {
-        ...artworkQuery(options?.featured ? "hero" : "row"),
-        ...(itemLimit === undefined ? {} : { item_limit: itemLimit }),
-      },
-      signal: options?.signal,
-    }).then(homeRowResponse);
-  try {
-    return await read(options?.itemLimit);
-  } catch (error) {
-    const rejected = error instanceof V2ProblemError && error.status === 422;
-    if (options?.itemLimit === undefined || !rejected) throw error;
-    return read();
-  }
+  return v2("GET /api/v2/home/sections/{id}/items", {
+    path: { id: sectionId },
+    signal: options?.signal,
+  }).then((section) => ({ section: sectionFromV2(section) }));
 }
 
 /**
@@ -216,42 +155,23 @@ export async function fetchHomeSectionItems(
 export function fetchLibrarySectionItems(
   libraryId: number,
   sectionId: string,
-  options?: SectionItemsOptions,
+  options?: { signal?: AbortSignal },
 ): Promise<HomeSectionItemsResponse> {
   return v2("GET /api/v2/library/{id}/sections/{section_id}/items", {
     path: { id: String(libraryId), section_id: sectionId },
-    query: artworkQuery(options?.featured ? "hero" : "row"),
     signal: options?.signal,
   }).then((section) => ({ section: sectionFromV2(section) }));
 }
 
-/** A library's Recommended layout: its rows' stored titles, without items. */
-export function libraryLayoutQuery(libraryId: number) {
-  return queryOptions({
+export function useLibraryLayout(libraryId: number) {
+  return useQuery({
     queryKey: sectionKeys.libraryLayout(libraryId),
     queryFn: ({ signal }): Promise<LibraryLayoutResponse> =>
       v2("GET /api/v2/library/{id}/layout", { path: { id: String(libraryId) }, signal }).then(
         (layout) => ({ sections: layout.sections }),
       ),
     staleTime: 5 * 60 * 1000,
-  });
-}
-
-/**
- * A library's Recommended layout. LibraryPage starts the read while it waits
- * for the saved page state and refetches a failed read when the tab is shown
- * again, so LibraryRecommended passes `retryOnMount: false` and shows a
- * failure that landed before it mounted instead of starting a second deadline.
- * The sidebar also reads it to name section pins.
- */
-export function useLibraryLayout(
-  libraryId: number,
-  options?: { enabled?: boolean; retryOnMount?: boolean },
-) {
-  return useQuery({
-    ...libraryLayoutQuery(libraryId),
-    enabled: libraryId > 0 && (options?.enabled ?? true),
-    retryOnMount: options?.retryOnMount,
+    enabled: libraryId > 0,
   });
 }
 
@@ -322,30 +242,15 @@ export function useDeleteSections() {
     },
     onSuccess: async ({ requested, deleted, failed, firstError }) => {
       if (failed === 0) {
-        toast.success(
-          t("web.admin.common.sections.deleted", { count: deleted, count_text: deleted }),
-        );
+        toast.success(`Deleted ${deleted} section${deleted === 1 ? "" : "s"}`);
       } else if (deleted > 0) {
-        toast.warning(
-          t("web.admin.common.sections.partiallyDeleted", {
-            count: requested,
-            count_text: requested,
-            deleted: deleted,
-          }),
-          {
-            description: firstError,
-          },
-        );
+        toast.warning(`Deleted ${deleted} of ${requested} sections`, {
+          description: firstError,
+        });
       } else {
-        toast.error(
-          t("web.admin.common.sections.deleteFailed", {
-            count: failed,
-            count_text: failed,
-          }),
-          {
-            description: firstError,
-          },
-        );
+        toast.error(`Failed to delete ${failed} section${failed === 1 ? "" : "s"}`, {
+          description: firstError,
+        });
       }
       await Promise.all([
         qc.invalidateQueries({ queryKey: sectionKeys.all }),

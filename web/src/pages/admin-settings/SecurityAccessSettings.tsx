@@ -4,7 +4,6 @@ import { useId, useMemo, useState } from "react";
 import type {
   RateLimitAuthEndpointConfig,
   RateLimitConfig,
-  RateLimitSessionQuota,
   RateLimitTierConfig,
 } from "@/api/types";
 import { SettingsPageHeader } from "@/components/settings/SettingsPageHeader";
@@ -23,7 +22,6 @@ import { useRateLimitConfig, useUpdateRateLimitConfig } from "@/hooks/queries/ad
 import { useRestartKeys } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { useReportUnsavedChanges } from "@/hooks/useUnsavedChanges";
-import { useT, type MessageKey } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { FieldGroup } from "./FieldGroup";
 import { SaveBar } from "@/components/SaveBar";
@@ -55,18 +53,6 @@ const DEFAULT_AUTH_ENDPOINT: RateLimitAuthEndpointConfig = {
   burst: 10,
 };
 
-const DEFAULT_SESSION_QUOTA: RateLimitSessionQuota = {
-  mode: "log",
-  requests_per_hour: 10000,
-  burst: 30000,
-};
-
-const SESSION_QUOTA_MODE_LABELS: Record<RateLimitSessionQuota["mode"], MessageKey> = {
-  off: "web.admin.settings.security.quotaMode.off",
-  log: "web.admin.settings.security.quotaMode.log",
-  enforce: "web.admin.settings.security.quotaMode.enforce",
-};
-
 const DEFAULT_CONFIG: RateLimitConfig = {
   enabled: true,
   backend: "memory",
@@ -88,23 +74,22 @@ const DEFAULT_CONFIG: RateLimitConfig = {
     device_poll: { requests_per_minute: 120, burst: 30 },
     autoscan_webhook: { requests_per_minute: 60, burst: 30 },
   },
-  session_quota: DEFAULT_SESSION_QUOTA,
 };
 
-const TIER_LABELS: Record<string, MessageKey> = {
-  standard: "web.admin.settings.security.tier.standard",
-  elevated: "web.admin.settings.security.tier.elevated",
+const TIER_LABELS: Record<string, string> = {
+  standard: "Standard API keys",
+  elevated: "Elevated API keys",
 };
 
-const AUTH_ENDPOINT_LABELS: Record<string, MessageKey> = {
-  login: "web.admin.settings.security.endpoint.login",
-  signup: "web.admin.settings.security.endpoint.signup",
-  setup: "web.admin.settings.security.endpoint.setup",
-  password_change: "web.admin.settings.security.endpoint.passwordChange",
-  device_start: "web.admin.settings.security.endpoint.deviceStart",
-  device_lookup: "web.admin.settings.security.endpoint.deviceLookup",
-  device_poll: "web.admin.settings.security.endpoint.devicePoll",
-  autoscan_webhook: "web.admin.settings.security.endpoint.autoscanWebhook",
+const AUTH_ENDPOINT_LABELS: Record<string, string> = {
+  login: "Sign in",
+  signup: "Sign up",
+  setup: "First-run setup",
+  password_change: "Change password",
+  device_start: "TV sign-in: start",
+  device_lookup: "TV sign-in: code lookup",
+  device_poll: "TV sign-in: waiting for approval",
+  autoscan_webhook: "Autoscan webhook",
 };
 
 interface RateLimitField {
@@ -136,7 +121,7 @@ function RateBox({
         value={field.value}
         onChange={(e) => field.onChange(e.target.value)}
         disabled={disabled}
-        className="w-24 text-end tabular-nums"
+        className="w-24 text-right tabular-nums"
       />
     </span>
   );
@@ -162,7 +147,6 @@ function RateTriadRow({
   burst: RateLimitField;
   disabled?: boolean;
 }) {
-  const t = useT();
   const baseId = useId();
 
   return (
@@ -171,30 +155,19 @@ function RateTriadRow({
         {perSecond && (
           <RateBox
             id={`${baseId}-rps`}
-            caption={t("web.admin.settings.security.rate.perSecond")}
+            caption="Per second"
             field={perSecond}
             disabled={disabled}
           />
         )}
-        <RateBox
-          id={`${baseId}-rpm`}
-          caption={t("web.admin.settings.security.rate.perMinute")}
-          field={perMinute}
-          disabled={disabled}
-        />
-        <RateBox
-          id={`${baseId}-burst`}
-          caption={t("web.admin.settings.security.rate.burst")}
-          field={burst}
-          disabled={disabled}
-        />
+        <RateBox id={`${baseId}-rpm`} caption="Per minute" field={perMinute} disabled={disabled} />
+        <RateBox id={`${baseId}-burst`} caption="Burst" field={burst} disabled={disabled} />
       </div>
     </SettingFieldRow>
   );
 }
 
 export default function SecurityAccessSettings() {
-  const t = useT();
   const form = useSettingsForm({ keys: useMemo(() => LOCAL_NETWORK_KEYS, []) });
   const restartKeys = useRestartKeys();
   const allRestart = (keys: string[]) => keys.every((key) => restartKeys.has(key));
@@ -218,6 +191,7 @@ export default function SecurityAccessSettings() {
   const limiterInactive = serverConfig?.enabled === true && serverConfig.active === false;
   const runningBackend = serverConfig?.active === true ? serverConfig.active_backend : undefined;
   const runningBackendDiffers = Boolean(runningBackend) && runningBackend !== savedBackend;
+  const backendNoun = (backend?: string) => (backend === "redis" ? "Redis" : "in-memory");
 
   const hydratedConfig = useMemo<RateLimitConfig>(() => {
     if (!serverConfig) return DEFAULT_CONFIG;
@@ -242,7 +216,6 @@ export default function SecurityAccessSettings() {
             DEFAULT_AUTH_ENDPOINT,
         ]),
       ),
-      session_quota: serverConfig.session_quota ?? DEFAULT_SESSION_QUOTA,
     };
   }, [serverConfig]);
 
@@ -274,13 +247,6 @@ export default function SecurityAccessSettings() {
       if (isNaN(num) || num <= 0) return;
       field(num);
     };
-  }
-
-  function handleSessionQuotaChange(update: Partial<RateLimitSessionQuota>) {
-    updateConfigState((prev) => ({
-      ...prev,
-      session_quota: { ...(prev.session_quota ?? DEFAULT_SESSION_QUOTA), ...update },
-    }));
   }
 
   function handleTierChange(tier: string, field: keyof RateLimitTierConfig, value: number) {
@@ -348,11 +314,7 @@ export default function SecurityAccessSettings() {
 
   if (form.isLoading || rateLimitsLoading)
     return (
-      <div
-        className="space-y-6"
-        role="status"
-        aria-label={t("web.admin.settings.security.loading")}
-      >
+      <div className="space-y-6" role="status" aria-label="Loading settings">
         <Skeleton className="h-8 w-48" />
         <div className="space-y-4">
           <Skeleton className="h-10 w-full" />
@@ -362,25 +324,21 @@ export default function SecurityAccessSettings() {
           <Skeleton className="h-10 w-full" />
           <Skeleton className="h-10 w-full" />
         </div>
-        <span className="sr-only">{t("web.admin.settings.security.loading")}</span>
+        <span className="sr-only">Loading settings</span>
       </div>
     );
 
   const savingRateLimits = updateConfig.isPending;
-  const sessionQuota = config.session_quota ?? DEFAULT_SESSION_QUOTA;
 
   return (
     <div className="flex h-full flex-col">
-      <SettingsPageHeader title={t("web.admin.settings.security.title")} />
+      <SettingsPageHeader title="Security" />
 
       <div className="flex-1 space-y-5">
-        <FieldGroup
-          label={t("web.admin.settings.security.localNetwork.group")}
-          restartAll={allRestart(LOCAL_NETWORK_KEYS)}
-        >
+        <FieldGroup label="Local network" restartAll={allRestart(LOCAL_NETWORK_KEYS)}>
           <SettingField
-            label={t("web.admin.settings.security.localNetwork.label")}
-            description={t("web.admin.settings.security.localNetwork.description")}
+            label="Local servers for every account"
+            description="Lets every account import history from, and sync with, Plex, Emby, and Jellyfin servers at local network addresses such as 192.168.x.x or localhost. Admins always can."
             type="toggle"
             value={form.getValue(LOCAL_MEDIA_SERVERS_KEY)}
             onChange={(v) => form.setValue(LOCAL_MEDIA_SERVERS_KEY, v)}
@@ -389,14 +347,17 @@ export default function SecurityAccessSettings() {
           {localMediaServersAllowed && (
             <div className="flex items-start gap-2 py-3 text-xs text-amber-500">
               <TriangleAlert className="mt-0.5 h-4 w-4 flex-shrink-0" />
-              <p>{t("web.admin.settings.security.localNetwork.warning")}</p>
+              <p>
+                Anyone who can sign in can make this server send requests to devices on its local
+                network. Turn this on only if you trust every account on this server.
+              </p>
             </div>
           )}
         </FieldGroup>
 
-        <FieldGroup label={t("web.admin.settings.security.rateLimit.group")}>
+        <FieldGroup label="Rate limiting">
           <SettingField
-            label={t("web.admin.settings.security.rateLimit.enable")}
+            label="Enable rate limiting"
             type="toggle"
             value={config.enabled ? "true" : "false"}
             onChange={(v) => updateConfigState((prev) => ({ ...prev, enabled: v === "true" }))}
@@ -404,27 +365,27 @@ export default function SecurityAccessSettings() {
             status={
               limiterInactive ? (
                 <SettingFieldStatus tone="warn">
-                  {t("web.admin.settings.security.rateLimit.notRunning")}
+                  Enabled, but no limiter is running in this process — it may have failed to start.
+                  Check the server logs.
                 </SettingFieldStatus>
               ) : undefined
             }
           />
 
           <SettingFieldRow
-            label={t("web.admin.settings.security.backend.label")}
+            label="Where counters are kept"
             htmlFor="rate-limit-backend"
             description={
               redisSelectable
-                ? t("web.admin.settings.security.backend.description")
-                : t("web.admin.settings.security.backend.descriptionNoRedis")
+                ? "Redis shares counters across servers, after a restart."
+                : "Redis shares counters across servers, after a restart. Set up Redis on the General page first."
             }
             status={
               runningBackendDiffers ? (
                 <SettingFieldStatus tone="warn">
-                  {t("web.admin.settings.security.backend.drift", {
-                    running: runningBackend ?? "",
-                    saved: savedBackend,
-                  })}
+                  The running limiter is using {backendNoun(runningBackend)} counters, not the saved{" "}
+                  {backendNoun(savedBackend)} backend. If a restart does not fix it, check that the
+                  saved backend is reachable.
                 </SettingFieldStatus>
               ) : undefined
             }
@@ -438,24 +399,22 @@ export default function SecurityAccessSettings() {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="memory">
-                  {t("web.admin.settings.security.backend.memory")}
-                </SelectItem>
+                <SelectItem value="memory">This server only</SelectItem>
                 <SelectItem value="redis" disabled={!redisSelectable}>
-                  {t("web.admin.settings.security.backend.redis")}
+                  Shared via Redis
                 </SelectItem>
               </SelectContent>
             </Select>
           </SettingFieldRow>
 
           <SettingFieldRow
-            label={t("web.admin.settings.security.global.label")}
+            label="Whole-server limit"
             htmlFor="global-rps"
-            description={t("web.admin.settings.security.global.description")}
+            description="Ceiling across every rate-limited route."
             // The row's unit slot rather than a span beside the input: the
             // triad rows below have no unit, and an inline one here would
             // push this box off the column they share.
-            unit={t("web.admin.settings.security.global.unit")}
+            unit="per second"
           >
             <Input
               id="global-rps"
@@ -468,13 +427,13 @@ export default function SecurityAccessSettings() {
                 )(e.target.value)
               }
               disabled={savingRateLimits}
-              className={cn("text-end tabular-nums", SETTINGS_NUMBER_WIDTH)}
+              className={cn("text-right tabular-nums", SETTINGS_NUMBER_WIDTH)}
             />
           </SettingFieldRow>
 
           <RateTriadRow
-            label={t("web.admin.settings.security.perAddress.label")}
-            description={t("web.admin.settings.security.perAddress.description")}
+            label="Per address and account"
+            description="Each IP has a budget. Signed-in requests also share an account budget, four times larger, across profiles, sessions, devices and API keys."
             disabled={savingRateLimits}
             perSecond={{
               value: config.ip_requests_per_second,
@@ -496,69 +455,13 @@ export default function SecurityAccessSettings() {
             }}
           />
 
-          <SettingsSubheading>
-            {t("web.admin.settings.security.session.heading")}
-          </SettingsSubheading>
-          <SettingFieldRow
-            label={t("web.admin.settings.security.session.quotaLabel")}
-            htmlFor="session-quota-mode"
-            description={t("web.admin.settings.security.session.quotaDescription")}
-          >
-            <Select
-              value={sessionQuota.mode}
-              onValueChange={(value) =>
-                handleSessionQuotaChange({ mode: value as RateLimitSessionQuota["mode"] })
-              }
-              disabled={savingRateLimits}
-            >
-              <SelectTrigger id="session-quota-mode" className={SETTINGS_CONTROL_WIDTH}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {Object.entries(SESSION_QUOTA_MODE_LABELS).map(([mode, label]) => (
-                  <SelectItem key={mode} value={mode}>
-                    {t(label)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </SettingFieldRow>
-          <SettingFieldRow
-            label={t("web.admin.settings.security.session.sizeLabel")}
-            htmlFor="session-quota-rph"
-            description={t("web.admin.settings.security.session.sizeDescription")}
-          >
-            <div className="flex flex-wrap items-end justify-end gap-2.5">
-              <RateBox
-                id="session-quota-rph"
-                caption={t("web.admin.settings.security.rate.perHour")}
-                disabled={savingRateLimits || sessionQuota.mode === "off"}
-                field={{
-                  value: sessionQuota.requests_per_hour,
-                  onChange: setNumber((num) =>
-                    handleSessionQuotaChange({ requests_per_hour: num }),
-                  ),
-                }}
-              />
-              <RateBox
-                id="session-quota-burst"
-                caption={t("web.admin.settings.security.rate.burst")}
-                disabled={savingRateLimits || sessionQuota.mode === "off"}
-                field={{
-                  value: sessionQuota.burst,
-                  onChange: setNumber((num) => handleSessionQuotaChange({ burst: num })),
-                }}
-              />
-            </div>
-          </SettingFieldRow>
-
-          <SettingsSubheading>{t("web.admin.settings.security.tiers.heading")}</SettingsSubheading>
+          <SettingsSubheading>API key tiers</SettingsSubheading>
           {Object.keys(TIER_LABELS).map((tier) => {
             const tierConfig = config.tiers[tier] ?? DEFAULT_TIER;
             return (
               <RateTriadRow
                 key={tier}
-                label={t(TIER_LABELS[tier]!)}
+                label={TIER_LABELS[tier]!}
                 disabled={savingRateLimits}
                 perSecond={{
                   value: tierConfig.requests_per_second,
@@ -576,15 +479,13 @@ export default function SecurityAccessSettings() {
             );
           })}
 
-          <SettingsSubheading>
-            {t("web.admin.settings.security.endpoints.heading")}
-          </SettingsSubheading>
+          <SettingsSubheading>Sign-in and webhook endpoints</SettingsSubheading>
           {Object.keys(AUTH_ENDPOINT_LABELS).map((endpoint) => {
             const epConfig = config.auth_endpoints[endpoint] ?? DEFAULT_AUTH_ENDPOINT;
             return (
               <RateTriadRow
                 key={endpoint}
-                label={t(AUTH_ENDPOINT_LABELS[endpoint]!)}
+                label={AUTH_ENDPOINT_LABELS[endpoint]!}
                 disabled={savingRateLimits}
                 perMinute={{
                   value: epConfig.requests_per_minute,

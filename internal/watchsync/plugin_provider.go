@@ -185,12 +185,10 @@ func (p *PluginProvider) ExportBatchSize() int {
 
 func (p *PluginProvider) Capabilities() Capabilities {
 	return Capabilities{
-		ImportWatched:  p.descriptor.GetImportWatched(),
-		ImportProgress: p.descriptor.GetImportProgress(),
-		ExportWatched:  p.descriptor.GetExportWatched(),
-		// Mark unwatched keeps watch history, so Silo sends a provider no
-		// history removals whatever its descriptor offers.
-		ExportUnwatched:        false,
+		ImportWatched:          p.descriptor.GetImportWatched(),
+		ImportProgress:         p.descriptor.GetImportProgress(),
+		ExportWatched:          p.descriptor.GetExportWatched(),
+		ExportUnwatched:        p.descriptor.GetExportUnwatched(),
 		ImportFavorites:        p.descriptor.GetImportFavorites(),
 		ExportFavorites:        p.descriptor.GetExportFavorites(),
 		RemoveFavorites:        p.descriptor.GetRemoveFavorites(),
@@ -340,9 +338,9 @@ func (p *PluginProvider) PollDeviceAuth(ctx context.Context, _ ServerConfig, ses
 		}
 		return TokenSet{}, deviceAuthorizationPendingError{session: updated}
 	case pluginv1.WatchSyncDeviceAuthorizationStatus_WATCH_SYNC_DEVICE_AUTHORIZATION_STATUS_DENIED:
-		return TokenSet{}, fmt.Errorf("watch sync plugin: %w", ErrDeviceAuthDenied)
+		return TokenSet{}, errors.New("watch sync plugin device authorization was denied")
 	case pluginv1.WatchSyncDeviceAuthorizationStatus_WATCH_SYNC_DEVICE_AUTHORIZATION_STATUS_EXPIRED:
-		return TokenSet{}, fmt.Errorf("watch sync plugin: %w", ErrAuthSessionExpired)
+		return TokenSet{}, errors.New("watch sync plugin device authorization expired")
 	case pluginv1.WatchSyncDeviceAuthorizationStatus_WATCH_SYNC_DEVICE_AUTHORIZATION_STATUS_AUTHORIZED:
 		return tokenSetFromProto(response.GetCredentials())
 	default:

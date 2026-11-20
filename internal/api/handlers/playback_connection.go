@@ -66,7 +66,7 @@ func (h *PlaybackHandler) currentReadings(probe *connectionstore.Probe, sample *
 // purpose: the sender's reading is not the receiver's link. Nothing is
 // recorded.
 func (h *PlaybackHandler) applyConnectionReading(r *http.Request, req *playback.StartRequestV3) error {
-	if !playback.HasFeatureV3(req.ClientFeatures, playback.FeatureBufferingQualityV1) ||
+	if !isNativeAPIV2(r.Context()) || !playback.HasFeatureV3(req.ClientFeatures, playback.FeatureBufferingQualityV1) ||
 		req.QualityPreference != playback.QualityAutoV3 || req.BandwidthEstimateKbps != nil || req.LearnedLimit == playback.LearnedLimitIgnoreV3 {
 		return nil
 	}
@@ -89,7 +89,7 @@ func (h *PlaybackHandler) applyConnectionReading(r *http.Request, req *playback.
 // the stored start request instead, and this function may have rewritten that
 // request's estimate to the limit, so recording it would renew the limit.
 func (h *PlaybackHandler) applyLearnedLimit(r *http.Request, req *playback.StartRequestV3, clientSent bool) (*playback.BandwidthLimitV3, error) {
-	if !playback.HasFeatureV3(req.ClientFeatures, playback.FeatureBufferingQualityV1) {
+	if !isNativeAPIV2(r.Context()) || !playback.HasFeatureV3(req.ClientFeatures, playback.FeatureBufferingQualityV1) {
 		return nil, nil
 	}
 	if observed := req.ObservedThroughputKbps; observed != nil && req.BandwidthEstimateKbps != nil && *observed < *req.BandwidthEstimateKbps {
@@ -176,13 +176,6 @@ func withoutObservedEstimateV3(req playback.StartRequestV3) playback.StartReques
 // video, including HDR, audio and subtitle constraints; a matching bitrate
 // alone is insufficient.
 func (h *PlaybackHandler) lowerBufferedVersion(r *http.Request, req playback.StartRequestV3, base *models.MediaFile, audio int, settings playback.PlannerSettingsV3) (*models.MediaFile, playback.StartRequestV3, int) {
-	return h.lowerBufferedVersionForIntent(r, req, base, audio, settings, nil)
-}
-
-// lowerBufferedVersionForIntent is lowerBufferedVersion for a replan with the
-// attempt's desired tracks: a candidate gets the viewer's chosen audio and
-// subtitle, not a remap of what base happens to be playing.
-func (h *PlaybackHandler) lowerBufferedVersionForIntent(r *http.Request, req playback.StartRequestV3, base *models.MediaFile, audio int, settings playback.PlannerSettingsV3, desired *playback.DesiredTracksV3) (*models.MediaFile, playback.StartRequestV3, int) {
 	if req.QualityPreference != playback.QualityAutoV3 || req.BandwidthEstimateKbps == nil || !req.AllowsAlternateVersions() {
 		return base, req, audio
 	}
@@ -231,44 +224,26 @@ func (h *PlaybackHandler) lowerBufferedVersionForIntent(r *http.Request, req pla
 	})
 	for _, version := range fitting {
 		candidate := version.file
-		next, nextAudio, ok := h.bufferedCandidateTracksV3(r, req, base, candidate, audio, desired)
-		if !ok {
+		next := req
+		dropped, err := h.remapSubtitleSelectionV3(r.Context(), base, candidate, &next)
+		if err != nil || dropped {
 			continue
 		}
+		// The returned request is the one later replans resolve against, so
+		// its audio selection moves to the candidate with the file.
+		if err := remapAudioSelectionV3(base, candidate, &next); err != nil {
+			continue
+		}
+		nextAudio := remapAudioIndexV3(base, candidate, audio)
 		if err := preflightPlaybackFile(r.Context(), candidate, h.MissingMarker, h.EventsHub); err != nil {
 			continue
 		}
-		result, _ := h.planPlaybackWithCapabilitiesV3(r.Context(), h.plannerInputV3(r.Context(), planningV3{plannerRequestedFile: base, settings: settings}, next, candidate, nextAudio))
+		result, _ := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: next, RequestedFile: base, EffectiveFile: candidate, AudioTrackIndex: nextAudio, Settings: settings, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidate), Now: time.Now(), AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidate)})
 		if result.Plan != nil && result.Plan.Delivery != playback.DeliveryTranscodeHLSV3 {
 			return candidate, next, nextAudio
 		}
 	}
 	return base, req, audio
-}
-
-// bufferedCandidateTracksV3 moves req's audio and subtitle to candidate, from
-// desired when the replan has it. ok is false when candidate would drop the
-// subtitle being shown, or the selection cannot be moved.
-func (h *PlaybackHandler) bufferedCandidateTracksV3(r *http.Request, req playback.StartRequestV3, base, candidate *models.MediaFile, audio int, desired *playback.DesiredTracksV3) (playback.StartRequestV3, int, bool) {
-	next := req
-	if desired != nil {
-		showsSubtitle := req.SubtitleTrackIndex != nil || req.SubtitleTrackID != ""
-		dropped, err := h.applyDesiredTracksV3(r.Context(), desired, candidate, &next)
-		if err != nil || (dropped && showsSubtitle) {
-			return next, 0, false
-		}
-		return next, requestAudioIndexV3(candidate, next), true
-	}
-	dropped, err := h.remapSubtitleSelectionV3(r.Context(), base, candidate, &next)
-	if err != nil || dropped {
-		return next, 0, false
-	}
-	// The returned request is the one later replans resolve against, so
-	// its audio selection moves to the candidate with the file.
-	if err := remapAudioSelectionV3(base, candidate, &next); err != nil {
-		return next, 0, false
-	}
-	return next, remapAudioIndexV3(base, candidate, audio), true
 }
 
 func isHDRRangeV3(dynamicRange string) bool {

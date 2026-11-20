@@ -16,7 +16,6 @@ import {
   adminAuthorityScope,
   requireAdminAuthority,
 } from "./adminAuthority";
-import { t } from "@/i18n";
 
 type SourceWire = components["schemas"]["AdminHistoryImportSource"];
 type MappingWire = components["schemas"]["AdminHistoryImportMapping"];
@@ -24,8 +23,6 @@ export type AdminImportRun = Omit<HistoryImportRun, "status"> & {
   status: HistoryImportRun["status"] | "canceling";
   terminal: boolean;
   cancelable: boolean;
-  /** The lookback cutoff; absent for a full import. */
-  played_since?: string;
   location?: string;
   retryAfterMs?: number;
 };
@@ -33,7 +30,7 @@ export const adminImportScope = adminAuthorityScope;
 export const importAuthority = captureAdminAuthority;
 const checkAuthority = requireAdminAuthority;
 function tag(etag?: string) {
-  if (!etag) throw new Error(t("web.admin.errors.historyImportConfigReload"));
+  if (!etag) throw new Error("Reload this configuration before saving.");
   return etag;
 }
 export const isAdminImportConflict = (error: unknown) =>
@@ -83,7 +80,8 @@ async function walk<T>(
     rows.push(...page.items);
     if (!page.page?.has_more) break;
     const next = page.page.next_cursor;
-    if (!next || seen.has(next)) throw new Error(t("web.admin.errors.historyImportPageIncomplete"));
+    if (!next || seen.has(next))
+      throw new Error("Incomplete history import page. Reload to try again.");
     seen.add(next);
     cursor = next;
   } while (rows.length < max);
@@ -255,7 +253,6 @@ function adminRunOf(run: components["schemas"]["AdminHistoryImportRun"]): AdminI
     status: run.status as AdminImportRun["status"],
     terminal: run.terminal,
     cancelable: run.cancelable,
-    played_since: run.played_since,
   };
 }
 export const importRunActive = (run: Pick<AdminImportRun, "terminal">) => !run.terminal;
@@ -278,23 +275,18 @@ export async function getAdminImportRun(
     location: location ?? `/api/v2/admin/history-imports/runs/${encodeURIComponent(id)}`,
   };
 }
-/** The run body: a lookback window in hours, or none for a full import. */
-const runBody = (lookbackHours?: number) =>
-  lookbackHours ? { lookback_hours: lookbackHours } : undefined;
-export async function createAdminImportRun(
-  id: number,
-  lookbackHours?: number,
-): Promise<AdminImportRun> {
+export async function createAdminImportRun(id: number): Promise<AdminImportRun> {
   const h = headers();
   const body = await v2("POST /api/v2/admin/history-imports/mappings/{id}/run", {
     path: { id: String(id) },
-    body: runBody(lookbackHours),
     profileContext: importAuthority(),
     onResponse: h.onResponse,
   });
   const hint = h.run();
   if (hint.location !== `/api/v2/admin/history-imports/runs/${encodeURIComponent(body.id)}`)
-    throw new Error(t("web.admin.errors.historyImportStatusMissing"));
+    throw new Error(
+      "The accepted import did not include its expected status location. Refresh runs before trying again.",
+    );
   return { ...adminRunOf(body), ...hint };
 }
 export async function getAdminImportRunsPage(
@@ -308,7 +300,7 @@ export async function getAdminImportRunsPage(
     profileContext,
   });
   if (result.page?.has_more && (!result.page.next_cursor || result.page.next_cursor === cursor))
-    throw new Error(t("web.admin.errors.historyImportPageIncomplete"));
+    throw new Error("Incomplete history import page. Reload to try again.");
   checkAuthority(profileContext);
   return {
     items: result.items.map(adminRunOf),
@@ -324,10 +316,9 @@ export async function cancelAdminImportRun(id: string) {
   });
   return { ...adminRunOf(body), ...h.run() };
 }
-export async function bulkAdminImportRuns(id: number, lookbackHours?: number) {
+export async function bulkAdminImportRuns(id: number) {
   const result = await v2("POST /api/v2/admin/history-imports/sources/{id}/bulk-run", {
     path: { id: String(id) },
-    body: runBody(lookbackHours),
     profileContext: importAuthority(),
   });
   return {

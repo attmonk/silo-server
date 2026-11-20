@@ -16,8 +16,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // inotifyMask is the per-directory watch mask. There is deliberately no
@@ -137,9 +135,7 @@ func newInotifyBackend(opts BackendOptions, hooks inotifyHooks) (Backend, error)
 		return nil, fmt.Errorf("inotify_init1: %w", err)
 	}
 	if hooks.addWatch == nil {
-		hooks.addWatch = func(fd int, path string, mask uint32) (int, error) {
-			return unix.InotifyAddWatch(fd, fspath.Decode(path), mask)
-		}
+		hooks.addWatch = unix.InotifyAddWatch
 	}
 	if hooks.maxUserWatches == nil {
 		hooks.maxUserWatches = readMaxUserWatches
@@ -880,7 +876,7 @@ func (b *inotifyBackend) markerChanged(parents []inotifyParent, name string) {
 // rewritten, or removed) and the directory stays included, it is reported
 // too: its patterns may now include or exclude entries in it.
 func (b *inotifyBackend) reevaluate(p inotifyParent, rulesChanged bool) {
-	entries, err := fspath.ReadDir(p.path)
+	entries, err := os.ReadDir(p.path)
 	if err != nil {
 		return // gone; its parent's event drops it
 	}

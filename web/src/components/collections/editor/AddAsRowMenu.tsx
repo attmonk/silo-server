@@ -9,9 +9,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { addAsARow, otherLibraries, libraryPageLabel } from "@/lib/collections/copy";
+import { ADD_AS_A_ROW, OTHER_LIBRARIES, libraryPageLabel } from "@/lib/collections/copy";
 import type { PageRef } from "@/lib/homeRows/types";
-import { useT } from "@/i18n";
 
 interface NamedLibrary {
   id: number;
@@ -39,16 +38,14 @@ export function AddAsRowMenu({
   describedBy?: string;
   onPick: (page: PageRef) => void;
 }) {
-  const t = useT();
+  const own = (place: string) => (mine ? `My ${place}` : place);
   const libraryItem = (library: NamedLibrary) => (
     <DropdownMenuItem
       key={library.id}
       onSelect={() => onPick({ kind: "library", libraryId: library.id })}
     >
       <LibraryIcon aria-hidden />
-      {mine
-        ? t("web.collections.rows.myLibraryPage", { library: library.name })
-        : libraryPageLabel(library.name)}
+      {own(libraryPageLabel(library.name))}
     </DropdownMenuItem>
   );
   return (
@@ -56,14 +53,14 @@ export function AddAsRowMenu({
       <DropdownMenuTrigger asChild disabled={disabled}>
         <Button variant="outline" size="sm" aria-describedby={describedBy}>
           <Plus aria-hidden />
-          {addAsARow()}
+          {ADD_AS_A_ROW}
           <ChevronDown aria-hidden className="opacity-70" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-[220px]">
         <DropdownMenuItem onSelect={() => onPick({ kind: "home" })}>
           <House aria-hidden />
-          {mine ? t("web.collections.rows.myHome") : t("web.collections.rows.home")}
+          {own("Home")}
         </DropdownMenuItem>
         {bound.length > 0 ? <DropdownMenuSeparator /> : null}
         {bound.map(libraryItem)}
@@ -71,7 +68,7 @@ export function AddAsRowMenu({
           <>
             <DropdownMenuSeparator />
             <DropdownMenuLabel className="text-muted-foreground text-[12px] font-medium">
-              {otherLibraries()}
+              {OTHER_LIBRARIES}
             </DropdownMenuLabel>
             {others.map(libraryItem)}
           </>

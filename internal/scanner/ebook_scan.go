@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,16 +16,14 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/idgen"
 	"github.com/Silo-Server/silo-server/internal/imageutil"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/rootcheck"
 	"github.com/Silo-Server/silo-server/internal/titleutil"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type ebookSQLExecutor interface {
@@ -87,7 +84,7 @@ func collectEbookRootScans(ctx context.Context, folderID int, roots, libraryRoot
 			continue
 		}
 		scan := ebookRootScan{root: cleanRoot}
-		info, statErr := fspath.Stat(cleanRoot)
+		info, statErr := os.Stat(cleanRoot)
 		switch {
 		case statErr != nil:
 			// Unmounted/missing/permission-broken root: failed, not empty.
@@ -105,7 +102,7 @@ func collectEbookRootScans(ctx context.Context, folderID int, roots, libraryRoot
 			rules, ignored, scan.rootErr = scanRootIgnoreRules(cleanRoot, libraryRoots)
 		}
 		if scan.rootErr == nil && !ignored {
-			if err := walkLogicalTree(ctx, cleanRoot, cleanRoot, walkModeEbook, visitedPhysicalDirs, rules, &scan.files, &scan.walkFailures, nil, fspath.ReadDir); err != nil {
+			if err := walkLogicalTree(ctx, cleanRoot, cleanRoot, walkModeEbook, visitedPhysicalDirs, rules, &scan.files, &scan.walkFailures, nil, os.ReadDir); err != nil {
 				return nil, err
 			}
 		}
@@ -144,14 +141,9 @@ func (s *Scanner) scanEbookPaths(ctx context.Context, folder *models.MediaFolder
 	if s == nil || folder == nil {
 		return fmt.Errorf("scanEbookPaths: nil scanner or folder")
 	}
-	ctx = withScopedScan(ctx, fullScan)
 	warning, err := s.scanWarningBeforeWalk(ctx, folder.ID, fullScan)
 	if err != nil {
 		return err
-	}
-	inventoryAt, err := s.scanInventoryTime(ctx)
-	if err != nil {
-		return fmt.Errorf("ebook scan: %w", err)
 	}
 	scans, err := collectEbookRootScans(ctx, folder.ID, roots, folder.Paths)
 	if err != nil {
@@ -166,7 +158,7 @@ func (s *Scanner) scanEbookPaths(ctx context.Context, folder *models.MediaFolder
 	}
 
 	if len(candidates) == 0 {
-		return s.reconcileEbookScan(ctx, folder, scans, inventoryAt, nil, fullScan, warning)
+		return s.reconcileEbookScan(ctx, folder, scans, nil, fullScan, warning)
 	}
 
 	workers := ebookScanWorkers()
@@ -282,7 +274,7 @@ func (s *Scanner) scanEbookPaths(ctx context.Context, folder *models.MediaFolder
 	for _, p := range candidates {
 		seenPaths[p] = true
 	}
-	return s.reconcileEbookScan(ctx, folder, scans, inventoryAt, seenPaths, fullScan, warning)
+	return s.reconcileEbookScan(ctx, folder, scans, seenPaths, fullScan, warning)
 }
 
 // ebookCleanupGuardRepo is the slice of catalog.FolderRepository the
@@ -397,9 +389,8 @@ func (s *Scanner) emptyCleanupDecision(
 }
 
 // reconcileEbookScan applies the post-walk safety policy and then performs
-// missing-file reconciliation for the roots that walked cleanly. inventoryAt is
-// the database time the scan took before walking (scanInventoryTime).
-func (s *Scanner) reconcileEbookScan(ctx context.Context, folder *models.MediaFolder, scans []ebookRootScan, inventoryAt time.Time, seenPaths map[string]bool, fullScan bool, warning catalog.ScanWarning) error {
+// missing-file reconciliation for the roots that walked cleanly.
+func (s *Scanner) reconcileEbookScan(ctx context.Context, folder *models.MediaFolder, scans []ebookRootScan, seenPaths map[string]bool, fullScan bool, warning catalog.ScanWarning) error {
 	if folder != nil {
 		defer s.reconcileMissingEbookEnrichment(ctx, folder.ID)
 	}
@@ -449,7 +440,7 @@ func (s *Scanner) reconcileEbookScan(ctx context.Context, folder *models.MediaFo
 		return s.setPartialWalkWarning(ctx, folder.ID, walkFailures, true)
 	}
 
-	if err := s.reconcileMissingEbookFiles(ctx, folder, reconcileRoots, inventoryAt, seenPaths, protectedRoots, confirmedCleanup); err != nil {
+	if err := s.reconcileMissingEbookFiles(ctx, folder, reconcileRoots, seenPaths, protectedRoots, confirmedCleanup); err != nil {
 		return err
 	}
 	if walkFailures > 0 {
@@ -466,43 +457,28 @@ func (s *Scanner) reconcileEbookScan(ctx context.Context, folder *models.MediaFo
 }
 
 // reconcileMissingEbookFiles mirrors the video/audio scan cleanup: DB files
-// under the scanned roots that were not seen on disk are marked missing,
-// except rows written since inventoryAt, which belong to a scan that walked
-// later. The folder trash is optionally emptied, and library memberships are
-// reconciled so items with no remaining files are removed (renames therefore
-// converge on the newly indexed path instead of leaving a stale duplicate item).
-func (s *Scanner) reconcileMissingEbookFiles(ctx context.Context, folder *models.MediaFolder, roots []string, inventoryAt time.Time, seenPaths map[string]bool, protectedRoots []string, confirmedCleanup bool) error {
+// under the scanned roots that were not seen on disk are marked missing, the
+// folder trash is optionally emptied, and library memberships are reconciled
+// so items with no remaining files are removed (renames therefore converge on
+// the newly indexed path instead of leaving a stale duplicate item).
+func (s *Scanner) reconcileMissingEbookFiles(ctx context.Context, folder *models.MediaFolder, roots []string, seenPaths map[string]bool, protectedRoots []string, confirmedCleanup bool) error {
 	if s.fileRepo == nil || s.libraryRepo == nil || len(roots) == 0 {
 		return nil
-	}
-
-	// Protect unreachable and suspect-empty configured roots before marking,
-	// as the audiobook and movie/series pipelines do, so a lost mount cannot
-	// remove its books through membership reconciliation.
-	protectedRoots, err := s.sweepProtectedRoots(ctx, folder, confirmedCleanup, protectedRoots)
-	if err != nil {
-		return err
 	}
 
 	now := time.Now().UTC()
 	missing := 0
 	for _, root := range roots {
-		existing, err := s.fileRepo.ListScanPresenceWrittenBefore(ctx, folder.ID, root, inventoryAt)
+		existing, err := s.fileRepo.GetByFolderAndPathPrefix(ctx, folder.ID, root)
 		if err != nil {
 			return fmt.Errorf("listing existing ebook files for %q: %w", root, err)
 		}
 		for _, mf := range existing {
-			if seenPaths[mf.FilePath] || pathWithinAnyRoot(mf.FilePath, protectedRoots) {
+			if mf == nil || seenPaths[mf.FilePath] || pathWithinAnyRoot(mf.FilePath, protectedRoots) {
 				continue
 			}
 			if mf.MissingSince == nil {
-				err := s.fileRepo.MarkMissingWrittenBefore(ctx, mf.ID, mf.FilePath, now, inventoryAt)
-				if errors.Is(err, ErrFileNotFound) {
-					// Another scan wrote, relinked, or deleted the row since it
-					// was listed. It is no longer this scan's to mark.
-					continue
-				}
-				if err != nil {
+				if err := s.fileRepo.MarkMissing(ctx, mf.ID, mf.FilePath, now); err != nil {
 					slog.ErrorContext(ctx, "ebook scan: failed to mark file missing", "component", "scanner",
 						"folder_id", folder.ID,
 						"path", mf.FilePath,
@@ -517,7 +493,7 @@ func (s *Scanner) reconcileMissingEbookFiles(ctx context.Context, folder *models
 
 	// The folder-wide sweep must retain the same protection as the marking
 	// pass, including rows already marked missing before this failed walk.
-	trashed, removedMemberships, deletedItems, err := s.sweepMissingWithProtectedRoots(ctx, folder, protectedRoots)
+	trashed, removedMemberships, deletedItems, err := s.sweepMissingAndReconcile(ctx, folder, confirmedCleanup, protectedRoots...)
 	if trashed > 0 {
 		slog.InfoContext(ctx, "ebook scan: emptied trash", "component", "scanner", "folder_id", folder.ID, "deleted", trashed)
 	}
@@ -550,7 +526,7 @@ func (s *Scanner) reconcileEbookFile(ctx context.Context, folder *models.MediaFo
 }
 
 func (s *Scanner) reconcileEbookFileWithSkipState(ctx context.Context, folder *models.MediaFolder, filePath string, skipped *int64, groupLocks *ebookGroupLocks, skipState ebookSkipState) error {
-	info, err := fspath.Stat(filePath)
+	info, err := os.Stat(filePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -560,7 +536,7 @@ func (s *Scanner) reconcileEbookFileWithSkipState(ctx context.Context, folder *m
 	size := info.Size()
 	modifiedAt := normalizeFileModifiedAt(info.ModTime())
 	if sidecarPath := ebookOPFSidecarPath(filePath); sidecarPath != "" {
-		if sidecarInfo, statErr := fspath.Stat(sidecarPath); statErr == nil {
+		if sidecarInfo, statErr := os.Stat(sidecarPath); statErr == nil {
 			sidecarModifiedAt := normalizeFileModifiedAt(sidecarInfo.ModTime())
 			if sidecarModifiedAt.After(modifiedAt) {
 				modifiedAt = sidecarModifiedAt
@@ -581,7 +557,7 @@ func (s *Scanner) reconcileEbookFileWithSkipState(ctx context.Context, folder *m
 			"path", filePath,
 			"error", skipErr,
 		)
-	} else if isUnchanged && s.confirmUnchangedFiles(ctx, folder.ID, []string{filePath}) {
+	} else if isUnchanged {
 		// New or changed books (in either format), and metadata enrichment,
 		// perform linking. Unchanged unlinked books need no candidate search.
 		atomic.AddInt64(skipped, 1)
@@ -593,7 +569,7 @@ func (s *Scanner) reconcileEbookFileWithSkipState(ctx context.Context, folder *m
 		return fmt.Errorf("parse ebook file %s: %w", filePath, err)
 	}
 	if parsed.Title == "" {
-		parsed.Title = ebookDisplayTitleFromPath(filePath)
+		parsed.Title = ebookTitleFromPath(filePath)
 	}
 	if len(parsed.Authors) == 0 {
 		if author := ebookAuthorFromPath(filePath); author != "" {
@@ -763,6 +739,9 @@ func (s *Scanner) upsertEbookMediaItem(ctx context.Context, folderID int, filePa
 			return existing.ContentID, true, nil
 		}
 		applyEbookToMediaItem(existing, book)
+		if existing.SortTitle == "" {
+			existing.SortTitle = titleutil.DeriveDefaultSortTitle(existing.Title)
+		}
 		if err := s.itemRepo.Upsert(ctx, existing); err != nil {
 			return "", false, err
 		}
@@ -776,6 +755,9 @@ func (s *Scanner) upsertEbookMediaItem(ctx context.Context, folderID int, filePa
 			return existing.ContentID, true, nil
 		}
 		applyEbookToMediaItem(existing, book)
+		if existing.SortTitle == "" {
+			existing.SortTitle = titleutil.DeriveDefaultSortTitle(existing.Title)
+		}
 		if err := s.itemRepo.Upsert(ctx, existing); err != nil {
 			return "", false, err
 		}
@@ -812,7 +794,7 @@ func resolveEbookMediaItem(
 
 	cleanTitle := strings.TrimSpace(book.Title)
 	if cleanTitle == "" {
-		cleanTitle = ebookDisplayTitleFromPath(filePath)
+		cleanTitle = ebookTitleFromPath(filePath)
 	}
 	return createEbookMediaItem(ctx, itemWriter, book, cleanTitle)
 }
@@ -834,6 +816,9 @@ func createEbookMediaItem(ctx context.Context, itemWriter filesystemMediaItemWri
 		Year:      book.Year,
 	}
 	applyEbookToMediaItem(item, book)
+	if item.SortTitle == "" {
+		item.SortTitle = titleutil.DeriveDefaultSortTitle(item.Title)
+	}
 	if err := itemWriter.Upsert(ctx, item); err != nil {
 		return "", err
 	}
@@ -865,6 +850,9 @@ func updateExistingEbookMediaItem(ctx context.Context, itemReader filesystemMedi
 		return true, nil
 	}
 	applyEbookToMediaItem(item, book)
+	if item.SortTitle == "" {
+		item.SortTitle = titleutil.DeriveDefaultSortTitle(item.Title)
+	}
 	return false, itemWriter.Upsert(ctx, item)
 }
 
@@ -875,36 +863,26 @@ func ebookItemHasCuratedMetadata(item *models.MediaItem) bool {
 	return item != nil && strings.EqualFold(strings.TrimSpace(item.Status), "matched")
 }
 
-// applyEbookToMediaItem copies file metadata onto the item, leaving each field
-// an admin locked as it is, even when it is empty.
 func applyEbookToMediaItem(item *models.MediaItem, book *parsedEbook) {
 	item.Type = "ebook"
-	locked := func(field int) bool { return slices.Contains(item.LockedFields, field) }
-	if !locked(lockedFieldName) {
-		if title := strings.TrimSpace(book.Title); title != "" {
-			item.Title = title
-		}
-		if item.SortTitle == "" {
-			item.SortTitle = titleutil.DeriveDefaultSortTitle(item.Title)
-		}
+	if title := strings.TrimSpace(book.Title); title != "" {
+		item.Title = title
 	}
-	if !locked(lockedFieldReleaseDates) {
-		if book.Year > 0 {
-			item.Year = book.Year
-		}
-		if !book.PublishedAt.IsZero() && item.ReleaseDate == nil {
-			rd := book.PublishedAt.UTC().Format("2006-01-02")
-			item.ReleaseDate = &rd
-		}
+	if book.Year > 0 {
+		item.Year = book.Year
 	}
-	if book.Description != "" && !locked(lockedFieldOverview) && (item.Overview == "" || looksLikeHTML(item.Overview)) {
+	if book.Description != "" && (item.Overview == "" || looksLikeHTML(item.Overview)) {
 		item.Overview = book.Description
 	}
-	if book.Publisher != "" && !locked(lockedFieldStudios) {
+	if book.Publisher != "" {
 		item.Studios = mergeUniqueStrings(item.Studios, []string{book.Publisher})
 	}
-	if len(book.Genres) > 0 && !locked(lockedFieldGenres) {
+	if len(book.Genres) > 0 {
 		item.Genres = mergeUniqueStrings(item.Genres, book.Genres)
+	}
+	if !book.PublishedAt.IsZero() && item.ReleaseDate == nil {
+		rd := book.PublishedAt.UTC().Format("2006-01-02")
+		item.ReleaseDate = &rd
 	}
 	if book.Language != "" && item.OriginalLanguage == "" {
 		item.OriginalLanguage = book.Language
@@ -1024,7 +1002,7 @@ func ebookContentGroupKey(book *parsedEbook, filePath string) string {
 		authors = book.Authors
 	}
 	if title == "" {
-		title = ebookDisplayTitleFromPath(filePath)
+		title = ebookTitleFromPath(filePath)
 	}
 	normalizedTitle := normalizeEbookIdentityPart(title)
 	if normalizedTitle == "" {
@@ -1073,13 +1051,6 @@ func ebookTitleFromPath(filePath string) string {
 	return strings.TrimSuffix(base, filepath.Ext(base))
 }
 
-// ebookDisplayTitleFromPath is ebookTitleFromPath as text for people: a
-// non-UTF-8 file name reads through fspath.Display, so the title and the
-// group key built from it never hold reserved code points.
-func ebookDisplayTitleFromPath(filePath string) string {
-	return fspath.Display(ebookTitleFromPath(filePath))
-}
-
 // ebookAuthorFromPath recovers an author for libraries that shelve books as
 // ".../<Author>/<Title>/<Title> - <Author>.ext" but embed no author in the file
 // (common for PDF/MOBI/AZW3). It returns a value only when two independent path
@@ -1088,7 +1059,7 @@ func ebookDisplayTitleFromPath(filePath string) string {
 // satisfy neither or only one signal, so they never get a junk author that would
 // poison the enrichment search.
 func ebookAuthorFromPath(filePath string) string {
-	base := ebookDisplayTitleFromPath(filePath)
+	base := ebookTitleFromPath(filePath)
 	idx := strings.LastIndex(base, " - ")
 	if idx < 0 {
 		return ""
@@ -1097,7 +1068,7 @@ func ebookAuthorFromPath(filePath string) string {
 	if fromName == "" {
 		return ""
 	}
-	grandparent := strings.TrimSpace(fspath.Display(filepath.Base(filepath.Dir(filepath.Dir(filePath)))))
+	grandparent := strings.TrimSpace(filepath.Base(filepath.Dir(filepath.Dir(filePath))))
 	switch grandparent {
 	case "", ".", string(filepath.Separator):
 		return ""
@@ -1154,11 +1125,8 @@ func looksLikePersonName(value string) bool {
 	return hasUpper
 }
 
-// normalizeEbookIdentityPart folds value for identity comparison. value may
-// be an fspath-encoded path part; it is read through fspath.Display first so
-// escaped bytes count as letters instead of being dropped.
 func normalizeEbookIdentityPart(value string) string {
-	value = strings.ToLower(strings.TrimSpace(fspath.Display(value)))
+	value = strings.ToLower(strings.TrimSpace(value))
 	var b strings.Builder
 	previousSpace := false
 	for _, r := range value {
@@ -1282,7 +1250,7 @@ func findSidecarBookCover(ebookFilePath string) (*parsedEbookCover, string, erro
 	if ebookFilePath == "" {
 		return nil, "", nil
 	}
-	entries, err := fspath.ReadDir(filepath.Dir(ebookFilePath))
+	entries, err := os.ReadDir(filepath.Dir(ebookFilePath))
 	if err != nil {
 		return nil, "", err
 	}
@@ -1329,7 +1297,7 @@ func findSidecarBookCover(ebookFilePath string) (*parsedEbookCover, string, erro
 }
 
 func readSidecarCover(path string) ([]byte, error) {
-	file, err := fspath.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -1482,17 +1450,6 @@ func (s *Scanner) upsertEbookPeople(ctx context.Context, contentID string, book 
 		return nil
 	}
 	if ebookPeopleCreditsEqual(existing, desired) {
-		return nil
-	}
-	var locked []int
-	if err := s.fileRepo.Pool().QueryRow(ctx,
-		`SELECT COALESCE(locked_fields, '{}'::integer[]) FROM media_items WHERE content_id = $1`,
-		contentID).Scan(&locked); err != nil {
-		return fmt.Errorf("read ebook field locks: %w", err)
-	}
-	// The ebook enricher holds authors under either the crew or the cast lock,
-	// so a rescan does too.
-	if slices.Contains(locked, lockedFieldCrew) || slices.Contains(locked, lockedFieldCast) {
 		return nil
 	}
 

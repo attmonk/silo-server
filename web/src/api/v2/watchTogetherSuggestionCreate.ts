@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import { randomUUID } from "@/lib/uuid";
 import {
   captureProfileRequestContext,
@@ -39,8 +38,7 @@ export async function createRoomSuggestion(draft: SuggestionCreationDraft) {
     throw error;
   });
   check();
-  if (result.suggestion_id !== body.suggestion_id)
-    throw new Error(t("web.common.errors.suggestionReceiptInvalid"));
+  if (result.suggestion_id !== body.suggestion_id) throw new Error("Invalid suggestion receipt.");
   return listRoomSuggestions(roomId, roomToken, authority).catch((error: unknown) => {
     check();
     throw error;

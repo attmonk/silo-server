@@ -11,7 +11,6 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/metadata"
-	"github.com/Silo-Server/silo-server/internal/metadata/showstatus"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -307,7 +306,7 @@ func parseTVShowNFO(data []byte) (*parsedNFO, error) {
 	p := parsedFromCommon(&s.nfoCommon, typeSeries)
 	p.FirstAirDate = firstDate(s.Premiered, s.Aired)
 	deriveYear(p, s.Premiered, s.Aired)
-	p.ShowStatus = showstatus.Normalize(s.Status)
+	p.ShowStatus = metadata.NormalizeShowStatus(s.Status)
 	// Kodi has no network element: a show's <studio> is its network.
 	p.Networks = slices.Clone(p.Studios)
 	p.SeasonNames = namedSeasons(s.NamedSeasons)

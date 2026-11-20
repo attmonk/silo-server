@@ -12,7 +12,6 @@ import {
 import { captureNotificationAuthority, notificationScope } from "@/api/v2/notifications";
 import { adminKeys } from "../keys";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 
 export function useServerNotificationChannels() {
   const context = captureProfileRequestContext();
@@ -33,12 +32,8 @@ export function useCreateServerNotificationChannel() {
     mutationFn: async (input: ServerNotificationChannelInput) => {
       if (!context) throw new StaleApiRequestContextError();
       requireNotificationAuthority(context);
-      if (inFlight.current)
-        throw new Error(t("web.admin.settings.hooks.serverNotificationChannels.createInProgress"));
-      if (!input.name || !input.url)
-        throw new Error(
-          t("web.admin.settings.hooks.serverNotificationChannels.nameAndUrlRequired"),
-        );
+      if (inFlight.current) throw new Error("Destination creation is already in progress.");
+      if (!input.name || !input.url) throw new Error("A name and webhook URL are required.");
       inFlight.current = true;
       try {
         const result = await v2("POST /api/v2/admin/notifications/server-channels", {
@@ -97,11 +92,7 @@ export function useUpdateServerNotificationChannel() {
       } catch {
         return;
       }
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : t("web.admin.settings.hooks.serverNotificationChannels.updateFailed"),
-      );
+      toast.error(error instanceof Error ? error.message : "Failed to update channel");
     },
   });
   return {
@@ -128,7 +119,7 @@ export function useDeleteServerNotificationChannel() {
     },
     onSuccess: (authority) => {
       requireNotificationAuthority(authority);
-      toast.success(t("web.admin.settings.hooks.serverNotificationChannels.deleted"));
+      toast.success("Channel deleted");
       void queryClient.invalidateQueries({
         queryKey: [...adminKeys.serverNotificationChannels(), notificationScope(authority)],
         exact: true,
@@ -142,7 +133,7 @@ export function useDeleteServerNotificationChannel() {
       } catch {
         return;
       }
-      toast.error(t("web.admin.settings.hooks.serverNotificationChannels.deleteFailed"));
+      toast.error("Failed to delete channel");
     },
   });
   return {
@@ -161,8 +152,7 @@ export function useTestServerNotificationChannel() {
     retry: false,
     mutationFn: async (id: string) => {
       if (!context) throw new StaleApiRequestContextError();
-      if (inFlight.current)
-        throw new Error(t("web.common.toast.notificationWebhooks.testInProgress"));
+      if (inFlight.current) throw new Error("A test delivery is already in progress.");
       inFlight.current = true;
       try {
         return await testNotificationDestination("server-channel", id, context);
@@ -210,11 +200,7 @@ export function useRotateServerNotificationChannelSecret() {
       } catch {
         return;
       }
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : t("web.admin.settings.hooks.serverNotificationChannels.rotateFailed"),
-      );
+      toast.error(error instanceof Error ? error.message : "Failed to rotate signing secret");
     },
   });
   return {

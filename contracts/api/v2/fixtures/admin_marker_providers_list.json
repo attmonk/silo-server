@@ -9,8 +9,7 @@
       "fetch_min_confidence": 0.4,
       "contribute_enabled": false,
       "contribute_auto_local": false,
-      "contribute_min_confidence": 0.8,
-      "default_contribute_enabled": false
+      "contribute_min_confidence": 0.8
     }
   ]
 }

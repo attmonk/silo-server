@@ -29,7 +29,6 @@ import {
   useCreateAutoscanWebhook,
   useUpdateAutoscanSource,
 } from "@/hooks/queries/useAutoscan";
-import { useT, type MessageKey } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 import { ChoiceCard, StepTrail, type Step } from "./ChoiceCard";
@@ -69,7 +68,6 @@ import { WebhookEndpointSection } from "./WebhookEndpoint";
 import { absoluteWebhookURL } from "./webhookURL";
 import { WebhookInstructions, WebhookProviderSelect, WebhookTriggerHint } from "./WebhookSetupStep";
 import { hasUsableMapping, newMapping, seedMappings, usableMappings } from "./webhookSetup";
-import { formatLocale } from "@/lib/appLocale";
 
 // ---------------------------------------------------------------------------
 // Add and edit share one dialog.
@@ -85,17 +83,15 @@ import { formatLocale } from "@/lib/appLocale";
 // ---------------------------------------------------------------------------
 
 /** Human wording for a delivery mode, used on the choice cards. */
-const DELIVERY_MODE_COPY: Record<
-  AutoscanDeliveryMode,
-  { title: MessageKey; description: MessageKey }
-> = {
+const DELIVERY_MODE_COPY: Record<AutoscanDeliveryMode, { title: string; description: string }> = {
   webhook: {
-    title: "web.admin.autoscan.sourceDialog.delivery.webhookTitle",
-    description: "web.admin.autoscan.sourceDialog.delivery.webhookDescription",
+    title: "The service tells Silo",
+    description:
+      "Instant. Paste one URL into the service's webhook settings. No credentials stored here.",
   },
   poll: {
-    title: "web.admin.autoscan.sourceDialog.delivery.pollTitle",
-    description: "web.admin.autoscan.sourceDialog.delivery.pollDescription",
+    title: "Silo checks the service",
+    description: "Silo asks on a schedule. Works without changing anything upstream.",
   },
 };
 
@@ -125,7 +121,6 @@ type SourceDialogProps = {
 
 export function SourceDialog(props: SourceDialogProps) {
   const { open, onOpenChange, connectionOptions, globalPollInterval } = props;
-  const t = useT();
   const editSource = props.mode === "edit" ? props.source : null;
   const isEdit = editSource !== null;
 
@@ -254,25 +249,16 @@ export function SourceDialog(props: SourceDialogProps) {
   const problems: Problem[] = [];
   if (hasPlugin) {
     if (connectionRequired && !draftConnectionId(form))
-      problems.push({
-        tab: "connection",
-        message: t("web.admin.autoscan.sourceDialog.problem.chooseServer"),
-      });
+      problems.push({ tab: "connection", message: "Choose the server this source reads from." });
     if (intervalInvalid)
       problems.push({
         tab: "settings",
-        message: t("web.admin.autoscan.sourceDialog.problem.intervalInvalid"),
+        message: "The check interval must be a whole number of seconds.",
       });
     if (!form.configValid)
-      problems.push({
-        tab: "settings",
-        message: t("web.admin.autoscan.sourceDialog.problem.settingsInvalid"),
-      });
+      problems.push({ tab: "settings", message: "Some settings are missing or invalid." });
     if (incomplete.length > 0)
-      problems.push({
-        tab: "paths",
-        message: t("web.admin.autoscan.sourceDialog.problem.mappingIncomplete"),
-      });
+      problems.push({ tab: "paths", message: "Each path mapping needs both paths." });
     // A new webhook source needs a mapping, and an edit may not remove the last
     // one: without it deliveries usually match no library. A source saved
     // earlier without mappings (both sides use the same paths) stays editable.
@@ -284,7 +270,7 @@ export function SourceDialog(props: SourceDialogProps) {
     )
       problems.push({
         tab: "paths",
-        message: t("web.admin.autoscan.sourceDialog.problem.mappingRequired"),
+        message: "Add at least one complete path mapping, or deliveries will match no library.",
       });
   }
   const [attempted, setAttempted] = useState(false);
@@ -294,37 +280,16 @@ export function SourceDialog(props: SourceDialogProps) {
 
   const tabs: Array<{ id: TabId; label: string }> = isWebhook
     ? [
-        { id: "connect", label: t("web.admin.autoscan.sourceDialog.tab.connect") },
-        { id: "paths", label: t("web.admin.autoscan.sourceDialog.tab.paths") },
-        ...(hasSettings
-          ? [
-              {
-                id: "settings" as const,
-                label: t("web.admin.autoscan.sourceDialog.tab.settings"),
-              },
-            ]
-          : []),
-        { id: "general", label: t("web.admin.autoscan.sourceDialog.tab.general") },
+        { id: "connect", label: "Connect" },
+        { id: "paths", label: "Match paths" },
+        ...(hasSettings ? [{ id: "settings" as const, label: "Settings" }] : []),
+        { id: "general", label: "General" },
       ]
     : [
-        ...(showConnection
-          ? [
-              {
-                id: "connection" as const,
-                label: t("web.admin.autoscan.sourceDialog.tab.connection"),
-              },
-            ]
-          : []),
-        ...(hasSettings
-          ? [
-              {
-                id: "settings" as const,
-                label: t("web.admin.autoscan.sourceDialog.tab.settings"),
-              },
-            ]
-          : []),
-        { id: "paths", label: t("web.admin.autoscan.sourceDialog.tab.paths") },
-        { id: "general", label: t("web.admin.autoscan.sourceDialog.tab.general") },
+        ...(showConnection ? [{ id: "connection" as const, label: "Connection" }] : []),
+        ...(hasSettings ? [{ id: "settings" as const, label: "Settings" }] : []),
+        { id: "paths", label: "Match paths" },
+        { id: "general", label: "General" },
       ];
   const [chosenTab, setActiveTab] = useState<TabId>(tabs[0]!.id);
   // The tab set follows the descriptor, which can arrive after the dialog opens.
@@ -519,38 +484,31 @@ export function SourceDialog(props: SourceDialogProps) {
     />
   ) : null;
 
+  const defaultIntervalText =
+    globalPollInterval != null ? ` (${formatInterval(globalPollInterval)})` : "";
   const intervalSection = showInterval ? (
     <div className="space-y-1.5">
-      <Label htmlFor={`${idBase}-interval`}>
-        {t("web.admin.autoscan.sourceDialog.interval.label")}
-      </Label>
+      <Label htmlFor={`${idBase}-interval`}>Check interval (seconds)</Label>
       <div className="flex items-center gap-2">
         <Input
           id={`${idBase}-interval`}
           className="w-32"
-          placeholder={t("web.admin.autoscan.sourceDialog.interval.placeholder")}
+          placeholder="Default"
           inputMode="numeric"
           value={form.intervalStr}
           aria-invalid={intervalInvalid}
           onChange={(e) => update({ intervalStr: e.target.value })}
         />
-        <span className="text-muted-foreground text-sm">
-          {t("web.admin.autoscan.sourceDialog.interval.unit")}
-        </span>
+        <span className="text-muted-foreground text-sm">sec</span>
       </div>
       {intervalInvalid && (
         <p className="text-destructive text-xs">
-          {t("web.admin.autoscan.sourceDialog.interval.invalid", {
-            max: MAX_POLL_INTERVAL_SECONDS.toLocaleString(formatLocale()),
-          })}
+          Must be a whole number from 1 to {MAX_POLL_INTERVAL_SECONDS.toLocaleString()}.
         </p>
       )}
       <p className="text-muted-foreground text-xs">
-        {globalPollInterval != null
-          ? t("web.admin.autoscan.sourceDialog.interval.helpWithDefault", {
-              interval: formatInterval(globalPollInterval),
-            })
-          : t("web.admin.autoscan.sourceDialog.interval.help")}
+        Optional — leave blank to use the global default{defaultIntervalText}. A longer interval
+        checks this source less often; values below the default have no effect.
       </p>
     </div>
   ) : null;
@@ -570,9 +528,9 @@ export function SourceDialog(props: SourceDialogProps) {
   const syncDisabledReason = !editSource
     ? null
     : !editSource.connection_id
-      ? t("web.admin.autoscan.sourceDialog.sync.noServer")
+      ? "Choose a server on the Connection tab and save to sync from it."
       : draftConnectionId(form) !== editSource.connection_id
-        ? t("web.admin.autoscan.sourceDialog.sync.unsaved")
+        ? "Save the new server choice first, then sync from it."
         : null;
   const mappingSection = hasPlugin ? (
     <div className="space-y-2">
@@ -595,27 +553,21 @@ export function SourceDialog(props: SourceDialogProps) {
       />
       {!isEdit && showConnection && (
         <p className="text-muted-foreground text-xs">
-          {t("web.admin.autoscan.sourceDialog.syncHint", {
-            b: (chunks) => <span className="font-medium">{chunks}</span>,
-          })}
+          Once the source is saved, Edit → Match paths can read these from the server with{" "}
+          <span className="font-medium">Sync from server</span>.
         </p>
       )}
     </div>
   ) : null;
 
-  // String() marks this as a copy for the React Compiler: it treats t() as
-  // possibly mutating its values, and the plugin object feeds the memoized
-  // descriptor above.
-  const typeName = String(selectedPlugin?.display_name ?? editSource?.capability_id ?? "");
+  const typeName = selectedPlugin?.display_name ?? editSource?.capability_id ?? "";
   // What the list calls the source while it has no label of its own (see
   // sourceTitle): the arr a webhook receives from, else the type.
   const unlabelledName = (isWebhook && providerName(provider)) || typeName;
   const labelSection = hasPlugin ? (
     <div className="space-y-1.5">
       <Label htmlFor={`${idBase}-label`}>
-        {t("web.admin.autoscan.sourceDialog.label.label", {
-          muted: (chunks) => <span className="text-muted-foreground font-normal">{chunks}</span>,
-        })}
+        Custom label <span className="text-muted-foreground font-normal">(optional)</span>
       </Label>
       <Input
         id={`${idBase}-label`}
@@ -624,14 +576,15 @@ export function SourceDialog(props: SourceDialogProps) {
         onChange={(e) => update({ label: e.target.value })}
       />
       <p className="text-muted-foreground text-xs">
-        {t("web.admin.autoscan.sourceDialog.label.help", { name: unlabelledName })}
+        Leave empty to show &ldquo;{unlabelledName}&rdquo;. A label tells sources of the same kind
+        apart in this list and in Activity.
       </p>
     </div>
   ) : null;
 
   const problemMessage = firstProblem ? (
     <p
-      className="text-destructive flex items-center gap-1.5 text-xs sm:me-auto sm:self-center"
+      className="text-destructive flex items-center gap-1.5 text-xs sm:mr-auto sm:self-center"
       role="alert"
     >
       <AlertTriangle className="size-3.5 shrink-0" />
@@ -667,14 +620,12 @@ export function SourceDialog(props: SourceDialogProps) {
           {labelSection}
           <div className="text-muted-foreground space-y-1 text-xs">
             <p>
-              {t("web.admin.autoscan.sourceDialog.general.type", {
-                type: typeName,
-                mode: isWebhook ? "webhook" : "poll",
-                b: (chunks) => <span className="text-foreground">{chunks}</span>,
-              })}
+              Type: <span className="text-foreground">{typeName}</span>
+              {" · "}
+              {isWebhook ? "webhook delivery" : "polled on a schedule"}
             </p>
             <p className="font-mono break-all">{editSource.plugin_id}</p>
-            <p>{t("web.admin.autoscan.sourceDialog.general.changeType")}</p>
+            <p>To use a different type, add a new source.</p>
           </div>
         </div>
       ),
@@ -684,9 +635,7 @@ export function SourceDialog(props: SourceDialogProps) {
       <Dialog open={open} onOpenChange={handleOpenChange}>
         <DialogContent className="max-h-[calc(100dvh-2rem)] grid-cols-[minmax(0,1fr)] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle className="pe-6 break-words">
-              {t("web.admin.autoscan.sourceDialog.editTitle", { name: props.title })}
-            </DialogTitle>
+            <DialogTitle className="pr-6 break-words">Edit source · {props.title}</DialogTitle>
             <DialogDescription>{props.description}</DialogDescription>
           </DialogHeader>
 
@@ -711,7 +660,7 @@ export function SourceDialog(props: SourceDialogProps) {
                   {problemTabs.has(tab.id) && (
                     <span
                       className="bg-destructive size-1.5 rounded-full"
-                      aria-label={t("web.admin.autoscan.sourceDialog.tabNeedsAttention")}
+                      aria-label="needs attention"
                     />
                   )}
                 </TabsTrigger>
@@ -736,20 +685,18 @@ export function SourceDialog(props: SourceDialogProps) {
             <Button
               type="button"
               variant="ghost"
-              className="text-destructive hover:text-destructive hover:bg-destructive/10 sm:me-auto"
+              className="text-destructive hover:text-destructive hover:bg-destructive/10 sm:mr-auto"
               onClick={() => props.onRequestDelete(editSource)}
             >
               <Trash2 />
-              {t("web.admin.autoscan.sourceDialog.deleteSource")}
+              Delete source
             </Button>
             {problemMessage}
             <Button variant="outline" onClick={close} disabled={busy}>
-              {t("common.cancel")}
+              Cancel
             </Button>
             <Button onClick={handleSubmit} disabled={saveBlocked}>
-              {updateSource.isPending
-                ? t("web.admin.autoscan.sourceDialog.saving")
-                : t("common.save")}
+              {updateSource.isPending ? "Saving…" : "Save"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -768,14 +715,14 @@ export function SourceDialog(props: SourceDialogProps) {
   const connectionChosen = draftConnectionId(form) !== null;
   const stepStates: Array<{ label: string; satisfied: boolean; touched: boolean }> = [
     {
-      label: t("web.admin.autoscan.sourceDialog.step.what"),
+      label: "What changes?",
       satisfied: Boolean(selectedPlugin),
       touched: Boolean(selectedPlugin),
     },
     ...(showDeliveryChoice
       ? [
           {
-            label: t("web.admin.autoscan.sourceDialog.step.how"),
+            label: "How do we hear about it?",
             satisfied: Boolean(form.deliveryMode),
             touched: Boolean(form.deliveryMode),
           },
@@ -784,7 +731,7 @@ export function SourceDialog(props: SourceDialogProps) {
     ...(showConnection
       ? [
           {
-            label: t("web.admin.autoscan.sourceDialog.step.server"),
+            label: "Which server?",
             satisfied: connectionChosen || !connectionRequired,
             touched: connectionChosen,
           },
@@ -795,28 +742,24 @@ export function SourceDialog(props: SourceDialogProps) {
       : isWebhook
         ? [
             {
-              label: t("web.admin.autoscan.sourceDialog.step.paths"),
+              label: "Match paths",
               satisfied: hasUsableMapping(form.mappings),
               touched: form.mappingsDirty,
             },
-            {
-              label: t("web.admin.autoscan.sourceDialog.step.connect"),
-              satisfied: false,
-              touched: false,
-            },
+            { label: "Connect it", satisfied: false, touched: false },
           ]
         : [
             ...(hasSettings
               ? [
                   {
-                    label: t("web.admin.autoscan.sourceDialog.step.setup"),
+                    label: "Set it up",
                     satisfied: !intervalInvalid && form.configValid,
                     touched: form.configDirty || form.intervalStr.trim() !== "",
                   },
                 ]
               : []),
             {
-              label: t("web.admin.autoscan.sourceDialog.step.paths"),
+              label: "Match paths",
               satisfied: incomplete.length === 0,
               touched: form.mappingsDirty,
             },
@@ -834,14 +777,12 @@ export function SourceDialog(props: SourceDialogProps) {
       <DialogContent className="max-h-[calc(100dvh-2rem)] grid-cols-[minmax(0,1fr)] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>
-            {createdWebhookSource
-              ? t("web.admin.autoscan.sourceDialog.connectTitle")
-              : t("web.admin.autoscan.sourceDialog.addTitle")}
+            {createdWebhookSource ? "Almost done — connect your service" : "Add scan source"}
           </DialogTitle>
           <DialogDescription>
             {createdWebhookSource
-              ? t("web.admin.autoscan.sourceDialog.connectDescription")
-              : t("web.admin.autoscan.sourceDialog.addDescription")}
+              ? "The source is created and listening. Paste this into your download manager to finish."
+              : "Pick what you want Silo to watch. Each source only asks for what it actually needs."}
           </DialogDescription>
         </DialogHeader>
 
@@ -859,10 +800,11 @@ export function SourceDialog(props: SourceDialogProps) {
               <div className="border-destructive/30 bg-destructive/10 space-y-3 rounded-md border p-3">
                 <p className="text-destructive flex items-center gap-1.5 text-sm font-medium">
                   <AlertTriangle className="size-4 shrink-0" />
-                  {t("web.admin.autoscan.sourceDialog.webhookFailedTitle")}
+                  Couldn&apos;t generate the webhook URL
                 </p>
                 <p className="text-muted-foreground text-xs">
-                  {t("web.admin.autoscan.sourceDialog.webhookFailedBody")}
+                  The source was created, but has no endpoint yet — it can&apos;t receive anything
+                  until one exists.
                 </p>
                 <Button
                   type="button"
@@ -876,36 +818,27 @@ export function SourceDialog(props: SourceDialogProps) {
                   }
                 >
                   <RefreshCw />
-                  {createWebhook.isPending
-                    ? t("web.admin.autoscan.sourceDialog.retrying")
-                    : t("common.tryAgain")}
+                  {createWebhook.isPending ? "Retrying…" : "Try again"}
                 </Button>
               </div>
             )}
           </div>
         ) : available.isLoading ? (
-          <p className="text-muted-foreground py-4 text-sm">
-            {t("web.admin.autoscan.sourceDialog.loadingSources")}
-          </p>
+          <p className="text-muted-foreground py-4 text-sm">Loading available sources…</p>
         ) : plugins.length === 0 ? (
           <p className="text-muted-foreground py-4 text-sm">
-            {t("web.admin.autoscan.sourceDialog.noPlugins", {
-              link: (chunks) => (
-                <Link
-                  to="/admin/plugins"
-                  className="text-primary underline-offset-4 hover:underline"
-                >
-                  {chunks}
-                </Link>
-              ),
-            })}
+            No scan-source plugins installed. Install one from the{" "}
+            <Link to="/admin/plugins" className="text-primary underline-offset-4 hover:underline">
+              Plugins page
+            </Link>{" "}
+            to add sources here.
           </p>
         ) : (
           <div className="space-y-5">
             <StepTrail steps={steps} />
 
             <div className="space-y-2">
-              <Label>{t("web.admin.autoscan.sourceDialog.pluginLabel")}</Label>
+              <Label>What should Silo watch?</Label>
               <div className="grid gap-2 sm:grid-cols-2">
                 {plugins.map((p) => {
                   const key = pluginKey(p.plugin_id, p.capability_id);
@@ -933,21 +866,17 @@ export function SourceDialog(props: SourceDialogProps) {
 
             {showDeliveryChoice && (
               <div className="space-y-2">
-                <Label>{t("web.admin.autoscan.sourceDialog.deliveryLabel")}</Label>
+                <Label>How should Silo hear about changes?</Label>
                 <div className="grid gap-2 sm:grid-cols-2">
                   {descriptor.delivery_modes.map((mode) => {
                     const copy = DELIVERY_MODE_COPY[mode];
                     return (
                       <ChoiceCard
                         key={mode}
-                        title={copy ? t(copy.title) : mode}
-                        description={copy ? t(copy.description) : undefined}
+                        title={copy?.title ?? mode}
+                        description={copy?.description}
                         icon={mode === "webhook" ? <Webhook className="size-3.5" /> : undefined}
-                        badge={
-                          mode === "webhook"
-                            ? t("web.admin.autoscan.sourceDialog.recommended")
-                            : undefined
-                        }
+                        badge={mode === "webhook" ? "Recommended" : undefined}
                         selected={deliveryMode === mode}
                         onSelect={() => selectDeliveryMode(mode)}
                       />
@@ -980,20 +909,16 @@ export function SourceDialog(props: SourceDialogProps) {
           {createdWebhookSource ? (
             // The source already exists at this point, so there is nothing to
             // cancel — only an acknowledgement that the URL has been copied.
-            <Button onClick={close}>{t("common.done")}</Button>
+            <Button onClick={close}>Done</Button>
           ) : (
             <>
               {problemMessage}
               <Button variant="outline" onClick={close} disabled={busy}>
-                {t("common.cancel")}
+                Cancel
               </Button>
               {plugins.length > 0 && (
                 <Button onClick={handleSubmit} disabled={!selectedPlugin || busy}>
-                  {busy
-                    ? t("web.admin.autoscan.sourceDialog.adding")
-                    : isWebhook
-                      ? t("web.admin.autoscan.sourceDialog.createAndContinue")
-                      : t("web.admin.autoscan.sourceDialog.addSource")}
+                  {busy ? "Adding…" : isWebhook ? "Create and continue" : "Add source"}
                 </Button>
               )}
             </>

@@ -13,9 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
-	"github.com/Silo-Server/silo-server/internal/nodepool/nodepooltest"
-
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
@@ -73,7 +70,7 @@ func TestHandleMasterManifestReplansAfterRemoteSoftwareToneMapFailure(t *testing
 			}
 			// The node accepted the software job but did not confirm its promised
 			// output. The manifest path must stop that job before trying a sibling.
-			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{ThrottleSeconds: request.ThrottleSeconds, RequireAudioTrack: request.RequireAudioTrack})
+			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{ThrottleSeconds: request.ThrottleSeconds})
 		case r.Method == http.MethodDelete && r.URL.Path == "/transcode/upstream-1":
 			failedNodeCleaned.Store(true)
 			w.WriteHeader(http.StatusNoContent)
@@ -101,7 +98,7 @@ func TestHandleMasterManifestReplansAfterRemoteSoftwareToneMapFailure(t *testing
 				return
 			}
 			fallbackModes.record(request.ToneMapMode)
-			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{RequireAudioTrack: request.RequireAudioTrack, HWAccel: request.HWAccel, ToneMapMode: request.ToneMapMode, ThrottleSeconds: request.ThrottleSeconds})
+			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{HWAccel: request.HWAccel, ToneMapMode: request.ToneMapMode, ThrottleSeconds: request.ThrottleSeconds})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -561,7 +558,7 @@ func newManifestToneMapFailoverHandler(
 	}}
 
 	maxJobs := 1
-	transcodes := nodepooltest.NewTranscodePool()
+	transcodes := nodepool.NewTranscodePool()
 	nodes := []*nodepool.Node{{ID: 1, URL: failedNodeURL, Enabled: true, Healthy: true, MaxJobs: &maxJobs}}
 	for index, nodeURL := range fallbackNodeURLs {
 		nodes = append(nodes, &nodepool.Node{ID: index + 2, URL: nodeURL, Enabled: true, Healthy: true, MaxJobs: &maxJobs})
@@ -581,8 +578,7 @@ func newManifestToneMapFailoverHandler(
 			config.PlaybackTranscodeSoftwareToneMapSettingKey: "true",
 		}},
 		JWTSecret: "test-secret",
-		NodeKeys:  nodeauthtest.SameKey("test-secret"),
-		tm:        keyedTranscodeManager(),
+		tm:        playback.NewTranscodeManager(),
 	}
 	if !localFallback {
 		requireCompatWorkerRouting(handler)

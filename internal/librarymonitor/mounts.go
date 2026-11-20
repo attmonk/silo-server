@@ -2,22 +2,20 @@ package librarymonitor
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // mountEntry is one line of /proc/self/mountinfo.
 type mountEntry struct {
 	id int
 	// dev is the filesystem's major:minor.
-	dev string
-	// point is fspath-encoded, like the paths it is compared with.
+	dev    string
 	point  string
 	fsType string
 }
@@ -68,7 +66,7 @@ func parseMountInfo(data string) []mountEntry {
 		out = append(out, mountEntry{
 			id:     id,
 			dev:    fields[2],
-			point:  fspath.Encode(unescapeMountPath(fields[4])),
+			point:  unescapeMountPath(fields[4]),
 			fsType: fields[sep+1],
 		})
 	}
@@ -204,7 +202,7 @@ func onUnsupportedMount(mounts map[string]bool, physical string) bool {
 // A target reached through further links is not caught here; callers check
 // again after resolving.
 func linkOntoUnsupportedMount(mounts map[string]bool, path, physicalParent string) bool {
-	target, err := fspath.Readlink(path)
+	target, err := os.Readlink(path)
 	if err != nil {
 		return false
 	}

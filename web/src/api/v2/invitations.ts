@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import { type ProfileRequestContextSnapshot } from "@/api/client";
 import {
   captureAdminAuthority,
@@ -55,7 +54,7 @@ export async function listAdminInvitationsPage(
       (typeof page.next_cursor !== "string" || !page.next_cursor || page.next_cursor === cursor)) ||
     (!page.has_more && !!page.next_cursor)
   )
-    throw new Error(t("web.common.errors.invitationPaginationInvalid"));
+    throw new Error("Invalid invitation pagination. Reload the list.");
   return { items: result.items, page: { has_more: page.has_more, next_cursor: page.next_cursor } };
 }
 function delivery(value: InvitationDelivery) {
@@ -68,7 +67,9 @@ function delivery(value: InvitationDelivery) {
       value.delivery_status,
     )
   )
-    throw new Error(t("web.common.errors.invitationResponseIncomplete"));
+    throw new Error(
+      "Invitation may have been created, but its response was incomplete. Reload history before continuing.",
+    );
   return value;
 }
 export async function createAdminInvitation(

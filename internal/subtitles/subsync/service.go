@@ -6,18 +6,16 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/ai/jobrunner"
 	"github.com/Silo-Server/silo-server/internal/database/queryattr"
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/mediaartifact"
 	"github.com/Silo-Server/silo-server/internal/mediasample"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/nodeauth"
-	"github.com/Silo-Server/silo-server/internal/nodesource"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
@@ -98,18 +96,13 @@ type Deps struct {
 	Subtitles  *subtitles.Manager
 	Rows       subtitleRows
 	// External stores sidecar timing corrections.
-	External  externalRows
-	Files     mediaFiles
-	Artifacts *mediaartifact.Store
-	Settings  SettingsReader
-	Nodes     NodeSource
-	// NodeKeys signs requests to the nodes; without it speech decoding runs
-	// on this server.
-	NodeKeys nodeauth.Keyring
-	// SourceGrants grants a node the file it samples; nil sends no grant.
-	SourceGrants nodesource.FileGranter
-	FFmpegPath   func() string
-	Notifier     Notifier
+	External   externalRows
+	Files      mediaFiles
+	Artifacts  *mediaartifact.Store
+	Settings   SettingsReader
+	Nodes      NodeSource
+	FFmpegPath func() string
+	Notifier   Notifier
 	// Node names this server in artifact failure records.
 	Node string
 }
@@ -141,15 +134,14 @@ type Service struct {
 // NewService builds a Service and starts its stale-job recovery.
 func NewService(d Deps) *Service {
 	s := &Service{
-		jobs: d.Jobs, rows: d.Rows, content: d.Subtitles, external: d.External, readFile: fspath.ReadFile,
+		jobs: d.Jobs, rows: d.Rows, content: d.Subtitles, external: d.External, readFile: os.ReadFile,
 		files: d.Files, artifacts: d.Artifacts,
-		settings: d.Settings, sampler: newSampler(d.Settings, d.Nodes, d.NodeKeys, d.FFmpegPath),
+		settings: d.Settings, sampler: newSampler(d.Settings, d.Nodes, d.FFmpegPath),
 		notifier: d.Notifier, node: d.Node, now: time.Now,
 	}
 	if s.node == "" {
 		s.node = "silo"
 	}
-	s.sampler.grants = d.SourceGrants
 	s.runner = jobrunner.New(d.AppContext, jobrunner.NewSemaphore(concurrentJobs), d.Jobs, "subtitle sync", nil)
 	s.runner.Recover()
 	return s
@@ -804,7 +796,7 @@ func (s *Service) speech(ctx context.Context, file *models.MediaFile, language s
 		if decoded != nil {
 			done = func(n int) { decoded(n, len(reqs)) }
 		}
-		results, executedOn, err := s.sampler.run(ctx, file, reqs, done)
+		results, executedOn, err := s.sampler.run(ctx, reqs, done)
 		if err == nil {
 			windows := make([]mediasample.SpeechLevels, 0, len(results))
 			for _, r := range results {

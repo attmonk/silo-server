@@ -30,8 +30,8 @@ var _ userstore.SectionOverrideEnumerator = (*SQLiteUserStore)(nil)
 
 // ListAllSectionOverrides exposes the account-wide read capability used by
 // scheduled section maintenance.
-func (s *SQLiteUserStore) ListAllSectionOverrides(ctx context.Context) ([]userstore.SectionOverride, error) {
-	return ListAllSectionOverrides(ctx, s.db)
+func (s *SQLiteUserStore) ListAllSectionOverrides(_ context.Context) ([]userstore.SectionOverride, error) {
+	return ListAllSectionOverrides(s.db)
 }
 
 // --- Profiles ---
@@ -52,8 +52,8 @@ func (s *SQLiteUserStore) UpdateProfile(_ context.Context, id string, u userstor
 	return UpdateProfile(s.db, id, u)
 }
 
-func (s *SQLiteUserStore) DeleteProfile(ctx context.Context, id string) ([]string, error) {
-	return DeleteProfile(ctx, s.db, id)
+func (s *SQLiteUserStore) DeleteProfile(_ context.Context, id string) error {
+	return DeleteProfile(s.db, id)
 }
 
 // --- Progress ---
@@ -116,10 +116,6 @@ func (s *SQLiteUserStore) ListCompletedProgressSince(_ context.Context, profileI
 	return ListCompletedProgressSince(s.db, profileID, since, until, limit)
 }
 
-func (s *SQLiteUserStore) ListProgressItemIDs(ctx context.Context, profileID string) ([]string, error) {
-	return ListProgressItemIDs(ctx, s.db, profileID)
-}
-
 func (s *SQLiteUserStore) ListProgressPage(_ context.Context, profileID, status string, after *userstore.ProgressKey, limit int) ([]userstore.WatchProgress, error) {
 	return ListProgressPage(s.db, profileID, status, after, limit)
 }
@@ -180,10 +176,6 @@ func (s *SQLiteUserStore) VisibleHistoryTimestamps(_ context.Context, profileID 
 
 func (s *SQLiteUserStore) RemoveHistoryItems(_ context.Context, profileID string, mediaItemIDs []string, removedAt time.Time) error {
 	return RemoveHistoryItems(s.db, profileID, mediaItemIDs, removedAt)
-}
-
-func (s *SQLiteUserStore) ClearWatchedState(_ context.Context, profileID string, mediaItemIDs []string, clearedAt time.Time) error {
-	return ClearWatchedState(s.db, profileID, mediaItemIDs, clearedAt)
 }
 
 func (s *SQLiteUserStore) DeleteHistoryBySource(_ context.Context, profileID string, mediaItemIDs []string, source userstore.WatchHistorySource) error {
@@ -383,10 +375,6 @@ func (s *SQLiteUserStore) ListSectionOverrides(_ context.Context, profileID, sco
 
 func (s *SQLiteUserStore) SaveSectionOverrides(_ context.Context, profileID, scope, libraryID string, overrides []userstore.SectionOverride) error {
 	return SaveSectionOverrides(s.db, profileID, scope, libraryID, overrides)
-}
-
-func (s *SQLiteUserStore) RenameCollectionRows(ctx context.Context, kind, collectionID, oldTitle, newTitle string, visibleTo func(profileID string) bool) error {
-	return RenameCollectionRows(ctx, s.db, kind, collectionID, oldTitle, newTitle, visibleTo)
 }
 
 func (s *SQLiteUserStore) ResetSectionOverrides(_ context.Context, profileID, scope, libraryID string) error {

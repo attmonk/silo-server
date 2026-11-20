@@ -1,10 +1,8 @@
 <p align="center">
-  <img src="assets/attmonk-mark.svg" alt="ATTMonk Server logo" width="112" height="112">
+  <img src="assets/icon.png" alt="Silo logo" width="112" height="112">
 </p>
 
-<h1 align="center">ATTMonk Server</h1>
-
-<p align="center">An independent fork of <a href="https://github.com/Silo-Server/silo-server">Silo</a>, maintained by ATTMonk.</p>
+<h1 align="center">Silo</h1>
 
 <p align="center">
   A self-hosted media server for films, series, audiobooks, ebooks, podcasts, and manga.
@@ -14,13 +12,13 @@
   <a href="https://github.com/Silo-Server/silo-server/releases"><img alt="Latest GitHub release" src="https://img.shields.io/github/v/release/Silo-Server/silo-server?include_prereleases&amp;sort=semver&amp;display_name=tag&amp;style=flat-square&amp;label=release"></a>
   <a href="https://github.com/orgs/Silo-Server/packages/container/package/silo-server"><img alt="Container image on GHCR" src="https://img.shields.io/badge/container-GHCR-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
   <a href="https://github.com/Silo-Server/silo-server/actions/workflows/ci.yml"><img alt="Continuous integration" src="https://img.shields.io/github/actions/workflow/status/Silo-Server/silo-server/ci.yml?branch=main&amp;style=flat-square&amp;label=CI"></a>
-  <img alt="Go 1.27" src="https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&amp;logo=go&amp;logoColor=white">
+  <img alt="Go 1.26" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&amp;logo=go&amp;logoColor=white">
   <img alt="React 19" src="https://img.shields.io/badge/React-19-149ECA?style=flat-square&amp;logo=react&amp;logoColor=white">
   <a href="LICENSE"><img alt="AGPL-3.0-or-later license" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-555555?style=flat-square"></a>
 </p>
 
 <p align="center">
-  <a href="#build-attmonk-server">Build ATTMonk Server</a>
+  <a href="#quick-start">Quick start</a>
   · <a href="https://siloserver.org/docs">Documentation</a>
   · <a href="docs/release-versioning.md">Builds &amp; releases</a>
   · <a href="https://discord.gg/siloserver">Discord</a>
@@ -31,7 +29,7 @@
 ---
 
 > [!WARNING]
-> ATTMonk Server is pre-release. APIs, configuration, and database migrations may change
+> Silo is pre-release. APIs, configuration, and database migrations may change
 > before the first stable release. Back up your deployment before updating.
 
 ## 1.0 release scope
@@ -44,7 +42,7 @@ release date. The broader capabilities below include those beta
 implementations, not a promise that every media type is supported in 1.0.
 Existing library data is preserved when upgrading.
 
-## What ATTMonk Server does
+## What Silo does
 
 <table>
   <tr>
@@ -79,81 +77,24 @@ Existing library data is preserved when upgrading.
     </td>
     <td width="33%" valign="top">
       <strong>Scale</strong><br><br>
-      Start with one integrated server; add transcode nodes that need only its
-      URL and a key, or proxy nodes that share its PostgreSQL and Redis, when
-      you need to.
+      Start with one integrated server; split proxy and transcode roles across
+      shared PostgreSQL and Redis when you need to.
     </td>
   </tr>
 </table>
 
-## ATTMonk Server web premiere reminders
+## Quick start
 
-ATTMonk Server adds metadata-driven reminders with IPTV channel shortcuts to the web
-calendar and series/episode details. It requires a compatible Dispatcharr, XC,
-or HDHomeRun adapter advertising an optional channel `watchPath`.
-
-1. Open **Calendar → Premiere reminders** in the desired profile.
-2. Map a broadcaster to one or more accessible channels and choose an expected
-   window (15–240 minutes; default 60). Series details offer show overrides.
-3. Add a show to favorites/watchlist or complete an episode to establish viewing
-   interest. Existing notification preferences and series mutes still apply.
-
-A profile gets at most one reminder per original episode premiere. During the
-configured window, one mapped channel opens directly and multiple feeds open a
-chooser. Timing uses the catalog's episode date plus series airtime and timezone;
-a date-only entry cannot create a timed action. No EPG episode matching or DVR is
-required. Metadata can change, and the selected regional feed may show something
-else at that instant. The shortcut means “premiere expected,” not verified live.
-
-Mappings, preferences, and notification receipts use the server's existing
-PostgreSQL database and its normal startup migration. The new controls are
-web-only. Older plugins keep working without shortcuts, and the updated adapters
-retain ordinary guide/playback compatibility with servers lacking this extension.
-See [the premiere API and delivery rules](docs/notifications-api.md#metadata-premiere-reminders-attmonk-server-extension)
-for profile scope, timing, deduplication, and capability discovery.
-
-
-## Build ATTMonk Server
-
-The deployed build is maintained on [`feat/web-premiere-deploy`](https://github.com/attmonk/silo-server/tree/feat/web-premiere-deploy);
-`main` tracks upstream integration and can differ from the deployed fork.
-
-The product name is ATTMonk Server; repository, executable, API and plugin IDs
-retain their Silo-compatible names. Build from this fork with the root Dockerfile
-for an existing PostgreSQL/Redis deployment.
-
-The fork publishes `ghcr.io/attmonk/attmonk-server`. `server` is the standalone
-server for existing PostgreSQL/Redis deployments; `latest` bundles PostgreSQL and
-Redis. Immutable tags are `<commit>-base` for the standalone server and `<commit>`
-for the bundled image. CI publishes from `feat/web-premiere-deploy` after its
-checks pass. Do not use the bundled image as a drop-in for the standalone server.
-
-To build the bundled image:
-
-```sh
-git clone --branch feat/web-premiere-deploy https://github.com/attmonk/silo-server.git
-cd silo-server
-docker build -t attmonk-server:base .
-docker build -f omnibus/Dockerfile --build-arg SILO_IMAGE=attmonk-server:base -t attmonk-server:local .
-```
-
-See [ATTMonk Server branding and compatibility](docs/attmonk-server.md).
-
-## Upstream installation reference
-
-The following is the upstream Silo installation reference. For ATTMonk Server,
-build this fork and choose that image in your deployment configuration.
-
-Requires Docker Compose 2.24 or newer. The default Compose file runs the
-omnibus image: Silo with a bundled PostgreSQL (with pgvector) and Redis, plus
-Meilisearch when you turn it on.
+Requires Docker Compose 2.24 or newer. The default stack runs Silo, PostgreSQL
+with pgvector, and Redis.
 
 ```sh
 git clone https://github.com/Silo-Server/silo-server.git
 cd silo-server
 cp .env.example .env
 chmod 600 .env
-key="$(openssl rand -base64 48)" && printf '\nSECRET_KEY=%s\n' "$key" >> .env
+printf '\nPOSTGRES_PASSWORD=%s\nSECRET_KEY=%s\n' \
+  "$(openssl rand -hex 24)" "$(openssl rand -base64 48)" >> .env
 ```
 
 Set `MEDIA_ROOT` in `.env` to the absolute path of your media, then:
@@ -164,23 +105,6 @@ docker compose up -d
 
 Open <http://localhost:8090> and complete onboarding.
 
-Hardware transcoding (VA-API or NVIDIA) and PostgreSQL and Redis access for
-proxy nodes on other hosts are commented out in `docker-compose.yml`; uncomment
-the lines you need. Transcode nodes reach the server on its web port.
-
-### Updating an install from before the omnibus image
-
-An install that runs Silo, PostgreSQL, and Redis in separate containers keeps
-that layout when its `.env` sets `COMPOSE_FILE=docker-compose.advanced.yml`; set
-it before updating. `docker-compose.yml` is an example of a new install and
-does not look for an earlier one: started on that data folder, it replaces
-the old `silo` container and comes up on a new, empty database with setup
-open, while the earlier PostgreSQL and Redis keep running with their data
-untouched. Moving into the single container is a separate step. The separate GPU and node Compose files are gone, so a `COMPOSE_FILE`
-that names one fails until it names only the deployment file you use, with
-the matching lines in it uncommented. See [Moving from the multi-container
-stack](docs/architecture/omnibus-image.md#moving-from-the-multi-container-stack).
-
 The [user manual](https://siloserver.org/docs) covers the rest, starting with
 [installation](https://siloserver.org/docs/install): backing up `SECRET_KEY`,
 storage, GPU acceleration, Meilisearch, external PostgreSQL and Redis,
@@ -189,7 +113,7 @@ transcode nodes, PostgreSQL tuning, backups, and updates.
 ## Builds and releases
 
 Until the first release, default-branch images carry an ordered `build-N` tag
-and the full commit SHA alongside `latest`. Build numbers order published images;
+and a short commit SHA alongside `latest`. Build numbers order published images;
 they are not release versions. [Release versioning](docs/release-versioning.md)
 defines each tag and the SemVer contract.
 
@@ -240,9 +164,8 @@ open source program.
 ## License and trademarks
 
 Silo's source code is licensed under the
-**GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`), with
-an additional permission to combine it with platform SDKs such as the Windows
-App SDK. See [LICENSE](LICENSE) and [PLATFORM-EXCEPTION.md](PLATFORM-EXCEPTION.md).
+**GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`). See
+[LICENSE](LICENSE).
 
 The **Silo name, logo, and wordmark are trademarks of Silo Media L.L.C.** and
 are not covered by the AGPL. Forks and redistributions may use the code but must

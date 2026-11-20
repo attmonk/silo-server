@@ -2,20 +2,92 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Only finished playback counts as a play. Marking a series watched writes one
-// history row per episode; those rows, and single-item marks from Silo or
-// Jellyfin clients, are not plays (#1743). Every playback stop writes a row, so
-// a title watched in several sittings has an incomplete row per sitting; only
-// the sitting that finished it is a play.
-func TestAdminTopActivityCountsFinishedPlayback(t *testing.T) {
+type stubTopActivitySource struct {
+	activity    *AdminTopActivity
+	err         error
+	gotDays     int
+	gotLimit    int
+	invalidated int
+	callCount   int
+}
+
+func (s *stubTopActivitySource) Get(_ context.Context, days, limit int) (*AdminTopActivity, error) {
+	s.callCount++
+	s.gotDays = days
+	s.gotLimit = limit
+	return s.activity, s.err
+}
+
+func (s *stubTopActivitySource) Invalidate() { s.invalidated++ }
+
+// A server with no watch history must answer with empty lists rather than
+// nulls: the bar-list widgets map over these fields directly.
+func TestAdminTopActivityEmptyListsSerializeAsArrays(t *testing.T) {
+	t.Parallel()
+
+	source := &stubTopActivitySource{activity: &AdminTopActivity{
+		Days:     7,
+		Limit:    10,
+		Titles:   []AdminTopTitle{},
+		Profiles: []AdminTopProfile{},
+	}}
+	handler := &AdminHandler{TopActivitySource: source}
+	rec := httptest.NewRecorder()
+	handler.HandleGetTopActivity(rec, httptest.NewRequest(http.MethodGet, "/admin/stats/top-activity", nil))
+
+	var body struct {
+		Titles   []AdminTopTitle   `json:"titles"`
+		Profiles []AdminTopProfile `json:"profiles"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Titles == nil || body.Profiles == nil {
+		t.Fatalf("titles/profiles decoded as null: %s", rec.Body.String())
+	}
+}
+
+func TestAdminTopActivityProviderInvalidateClearsEveryVariant(t *testing.T) {
+	t.Parallel()
+
+	provider, err := NewAdminTopActivityProvider(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("new provider: %v", err)
+	}
+	t.Cleanup(provider.Close)
+
+	keys := []string{
+		adminTopActivityCachePrefix + "7&limit=10",
+		adminTopActivityCachePrefix + "30&limit=25",
+	}
+	for _, key := range keys {
+		provider.cache.Set(key, &AdminTopActivity{}, time.Minute)
+	}
+
+	provider.Invalidate()
+
+	for _, key := range keys {
+		if _, ok := provider.cache.Get(key); ok {
+			t.Fatalf("%s survived Invalidate", key)
+		}
+	}
+}
+
+// Marking a series watched writes one history row per episode. Those rows, and
+// single-item marks from Silo or Jellyfin clients, are not plays (#1743).
+func TestAdminTopActivityCountsPlaybackNotMarks(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
@@ -65,22 +137,16 @@ func TestAdminTopActivityCountsFinishedPlayback(t *testing.T) {
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO user_watch_history(id, user_id, profile_id, media_item_id, watched_at, completed, source)
-		SELECT gen_random_uuid()::text, $1, $2, item, now() - interval '1 hour', completed, source
+		SELECT gen_random_uuid()::text, $1, $2, item, now() - interval '1 hour', true, source
 		FROM (VALUES
-			('top-marks-s01e01', 'jellycompat', true),
-			('top-marks-s01e02', 'jellycompat', true),
-			('top-marks-s01e03', 'jellycompat', true),
-			('top-marks-manual', 'manual', true),
-			('top-marks-played', 'playback', true),
-			('top-marks-played', 'playback', true),
-			('top-marks-resumed', 'playback', false),
-			('top-marks-resumed', 'playback', false),
-			('top-marks-resumed', 'playback', false),
-			('top-marks-resumed', 'playback', true),
-			('top-marks-abandoned', 'playback', false),
-			('top-marks-abandoned', 'playback', false),
-			('top-marks-legacy', 'legacy', true)
-		) AS rows(item, source, completed)`, userID, profileID); err != nil {
+			('top-marks-s01e01', 'jellycompat'),
+			('top-marks-s01e02', 'jellycompat'),
+			('top-marks-s01e03', 'jellycompat'),
+			('top-marks-manual', 'manual'),
+			('top-marks-played', 'playback'),
+			('top-marks-played', 'playback'),
+			('top-marks-legacy', 'legacy')
+		) AS rows(item, source)`, userID, profileID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -92,10 +158,10 @@ func TestAdminTopActivityCountsFinishedPlayback(t *testing.T) {
 	for _, title := range activity.Titles {
 		titles = append(titles, fmt.Sprintf("%s=%d", title.MediaItemID, title.Plays))
 	}
-	if got, want := strings.Join(titles, ","), "top-marks-played=2,top-marks-legacy=1,top-marks-resumed=1"; got != want {
-		t.Errorf("titles = %s, want %s; marks and unfinished sittings are not plays", got, want)
+	if got, want := strings.Join(titles, ","), "top-marks-played=2,top-marks-legacy=1"; got != want {
+		t.Errorf("titles = %s, want %s; marks are not plays", got, want)
 	}
-	if len(activity.Profiles) != 1 || activity.Profiles[0].Plays != 4 {
-		t.Errorf("profiles = %+v, want one profile with 4 plays", activity.Profiles)
+	if len(activity.Profiles) != 1 || activity.Profiles[0].Plays != 3 {
+		t.Errorf("profiles = %+v, want one profile with 3 plays", activity.Profiles)
 	}
 }

@@ -9,9 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
 	"github.com/Silo-Server/silo-server/internal/events"
+	"github.com/redis/go-redis/v9"
 )
 
 func roomSocketRedis(t *testing.T) (*redis.Client, *redis.Client) {

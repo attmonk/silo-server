@@ -13,12 +13,9 @@ import (
 // removal grace period, are not counted again. Two scans of the same folder
 // that overlap in time can both count the same file.
 type ScanResult struct {
-	New       int
-	Updated   int
-	Unchanged int
-	// NoVideo counts files in a movie, series or mixed library that hold no
-	// video stream and were left out of the catalog.
-	NoVideo            int
+	New                int
+	Updated            int
+	Unchanged          int
 	Missing            int
 	FilesDeleted       int
 	MembershipsRemoved int
@@ -96,15 +93,12 @@ type VideoTrackInfo struct {
 	VideoRange          string
 	VideoRangeType      string
 	ColorRange          string
-	// FrameColorRange is the first decoded frame's range; see
-	// models.VideoTrack.FrameColorRange.
-	FrameColorRange string
-	ColorPrimaries  string
-	ColorSpace      string
-	ColorTransfer   string
-	BitDepth        int
-	PixelFormat     string
-	ReferenceFrames int
+	ColorPrimaries      string
+	ColorSpace          string
+	ColorTransfer       string
+	BitDepth            int
+	PixelFormat         string
+	ReferenceFrames     int
 	// HDR10PlusUnchecked marks a PQ track whose first frame was not read;
 	// see models.VideoTrack.HDR10PlusUnchecked.
 	HDR10PlusUnchecked bool
@@ -137,8 +131,6 @@ type SubtitleTrackInfo struct {
 	Forced           bool
 	Default          bool
 	HearingImpaired  bool
-	// IndexOnly is models.SubtitleTrack.IndexOnly.
-	IndexOnly bool
 }
 
 // ExternalSubtitleInfo describes a discovered sidecar subtitle file.
@@ -206,19 +198,11 @@ type SegmentProvenance struct {
 	Provider   *string
 	Confidence *float64
 	Algorithm  string
-	// Absent writes a tombstone for the segment: this provenance without
-	// bounds, saying the file has none of the kind.
-	Absent bool
 }
 
-// HasAnySegment reports whether the update supplies ranges or absent answers,
-// or refreshes a provider whose withdrawn ranges may need removal.
+// HasAnySegment reports whether the update supplies ranges or refreshes a
+// provider whose withdrawn ranges may need removal.
 func (u MarkerUpdate) HasAnySegment() bool {
-	for _, provenance := range []*SegmentProvenance{u.IntroProvenance, u.CreditsProvenance, u.RecapProvenance, u.PreviewProvenance} {
-		if provenance != nil && provenance.Absent {
-			return true
-		}
-	}
 	return len(u.Segments) > 0 || len(u.RefreshedProviders) > 0 || u.IntroStart != nil || u.IntroEnd != nil ||
 		u.CreditsStart != nil || u.CreditsEnd != nil ||
 		u.RecapStart != nil || u.RecapEnd != nil ||
@@ -243,11 +227,10 @@ func MarkerUpdateFromPayload(p markers.MarkerUpdatePayload) MarkerUpdate {
 		{p.Recap, &u.RecapProvenance}, {p.Preview, &u.PreviewProvenance},
 	} {
 		u.Segments = append(u.Segments, segment.payload.Ranges...)
-		if segment.payload.Present() || segment.payload.Absent() {
+		if segment.payload.Present() {
 			*segment.target = &SegmentProvenance{
 				Source: segment.payload.Source, Provider: segment.payload.Provider,
 				Confidence: segment.payload.Confidence, Algorithm: segment.payload.Algorithm,
-				Absent: segment.payload.Absent(),
 			}
 		}
 	}

@@ -13,12 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 var (
@@ -78,20 +76,6 @@ type Store interface {
 	Resolve(context.Context, string, bool, catalog.AccessFilter) (string, []File, error)
 }
 
-// Item is a catalog item that can own themes: a movie, series, season (stored
-// or synthetic), or episode. SeriesID is the item itself for a movie or
-// series; SeasonID is an episode's stored season, empty for a synthetic one.
-type Item struct {
-	ID, Type, SeriesID, SeasonID string
-	SeasonNumber                 int
-}
-
-// itemStore is the optional Store form for an item the caller already looked
-// up and authorized. A store without it resolves the item by ID instead.
-type itemStore interface {
-	ResolveItem(context.Context, Item, bool, catalog.AccessFilter) (string, []File, error)
-}
-
 type Identity struct {
 	UserID         int    `json:"user_id"`
 	ProfileID      string `json:"profile_id"`
@@ -138,17 +122,8 @@ func NewService(store Store, secret string) *Service {
 	return &Service{Store: store, key: key}
 }
 
-// Discover lists the themes of an item the caller has already authorized
-// under filter, as item detail has, so the item is not looked up again.
-func (s *Service) Discover(ctx context.Context, item Item, inherit bool, filter catalog.AccessFilter) (Set, error) {
-	var owner string
-	var files []File
-	var err error
-	if store, ok := s.Store.(itemStore); ok {
-		owner, files, err = store.ResolveItem(ctx, item, inherit, filter)
-	} else {
-		owner, files, err = s.Store.Resolve(ctx, item.ID, inherit, filter)
-	}
+func (s *Service) Discover(ctx context.Context, id string, inherit bool, filter catalog.AccessFilter) (Set, error) {
+	owner, files, err := s.Store.Resolve(ctx, id, inherit, filter)
 	set := Set{OwnerID: owner, Items: []Song{}}
 	for _, file := range files {
 		set.Items = append(set.Items, file.Song)
@@ -229,14 +204,12 @@ func Open(file File) (*os.File, error) {
 	if err != nil || !filepath.IsLocal(rel) {
 		return nil, ErrUnavailable
 	}
-	// Both paths are fspath-encoded; the encoding never produces a separator,
-	// so rel decodes to the real relative name.
-	root, err := os.OpenRoot(fspath.Decode(file.OwnerPath))
+	root, err := os.OpenRoot(file.OwnerPath)
 	if err != nil {
 		return nil, ErrUnavailable
 	}
 	defer func() { _ = root.Close() }()
-	f, err := root.Open(fspath.Decode(rel))
+	f, err := root.Open(rel)
 	if err != nil {
 		return nil, ErrUnavailable
 	}
@@ -270,7 +243,7 @@ func ServeFile(w http.ResponseWriter, r *http.Request, id, path string, size int
 		http.Error(w, "theme audio unavailable", http.StatusNotFound)
 		return
 	}
-	f, err := fspath.Open(path)
+	f, err := os.Open(path)
 	if err != nil {
 		http.Error(w, "theme audio unavailable", http.StatusNotFound)
 		return
@@ -290,7 +263,7 @@ func Unchanged(path string, size int64, modified time.Time) bool {
 	if !filepath.IsAbs(path) || Container(path) == "" {
 		return false
 	}
-	info, err := fspath.Stat(path)
+	info, err := os.Stat(path)
 	return err == nil && matches(info, size, modified)
 }
 

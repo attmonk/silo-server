@@ -13,8 +13,6 @@ import { useAuth, getBootstrapProfile } from "@/hooks/useAuth";
 import { useAvailableUserLibraries } from "@/hooks/queries/libraries";
 import { useProfiles } from "@/hooks/queries/profiles";
 import { isHouseholdSetupDone, setHouseholdSetupDone } from "@/lib/onboarding";
-import { canAddProfile } from "@/lib/profile-management";
-import { useT } from "@/i18n";
 
 /**
  * The "Who's watching?" onboarding step, shown once right after an invite is
@@ -30,16 +28,13 @@ export default function HouseholdSetup() {
     avatarUploadEnabled,
     maxAdvisoryAgeSupported,
     requireAdvisoryAgeSupported,
-    requestsAllowedSupported,
-    maxProfiles,
   } = useProfiles();
-  const { data: libraries = [] } = useAvailableUserLibraries({ includeHidden: true });
+  const { data: libraries = [] } = useAvailableUserLibraries();
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<Profile | null>(null);
   const navigate = useNavigate();
 
-  const t = useT();
-  useDocumentTitle(t("web.onboarding.householdSetup.title"));
+  useDocumentTitle("Who's watching?");
 
   if (loading) {
     return (
@@ -82,10 +77,11 @@ export default function HouseholdSetup() {
       <div className="relative z-10 w-full max-w-2xl px-4">
         <div className="mb-10 text-center">
           <h1 className="text-3xl font-extrabold tracking-[-0.04em] sm:text-4xl">
-            {t("web.onboarding.householdSetup.title")}
+            Who&apos;s watching?
           </h1>
           <p className="text-muted-foreground mx-auto mt-3 max-w-md text-sm leading-6">
-            {t("web.onboarding.householdSetup.description")}
+            Everyone gets their own history, watchlist, and recommendations. Add the whole household
+            now or later — this is your account either way.
           </p>
         </div>
 
@@ -101,7 +97,7 @@ export default function HouseholdSetup() {
                 type="button"
                 onClick={() => openEditor(p)}
                 className="group flex w-24 flex-col items-center gap-2 text-center"
-                title={t("web.onboarding.householdSetup.editProfile")}
+                title="Edit profile"
               >
                 <div className="relative">
                   <Avatar className="border-border group-hover:border-primary size-20 rounded-2xl border transition-colors">
@@ -115,40 +111,32 @@ export default function HouseholdSetup() {
                       variant="outline"
                       className="bg-background absolute -bottom-2 left-1/2 -translate-x-1/2 px-1.5 py-0 font-mono text-[9px] tracking-wider uppercase"
                     >
-                      {p.is_child
-                        ? t("web.onboarding.householdSetup.kidsBadge")
-                        : t("web.onboarding.householdSetup.pinBadge")}
+                      {p.is_child ? "Kids" : "PIN"}
                     </Badge>
                   )}
                 </div>
                 <span className="mt-1 text-sm font-semibold">{p.name}</span>
               </button>
             ))}
-            {canAddProfile(profiles.length, maxProfiles) ? (
-              <button
-                type="button"
-                onClick={() => openEditor(null)}
-                className="group flex w-24 flex-col items-center gap-2 text-center"
-              >
-                <div className="border-border group-hover:border-primary text-muted-foreground grid size-20 place-items-center rounded-2xl border border-dashed transition-colors">
-                  <Plus className="size-7" />
-                </div>
-                <span className="text-muted-foreground mt-1 text-sm font-medium">
-                  {t("web.onboarding.householdSetup.addProfile")}
-                </span>
-              </button>
-            ) : null}
+            <button
+              type="button"
+              onClick={() => openEditor(null)}
+              className="group flex w-24 flex-col items-center gap-2 text-center"
+            >
+              <div className="border-border group-hover:border-primary text-muted-foreground grid size-20 place-items-center rounded-2xl border border-dashed transition-colors">
+                <Plus className="size-7" />
+              </div>
+              <span className="text-muted-foreground mt-1 text-sm font-medium">Add profile</span>
+            </button>
           </div>
         )}
 
         <div className="mt-12 flex justify-center gap-3">
           <Button variant="ghost" onClick={finish}>
-            {profiles.length > 1
-              ? t("web.ui.skipForNow")
-              : t("web.onboarding.householdSetup.justMe")}
+            {profiles.length > 1 ? "Skip for now" : "Just me for now"}
           </Button>
           <Button onClick={finish} disabled={profilesLoading}>
-            {t("web.ui.continue")}
+            Continue
           </Button>
         </div>
       </div>
@@ -156,12 +144,10 @@ export default function HouseholdSetup() {
       <ProfileEditorDialog
         open={editorOpen}
         profile={editing}
-        createsPrimary={profiles.length === 0}
         libraries={libraries}
         avatarUploadEnabled={avatarUploadEnabled}
         advisoryAgeSupported={maxAdvisoryAgeSupported}
         requireAdvisoryAgeSupported={requireAdvisoryAgeSupported}
-        requestsAllowedSupported={requestsAllowedSupported}
         onOpenChange={(open) => {
           setEditorOpen(open);
           if (!open) setEditing(null);

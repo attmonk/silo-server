@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
@@ -242,17 +243,82 @@ func decodeCards(t *testing.T, body string) cardPage {
 	return page
 }
 
+// listCardIDs walks every page of the listing and returns the ids in order.
+func listCardIDs(t *testing.T, h http.Handler, path string, headers map[string]string) ([]string, int) {
+	t.Helper()
+	var ids []string
+	cursor, pages := "", 0
+	for {
+		url := path
+		if cursor != "" {
+			url += "&cursor=" + cursor
+		}
+		rec := do(t, h, http.MethodGet, url, "", headers)
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", url, rec.Code, rec.Body.String())
+		}
+		page := decodeCards(t, rec.Body.String())
+		pages++
+		for _, it := range page.Items {
+			ids = append(ids, it.ContentID)
+		}
+		if !page.Page.HasMore {
+			return ids, pages
+		}
+		cursor = page.Page.NextCursor
+	}
+}
+
 func favoritesDeps(lists *fakePersonalLists) Dependencies {
 	deps := pilotDeps(nil, nil)
 	deps.PersonalLists = lists
 	return deps
 }
 
+func TestListFavoritesCursor(t *testing.T) {
+	lists := &fakePersonalLists{favorites: favoriteRows()}
+	// The first page ends inside a timestamp tie, so continuation must keep the item ID.
+	lists.favorites[2].AddedAt = lists.favorites[1].AddedAt
+	h := newTestHandler(t, favoritesDeps(lists))
+	ids, pages := listCardIDs(t, h, "/api/v2/favorites?limit=2", viewerHeaders())
+	if pages != 2 || strings.Join(ids, ",") != "movie:c,movie:b,movie:a" {
+		t.Fatalf("ids = %v pages = %d", ids, pages)
+	}
+	// An entry without a card still counts toward has_more: the page is one
+	// card short but the next page follows.
+	lists.missing = map[string]bool{"movie:b": true}
+	ids, pages = listCardIDs(t, h, "/api/v2/favorites?limit=2", viewerHeaders())
+	if pages != 2 || strings.Join(ids, ",") != "movie:c,movie:a" {
+		t.Fatalf("ids = %v pages = %d", ids, pages)
+	}
+	// The probe row's own card never leaks into the page.
+	lists.missing = map[string]bool{"movie:c": true}
+	rec := do(t, h, http.MethodGet, "/api/v2/favorites?limit=1", "", viewerHeaders())
+	page := decodeCards(t, rec.Body.String())
+	if len(page.Items) != 0 || !page.Page.HasMore {
+		t.Fatalf("page = %s", rec.Body.String())
+	}
+}
+
+func TestGetFavorite(t *testing.T) {
+	lists := &fakePersonalLists{favorites: favoriteRows(), missing: map[string]bool{"movie:hidden": true}}
+	h := newTestHandler(t, favoritesDeps(lists))
+	rec := do(t, h, http.MethodGet, "/api/v2/favorites/movie:c", "", viewerHeaders())
+	if rec.Code != 200 || rec.Body.String() != `{"item_id":"movie:c","added_at":"2026-01-02T03:04:05.000Z"}`+"\n" {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// Not a favorite, and an item the viewer may not see, are both 404.
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/favorites/movie:nope", "", viewerHeaders()), TypeNotFound)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/favorites/movie:hidden", "", viewerHeaders()), TypeNotFound)
+	// Another profile's favorite is not this profile's.
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/favorites/movie:z", "", viewerHeaders()), TypeNotFound)
+}
+
 func TestFavoritesDenied(t *testing.T) {
 	h := newTestHandler(t, favoritesDeps(&fakePersonalLists{err: errStore}))
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/api/v2/favorites"}, {http.MethodGet, "/api/v2/favorites/movie:c"},
-		{http.MethodGet, "/api/v2/favorites/movie:c/membership"}, {http.MethodPut, "/api/v2/favorites/movie:c"}, {http.MethodDelete, "/api/v2/favorites/movie:c"},
+		{http.MethodPut, "/api/v2/favorites/movie:c"}, {http.MethodDelete, "/api/v2/favorites/movie:c"},
 	} {
 		requireProblem(t, do(t, h, tc.method, tc.path, "", nil), TypeAuthenticationRequired)
 		p := requireProblem(t, do(t, h, tc.method, tc.path, "", bearer(memberToken)), TypeValidationFailed)
@@ -269,3 +335,6 @@ func TestFavoritesDenied(t *testing.T) {
 	deps.PersonalLists = nil
 	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/favorites", "", viewerHeaders()), TypeDependencyUnavailable)
 }
+
+// The v1 handler is the service the fake stands in for.
+var _ PersonalListService = (*handlers.PersonalDataHandler)(nil)

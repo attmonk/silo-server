@@ -7,7 +7,6 @@ import { useFavorites } from "@/hooks/queries/favorites";
 import { useOnboardingFlow } from "@/hooks/queries/onboarding";
 import { TourHost } from "@/components/onboarding/TourHost";
 import { NotInterestedList } from "@/components/settings/NotInterestedList";
-import { useT } from "@/i18n";
 
 /**
  * Re-entry point for the taste-seeding flow. Always links to /taste-seed —
@@ -15,7 +14,6 @@ import { useT } from "@/i18n";
  * users can both add new picks and review their existing ones from here.
  */
 export default function PersonalizeSettings() {
-  const t = useT();
   const { data: favorites } = useFavorites();
   const favoriteCount = favorites?.length ?? 0;
   const [replaying, setReplaying] = useState(false);
@@ -25,8 +23,10 @@ export default function PersonalizeSettings() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.personalize.title")}
-        subtitle={t("web.settings.personalize.subtitle")}
+        title="Personalize"
+        subtitle={
+          'Pick titles you love so your home, recommendations, and "For You" rows reflect your taste.'
+        }
       />
 
       <div className="surface-panel rounded-2xl border-0 p-6">
@@ -36,17 +36,16 @@ export default function PersonalizeSettings() {
           </div>
           <div className="min-w-0 flex-1 space-y-3">
             <div>
-              <h3 className="text-base font-semibold">
-                {t("web.settings.personalize.refineTitle")}
-              </h3>
+              <h3 className="text-base font-semibold">Refine your taste profile</h3>
               <p className="text-muted-foreground mt-1 text-sm">
-                {t("web.settings.personalize.refineDescription")}
+                Browse popular titles and pick the ones you love. Already-favorited titles will be
+                marked, so you can add to (or trim) your picks any time.
               </p>
             </div>
             <Button asChild>
               <Link to="/taste-seed?from=settings">
-                {t("web.settings.personalize.openPicker")}
-                <ArrowRight className="ms-1 h-4 w-4" />
+                Open the picker
+                <ArrowRight className="ml-1 h-4 w-4" />
               </Link>
             </Button>
           </div>
@@ -62,13 +61,14 @@ export default function PersonalizeSettings() {
           </div>
           <div className="min-w-0 flex-1 space-y-3">
             <div>
-              <h3 className="text-base font-semibold">{t("web.settings.personalize.tourTitle")}</h3>
+              <h3 className="text-base font-semibold">Replay the feature tour</h3>
               <p className="text-muted-foreground mt-1 text-sm">
-                {t("web.settings.personalize.tourDescription")}
+                A two-minute walkthrough of what this server can do — watch together, requests,
+                watchlists, and the playback settings worth knowing about.
               </p>
             </div>
             <Button variant="outline" onClick={() => setReplaying(true)}>
-              {t("web.settings.personalize.startTour")}
+              Start the tour
             </Button>
           </div>
         </div>
@@ -82,11 +82,10 @@ export default function PersonalizeSettings() {
         <Heart className="h-4 w-4" />
         <span>
           {favoriteCount === 0
-            ? t("web.settings.personalize.noFavorites")
-            : t("web.settings.personalize.favoriteCount", {
-                count: favoriteCount,
-                count_text: favoriteCount,
-              })}
+            ? "You haven't favorited anything yet."
+            : favoriteCount === 1
+              ? "1 favorite is shaping your recommendations."
+              : `${favoriteCount} favorites are shaping your recommendations.`}
         </span>
       </div>
     </div>

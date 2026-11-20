@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 
-import { Card, CardContent } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useAdminTimeseries } from "@/hooks/queries/admin/dashboardInsights";
 import { formatDataTotal, formatMbps, formatMbpsValue } from "../format";
 import {
@@ -11,13 +11,9 @@ import {
   rangeTitle,
 } from "../range";
 import { useWidgetRange } from "../widgetChrome";
-import { WidgetHeader } from "../WidgetHeader";
 import { WidgetRangePicker } from "../WidgetRangePicker";
-import { WidgetViewToggle } from "../WidgetViewToggle";
-import { buildEgressBands } from "./egressBands";
 import { TimeseriesChartBody } from "./timeseriesChart";
 import { buildTimeseriesPoints } from "./timeseriesSeries";
-import { useAppLanguage, useT } from "@/i18n";
 
 /**
  * Egress the deployment served over the chosen window, in Mbps.
@@ -34,22 +30,10 @@ import { useAppLanguage, useT } from "@/i18n";
  * server's total and download maxima are peak-preserved independently, so
  * they can come from different minutes and their difference is not any
  * minute's playback rate.
- *
- * Once a stream node has served egress in the window, a Total/Nodes switch
- * splits the same total into stacked bands per node (see buildEgressBands).
- * Installs without proxy nodes never see the switch.
  */
 export function EgressWidget() {
-  const t = useT();
-  // buildEgressBands names the "Other" band, so the bands follow the language.
-  const language = useAppLanguage();
-  // The view is stored with the placement, so Nodes survives a reload.
-  const { range, view, setView } = useWidgetRange();
+  const { range } = useWidgetRange();
   const query = useAdminTimeseries(rangeHours(range));
-  const byNode = view === "nodes";
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- language re-runs the labels
-  const bands = useMemo(() => buildEgressBands(query.data), [query.data, language]);
-  const showBands = byNode && bands !== null;
   const hasDownloadTraffic = useMemo(
     () => (query.data?.points ?? []).some((point) => (point.download_egress_kbps ?? 0) > 0),
     [query.data],
@@ -73,63 +57,39 @@ export function EgressWidget() {
 
   return (
     <Card className="h-full">
-      <WidgetHeader title={rangeTitle(t("web.admin.dashboard.widgets.egress.title"), range)}>
-        {totalBytes != null ? (
-          // Secondary to the peak: when the header is too narrow for both
-          // beside the range picker, the total is dropped rather than
-          // truncated. CardHeader is the `card-header` container.
-          <span className="text-muted-foreground hidden text-[11px] whitespace-nowrap tabular-nums @md/card-header:inline">
-            {t("web.admin.dashboard.widgets.egress.total", { value: formatDataTotal(totalBytes) })}
+      <CardHeader className="flex shrink-0 flex-row items-center justify-between gap-2 space-y-0 pb-3">
+        <CardTitle className="text-sm font-bold">{rangeTitle("Egress", range)}</CardTitle>
+        <div className="flex min-w-0 items-center gap-2">
+          {totalBytes != null ? (
+            // Secondary to the peak: when the header is too narrow for both
+            // beside the range picker, the total is dropped rather than
+            // truncated. CardHeader is the `card-header` container.
+            <span className="text-muted-foreground hidden text-[11px] whitespace-nowrap tabular-nums @md/card-header:inline">
+              Total {formatDataTotal(totalBytes)}
+            </span>
+          ) : null}
+          <span className="text-muted-foreground text-[11px] tabular-nums">
+            Peak {formatMbps(peak)}
           </span>
-        ) : null}
-        <span className="text-muted-foreground text-[11px] whitespace-nowrap tabular-nums">
-          {t("web.admin.dashboard.widgets.egress.peak", { value: formatMbps(peak) })}
-        </span>
-        {bands ? (
-          <WidgetViewToggle
-            value={byNode ? "nodes" : "total"}
-            options={[
-              {
-                value: "total",
-                label: t("web.admin.dashboard.widgets.egress.viewTotal"),
-                ariaLabel: t("web.admin.dashboard.widgets.egress.viewTotalLabel"),
-              },
-              {
-                value: "nodes",
-                label: t("web.admin.dashboard.widgets.egress.viewNodes"),
-                ariaLabel: t("web.admin.dashboard.widgets.egress.viewNodesLabel"),
-              },
-            ]}
-            onChange={setView}
-          />
-        ) : null}
-        <WidgetRangePicker />
-      </WidgetHeader>
+          <WidgetRangePicker />
+        </div>
+      </CardHeader>
       <CardContent className="flex min-h-0 flex-1 flex-col">
         <TimeseriesChartBody
           query={query}
           points={points}
-          seriesLabel={t("web.admin.dashboard.widgets.egress.seriesLabel")}
+          seriesLabel="Egress"
           overlays={
-            hasDownloadTraffic && !showBands
-              ? [
-                  {
-                    label: t("web.admin.dashboard.widgets.egress.downloadsSeries"),
-                    points: downloadPoints,
-                    seriesIndex: 1,
-                  },
-                ]
+            hasDownloadTraffic
+              ? [{ label: "Downloads", points: downloadPoints, seriesIndex: 1 }]
               : undefined
           }
-          stacks={showBands ? bands : undefined}
-          ariaLabel={t("web.admin.dashboard.widgets.egress.chartLabel", {
-            range: rangePhrase(range),
-          })}
-          errorMessage={t("web.admin.dashboard.widgets.egress.loadFailed")}
-          emptyMessage={t("web.admin.dashboard.widgets.egress.empty")}
+          ariaLabel={`Egress over ${rangePhrase(range)}, in megabits per second`}
+          errorMessage="Failed to load egress history."
+          emptyMessage="No egress samples yet"
           formatValue={formatMbps}
           formatTick={formatMbpsValue}
-          formatTimestamp={(time) => formatRangeTimestamp(range, time, { withTime: true })}
+          formatTimestamp={(t) => formatRangeTimestamp(range, t, { withTime: true })}
           edgeLabels={rangeEdgeLabels(range)}
           fill
         />

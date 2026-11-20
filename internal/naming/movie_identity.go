@@ -5,8 +5,6 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 const mediumIdentityConfidence = "medium"
@@ -36,14 +34,12 @@ type inferMovieStem struct {
 
 type InferMovieStem = inferMovieStem
 
-// ParseInferMovieStem and ParseInferFolderTitleYear take a single file or
-// folder name and parse its display text (see fspath.Display).
 func ParseInferMovieStem(name string, folderTitle string, folderYear int) InferMovieStem {
-	return parseInferMovieStem(fspath.Display(name), fspath.Display(folderTitle), folderYear)
+	return parseInferMovieStem(name, folderTitle, folderYear)
 }
 
 func ParseInferFolderTitleYear(name string) (string, int, bool) {
-	return parseInferFolderTitleYear(fspath.Display(name))
+	return parseInferFolderTitleYear(name)
 }
 
 func InferTitlesCoherent(left string, right string) bool {
@@ -343,7 +339,7 @@ func normalizeInferComparable(name string) string {
 }
 
 func normalizeInferTokens(name string) []string {
-	surface := stripInferProviderTags(fspath.Display(name))
+	surface := stripInferProviderTags(name)
 	surface = strings.ToLower(surface)
 	var builder strings.Builder
 	builder.Grow(len(surface))

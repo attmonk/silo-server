@@ -3,8 +3,7 @@ package scanner
 import (
 	"encoding/binary"
 	"fmt"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
+	"os"
 )
 
 const (
@@ -28,7 +27,7 @@ const (
 //
 // Files smaller than 128KB (65536 * 2) return an error.
 func ComputeOSHash(path string) (string, error) {
-	f, err := fspath.Open(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("oshash: open %s: %w", path, err)
 	}

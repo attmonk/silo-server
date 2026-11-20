@@ -7,10 +7,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { languageOptions } from "@/player/utils/languageNames";
-import { providerOptionLabel, SUBTITLE_PROVIDER_OPTIONS } from "./subtitleAdminStyles";
+import { LANGUAGES } from "@/player/utils/languageNames";
+import { SUBTITLE_PROVIDER_OPTIONS } from "./subtitleAdminStyles";
 
 const ALL = "all";
 
@@ -39,24 +38,23 @@ export default function AdminSubtitlesFilters({
   onSearchChange,
   onReset,
 }: AdminSubtitlesFiltersProps) {
-  const t = useT();
   return (
     <div className="surface-panel rounded-2xl border-0 px-3 py-3 sm:px-4">
-      <div className="flex flex-col gap-4 xl:flex-row xl:flex-wrap xl:items-center xl:justify-between">
-        <div className="min-w-0 flex-1 xl:min-w-48">
+      <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+        <div className="min-w-0 flex-1">
           <Input
             value={search}
             onChange={(event) => onSearchChange(event.target.value)}
-            placeholder={t("web.admin.common.subtitles.filters.searchPlaceholder")}
+            placeholder="Search release name…"
             className="font-mono text-xs sm:max-w-sm"
-            aria-label={t("web.admin.common.subtitles.filters.searchLabel")}
+            aria-label="Search subtitle release name"
           />
         </div>
 
         <div
           className="flex flex-wrap items-center gap-1.5"
           role="group"
-          aria-label={t("web.admin.common.subtitles.filters.providerGroup")}
+          aria-label="Filter by subtitle provider"
         >
           {SUBTITLE_PROVIDER_OPTIONS.map((option) => {
             const active = provider === option.value;
@@ -73,27 +71,20 @@ export default function AdminSubtitlesFilters({
                     : "border-border/60 bg-muted/20 text-muted-foreground hover:bg-muted/40 hover:text-foreground",
                 )}
               >
-                {providerOptionLabel(option)}
+                {option.label}
               </button>
             );
           })}
         </div>
 
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Select value={language} onValueChange={onLanguageChange}>
-            <SelectTrigger
-              className="max-w-80 min-w-[180px]"
-              aria-label={t("web.admin.common.subtitles.filters.languageLabel")}
-            >
-              <SelectValue
-                placeholder={t("web.admin.common.subtitles.filters.languagePlaceholder")}
-              />
+            <SelectTrigger className="w-[180px]" aria-label="Filter by language">
+              <SelectValue placeholder="Language" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={ALL}>
-                {t("web.admin.common.subtitles.filters.allLanguages")}
-              </SelectItem>
-              {languageOptions().map((lang) => (
+              <SelectItem value={ALL}>All languages</SelectItem>
+              {LANGUAGES.map((lang) => (
                 <SelectItem key={lang.code} value={lang.code}>
                   {lang.label}
                 </SelectItem>
@@ -102,18 +93,11 @@ export default function AdminSubtitlesFilters({
           </Select>
 
           <Select value={userId} onValueChange={onUserChange}>
-            <SelectTrigger
-              className="max-w-80 min-w-[200px]"
-              aria-label={t("web.admin.common.subtitles.filters.uploaderLabel")}
-            >
-              <SelectValue
-                placeholder={t("web.admin.common.subtitles.filters.uploaderPlaceholder")}
-              />
+            <SelectTrigger className="w-[200px]" aria-label="Filter by uploader">
+              <SelectValue placeholder="Uploader" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={ALL}>
-                {t("web.admin.common.subtitles.filters.allUploaders")}
-              </SelectItem>
+              <SelectItem value={ALL}>All uploaders</SelectItem>
               {users.map((user) => (
                 <SelectItem key={user.id} value={String(user.id)}>
                   {user.username}
@@ -123,7 +107,7 @@ export default function AdminSubtitlesFilters({
           </Select>
 
           <Button type="button" variant="ghost" size="sm" onClick={onReset}>
-            {t("web.admin.common.subtitles.resetFilters")}
+            Reset filters
           </Button>
         </div>
       </div>

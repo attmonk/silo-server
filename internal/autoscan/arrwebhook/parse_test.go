@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/autoscan"
@@ -25,6 +24,20 @@ func paths(changes []autoscan.Change) []string {
 		out = append(out, c.SourcePath)
 	}
 	return out
+}
+
+func TestParseSonarrDownload(t *testing.T) {
+	parsed, err := Parse(ProviderAuto, fixture(t, "sonarr_download.json"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if parsed.Provider != ProviderSonarr || parsed.EventType != "Download" || parsed.Test {
+		t.Fatalf("unexpected classification: %+v", parsed)
+	}
+	want := "/data/tv/Example Show/Season 02/Example Show - S02E01 - The One That Imports.mkv"
+	if len(parsed.Changes) != 1 || parsed.Changes[0].SourcePath != want || parsed.Changes[0].Scope != autoscan.ChangeScopeFile {
+		t.Fatalf("changes = %+v", parsed.Changes)
+	}
 }
 
 func TestParseSonarrRenameIncludesPreviousPaths(t *testing.T) {
@@ -63,6 +76,33 @@ func TestParseSonarrEpisodeFileDelete(t *testing.T) {
 		t.Fatalf("event type = %q", parsed.EventType)
 	}
 	if len(parsed.Changes) != 1 || parsed.Changes[0].SourcePath != "/data/tv/Example Show/Season 02/Example Show - S02E01.mkv" {
+		t.Fatalf("changes = %+v", parsed.Changes)
+	}
+}
+
+func TestParseSonarrTest(t *testing.T) {
+	parsed, err := Parse(ProviderAuto, fixture(t, "sonarr_test.json"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !parsed.Test || len(parsed.Changes) != 0 {
+		t.Fatalf("test event must be a no-op: %+v", parsed)
+	}
+	if parsed.Provider != ProviderSonarr {
+		t.Fatalf("provider = %q", parsed.Provider)
+	}
+}
+
+func TestParseRadarrDownload(t *testing.T) {
+	parsed, err := Parse(ProviderAuto, fixture(t, "radarr_download.json"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if parsed.Provider != ProviderRadarr || parsed.EventType != "Download" {
+		t.Fatalf("unexpected classification: %+v", parsed)
+	}
+	want := "/data/movies/Example Movie (2024)/Example Movie (2024) Bluray-1080p.mkv"
+	if len(parsed.Changes) != 1 || parsed.Changes[0].SourcePath != want {
 		t.Fatalf("changes = %+v", parsed.Changes)
 	}
 }
@@ -127,43 +167,30 @@ func TestParseRadarrMovieFileDelete(t *testing.T) {
 	}
 }
 
-// A series or movie deleted with its files becomes one subtree change for its
-// folder, marked Removed; one deleted with its files kept changes nothing.
-func TestParseSeriesAndMovieDelete(t *testing.T) {
-	removed := func(path string) []autoscan.Change {
-		return []autoscan.Change{{SourcePath: path, Scope: autoscan.ChangeScopeSubtree, Removed: true}}
+func TestParseUnknownEventIsNoOpNotError(t *testing.T) {
+	parsed, err := Parse(ProviderSonarr, fixture(t, "unknown_event.json"))
+	if err != nil {
+		t.Fatalf("unknown event types must parse: %v", err)
 	}
-	for _, tc := range []struct {
-		name, eventType, provider string
-		body                      []byte
-		want                      []autoscan.Change
-	}{
-		{"series, files deleted", "SeriesDelete", ProviderSonarr, fixture(t, "sonarr_series_delete.json"), removed("/data/tv/Example Show")},
-		{"movie, files kept", "MovieDelete", ProviderRadarr, fixture(t, "radarr_movie_delete.json"), nil},
-		{"series, files kept", "SeriesDelete", ProviderSonarr,
-			[]byte(`{"eventType":"SeriesDelete","series":{"path":"/data/tv/Show"},"deletedFiles":false}`), nil},
-		{"movie, files deleted", "MovieDelete", ProviderRadarr,
-			[]byte(`{"eventType":"MovieDelete","movie":{"folderPath":"/data/movies/Film (2024)","path":"/data/movies/Film (2024)"},"deletedFiles":true}`),
-			removed("/data/movies/Film (2024)")},
-		{"movie without folderPath", "MovieDelete", ProviderRadarr,
-			[]byte(`{"eventType":"MovieDelete","movie":{"path":"/data/movies/Film (2024)"},"deletedFiles":true}`),
-			removed("/data/movies/Film (2024)")},
-		{"deletedFiles absent", "MovieDelete", ProviderRadarr,
-			[]byte(`{"eventType":"MovieDelete","movie":{"folderPath":"/data/movies/Film (2024)"}}`), nil},
-		{"no folder named", "MovieDelete", "", []byte(`{"eventType":"MovieDelete","deletedFiles":true}`), nil},
+	if parsed.EventType != "Health" || parsed.Test || len(parsed.Changes) != 0 {
+		t.Fatalf("unknown event must be a no-op: %+v", parsed)
+	}
+}
+
+// SeriesDelete and MovieDelete send deletedFiles as a bool, not the file list
+// an upgrade's download carries; they are valid deliveries with nothing to do.
+func TestParseSeriesAndMovieDeleteAreNoOps(t *testing.T) {
+	for _, tc := range []struct{ fixture, eventType, provider string }{
+		{"sonarr_series_delete.json", "SeriesDelete", ProviderSonarr},
+		{"radarr_movie_delete.json", "MovieDelete", ProviderRadarr},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			parsed, err := Parse(ProviderAuto, tc.body)
-			if err != nil {
-				t.Fatalf("Parse: %v", err)
-			}
-			if parsed.EventType != tc.eventType || parsed.Provider != tc.provider || parsed.Test {
-				t.Fatalf("want %s from %s, got %+v", tc.eventType, tc.provider, parsed)
-			}
-			if !reflect.DeepEqual(parsed.Changes, tc.want) {
-				t.Fatalf("changes = %+v, want %+v", parsed.Changes, tc.want)
-			}
-		})
+		parsed, err := Parse(ProviderAuto, fixture(t, tc.fixture))
+		if err != nil {
+			t.Fatalf("%s: Parse: %v", tc.fixture, err)
+		}
+		if parsed.EventType != tc.eventType || parsed.Provider != tc.provider || parsed.Test || len(parsed.Changes) != 0 {
+			t.Fatalf("%s: want a no-op %s from %s, got %+v", tc.fixture, tc.eventType, tc.provider, parsed)
+		}
 	}
 }
 
@@ -189,6 +216,39 @@ func TestParseMalformedBody(t *testing.T) {
 	}
 	if _, err := Parse(ProviderAuto, []byte(`{"noEventType": true}`)); !errors.Is(err, ErrMalformedPayload) {
 		t.Fatalf("missing eventType must be malformed, got %v", err)
+	}
+}
+
+func TestParseAutoInferenceFailure(t *testing.T) {
+	// A work-producing event with neither series nor movie shape cannot be
+	// attributed in auto mode.
+	body := []byte(`{"eventType": "Download"}`)
+	if _, err := Parse(ProviderAuto, body); !errors.Is(err, ErrUnknownProvider) {
+		t.Fatalf("want ErrUnknownProvider, got %v", err)
+	}
+	// The same payload with an explicit provider parses (zero changes).
+	parsed, err := Parse(ProviderSonarr, body)
+	if err != nil {
+		t.Fatalf("explicit provider must parse: %v", err)
+	}
+	if len(parsed.Changes) != 0 {
+		t.Fatalf("changes = %+v, want none", parsed.Changes)
+	}
+}
+
+func TestParseImportFallsBackToSubtree(t *testing.T) {
+	body := []byte(`{
+		"eventType": "Download",
+		"series": {"path": "/data/tv/Example Show"}
+	}`)
+	parsed, err := Parse(ProviderAuto, body)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(parsed.Changes) != 1 ||
+		parsed.Changes[0].SourcePath != "/data/tv/Example Show" ||
+		parsed.Changes[0].Scope != autoscan.ChangeScopeSubtree {
+		t.Fatalf("changes = %+v, want one subtree fallback", parsed.Changes)
 	}
 }
 

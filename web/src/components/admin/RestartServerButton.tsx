@@ -1,6 +1,5 @@
 import { useState, type ComponentProps } from "react";
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useRequestServerRestart } from "@/hooks/queries/admin/serverRestart";
 import { RotateCcw } from "lucide-react";
@@ -14,12 +13,11 @@ export interface RestartServerButtonProps {
 }
 
 export function RestartServerButton({
-  label,
+  label = "Restart Server",
   variant = "outline",
   size = "sm",
   className,
 }: RestartServerButtonProps = {}) {
-  const t = useT();
   const [showConfirm, setShowConfirm] = useState(false);
   const restart = useRequestServerRestart();
 
@@ -29,11 +27,11 @@ export function RestartServerButton({
       const result = await restart.mutateAsync();
       toast.success(
         result.status === "already_requested"
-          ? t("web.admin.common.restartServer.alreadyRequested")
-          : t("web.admin.common.restartServer.shuttingDown"),
+          ? "Server restart is already in progress."
+          : "Server is restarting...",
       );
     } catch {
-      toast.error(t("web.admin.common.restartServer.failed"));
+      toast.error("Could not confirm the restart. Check server status or restart manually.");
     }
   }
 
@@ -46,15 +44,15 @@ export function RestartServerButton({
         onClick={() => setShowConfirm(true)}
         disabled={restart.isPending}
       >
-        <RotateCcw className="me-1.5 h-3.5 w-3.5" />
-        {label ?? t("web.admin.common.restartServer.button")}
+        <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+        {label}
       </Button>
       <ConfirmDialog
         open={showConfirm}
         onOpenChange={setShowConfirm}
-        title={t("web.admin.common.restartServer.confirmTitle")}
-        description={t("web.admin.common.restartServer.confirmDescription")}
-        confirmLabel={t("web.admin.common.restartServer.confirm")}
+        title="Restart server?"
+        description="The server will restart to apply configuration changes. Active streams will be interrupted."
+        confirmLabel="Restart"
         variant="destructive"
         onConfirm={handleRestart}
       />

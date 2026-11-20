@@ -17,7 +17,8 @@ the missing kinds that are on and skips files with none left. v2
 `redetect-markers` and `refresh-markers` narrow their kinds the same way;
 `redetect-markers` answers `409` when none of the requested kinds are on, and
 `refresh-markers` does too in `local` mode; in `both` mode the online refresh
-still runs. v2 `redetect-intro` predates the settings and ignores them. Turning a kind off never deletes its markers.
+still runs. v2 `redetect-intro` and the v1 routes predate the settings and
+ignore them. Turning a kind off never deletes its markers.
 
 Every API server runs the task manager, so the task takes a PostgreSQL
 advisory lock before it analyzes anything. While one server holds it, a run on
@@ -42,30 +43,6 @@ for a single item does not take the lock.
    extension is capped at five seconds because longer ones mostly overshot into
    the episode. Other files of the same episode with a matching duration copy
    the result (`episode-version-copy:v1`).
-
-   Many anime releases title the cold open `Intro` and the opening song `OP`.
-   So when any file of the season group (below), the file itself included,
-   has an opening song chapter (`OP`, `OP2`, `OP: …`, `Opening`, `Opening 2`,
-   or `Opening: …`, but not `Opening Credits`), an `Intro` or `Introduction`
-   chapter there is read as a cold open and is not the intro. A release that
-   never names an opening song keeps `Intro` as its intro. Two adjacent
-   intro-like chapters, such as `Intro` then `OP`, are still ambiguous and go
-   to Chromaprint. Every pass that reads chapters, including playback, admin
-   re-detection, and the silence backfill, reads them against the whole season
-   group, so a file's result does not depend on how its analysis started.
-
-   When a file's chapters no longer produce the chapter intro stored for it,
-   because they give no intro or one that doesn't overlap it, as after a change
-   to these rules or a remux, local analysis withdraws it (`chapter:v1`,
-   `chapter:silence:v1`, `chapter:silence:v2`) and places the new one if there
-   is one. It withdraws a version copy (`episode-version-copy:v1`) once no
-   version of the episode it could be copied from (a duration within three
-   seconds) produces an intro that overlaps it. These results
-   outrank every Chromaprint result, so left in place they would keep their
-   stale range for good. The file's season group is then compared again even
-   when its stored analysis still stands. The silence backfill withdraws
-   nothing, since it does not compare season groups; it runs right after the
-   nightly episode pass, which has already withdrawn what it would.
 2. **Chromaprint.** Remaining files are grouped by library, season, and
    presentation (edition and audio language). Each file's opening audio
    (25 percent of the runtime, at most ten minutes) is fingerprinted once and
@@ -74,35 +51,13 @@ for a single item does not take the lock.
    seconds to 3 minutes.
    A file's intro is the median of the pair results that agree with its
    most-confirmed one (`chromaprint:v4`).
-
-Earlier versions moved a Chromaprint start past subtitle cues in its first
-15 seconds (`chromaprint:dialogue:v4`). Most such cues belonged to the opening
-itself: song lyrics, often in a translated or karaoke subtitle, title-sequence
-narration, or caption credits. The start moved a median 13 to 15 seconds later
-and agreed with TheIntroDB and Plex markers far less often. Moving it only past
-cues that overlap the start, or begin within half a second after it, still
-agreed with TheIntroDB less often than the unrefined start, so
-`chromaprint:v4` no longer uses subtitles, and re-analysis replaces
-`chromaprint:dialogue:v4` markers under the same-version rule in
-`markers.CanWriteMarkerUpdate`.
-
-A season comparison that no longer finds an intro for a file withdraws the
-Chromaprint intro an earlier comparison stored for it (any `chromaprint:`
-identifier), as after a stricter matching rule or a change to the season's
-files. `WithdrawMarker` clears it only while the file still holds that
-scanner result, so manual and online intros stay, and so do chapter and
-version-copy intros, which step 1 withdraws on its own terms.
-Only a comparison over the whole season group withdraws: a group with a
-failed or deferred fingerprint, or with a file left out because a manual or
-online marker holds its intro, withdraws nothing, since the missing file
-could be the partner that confirms an intro. A group with a held-out file
-stores a distinct input signature, so it is compared again in full once no
-file is held out, as after the held-out file is deleted. A failed marker
-write leaves the group `failed`, so the next run analyzes it again.
+3. **Dialogue.** When an external dialogue subtitle overlaps the first seconds
+   of a Chromaprint intro, the start moves to the end of that dialogue
+   (`chromaprint:dialogue:v4`).
 
 Chromaprint points summarize a window that starts at the point's timestamp,
 so raw matches start and end early. Fixed leads measured against authored
-intro chapters move both boundaries later.
+intro chapters move both boundaries back.
 
 Every ffmpeg attempt that detection makes (fingerprints, tail passes, and
 silence detection) has a deadline of two minutes plus the running time of
@@ -124,35 +79,14 @@ at least 80 percent of the authored intro chapter in replay:
 |---|---|
 | At least 20 seconds, confirmed by two or more pairs, and within 1.5 seconds of the season's usual intro duration, which at least half the season's episodes share | 0.90 |
 | Other markers of at least 20 seconds | 0.65 |
-| Shorter than 20 seconds, confirmed by two or more pairs | 0.30 |
+| Shorter than 20 seconds | 0.30 |
 
-A match shorter than 20 seconds that only one partner episode confirms is not
-written: a recurring music cue is often shared by a single pair of episodes,
-while a title card recurs across the season. Such a file first gets the wider
-search, as a file with no match does, so a title card shared with episodes
-outside its neighbor window still finds its partners. That search records
-results for the file alone, so it changes no other file's match. Music cues
-that several episodes share are still written, and they fall in the lower
-rows because few of them match most of a season.
-
-Chapter-based markers keep 0.95, and silence-extended chapters 0.98.
-Contribution to online providers compares these values with each provider's
-minimum confidence.
+Recurring music cues mistaken for intros are short and rarely shared by most
+of a season, so they fall in the lower rows. Chapter-based markers keep 0.95,
+and silence-extended chapters 0.98. Contribution to online providers compares
+these values with each provider's minimum confidence.
 
 ### Chapters and online markers
-
-Between online providers, `markers.mergeProviderResults` picks one provider per
-kind and keeps every range that provider returned for the kind. Each provider
-is ranked by its best marker of that kind, compared with
-`markers.mergeCandidate.better`: the highest confidence, then the lower
-`fetch_priority`, then the higher submission count, then the provider ID. A
-marker without a confidence, or with a non-finite one or one outside 0 to 1,
-counts as 0 and loses to any rated one, but is still used when no other
-provider has that kind. Confidences are compared as
-each provider reports them, on their own scales; a marker below its provider's
-`fetch_min_confidence` is left out before the comparison. `selectResults`
-applies the current settings to fetched and cached answers alike, so a
-settings change applies without a refetch.
 
 Source priority puts online and plugin markers above every local one. The
 marker writer, `markers.CanWriteMarkerUpdate`, makes one exception for markers
@@ -176,39 +110,8 @@ scheduled run, a re-detection, or a playback or admin refresh that starts local
 analysis because a file of the episode lacks a marker. Playback analyzes the
 kinds the played file lacks; admin refresh then analyzes every enabled kind.
 Both cover every version of the episode. The nightly movie pass does not list
-movies whose online credits are a range, so a movie's credits chapter replaces
-weaker online credits only on re-detection. It does list movies whose credits
-are a provider's absent answer (below), since their bounds are NULL; there a
-stronger credits chapter replaces the absent answer on the nightly run, and a
-movie without one is skipped before its file is read.
-
-### Absent answers
-
-The host sets `accepts_absent` on every marker fetch, so a provider may answer
-that an item has no segment of a kind: a `MarkerSegment` with `absent` set and
-no bounds. `markerFromPluginSegment` maps it to a `Marker` with `Absent` set,
-never to a range; a segment without bounds would otherwise default to the
-whole file. Between providers an absent answer competes for its kind like a
-marker, through the same comparator and minimum confidence. A provider that
-returns both a range and an absent answer for one kind answered with the
-range.
-
-The writer stores an absent answer as a tombstone, the same shape a manual
-clear stores: NULL bounds and no ranges, with the provider's source, ID,
-algorithm, and confidence. `SegmentPayload.Absent` names that shape. Under
-`CanWriteMarkerUpdate` it holds its kind like the provider's marker would: a
-manual marker or clear keeps it out, it replaces scanner results, and a
-chapter marker and an absent answer are weighed by confidence under the rule
-above. With `markers.online_storage` set to `on_demand`, `ApplyResult` and
-`OverlayOnline` project it the same way without saving it. A refreshed
-provider that no longer gives the answer withdraws the tombstone like any
-withdrawn range.
-
-Local analysis treats a provider tombstone as that provider's marker: the
-analyzer leaves the kind alone (`Candidate.hasHigherPriority`) unless the
-chapter rule lets a chapter replace it, and lazy playback does not ask local
-analysis for the kind. Playback, jellycompat, and the APIs read bounds, so a
-tombstone is no marker to clients, as a manual clear is.
+movies whose credits came online, so a movie's credits chapter replaces weaker
+online credits only on re-detection.
 
 ## Versions and caches
 
@@ -223,16 +126,6 @@ tombstone is no marker to clients, as a manual clear is.
   statuses. Intro detection writes only `complete` rows.
 - `AnalysisBehaviorVersion` is part of the season state key. Bump it to
   re-run every season comparison over cached fingerprints.
-- A season group whose stored state settled it is skipped while its input
-  signature is unchanged. The database clears a file's derived markers when
-  its identity changes (hash, size, modification time, duration, item,
-  episode, extra, or season and episode numbers) and stamps
-  `media_files.markers_invalidated_at`. A rematch or a touched file changes
-  nothing else the analysis reads, so the signature includes that stamp:
-  the group is analyzed again and its markers come back, even when the
-  invalidation lands while a run is analyzing the group. A file never
-  invalidated adds nothing to the signature. Credits season state follows
-  the same rule.
 - Algorithm identifiers are stored with each marker. Between two scanner
   results, `markers.scannerAlgorithmPriority` decides which may replace the
   other before confidence is compared. A new identifier needs a rank above the
@@ -355,7 +248,7 @@ percentile of its 10th-percentile luma, capped at 30:
 - **Black:** the same background without text.
 - **Card:** a flat background at least 24 levels above black, with text at
   least 60 levels from it and moderate saturation.
-- **Mostly black:** passes every lettered test except coverage and contrast, with 70 to 85
+- **Mostly black:** passes every lettered test except coverage, with 70 to 85
   percent below luma 32. Dense columns of names and logos on black look like
   this.
 - Anything else is story.
@@ -375,10 +268,6 @@ start or end a run, and a start never moves back over them.
    lie within 20 seconds. If the first such run starts up to 60 seconds after
    the match and only story or mostly black keyframes lie between, the
    credits start there: the match often begins on music over the last shot.
-   True-black keyframes directly before the run's first text count as its
-   start when they all lie within 10 seconds of that text, since credits
-   usually cut to black before the first name; a longer stretch of black
-   keeps the match's start.
    Credits that video moved rate 0.05 higher, up to 0.95
    (`credits-audio:video:v1`); otherwise the match keeps its rating
    (`credits-audio:v1`: 0.90 when the season agrees on its duration, 0.65
@@ -401,8 +290,8 @@ These rules were validated on frame-checked episodes and movies from several
 series; every start they placed early was checked against frames and cut no
 story.
 
-Automatic contribution to online providers shares detected episode credits as
-it does intros, when they meet the provider's minimum confidence. At the default 0.95,
+Automatic contribution to online providers shares detected credits as it does
+intros, when they meet the provider's minimum confidence. At the default 0.95,
 that is chapter credits and season-agreed audio credits that video moved.
 
 Credits versions and caches:
@@ -428,11 +317,9 @@ Credits versions and caches:
   state. It covers the fingerprint key and, when the analysis ran tail
   passes, the tail key, so a group settled while ffmpeg could not run tail
   passes is analyzed again once it can. A run without tail passes also skips
-  a group a tail-capable run settled, under this or any earlier
-  `CreditsBehaviorVersion`, so it cannot replace that run's audio and video
-  credits with audio-only ones. Bump `CreditsBehaviorVersion` to re-run every
-  credits comparison over cached fingerprints and tails; runs without tail
-  passes keep off groups a tail-capable run settled before the bump.
+  a group a tail-capable run settled, so it cannot replace that run's audio
+  and video credits with audio-only ones. Bump `CreditsBehaviorVersion` to
+  re-run every credits comparison over cached fingerprints and tails.
 - Credits algorithms rank in `markers.scannerAlgorithmPriority` as
   `credits-chapter:v1` (30), `credits-version-copy:v1` (24),
   `credits-audio:video:v1` (22), `credits-audio:v1` (21), and
@@ -490,14 +377,10 @@ below the movie's credits chapter, which re-detection replaces
 The scheduled run analyzes movies after episodes, under the same cluster
 lock and ffmpeg limit. It lists movies whose movie tail is not stored for the
 file as it is now (complete, unusable, or failed on this server and still
-backing off), newest first; files retried after a failure come last. Once a movie's tail is stored, the run does not
+backing off), never-analyzed files first, then the newest; files retried
+after a failure come last. Once a movie's tail is stored, the run does not
 look at it again until the file changes; admin refresh and playback place its
-credits again from the stored tail. A tail records the file's invalidation
-time it was stored with (see [Versions and caches](#versions-and-caches)),
-and settles the movie only while the file still has that time. After an
-invalidation the run lists the movie, places its credits from the tail
-without sampling it again, and stores the tail again with the new time,
-which settles it, even when its silence pass times out. As for episodes, a tail ruled out by probe
+credits again from the stored tail. As for episodes, a tail ruled out by probe
 metadata (no video, or an all-intra codec) is decided on every analysis and
 never stored, and an unusable row an earlier build stored that way does not
 keep a movie out. Such movies, like movies whose credits come from a chapter,
@@ -508,137 +391,12 @@ last movie of the one before in that order, so a movie analyzed in this run
 that is still eligible is not listed again in it. The run starts no new
 movie, and lists no further page, once 60 minutes have passed since it
 started listing movies, and then reports `movie_budget_exhausted`; the
-remaining movies wait for the next run. When the run has a deadline, such as
-a scheduled run with a max runtime, the episode pass stops early enough to
-leave the movies that 60 minutes, or half the time left when the run starts if
-that is shorter. It stops where a cancel stops it, keeping the season groups
-it finished, reports `episode_budget_exhausted`, and the movie pass runs. A
-server without Chromaprint, which runs its episodes and then a separate movie
-pass under the cluster lock, leaves the same share when credits are on, even
-if another server then holds the lock and runs the movies. A run without a
-deadline, or one whose movie pass would list no movie, gives the episodes as
-long as they take. Run summaries count
+remaining movies wait for the next run. Run summaries count
 `movies_considered` (the movies the run listed) and
 `movie_credits_markers_written`; the credits tail counters include movies.
 
 Playback analysis of a movie without credits analyzes that file alone, with
 playback priority. Admin refresh of a movie analyzes each of its files.
-
-## Contribution
-
-Providers with contribution enabled receive this server's markers through
-`markers.ContributionService`: a manual save sends the saved kinds at once,
-and the daily "Share detected markers" task (`contribute_markers`) sends the
-scanner intros and credits of episodes, not specials or movies, at or above
-each provider's minimum confidence to providers with automatic sharing on. Online
-and plugin markers are never sent, so a provider's data does not reach
-another provider through this server. Automated "nothing found" results are
-never sent either: a detector that finds nothing is no evidence of absence.
-
-A manual clear is sent as an absent submission (`absent` set, no times,
-source `manual`, algorithm `manual:v1`, confidence 1), only to providers whose
-marker capability declares `supports_absent`. Every clear path sends it: the
-segment clear (`clearFileMarkerSegment`) and a clear inside a marker write
-(`setFileMarkers`, `setItemMarkers`). Its content hash and claim carry NULL times,
-which `currentAmendHashSQL` hashes as `ContentHash` does, so the amend check
-below matches them against the stored tombstone.
-
-Each attempt first claims a target in `marker_contributions`, keyed by
-provider, kind, and `target_key`; a partial unique index allows one active
-claim per target. The target key is the item kind, the provider's first
-required external ID (or else TMDB, TVDB, then IMDb), and the season and
-episode. An active claim blocks every later payload for that target, whatever
-times it carries, because most providers keep one submission per account for
-each item. A stale in-flight claim, a retryable error, and an `invalid`
-refusal older than 30 days free the target.
-
-A provider whose marker capability declares `supports_amend` replaces its
-earlier submission instead. For it, the target key is `file:<media_file_id>`,
-so each file is its own target. The key names no external ID, so a submission
-still in flight when the item's IDs change holds the target, and the next one
-waits for it. The content hash also covers the episode's own IDs, the
-numbering it follows, the file's hash and size, and the marker's source,
-algorithm, and confidence in whole thousandths, so a corrected episode ID, a
-file replaced at the same path, a new detection version, or a rescore is a
-change. A claim whose
-content hash differs from the new one is taken over once it is settled, even
-as a `conflict`. Before taking over a target, `Claim` checks under its lock
-that the payload's content hash is still the one the file's current state
-gives (`currentAmendHashSQL`: the stored marker, the file's duration, hash
-and size, and the item's IDs and episode numbering as the resolver reads
-them), so an older save, or a run that read
-the file before a save, a new detection, a re-probe, or a metadata change,
-never replaces a newer payload at the provider.
-
-`Claim` and both daily candidate queries use `currentAmendHashSQL`, which
-must hash exactly as `newContributionRow` does; the database contract tests
-`TestContributionStoreAmendResubmitsChangedMarkers` and
-`TestContributionStoreAmendSendsAnUnsentManualCorrection` check that. The
-queries offer a marker again when it no longer matches its active claim.
-
-A save's background contribution tries each provider once and never waits,
-and stops at the first rate limit. At a provider that supports amend,
-the daily task sends what it did not: a skip behind another submission in
-flight, a rate limit or other retryable error, or a run lost when its server
-stopped. `CandidateManualCorrections` offers a manual marker of any kind, on
-a movie or an episode, when the provider already has a `marker_contributions`
-row for that file and segment and none of its active claims there has the
-marker's current content hash. A change to the item's IDs therefore sends a
-correction again. It offers a manual clear the same way, but only to a
-provider that declares `supports_absent`. The run uses
-`ContributeOptions.Corrections`, which `Claim` accepts only with such a row
-(`ContributionRow.Correction`). It runs for every provider with contribution
-enabled that supports amend, whether or not automatic sharing is on, before
-the scanner passes. The state is in the database, so this works whichever
-server saved. A manual marker or clear at a provider that holds nothing for
-the file is never offered. Providers without
-`supports_amend` get only scanner markers from the daily task.
-
-A manual save of a kind whose bounds are both within a second of a marker an
-online or plugin provider supplied, as the user was shown it, may repeat that
-provider's data (`markers.KeepsProviderMarker`, which checks every occurrence
-of the kind). The save stores that kind with source `manual` and algorithm
-`manual:withheld:v1` instead of `manual:v1`, and no contribution path sends
-it: not the save's own run, the daily task, an admin contribution, or an amend
-resend, to any provider, including the one whose marker it kept. A save that
-keeps an earlier withheld marker stays withheld. A manual clear of a kind
-that, as the user was shown it, held an online or plugin provider's absent
-answer, or an earlier withheld clear, repeats that answer
-(`markers.KeepsProviderAbsence`); its tombstone stores `manual:withheld:v1`
-the same way. The comparison uses the stored row, which is what a player is
-shown unless online lookups run with `markers.online_storage` set to
-`on_demand` (`PopulationService.ShowsStoredMarkers`). In that mode a player is
-shown provider answers that each replica caches in its own memory for a while
-and never stores, and a provider's answer can change between playback and the
-save, so no lookup at save time can say which marker or answer the user saw.
-Every kind such a save sets or clears is withheld, except a kind the file
-already held as a `manual:v1` marker: no provider marker replaces one, and
-since every other save in that mode is withheld, the kind already held it when
-any editor still open loaded the file. A withheld marker or a manual clear
-does not exempt a save, because an editor opened before the save that wrote it
-may still show a provider's marker. Provenance is written with the marker in
-one statement, so it survives restarts, races between saves, and changes to
-the item's metadata. Everywhere else, including write priority, local
-detection, the API, and jellycompat, `manual:withheld:v1` is a manual marker
-like `manual:v1`. `/api/v2` reports the stored algorithm.
-
-With stored markers, a save is compared with the row as it is when the save
-arrives, not with what the editor showed, which the API does not send. If the
-stored kind changes while an editor is open, through a provider refresh or
-another user's save, a save that keeps the provider marker or answer the
-editor showed can be stored as `manual:v1` and shared. Closing this needs the
-save to name the state it edited, such as an `If-Match` precondition on the
-`/api/v2` marker write.
-
-Builds from before this rule do not know `manual:withheld:v1`. During a
-rolling upgrade from one, an older replica can still send a withheld marker
-when an admin contribution of that file reaches it, as it sends its own saves
-that keep a provider's marker, until the last older replica is replaced.
-
-The rule exists because TheIntroDB's terms forbid using its data to seed other
-databases, so Silo must not pass a provider's marker on as if a person had
-found it. It applies to every provider, the one the marker came from
-included, so it stays one simple rule.
 
 ## Measuring accuracy
 
@@ -649,18 +407,3 @@ the answer. Report the share of files whose start and end both fall within one
 and three seconds of the chapter bounds, and the median and 90th percentile
 error per boundary. Evaluate a matcher change this way before changing
 constants.
-
-TheIntroDB's markers are a second reference. Look up a sample of episodes with
-the plugin's own client, so the request matches what the server sends, and
-compare them with a replay over cached fingerprints rather than stored
-markers, which a provider marker replaces. Count only answers for a release
-within two seconds of the file's duration, since other releases shift the
-timings, and report entries with a confidence of at least 0.5 and two or more
-submissions apart: single submissions are often wrong, and TheIntroDB credits
-include anime openings, which `CheckCreditsPlacement` rejects. On 162 such
-entries, almost all anime with chapter-snapped starts, intros without subtitle
-refinement had both boundaries within three seconds for 93 percent of files.
-Plex's own markers for the same media files are a third reference, with
-different coverage: on 13,211
-replayed files from a mostly non-anime library, 69 percent were within three
-seconds and 90 percent within five; Plex intros end about 1.7 seconds earlier.

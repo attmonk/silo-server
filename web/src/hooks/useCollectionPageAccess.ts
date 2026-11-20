@@ -11,7 +11,6 @@ import {
   type EditorSnapshot,
   type ScopeKind,
 } from "@/lib/collections/scope";
-import { useAppLanguage } from "@/i18n";
 
 /** The collection a collection page shows. `libraryId` is the library it was opened in, if any. */
 export interface CollectionPageTarget {
@@ -43,7 +42,6 @@ export type CollectionPageAccess =
 const NONE: CollectionPageAccess = { kind: "none" };
 
 export function useCollectionPageAccess(target: CollectionPageTarget | null): CollectionPageAccess {
-  useAppLanguage();
   const actingAdmin = useIsActingAdmin();
   const { profile } = useCurrentProfile();
   const profiles = useProfiles();

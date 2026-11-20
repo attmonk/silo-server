@@ -9,9 +9,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/nodeauth"
-	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
 )
 
 func TestStopRemoteTranscodeAfterFailure(t *testing.T) {
@@ -26,7 +23,6 @@ func TestStopRemoteTranscodeAfterFailure(t *testing.T) {
 	}))
 	defer node.Close()
 	m := NewTranscodeManager()
-	m.NodeKeysFn = func() nodeauth.Keyring { return nodeauthtest.NodeKey("snk1_1_stop-key") }
 
 	// An unreachable node is stopped in the background: the call returns
 	// while the node is still holding the stop.

@@ -31,6 +31,8 @@ const (
 	// metadataAIOnViewOff is the on-view mode of an unwired or unconfigured
 	// translation service.
 	metadataAIOnViewOff = "off"
+	// metadataAIStatusEnabledKey is the v1 status probe's enabled member.
+	metadataAIStatusEnabledKey = "enabled"
 )
 
 // TrailerRefreshCapabilityView is what a server offers for the viewer-facing
@@ -198,7 +200,7 @@ func (h *MetadataAIHandler) TranslateOnView(ctx context.Context, filter catalog.
 	// The account budget comes first, so a refused request cannot fan out
 	// into the pending-language reads below without spending it.
 	if h.Limiter != nil && requestedBy != nil {
-		result := h.Limiter.Allow(ctx, metadataAIOnViewLimiterKey(*requestedBy), metadataAIOnViewRate)
+		result := h.onViewAllow(ctx, *requestedBy)
 		if !result.Allowed {
 			limited := apiError(http.StatusTooManyRequests, "rate_limited", "Too many translation requests")
 			if result.RetryAfter > 0 {
@@ -257,7 +259,24 @@ func onViewNotConfigured(cause error) *APIError {
 		Message: "On-view translation is not enabled on this server", cause: cause}
 }
 
-// SearchPeopleScoped serves v2 people search with media scope, ranked as catalog.PersonRepository.SearchScoped describes.
+// SearchPeople answers up to limit people matching query that the viewer can
+// see through at least one credit, as person detail requires; limit <= 0 is 20.
+func (h *PeopleHandler) SearchPeople(ctx context.Context, query string, limit int, filter catalog.AccessFilter) ([]PersonView, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	people, err := h.personRepo.SearchAlphabetical(ctx, query, limit, filter)
+	if err != nil {
+		return nil, apiError(http.StatusInternalServerError, "search_failed", err.Error())
+	}
+	resp := make([]PersonView, len(people))
+	for i, p := range people {
+		resp[i] = h.toResponse(ctx, p)
+	}
+	return resp, nil
+}
+
+// SearchPeopleScoped serves v2 people search with media scope and exact-name ranking.
 func (h *PeopleHandler) SearchPeopleScoped(ctx context.Context, query string, limit int, mediaScope string, filter catalog.AccessFilter) ([]PersonView, error) {
 	people, err := h.personRepo.SearchScoped(ctx, query, limit, mediaScope, filter)
 	if err != nil {

@@ -5,8 +5,6 @@
  * them.
  */
 
-import { t } from "@/i18n";
-
 export const DEVICE_CODE_LENGTH = 8;
 export const QUICK_CONNECT_CODE_LENGTH = 6;
 
@@ -44,6 +42,6 @@ export function spokenDeviceCode(value: string) {
 export function tooManyCodesMessage(retryAfterSeconds: number | null) {
   const minutes = retryAfterSeconds ? Math.max(1, Math.ceil(retryAfterSeconds / 60)) : null;
   return minutes
-    ? t("web.auth.quickConnect.tooManyCodesMinutes", { minutes })
-    : t("web.auth.quickConnect.tooManyCodes");
+    ? `You've tried too many codes. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`
+    : "You've tried too many codes. Try again later.";
 }

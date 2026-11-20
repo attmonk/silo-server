@@ -17,8 +17,6 @@ import {
   useAdminUserProfileActivity,
 } from "@/hooks/queries/admin/userActivity";
 import { useAdminUserCapabilities } from "@/hooks/queries/admin/users";
-import { useT, type MessageKey } from "@/i18n";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
 
 import { StatStrip, StatTile, SubTabs } from "../ui";
 import { DeviceDownloadsCard } from "./DeviceDownloadsCard";
@@ -26,18 +24,16 @@ import { MonitoredSeriesCard } from "./MonitoredSeriesCard";
 import { IN_PROGRESS_STATUSES, isAndroidPlatform } from "./downloadPresentation";
 
 const ALL = "all";
-/** Keeps the space between the error and its Retry button. */
-const SPACE = " ";
 
 type StatusFilter = "all" | "on_device" | "in_progress" | "requested" | "failed" | "revoked";
 
-const STATUS_OPTIONS: { value: StatusFilter; label: MessageKey }[] = [
-  { value: "all", label: "web.admin.users.detail.downloads.filterAll" },
-  { value: "on_device", label: "web.admin.users.detail.downloads.status.onDevice" },
-  { value: "in_progress", label: "web.admin.users.detail.downloads.inProgress" },
-  { value: "requested", label: "web.admin.users.detail.downloads.requestedOnAndroid" },
-  { value: "failed", label: "web.admin.users.detail.downloads.status.failed" },
-  { value: "revoked", label: "web.admin.users.detail.downloads.status.revoked" },
+const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
+  { value: "all", label: "Everything" },
+  { value: "on_device", label: "On device" },
+  { value: "in_progress", label: "In progress" },
+  { value: "requested", label: "Requested on Android" },
+  { value: "failed", label: "Failed" },
+  { value: "revoked", label: "Revoked" },
 ];
 
 /**
@@ -64,11 +60,11 @@ function matchesStatus(row: AdminUserDownload, filter: StatusFilter, android: bo
   }
 }
 
-/** The note for a capped list, or null when both lists loaded in full. */
-function partialListNote(downloads?: boolean, monitors?: boolean): MessageKey | null {
-  if (downloads && monitors) return "web.admin.users.detail.downloads.partial.both";
-  if (downloads) return "web.admin.users.detail.downloads.partial.downloads";
-  if (monitors) return "web.admin.users.detail.downloads.partial.monitors";
+/** What a capped list covers, or null when both lists loaded in full. */
+function partialListText(downloads?: boolean, monitors?: boolean): string | null {
+  if (downloads && monitors) return "the first 5,000 downloads and 2,000 monitored series";
+  if (downloads) return "the first 5,000 downloads";
+  if (monitors) return "the first 2,000 monitored series";
   return null;
 }
 
@@ -85,7 +81,6 @@ function Message({ children, role }: { children: ReactNode; role?: "alert" }) {
 
 /** What each of the account's devices holds, and which series download on their own. */
 export function DownloadsTab({ user }: { user: AdminUser }) {
-  const t = useT();
   const capabilities = useAdminUserCapabilities();
   const available = capabilities.data?.account_downloads === true;
   const devicesAvailable = capabilities.data?.account_devices === true;
@@ -100,7 +95,7 @@ export function DownloadsTab({ user }: { user: AdminUser }) {
 
   const rows = useMemo(() => downloads.data?.items ?? [], [downloads.data]);
   const monitorRows = useMemo(() => monitors.data?.items ?? [], [monitors.data]);
-  const partial = partialListNote(downloads.data?.truncated, monitors.data?.truncated);
+  const partial = partialListText(downloads.data?.truncated, monitors.data?.truncated);
   const deviceById = useMemo(
     () => new Map<string, AdminUserDeviceRow>((devices.data ?? []).map((d) => [d.device_id, d])),
     [devices.data],
@@ -111,40 +106,33 @@ export function DownloadsTab({ user }: { user: AdminUser }) {
   );
   const deviceName = (id: string) => {
     const device = deviceById.get(id);
-    return device
-      ? device.device_name || t("web.admin.users.detail.common.unnamedDevice")
-      : t("web.admin.users.detail.common.unknownDevice");
+    return device ? device.device_name || "Unnamed device" : "Unknown device";
   };
   const android = (id: string) => isAndroidPlatform(deviceById.get(id)?.device_platform);
 
   // Devices in the order their newest row arrived (the list is newest first).
   const deviceIds = useMemo(() => [...new Set(rows.map((row) => row.device_id))], [rows]);
 
-  if (capabilities.isLoading) {
-    return <Message>{t("web.admin.users.detail.downloads.loading")}</Message>;
-  }
-  if (!available) return <Message>{t("web.admin.users.detail.downloads.unavailable")}</Message>;
+  if (capabilities.isLoading) return <Message>Loading downloads...</Message>;
+  if (!available) return <Message>Downloads aren&apos;t available on this server.</Message>;
   if (downloads.isError || monitors.isError)
     return (
       <Message role="alert">
-        <span className="text-destructive">{t("web.admin.users.detail.downloads.failed")}</span>
-        {SPACE}
+        <span className="text-destructive">Couldn&apos;t load this account&apos;s downloads.</span>{" "}
         <Button
           variant="outline"
           size="sm"
-          className="ms-2"
+          className="ml-2"
           onClick={() => {
             void downloads.refetch();
             void monitors.refetch();
           }}
         >
-          {t("common.retry")}
+          Retry
         </Button>
       </Message>
     );
-  if (downloads.isLoading || monitors.isLoading) {
-    return <Message>{t("web.admin.users.detail.downloads.loading")}</Message>;
-  }
+  if (downloads.isLoading || monitors.isLoading) return <Message>Loading downloads...</Message>;
 
   const counted = (predicate: (row: AdminUserDownload) => boolean) => rows.filter(predicate).length;
   const onDevice = counted((row) => !android(row.device_id) && row.status === "completed");
@@ -174,28 +162,20 @@ export function DownloadsTab({ user }: { user: AdminUser }) {
   return (
     <div className="space-y-4">
       <StatStrip columns={4}>
+        <StatTile label="On device" value={onDevice} detail="confirmed by the app" />
         <StatTile
-          label={t("web.admin.users.detail.downloads.status.onDevice")}
-          value={onDevice}
-          detail={t("web.admin.users.detail.downloads.stats.onDeviceDetail")}
-        />
-        <StatTile
-          label={t("web.admin.users.detail.downloads.inProgress")}
+          label="In progress"
           value={inProgress}
-          detail={t("web.admin.users.detail.downloads.stats.inProgressDetail")}
+          detail="downloading, preparing, or waiting"
         />
         {anyAndroid && (
           <StatTile
-            label={t("web.admin.users.detail.downloads.requestedOnAndroid")}
+            label="Requested on Android"
             value={requestedCount}
-            detail={t("web.admin.users.detail.downloads.stats.requestedDetail")}
+            detail="not confirmed by the app"
           />
         )}
-        <StatTile
-          label={t("web.admin.users.detail.downloads.monitoredSeries")}
-          value={activeMonitors}
-          detail={t("web.admin.users.detail.downloads.stats.monitoredDetail")}
-        />
+        <StatTile label="Monitored series" value={activeMonitors} detail="synced by the app" />
       </StatStrip>
 
       {partial && (
@@ -203,34 +183,28 @@ export function DownloadsTab({ user }: { user: AdminUser }) {
           role="note"
           className="border-border/60 bg-muted/30 rounded-lg border px-3 py-2 text-[13px] leading-relaxed"
         >
-          {t(partial)}
+          The lists and counts here cover only {partial}; this account has more.
         </p>
       )}
 
       {rows.length > 0 && (
         <div className="flex flex-wrap items-center justify-between gap-3">
           <SubTabs
-            ariaLabel={t("web.admin.users.detail.downloads.devicesLabel")}
+            ariaLabel="Devices"
             value={selectedDevice}
             onValueChange={setDeviceFilter}
             items={[
-              { value: ALL, label: t("web.admin.users.detail.downloads.allDevices") },
+              { value: ALL, label: "All devices" },
               ...deviceIds.map((id) => ({ value: id, label: deviceName(id) })),
             ]}
           />
           <div className="flex flex-wrap items-center gap-2">
             <Select value={profileFilter} onValueChange={setProfileFilter}>
-              <SelectTrigger
-                size="sm"
-                className="w-40"
-                aria-label={t("web.admin.users.detail.common.profileFilter")}
-              >
+              <SelectTrigger size="sm" className="w-40" aria-label="Profile">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent className={TOUCH_TARGETS}>
-                <SelectItem value={ALL}>
-                  {t("web.admin.users.detail.common.allProfiles")}
-                </SelectItem>
+              <SelectContent>
+                <SelectItem value={ALL}>All profiles</SelectItem>
                 {(profiles.data ?? []).map((profile) => (
                   <SelectItem key={profile.id} value={profile.id}>
                     {profile.name || profile.id}
@@ -242,18 +216,14 @@ export function DownloadsTab({ user }: { user: AdminUser }) {
               value={statusFilter}
               onValueChange={(value) => setStatusFilter(value as StatusFilter)}
             >
-              <SelectTrigger
-                size="sm"
-                className="w-40"
-                aria-label={t("web.admin.users.detail.downloads.statusFilter")}
-              >
+              <SelectTrigger size="sm" className="w-40" aria-label="Status">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent className={TOUCH_TARGETS}>
+              <SelectContent>
                 {STATUS_OPTIONS.filter((option) => option.value !== "requested" || anyAndroid).map(
                   (option) => (
                     <SelectItem key={option.value} value={option.value}>
-                      {t(option.label)}
+                      {option.label}
                     </SelectItem>
                   ),
                 )}
@@ -264,9 +234,9 @@ export function DownloadsTab({ user }: { user: AdminUser }) {
       )}
 
       {rows.length === 0 ? (
-        <Message>{t("web.admin.users.detail.downloads.empty")}</Message>
+        <Message>No downloads on this account&apos;s devices.</Message>
       ) : cards.length === 0 ? (
-        <Message>{t("web.admin.users.detail.downloads.noMatch")}</Message>
+        <Message>No downloads match these filters.</Message>
       ) : (
         cards.map((card) => (
           <DeviceDownloadsCard
@@ -290,7 +260,8 @@ export function DownloadsTab({ user }: { user: AdminUser }) {
       />
 
       <p className="text-muted-foreground text-xs">
-        {t("web.admin.users.detail.downloads.wipedNote")}
+        A device that was wiped or had the app removed keeps its rows here until it&apos;s removed
+        from the account.
       </p>
     </div>
   );

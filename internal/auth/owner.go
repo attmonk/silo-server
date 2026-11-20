@@ -4,12 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 
-	"github.com/Silo-Server/silo-server/internal/auditmutation"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5"
 )
@@ -142,26 +139,7 @@ func changesAccessPolicy(target *models.User, input models.UpdateUserInput) bool
 		changesOverride(input.AudioTranscodeAllowed, target.AudioTranscodeAllowed) ||
 		changesOverride(input.DownloadAllowed, target.DownloadAllowed) ||
 		changesOverride(input.DownloadTranscodeAllowed, target.DownloadTranscodeAllowed) ||
-		changesOverride(input.RequestsAllowed, target.RequestsAllowed) ||
-		changesPermissions(input.Permissions, target.Permissions)
-}
-
-// changesPermissions compares permission lists after normalization, so a
-// reordered or duplicated resend is not a change. A list that does not
-// normalize counts as a change; the update rejects it later anyway.
-func changesPermissions(input *[]string, current []string) bool {
-	if input == nil {
-		return false
-	}
-	next, err := NormalizePermissions(*input)
-	if err != nil {
-		return true
-	}
-	saved, err := NormalizePermissions(current)
-	if err != nil {
-		return true
-	}
-	return !slices.Equal(next, saved)
+		changesOverride(input.RequestsAllowed, target.RequestsAllowed)
 }
 
 func changesOverride[T comparable](input models.Optional[T], current *T) bool {
@@ -286,21 +264,8 @@ func (r *UserRepository) TransferOwnership(ctx context.Context, fromID, toID int
 	if err := moveOwnership(ctx, tx, fromID, toID); err != nil {
 		return err
 	}
-	audit, err := auditmutation.RecordMutation(ctx, tx, auditmutation.ActionOwnershipTransferred, auditmutation.TargetUser,
-		strconv.Itoa(toID), http.StatusNoContent,
-		auditmutation.Changes(map[string]any{auditFieldOwner: fromID}, map[string]any{auditFieldOwner: toID}))
-	if err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	auditmutation.CommitMutation(ctx, audit)
-	return nil
+	return tx.Commit(ctx)
 }
-
-// auditFieldOwner names the server Owner's account in an ownership transfer.
-const auditFieldOwner = "owner_user_id"
 
 // moveOwnership clears the current Owner before marking the next: the
 // single-Owner index is checked row by row. The new Owner becomes a
@@ -360,7 +325,7 @@ func (r *UserRepository) SetOwner(ctx context.Context, username string) (*models
 	// Lock the named account and the current Owner in one statement, in id
 	// order, so concurrent recoveries serialize instead of deadlocking.
 	rows, err := tx.Query(ctx, `
-		SELECT id, COALESCE(username = $1, false), is_owner, role, enabled FROM users
+		SELECT id, username = $1, is_owner, role, enabled FROM users
 		WHERE username = $1 OR is_owner ORDER BY id FOR UPDATE`, NormalizeUsername(strings.TrimSpace(username)))
 	if err != nil {
 		return nil, 0, err

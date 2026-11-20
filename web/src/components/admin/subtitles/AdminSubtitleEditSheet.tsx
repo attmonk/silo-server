@@ -24,8 +24,7 @@ import {
 } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
 import { useAdminUpdateDownloadedSubtitle } from "@/hooks/queries/admin/subtitles";
-import { useT } from "@/i18n";
-import { languageOptions, getLanguageName } from "@/player/utils/languageNames";
+import { LANGUAGES, getLanguageName } from "@/player/utils/languageNames";
 import { cn } from "@/lib/utils";
 import { languageChipClass, providerBadgeClass, providerLabel } from "./subtitleAdminStyles";
 
@@ -40,7 +39,6 @@ export default function AdminSubtitleEditSheet({
   open,
   onOpenChange,
 }: AdminSubtitleEditSheetProps) {
-  const t = useT();
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="flex w-full flex-col overflow-y-auto sm:max-w-md">
@@ -53,7 +51,7 @@ export default function AdminSubtitleEditSheet({
         ) : (
           <>
             <SheetHeader>
-              <SheetTitle>{t("web.admin.common.subtitles.edit.title")}</SheetTitle>
+              <SheetTitle>Edit subtitle</SheetTitle>
             </SheetHeader>
           </>
         )}
@@ -69,10 +67,8 @@ function AdminSubtitleEditorLoader({
   intent: AdminSubtitleEditIntent;
   onClose: () => void;
 }) {
-  const t = useT();
   const [editor, setEditor] = useState<AdminSubtitleEditor | null>(null);
-  // The load failure; its text is read at render, in the interface language.
-  const [error, setError] = useState<{ cause: unknown } | null>(null);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     const controller = new AbortController();
     let active = true;
@@ -81,7 +77,8 @@ function AdminSubtitleEditorLoader({
         if (active) setEditor(value);
       },
       (error: unknown) => {
-        if (active) setError({ cause: error });
+        if (active)
+          setError(error instanceof Error ? error.message : "Unable to load subtitle metadata.");
       },
     );
     return () => {
@@ -89,21 +86,14 @@ function AdminSubtitleEditorLoader({
       controller.abort();
     };
   }, [intent]);
-  const errorText =
-    error &&
-    (error.cause instanceof Error
-      ? error.cause.message
-      : t("web.admin.common.subtitles.edit.loadFailed"));
   if (!editor)
     return (
       <>
         <SheetHeader>
-          <SheetTitle>{t("web.admin.common.subtitles.edit.title")}</SheetTitle>
-          <SheetDescription>{t("web.admin.common.subtitles.edit.loadHint")}</SheetDescription>
+          <SheetTitle>Edit subtitle</SheetTitle>
+          <SheetDescription>Load current metadata before making changes.</SheetDescription>
         </SheetHeader>
-        <p role={errorText ? "alert" : "status"}>
-          {errorText ?? t("web.admin.common.subtitles.edit.loading")}
-        </p>
+        <p role={error ? "alert" : "status"}>{error ?? "Loading subtitle metadata…"}</p>
       </>
     );
   return <AdminSubtitleEditForm editor={editor} onClose={onClose} />;
@@ -116,7 +106,6 @@ function AdminSubtitleEditForm({
   editor: AdminSubtitleEditor;
   onClose: () => void;
 }) {
-  const t = useT();
   const subtitle = editor.body;
   const updateMutation = useAdminUpdateDownloadedSubtitle();
   const active = useRef(true);
@@ -151,9 +140,7 @@ function AdminSubtitleEditForm({
       if (active.current) onClose();
     } catch (error) {
       if (active.current)
-        setFailure(
-          error instanceof Error ? error.message : t("web.admin.common.subtitles.edit.saveFailed"),
-        );
+        setFailure(error instanceof Error ? error.message : "Save was not confirmed.");
     } finally {
       saving.current = false;
     }
@@ -162,14 +149,16 @@ function AdminSubtitleEditForm({
   return (
     <>
       <SheetHeader>
-        <SheetTitle>{t("web.admin.common.subtitles.edit.title")}</SheetTitle>
-        <SheetDescription>{t("web.admin.common.subtitles.edit.description")}</SheetDescription>
+        <SheetTitle>Edit subtitle</SheetTitle>
+        <SheetDescription>
+          Update stored metadata for this subtitle record. File content is not replaced.
+        </SheetDescription>
       </SheetHeader>
 
       <div className="space-y-6 px-1 py-2">
         <div className="surface-panel-subtle space-y-3 rounded-xl px-4 py-4">
           <div className="text-sm font-semibold">
-            {editor.intent.subtitle.media_title || t("web.admin.common.subtitles.unknownMedia")}
+            {editor.intent.subtitle.media_title || "Unknown media"}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <span
@@ -178,10 +167,7 @@ function AdminSubtitleEditForm({
                 languageChipClass(),
               )}
             >
-              {t("web.admin.common.subtitles.languageCode", {
-                code: subtitle.language.toUpperCase(),
-                language: getLanguageName(subtitle.language),
-              })}
+              {subtitle.language.toUpperCase()} · {getLanguageName(subtitle.language)}
             </span>
             <span
               className={cn(
@@ -195,33 +181,28 @@ function AdminSubtitleEditForm({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="subtitle-language">{t("web.admin.common.subtitles.edit.language")}</Label>
+          <Label htmlFor="subtitle-language">Language</Label>
           <Select value={language} onValueChange={setLanguage}>
             <SelectTrigger id="subtitle-language">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {languageOptions().map((lang) => (
+              {LANGUAGES.map((lang) => (
                 <SelectItem key={lang.code} value={lang.code}>
-                  {t("web.admin.common.subtitles.languageCode", {
-                    code: lang.code.toUpperCase(),
-                    language: lang.label,
-                  })}
+                  {lang.code.toUpperCase()} · {lang.label}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
           {languageChanged && (
             <p className="text-muted-foreground text-xs leading-relaxed">
-              {t("web.admin.common.subtitles.edit.languageChanged")}
+              Updates stored language label; file content unchanged.
             </p>
           )}
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="subtitle-release-name">
-            {t("web.admin.common.subtitles.edit.releaseName")}
-          </Label>
+          <Label htmlFor="subtitle-release-name">Release name</Label>
           <Input
             id="subtitle-release-name"
             value={releaseName}
@@ -232,12 +213,8 @@ function AdminSubtitleEditForm({
 
         <div className="border-border/60 flex items-center justify-between rounded-xl border px-4 py-3">
           <div className="space-y-1">
-            <Label htmlFor="subtitle-hearing-impaired">
-              {t("web.admin.common.subtitles.edit.hearingImpaired")}
-            </Label>
-            <p className="text-muted-foreground text-xs">
-              {t("web.admin.common.subtitles.edit.hearingImpairedHelp")}
-            </p>
+            <Label htmlFor="subtitle-hearing-impaired">Hearing impaired</Label>
+            <p className="text-muted-foreground text-xs">Marks this track as SDH/CC.</p>
           </div>
           <Switch
             id="subtitle-hearing-impaired"
@@ -248,12 +225,15 @@ function AdminSubtitleEditForm({
       </div>
 
       {failure && (
-        <p role="alert">{t("web.admin.common.subtitles.edit.failureHint", { error: failure })}</p>
+        <p role="alert">
+          {failure} Your edits remain here. Close and reopen to review current metadata before
+          another save.
+        </p>
       )}
 
       <SheetFooter className="mt-auto gap-2 sm:justify-end">
         <Button type="button" variant="outline" onClick={onClose}>
-          {t("common.cancel")}
+          Cancel
         </Button>
         <Button
           type="button"
@@ -266,7 +246,7 @@ function AdminSubtitleEditForm({
           }
           onClick={() => void handleSave()}
         >
-          {t("web.admin.common.subtitles.edit.saveChanges")}
+          Save changes
         </Button>
       </SheetFooter>
     </>

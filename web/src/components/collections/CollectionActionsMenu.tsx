@@ -1,29 +1,18 @@
 import type { Ref } from "react";
-import {
-  Eye,
-  House,
-  Library as LibraryIcon,
-  Pencil,
-  RefreshCw,
-  ShieldCheck,
-  Trash2,
-  Users,
-} from "lucide-react";
+import { Eye, House, Library as LibraryIcon, Pencil, RefreshCw, Trash2, Users } from "lucide-react";
 
 import { ActionMenu, type ActionMenuItem } from "@/components/calm/ActionMenu";
 import {
-  addToHome,
-  addToHomeHelp,
-  addToLibraryPage,
-  addToLibraryPageHelp,
-  addToMyHomeHelp,
-  addToMyHomeItem,
-  showToOtherProfilesLabel,
-  showToOtherProfilesShortHelp,
-  syncNow,
+  ADD_TO_HOME,
+  ADD_TO_HOME_HELP,
+  ADD_TO_LIBRARY_PAGE,
+  ADD_TO_LIBRARY_PAGE_HELP,
+  ADD_TO_MY_HOME_HELP,
+  ADD_TO_MY_HOME_ITEM,
+  SHOW_TO_OTHER_PROFILES_LABEL,
+  SHOW_TO_OTHER_PROFILES_SHORT_HELP,
 } from "@/lib/collections/copy";
 import type { PageRef } from "@/lib/homeRows/types";
-import { useT, type Translate } from "@/i18n";
 
 /** Where a collection can be opened: one item, or a submenu when there are several. */
 export interface OpenInLibraries {
@@ -33,24 +22,21 @@ export interface OpenInLibraries {
   disabledReason?: string;
 }
 
-function openInItem(
-  t: Translate,
-  { libraries, onOpen, disabledReason }: OpenInLibraries,
-): ActionMenuItem {
+function openInItem({ libraries, onOpen, disabledReason }: OpenInLibraries): ActionMenuItem {
   const shared = { icon: Eye, disabled: Boolean(disabledReason), help: disabledReason };
   if (libraries.length === 1) {
     const [library] = libraries;
     return {
       ...shared,
       key: "open",
-      label: t("web.collections.actions.openInLibrary", { library: library!.name }),
+      label: `Open in ${library!.name}`,
       onSelect: () => onOpen(library!.id),
     };
   }
   return {
     ...shared,
     key: "open",
-    label: t("web.collections.actions.openIn"),
+    label: "Open in",
     items: libraries.map((library) => ({
       key: `open-${library.id}`,
       label: library.name,
@@ -78,8 +64,8 @@ function addAsRowItems({ libraries, onAdd, disabledReason, mine }: AddAsRow): Ac
   const disabled = Boolean(disabledReason);
   const home: ActionMenuItem = {
     key: "add-home",
-    label: mine ? addToMyHomeItem() : addToHome(),
-    help: disabledReason ?? (mine ? addToMyHomeHelp() : addToHomeHelp()),
+    label: mine ? ADD_TO_MY_HOME_ITEM : ADD_TO_HOME,
+    help: disabledReason ?? (mine ? ADD_TO_MY_HOME_HELP : ADD_TO_HOME_HELP),
     icon: House,
     // Your own card's menu runs on from Edit and Sync now (spec §5.3).
     group: !mine,
@@ -89,8 +75,8 @@ function addAsRowItems({ libraries, onAdd, disabledReason, mine }: AddAsRow): Ac
   if (libraries.length === 0) return [home];
   const page = {
     key: "add-library",
-    label: addToLibraryPage(),
-    help: disabledReason ?? addToLibraryPageHelp(),
+    label: ADD_TO_LIBRARY_PAGE,
+    help: disabledReason ?? ADD_TO_LIBRARY_PAGE_HELP,
     icon: LibraryIcon,
     disabled,
   };
@@ -126,7 +112,6 @@ export function CollectionActionsMenu({
   sync,
   addRow,
   share,
-  onAllowForProfiles,
   onDelete,
   triggerRef,
   placement = "poster",
@@ -137,26 +122,18 @@ export function CollectionActionsMenu({
   sync?: { onSync: () => void; syncing: boolean };
   addRow?: AddAsRow;
   share?: { shared: boolean; onChange: (shared: boolean) => void; disabled?: boolean };
-  /** Opens "Allow for…" for the household's limited profiles; primary profile only. */
-  onAllowForProfiles?: () => void;
   onDelete: () => void;
   triggerRef?: Ref<HTMLButtonElement>;
   placement?: "poster" | "row";
 }) {
-  const t = useT();
   const items: ActionMenuItem[] = [
-    {
-      key: "edit",
-      label: t("web.collections.admin.editCollection"),
-      icon: Pencil,
-      onSelect: onEdit,
-    },
+    { key: "edit", label: "Edit collection", icon: Pencil, onSelect: onEdit },
   ];
-  if (openIn && openIn.libraries.length > 0) items.push(openInItem(t, openIn));
+  if (openIn && openIn.libraries.length > 0) items.push(openInItem(openIn));
   if (sync) {
     items.push({
       key: "sync",
-      label: sync.syncing ? t("web.collections.actions.syncing") : syncNow(),
+      label: sync.syncing ? "Syncing…" : "Sync now",
       icon: RefreshCw,
       disabled: sync.syncing,
       onSelect: sync.onSync,
@@ -166,8 +143,8 @@ export function CollectionActionsMenu({
   if (share) {
     items.push({
       key: "share",
-      label: showToOtherProfilesLabel(),
-      help: showToOtherProfilesShortHelp(),
+      label: SHOW_TO_OTHER_PROFILES_LABEL,
+      help: SHOW_TO_OTHER_PROFILES_SHORT_HELP,
       icon: Users,
       group: true,
       checked: share.shared,
@@ -175,19 +152,9 @@ export function CollectionActionsMenu({
       onCheckedChange: share.onChange,
     });
   }
-  if (onAllowForProfiles) {
-    items.push({
-      key: "allow-for-profiles",
-      label: t("web.collections.actions.allowFor"),
-      help: t("web.collections.actions.allowForHelp"),
-      icon: ShieldCheck,
-      group: !share,
-      onSelect: onAllowForProfiles,
-    });
-  }
   items.push({
     key: "delete",
-    label: t("web.collections.actions.delete"),
+    label: "Delete…",
     icon: Trash2,
     destructive: true,
     group: true,
@@ -195,7 +162,7 @@ export function CollectionActionsMenu({
   });
   return (
     <ActionMenu
-      label={t("web.collections.admin.moreFor", { name })}
+      label={`More for ${name}`}
       items={items}
       triggerRef={triggerRef}
       triggerClassName={

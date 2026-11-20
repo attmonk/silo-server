@@ -12,7 +12,6 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
-	"github.com/Silo-Server/silo-server/internal/requests/discoverrows"
 )
 
 // The requests domain: a profile's media requests and the TMDB-backed
@@ -142,20 +141,18 @@ type RequestMediaPage struct {
 
 // DiscoverSection is one discovery row.
 type DiscoverSection struct {
-	Key   string `json:"key" doc:"The row's stable ID. The six built-in rows keep trending_movies, trending_series, popular_movies, popular_series, upcoming_movies and on_air_series; a row an admin adds has an opaque ID" example:"trending_movies"`
-	Title string `json:"title" example:"Trending Movies"`
-	SectionTitleKey
+	Key          string               `json:"key" example:"trending_movies"`
+	Title        string               `json:"title" example:"Trending Movies"`
 	Page         int                  `json:"page" example:"1"`
 	TotalPages   int                  `json:"total_pages" example:"500"`
 	TotalResults int                  `json:"total_results" example:"10000"`
 	Results      []RequestMediaResult `json:"results" doc:"Empty, never null"`
-	NextPage     int                  `json:"next_page,omitempty" doc:"The page to request next when filling this page read more than one provider page (for a rating limit, or a row that leaves out titles the library has), since page+1 would repeat titles. After such a read reaches the end it is past total_pages, which means there are no more pages. Absent when page+1 applies or there are no more pages"`
+	NextPage     int                  `json:"next_page,omitempty" doc:"The page to request next when rating backfill consumed more than one provider page; absent when page+1 applies or there are no more pages"`
 }
 
 // DiscoverSectionCollection is the listDiscoverSections envelope.
 type DiscoverSectionCollection struct {
 	Collection[DiscoverSection]
-	RowOrder []DiscoverRowRef `json:"row_order" doc:"Every row the page shows, in order. items holds the title rows that have titles; a brand row (type studios, networks or genres) draws the cards of the matching brand list operation. A client skips a type it does not know. Empty, never null"`
 }
 
 // DiscoverBrand is a studio, network, or genre card.
@@ -369,7 +366,6 @@ const (
 	opGetRequestMediaDetail = "getRequestMediaDetail"
 	opListDiscoverSections  = "listDiscoverSections"
 	opGetDiscoverSection    = "getDiscoverSection"
-	opGetDiscoverRow        = "getDiscoverRow"
 	opListDiscoverGenres    = "listDiscoverGenres"
 	opListDiscoverNetworks  = "listDiscoverNetworks"
 	opListDiscoverStudios   = "listDiscoverStudios"
@@ -393,12 +389,10 @@ func registerRequests(reg *Registry) {
 	create.Errors = []int{http.StatusConflict, http.StatusTooManyRequests}
 	Register(reg, Operation{Operation: create, Class: ClassProfileScoped, DemoRestricted: isMutatingMethod(create.Method), ServiceBacked: true, RetrySafety: RetrySafetyNonRetryable}, reg.createRequest)
 
-	listMine := humaOp(http.MethodGet, Prefix+"/requests/mine", opListMyRequests, requestsTag,
-		"List the account's media requests, newest first.")
-	listMine.Description = "Lists the requests every profile on the account made. A profile the household manager blocked from requests sees only the requests it made itself."
 	Register(reg, Operation{
-		Operation: listMine,
-		Class:     ClassProfileScoped, ServiceBacked: true,
+		Operation: humaOp(http.MethodGet, Prefix+"/requests/mine", opListMyRequests, requestsTag,
+			"List the account's media requests, newest first."),
+		Class: ClassProfileScoped, ServiceBacked: true,
 	}, func(ctx context.Context, in *MediaRequestListInput) (*MediaRequestCollectionOutput, error) {
 		return reg.listMyRequests(ctx, cursors, in)
 	})
@@ -414,19 +408,14 @@ func registerRequests(reg *Registry) {
 	Register(reg, Operation{Operation: detail, Class: ClassProfileScoped, ServiceBacked: true}, reg.getRequestMediaDetail)
 
 	sections := humaOp(http.MethodGet, Prefix+"/requests/discover", opListDiscoverSections, requestsTag,
-		"List the Discover page's rows in the admin's order, with each title row's first page.")
+		"List the discovery rows with their first page.")
 	sections.Errors = []int{http.StatusConflict}
 	Register(reg, Operation{Operation: sections, Class: ClassProfileScoped, ServiceBacked: true}, reg.listDiscoverSections)
 
 	section := humaOp(http.MethodGet, Prefix+"/requests/discover/{section}", opGetDiscoverSection, requestsTag,
-		"Get one page of a built-in discovery row; getDiscoverRow serves every row.")
-	section.Errors = []int{http.StatusNotFound, http.StatusConflict}
+		"Get one page of a discovery row.")
+	section.Errors = []int{http.StatusConflict}
 	Register(reg, Operation{Operation: section, Class: ClassProfileScoped, ServiceBacked: true}, reg.getDiscoverSection)
-
-	row := humaOp(http.MethodGet, Prefix+"/requests/discover/rows/{row_id}", opGetDiscoverRow, requestsTag,
-		"Get one page of a Discover title row, for its see all page.")
-	row.Errors = []int{http.StatusNotFound, http.StatusConflict}
-	Register(reg, Operation{Operation: row, Class: ClassProfileScoped, ServiceBacked: true}, reg.getDiscoverRow)
 
 	for _, brand := range []struct{ id, segment, summary string }{
 		{opListDiscoverGenres, "genres", "List the browsable genres."},
@@ -482,7 +471,6 @@ func registerRequests(reg *Registry) {
 
 	get := humaOp(http.MethodGet, Prefix+"/requests/{id}", opGetRequest, requestsTag,
 		"Get one of the account's media requests.")
-	get.Description = "A profile the household manager blocked from requests gets 403 for a request another profile made, unless it acts as an admin."
 	get.Errors = []int{http.StatusConflict}
 	Register(reg, Operation{Operation: get, Class: ClassProfileScoped, ServiceBacked: true}, reg.getRequest)
 }
@@ -659,31 +647,41 @@ func (reg *Registry) unfollowRequestMedia(ctx context.Context, in *RequestMediaD
 	return nil, nil
 }
 
-// listDiscoverSections is v1 GET /requests/discover, laid out by the admin's
-// Discover layout.
+// listDiscoverSections is v1 GET /requests/discover.
 func (reg *Registry) listDiscoverSections(ctx context.Context, _ *struct{}) (*DiscoverSectionCollectionOutput, error) {
 	svc, viewer, p := reg.requestViewer(ctx)
 	if p != nil {
 		return nil, p
 	}
-	page, err := svc.DiscoverRows(ctx, viewer)
+	sections, err := svc.DiscoverAll(ctx, viewer)
 	if err != nil {
 		return nil, requestProblem(err)
 	}
-	items := make([]DiscoverSection, 0, len(page.Sections))
+	items := make([]DiscoverSection, 0, len(sections))
 	var marks []watchlistMark
-	for i := range page.Sections {
-		items = append(items, discoverSectionOf(&page.Sections[i]))
+	for i := range sections {
+		items = append(items, discoverSectionOf(&sections[i]))
 	}
 	for i := range items {
 		marks = append(marks, watchlistMarksOf(items[i].Results)...)
 	}
 	reg.markInWatchlist(ctx, marks)
-	order := make([]DiscoverRowRef, 0, len(page.Order))
-	for _, r := range page.Order {
-		order = append(order, DiscoverRowRef{Key: r.Key, Type: string(r.Type), Title: r.Title, SectionTitleKey: sectionTitleKeyOf(discoverrows.TitleKey(r.Key, r.Title), nil)})
+	return &DiscoverSectionCollectionOutput{Body: DiscoverSectionCollection{Collection: NewCollection(items)}}, nil
+}
+
+// getDiscoverSection is v1 GET /requests/discover/{section}.
+func (reg *Registry) getDiscoverSection(ctx context.Context, in *DiscoverSectionInput) (*DiscoverSectionOutput, error) {
+	svc, viewer, p := reg.requestViewer(ctx)
+	if p != nil {
+		return nil, p
 	}
-	return &DiscoverSectionCollectionOutput{Body: DiscoverSectionCollection{Collection: NewCollection(items), RowOrder: order}}, nil
+	section, err := svc.Discover(ctx, viewer, in.Section, in.Page)
+	if err != nil {
+		return nil, requestProblem(err)
+	}
+	out := discoverSectionOf(section)
+	reg.markInWatchlist(ctx, watchlistMarksOf(out.Results))
+	return &DiscoverSectionOutput{Body: out}, nil
 }
 
 // listDiscoverBrands is v1 GET /requests/discover/{genres,networks,studios}.
@@ -881,12 +879,9 @@ func mediaRequestOf(r *mediarequests.Request, viewer mediarequests.Viewer) Media
 }
 
 // requestDownloadOf maps download progress. The byte counts and percent are
-// left out while the size is unknown (a total of 0). Progress with no report
-// time, which only an out-of-band database edit can leave behind, is left out
-// whole: a zero Instant cannot be marshaled and would fail the entire response.
-// It stays on the domain value so the download refresh pass can still clear it.
+// left out while the size is unknown (a total of 0).
 func requestDownloadOf(d *mediarequests.DownloadProgress) *RequestDownload {
-	if d == nil || d.UpdatedAt.IsZero() {
+	if d == nil {
 		return nil
 	}
 	out := &RequestDownload{
@@ -973,7 +968,7 @@ func requestMediaSeasonsOf(seasons []mediarequests.RequestSeason) []RequestMedia
 
 func discoverSectionOf(s *mediarequests.DiscoverySection) DiscoverSection {
 	return DiscoverSection{
-		Key: s.Key, Title: s.Title, SectionTitleKey: sectionTitleKeyOf(discoverrows.TitleKey(s.Key, s.Title), nil), Page: s.Page, TotalPages: s.TotalPages, TotalResults: s.TotalResults,
+		Key: s.Key, Title: s.Title, Page: s.Page, TotalPages: s.TotalPages, TotalResults: s.TotalResults,
 		Results: requestMediaResultsOf(s.Results), NextPage: s.NextPage,
 	}
 }

@@ -1,5 +1,4 @@
 import type { GuidedFormState } from "@/components/collections/CollectionGuidedRulesEditor";
-import { t } from "@/i18n";
 import { formatLanguage } from "@/lib/languageDisplay";
 
 export interface ActiveFilterBadge {
@@ -11,8 +10,6 @@ export interface ActiveFilterBadge {
 /**
  * Compute displayable badge descriptors for all active "secondary" filters.
  * Skips mediaScope, sortField, sortOrder (shown inline in the bar).
- * Labels are in the current app language; a component showing them re-renders
- * on a language change (`useAppLanguage()`).
  */
 export function getActiveFilterBadges(
   state: GuidedFormState,
@@ -24,7 +21,7 @@ export function getActiveFilterBadges(
   for (const genre of state.genres) {
     badges.push({
       key: `genre:${genre}`,
-      label: t("web.catalog.filters.badgeGenre", { genre }),
+      label: `Genre: ${genre}`,
       clearPatch: { genres: state.genres.filter((g) => g !== genre) },
     });
   }
@@ -33,19 +30,19 @@ export function getActiveFilterBadges(
   if (state.yearFrom && state.yearTo) {
     badges.push({
       key: "year",
-      label: t("web.catalog.filters.badgeYearRange", { from: state.yearFrom, to: state.yearTo }),
+      label: `Year: ${state.yearFrom}–${state.yearTo}`,
       clearPatch: { yearFrom: "", yearTo: "" },
     });
   } else if (state.yearFrom) {
     badges.push({
       key: "year",
-      label: t("web.catalog.filters.badgeYearFrom", { year: state.yearFrom }),
+      label: `Year: >= ${state.yearFrom}`,
       clearPatch: { yearFrom: "" },
     });
   } else if (state.yearTo) {
     badges.push({
       key: "year",
-      label: t("web.catalog.filters.badgeYearTo", { year: state.yearTo }),
+      label: `Year: <= ${state.yearTo}`,
       clearPatch: { yearTo: "" },
     });
   }
@@ -54,7 +51,7 @@ export function getActiveFilterBadges(
   if (state.minRating) {
     badges.push({
       key: "minRating",
-      label: t("web.catalog.filters.badgeMinImdb", { rating: state.minRating }),
+      label: `IMDb: >= ${state.minRating}`,
       clearPatch: { minRating: "" },
     });
   }
@@ -63,7 +60,7 @@ export function getActiveFilterBadges(
   if (state.contentRating) {
     badges.push({
       key: "contentRating",
-      label: t("web.catalog.filters.badgeContentRating", { rating: state.contentRating }),
+      label: `Rated: ${state.contentRating}`,
       clearPatch: { contentRating: "" },
     });
   }
@@ -71,7 +68,7 @@ export function getActiveFilterBadges(
   for (const lang of state.originalLanguages) {
     badges.push({
       key: `originalLanguage:${lang}`,
-      label: t("web.catalog.filters.badgeLanguage", { language: formatLanguage(lang) }),
+      label: `Language: ${formatLanguage(lang)}`,
       clearPatch: {
         originalLanguages: state.originalLanguages.filter((l) => l !== lang),
       },
@@ -81,7 +78,7 @@ export function getActiveFilterBadges(
   if (state.actor) {
     badges.push({
       key: "actor",
-      label: t("web.catalog.filters.badgeActor", { name: state.actor }),
+      label: `Actor: ${state.actor}`,
       clearPatch: { actor: "" },
     });
   }
@@ -89,7 +86,7 @@ export function getActiveFilterBadges(
   if (state.director) {
     badges.push({
       key: "director",
-      label: t("web.catalog.filters.badgeDirector", { name: state.director }),
+      label: `Director: ${state.director}`,
       clearPatch: { director: "" },
     });
   }
@@ -97,7 +94,7 @@ export function getActiveFilterBadges(
   if (state.writer) {
     badges.push({
       key: "writer",
-      label: t("web.catalog.filters.badgeWriter", { name: state.writer }),
+      label: `Writer: ${state.writer}`,
       clearPatch: { writer: "" },
     });
   }
@@ -105,7 +102,7 @@ export function getActiveFilterBadges(
   if (state.producer) {
     badges.push({
       key: "producer",
-      label: t("web.catalog.filters.badgeProducer", { name: state.producer }),
+      label: `Producer: ${state.producer}`,
       clearPatch: { producer: "" },
     });
   }
@@ -113,7 +110,7 @@ export function getActiveFilterBadges(
   if (state.author) {
     badges.push({
       key: "author",
-      label: t("web.catalog.filters.badgeAuthor", { name: state.author }),
+      label: `Author: ${state.author}`,
       clearPatch: { author: "" },
     });
   }
@@ -121,7 +118,7 @@ export function getActiveFilterBadges(
   if (state.narrator && state.mediaScope === "audiobook") {
     badges.push({
       key: "narrator",
-      label: t("web.catalog.filters.badgeNarrator", { name: state.narrator }),
+      label: `Narrator: ${state.narrator}`,
       clearPatch: { narrator: "" },
     });
   }
@@ -129,7 +126,7 @@ export function getActiveFilterBadges(
   if (state.series) {
     badges.push({
       key: "series",
-      label: t("web.catalog.filters.badgeSeries", { name: state.series }),
+      label: `Series: ${state.series}`,
       clearPatch: { series: "" },
     });
   }
@@ -138,7 +135,7 @@ export function getActiveFilterBadges(
   if (state.studio) {
     badges.push({
       key: "studio",
-      label: t("web.catalog.filters.badgeStudio", { name: state.studio }),
+      label: `Studio: ${state.studio}`,
       clearPatch: { studio: "" },
     });
   }
@@ -147,7 +144,7 @@ export function getActiveFilterBadges(
   if (state.network) {
     badges.push({
       key: "network",
-      label: t("web.catalog.filters.badgeNetwork", { name: state.network }),
+      label: `Network: ${state.network}`,
       clearPatch: { network: "" },
     });
   }
@@ -156,7 +153,7 @@ export function getActiveFilterBadges(
   if (state.country) {
     badges.push({
       key: "country",
-      label: t("web.catalog.filters.badgeCountry", { country: state.country }),
+      label: `Country: ${state.country}`,
       clearPatch: { country: "" },
     });
   }
@@ -165,20 +162,27 @@ export function getActiveFilterBadges(
   if (state.status) {
     badges.push({
       key: "status",
-      label: t("web.catalog.filters.badgeMatch", { status: state.status }),
+      label: `Match: ${state.status}`,
       clearPatch: { status: "" },
     });
   }
 
   if (state.watchStatus) {
-    const statusKey = options.isAudiobookLibrary
-      ? "web.catalog.filters.badgeListening"
+    const statusVerb = options.isAudiobookLibrary
+      ? "Listening"
       : state.mediaScope === "ebook"
-        ? "web.catalog.filters.badgeRead"
-        : "web.catalog.filters.badgeWatch";
+        ? "Read"
+        : "Watch";
+    const statusLabel = options.isAudiobookLibrary
+      ? state.watchStatus === "watched"
+        ? "listened"
+        : state.watchStatus === "unwatched"
+          ? "unlistened"
+          : state.watchStatus.replace("_", " ")
+      : state.watchStatus.replace("_", " ");
     badges.push({
       key: "watchStatus",
-      label: t(statusKey, { status: state.watchStatus }),
+      label: `${statusVerb}: ${statusLabel}`,
       clearPatch: { watchStatus: "" },
     });
   }
@@ -187,7 +191,7 @@ export function getActiveFilterBadges(
   if (state.addedInLast) {
     badges.push({
       key: "addedInLast",
-      label: t("web.catalog.filters.badgeAddedInLast", { span: state.addedInLast }),
+      label: `Added in last: ${state.addedInLast}`,
       clearPatch: { addedInLast: "" },
     });
   }
@@ -196,7 +200,7 @@ export function getActiveFilterBadges(
   if (state.releasedInLast) {
     badges.push({
       key: "releasedInLast",
-      label: t("web.catalog.filters.badgeReleasedInLast", { span: state.releasedInLast }),
+      label: `Released in last: ${state.releasedInLast}`,
       clearPatch: { releasedInLast: "" },
     });
   }

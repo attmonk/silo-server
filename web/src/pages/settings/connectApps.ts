@@ -1,7 +1,8 @@
 import type { Profile } from "@/api/types";
-import type { AccountIdentity } from "@/hooks/queries/account";
-import type { AuthProviderOption } from "@/hooks/useAuth";
-import { t } from "@/i18n";
+
+export const SILO_APP_EXAMPLES = "Silo for iPhone, Apple TV, Android, Android TV, and this website";
+
+export const JELLYFIN_APP_EXAMPLES = "Infuse, Swiftfin, JellyCon, Findroid, Jellyfin Media Player";
 
 /**
  * Builds the username a Jellyfin-protocol client must send.
@@ -29,7 +30,7 @@ export function buildJellyfinUsername(accountUsername: string, profileName: stri
  */
 export function jellyfinUsernameIssue(profileName: string): string | null {
   if (profileName.includes("#")) {
-    return t("web.settings.connectApps.usernameIssue");
+    return "This profile's name contains a #, which Jellyfin apps can't sign in with. Rename it in Settings → Profiles to use it from one.";
   }
   return null;
 }
@@ -65,69 +66,9 @@ export function buildJellyfinPasswordHint(
   profile: Pick<Profile, "name" | "has_pin"> | null,
 ): string {
   if (!profile) {
-    return t("web.settings.connectApps.passwordHint.noProfile");
+    return "Your account password.";
   }
   return profile.has_pin
-    ? t("web.settings.connectApps.passwordHint.pin", { name: profile.name })
-    : t("web.settings.connectApps.passwordHint.noPin", { name: profile.name });
-}
-
-/**
- * How this account signs in on a Silo app's sign-in screen.
- *
- * - `password`: the username and Silo password form.
- * - `directory`: the same form, with the linked directory's (LDAP) username
- *   and password; the server routes a name without a Silo password there.
- * - `provider`: the linked OAuth (OIDC) provider's button, which opens the
- *   provider in a browser. TVs show a code to approve instead.
- * - `network`: the linked network provider's (such as Tailscale) "Continue
- *   as" button, offered only on a device reaching the server through it.
- * - `none`: nothing the sign-in screens offer works for this account.
- */
-export type SiloSignIn =
-  | { kind: "password" }
-  | { kind: "directory"; provider: AuthProviderOption; username: string }
-  | { kind: "provider"; provider: AuthProviderOption }
-  | { kind: "network"; providerName: string }
-  | { kind: "none" };
-
-/**
- * Works out what a Silo sign-in screen lets this account use.
- *
- * The account's password counts only while the server's sign-in screens show
- * the password form (`passwordFormShown`, listAuthProviders' password_login):
- * with local sign-in off, a break-glass password still works for recovery
- * and Jellyfin apps, but the Silo apps hide the form. Otherwise the account
- * signs in through a linked identity whose provider is enabled; an identity
- * at a disabled provider has an empty provider_id. A network provider is
- * listed only to requests that come through its own network, so an enabled
- * provider missing from the list is one of those.
- */
-export function resolveSiloSignIn(
-  accountPasswordWorks: boolean,
-  passwordFormShown: boolean,
-  providers: AuthProviderOption[],
-  identities: AccountIdentity[],
-): SiloSignIn {
-  if (accountPasswordWorks && passwordFormShown) {
-    return { kind: "password" };
-  }
-  let network: SiloSignIn | null = null;
-  for (const identity of identities) {
-    if (!identity.provider_id) continue;
-    const provider = providers.find((entry) => entry.id === identity.provider_id);
-    if (provider?.mode === "oauth") {
-      return { kind: "provider", provider };
-    }
-    if (provider?.mode === "credentials" && passwordFormShown) {
-      return { kind: "directory", provider, username: identity.username };
-    }
-    if (!provider || provider.mode === "network") {
-      network ??= {
-        kind: "network",
-        providerName: provider?.display_name ?? identity.provider_name,
-      };
-    }
-  }
-  return network ?? { kind: "none" };
+    ? `${profile.name} has a PIN, so append # and the PIN to your account password.`
+    : `${profile.name} has no PIN — just your account password, nothing appended.`;
 }

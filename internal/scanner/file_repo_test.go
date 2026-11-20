@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -121,6 +120,34 @@ func TestRecomputeSharedMarkerAttributionUsesLegacyAttributionForUnattributedSeg
 	}
 }
 
+func TestMarkerAuditSegmentForStatePreservesBeforeAfterShape(t *testing.T) {
+	manual := models.MarkerSourceManual
+	algorithm := "manual:v1"
+	confidence := 1.0
+	detectedAt := time.Unix(300, 0).UTC()
+
+	segment := markerAuditSegmentForState(segmentState{
+		start:      floatPtr(5),
+		end:        floatPtr(65),
+		source:     &manual,
+		confidence: &confidence,
+		algorithm:  &algorithm,
+		detectedAt: &detectedAt,
+	})
+	if segment == nil {
+		t.Fatal("expected audit segment")
+	}
+	if segment.Start == nil || *segment.Start != 5 || segment.End == nil || *segment.End != 65 {
+		t.Fatalf("audit segment bounds = %v..%v, want 5..65", segment.Start, segment.End)
+	}
+	if segment.Source == nil || *segment.Source != manual || segment.Algorithm == nil || *segment.Algorithm != algorithm {
+		t.Fatalf("audit provenance = source %v algorithm %v", segment.Source, segment.Algorithm)
+	}
+	if segment.DetectedAt == nil || !segment.DetectedAt.Equal(detectedAt) {
+		t.Fatalf("detected_at = %v, want %v", segment.DetectedAt, detectedAt)
+	}
+}
+
 func TestRecomputeSharedMarkerAttributionDropsClearedManualSegment(t *testing.T) {
 	manual := models.MarkerSourceManual
 	scannerSource := models.MarkerSourceScanner
@@ -158,6 +185,30 @@ func TestRecomputeSharedMarkerAttributionClearsWhenNoSegmentsRemain(t *testing.T
 }
 
 func floatPtr(v float64) *float64 { return &v }
+
+// Multipart ordering must survive rows written before the part-index column:
+// SQL orders those legacy rows by file path, which puts part10 before part2.
+func TestSortPresentationFilesOrdersLegacyRowsNaturally(t *testing.T) {
+	files := []*models.MediaFile{
+		{ID: 1, FilePath: "/book/part10.m4b"},
+		{ID: 2, FilePath: "/book/part2.m4b", PresentationPartIndex: 2, PresentationPartTotal: 3},
+		{ID: 3, FilePath: "/book/part1.m4b"},
+		{ID: 4, FilePath: "/book/part1.m4b", PresentationPartIndex: 1, PresentationPartTotal: 3},
+		{ID: 5, FilePath: "/book/part3.m4b", PresentationPartIndex: 3, PresentationPartTotal: 3},
+	}
+	sortPresentationFiles(files)
+
+	got := make([]int, 0, len(files))
+	for _, f := range files {
+		got = append(got, f.ID)
+	}
+	want := []int{4, 2, 5, 3, 1}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("presentation order = %v, want %v", got, want)
+		}
+	}
+}
 
 func TestMarkerUpdateDropsCreditsOutsideCreditsWindow(t *testing.T) {
 	// A 40-minute episode, whose credits window opens at 32:30, from a
@@ -260,65 +311,5 @@ func TestMarkerMutationChecksCreditsAgainstTheIntroItLeaves(t *testing.T) {
 	}
 	if !changed.credits || state.credits.start == nil || *state.credits.start != 1350 {
 		t.Fatalf("credits not written: changed=%v start=%v", changed.credits, state.credits.start)
-	}
-}
-
-// A provider's absent answer replaces a local intro with a tombstone carrying
-// the provider's provenance, and leaves with the answer once the refreshed
-// provider stops giving it.
-func TestMarkerUpdateWritesAndWithdrawsAbsentAnswer(t *testing.T) {
-	scannerSource, algorithm := models.MarkerSourceScanner, "chromaprint:v4"
-	state := markerMutationState{duration: 1800, file: models.MediaFile{EpisodeID: "episode"}, intro: segmentState{
-		start: floatPtr(10), end: floatPtr(70), source: &scannerSource, confidence: floatPtr(0.9), algorithm: &algorithm,
-		ranges: []models.MarkerSegment{{Kind: models.MarkerSegmentIntro, StartSeconds: 10, EndSeconds: 70}},
-	}}
-	const provider = "plugin:1:markers"
-	absent := MarkerUpdateFromPayload(markers.BuildUpdatePayload(markers.Result{
-		SourceClass: models.MarkerSourceOnline, RefreshedProviders: []string{provider},
-		Markers: []markers.Marker{{Kind: markers.MarkerKindIntro, Absent: true, Confidence: 0.9,
-			SourceClass: models.MarkerSourcePlugin, ProviderID: provider, Algorithm: "consensus:v1"}},
-	}))
-
-	applied, err := applyMarkerUpdateToMutationState(&absent, &state, time.Now())
-	if err != nil {
-		t.Fatalf("apply absent: %v", err)
-	}
-	intro := state.intro
-	if !applied.intro || intro.start != nil || intro.end != nil || len(intro.ranges) != 0 ||
-		intro.source == nil || *intro.source != models.MarkerSourcePlugin || intro.provider == nil || *intro.provider != provider ||
-		intro.algorithm == nil || *intro.algorithm != "consensus:v1" || intro.confidence == nil || *intro.confidence != 0.9 {
-		t.Fatalf("absent answer not stored as a plugin tombstone: applied=%v state=%+v", applied.intro, intro)
-	}
-
-	miss := MarkerUpdateFromPayload(markers.BuildUpdatePayload(markers.Result{RefreshedProviders: []string{provider}}))
-	applied, err = applyMarkerUpdateToMutationState(&miss, &state, time.Now())
-	if err != nil {
-		t.Fatalf("apply refresh: %v", err)
-	}
-	if !applied.intro || !segmentEqual(state.intro, segmentState{}) {
-		t.Fatalf("withdrawn absent answer kept: applied=%v state=%+v", applied.intro, state.intro)
-	}
-}
-
-// A manual clear that a save withholds is written as a manual tombstone with
-// the withheld algorithm, replacing a provider's absent answer, so no
-// contribution sends it.
-func TestManualClearStoresWithheldProvenance(t *testing.T) {
-	pluginSource, provider, algorithm := models.MarkerSourcePlugin, "plugin:1:markers", "consensus:v1"
-	state := markerMutationState{duration: 1800, file: models.MediaFile{EpisodeID: "episode"}, intro: segmentState{
-		source: &pluginSource, provider: &provider, confidence: floatPtr(0.9), algorithm: &algorithm,
-	}}
-	update := MarkerUpdate{MarkersSource: models.MarkerSourceManual, MarkersConfidence: floatPtr(1), MarkersAlgorithm: markers.ManualAlgorithm,
-		IntroProvenance: &SegmentProvenance{Source: models.MarkerSourceManual, Confidence: floatPtr(1), Algorithm: markers.ManualWithheldAlgorithm, Absent: true}}
-
-	changed, err := applyMarkerMutation(&update, markerSegmentFlags{intro: true}, &state, time.Now())
-	if err != nil {
-		t.Fatalf("apply clear: %v", err)
-	}
-	intro := state.intro
-	if !changed.intro || intro.start != nil || intro.end != nil || intro.provider != nil ||
-		intro.source == nil || *intro.source != models.MarkerSourceManual ||
-		intro.algorithm == nil || *intro.algorithm != markers.ManualWithheldAlgorithm {
-		t.Fatalf("withheld clear not stored as a withheld manual tombstone: changed=%v state=%+v", changed.intro, intro)
 	}
 }

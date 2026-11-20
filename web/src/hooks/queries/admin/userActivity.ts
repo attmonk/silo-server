@@ -15,7 +15,6 @@ import {
   type AdminUserPlay,
 } from "@/api/v2/adminUserActivity";
 import { adminUsersKey } from "./users";
-import { t } from "@/i18n";
 
 const ACTIVITY_STALE_TIME = 30_000;
 const LIVE_REFRESH_INTERVAL = 15_000;
@@ -155,7 +154,7 @@ export function useAdminUserWatchHistory(opts: {
         const index = params.findIndex((param) => param?.cursor === pageParam?.cursor);
         const prior = index < 0 ? params : params.slice(0, index + 1);
         if (prior.some((param) => param?.cursor === page.nextCursor))
-          throw new Error(t("web.admin.errors.watchHistoryInvalid"));
+          throw new Error("Invalid watch history page. Reload the page.");
       }
       return { ...page, endedAfter };
     },

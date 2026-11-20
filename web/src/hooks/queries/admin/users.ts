@@ -35,7 +35,6 @@ import { SETTING_DEFINITIONS, SETTING_KEYS, type SettingKey } from "@/lib/settin
 import { adminKeys } from "../keys";
 import { useAdminUserProfiles } from "./history";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 
 const ADMIN_STALE_TIME = 30_000;
 
@@ -124,7 +123,7 @@ export function settingValueFromString(key: string, raw: string): unknown {
     case "number": {
       const parsed = Number(trimmed);
       if (!Number.isFinite(parsed)) {
-        throw new Error(t("web.common.settingValue.notANumber", { key, raw }));
+        throw new Error(`${key}: "${raw}" is not a number`);
       }
       return definition.type === "integer" ? Math.trunc(parsed) : parsed;
     }
@@ -132,7 +131,7 @@ export function settingValueFromString(key: string, raw: string): unknown {
       try {
         return JSON.parse(trimmed) as unknown;
       } catch {
-        throw new Error(t("web.common.settingValue.invalidJson", { key }));
+        throw new Error(`${key}: the value must be valid JSON`);
       }
     default:
       // Strings, enums and language tags travel as themselves; so does a key
@@ -331,15 +330,13 @@ export function useUpdateAdminUserSetting() {
     }) =>
       setAdminSettingValue(userId, key, identity, settingValueFromString(key, value), authority),
     onSuccess: (_data, variables) => {
-      toast.success(t("web.admin.common.users.settingUpdated"));
+      toast.success("User setting updated");
       queryClient.invalidateQueries({
         queryKey: [...adminUsersKey(adminUserScope(authority)), "settings", variables.userId],
       });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.admin.common.users.settingSaveFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to save setting");
     },
   });
 }
@@ -367,15 +364,13 @@ export function useDeleteAdminUserSetting() {
       await deleteAdminSettingValue(userId, key, identity, authority);
     },
     onSuccess: (_data, variables) => {
-      toast.success(t("web.admin.common.users.settingReset"));
+      toast.success("User setting reset");
       queryClient.invalidateQueries({
         queryKey: [...adminUsersKey(adminUserScope(authority)), "settings", variables.userId],
       });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.admin.common.users.settingResetFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to reset setting");
     },
   });
 }
@@ -470,16 +465,14 @@ export function useUpdateAdminUserDeviceSetting() {
         authority,
       ),
     onSuccess: (_data, variables) => {
-      toast.success(t("web.admin.common.users.deviceOverrideUpdated"));
+      toast.success("Device override updated");
       invalidateAdminDeviceCaches(queryClient, variables.userId, authority);
       queryClient.invalidateQueries({
         queryKey: adminKeys.deviceDetail(variables.userId, variables.deviceId),
       });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.admin.common.users.deviceOverrideSaveFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to save device override");
     },
   });
 }
@@ -507,16 +500,14 @@ export function useDeleteAdminUserDeviceSetting() {
         authority,
       ),
     onSuccess: (_data, variables) => {
-      toast.success(t("web.admin.common.users.deviceOverrideReset"));
+      toast.success("Device override reset");
       invalidateAdminDeviceCaches(queryClient, variables.userId, authority);
       queryClient.invalidateQueries({
         queryKey: adminKeys.deviceDetail(variables.userId, variables.deviceId),
       });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.admin.common.users.deviceOverrideResetFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to reset override");
     },
   });
 }
@@ -559,22 +550,14 @@ export function useDeleteAllAdminUserDeviceSettingsForDevice() {
             continue;
           }
           throw new Error(
-            t("web.admin.common.users.resetAllStopped", {
-              count: keys.length,
-              count_text: keys.length,
-              completed: completed,
-              reason:
-                err instanceof Error
-                  ? err.message
-                  : t("web.admin.common.users.resetAllRemainingFailed"),
-            }),
+            `Reset stopped after ${completed} of ${keys.length} overrides. Reload the settings before continuing. ${err instanceof Error ? err.message : "The remaining override could not be reset."}`,
           );
         }
       }
       return { completed };
     },
     onSuccess: (_data, variables) => {
-      toast.success(t("web.admin.common.users.resetAllDone"));
+      toast.success("All device overrides reset");
       invalidateAdminDeviceCaches(queryClient, variables.userId, authority);
       queryClient.invalidateQueries({
         queryKey: adminKeys.deviceDetail(variables.userId, variables.deviceId),
@@ -582,7 +565,7 @@ export function useDeleteAllAdminUserDeviceSettingsForDevice() {
     },
     onError: (err, variables) => {
       invalidateAdminDeviceCaches(queryClient, variables.userId, authority);
-      toast.error(err instanceof Error ? err.message : t("web.admin.common.users.resetAllFailed"));
+      toast.error(err instanceof Error ? err.message : "Failed to reset device");
     },
   });
 }
@@ -670,6 +653,6 @@ export function useResetAdminDeviceLearnedLimit() {
       queryClient.invalidateQueries({
         queryKey: adminKeys.deviceDetail(variables.userId, variables.deviceId),
       }),
-    onError: () => toast.error(t("web.admin.common.users.clearLearnedLimitFailed")),
+    onError: () => toast.error("Failed to clear learned limit"),
   });
 }

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Bookmark, BookmarkCheck, Loader2, Plus } from "lucide-react";
+import { Bookmark, BookmarkCheck, Library, Loader2, Plus } from "lucide-react";
 import type { MediaRequest, RequestMediaResult, RequestMediaType } from "@/api/types";
 import { cn } from "@/lib/utils";
 import {
@@ -26,15 +26,19 @@ import {
   mediaItemMenuIconClassName,
   mediaItemMenuTriggerClassName,
 } from "@/components/mediaItemMenuTrigger";
-import { useT } from "@/i18n";
 
-// The badge takes the top-right corner and truncates when the card is narrow.
-const BADGE_CLASS = "ms-auto max-w-full shrink-0";
+// The badge takes the top-right corner and truncates before it reaches the
+// Library chip on the left.
+const BADGE_CLASS = "ml-auto max-w-full shrink-0";
 const DETAIL_CLASS = "text-muted-foreground mt-1 truncate text-[0.75rem] font-medium";
 
 type DiscoverProps = {
   variant: "discover";
   item: RequestMediaResult;
+  /** Called when the hover Request action is clicked. Omit to suppress the action. */
+  onRequest?: () => void;
+  /** Shows the pending state on the hover Request action. Ignored when onRequest is omitted. */
+  isSubmitting?: boolean;
   /**
    * Called when the hover watchlist action is clicked; it reads
    * item.in_watchlist. Omit to suppress the action.
@@ -77,6 +81,8 @@ export default function RequestPosterCard(props: RequestPosterCardProps) {
   return (
     <DiscoverCard
       item={props.item}
+      isSubmitting={props.isSubmitting}
+      onRequest={props.onRequest}
       onToggleWatchlist={props.onToggleWatchlist}
       isWatchlistPending={props.isWatchlistPending}
       fluid={props.fluid}
@@ -86,6 +92,8 @@ export default function RequestPosterCard(props: RequestPosterCardProps) {
 
 function DiscoverCard({
   item,
+  isSubmitting,
+  onRequest,
   onToggleWatchlist,
   isWatchlistPending,
   fluid,
@@ -105,6 +113,7 @@ function DiscoverCard({
       year={item.year}
       posterPath={item.poster_path}
       href={requestDetailHref(item.media_type, item.tmdb_id)}
+      libraryContentId={item.library_content_id}
       fluid={fluid}
       dim={!requestable}
       badge={
@@ -112,6 +121,15 @@ function DiscoverCard({
           <RequestStatusBadge state={state} overlay className={BADGE_CLASS} />
         ) : !requestable ? (
           <RequestReasonBadge reason={item.request.reason} overlay className={BADGE_CLASS} />
+        ) : null
+      }
+      action={
+        requestable && onRequest ? (
+          <RequestAction
+            title={`${item.title} (${[formatMediaType(item.media_type), item.year].filter(Boolean).join(" · ")})`}
+            pending={Boolean(isSubmitting)}
+            onRequest={onRequest}
+          />
         ) : null
       }
       cornerAction={
@@ -129,7 +147,6 @@ function DiscoverCard({
 }
 
 function MineCard({ request, fluid, onCancel, isCancelling }: Omit<MineProps, "variant">) {
-  const t = useT();
   const state = requestDisplayState(request.status, request.outcome, request.state);
   const isClosed =
     request.outcome === "failed" ||
@@ -151,6 +168,7 @@ function MineCard({ request, fluid, onCancel, isCancelling }: Omit<MineProps, "v
       year={request.year}
       posterPath={request.poster_path}
       href={requestDetailHref(request.media_type, request.tmdb_id)}
+      libraryContentId={request.library_content_id}
       fluid={fluid}
       dim={isClosed}
       badge={state ? <RequestStatusBadge state={state} overlay className={BADGE_CLASS} /> : null}
@@ -181,10 +199,10 @@ function MineCard({ request, fluid, onCancel, isCancelling }: Omit<MineProps, "v
               size="xs"
               onClick={onCancel}
               disabled={isCancelling}
-              aria-label={t("web.requests.cancel.actionFor", { title: request.title })}
-              className="text-muted-foreground -ms-2 mt-1.5"
+              aria-label={`Cancel request for ${request.title}`}
+              className="text-muted-foreground mt-1.5 -ml-2"
             >
-              {t("web.requests.cancel.action")}
+              Cancel request
             </Button>
           ) : null}
         </>
@@ -195,8 +213,8 @@ function MineCard({ request, fluid, onCancel, isCancelling }: Omit<MineProps, "v
 
 /**
  * The library poster card for a title outside the library: the same artwork
- * frame and caption, with a request badge where library cards carry their
- * overlay badges. Requesting happens on the title's detail page.
+ * frame, hover reveal, and caption, with a request badge where library cards
+ * carry their overlay badges and a Request action where they carry Play.
  */
 function ExternalTitleCard({
   title,
@@ -204,9 +222,11 @@ function ExternalTitleCard({
   year,
   posterPath,
   href,
+  libraryContentId,
   fluid,
   dim,
   badge,
+  action,
   cornerAction,
   children,
 }: {
@@ -215,18 +235,26 @@ function ExternalTitleCard({
   year?: number;
   posterPath?: string;
   href: string;
+  /** Adds a Library chip linking to the title's library item. */
+  libraryContentId?: string;
   fluid?: boolean;
   dim?: boolean;
   badge?: ReactNode;
+  /** The hover action in the card's centre slot. */
+  action?: ReactNode;
   /** A hover action in the poster's bottom-right corner, where library cards keep their menu. */
   cornerAction?: ReactNode;
-  /** Request details below the caption; pass null for none. */
+  /** Request details below the caption. Shown whatever the caption setting; pass null for none. */
   children?: ReactNode;
 }) {
-  const t = useT();
   const { cardPresentation } = useUICustomization();
+  const showCaption = cardPresentation.caption !== "artwork";
+  // Unlike a library card, a TMDB title always names its type and year under
+  // a caption: a movie and a series can share a title, and the viewer is
+  // choosing which one to request.
+  const showMetadata = showCaption;
   const meta = [formatMediaType(mediaType), year].filter(Boolean).join(" · ");
-  const label = t("web.requests.card.label", { title, meta });
+  const label = `${title} (${meta})`;
 
   return (
     <div
@@ -249,32 +277,39 @@ function ExternalTitleCard({
             dim={dim}
           />
         </ViewTransitionLink>
-        {badge ? (
-          <div className="pointer-events-none absolute inset-x-2 top-2 z-10 flex items-center">
+        {libraryContentId || badge ? (
+          <div className="pointer-events-none absolute inset-x-2 top-2 z-10 flex flex-wrap items-center gap-1.5">
+            {libraryContentId ? <LibraryChip contentID={libraryContentId} title={title} /> : null}
             {badge}
           </div>
         ) : null}
+        {action}
         {cornerAction ? (
-          // eslint-disable-next-line silo/no-physical-direction -- on the poster artwork, which doesn't mirror; matches CardOverlays and CardWatchStatus
           <div className="absolute right-1.5 bottom-1.5 z-20 sm:right-2.5 sm:bottom-2.5">
             {cornerAction}
           </div>
         ) : null}
       </div>
-      <div className={MEDIA_CARD_CAPTION_CLASS}>
-        <ViewTransitionLink to={href} className={MEDIA_CARD_TITLE_CLASS}>
-          {title}
-        </ViewTransitionLink>
-        <ViewTransitionLink to={href} className={MEDIA_CARD_META_CLASS}>
-          {meta}
-        </ViewTransitionLink>
-        {children}
-      </div>
+      {showCaption || children ? (
+        <div className={MEDIA_CARD_CAPTION_CLASS}>
+          {showCaption ? (
+            <ViewTransitionLink to={href} className={MEDIA_CARD_TITLE_CLASS}>
+              {title}
+            </ViewTransitionLink>
+          ) : null}
+          {showMetadata ? (
+            <ViewTransitionLink to={href} className={MEDIA_CARD_META_CLASS}>
+              {meta}
+            </ViewTransitionLink>
+          ) : null}
+          {children}
+        </div>
+      ) : null}
     </div>
   );
 }
 
-/** The centred hover Request action on a watchlist title's poster card. */
+/** The centred hover Request action on a TMDB title's poster card. */
 export function RequestAction({
   title,
   pending,
@@ -284,16 +319,11 @@ export function RequestAction({
   pending: boolean;
   onRequest: () => void;
 }) {
-  const t = useT();
   return (
     <button
       type="button"
       disabled={pending}
-      aria-label={
-        pending
-          ? t("web.requests.card.sendingFor", { title })
-          : t("web.requests.card.requestTitle", { title })
-      }
+      aria-label={pending ? `Sending request for ${title}` : `Request ${title}`}
       onClick={(event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -309,12 +339,12 @@ export function RequestAction({
       {pending ? (
         <>
           <Loader2 className="size-3.5 animate-spin" aria-hidden />
-          {t("web.requests.card.sending")}
+          Sending
         </>
       ) : (
         <>
           <Plus className="size-3.5 stroke-[2.5]" aria-hidden />
-          {t("web.requests.request")}
+          Request
         </>
       )}
     </button>
@@ -333,7 +363,6 @@ export function WatchlistAction({
   pending: boolean;
   onToggle: () => void;
 }) {
-  const t = useT();
   const Icon = inWatchlist ? BookmarkCheck : Bookmark;
   return (
     <button
@@ -341,13 +370,9 @@ export function WatchlistAction({
       disabled={pending}
       aria-pressed={inWatchlist}
       aria-label={
-        inWatchlist
-          ? t("web.requests.card.removeFromWatchlist", { title })
-          : t("web.requests.card.addToWatchlistFor", { title })
+        inWatchlist ? `Remove ${title} from your watchlist` : `Add ${title} to your watchlist`
       }
-      title={
-        inWatchlist ? t("web.requests.card.onWatchlist") : t("web.requests.card.addToWatchlist")
-      }
+      title={inWatchlist ? "On Watchlist" : "Add to Watchlist"}
       onClick={(event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -365,5 +390,18 @@ export function WatchlistAction({
         aria-hidden
       />
     </button>
+  );
+}
+
+function LibraryChip({ contentID, title }: { contentID: string; title: string }) {
+  return (
+    <ViewTransitionLink
+      to={`/item/${encodeURIComponent(contentID)}`}
+      aria-label={`Open ${title} in library`}
+      className="glass-chip text-foreground focus-visible:ring-ring pointer-events-auto inline-flex shrink-0 items-center gap-1 rounded-full border border-white/15 px-2.5 py-1 text-[0.625rem] leading-none font-semibold tracking-[0.14em] uppercase transition-colors hover:border-white/40 focus-visible:ring-2 focus-visible:outline-none"
+    >
+      <Library className="size-3 shrink-0" strokeWidth={2.4} aria-hidden />
+      Library
+    </ViewTransitionLink>
   );
 }

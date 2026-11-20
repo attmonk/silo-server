@@ -58,8 +58,7 @@ The server needs no change: the planner already honours both claims on
 `web/src/player/engine/routing.ts` decides who plays the plan:
 
 1. The media element, when it plays the container, video codec and audio codec
-   natively, the plan's dynamic range is SDR or HDR that the plan's
-   `claims.video` validated for this display, and the selected audio track is the container
+   natively, the source is SDR, and the selected audio track is the container
    default (the first track flagged default, else the first, as the server
    computes it). Hardware decode and the browser's own A/V sync win whenever
    they can.
@@ -107,7 +106,7 @@ VideoPlayer (page)
   wherever they land.
 - **Audio.** The AudioContext opens at the track's sample rate. Surround
   passes through when `destination.maxChannelCount` allows it; otherwise the
-  worker downmixes with ATSC A/52 Lo/Ro coefficients and soft-limits
+  worker downmixes with ATSC A/52 Lo/Ro coefficients and the worklet soft-limits
   overs. At a playback rate other than 1 the worklet's read head still steps
   through the queue at that rate, which keeps the clock and the credits as at
   1x, but the samples come from a WSOLA time stretcher (`timeStretch.ts`) that
@@ -207,27 +206,6 @@ source gamut to BT.709, sRGB encode. These match the server's tone-map recipes i
   failure.
 - **Layers.** Each session draws in its own box, which replaces whatever an
   earlier session left in the surface.
-- **Start position.** A decode run starts at the key packet at or before its
-  position. Mediabunny's verified lookup on Chromium accepts an H.264 key
-  only at an IDR slice and walks back key by key, and an open-GOP stream (as
-  on Blu-ray) may have its only IDR at the start of the file. So for H.264
-  the worker takes the container's key packet when it is an IDR or carries a
-  recovery point SEI with `recovery_frame_cnt` 0 (`engine/h264.ts`; the slice
-  type and `exact_match_flag` are not checked, matching Chromium's key-frame
-  check), and leaves out the leading pictures after a recovery point, which
-  reference the GOP before and show before it (`engine/videoStart.ts`). It
-  steps back past a key packet that is neither (some containers mark every
-  frame as a key) and from a recovery point the decoder rejects before
-  decoding any picture, through the error callback or a `DataError` from
-  `decode()`; a decoder that decoded a picture and then failed is a decode
-  failure. After `MAX_H264_START_ATTEMPTS` starts, or once the keys it steps
-  past are `MAX_H264_START_LOOKBACK_SECONDS` behind the position (a start it
-  can decode from is tried however far back), the run fails over as
-  `browser_engine_video_unsupported` instead of walking back to the start of
-  the file. A search that reaches the start of the file without a start that
-  worked looks forward from the first key, past the position, for a start it
-  has not tried, within the same bounds. A newer run stops the search. Other codecs use the verified
-  lookup.
 - **Dolby Vision.** RPU (NAL 62) and enhancement-layer (NAL 63 or
   `nuh_layer_id > 0`) units are removed before decode (`engine/hevc.ts`).
 

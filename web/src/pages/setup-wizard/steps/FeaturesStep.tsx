@@ -1,15 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 
 import {
   ConnectionCheckAction,
   useConnectionCheck,
 } from "@/components/admin/ConnectionCheckAction";
 import { MobilePushPrivacyDisclosure } from "@/components/notifications/MobilePushPrivacyDisclosure";
+import { Button } from "@/components/ui/button";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
-import { useT } from "@/i18n";
-import { MARKER_SHARING_DISCLOSURE_KEY } from "@/lib/markers";
-import { EmbeddingProviderField } from "@/pages/admin-settings/AIProviders";
-import { ModelField } from "@/pages/admin-settings/AIModelField";
+import {
+  RECOMMENDATION_PROVIDER_OPTIONS,
+  matchRecommendationProviderPreset,
+  type RecommendationProviderPreset,
+} from "@/lib/recommendation-provider-presets";
 import { SettingField } from "@/pages/admin-settings/SettingField";
 
 import { StepFrame, StepSection, StepSkeleton } from "../StepFrame";
@@ -18,14 +20,7 @@ import { useStepSubmit, useStepSummary } from "../useStep";
 const APPLE_PUSH_KEY = "notifications.apple_push_delivery_enabled";
 const ANDROID_PUSH_KEY = "notifications.android_push_delivery_enabled";
 
-const SHARE_MARKERS_KEY = "markers.share_by_default";
-
-const MARKER_KEYS = [
-  "markers.mode",
-  "markers.lazy_playback",
-  "markers.online_storage",
-  SHARE_MARKERS_KEY,
-];
+const MARKER_KEYS = ["markers.mode", "markers.lazy_playback", "markers.online_storage"];
 
 const DOWNLOAD_KEYS = [
   "download.enabled",
@@ -34,29 +29,21 @@ const DOWNLOAD_KEYS = [
   "download.max_concurrent_per_user",
 ];
 
-const EMBEDDING_PROVIDER_KEY = "recommendations.embedding_provider_id";
-const EMBEDDING_MODEL_KEY = "recommendations.embedding_model";
-const RECS_KEYS = ["recommendations.enabled", EMBEDDING_PROVIDER_KEY, EMBEDDING_MODEL_KEY];
+const RECS_KEYS = [
+  "recommendations.enabled",
+  "recommendations.embedding_base_url",
+  "recommendations.embedding_model",
+  "recommendations.embedding_auth_token",
+];
 
 const KEYS = [APPLE_PUSH_KEY, ANDROID_PUSH_KEY, ...MARKER_KEYS, ...DOWNLOAD_KEYS, ...RECS_KEYS];
 
 export function FeaturesStep() {
-  const t = useT();
   const form = useSettingsForm({ keys: KEYS });
-  const { handleSubmit, busy } = useStepSubmit("features", form, t("web.setup.wizard.saveFailed"));
+  const { handleSubmit, busy } = useStepSubmit("features", form, "Failed to save");
   const recsCheck = useConnectionCheck("recommendations_embedding", form, RECS_KEYS);
   const [showDisclosure, setShowDisclosure] = useState(false);
-  const sharePrefilled = useRef(false);
-
-  // A new server shares markers by default only once this choice is saved,
-  // so stage the switch's on default while nothing is stored. Continuing
-  // saves it; leaving the step unsaved keeps sharing off.
-  const { loaded, getPersistedValue, setValue } = form;
-  useEffect(() => {
-    if (sharePrefilled.current || !loaded) return;
-    sharePrefilled.current = true;
-    if (getPersistedValue(SHARE_MARKERS_KEY) === "") setValue(SHARE_MARKERS_KEY, "true");
-  }, [loaded, getPersistedValue, setValue]);
+  const [presetId, setPresetId] = useState<string | null>(null);
 
   // Both push keys are written together; either still on means push is on.
   // The snapshot carries the server default (on) for a fresh install, so the
@@ -69,21 +56,25 @@ export function FeaturesStep() {
   const onlineMarkersEnabled = markerMode === "online" || markerMode === "both";
   const localMarkersEnabled = markerMode === "local" || markerMode === "both";
   const onlineMarkerStorage = form.getValue("markers.online_storage") || "stored";
-  // Unset reads as on, the default the effect above stages.
-  const shareMarkers = form.getValue(SHARE_MARKERS_KEY) !== "false";
 
-  const embeddingProviderID = form.getValue(EMBEDDING_PROVIDER_KEY);
+  const baseUrl = form.getValue("recommendations.embedding_base_url");
+  const model = form.getValue("recommendations.embedding_model");
+  const activePreset =
+    RECOMMENDATION_PROVIDER_OPTIONS.find((p) => p.id === presetId) ??
+    matchRecommendationProviderPreset(baseUrl, model) ??
+    null;
+  const tokenConfigured = form.sensitiveConfigured.includes("recommendations.embedding_auth_token");
+  const showToken =
+    activePreset?.needsToken ??
+    (form.getValue("recommendations.embedding_auth_token") !== "" || tokenConfigured);
 
   const enabledFeatures = [
-    onlineMarkersEnabled || localMarkersEnabled ? t("web.setup.features.summarySkipMarkers") : null,
-    pushEnabled ? t("web.setup.features.summaryPush") : null,
-    downloadsEnabled ? t("web.setup.features.downloads") : null,
-    recsEnabled ? t("web.setup.features.recommendations") : null,
+    onlineMarkersEnabled || localMarkersEnabled ? "Skip markers" : null,
+    pushEnabled ? "Push" : null,
+    downloadsEnabled ? "Downloads" : null,
+    recsEnabled ? "Recommendations" : null,
   ].filter(Boolean);
-  useStepSummary(
-    "features",
-    enabledFeatures.length ? enabledFeatures.join(", ") : t("web.setup.features.summaryNone"),
-  );
+  useStepSummary("features", enabledFeatures.length ? enabledFeatures.join(", ") : "Nothing extra");
 
   function setPush(value: boolean) {
     form.setValue(APPLE_PUSH_KEY, String(value));
@@ -104,20 +95,29 @@ export function FeaturesStep() {
     if (enabled || !onlineMarkersEnabled) form.setValue("markers.lazy_playback", String(enabled));
   }
 
+  function applyPreset(preset: RecommendationProviderPreset) {
+    setPresetId(preset.id);
+    if (preset.id !== "custom") {
+      form.setValue("recommendations.embedding_base_url", preset.baseUrl);
+      form.setValue("recommendations.embedding_model", preset.model);
+    }
+  }
+
   if (form.isPending) return <StepSkeleton rows={4} />;
 
   // Require the snapshot so enabled defaults are reviewed before continuing.
   if (form.loadError) {
     return (
       <StepFrame
-        title={t("web.setup.features.title")}
-        lede={t("web.setup.features.loadFailedLede")}
+        title="Features"
+        lede="Couldn't load the current settings for this step."
         onContinue={() => window.location.reload()}
-        continueLabel={t("web.setup.features.reload")}
+        continueLabel="Reload"
       >
         <StepSection>
           <p className="text-muted-foreground py-3 text-sm">
-            {t("web.setup.features.loadFailedBody")}
+            Online markers, local marker detection, and mobile push are on by default. Reload to
+            review these settings before continuing.
           </p>
         </StepSection>
       </StepFrame>
@@ -126,32 +126,32 @@ export function FeaturesStep() {
 
   return (
     <StepFrame
-      title={t("web.setup.features.title")}
-      lede={t("web.setup.features.lede")}
+      title="Features"
+      lede="Choose the features you want to use. You can change these settings later."
       onSubmit={handleSubmit}
       busy={busy}
-      footnote={t("web.setup.features.footnote")}
+      footnote="Each of these has its own page under Admin › Settings."
     >
       <StepSection>
         <SettingField
-          label={t("web.setup.features.onlineMarkersLabel")}
+          label="Skip markers from TheIntroDB"
           type="toggle"
-          description={t("web.setup.features.onlineMarkersDescription")}
+          description="TheIntroDB is installed by default to find intros, credits, recaps, and other segments you can skip. Online markers are preferred over local detection."
           value={onlineMarkersEnabled ? "true" : "false"}
           onChange={(value) => setOnlineMarkers(value === "true")}
         />
         {onlineMarkersEnabled ? (
           <SettingField
-            label={t("web.setup.features.storageLabel")}
+            label="Save online markers"
             type="select"
             description={
               onlineMarkerStorage === "stored"
-                ? t("web.setup.features.storageStoredDescription")
-                : t("web.setup.features.storageOnDemandDescription")
+                ? "Silo saves markers from enabled providers such as TheIntroDB. The Sync online markers task fetches missing markers and refreshes saved markers daily at 03:00 (server time) by default."
+                : "Fetch markers when needed without saving them to your library. Scheduled online sync is disabled."
             }
             options={[
-              { value: "stored", label: t("web.setup.features.storageStored") },
-              { value: "on_demand", label: t("web.setup.features.storageOnDemand") },
+              { value: "stored", label: "Save to library" },
+              { value: "on_demand", label: "Fetch when needed" },
             ]}
             value={onlineMarkerStorage}
             onChange={(value) => {
@@ -161,34 +161,25 @@ export function FeaturesStep() {
           />
         ) : null}
         <SettingField
-          label={t("web.setup.features.localMarkersLabel")}
+          label="Detect markers on this server"
           type="toggle"
-          description={t("web.setup.features.localMarkersDescription")}
+          description="Detect missing intros and credits using this server's CPU. Saved online markers take priority. Applies to libraries with marker detection enabled."
           value={localMarkersEnabled ? "true" : "false"}
           onChange={(value) => setLocalMarkers(value === "true")}
         />
         <SettingField
-          label={t("web.setup.features.shareMarkersLabel")}
-          type="toggle"
-          description={t(MARKER_SHARING_DISCLOSURE_KEY)}
-          value={shareMarkers ? "true" : "false"}
-          onChange={(value) => form.setValue(SHARE_MARKERS_KEY, value)}
-        />
-        <SettingField
-          label={t("web.setup.features.pushLabel")}
+          label="Mobile push notifications"
           type="toggle"
           description={
             <>
-              {t("web.setup.features.pushDescription")}{" "}
+              Delivers to the iOS and Android apps through Silo's open-source relay. On by default.{" "}
               <button
                 type="button"
                 className="text-foreground underline underline-offset-2"
                 onClick={() => setShowDisclosure((v) => !v)}
                 aria-expanded={showDisclosure}
               >
-                {showDisclosure
-                  ? t("web.setup.features.pushDisclosureHide")
-                  : t("web.setup.features.pushDisclosureShow")}
+                {showDisclosure ? "Hide what the relay sees" : "What does the relay see?"}
               </button>
             </>
           }
@@ -201,62 +192,96 @@ export function FeaturesStep() {
           </div>
         ) : null}
         <SettingField
-          label={t("web.setup.features.downloads")}
+          label="Downloads"
           type="toggle"
-          description={t("web.setup.features.downloadsDescription")}
+          description="Let people save files to their devices for offline viewing."
           value={downloadsEnabled ? "true" : "false"}
           onChange={(v) => form.setValue("download.enabled", v)}
         />
         {downloadsEnabled ? (
           <>
             <SettingField
-              label={t("web.setup.features.serverBandwidthLabel")}
+              label="Total download bandwidth"
               type="number"
-              unit={t("web.setup.features.mbps")}
-              description={t("web.setup.features.serverBandwidthDescription")}
+              unit="Mbps"
+              description="Shared across everyone. 0 means unlimited."
               value={form.getValue("download.server_bandwidth_mbps")}
               onChange={(v) => form.setValue("download.server_bandwidth_mbps", v)}
             />
             <SettingField
-              label={t("web.setup.features.userBandwidthLabel")}
+              label="Per-person download bandwidth"
               type="number"
-              unit={t("web.setup.features.mbps")}
-              description={t("web.setup.features.userBandwidthDescription")}
+              unit="Mbps"
+              description="0 means unlimited."
               value={form.getValue("download.user_bandwidth_mbps")}
               onChange={(v) => form.setValue("download.user_bandwidth_mbps", v)}
             />
           </>
         ) : null}
         <SettingField
-          label={t("web.setup.features.recommendations")}
+          label="Recommendations"
           type="toggle"
-          description={t("web.setup.features.recommendationsDescription")}
+          description="Suggests what to watch next using embeddings from an AI provider. Needs the pgvector extension."
           value={recsEnabled ? "true" : "false"}
           onChange={(v) => form.setValue("recommendations.enabled", v)}
         />
       </StepSection>
 
       {recsEnabled ? (
-        <StepSection title={t("web.setup.features.providerTitle")}>
-          <EmbeddingProviderField
-            value={embeddingProviderID}
-            onChange={(id) => form.setValue(EMBEDDING_PROVIDER_KEY, id)}
+        <StepSection title="Recommendation provider">
+          <div className="py-3">
+            <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Provider">
+              {RECOMMENDATION_PROVIDER_OPTIONS.map((preset) => {
+                const selected = activePreset?.id === preset.id;
+                return (
+                  <Button
+                    key={preset.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    variant={selected ? "default" : "secondary"}
+                    size="sm"
+                    onClick={() => applyPreset(preset)}
+                  >
+                    {preset.label}
+                    {preset.tag ? (
+                      <span className="ml-1.5 text-[10px] opacity-70">{preset.tag}</span>
+                    ) : null}
+                  </Button>
+                );
+              })}
+            </div>
+            {activePreset ? (
+              <p className="text-muted-foreground mt-2 text-xs">{activePreset.description}</p>
+            ) : null}
+          </div>
+          <SettingField
+            label="Base URL"
+            hint="https://generativelanguage.googleapis.com"
+            value={baseUrl}
+            onChange={(v) => form.setValue("recommendations.embedding_base_url", v)}
           />
-          <ModelField
-            label={t("web.setup.features.modelLabel")}
-            providerID={embeddingProviderID}
-            kind="embeddings"
-            value={form.getValue(EMBEDDING_MODEL_KEY)}
-            onChange={(v) => form.setValue(EMBEDDING_MODEL_KEY, v)}
-            // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- example model identifier
-            placeholder="gemini-embedding-001"
+          <SettingField
+            label="Model"
+            hint="gemini-embedding-001"
+            value={model}
+            onChange={(v) => form.setValue("recommendations.embedding_model", v)}
           />
+          {showToken ? (
+            <SettingField
+              label="API key"
+              type="password"
+              value={form.getValue("recommendations.embedding_auth_token")}
+              onChange={(v) => form.setValue("recommendations.embedding_auth_token", v)}
+              sensitiveConfigured={tokenConfigured}
+            />
+          ) : null}
           <ConnectionCheckAction
             onClick={recsCheck.run}
             result={recsCheck.result}
             isPending={recsCheck.isPending}
             disabled={busy}
-            label={t("web.setup.wizard.checkConnection")}
+            label="Check connection"
           />
         </StepSection>
       ) : null}

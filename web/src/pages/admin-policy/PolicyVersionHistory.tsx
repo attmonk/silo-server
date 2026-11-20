@@ -29,7 +29,6 @@ import {
   usePolicyVersions,
   usePolicyDocument,
 } from "@/hooks/queries/admin/policy";
-import { useT } from "@/i18n";
 
 import { formatPolicyDate, messageFromError } from "./policyPageUtils";
 
@@ -39,7 +38,6 @@ interface PolicyVersionHistoryProps {
 }
 
 export function PolicyVersionHistory({ documentId, activeVersionId }: PolicyVersionHistoryProps) {
-  const t = useT();
   const history = usePolicyVersions(documentId);
   const { data: versions, isLoading } = history;
   const canonical = usePolicyDocument(documentId);
@@ -76,7 +74,7 @@ export function PolicyVersionHistory({ documentId, activeVersionId }: PolicyVers
       setRollbackVersionId(undefined);
     } catch (error) {
       setNeedsReview(true);
-      setMessage(policyMutationMessage(error, t("web.admin.access.policy.activateFailed")));
+      setMessage(policyMutationMessage(error, "Unable to activate policy version."));
     }
   }
 
@@ -85,38 +83,34 @@ export function PolicyVersionHistory({ documentId, activeVersionId }: PolicyVers
       {message && <p role="status">{message}</p>}
       {history.error && (
         <div role="alert">
-          <p>{messageFromError(history.error, t("web.admin.access.policy.history.loadFailed"))}</p>
-          <Button onClick={() => void history.restart()}>
-            {t("web.admin.access.policy.history.restart")}
-          </Button>
+          <p>{messageFromError(history.error, "Unable to load version history.")}</p>
+          <Button onClick={() => void history.restart()}>Restart version history</Button>
         </div>
       )}
       <div className="surface-panel-subtle overflow-hidden rounded-2xl">
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>{t("web.admin.access.policy.history.column.version")}</TableHead>
-              <TableHead>{t("web.admin.access.policy.history.column.author")}</TableHead>
-              <TableHead>{t("web.admin.access.policy.history.column.created")}</TableHead>
-              <TableHead>{t("web.admin.access.policy.history.column.comment")}</TableHead>
-              <TableHead>{t("web.admin.access.policy.history.column.compile")}</TableHead>
-              <TableHead className="text-end">
-                {t("web.admin.access.policy.history.column.actions")}
-              </TableHead>
+              <TableHead>Version</TableHead>
+              <TableHead>Author</TableHead>
+              <TableHead>Created</TableHead>
+              <TableHead>Comment</TableHead>
+              <TableHead>Compile</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {isLoading && (
               <TableRow>
                 <TableCell colSpan={6} className="text-muted-foreground py-6 text-center">
-                  {t("web.admin.access.policy.history.loading")}
+                  Loading versions...
                 </TableCell>
               </TableRow>
             )}
             {!isLoading && versions?.length === 0 && (
               <TableRow>
                 <TableCell colSpan={6} className="text-muted-foreground py-6 text-center">
-                  {t("web.admin.access.policy.history.empty")}
+                  No versions have been saved for this document.
                 </TableCell>
               </TableRow>
             )}
@@ -139,34 +133,26 @@ export function PolicyVersionHistory({ documentId, activeVersionId }: PolicyVers
                   }}
                 >
                   <TableCell className="font-medium">
-                    {t("web.admin.access.policy.versionNumber", {
-                      version: version.version_number,
-                    })}
+                    v{version.version_number}
                     {isActive && (
-                      <Badge variant="secondary" className="ms-2">
-                        {t("web.admin.access.policy.status.active")}
+                      <Badge variant="secondary" className="ml-2">
+                        Active
                       </Badge>
                     )}
                   </TableCell>
                   <TableCell>
-                    {version.created_by_user_id
-                      ? t("web.admin.access.policy.history.author", {
-                          id: String(version.created_by_user_id),
-                        })
-                      : t("web.admin.access.policy.noValue")}
+                    {version.created_by_user_id ? `User ${version.created_by_user_id}` : "—"}
                   </TableCell>
                   <TableCell>{formatPolicyDate(version.created_at)}</TableCell>
                   <TableCell className="max-w-[260px] truncate">
-                    {version.comment?.trim() || t("web.admin.access.policy.noValue")}
+                    {version.comment?.trim() || "—"}
                   </TableCell>
                   <TableCell>
                     <Badge variant={version.compiled_ok ? "secondary" : "destructive"}>
-                      {version.compiled_ok
-                        ? t("web.admin.access.policy.history.compiled")
-                        : t("web.admin.access.policy.history.failed")}
+                      {version.compiled_ok ? "Compiled" : "Failed"}
                     </Badge>
                   </TableCell>
-                  <TableCell className="text-end">
+                  <TableCell className="text-right">
                     <Button
                       type="button"
                       size="sm"
@@ -183,7 +169,7 @@ export function PolicyVersionHistory({ documentId, activeVersionId }: PolicyVers
                       }}
                     >
                       <RotateCcw className="size-4" />
-                      {t("web.admin.access.policy.history.activateVersion")}
+                      Activate version
                     </Button>
                   </TableCell>
                 </TableRow>
@@ -195,14 +181,12 @@ export function PolicyVersionHistory({ documentId, activeVersionId }: PolicyVers
 
       {history.hasNextPage && (
         <Button onClick={() => void history.fetchNextPage()} disabled={history.isFetchingNextPage}>
-          {t("web.admin.access.policy.history.loadOlder")}
+          Load older versions
         </Button>
       )}
       {sourceVersion?.source !== undefined && (
         <div className="space-y-2">
-          <h3 className="text-sm font-semibold">
-            {t("web.admin.access.policy.history.selectedSource")}
-          </h3>
+          <h3 className="text-sm font-semibold">Selected Source</h3>
           <RegoEditor value={sourceVersion.source} readOnly height="260px" />
         </div>
       )}
@@ -213,13 +197,10 @@ export function PolicyVersionHistory({ documentId, activeVersionId }: PolicyVers
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>
-              {t("web.admin.access.policy.activateTitle", {
-                version: String(rollbackVersion?.version_number ?? ""),
-              })}
-            </AlertDialogTitle>
+            <AlertDialogTitle>Activate saved v{rollbackVersion?.version_number}?</AlertDialogTitle>
             <AlertDialogDescription>
-              {t("web.admin.access.policy.history.activateBody", { name: captured?.name ?? "" })}
+              This saves the selected active version for {captured?.name}. Servers reload
+              independently. The previous version remains in history.
             </AlertDialogDescription>
           </AlertDialogHeader>
           {needsReview && <p role="alert">{message}</p>}
@@ -234,12 +215,12 @@ export function PolicyVersionHistory({ documentId, activeVersionId }: PolicyVers
             />
           )}
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
             <Button
               onClick={() => void confirmRollback()}
               disabled={activate.isPending || needsReview}
             >
-              {t("web.admin.access.policy.history.activate")}
+              Activate
             </Button>
           </AlertDialogFooter>
         </AlertDialogContent>

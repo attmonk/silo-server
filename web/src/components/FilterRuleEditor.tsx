@@ -25,13 +25,11 @@ import {
   newFilterRule,
   type CollectionFieldOption,
   type CollectionLanguageSource,
-  type QueryRuleCapabilities,
 } from "@/components/collections/collectionBuilderFields";
 import { FacetValuePicker } from "@/components/ui/facet-value-picker";
 import { PersonSearchSelect } from "@/components/ui/person-search-select";
 import { type FacetValueScope, useRuleLanguages } from "@/hooks/queries/facetValues";
-import { useQueryRuleCapabilities } from "@/hooks/queries/personSearch";
-import { useT, type MessageKey, type Translate } from "@/i18n";
+import { useExtendedQueryRules } from "@/hooks/queries/personSearch";
 import { formatLanguage } from "@/lib/languageDisplay";
 import {
   getDefaultQuerySortOrder,
@@ -60,55 +58,36 @@ interface FilterRuleEditorProps {
   valueScope?: FacetValueScope;
 }
 
-/**
- * A field a rule row offers. `labelKey`, when set, names the field in place
- * of the shared table's `label` (kept as that table's English).
- */
-export type FilterRuleFieldOption = CollectionFieldOption & { labelKey?: MessageKey };
-
-/** The field's name in the app language. */
-function fieldLabel(t: Translate, option: FilterRuleFieldOption): string {
-  return option.labelKey ? t(option.labelKey) : option.label;
-}
-
 /** The scopes a show can match in, where fields about its episodes apply. */
 const SHOW_SCOPES: ReadonlySet<FilterRuleMediaScope> = new Set(["all", "video", "series"]);
 
 /**
  * The fields a rule row offers. `shownRatingSources` leaves out ratings an
- * administrator hid; unset offers every rating. Capabilities leave out rules
- * the connected server does not support.
+ * administrator hid; unset offers every rating. `extendedRules` false leaves
+ * out what only a server advertising `extended_query_rules` takes.
  */
 export function getFilterRuleFieldOptions(
   allowPersonalizedFilters = false,
   mediaScope: FilterRuleMediaScope = "all",
   shownRatingSources?: ReadonlySet<string>,
-  capabilities: QueryRuleCapabilities = {},
-): FilterRuleFieldOption[] {
-  return availableCollectionFields(allowPersonalizedFilters, shownRatingSources, capabilities)
+  extendedRules = true,
+) {
+  return availableCollectionFields(allowPersonalizedFilters, shownRatingSources, extendedRules)
     .filter(
       (option) =>
         (!option.showsOnly || SHOW_SCOPES.has(mediaScope)) &&
-        (!option.episodesOnly || mediaScope === "episode") &&
         (!option.noEpisodeValue || mediaScope !== "episode"),
     )
     .map((option) => {
-      if (mediaScope === "episode" && option.value === "title") {
-        return {
-          ...option,
-          label: "Episode title",
-          labelKey: "web.catalog.rules.fieldEpisodeTitle",
-        };
-      }
       // Ebook and manga are read rather than watched, so relabel "watched".
       if (mediaScope !== "ebook" && mediaScope !== "manga") {
         return option;
       }
       switch (option.value) {
         case "watched":
-          return { ...option, label: "Read", labelKey: "web.catalog.rules.fieldRead" };
+          return { ...option, label: "Read" };
         case "last_watched":
-          return { ...option, label: "Last read", labelKey: "web.catalog.rules.fieldLastRead" };
+          return { ...option, label: "Last read" };
         default:
           return option;
       }
@@ -136,11 +115,11 @@ function canEditRule(
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 /** "30d": the server trims and ignores case, and reads m as months. */
 const IN_LAST = /^\s*(\d+)\s*([hdwmy])\s*$/i;
-const IN_LAST_UNITS: ReadonlyArray<readonly [string, MessageKey]> = [
-  ["d", "web.catalog.rules.unitDays"],
-  ["w", "web.catalog.rules.unitWeeks"],
-  ["m", "web.catalog.rules.unitMonths"],
-  ["y", "web.catalog.rules.unitYears"],
+const IN_LAST_UNITS: ReadonlyArray<[string, string]> = [
+  ["d", "days"],
+  ["w", "weeks"],
+  ["m", "months"],
+  ["y", "years"],
 ];
 
 function normalizeRuleValue(
@@ -179,7 +158,7 @@ function normalizeRuleValue(
 
 interface FilterRuleRowProps {
   rule: FilterRule;
-  fieldOptions: FilterRuleFieldOption[];
+  fieldOptions: CollectionFieldOption[];
   allowPersonalizedFilters: boolean;
   onChange: (updates: Partial<FilterRule>) => void;
   onRemove: () => void;
@@ -230,7 +209,6 @@ export function FilterRuleRow({
   valueScope,
   focusValue = false,
 }: FilterRuleRowProps) {
-  const t = useT();
   const size = RULE_ROW_SIZES[roomy ? "roomy" : "compact"];
   const fieldDef = getCollectionFieldOption(rule.field);
   const valueRef = useRef<HTMLDivElement>(null);
@@ -243,18 +221,17 @@ export function FilterRuleRow({
     return (
       <div
         role="group"
-        aria-label={t("web.catalog.rules.notEditableLabel")}
+        aria-label="Rule not editable here"
         className="border-border flex items-center gap-2 rounded-md border border-dashed px-2 py-1 text-xs"
       >
         <span className="flex-1">
-          {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- a space, not text */}
-          <span className="font-medium">{t("web.catalog.rules.notEditable")}</span>{" "}
+          <span className="font-medium">Not editable here</span>{" "}
           <code className="text-muted-foreground">
             {rule.field} {rule.op} {JSON.stringify(rule.value)}
           </code>
         </span>
         <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={onRemove}>
-          {t("web.catalog.rules.remove")}
+          Remove
         </Button>
       </div>
     );
@@ -265,9 +242,7 @@ export function FilterRuleRow({
   // leave out stays offered to a rule that already compares it.
   const offeredDef = fieldOptions.find((f) => f.value === fieldDef.value);
   const offered = offeredDef ? fieldOptions : [...fieldOptions, fieldDef];
-  const fields: FilterRuleFieldOption[] = offered.filter(
-    (f) => !f.hidden || f.value === fieldDef.value,
-  );
+  const fields = offered.filter((f) => !f.hidden || f.value === fieldDef.value);
   const operators = (offeredDef ?? fieldDef).operators.filter(
     (op) => !op.hidden || op.value === rule.op,
   );
@@ -282,10 +257,7 @@ export function FilterRuleRow({
           onChange({ field: v, op: defaultOp, value: getDefaultRuleValue(v, defaultOp) });
         }}
       >
-        <SelectTrigger
-          aria-label={t("web.catalog.rules.field")}
-          className={cn(size.control, size.field)}
-        >
+        <SelectTrigger aria-label="Field" className={cn(size.control, size.field)}>
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -296,7 +268,7 @@ export function FilterRuleRow({
                 <SelectLabel>{name}</SelectLabel>
                 {inGroup.map((f) => (
                   <SelectItem key={f.value} value={f.value}>
-                    {fieldLabel(t, f)}
+                    {f.label}
                   </SelectItem>
                 ))}
               </SelectGroup>
@@ -311,10 +283,7 @@ export function FilterRuleRow({
           onChange({ op: v, value: normalizeRuleValue(rule.field, v, rule.value) })
         }
       >
-        <SelectTrigger
-          aria-label={t("web.catalog.rules.condition")}
-          className={cn(size.control, size.op)}
-        >
+        <SelectTrigger aria-label="Condition" className={cn(size.control, size.op)}>
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -340,7 +309,7 @@ export function FilterRuleRow({
         type="button"
         variant="ghost"
         size="sm"
-        aria-label={t("web.catalog.rules.removeRule")}
+        aria-label="Remove rule"
         className="text-muted-foreground hover:text-destructive h-7 w-7 shrink-0 p-0"
         onClick={onRemove}
       >
@@ -364,7 +333,6 @@ function RuleValueControl({
   valueScope: FacetValueScope | undefined;
   onChange: (value: FilterRule["value"]) => void;
 }) {
-  const t = useT();
   const control = cn(size.control, "min-w-0");
   const unit = fieldDef.unit ? (
     <span className="text-muted-foreground shrink-0 text-sm">{fieldDef.unit}</span>
@@ -374,35 +342,32 @@ function RuleValueControl({
     const range = Array.isArray(rule.value) && rule.value.length === 2 ? rule.value : ["", ""];
     return (
       <div className={cn("flex items-center gap-2", size.value)}>
-        {(["web.catalog.rules.rangeFrom", "web.catalog.rules.rangeTo"] as const).map(
-          (key, index) => {
-            const name = t(key);
-            const set = (next: string | number) => {
-              const value: [string | number, string | number] = [range[0] ?? "", range[1] ?? ""];
-              value[index] = next;
-              onChange(value);
-            };
-            return fieldDef.inputType === "date" ? (
-              <DateInput
-                key={key}
-                label={name}
-                value={range[index]}
-                onChange={set}
-                className={cn(control, "flex-1")}
-              />
-            ) : (
-              <Input
-                key={key}
-                type={fieldDef.inputType === "number" ? "number" : "text"}
-                aria-label={name}
-                placeholder={name}
-                value={String(range[index] ?? "")}
-                onChange={(e) => set(inputValue(fieldDef, e.target.value))}
-                className={cn(control, "flex-1")}
-              />
-            );
-          },
-        )}
+        {(["From", "To"] as const).map((name, index) => {
+          const set = (next: string | number) => {
+            const value: [string | number, string | number] = [range[0] ?? "", range[1] ?? ""];
+            value[index] = next;
+            onChange(value);
+          };
+          return fieldDef.inputType === "date" ? (
+            <DateInput
+              key={name}
+              label={name}
+              value={range[index]}
+              onChange={set}
+              className={cn(control, "flex-1")}
+            />
+          ) : (
+            <Input
+              key={name}
+              type={fieldDef.inputType === "number" ? "number" : "text"}
+              aria-label={name}
+              placeholder={name}
+              value={String(range[index] ?? "")}
+              onChange={(e) => set(inputValue(fieldDef, e.target.value))}
+              className={cn(control, "flex-1")}
+            />
+          );
+        })}
         {unit}
       </div>
     );
@@ -412,15 +377,12 @@ function RuleValueControl({
     case "boolean":
       return (
         <Select value={String(Boolean(rule.value))} onValueChange={(v) => onChange(v === "true")}>
-          <SelectTrigger
-            aria-label={t("web.catalog.rules.value")}
-            className={cn(size.control, size.value)}
-          >
+          <SelectTrigger aria-label="Value" className={cn(size.control, size.value)}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="true">{t("web.catalog.rules.yes")}</SelectItem>
-            <SelectItem value="false">{t("web.catalog.rules.no")}</SelectItem>
+            <SelectItem value="true">Yes</SelectItem>
+            <SelectItem value="false">No</SelectItem>
           </SelectContent>
         </Select>
       );
@@ -430,11 +392,8 @@ function RuleValueControl({
           value={String(rule.value)}
           onValueChange={(v) => onChange(fieldDef.valueType === "number" ? Number(v) : v)}
         >
-          <SelectTrigger
-            aria-label={t("web.catalog.rules.value")}
-            className={cn(size.control, size.value)}
-          >
-            <SelectValue placeholder={t("web.catalog.rules.pickOne")} />
+          <SelectTrigger aria-label="Value" className={cn(size.control, size.value)}>
+            <SelectValue placeholder="Pick one" />
           </SelectTrigger>
           <SelectContent>
             {fieldDef.selectOptions?.map((opt) => (
@@ -454,8 +413,8 @@ function RuleValueControl({
           value={String(rule.value ?? "")}
           onChange={onChange}
           scope={valueScope}
-          placeholder={fieldDef.placeholder ?? t("web.catalog.rules.pickValue")}
-          searchLabel={fieldDef.searchLabel ?? t("web.catalog.rules.searchValues")}
+          placeholder={fieldDef.placeholder ?? "Pick a value"}
+          searchLabel={fieldDef.searchLabel ?? "Search values"}
           className={cn(size.control, size.value)}
         />
       );
@@ -479,7 +438,7 @@ function RuleValueControl({
         />
       ) : (
         <DateInput
-          label={t("web.catalog.rules.value")}
+          label="Value"
           value={rule.value}
           onChange={onChange}
           className={cn(size.control, size.value)}
@@ -490,11 +449,11 @@ function RuleValueControl({
         <div className={cn("flex items-center gap-2", size.value)}>
           <Input
             type={fieldDef.inputType === "number" ? "number" : "text"}
-            aria-label={t("web.catalog.rules.value")}
+            aria-label="Value"
             value={String(rule.value)}
             onChange={(e) => onChange(inputValue(fieldDef, e.target.value))}
             className={cn(control, "flex-1")}
-            placeholder={t("web.catalog.rules.value")}
+            placeholder="Value"
           />
           {unit}
         </div>
@@ -532,24 +491,20 @@ function LanguageValueSelect({
   onChange: (value: string) => void;
   className: string;
 }) {
-  const t = useT();
   const filters = useRuleLanguages(scope, { includeTechnical: source !== "original" });
   const codes = new Set(filters.data?.[LANGUAGE_LISTS[source]] ?? []);
   if (value) codes.add(value);
   const options = [...codes]
     .map((code) => ({ code, name: formatLanguage(code) || code }))
     .sort((a, b) => a.name.localeCompare(b.name));
-  let placeholder = t("web.catalog.rules.pickLanguage");
-  if (filters.isLoading) placeholder = t("web.catalog.rules.loadingLanguages");
-  else if (filters.isError && !filters.data)
-    placeholder = t("web.catalog.rules.languagesLoadFailed");
+  let placeholder = "Pick a language";
+  if (filters.isLoading) placeholder = "Loading languages";
+  else if (filters.isError && !filters.data) placeholder = "Couldn’t load languages";
   let status: string | null = null;
   if (filters.isError) {
-    status = filters.data
-      ? t("web.catalog.rules.languagesRefreshFailed")
-      : t("web.catalog.rules.languagesLoadFailed");
+    status = filters.data ? "Couldn’t refresh languages" : "Couldn’t load languages";
   } else if (options.length === 0) {
-    status = t("web.catalog.rules.noLanguages");
+    status = "No languages yet";
   }
 
   return (
@@ -561,7 +516,7 @@ function LanguageValueSelect({
         if (open && filters.isError) void filters.refetch();
       }}
     >
-      <SelectTrigger aria-label={t("web.catalog.rules.value")} className={className}>
+      <SelectTrigger aria-label="Value" className={className}>
         <SelectValue placeholder={placeholder} />
       </SelectTrigger>
       <SelectContent>
@@ -619,7 +574,6 @@ function InLastInput({
   className: string;
   control: string;
 }) {
-  const t = useT();
   const text = String(value ?? "");
   const parsed = IN_LAST.exec(text);
   // The unit picked while the number is blank, which writes nothing yet.
@@ -629,7 +583,7 @@ function InLastInput({
     return (
       <div className={className}>
         <Input
-          aria-label={t("web.catalog.rules.value")}
+          aria-label="Value"
           value={text}
           onChange={(e) => onChange(e.target.value)}
           className={cn(control, "flex-1")}
@@ -640,10 +594,7 @@ function InLastInput({
 
   const amount = parsed?.[1] ?? "";
   const unit = parsed?.[2]?.toLowerCase() ?? unitDraft;
-  const units =
-    unit === "h"
-      ? [["h", "web.catalog.rules.unitHours"] as const, ...IN_LAST_UNITS]
-      : IN_LAST_UNITS;
+  const units = unit === "h" ? [["h", "hours"] as const, ...IN_LAST_UNITS] : IN_LAST_UNITS;
   const write = (nextAmount: string, nextUnit: string) => {
     setUnitDraft(nextUnit);
     // The server rejects a span of 0, so an amount below 1 writes nothing.
@@ -657,21 +608,20 @@ function InLastInput({
         type="number"
         min={1}
         step={1}
-        aria-label={t("web.catalog.rules.amount")}
-        // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an example number, not text
+        aria-label="Amount"
         placeholder="30"
         value={amount}
         onChange={(e) => write(e.target.value.trim(), unit)}
         className={cn(control, "w-20 flex-none")}
       />
       <Select value={unit} onValueChange={(next) => write(amount, next)}>
-        <SelectTrigger aria-label={t("web.catalog.rules.unit")} className={cn(control, "flex-1")}>
+        <SelectTrigger aria-label="Unit" className={cn(control, "flex-1")}>
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
           {units.map(([value, name]) => (
             <SelectItem key={value} value={value}>
-              {t(name)}
+              {name}
             </SelectItem>
           ))}
         </SelectContent>
@@ -697,7 +647,6 @@ export function FilterSortControls({
   allowPersonalizedSorts = false,
   sortRelevanceScope,
 }: FilterSortControlsProps) {
-  const t = useT();
   const shownRatingSources = useShownRatingSources();
   const sortOptions = getCollectionSortOptions(
     allowPersonalizedSorts,
@@ -720,7 +669,7 @@ export function FilterSortControls({
         value={selectedSort.field}
         onValueChange={(v) => onChange({ sort: v, order: getDefaultQuerySortOrder(v) })}
       >
-        <SelectTrigger aria-label={t("web.catalog.sort.sortBy")} className="h-8 w-32 text-xs">
+        <SelectTrigger aria-label="Sort by" className="h-8 w-32 text-xs">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -732,12 +681,12 @@ export function FilterSortControls({
         </SelectContent>
       </Select>
       <Select value={order || "desc"} onValueChange={(v) => onChange({ order: v })}>
-        <SelectTrigger aria-label={t("web.catalog.sort.direction")} className="h-8 w-28 text-xs">
+        <SelectTrigger aria-label="Direction" className="h-8 w-28 text-xs">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value="desc">{t("web.catalog.sort.descending")}</SelectItem>
-          <SelectItem value="asc">{t("web.catalog.sort.ascending")}</SelectItem>
+          <SelectItem value="desc">Descending</SelectItem>
+          <SelectItem value="asc">Ascending</SelectItem>
         </SelectContent>
       </Select>
     </>
@@ -753,15 +702,14 @@ export default function FilterRuleEditor({
   mediaScope = "all",
   valueScope,
 }: FilterRuleEditorProps) {
-  const t = useT();
   const config = value || { match: "all", groups: [] };
   const shownRatingSources = useShownRatingSources();
-  const capabilities = useQueryRuleCapabilities();
+  const extendedRules = useExtendedQueryRules();
   const fieldOptions = getFilterRuleFieldOptions(
     allowPersonalizedFilters,
     mediaScope,
     shownRatingSources,
-    capabilities,
+    extendedRules,
   );
 
   function updateConfig(updates: Partial<FilterConfig>) {
@@ -811,52 +759,47 @@ export default function FilterRuleEditor({
 
   return (
     <div className="space-y-4">
-      <div className="text-muted-foreground flex items-center gap-2 text-sm">
-        {t("web.catalog.rules.matchGroups", {
-          match: () => (
-            <Select
-              value={config.match}
-              onValueChange={(v) => updateConfig({ match: v as "all" | "any" })}
-            >
-              <SelectTrigger className="text-foreground h-8 w-20">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">{t("web.catalog.rules.matchAll")}</SelectItem>
-                <SelectItem value="any">{t("web.catalog.rules.matchAny")}</SelectItem>
-              </SelectContent>
-            </Select>
-          ),
-        })}
+      <div className="flex items-center gap-2 text-sm">
+        <span className="text-muted-foreground">Match</span>
+        <Select
+          value={config.match}
+          onValueChange={(v) => updateConfig({ match: v as "all" | "any" })}
+        >
+          <SelectTrigger className="h-8 w-20">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">ALL</SelectItem>
+            <SelectItem value="any">ANY</SelectItem>
+          </SelectContent>
+        </Select>
+        <span className="text-muted-foreground">of the following groups</span>
       </div>
 
       {config.groups.map((group, groupIdx) => (
         <div key={groupIdx} className="border-border space-y-2 rounded-lg border p-3">
           <div className="flex items-center justify-between">
-            <div className="text-muted-foreground flex items-center gap-2 text-sm">
-              {t("web.catalog.rules.matchRules", {
-                match: () => (
-                  <Select
-                    value={group.match}
-                    onValueChange={(v) => updateGroup(groupIdx, { match: v as "all" | "any" })}
-                  >
-                    <SelectTrigger className="text-foreground h-7 w-20 text-xs">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">{t("web.catalog.rules.matchAll")}</SelectItem>
-                      <SelectItem value="any">{t("web.catalog.rules.matchAny")}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                ),
-              })}
+            <div className="flex items-center gap-2 text-sm">
+              <span className="text-muted-foreground">Match</span>
+              <Select
+                value={group.match}
+                onValueChange={(v) => updateGroup(groupIdx, { match: v as "all" | "any" })}
+              >
+                <SelectTrigger className="h-7 w-20 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">ALL</SelectItem>
+                  <SelectItem value="any">ANY</SelectItem>
+                </SelectContent>
+              </Select>
+              <span className="text-muted-foreground">rules</span>
             </div>
             <Button
               type="button"
               variant="ghost"
               size="sm"
               className="text-muted-foreground hover:text-destructive h-7 w-7 p-0"
-              aria-label={t("web.home.addRow.rules.removeGroup", { number: groupIdx + 1 })}
               onClick={() => removeGroup(groupIdx)}
             >
               <Trash2 className="h-3.5 w-3.5" />
@@ -871,7 +814,7 @@ export default function FilterRuleEditor({
               allowPersonalizedFilters={allowPersonalizedFilters}
               onChange={(updates) => updateRule(groupIdx, ruleIdx, updates)}
               onRemove={() => removeRule(groupIdx, ruleIdx)}
-              label={t("web.catalog.rules.ruleNumber", { number: ruleIdx + 1 })}
+              label={`Rule ${ruleIdx + 1}`}
               valueScope={valueScope}
             />
           ))}
@@ -883,18 +826,18 @@ export default function FilterRuleEditor({
             className="h-7 text-xs"
             onClick={() => addRule(groupIdx)}
           >
-            <Plus className="me-1 h-3 w-3" /> {t("web.catalog.rules.addRule")}
+            <Plus className="mr-1 h-3 w-3" /> Add Rule
           </Button>
         </div>
       ))}
 
       <Button type="button" variant="outline" size="sm" onClick={addGroup}>
-        <Plus className="me-1 h-3.5 w-3.5" /> {t("web.catalog.rules.addGroup")}
+        <Plus className="mr-1 h-3.5 w-3.5" /> Add Group
       </Button>
 
       {/* Sort controls */}
       <div className="border-border flex items-center gap-2 border-t pt-2">
-        <span className="text-muted-foreground text-sm">{t("web.catalog.sort.sortBy")}</span>
+        <span className="text-muted-foreground text-sm">Sort by</span>
         <FilterSortControls
           sort={config.sort}
           order={config.order}

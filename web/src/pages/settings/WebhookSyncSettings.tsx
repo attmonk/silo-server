@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import {
   AlertTriangle,
@@ -46,10 +46,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { copyTextToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { v2ErrorText } from "@/api/v2/request";
 import type {
   WebhookSyncConnection,
   WebhookSyncDiscoveredUser,
@@ -73,12 +71,8 @@ import {
   getPreferredPlexServerURL,
   type BrowserPlexServer,
 } from "@/lib/plexAuth";
-import { formatLocale } from "@/lib/appLocale";
-import { useT, type MessageKey, type Translate } from "@/i18n";
 
 const UNMAPPED_VALUE = "__unmapped__";
-/** Item cell of a delivery with no matched item: punctuation, not text. */
-const EMPTY_CELL = "\u2014";
 
 const JELLYFIN_TEMPLATE = `{
   "provider": "jellyfin",
@@ -115,27 +109,25 @@ const JELLYFIN_TEMPLATE = `{
   }
 }`;
 
-function formatTimestamp(t: Translate, value?: string | null) {
-  if (!value) return t("web.settings.webhooks.never");
+function formatTimestamp(value?: string | null) {
+  if (!value) return "Never";
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return t("web.settings.webhooks.never");
-  return new Intl.DateTimeFormat(formatLocale(), {
+  if (Number.isNaN(date.getTime())) return "Never";
+  return new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(date);
 }
 
-function relativeTime(t: Translate, value?: string | null) {
+function relativeTime(value?: string | null) {
   if (!value) return null;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 60) return t("web.settings.webhooks.justNow");
-  if (seconds < 3600)
-    return t("web.settings.webhooks.minutesAgo", { minutes: Math.floor(seconds / 60) });
-  if (seconds < 86400)
-    return t("web.settings.webhooks.hoursAgo", { hours: Math.floor(seconds / 3600) });
-  return t("web.settings.webhooks.daysAgo", { days: Math.floor(seconds / 86400) });
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
 }
 
 type ConnectionHealth = "healthy" | "error" | "waiting";
@@ -161,19 +153,19 @@ const HEALTH_DOT: Record<ConnectionHealth, string> = {
   waiting: "bg-yellow-400/70",
 };
 
-const HEALTH_LABEL: Record<ConnectionHealth, MessageKey> = {
-  healthy: "web.settings.webhooks.health.healthy",
-  error: "web.settings.webhooks.health.error",
-  waiting: "web.settings.webhooks.health.waiting",
+const HEALTH_LABEL: Record<ConnectionHealth, string> = {
+  healthy: "Receiving events",
+  error: "Needs attention",
+  waiting: "Awaiting first event",
 };
 
-const EVENT_OUTCOME_LABEL: Record<WebhookSyncEventLog["outcome"], MessageKey> = {
-  applied: "web.settings.webhooks.outcome.applied",
-  ignored: "web.settings.webhooks.outcome.ignored",
-  unmatched: "web.settings.webhooks.outcome.unmatched",
-  skipped: "web.settings.webhooks.outcome.skipped",
-  rejected: "web.settings.webhooks.outcome.rejected",
-  error: "web.settings.webhooks.outcome.error",
+const EVENT_OUTCOME_LABEL: Record<WebhookSyncEventLog["outcome"], string> = {
+  applied: "Applied",
+  ignored: "Ignored",
+  unmatched: "Unmatched",
+  skipped: "Skipped",
+  rejected: "Rejected",
+  error: "Error",
 };
 
 const EVENT_OUTCOME_BADGE: Record<WebhookSyncEventLog["outcome"], string> = {
@@ -203,41 +195,35 @@ function eventAttrString(event: WebhookSyncEventLog, key: string) {
   return "";
 }
 
-function eventUserLabel(t: Translate, event: WebhookSyncEventLog) {
+function eventUserLabel(event: WebhookSyncEventLog) {
   const userName = eventAttrString(event, "external_user_name");
   const userID = eventAttrString(event, "external_user_id");
   if (userName && userID) return `${userName} (${userID})`;
-  return userName || userID || t("web.settings.webhooks.unknownUser");
+  return userName || userID || "Unknown user";
 }
 
 function eventMatchedItemLabel(event: WebhookSyncEventLog) {
   return eventAttrString(event, "matched_media_item_title") || null;
 }
 
-const EVENT_ATTR_LABELS: Record<string, MessageKey> = {
-  event_kind: "web.settings.webhooks.attr.eventKind",
-  action: "web.settings.webhooks.attr.action",
-  external_user_id: "web.settings.webhooks.attr.externalUserId",
-  external_user_name: "web.settings.webhooks.attr.externalUserName",
-  external_item_id: "web.settings.webhooks.attr.externalItemId",
-  media_kind: "web.settings.webhooks.attr.mediaKind",
-  matched_media_item_id: "web.settings.webhooks.attr.matchedMediaItemId",
-  matched_media_item_title: "web.settings.webhooks.attr.matchedMediaItemTitle",
-  profile_id: "web.settings.webhooks.attr.profileId",
-  client_ip: "web.settings.webhooks.attr.clientIp",
-  content_type: "web.settings.webhooks.attr.contentType",
-  user_agent: "web.settings.webhooks.attr.userAgent",
-  path_pattern: "web.settings.webhooks.attr.pathPattern",
+const EVENT_ATTR_LABELS: Record<string, string> = {
+  event_kind: "Event kind",
+  action: "Action",
+  external_user_id: "External user ID",
+  external_user_name: "External user",
+  external_item_id: "External item ID",
+  media_kind: "Media kind",
+  matched_media_item_id: "Matched item ID",
+  matched_media_item_title: "Matched item",
+  profile_id: "Profile ID",
+  client_ip: "Client IP",
+  content_type: "Content type",
+  user_agent: "User agent",
+  path_pattern: "Path pattern",
 };
 
-function eventAttrLabel(t: Translate, key: string) {
-  const label = EVENT_ATTR_LABELS[key];
-  return label ? t(label) : key.replace(/_/g, " ");
-}
-
-/** Rich-text tag for a control name in the media server's own interface. */
-function hl(chunks: ReactNode) {
-  return <span className="text-foreground">{chunks}</span>;
+function eventAttrLabel(key: string) {
+  return EVENT_ATTR_LABELS[key] ?? key.replace(/_/g, " ");
 }
 
 type ProviderType = "plex" | "emby" | "jellyfin";
@@ -245,9 +231,9 @@ type ConnectionDraft = { serverName: string; defaultProfileId: string };
 
 type EventMatrixTone = "required" | "recommended" | "skip";
 type EventMatrixSection = {
-  label: MessageKey;
+  label: string;
   tone: EventMatrixTone;
-  items: { event: MessageKey; note: MessageKey }[];
+  items: { event: string; note: string }[];
 };
 
 const EVENT_MATRIX_TONE: Record<EventMatrixTone, string> = {
@@ -257,7 +243,6 @@ const EVENT_MATRIX_TONE: Record<EventMatrixTone, string> = {
 };
 
 function EventMatrix({ sections }: { sections: EventMatrixSection[] }) {
-  const t = useT();
   return (
     <div className="border-border/50 divide-border/50 divide-y rounded-md border">
       {sections.map((section) => (
@@ -268,18 +253,13 @@ function EventMatrix({ sections }: { sections: EventMatrixSection[] }) {
               EVENT_MATRIX_TONE[section.tone],
             )}
           >
-            {t(section.label)}
+            {section.label}
           </p>
           <ul className="space-y-1">
             {section.items.map((item) => (
-              <li key={item.event} className="text-muted-foreground text-[13px] leading-relaxed">
-                {t("web.settings.webhooks.setup.eventLine", {
-                  event: t(item.event),
-                  note: t(item.note),
-                  name: (chunks: ReactNode) => (
-                    <span className="text-foreground font-medium">{chunks}</span>
-                  ),
-                })}
+              <li key={item.event} className="text-[13px] leading-relaxed">
+                <span className="text-foreground font-medium">{item.event}</span>
+                <span className="text-muted-foreground"> — {item.note}</span>
               </li>
             ))}
           </ul>
@@ -290,7 +270,6 @@ function EventMatrix({ sections }: { sections: EventMatrixSection[] }) {
 }
 
 export default function WebhookSyncSettings() {
-  const t = useT();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { profile } = useCurrentProfile();
@@ -388,12 +367,12 @@ export default function WebhookSyncSettings() {
       events = events.filter(
         (e) =>
           e.summary.toLowerCase().includes(q) ||
-          eventUserLabel(t, e).toLowerCase().includes(q) ||
+          eventUserLabel(e).toLowerCase().includes(q) ||
           (e.error_message ?? "").toLowerCase().includes(q),
       );
     }
     return events;
-  }, [eventsQuery.data, eventOutcomeFilter, eventSearch, t]);
+  }, [eventsQuery.data, eventOutcomeFilter, eventSearch]);
 
   const eventTotalPages = Math.max(1, Math.ceil(filteredEvents.length / EVENTS_PER_PAGE));
   const eventPageClamped = Math.min(eventPage, eventTotalPages - 1);
@@ -427,14 +406,16 @@ export default function WebhookSyncSettings() {
     }
 
     if (!returnedPlexPinId || !returnedPlexPinCode) {
-      setPlexAuthError(t("web.settings.webhooks.plexAuth.missingSession"));
+      setPlexAuthError(
+        "Plex sign-in returned without the expected session details. Please try again.",
+      );
       void navigate("/settings/webhook-sync", { replace: true });
       return;
     }
 
     const pinID = Number(returnedPlexPinId);
     if (!Number.isFinite(pinID) || pinID <= 0) {
-      setPlexAuthError(t("web.settings.webhooks.plexAuth.invalidPin"));
+      setPlexAuthError("Plex sign-in returned an invalid PIN. Please try again.");
       void navigate("/settings/webhook-sync", { replace: true });
       return;
     }
@@ -457,9 +438,7 @@ export default function WebhookSyncSettings() {
         }
         setPlexServers([]);
         setSelectedServerId("");
-        setPlexAuthError(
-          error instanceof Error ? error.message : t("web.settings.webhooks.plexAuth.finishFailed"),
-        );
+        setPlexAuthError(error instanceof Error ? error.message : "Failed to finish Plex sign-in");
       } finally {
         if (!cancelled) {
           setPlexAuthPending(false);
@@ -471,7 +450,6 @@ export default function WebhookSyncSettings() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- the plex.tv return is handled once, not again when the language (t) changes
   }, [navigate, returnedPlexAuth, returnedPlexPinCode, returnedPlexPinId]);
 
   useEffect(() => {
@@ -497,10 +475,10 @@ export default function WebhookSyncSettings() {
 
   async function copyText(text: string) {
     try {
-      await copyTextToClipboard(text);
-      toast.success(t("web.settings.webhooks.copied"));
+      await navigator.clipboard.writeText(text);
+      toast.success("Copied to clipboard");
     } catch {
-      toast.error(t("web.settings.webhooks.copyFailed"));
+      toast.error("Failed to copy to clipboard");
     }
   }
 
@@ -519,9 +497,7 @@ export default function WebhookSyncSettings() {
       window.location.assign(buildPlexAuthURL(pin.code, forwardURL.toString()));
     } catch (error) {
       setPlexAuthPending(false);
-      setPlexAuthError(
-        error instanceof Error ? error.message : t("web.settings.webhooks.plexAuth.startFailed"),
-      );
+      setPlexAuthError(error instanceof Error ? error.message : "Failed to start Plex sign-in");
     }
   }
 
@@ -611,24 +587,24 @@ export default function WebhookSyncSettings() {
   return (
     <div className="space-y-6 pb-6">
       <PageHeader
-        title={t("web.settings.webhooks.title")}
-        subtitle={t("web.settings.webhooks.subtitle")}
+        title="Webhook Sync"
+        subtitle="Receive watched, stop, and progress events from Plex, Emby, and Jellyfin."
       />
 
       <SettingsGroup
-        title={t("web.settings.webhooks.add.title")}
-        description={t("web.settings.webhooks.add.description")}
+        title="Add a connection"
+        description="Create a provider-specific webhook endpoint and choose the default Silo profile."
       >
         <div className="flex flex-col gap-3">
-          <Label className="text-sm font-medium">{t("web.settings.webhooks.add.provider")}</Label>
+          <Label className="text-sm font-medium">Provider</Label>
           <Select value={provider} onValueChange={(value) => setProvider(value as ProviderType)}>
             <SelectTrigger className="w-full sm:w-[260px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="plex">{providerLabel("plex")}</SelectItem>
-              <SelectItem value="emby">{providerLabel("emby")}</SelectItem>
-              <SelectItem value="jellyfin">{providerLabel("jellyfin")}</SelectItem>
+              <SelectItem value="plex">Plex</SelectItem>
+              <SelectItem value="emby">Emby</SelectItem>
+              <SelectItem value="jellyfin">Jellyfin</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -637,16 +613,11 @@ export default function WebhookSyncSettings() {
           <>
             <div className="border-border/50 flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="min-w-0 space-y-0.5">
-                <Label className="text-sm font-medium">
-                  {t("web.settings.webhooks.add.plexAccount")}
-                </Label>
+                <Label className="text-sm font-medium">Plex account</Label>
                 <p className="text-muted-foreground text-[13px] leading-relaxed">
                   {hasSignedInToPlex
-                    ? t("web.settings.webhooks.add.plexServers", {
-                        count: plexServers.length,
-                        count_text: plexServers.length,
-                      })
-                    : t("web.settings.webhooks.add.plexAuthorizeHint")}
+                    ? `${plexServers.length} server${plexServers.length === 1 ? "" : "s"} available`
+                    : "Authorize via plex.tv to discover your servers"}
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -660,9 +631,7 @@ export default function WebhookSyncSettings() {
                   disabled={plexAuthPending}
                 >
                   <ExternalLink className="h-3.5 w-3.5" />
-                  {hasSignedInToPlex
-                    ? t("web.settings.webhooks.add.reauthenticate")
-                    : t("web.settings.webhooks.add.signInToPlex")}
+                  {hasSignedInToPlex ? "Re-authenticate" : "Sign in to Plex"}
                 </Button>
               </div>
             </div>
@@ -672,11 +641,9 @@ export default function WebhookSyncSettings() {
             {hasSignedInToPlex ? (
               <div className="border-border/50 flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0 space-y-0.5">
-                  <Label className="text-sm font-medium">
-                    {t("web.settings.webhooks.add.server")}
-                  </Label>
+                  <Label className="text-sm font-medium">Server</Label>
                   <p className="text-muted-foreground text-[13px] leading-relaxed">
-                    {t("web.settings.webhooks.add.serverHint")}
+                    The Plex Media Server that will send webhook events.
                   </p>
                 </div>
                 <Select
@@ -686,7 +653,7 @@ export default function WebhookSyncSettings() {
                   }}
                 >
                   <SelectTrigger className="w-full sm:w-[240px]">
-                    <SelectValue placeholder={t("web.settings.webhooks.add.selectServer")} />
+                    <SelectValue placeholder="Select a server" />
                   </SelectTrigger>
                   <SelectContent>
                     {plexServers.map((server) => (
@@ -701,28 +668,20 @@ export default function WebhookSyncSettings() {
           </>
         ) : (
           <div className="border-border/50 flex flex-col gap-3 border-t pt-4">
-            <Label className="text-sm font-medium">
-              {t("web.settings.webhooks.connectionName")}
-            </Label>
+            <Label className="text-sm font-medium">Connection name</Label>
             <Input
               value={manualServerName}
               onChange={(event) => setManualServerName(event.target.value)}
-              placeholder={
-                provider === "emby"
-                  ? t("web.settings.webhooks.add.embyNamePlaceholder")
-                  : t("web.settings.webhooks.add.jellyfinNamePlaceholder")
-              }
+              placeholder={provider === "emby" ? "My Emby Server" : "My Jellyfin Server"}
             />
           </div>
         )}
 
         <div className="border-border/50 flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0 space-y-0.5">
-            <Label className="text-sm font-medium">
-              {t("web.settings.webhooks.defaultProfile")}
-            </Label>
+            <Label className="text-sm font-medium">Default profile</Label>
             <p className="text-muted-foreground text-[13px] leading-relaxed">
-              {t("web.settings.webhooks.add.defaultProfileHint")}
+              The signed-in external user is linked to this profile when the connection is created.
             </p>
           </div>
           <Select
@@ -730,17 +689,14 @@ export default function WebhookSyncSettings() {
             onValueChange={(value) => setDefaultProfileId(value === UNMAPPED_VALUE ? "" : value)}
           >
             <SelectTrigger className="w-full sm:w-[240px]">
-              <SelectValue placeholder={t("web.settings.webhooks.chooseProfile")} />
+              <SelectValue placeholder="Choose a profile" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={UNMAPPED_VALUE}>
-                {t("web.settings.webhooks.chooseProfile")}
-              </SelectItem>
+              <SelectItem value={UNMAPPED_VALUE}>Choose a profile</SelectItem>
               {profiles.map((candidate) => (
                 <SelectItem key={candidate.id} value={candidate.id}>
-                  {profile?.id === candidate.id
-                    ? t("web.settings.webhooks.add.currentProfile", { name: candidate.name })
-                    : candidate.name}
+                  {candidate.name}
+                  {profile?.id === candidate.id ? " (current)" : ""}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -757,38 +713,39 @@ export default function WebhookSyncSettings() {
             ) : (
               <Plus className="h-4 w-4" />
             )}
-            {t("web.settings.webhooks.add.create")}
+            Create connection
           </Button>
         </div>
       </SettingsGroup>
 
       {/* ── Connected servers ── */}
       <SettingsGroup
-        title={t("web.settings.webhooks.servers.title")}
-        description={t("web.settings.webhooks.servers.description")}
+        title="Connected servers"
+        description="Manage webhook endpoints, provider setup instructions, and profile mappings."
       >
         {connectionsQuery.isLoading ? (
           <div className="text-muted-foreground flex items-center gap-2 text-sm">
             <Loader2 className="h-4 w-4 animate-spin" />
-            {t("web.settings.webhooks.servers.loading")}
+            Loading connections...
           </div>
         ) : connectionsQuery.isError ? (
           <div className="flex items-start gap-2.5 rounded-md bg-red-500/10 px-3 py-2.5">
             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
             <p className="text-sm leading-relaxed text-red-300">
-              {v2ErrorText(connectionsQuery.error, t("web.settings.webhooks.servers.loadFailed"))}
+              {connectionsQuery.error instanceof Error
+                ? connectionsQuery.error.message
+                : "Failed to load webhook connections"}
             </p>
           </div>
         ) : connections.length === 0 ? (
           <p className="text-muted-foreground text-sm">
-            {t("web.settings.webhooks.servers.empty")}
+            No webhook connections yet. Create one above to generate a provider-specific endpoint.
           </p>
         ) : (
           <div className="space-y-2">
             {connections.map((connection) => {
               const health = connectionHealth(connection);
               const isSelected = connection.id === currentConnectionId;
-              const userCount = connection.user_count ?? 0;
 
               return (
                 <button
@@ -796,7 +753,7 @@ export default function WebhookSyncSettings() {
                   type="button"
                   onClick={() => setSelectedConnectionId(connection.id)}
                   className={cn(
-                    "group flex w-full items-center justify-between gap-4 rounded-lg px-4 py-3 text-start transition-colors",
+                    "group flex w-full items-center justify-between gap-4 rounded-lg px-4 py-3 text-left transition-colors",
                     isSelected ? "bg-accent/50 ring-border ring-1" : "hover:bg-accent/20",
                   )}
                 >
@@ -805,23 +762,16 @@ export default function WebhookSyncSettings() {
                     <div className="min-w-0">
                       <span className="text-sm font-medium">
                         {connection.server_name}
-                        <span className="text-muted-foreground ms-2 text-xs font-normal">
+                        <span className="text-muted-foreground ml-2 text-xs font-normal">
                           {providerLabel(connection.provider)}
                         </span>
                       </span>
                       <p className="text-muted-foreground text-xs">
+                        {connection.user_count ?? 0} user
+                        {(connection.user_count ?? 0) === 1 ? "" : "s"}
                         {connection.last_webhook_received_at
-                          ? t("web.settings.webhooks.servers.usersLastEvent", {
-                              count: userCount,
-                              count_text: userCount,
-                              time:
-                                relativeTime(t, connection.last_webhook_received_at) ??
-                                formatTimestamp(t, connection.last_webhook_received_at),
-                            })
-                          : t("web.settings.webhooks.servers.users", {
-                              count: userCount,
-                              count_text: userCount,
-                            })}
+                          ? ` · last event ${relativeTime(connection.last_webhook_received_at) ?? formatTimestamp(connection.last_webhook_received_at)}`
+                          : ""}
                       </p>
                     </div>
                   </div>
@@ -829,7 +779,7 @@ export default function WebhookSyncSettings() {
                     variant={health === "error" ? "destructive" : "outline"}
                     className="shrink-0 text-xs"
                   >
-                    {t(HEALTH_LABEL[health])}
+                    {HEALTH_LABEL[health]}
                   </Badge>
                 </button>
               );
@@ -843,9 +793,7 @@ export default function WebhookSyncSettings() {
         <>
           <SettingsGroup
             title={selectedConnection.server_name}
-            description={t("web.settings.webhooks.detail.description", {
-              provider: providerLabel(selectedConnection.provider),
-            })}
+            description={`${providerLabel(selectedConnection.provider)} webhook endpoint`}
           >
             {(() => {
               const health = connectionHealth(selectedConnection);
@@ -859,9 +807,7 @@ export default function WebhookSyncSettings() {
                       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
                       <div className="min-w-0 space-y-0.5">
                         <p className="text-sm font-medium text-red-300">
-                          {t("web.settings.webhooks.detail.errorAt", {
-                            time: formatTimestamp(t, selectedConnection.last_webhook_error_at),
-                          })}
+                          Error {formatTimestamp(selectedConnection.last_webhook_error_at)}
                         </p>
                         <p className="text-[13px] leading-relaxed text-red-300/80">
                           {selectedConnection.last_webhook_error_message}
@@ -872,16 +818,14 @@ export default function WebhookSyncSettings() {
                     <div className="flex items-center gap-2 text-[13px]">
                       <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
                       <span className="text-muted-foreground">
-                        {t("web.settings.webhooks.detail.ready")}
+                        Ready to receive webhook traffic
                       </span>
                     </div>
                   )}
 
                   {/* Webhook URL */}
                   <div className="space-y-1.5">
-                    <Label className="text-muted-foreground text-xs">
-                      {t("web.settings.webhooks.detail.webhookUrl")}
-                    </Label>
+                    <Label className="text-muted-foreground text-xs">Webhook URL</Label>
                     <div className="flex flex-col gap-2 sm:flex-row">
                       <Input value={webhookURL} readOnly className="font-mono text-xs" />
                       <div className="flex gap-2">
@@ -892,7 +836,7 @@ export default function WebhookSyncSettings() {
                           disabled={!webhookURL}
                         >
                           <Copy className="h-3.5 w-3.5" />
-                          {t("web.settings.webhooks.detail.copy")}
+                          Copy
                         </Button>
                         <Button
                           variant="outline"
@@ -909,7 +853,7 @@ export default function WebhookSyncSettings() {
                           disabled={rotateWebhookMutation.isPending}
                         >
                           <RotateCcw className="h-3.5 w-3.5" />
-                          {t("web.settings.webhooks.detail.rotate")}
+                          Rotate
                         </Button>
                         <Button
                           variant="outline"
@@ -921,7 +865,7 @@ export default function WebhookSyncSettings() {
                           disabled={deleteConnectionMutation.isPending}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
-                          {t("web.settings.webhooks.detail.delete")}
+                          Delete
                         </Button>
                       </div>
                     </div>
@@ -931,9 +875,7 @@ export default function WebhookSyncSettings() {
                   <div className="border-border/50 space-y-3 border-t pt-4">
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div className="space-y-1.5">
-                        <Label className="text-muted-foreground text-xs">
-                          {t("web.settings.webhooks.connectionName")}
-                        </Label>
+                        <Label className="text-muted-foreground text-xs">Connection name</Label>
                         <Input
                           value={currentConnectionServerName}
                           onChange={(event) =>
@@ -942,9 +884,7 @@ export default function WebhookSyncSettings() {
                         />
                       </div>
                       <div className="space-y-1.5">
-                        <Label className="text-muted-foreground text-xs">
-                          {t("web.settings.webhooks.defaultProfile")}
-                        </Label>
+                        <Label className="text-muted-foreground text-xs">Default profile</Label>
                         <Select
                           value={currentConnectionDefaultValue}
                           onValueChange={(value) =>
@@ -954,12 +894,10 @@ export default function WebhookSyncSettings() {
                           }
                         >
                           <SelectTrigger>
-                            <SelectValue placeholder={t("web.settings.webhooks.chooseProfile")} />
+                            <SelectValue placeholder="Choose a profile" />
                           </SelectTrigger>
                           <SelectContent>
-                            <SelectItem value={UNMAPPED_VALUE}>
-                              {t("web.settings.webhooks.detail.noDefaultProfile")}
-                            </SelectItem>
+                            <SelectItem value={UNMAPPED_VALUE}>No default profile</SelectItem>
                             {profiles.map((candidate) => (
                               <SelectItem key={candidate.id} value={candidate.id}>
                                 {candidate.name}
@@ -996,7 +934,7 @@ export default function WebhookSyncSettings() {
                         {updateConnectionMutation.isPending ? (
                           <Loader2 className="h-4 w-4 animate-spin" />
                         ) : null}
-                        {t("web.settings.webhooks.detail.save")}
+                        Save connection
                       </Button>
                     </div>
                   </div>
@@ -1004,27 +942,24 @@ export default function WebhookSyncSettings() {
                   {/* Profile mapping — part of connection config */}
                   <div className="border-border/50 space-y-3 border-t pt-4">
                     <div className="space-y-0.5">
-                      <Label className="text-sm font-medium">
-                        {t("web.settings.webhooks.mapping.title")}
-                      </Label>
+                      <Label className="text-sm font-medium">Profile mapping</Label>
                       <p className="text-muted-foreground text-[13px] leading-relaxed">
-                        {t("web.settings.webhooks.mapping.description")}
+                        Map each external user to a Silo profile. Unmapped users are ignored.
                       </p>
                     </div>
 
                     {mappingsQuery.isLoading ? (
                       <div className="text-muted-foreground flex items-center gap-2 text-sm">
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        {t("web.settings.webhooks.mapping.loading")}
+                        Loading users...
                       </div>
                     ) : mappingsQuery.isError ? (
                       <div className="flex items-start gap-2.5 rounded-md bg-red-500/10 px-3 py-2.5">
                         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
                         <p className="text-sm leading-relaxed text-red-300">
-                          {v2ErrorText(
-                            mappingsQuery.error,
-                            t("web.settings.webhooks.mapping.loadFailed"),
-                          )}
+                          {mappingsQuery.error instanceof Error
+                            ? mappingsQuery.error.message
+                            : "Failed to load profile mappings"}
                         </p>
                       </div>
                     ) : mappingRows.length > 0 ? (
@@ -1051,14 +986,10 @@ export default function WebhookSyncSettings() {
                               }
                             >
                               <SelectTrigger className="w-full sm:w-[240px]">
-                                <SelectValue
-                                  placeholder={t("web.settings.webhooks.chooseProfile")}
-                                />
+                                <SelectValue placeholder="Choose a profile" />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value={UNMAPPED_VALUE}>
-                                  {t("web.settings.webhooks.mapping.ignore")}
-                                </SelectItem>
+                                <SelectItem value={UNMAPPED_VALUE}>Ignore this user</SelectItem>
                                 {profiles.map((candidate) => (
                                   <SelectItem key={candidate.id} value={candidate.id}>
                                     {candidate.name}
@@ -1077,13 +1008,13 @@ export default function WebhookSyncSettings() {
                             {updateMappingsMutation.isPending ? (
                               <Loader2 className="h-4 w-4 animate-spin" />
                             ) : null}
-                            {t("web.settings.webhooks.mapping.save")}
+                            Save mappings
                           </Button>
                         </div>
                       </div>
                     ) : (
                       <p className="text-muted-foreground text-sm">
-                        {t("web.settings.webhooks.mapping.empty")}
+                        No users discovered yet. Send a webhook event first, then map them here.
                       </p>
                     )}
                   </div>
@@ -1092,58 +1023,79 @@ export default function WebhookSyncSettings() {
                   <details className="border-border/50 border-t pt-4">
                     <summary className="text-muted-foreground flex cursor-pointer items-center gap-2 text-sm font-medium select-none">
                       <Server className="h-3.5 w-3.5" />
-                      {t("web.settings.webhooks.setup.title")}
+                      Setup instructions
                     </summary>
                     <div className="mt-3">
                       {selectedConnection.provider === "plex" ? (
-                        <ol className="text-muted-foreground list-decimal space-y-1.5 ps-5 text-sm leading-relaxed">
-                          <li>{t("web.settings.webhooks.setup.plex.step1", { hl })}</li>
-                          <li>{t("web.settings.webhooks.setup.plex.step2", { hl })}</li>
-                          <li>{t("web.settings.webhooks.setup.plex.step3")}</li>
-                          <li>{t("web.settings.webhooks.setup.plex.step4")}</li>
+                        <ol className="text-muted-foreground list-decimal space-y-1.5 pl-5 text-sm leading-relaxed">
+                          <li>
+                            In Plex, open{" "}
+                            <span className="text-foreground">Settings → Webhooks</span> (Plex Pass
+                            required).
+                          </li>
+                          <li>
+                            Click <span className="text-foreground">Add Webhook</span> and paste the
+                            URL above.
+                          </li>
+                          <li>
+                            Save. Plex sends events automatically — no per-event toggles to
+                            configure.
+                          </li>
+                          <li>
+                            Plex sends no webhook when someone marks an item watched or unwatched by
+                            hand, so only playback reaches Silo.
+                          </li>
                         </ol>
                       ) : null}
                       {selectedConnection.provider === "emby" ? (
                         <div className="space-y-4 text-sm">
-                          <ol className="text-muted-foreground list-decimal space-y-1.5 ps-5 leading-relaxed">
-                            <li>{t("web.settings.webhooks.setup.emby.step1", { hl })}</li>
-                            <li>{t("web.settings.webhooks.setup.emby.step2", { hl })}</li>
-                            <li>{t("web.settings.webhooks.setup.emby.step3")}</li>
+                          <ol className="text-muted-foreground list-decimal space-y-1.5 pl-5 leading-relaxed">
+                            <li>
+                              In the Emby dashboard, open{" "}
+                              <span className="text-foreground">Notifications</span> and add a new{" "}
+                              <span className="text-foreground">Webhooks</span> notification.
+                            </li>
+                            <li>
+                              Paste the URL above into <span className="text-foreground">Url</span>,
+                              and set <span className="text-foreground">Request content type</span>{" "}
+                              to <span className="text-foreground">application/json</span>.
+                            </li>
+                            <li>Enable the events listed below, then save.</li>
                           </ol>
 
                           <EventMatrix
                             sections={[
                               {
-                                label: "web.settings.webhooks.setup.events.required",
+                                label: "Required",
                                 tone: "required",
                                 items: [
                                   {
-                                    event: "web.settings.webhooks.setup.emby.eventPlaybackStop",
-                                    note: "web.settings.webhooks.setup.emby.notePlaybackStop",
+                                    event: "Playback → Stop",
+                                    note: "Records watch progress and completion.",
                                   },
                                 ],
                               },
                               {
-                                label: "web.settings.webhooks.setup.events.recommended",
+                                label: "Recommended",
                                 tone: "recommended",
                                 items: [
                                   {
-                                    event: "web.settings.webhooks.setup.emby.eventFavorites",
-                                    note: "web.settings.webhooks.setup.emby.noteFavorites",
+                                    event: "Users → Add to Favorites, Remove from Favorites",
+                                    note: "Syncs favorites to the mapped Silo profile.",
                                   },
                                   {
-                                    event: "web.settings.webhooks.setup.emby.eventMarkPlayed",
-                                    note: "web.settings.webhooks.setup.emby.noteMarkPlayed",
+                                    event: "Users → Mark Played, Mark Unplayed",
+                                    note: "Needed only if your household manually marks items watched without playing them. Mark Played will duplicate Stop for normal completions, but the result is the same.",
                                   },
                                 ],
                               },
                               {
-                                label: "web.settings.webhooks.setup.events.skip",
+                                label: "Skip",
                                 tone: "skip",
                                 items: [
                                   {
-                                    event: "web.settings.webhooks.setup.emby.eventPlaybackOther",
-                                    note: "web.settings.webhooks.setup.emby.notePlaybackOther",
+                                    event: "Playback → Start, Pause, Unpause",
+                                    note: "Silo only records completion, not in-progress state.",
                                   },
                                 ],
                               },
@@ -1153,17 +1105,42 @@ export default function WebhookSyncSettings() {
                       ) : null}
                       {selectedConnection.provider === "jellyfin" ? (
                         <div className="space-y-4 text-sm">
-                          <ol className="text-muted-foreground list-decimal space-y-1.5 ps-5 leading-relaxed">
-                            <li>{t("web.settings.webhooks.setup.jellyfin.step1", { hl })}</li>
-                            <li>{t("web.settings.webhooks.setup.jellyfin.step2", { hl })}</li>
-                            <li>{t("web.settings.webhooks.setup.jellyfin.step3", { hl })}</li>
-                            <li>{t("web.settings.webhooks.setup.jellyfin.step4", { hl })}</li>
-                            <li>{t("web.settings.webhooks.setup.jellyfin.step5", { hl })}</li>
+                          <ol className="text-muted-foreground list-decimal space-y-1.5 pl-5 leading-relaxed">
+                            <li>
+                              Install the official <span className="text-foreground">Webhook</span>{" "}
+                              plugin from{" "}
+                              <span className="text-foreground">Dashboard → Plugins → Catalog</span>{" "}
+                              and restart Jellyfin.
+                            </li>
+                            <li>
+                              Open{" "}
+                              <span className="text-foreground">Dashboard → Plugins → Webhook</span>{" "}
+                              and add a <span className="text-foreground">Generic Destination</span>
+                              .
+                            </li>
+                            <li>
+                              Paste the URL above into{" "}
+                              <span className="text-foreground">Webhook Url</span>.
+                            </li>
+                            <li>
+                              Under <span className="text-foreground">Notification Type</span>,
+                              enable <span className="text-foreground">Playback Stop</span> for
+                              watch progress and{" "}
+                              <span className="text-foreground">User Data Saved</span> for items
+                              marked played or unplayed. User Data Saved also fires during playback;
+                              Silo ignores those deliveries. Leave{" "}
+                              <span className="text-foreground">Playback Progress</span> off — Silo
+                              ignores it and it generates heavy traffic.
+                            </li>
+                            <li>
+                              Paste the template below into{" "}
+                              <span className="text-foreground">Template</span> and save.
+                            </li>
                           </ol>
 
                           <div className="space-y-1.5">
                             <Label className="text-muted-foreground text-xs">
-                              {t("web.settings.webhooks.setup.jellyfin.template")}
+                              Webhook payload template
                             </Label>
                             <textarea
                               readOnly
@@ -1176,7 +1153,7 @@ export default function WebhookSyncSettings() {
                               onClick={() => void copyText(JELLYFIN_TEMPLATE)}
                             >
                               <Copy className="h-3.5 w-3.5" />
-                              {t("web.settings.webhooks.setup.jellyfin.copyTemplate")}
+                              Copy template
                             </Button>
                           </div>
                         </div>
@@ -1190,19 +1167,21 @@ export default function WebhookSyncSettings() {
 
           {/* Recent deliveries — table */}
           <SettingsGroup
-            title={t("web.settings.webhooks.deliveries.title")}
-            description={t("web.settings.webhooks.deliveries.description")}
+            title="Recent deliveries"
+            description="Latest webhook requests for this connection."
           >
             {eventsQuery.isLoading ? (
               <div className="text-muted-foreground flex items-center gap-2 text-sm">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                {t("web.settings.webhooks.deliveries.loading")}
+                Loading deliveries...
               </div>
             ) : eventsQuery.isError ? (
               <div className="flex items-start gap-2.5 rounded-md bg-red-500/10 px-3 py-2.5">
                 <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
                 <p className="text-sm leading-relaxed text-red-300">
-                  {v2ErrorText(eventsQuery.error, t("web.settings.webhooks.deliveries.loadFailed"))}
+                  {eventsQuery.error instanceof Error
+                    ? eventsQuery.error.message
+                    : "Failed to load recent webhook deliveries"}
                 </p>
               </div>
             ) : (eventsQuery.data?.length ?? 0) > 0 ? (
@@ -1210,12 +1189,12 @@ export default function WebhookSyncSettings() {
                 {/* Filter bar */}
                 <div className="flex flex-col gap-2 sm:flex-row">
                   <div className="relative flex-1">
-                    <Search className="text-muted-foreground pointer-events-none absolute start-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2" />
+                    <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2" />
                     <Input
                       value={eventSearch}
                       onChange={(e) => setEventSearch(e.target.value)}
-                      placeholder={t("web.settings.webhooks.deliveries.search")}
-                      className="h-8 ps-8 text-xs"
+                      placeholder="Search events..."
+                      className="h-8 pl-8 text-xs"
                     />
                   </div>
                   <Select
@@ -1228,13 +1207,11 @@ export default function WebhookSyncSettings() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="all">
-                        {t("web.settings.webhooks.deliveries.allOutcomes")}
-                      </SelectItem>
+                      <SelectItem value="all">All outcomes</SelectItem>
                       {(Object.keys(EVENT_OUTCOME_LABEL) as WebhookSyncEventLog["outcome"][]).map(
                         (key) => (
                           <SelectItem key={key} value={key}>
-                            {t(EVENT_OUTCOME_LABEL[key])}
+                            {EVENT_OUTCOME_LABEL[key]}
                           </SelectItem>
                         ),
                       )}
@@ -1247,21 +1224,11 @@ export default function WebhookSyncSettings() {
                   <Table>
                     <TableHeader>
                       <TableRow>
-                        <TableHead className="text-xs">
-                          {t("web.settings.webhooks.deliveries.colStatus")}
-                        </TableHead>
-                        <TableHead className="text-xs">
-                          {t("web.settings.webhooks.deliveries.colEvent")}
-                        </TableHead>
-                        <TableHead className="text-xs">
-                          {t("web.settings.webhooks.deliveries.colItem")}
-                        </TableHead>
-                        <TableHead className="text-xs">
-                          {t("web.settings.webhooks.deliveries.colUser")}
-                        </TableHead>
-                        <TableHead className="text-end text-xs">
-                          {t("web.settings.webhooks.deliveries.colTime")}
-                        </TableHead>
+                        <TableHead className="text-xs">Status</TableHead>
+                        <TableHead className="text-xs">Event</TableHead>
+                        <TableHead className="text-xs">Item</TableHead>
+                        <TableHead className="text-xs">User</TableHead>
+                        <TableHead className="text-right text-xs">Time</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -1276,7 +1243,7 @@ export default function WebhookSyncSettings() {
                               variant="outline"
                               className={cn("text-xs", EVENT_OUTCOME_BADGE[event.outcome])}
                             >
-                              {t(EVENT_OUTCOME_LABEL[event.outcome])}
+                              {EVENT_OUTCOME_LABEL[event.outcome]}
                             </Badge>
                           </TableCell>
                           <TableCell>
@@ -1289,15 +1256,14 @@ export default function WebhookSyncSettings() {
                           </TableCell>
                           <TableCell className="max-w-[200px] text-xs">
                             {eventMatchedItemLabel(event) ?? (
-                              <span className="text-muted-foreground">{EMPTY_CELL}</span>
+                              <span className="text-muted-foreground">&mdash;</span>
                             )}
                           </TableCell>
                           <TableCell className="text-muted-foreground text-xs">
-                            {eventUserLabel(t, event)}
+                            {eventUserLabel(event)}
                           </TableCell>
-                          <TableCell className="text-muted-foreground text-end text-xs">
-                            {relativeTime(t, event.received_at) ??
-                              formatTimestamp(t, event.received_at)}
+                          <TableCell className="text-muted-foreground text-right text-xs">
+                            {relativeTime(event.received_at) ?? formatTimestamp(event.received_at)}
                           </TableCell>
                         </TableRow>
                       ))}
@@ -1305,7 +1271,7 @@ export default function WebhookSyncSettings() {
                   </Table>
                 ) : (
                   <p className="text-muted-foreground py-4 text-center text-sm">
-                    {t("web.settings.webhooks.deliveries.noMatches")}
+                    No deliveries match the current filters.
                   </p>
                 )}
 
@@ -1313,11 +1279,7 @@ export default function WebhookSyncSettings() {
                 {filteredEvents.length > EVENTS_PER_PAGE ? (
                   <div className="border-border/40 flex items-center justify-between border-t px-1 pt-3">
                     <span className="text-muted-foreground text-xs tracking-tight tabular-nums">
-                      {t("web.settings.webhooks.deliveries.range", {
-                        start: eventRangeStart,
-                        end: eventRangeEnd,
-                        total: filteredEvents.length,
-                      })}
+                      {eventRangeStart}&ndash;{eventRangeEnd} of {filteredEvents.length}
                     </span>
                     <div className="flex items-center gap-0.5">
                       <Button
@@ -1326,8 +1288,7 @@ export default function WebhookSyncSettings() {
                         className="h-7 w-7"
                         disabled={eventPageClamped <= 0}
                         onClick={() => setEventPage(0)}
-                        title={t("web.settings.webhooks.deliveries.firstPage")}
-                        aria-label={t("web.settings.webhooks.deliveries.firstPage")}
+                        title="First page"
                       >
                         <ChevronsLeft className="h-3.5 w-3.5" />
                       </Button>
@@ -1337,8 +1298,7 @@ export default function WebhookSyncSettings() {
                         className="h-7 w-7"
                         disabled={eventPageClamped <= 0}
                         onClick={() => setEventPage((p) => Math.max(0, p - 1))}
-                        title={t("web.settings.webhooks.deliveries.previousPage")}
-                        aria-label={t("web.settings.webhooks.deliveries.previousPage")}
+                        title="Previous page"
                       >
                         <ChevronLeft className="h-3.5 w-3.5" />
                       </Button>
@@ -1348,8 +1308,7 @@ export default function WebhookSyncSettings() {
                         className="h-7 w-7"
                         disabled={eventPageClamped >= eventTotalPages - 1}
                         onClick={() => setEventPage((p) => Math.min(eventTotalPages - 1, p + 1))}
-                        title={t("web.settings.webhooks.deliveries.nextPage")}
-                        aria-label={t("web.settings.webhooks.deliveries.nextPage")}
+                        title="Next page"
                       >
                         <ChevronRight className="h-3.5 w-3.5" />
                       </Button>
@@ -1359,8 +1318,7 @@ export default function WebhookSyncSettings() {
                         className="h-7 w-7"
                         disabled={eventPageClamped >= eventTotalPages - 1}
                         onClick={() => setEventPage(eventTotalPages - 1)}
-                        title={t("web.settings.webhooks.deliveries.lastPage")}
-                        aria-label={t("web.settings.webhooks.deliveries.lastPage")}
+                        title="Last page"
                       >
                         <ChevronsRight className="h-3.5 w-3.5" />
                       </Button>
@@ -1370,7 +1328,7 @@ export default function WebhookSyncSettings() {
               </>
             ) : (
               <p className="text-muted-foreground text-sm">
-                {t("web.settings.webhooks.deliveries.empty")}
+                No deliveries yet. Send a test event from the provider to confirm the connection.
               </p>
             )}
           </SettingsGroup>
@@ -1384,10 +1342,7 @@ export default function WebhookSyncSettings() {
             <DialogHeader>
               <DialogTitle className="text-base">{selectedEvent.summary}</DialogTitle>
               <DialogDescription>
-                {t("web.settings.webhooks.event.receivedHttp", {
-                  time: formatTimestamp(t, selectedEvent.received_at),
-                  status: selectedEvent.http_status,
-                })}
+                {formatTimestamp(selectedEvent.received_at)} · HTTP {selectedEvent.http_status}
               </DialogDescription>
             </DialogHeader>
 
@@ -1398,7 +1353,7 @@ export default function WebhookSyncSettings() {
                   variant="outline"
                   className={cn("text-xs", EVENT_OUTCOME_BADGE[selectedEvent.outcome])}
                 >
-                  {t(EVENT_OUTCOME_LABEL[selectedEvent.outcome])}
+                  {EVENT_OUTCOME_LABEL[selectedEvent.outcome]}
                 </Badge>
                 {eventMatchedItemLabel(selectedEvent) ? (
                   <span className="text-sm">{eventMatchedItemLabel(selectedEvent)}</span>
@@ -1414,16 +1369,14 @@ export default function WebhookSyncSettings() {
               {/* Attributes */}
               {Object.keys(selectedEvent.attrs ?? {}).length > 0 ? (
                 <div className="space-y-1.5">
-                  <Label className="text-muted-foreground text-xs">
-                    {t("web.settings.webhooks.event.attributes")}
-                  </Label>
+                  <Label className="text-muted-foreground text-xs">Attributes</Label>
                   <div className="grid gap-x-6 gap-y-1.5 sm:grid-cols-2">
                     {Object.entries(selectedEvent.attrs ?? {})
                       .filter(([, v]) => v !== "" && v != null)
                       .sort(([a], [b]) => a.localeCompare(b))
                       .map(([key, value]) => (
                         <div key={key} className="min-w-0">
-                          <p className="text-muted-foreground text-xs">{eventAttrLabel(t, key)}</p>
+                          <p className="text-muted-foreground text-xs">{eventAttrLabel(key)}</p>
                           <p className="truncate text-xs break-all">
                             {typeof value === "string" ? value : JSON.stringify(value)}
                           </p>
@@ -1436,9 +1389,7 @@ export default function WebhookSyncSettings() {
               {/* Body excerpt */}
               {selectedEvent.body_excerpt ? (
                 <div className="space-y-1.5">
-                  <Label className="text-muted-foreground text-xs">
-                    {t("web.settings.webhooks.event.bodyExcerpt")}
-                  </Label>
+                  <Label className="text-muted-foreground text-xs">Body excerpt</Label>
                   <pre className="bg-background max-h-60 overflow-auto rounded-md border px-3 py-2 text-xs whitespace-pre-wrap">
                     {selectedEvent.body_excerpt}
                   </pre>
@@ -1448,7 +1399,7 @@ export default function WebhookSyncSettings() {
               {/* Request ID */}
               {selectedEvent.request_id ? (
                 <p className="text-muted-foreground text-xs">
-                  {t("web.settings.webhooks.event.requestId", { id: selectedEvent.request_id })}
+                  Request ID: {selectedEvent.request_id}
                 </p>
               ) : null}
             </div>

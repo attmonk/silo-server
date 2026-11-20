@@ -14,7 +14,6 @@ import { accountRoleLabel } from "@/lib/accountOwner";
 import { formatRelativeTime } from "@/lib/date";
 import { useAdminUsers } from "@/hooks/queries/admin/users";
 import { SectionError, UserSkeletonRows } from "../feedback";
-import { useT } from "@/i18n";
 
 // Most recently active first; users with no recorded activity sink to the
 // bottom. The list endpoint itself returns account-creation order.
@@ -27,10 +26,7 @@ function byLastActive(a: AdminUser, b: AdminUser): number {
   return a.username.localeCompare(b.username);
 }
 
-const EM_DASH = "—";
-
 export function UsersWidget() {
-  const t = useT();
   const navigate = useNavigate();
   const usersQuery = useAdminUsers();
   const users = [...(usersQuery.data ?? [])].sort(byLastActive);
@@ -38,38 +34,28 @@ export function UsersWidget() {
   return (
     <Card className="h-full">
       <CardHeader className="flex shrink-0 flex-row items-center justify-between space-y-0 pb-3">
-        <CardTitle className="text-sm font-bold">
-          {t("web.admin.dashboard.widgets.users.title")}
-        </CardTitle>
+        <CardTitle className="text-sm font-bold">Users</CardTitle>
         <Link
           to="/admin/users"
           className="text-muted-foreground hover:text-primary text-[11px] transition-colors"
         >
-          {t("web.admin.dashboard.widgets.users.manage")}
+          Manage ›
         </Link>
       </CardHeader>
       <CardContent className="min-h-0 flex-1 overflow-y-auto">
         {usersQuery.isLoading ? (
           <UserSkeletonRows />
         ) : usersQuery.error ? (
-          <SectionError message={t("web.admin.dashboard.widgets.users.loadFailed")} />
+          <SectionError message="Failed to load users." />
         ) : users.length === 0 ? (
-          <div className="text-muted-foreground py-4 text-center text-sm">
-            {t("web.admin.dashboard.widgets.users.empty")}
-          </div>
+          <div className="text-muted-foreground py-4 text-center text-sm">No users.</div>
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
-                {/* w-full + max-w-0 makes this column take the leftover width and
-                    clip long emails instead of widening the table. */}
-                <TableHead className="w-full max-w-0">
-                  {t("web.admin.dashboard.widgets.users.user")}
-                </TableHead>
-                <TableHead className="hidden sm:table-cell">
-                  {t("web.admin.dashboard.widgets.users.lastActive")}
-                </TableHead>
-                <TableHead>{t("web.admin.dashboard.widgets.users.status")}</TableHead>
+                <TableHead>User</TableHead>
+                <TableHead className="hidden sm:table-cell">Last active</TableHead>
+                <TableHead>Status</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -79,7 +65,7 @@ export function UsersWidget() {
                   className="hover:bg-accent/50 focus-visible:ring-ring cursor-pointer focus-visible:ring-2 focus-visible:outline-none"
                   role="link"
                   tabIndex={0}
-                  aria-label={t("web.admin.dashboard.widgets.users.openUser", { name: u.username })}
+                  aria-label={`Open ${u.username}`}
                   onClick={() => navigate(`/admin/users/${u.id}`)}
                   onKeyDown={(event) => {
                     // Space scrolls the page by default; a row that behaves like
@@ -90,7 +76,7 @@ export function UsersWidget() {
                     }
                   }}
                 >
-                  <TableCell className="w-full max-w-0">
+                  <TableCell>
                     <div className="flex items-center gap-2.5">
                       <div
                         className="text-primary-foreground flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-[10px] font-bold"
@@ -116,14 +102,12 @@ export function UsersWidget() {
                   <TableCell className="text-muted-foreground hidden text-xs whitespace-nowrap sm:table-cell">
                     {formatRelativeTime(u.last_active_at ?? null, {
                       rounding: "floor",
-                      justNowLabel: t("web.admin.dashboard.widgets.users.justNow"),
-                    }) ?? EM_DASH}
+                      justNowLabel: "Just now",
+                    }) ?? "—"}
                   </TableCell>
                   <TableCell>
                     <Badge variant={u.enabled ? "outline" : "destructive"}>
-                      {u.enabled
-                        ? t("web.admin.dashboard.widgets.users.active")
-                        : t("web.admin.dashboard.widgets.users.disabled")}
+                      {u.enabled ? "Active" : "Disabled"}
                     </Badge>
                   </TableCell>
                 </TableRow>

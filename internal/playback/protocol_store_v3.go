@@ -61,18 +61,6 @@ type ProgressReceiptV3 struct {
 	// caller's sample when applied or replayed, the newer stored sample when
 	// stale, nil when nothing has been applied yet.
 	Accepted *ProgressSampleV3
-	// Lifecycle is the pause or resume the applied sample made to the
-	// session's announced lifecycle state, committed with the sample; nil
-	// when the state did not change or the store keeps no lifecycle.
-	Lifecycle *LifecycleChangeV3
-}
-
-// LifecycleChangeV3 is a lifecycle pause transition an accepted progress
-// sample made: its sequence number, commit time and new pause state.
-type LifecycleChangeV3 struct {
-	Seq    int64
-	At     time.Time
-	Paused bool
 }
 
 // StopReceiptV3 is what a stop returns, and what every later stop of the same
@@ -163,17 +151,6 @@ type AttemptRecordV3 struct {
 	// A replica reaping a stale local copy compares it with its own activity
 	// clock, since requests can land on other replicas.
 	LastSampleAt time.Time
-	// CreatedAt is when the attempt row was saved, which is when its session
-	// started. SaveAttempt ignores it.
-	CreatedAt time.Time
-	// LoginSessionID is the login session that started the attempt; empty
-	// for an API key. The plan URL's stream reference authorizes the
-	// attempt's media on its own only while that session is active.
-	LoginSessionID string
-	// DesiredTracks is the audio and subtitle the viewer asked for, which
-	// can differ from CurrentPlan's selection after a version change had to
-	// fall back. Nil on rows written before it existed.
-	DesiredTracks *DesiredTracksV3
 }
 
 // AttemptIdentityV3 carries only the ownership columns of an attempt so
@@ -183,11 +160,6 @@ type AttemptIdentityV3 struct {
 	SessionID         string
 	UserID            int
 	ProfileID         string
-	// Stopped reports that the attempt has been stopped (StoppedAt is set).
-	Stopped bool
-	// LoginSessionID is the login session that started the attempt, or
-	// empty; see AttemptRecordV3.LoginSessionID.
-	LoginSessionID string
 }
 
 type RouteEventRecordV3 struct {
@@ -309,7 +281,6 @@ func (s *MemoryPlanStoreV3) SaveAttempt(_ context.Context, record AttemptRecordV
 		return ErrPlaybackAttemptExistsV3
 	}
 	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID = 0, nil, nil, ""
-	record.CreatedAt = now
 	s.attempts[record.PlaybackAttemptID] = record
 	return nil
 }
@@ -447,7 +418,7 @@ func (s *MemoryPlanStoreV3) GetAttemptIdentity(ctx context.Context, sessionID st
 	if err != nil {
 		return nil, err
 	}
-	return &AttemptIdentityV3{PlaybackAttemptID: record.PlaybackAttemptID, SessionID: record.SessionID, UserID: record.UserID, ProfileID: record.ProfileID, Stopped: record.StoppedAt != nil, LoginSessionID: record.LoginSessionID}, nil
+	return &AttemptIdentityV3{PlaybackAttemptID: record.PlaybackAttemptID, SessionID: record.SessionID, UserID: record.UserID, ProfileID: record.ProfileID}, nil
 }
 
 func (s *MemoryPlanStoreV3) GetAttemptIdentityByPlaybackAttemptID(ctx context.Context, attemptID string) (*AttemptIdentityV3, error) {
@@ -455,7 +426,7 @@ func (s *MemoryPlanStoreV3) GetAttemptIdentityByPlaybackAttemptID(ctx context.Co
 	if err != nil {
 		return nil, err
 	}
-	return &AttemptIdentityV3{PlaybackAttemptID: record.PlaybackAttemptID, SessionID: record.SessionID, UserID: record.UserID, ProfileID: record.ProfileID, Stopped: record.StoppedAt != nil, LoginSessionID: record.LoginSessionID}, nil
+	return &AttemptIdentityV3{PlaybackAttemptID: record.PlaybackAttemptID, SessionID: record.SessionID, UserID: record.UserID, ProfileID: record.ProfileID}, nil
 }
 
 func (s *MemoryPlanStoreV3) RecordRouteEvent(_ context.Context, record RouteEventRecordV3) (bool, error) {

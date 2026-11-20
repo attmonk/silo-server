@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // maxEpisodeNumberDigits bounds the episode numbers this package reports.
@@ -43,21 +41,8 @@ var (
 
 // ResolvePathContext classifies a media path using both naming heuristics and
 // the declared library type. libraryType accepts values like "movies",
-// "movie", "series", "tv", "show", or "mixed". Names are parsed as display
-// text (see fspath.Display); paths in the result keep the input's encoding.
+// "movie", "series", "tv", "show", or "mixed".
 func ResolvePathContext(filePath string, libraryType string, libraryRoots ...string) *PathContext {
-	paths := newDisplayPaths(filePath, libraryRoots)
-	if paths == nil {
-		return resolvePathContext(filePath, libraryType, libraryRoots...)
-	}
-	ctx := resolvePathContext(paths.file, libraryType, paths.roots...)
-	ctx.RootPath = paths.toEncoded(ctx.RootPath)
-	ctx.LibraryRootPath = paths.toEncoded(ctx.LibraryRootPath)
-	return ctx
-}
-
-//nolint:gocyclo // the existing ResolvePathContext classifier, moved unchanged behind the display-text wrapper
-func resolvePathContext(filePath string, libraryType string, libraryRoots ...string) *PathContext {
 	normalized := filepath.ToSlash(filePath)
 	if normalized == "" {
 		return &PathContext{}
@@ -341,7 +326,7 @@ func parseTitleYearCandidate(name string) (string, int) {
 }
 
 func normalizeComparableTitle(name string) string {
-	candidate := stripFolderTags(fspath.Display(name))
+	candidate := stripFolderTags(name)
 	candidate = strings.NewReplacer(".", " ", "_", " ", "-", " ").Replace(candidate)
 	candidate = collapseWhitespace(strings.TrimSpace(candidate))
 	title, _ := parseTitleYearCandidate(candidate)
@@ -499,6 +484,13 @@ func extractMovieTitleYear(filePath, libraryRoot string) (string, int) {
 		return stem.Title, stem.Year
 	}
 	return parseTitleYearCandidate(nameNoExt)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func comparableTitlesOverlap(left string, right string) bool {

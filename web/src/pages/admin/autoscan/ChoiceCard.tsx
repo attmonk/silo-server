@@ -1,6 +1,5 @@
 import type { ReactNode } from "react";
 
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 /**
@@ -41,7 +40,7 @@ export function ChoiceCard({
       aria-describedby={describedBy}
       onClick={disabled ? undefined : onSelect}
       className={cn(
-        "rounded-lg border p-3 text-start transition-colors aria-disabled:cursor-not-allowed aria-disabled:opacity-60",
+        "rounded-lg border p-3 text-left transition-colors aria-disabled:cursor-not-allowed aria-disabled:opacity-60",
         selected
           ? "border-primary bg-accent"
           : "border-border [&:not([aria-disabled])]:hover:bg-accent/50",
@@ -65,9 +64,6 @@ export function ChoiceCard({
   );
 }
 
-/** Marks a completed step; a symbol, not text. */
-const DONE_MARK = "✓";
-
 export interface Step {
   label: string;
   /** Answered: the operator has filled it in, or moved on past an optional one. */
@@ -81,7 +77,6 @@ export interface Step {
  * The first unanswered step is the current one.
  */
 export function StepTrail({ steps }: { steps: Step[] }) {
-  const t = useT();
   if (steps.length < 2) return null;
   const currentIndex = steps.findIndex((step) => !step.done);
 
@@ -107,12 +102,10 @@ export function StepTrail({ steps }: { steps: Step[] }) {
                   done && "border-success/40 bg-success/15 text-success",
                 )}
               >
-                {done ? DONE_MARK : index + 1}
+                {done ? "✓" : index + 1}
               </span>
               {step.label}
-              {done && (
-                <span className="sr-only">{t("web.admin.autoscan.sourceDialog.stepDone")}</span>
-              )}
+              {done && <span className="sr-only">(done)</span>}
             </span>
           </li>
         );

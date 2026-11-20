@@ -2,8 +2,6 @@ import type { PersonalizedSorts } from "@/lib/querySortOptions";
 import { useShownRatingSources } from "@/hooks/queries/ratingsCapability";
 import { useMemo } from "react";
 
-import { useT } from "@/i18n";
-
 import {
   normalizeQueryDefinition,
   type CatalogFiltersResponse,
@@ -419,7 +417,6 @@ export default function CollectionGuidedRulesEditor({
   libraryType,
   catalogState,
 }: CollectionGuidedRulesEditorProps) {
-  const t = useT();
   const state = useMemo(() => queryDefinitionToGuidedState(value), [value]);
   const metadataFiltersQuery = useCatalogMetadataFilters();
   const filters = providedFilters ?? metadataFiltersQuery.data;
@@ -437,20 +434,20 @@ export default function CollectionGuidedRulesEditor({
     state.mediaScope === "manga";
   const isBookLibrary = isAudiobookLibrary || isEbookLibrary;
   const progressStatusLabel = isEbookLibrary
-    ? t("web.collections.guidedRules.readStatus")
+    ? "Read Status"
     : isAudiobookLibrary
-      ? t("web.collections.guidedRules.listeningStatus")
-      : t("web.collections.guidedRules.watchStatus");
+      ? "Listening Status"
+      : "Watch Status";
   const completedProgressLabel = isEbookLibrary
-    ? t("web.collections.guidedRules.read")
+    ? "Read"
     : isAudiobookLibrary
-      ? t("web.collections.guidedRules.listened")
-      : t("web.collections.guidedRules.watched");
+      ? "Listened"
+      : "Watched";
   const unstartedProgressLabel = isEbookLibrary
-    ? t("web.collections.guidedRules.unread")
+    ? "Unread"
     : isAudiobookLibrary
-      ? t("web.collections.guidedRules.unlistened")
-      : t("web.collections.guidedRules.unwatched");
+      ? "Unlistened"
+      : "Unwatched";
   const shownRatingSources = useShownRatingSources();
   const sortOptions = getCollectionSortOptions(
     allowPersonalizedSorts,
@@ -500,7 +497,7 @@ export default function CollectionGuidedRulesEditor({
         >
           {showMediaScopeSelector ? (
             <div className="space-y-2">
-              <Label>{t("web.collections.guidedRules.mediaType")}</Label>
+              <Label>Media Type</Label>
               <Select
                 value={state.mediaScope}
                 onValueChange={(v) => {
@@ -523,18 +520,14 @@ export default function CollectionGuidedRulesEditor({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">{t("web.collections.rules.mediaAll")}</SelectItem>
-                  <SelectItem value="video">{t("web.collections.rules.mediaVideo")}</SelectItem>
-                  <SelectItem value="movie">{t("web.collections.rules.mediaMovies")}</SelectItem>
-                  <SelectItem value="series">{t("web.collections.rules.mediaSeries")}</SelectItem>
-                  <SelectItem value="episode">
-                    {t("web.collections.rules.mediaEpisodes")}
-                  </SelectItem>
-                  <SelectItem value="audiobook">
-                    {t("web.collections.rules.mediaAudiobooks")}
-                  </SelectItem>
-                  <SelectItem value="ebook">{t("web.collections.rules.mediaEbooks")}</SelectItem>
-                  <SelectItem value="manga">{t("web.collections.rules.mediaManga")}</SelectItem>
+                  <SelectItem value="all">All Media</SelectItem>
+                  <SelectItem value="video">Movies & Series</SelectItem>
+                  <SelectItem value="movie">Movies</SelectItem>
+                  <SelectItem value="series">Series</SelectItem>
+                  <SelectItem value="episode">Episodes</SelectItem>
+                  <SelectItem value="audiobook">Audiobooks</SelectItem>
+                  <SelectItem value="ebook">Ebooks</SelectItem>
+                  <SelectItem value="manga">Manga</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -542,7 +535,7 @@ export default function CollectionGuidedRulesEditor({
 
           {allowLibrarySelection ? (
             <div className="space-y-2">
-              <Label>{t("web.collections.rules.libraries")}</Label>
+              <Label>Libraries</Label>
               <LibraryMultiSelect
                 libraries={libraries}
                 value={state.libraryIds}
@@ -554,23 +547,21 @@ export default function CollectionGuidedRulesEditor({
       ) : null}
 
       <div className="space-y-2">
-        <Label>{t("web.collections.guidedRules.genres")}</Label>
+        <Label>Genres</Label>
         <SearchableMultiSelect
           options={filters?.genres ?? []}
           value={state.genres}
           onChange={(genres) => update({ genres })}
-          placeholder={t("web.collections.guidedRules.selectGenres")}
+          placeholder="Select genres..."
           disabled={readOnly}
           isLoading={filtersLoading}
         />
-        <p className="text-muted-foreground text-xs">
-          {t("web.collections.guidedRules.genresHelp")}
-        </p>
+        <p className="text-muted-foreground text-xs">Items must match all selected genres.</p>
       </div>
 
       <div className="grid gap-4 md:grid-cols-3">
         <div className="space-y-2">
-          <Label>{t("web.collections.guidedRules.decade")}</Label>
+          <Label>Decade</Label>
           <Select
             value={state.decade || "__custom__"}
             onValueChange={(value) => updateDecade(value === "__custom__" ? "" : value)}
@@ -580,32 +571,32 @@ export default function CollectionGuidedRulesEditor({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="__custom__">{t("web.collections.guidedRules.custom")}</SelectItem>
+              <SelectItem value="__custom__">Custom</SelectItem>
               {DECADE_OPTIONS.map((year) => (
                 <SelectItem key={year} value={String(year)}>
-                  {t("web.collections.guidedRules.decadeOption", { decade: year })}
+                  {year}s
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
         </div>
         <div className="space-y-2">
-          <Label>{t("web.collections.guidedRules.yearFrom")}</Label>
+          <Label>Year From</Label>
           <Input
             type="number"
             value={state.yearFrom}
             onChange={(e) => update({ yearFrom: e.target.value, decade: "" })}
-            placeholder={t("web.collections.guidedRules.yearFromPlaceholder")}
+            placeholder="e.g. 2000"
             disabled={readOnly}
           />
         </div>
         <div className="space-y-2">
-          <Label>{t("web.collections.guidedRules.yearTo")}</Label>
+          <Label>Year To</Label>
           <Input
             type="number"
             value={state.yearTo}
             onChange={(e) => update({ yearTo: e.target.value, decade: "" })}
-            placeholder={t("web.collections.guidedRules.yearToPlaceholder")}
+            placeholder="e.g. 2025"
             disabled={readOnly}
           />
         </div>
@@ -614,7 +605,7 @@ export default function CollectionGuidedRulesEditor({
       {isBookLibrary ? null : (
         <div className="grid gap-4 md:grid-cols-2">
           <div className="space-y-2">
-            <Label>{t("web.collections.guidedRules.minRating")}</Label>
+            <Label>Minimum IMDb Rating</Label>
             <Input
               type="number"
               min={0}
@@ -622,17 +613,17 @@ export default function CollectionGuidedRulesEditor({
               step={0.1}
               value={state.minRating}
               onChange={(e) => update({ minRating: e.target.value })}
-              placeholder={t("web.collections.guidedRules.minRatingPlaceholder")}
+              placeholder="e.g. 7.0"
               disabled={readOnly}
             />
           </div>
           <div className="space-y-2">
-            <Label>{t("web.collections.guidedRules.contentRating")}</Label>
+            <Label>Content Rating</Label>
             <SearchableSelect
               options={filters?.content_ratings ?? []}
               value={state.contentRating}
               onChange={(contentRating) => update({ contentRating })}
-              placeholder={t("web.collections.guidedRules.selectRating")}
+              placeholder="Select rating..."
               disabled={readOnly}
               isLoading={filtersLoading}
             />
@@ -641,12 +632,12 @@ export default function CollectionGuidedRulesEditor({
       )}
 
       <div className="space-y-2">
-        <Label>{t("web.collections.guidedRules.originalLanguage")}</Label>
+        <Label>Original Language</Label>
         <SearchableMultiSelect
           options={languageOptions}
           value={state.originalLanguages}
           onChange={(originalLanguages) => update({ originalLanguages })}
-          placeholder={t("web.collections.guidedRules.selectLanguages")}
+          placeholder="Select languages..."
           disabled={readOnly}
           isLoading={filtersLoading}
           getLabel={formatLanguage}
@@ -657,7 +648,7 @@ export default function CollectionGuidedRulesEditor({
         <>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label>{t("web.collections.guidedRules.actor")}</Label>
+              <Label>Actor</Label>
               <PersonSearchSelect
                 value={state.actor}
                 onChange={(actor) => update({ actor })}
@@ -665,7 +656,7 @@ export default function CollectionGuidedRulesEditor({
               />
             </div>
             <div className="space-y-2">
-              <Label>{t("web.collections.guidedRules.director")}</Label>
+              <Label>Director</Label>
               <PersonSearchSelect
                 value={state.director}
                 onChange={(director) => update({ director })}
@@ -676,7 +667,7 @@ export default function CollectionGuidedRulesEditor({
 
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label>{t("web.collections.guidedRules.writer")}</Label>
+              <Label>Writer</Label>
               <PersonSearchSelect
                 value={state.writer}
                 onChange={(writer) => update({ writer })}
@@ -684,7 +675,7 @@ export default function CollectionGuidedRulesEditor({
               />
             </div>
             <div className="space-y-2">
-              <Label>{t("web.collections.guidedRules.producer")}</Label>
+              <Label>Producer</Label>
               <PersonSearchSelect
                 value={state.producer}
                 onChange={(producer) => update({ producer })}
@@ -695,23 +686,23 @@ export default function CollectionGuidedRulesEditor({
 
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label>{t("web.collections.guidedRules.studio")}</Label>
+              <Label>Studio</Label>
               <SearchableSelect
                 options={filters?.studios ?? []}
                 value={state.studio}
                 onChange={(studio) => update({ studio })}
-                placeholder={t("web.collections.guidedRules.selectStudio")}
+                placeholder="Select studio..."
                 disabled={readOnly}
                 isLoading={filtersLoading}
               />
             </div>
             <div className="space-y-2">
-              <Label>{t("web.collections.guidedRules.network")}</Label>
+              <Label>Network</Label>
               <SearchableSelect
                 options={filters?.networks ?? []}
                 value={state.network}
                 onChange={(network) => update({ network })}
-                placeholder={t("web.collections.guidedRules.selectNetwork")}
+                placeholder="Select network..."
                 disabled={readOnly}
                 isLoading={filtersLoading}
               />
@@ -724,14 +715,14 @@ export default function CollectionGuidedRulesEditor({
         <>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label>{t("web.collections.guidedRules.author")}</Label>
+              <Label>Author</Label>
               {catalogState ? (
                 <FacetSearchSelect
                   facet="author"
                   state={catalogState}
                   value={state.author}
                   onChange={(author) => update({ author })}
-                  placeholder={t("web.collections.guidedRules.searchAuthors")}
+                  placeholder="Search authors..."
                   disabled={readOnly}
                 />
               ) : (
@@ -739,7 +730,7 @@ export default function CollectionGuidedRulesEditor({
                   options={filters?.authors ?? []}
                   value={state.author}
                   onChange={(author) => update({ author })}
-                  placeholder={t("web.collections.guidedRules.selectAuthor")}
+                  placeholder="Select author..."
                   disabled={readOnly}
                   isLoading={filtersLoading}
                 />
@@ -747,14 +738,14 @@ export default function CollectionGuidedRulesEditor({
             </div>
             {isAudiobookLibrary ? (
               <div className="space-y-2">
-                <Label>{t("web.collections.guidedRules.narrator")}</Label>
+                <Label>Narrator</Label>
                 {catalogState ? (
                   <FacetSearchSelect
                     facet="narrator"
                     state={catalogState}
                     value={state.narrator}
                     onChange={(narrator) => update({ narrator })}
-                    placeholder={t("web.collections.guidedRules.searchNarrators")}
+                    placeholder="Search narrators..."
                     disabled={readOnly}
                   />
                 ) : (
@@ -762,7 +753,7 @@ export default function CollectionGuidedRulesEditor({
                     options={filters?.narrators ?? []}
                     value={state.narrator}
                     onChange={(narrator) => update({ narrator })}
-                    placeholder={t("web.collections.guidedRules.selectNarrator")}
+                    placeholder="Select narrator..."
                     disabled={readOnly}
                     isLoading={filtersLoading}
                   />
@@ -772,14 +763,14 @@ export default function CollectionGuidedRulesEditor({
           </div>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label>{t("web.collections.guidedRules.series")}</Label>
+              <Label>Series</Label>
               {catalogState ? (
                 <FacetSearchSelect
                   facet="series"
                   state={catalogState}
                   value={state.series}
                   onChange={(series) => update({ series })}
-                  placeholder={t("web.collections.guidedRules.searchSeries")}
+                  placeholder="Search series..."
                   disabled={readOnly}
                 />
               ) : (
@@ -787,7 +778,7 @@ export default function CollectionGuidedRulesEditor({
                   options={filters?.series ?? []}
                   value={state.series}
                   onChange={(series) => update({ series })}
-                  placeholder={t("web.collections.guidedRules.selectSeries")}
+                  placeholder="Select series..."
                   disabled={readOnly}
                   isLoading={filtersLoading}
                 />
@@ -799,12 +790,12 @@ export default function CollectionGuidedRulesEditor({
 
       <div className="grid gap-4 md:grid-cols-2">
         <div className="space-y-2">
-          <Label>{t("web.collections.guidedRules.country")}</Label>
+          <Label>Country</Label>
           <SearchableSelect
             options={filters?.countries ?? []}
             value={state.country}
             onChange={(country) => update({ country })}
-            placeholder={t("web.collections.guidedRules.selectCountry")}
+            placeholder="Select country..."
             disabled={readOnly}
             isLoading={filtersLoading}
           />
@@ -813,22 +804,20 @@ export default function CollectionGuidedRulesEditor({
 
       <div className={cn("grid gap-4", allowPersonalizedFilters ? "md:grid-cols-2" : undefined)}>
         <div className="space-y-2">
-          <Label>{t("web.collections.guidedRules.matchStatus")}</Label>
+          <Label>Match Status</Label>
           <Select
             value={state.status || "__any__"}
             onValueChange={(v) => update({ status: v === "__any__" ? "" : v })}
             disabled={readOnly}
           >
             <SelectTrigger>
-              <SelectValue placeholder={t("web.collections.guidedRules.any")} />
+              <SelectValue placeholder="Any" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="__any__">{t("web.collections.guidedRules.any")}</SelectItem>
-              <SelectItem value="matched">{t("web.collections.guidedRules.matched")}</SelectItem>
-              <SelectItem value="unmatched">
-                {t("web.collections.guidedRules.unmatched")}
-              </SelectItem>
-              <SelectItem value="pending">{t("web.collections.guidedRules.pending")}</SelectItem>
+              <SelectItem value="__any__">Any</SelectItem>
+              <SelectItem value="matched">Matched</SelectItem>
+              <SelectItem value="unmatched">Unmatched</SelectItem>
+              <SelectItem value="pending">Pending</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -846,15 +835,13 @@ export default function CollectionGuidedRulesEditor({
               disabled={readOnly}
             >
               <SelectTrigger>
-                <SelectValue placeholder={t("web.collections.guidedRules.any")} />
+                <SelectValue placeholder="Any" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="__any__">{t("web.collections.guidedRules.any")}</SelectItem>
+                <SelectItem value="__any__">Any</SelectItem>
                 <SelectItem value="watched">{completedProgressLabel}</SelectItem>
                 <SelectItem value="unwatched">{unstartedProgressLabel}</SelectItem>
-                <SelectItem value="in_progress">
-                  {t("web.collections.guidedRules.inProgress")}
-                </SelectItem>
+                <SelectItem value="in_progress">In Progress</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -863,7 +850,7 @@ export default function CollectionGuidedRulesEditor({
 
       {isBookLibrary ? null : (
         <div className="space-y-2">
-          <Label>{t("web.collections.guidedRules.videoQuality")}</Label>
+          <Label>Video Quality</Label>
           <div className="flex flex-wrap gap-2">
             {[
               { key: "fourK", label: "4K" },
@@ -894,20 +881,20 @@ export default function CollectionGuidedRulesEditor({
 
       <div className="grid gap-4 md:grid-cols-2">
         <div className="space-y-2">
-          <Label>{t("web.collections.guidedRules.addedInLast")}</Label>
+          <Label>Added in the Last</Label>
           <Input
             value={state.addedInLast}
             onChange={(e) => update({ addedInLast: e.target.value })}
-            placeholder={t("web.collections.guidedRules.addedInLastPlaceholder")}
+            placeholder="e.g. 30d, 2w, 6m"
             disabled={readOnly}
           />
         </div>
         <div className="space-y-2">
-          <Label>{t("web.collections.guidedRules.releasedInLast")}</Label>
+          <Label>Released in the Last</Label>
           <Input
             value={state.releasedInLast}
             onChange={(e) => update({ releasedInLast: e.target.value })}
-            placeholder={t("web.collections.guidedRules.releasedInLastPlaceholder")}
+            placeholder="e.g. 90d, 1y"
             disabled={readOnly}
           />
         </div>
@@ -916,7 +903,7 @@ export default function CollectionGuidedRulesEditor({
       {showSortControls ? (
         <div className="border-border grid gap-4 border-t pt-4 md:grid-cols-2">
           <div className="space-y-2">
-            <Label>{t("web.collections.guidedRules.sortBy")}</Label>
+            <Label>Sort By</Label>
             <Select
               value={selectedSort.field}
               onValueChange={(v) =>
@@ -937,7 +924,7 @@ export default function CollectionGuidedRulesEditor({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label>{t("web.collections.guidedRules.order")}</Label>
+            <Label>Order</Label>
             <Select
               value={state.sortOrder}
               onValueChange={(v) => update({ sortOrder: v as "asc" | "desc" })}
@@ -947,8 +934,8 @@ export default function CollectionGuidedRulesEditor({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="desc">{t("web.collections.guidedRules.descending")}</SelectItem>
-                <SelectItem value="asc">{t("web.collections.guidedRules.ascending")}</SelectItem>
+                <SelectItem value="desc">Descending</SelectItem>
+                <SelectItem value="asc">Ascending</SelectItem>
               </SelectContent>
             </Select>
           </div>

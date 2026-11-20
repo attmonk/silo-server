@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"log/slog"
 
-	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/settingskeys"
 	"github.com/Silo-Server/silo-server/internal/settingsresolve"
@@ -15,16 +14,9 @@ import (
 // HideWatchedItemsFromHome resolves the acting profile's Home preference.
 // Failure is fail-open: an unavailable preference store must not make media
 // disappear from Home unexpectedly.
-//
-// Like NextUpMode, a request that passed viewer access answers from its scope
-// without a store read; a scope whose preferences could not be read has no
-// NextUpMode and resolves here.
 func HideWatchedItemsFromHome(ctx context.Context, store userstore.UserStore, profileID string) bool {
 	if store == nil || profileID == "" {
 		return false
-	}
-	if scope, ok := access.GetScope(ctx); ok && scope.ProfileID == profileID && scope.NextUpMode != "" {
-		return scope.HideWatchedItemsOnHome
 	}
 
 	contract, err := settingscontract.Load()
@@ -60,9 +52,7 @@ func HideWatchedItemsFromHome(ctx context.Context, store userstore.UserStore, pr
 // it would drop the one card the viewer is resuming.
 func PreserveWatchedItemsOnHome(sectionType SectionType) bool {
 	switch sectionType {
-	case SectionMostWatched, SectionProfileActivityFeed, SectionForgottenFavorites, SectionContinueWatching,
-		// A row of collections has no titles to hide.
-		SectionCollectionPosters:
+	case SectionMostWatched, SectionProfileActivityFeed, SectionForgottenFavorites, SectionContinueWatching:
 		return true
 	default:
 		return false

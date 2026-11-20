@@ -9,7 +9,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/fspath"
 	"github.com/Silo-Server/silo-server/internal/playback/keyframes"
 )
 
@@ -105,10 +104,9 @@ func sheetKeyframes(ctx context.Context, req Request) []float64 {
 // matroskaKeyframes reads the keyframe times of the Matroska file at path
 // from its Cues and a few clusters' block headers (keyframes.ReadMatroska),
 // or returns nil. The file opens without blocking, so a FIFO in its place
-// cannot hold the lookup, and only a regular file is read. A relayed input (a
-// transcode node reading through the core) reads its Cues over HTTP.
+// cannot hold the lookup, and only a regular file is read.
 func matroskaKeyframes(ctx context.Context, path string) []float64 {
-	file, err := openKeyframeSource(ctx, path)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil
 	}
@@ -122,15 +120,6 @@ func matroskaKeyframes(ctx context.Context, path string) []float64 {
 		return nil
 	}
 	return index.Keyframes
-}
-
-// openKeyframeSource opens path for the Cues read: a relayed input through
-// its relay, a library path without blocking.
-func openKeyframeSource(ctx context.Context, path string) (fspath.Reader, error) {
-	if fspath.IsRelayed(path) {
-		return fspath.OpenReader(ctx, path)
-	}
-	return fspath.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 }
 
 // contextReaderAt stops reading once ctx ends.

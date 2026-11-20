@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { Link, Navigate } from "react-router";
+import { Link, useParams } from "react-router";
 import { captureSessionIdentity, getAccessToken, isSessionIdentityCurrent } from "@/api/client";
 import {
   completePasswordReset,
@@ -11,7 +11,6 @@ import { sessionFromTokenPair } from "@/api/v2/account";
 import { V2ProblemError } from "@/api/v2/request";
 import { useAuth } from "@/hooks/useAuth";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
-import { useLinkToken } from "@/hooks/useLinkToken";
 import { usePostSignInNavigation } from "@/hooks/usePostSignInNavigation";
 import { usePasswordResetAvailable } from "@/hooks/queries/passwordReset";
 import { formatDateTime } from "@/lib/datetime";
@@ -20,13 +19,9 @@ import { Button } from "@/components/ui/button";
 import { PasswordInput } from "@/components/PasswordInput";
 import { Label } from "@/components/ui/label";
 import { AuthCard, SignInHint } from "@/components/auth/AuthCard";
-import { useT } from "@/i18n";
 
 export default function PasswordReset() {
-  const token = useLinkToken();
-  // Opened without its token, as when something on the way dropped the
-  // link's fragment: the forgot-password page is where to get a new link.
-  if (!token) return <Navigate to="/forgot-password" replace />;
+  const { token = "" } = useParams();
   return <ResetForm key={token} token={token} />;
 }
 
@@ -54,8 +49,7 @@ function ResetForm({ token }: { token: string }) {
   const { available: canRequestLink } = usePasswordResetAvailable(lookup.unavailable === true);
   const busy = useRef(false);
   const lifetime = useRef<AbortController | null>(null);
-  const t = useT();
-  useDocumentTitle(t("web.auth.passwordReset.documentTitle"));
+  useDocumentTitle("Reset Password");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -92,12 +86,12 @@ function ResetForm({ token }: { token: string }) {
   // their session with the reset account's, so they sign out first.
   if (!loading && user && !completed) {
     return (
-      <AuthCard title={t("web.auth.passwordRules.resetPasswordTitle")}>
+      <AuthCard title="Reset password">
         <p className="mb-4 text-sm">
-          {t("web.auth.passwordReset.signedIn", { username: user.username })}
+          You&apos;re signed in as {user.username}. Sign out to use this reset link.
         </p>
         <Button className="w-full" onClick={logout}>
-          {t("common.signOut")}
+          Sign out
         </Button>
       </AuthCard>
     );
@@ -111,12 +105,12 @@ function ResetForm({ token }: { token: string }) {
   }
   if (signInAs) {
     return (
-      <AuthCard title={t("web.auth.passwordRules.passwordChanged")}>
+      <AuthCard title="Password changed">
         <p role="status" className="mb-4 text-sm">
-          {t("web.auth.passwordReset.signInAs", { username: signInAs })}
+          Sign in as {signInAs} with your new password.
         </p>
         <Button asChild className="w-full">
-          <Link to="/login">{t("web.auth.signIn")}</Link>
+          <Link to="/login">Sign in</Link>
         </Button>
       </AuthCard>
     );
@@ -124,27 +118,23 @@ function ResetForm({ token }: { token: string }) {
   if (!lookup.data) {
     return (
       <AuthCard
-        title={
-          lookup.unavailable
-            ? t("web.auth.passwordReset.unavailableTitle")
-            : t("web.auth.passwordReset.loadFailedTitle")
-        }
+        title={lookup.unavailable ? "Link unavailable" : "Could not load link"}
         description={
           lookup.unavailable
             ? canRequestLink
-              ? t("web.auth.passwordReset.unavailableRequestNew")
-              : t("web.auth.passwordReset.unavailableAskAdmin")
-            : t("web.auth.passwordReset.loadFailed")
+              ? "This link was already used, replaced by a newer one, or expired. Request a new link, or ask your admin for one."
+              : "This link was already used, replaced by a newer one, or expired. Ask your admin for a new link."
+            : "The server could not confirm this link. Try loading it again."
         }
       >
         {!lookup.unavailable && (
           <Button className="mb-4 w-full" onClick={reloadLookup}>
-            {t("web.auth.passwordReset.reloadLink")}
+            Reload link
           </Button>
         )}
         {lookup.unavailable && canRequestLink && (
           <Button asChild className="mb-4 w-full">
-            <Link to="/forgot-password">{t("web.auth.passwordReset.requestNewLink")}</Link>
+            <Link to="/forgot-password">Request a new link</Link>
           </Button>
         )}
         <SignInHint />
@@ -185,7 +175,7 @@ function ResetForm({ token }: { token: string }) {
       // A rejected password leaves the link unspent; anything else may have
       // committed, so the link is reloaded before another attempt.
       if (err instanceof V2ProblemError && err.problemType === "validation_failed") {
-        setError(passwordErrorMessage(err, t("web.auth.passwordReset.setFailed")));
+        setError(passwordErrorMessage(err, "Could not set the password."));
       } else if (err instanceof V2ProblemError && err.status === 404) {
         setLookup({ pending: false, unavailable: true });
       } else {
@@ -200,11 +190,8 @@ function ResetForm({ token }: { token: string }) {
   return (
     <AuthCard
       eyebrow={reset.server_name}
-      title={t("web.auth.passwordRules.chooseNewPassword")}
-      description={t("web.auth.passwordReset.description", {
-        username: reset.username,
-        expires: formatDateTime(reset.expires_at),
-      })}
+      title="Choose a new password"
+      description={`For ${reset.username}. The link expires ${formatDateTime(reset.expires_at)}. Saving signs this account out on every device.`}
     >
       {error && (
         <p role="alert" className="text-destructive mb-4 text-sm">
@@ -213,16 +200,19 @@ function ResetForm({ token }: { token: string }) {
       )}
       {recovery && (
         <div role="alert" className="mb-4 space-y-3 text-sm">
-          <p>{t("web.auth.passwordReset.recovery")}</p>
+          <p>
+            We could not confirm the result. Your password may have changed. Try signing in with the
+            new password, or reload this link before trying again.
+          </p>
           <Button type="button" variant="outline" onClick={reloadLookup}>
-            {t("web.auth.passwordReset.reloadLink")}
+            Reload link
           </Button>
         </div>
       )}
       <form onSubmit={handleSubmit} className="space-y-4">
         <div className="space-y-2">
-          <Label htmlFor="reset-password">{t("web.auth.passwordRules.newPassword")}</Label>
-          <p className="text-muted-foreground text-xs">{t("web.auth.passwordRules.minLength")}</p>
+          <Label htmlFor="reset-password">New password</Label>
+          <p className="text-muted-foreground text-xs">At least 8 characters</p>
           <PasswordInput
             id="reset-password"
             value={password}
@@ -234,9 +224,7 @@ function ResetForm({ token }: { token: string }) {
           />
         </div>
         <div className="space-y-2">
-          <Label htmlFor="reset-confirm-password">
-            {t("web.auth.passwordRules.confirmNewPassword")}
-          </Label>
+          <Label htmlFor="reset-confirm-password">Confirm new password</Label>
           <PasswordInput
             id="reset-confirm-password"
             value={confirmation}
@@ -247,7 +235,7 @@ function ResetForm({ token }: { token: string }) {
           />
         </div>
         <Button type="submit" className="w-full" disabled={submitting || recovery}>
-          {submitting ? t("web.ui.saving") : t("web.auth.passwordRules.savePassword")}
+          {submitting ? "Saving..." : "Save password"}
         </Button>
       </form>
       <SignInHint />

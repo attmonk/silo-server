@@ -1,7 +1,6 @@
 import { Eye, KeyRound, MonitorPlay, ScrollText, type LucideIcon } from "lucide-react";
 
 import type { PolicyDocument } from "@/api/adminPolicy";
-import { useT, type MessageKey, type Translate } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 import { formatPolicyDomain } from "./policyPageUtils";
@@ -11,7 +10,7 @@ export interface PolicyDomainMeta {
   title: string;
   /** Plain-language summary of what this domain governs. */
   governs: string;
-  /** A concrete example of a narrowing rule an admin might write, unquoted. */
+  /** A concrete example of a narrowing rule an admin might write. */
   example: string;
   /**
    * Plain-language statements of what the shipped baseline enforces. These
@@ -23,78 +22,65 @@ export interface PolicyDomainMeta {
   overrideCan: string;
 }
 
-interface DomainMetaKeys {
-  icon: LucideIcon;
-  title: MessageKey;
-  governs: MessageKey;
-  example: MessageKey;
-  baseline: MessageKey[];
-  overrideCan: MessageKey;
-}
-
-const DOMAIN_META: Record<string, DomainMetaKeys> = {
+const DOMAIN_META: Record<string, PolicyDomainMeta> = {
   scope: {
     icon: Eye,
-    title: "web.admin.access.policy.domain.scope.title",
-    governs: "web.admin.access.policy.domain.scope.governs",
-    example: "web.admin.access.policy.domain.scope.example",
+    title: "Library visibility",
+    governs:
+      "What each profile can see: allowed libraries, the content-rating ceiling, and the playback-quality ceiling. Evaluated on every signed-in request.",
+    example: "“After 21:00, cap every profile at PG.”",
     baseline: [
-      "web.admin.access.policy.domain.scope.baseline1",
-      "web.admin.access.policy.domain.scope.baseline2",
-      "web.admin.access.policy.domain.scope.baseline3",
-      "web.admin.access.policy.domain.scope.baseline4",
-      "web.admin.access.policy.domain.scope.baseline5",
+      "A profile sees only the libraries allowed for both the account and the profile — whichever of the two restricts, applies.",
+      "Libraries a user hid for themselves stay hidden.",
+      "The profile's content-rating ceiling hides anything rated above it (see the rating tiers below).",
+      "Playback quality is capped at the stricter of the account and profile ceilings.",
+      "A profile protected by a PIN must be verified before it sees anything.",
     ],
-    overrideCan: "web.admin.access.policy.domain.scope.overrideCan",
+    overrideCan:
+      "An override can remove libraries from view, lower the rating or quality ceiling, or mark the profile unverified — it can never add access the baseline denied.",
   },
   permission: {
     icon: KeyRound,
-    title: "web.admin.access.policy.domain.permission.title",
-    governs: "web.admin.access.policy.domain.permission.governs",
-    example: "web.admin.access.policy.domain.permission.example",
+    title: "Admin & permissions",
+    governs:
+      "The acting-admin gate and per-user permissions such as marker editing and metadata curation.",
+    example: "“Deny metadata curation on weekends.”",
     baseline: [
-      "web.admin.access.policy.domain.permission.baseline1",
-      "web.admin.access.policy.domain.permission.baseline2",
-      "web.admin.access.policy.domain.permission.baseline3",
-      "web.admin.access.policy.domain.permission.baseline4",
+      "Disabled accounts are denied everything.",
+      "Admin actions require the admin role, used from the household's primary profile (or before any profile is chosen).",
+      "Marker editing: admins automatically; everyone else needs the permission assigned to their account.",
+      "Metadata curation: same rule, and the item must also live inside the user's allowed libraries.",
     ],
-    overrideCan: "web.admin.access.policy.domain.permission.overrideCan",
+    overrideCan:
+      "An override can deny a permission the baseline would grant — it can never grant one the baseline denies.",
   },
   action: {
     icon: MonitorPlay,
-    title: "web.admin.access.policy.domain.action.title",
-    governs: "web.admin.access.policy.domain.action.governs",
-    example: "web.admin.access.policy.domain.action.example",
+    title: "Downloads & playback",
+    governs:
+      "Download and transcode eligibility, plus how many concurrent streams and transcodes a user may run.",
+    example: "“No downloads between 22:00 and 07:00.”",
     baseline: [
-      "web.admin.access.policy.domain.action.baseline1",
-      "web.admin.access.policy.domain.action.baseline2",
-      "web.admin.access.policy.domain.action.baseline3",
+      "Downloads require downloads to be enabled on the server and allowed for the user.",
+      "Transcoded downloads additionally require transcoding to be enabled, allowed for the user, and a prepared artifact.",
+      "New streams are admitted while the user is under their concurrent-stream limit; transcodes also check the transcode limit. A limit of 0 means unlimited.",
     ],
-    overrideCan: "web.admin.access.policy.domain.action.overrideCan",
+    overrideCan:
+      "An override can deny a download or stream the baseline would allow, or tighten the quality ceiling — never the reverse.",
   },
 };
 
-/** A domain's presentation in the current language (`t` from the calling component). */
-export function policyDomainMeta(domain: string, t: Translate): PolicyDomainMeta {
-  const keys = Object.hasOwn(DOMAIN_META, domain) ? DOMAIN_META[domain] : undefined;
-  if (!keys) {
-    return {
-      icon: ScrollText,
-      title: formatPolicyDomain(domain),
-      governs: t("web.admin.access.policy.domain.unknownGoverns"),
-      example: "",
-      baseline: [],
-      overrideCan: "",
-    };
-  }
-  return {
-    icon: keys.icon,
-    title: t(keys.title),
-    governs: t(keys.governs),
-    example: t(keys.example),
-    baseline: keys.baseline.map((key) => t(key)),
-    overrideCan: t(keys.overrideCan),
-  };
+const FALLBACK_META: PolicyDomainMeta = {
+  icon: ScrollText,
+  title: "Policy",
+  governs: "Custom decisions for this domain.",
+  example: "",
+  baseline: [],
+  overrideCan: "",
+};
+
+export function policyDomainMeta(domain: string): PolicyDomainMeta {
+  return DOMAIN_META[domain] ?? { ...FALLBACK_META, title: formatPolicyDomain(domain) };
 }
 
 export type PolicyDocumentStatus = "live" | "draft" | "disabled";
@@ -104,10 +90,10 @@ export function policyDocumentStatus(document: PolicyDocument): PolicyDocumentSt
   return document.active_version_id ? "live" : "draft";
 }
 
-const STATUS_PRESENTATION: Record<PolicyDocumentStatus, { label: MessageKey; dot: string }> = {
-  live: { label: "web.admin.access.policy.status.active", dot: "bg-emerald-400" },
-  draft: { label: "web.admin.access.policy.status.draft", dot: "bg-amber-400" },
-  disabled: { label: "web.admin.access.policy.status.disabled", dot: "bg-muted-foreground/50" },
+const STATUS_PRESENTATION: Record<PolicyDocumentStatus, { label: string; dot: string }> = {
+  live: { label: "Active", dot: "bg-emerald-400" },
+  draft: { label: "Draft", dot: "bg-amber-400" },
+  disabled: { label: "Disabled", dot: "bg-muted-foreground/50" },
 };
 
 interface PolicyStatusPillProps {
@@ -118,7 +104,6 @@ interface PolicyStatusPillProps {
 }
 
 export function PolicyStatusPill({ status, versionNumber, className }: PolicyStatusPillProps) {
-  const t = useT();
   const presentation = STATUS_PRESENTATION[status];
   return (
     <span
@@ -128,11 +113,9 @@ export function PolicyStatusPill({ status, versionNumber, className }: PolicySta
       )}
     >
       <span aria-hidden className={cn("size-1.5 rounded-full", presentation.dot)} />
-      {t(presentation.label)}
+      {presentation.label}
       {status === "live" && versionNumber !== undefined && (
-        <span className="text-muted-foreground">
-          {t("web.admin.access.policy.versionNumber", { version: versionNumber })}
-        </span>
+        <span className="text-muted-foreground">v{versionNumber}</span>
       )}
     </span>
   );

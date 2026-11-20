@@ -192,3 +192,14 @@ func TestYieldCanceledWhileWaitingKeepsOtherSlot(t *testing.T) {
 		}
 	})
 }
+
+func TestYieldOutsideJobOnlyReportsContext(t *testing.T) {
+	if err := Yield(context.Background()); err != nil {
+		t.Fatalf("Yield = %v, want nil outside a job", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := Yield(ctx); err == nil {
+		t.Fatal("Yield ignored a canceled context")
+	}
+}

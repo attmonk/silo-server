@@ -5,10 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (

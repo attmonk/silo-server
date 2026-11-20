@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 import type { SetMarkersRequest } from "@/api/types";
 import { getItemMarkers, setItemMarkers, getItemMarkerHistory } from "@/api/v2/markers";
 import { adminKeys, itemKeys } from "@/hooks/queries/keys";
@@ -21,7 +20,7 @@ export function useSetItemMarkers(itemId: string | undefined) {
   return useMutation({
     mutationFn: (body: SetMarkersRequest) => setItemMarkers(itemId ?? "", body),
     onSuccess: (data) => {
-      toast.success(t("web.common.toast.markers.saved"));
+      toast.success("Markers saved");
       if (itemId) {
         queryClient.setQueryData(itemKeys.markers(itemId), data);
         // Detail/watch responses embed markers, so refresh them too. Invalidate
@@ -34,9 +33,7 @@ export function useSetItemMarkers(itemId: string | undefined) {
       }
     },
     onError: (error: unknown) => {
-      toast.error(
-        error instanceof Error ? error.message : t("web.common.toast.markers.saveFailed"),
-      );
+      toast.error(error instanceof Error ? error.message : "Failed to save markers");
     },
   });
 }

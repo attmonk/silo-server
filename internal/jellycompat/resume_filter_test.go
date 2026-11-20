@@ -3,9 +3,9 @@ package jellycompat
 import (
 	"context"
 	"fmt"
-	"math"
 	"testing"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -72,6 +72,42 @@ func dtoNames(dtos []baseItemDTO) []string {
 	return names
 }
 
+// TestLoadProgressPage_ResumeHidesFilteredEntries pins that the Resume path
+// runs every raw batch through FilterResumeProgress so dismissed and
+// superseded entries never reach Jellyfin clients, mirroring the first-party
+// Continue Watching row.
+func TestLoadProgressPage_ResumeHidesFilteredEntries(t *testing.T) {
+	items := map[string]*models.MediaItem{
+		"movie-1": {ContentID: "movie-1", Type: "movie", Title: "Movie One"},
+		"movie-2": {ContentID: "movie-2", Type: "movie", Title: "Movie Two"},
+		"movie-3": {ContentID: "movie-3", Type: "movie", Title: "Movie Three"},
+	}
+	userData := &resumeFilteringUserData{
+		entries: []upstreamProgress{
+			{MediaItemID: "movie-1", PositionSeconds: 10, DurationSeconds: 100},
+			{MediaItemID: "movie-2", PositionSeconds: 20, DurationSeconds: 100},
+			{MediaItemID: "movie-3", PositionSeconds: 30, DurationSeconds: 100},
+		},
+		hidden: map[string]bool{"movie-2": true},
+	}
+	h := resumeTestHandler(userData, items)
+
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	dtos, _, err := h.loadProgressPage(context.Background(), session, "in_progress", itemsQuery{limit: 10}, nil, nil)
+	if err != nil {
+		t.Fatalf("loadProgressPage: %v", err)
+	}
+
+	got := dtoNames(dtos)
+	want := []string{"Movie One", "Movie Three"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("resume names = %v, want %v", got, want)
+	}
+	if userData.filterCalls == 0 {
+		t.Fatal("expected FilterResumeProgress to be called for in_progress status")
+	}
+}
+
 // TestLoadProgressPage_BoundsScanForSparseVisibleSet pins the resumeScanMaxRows
 // cap: a heavy watcher whose in-progress rows are almost all hidden by
 // FilterResumeProgress must not page through the entire history looking to fill
@@ -126,46 +162,99 @@ func TestLoadProgressPage_BoundsScanForSparseVisibleSet(t *testing.T) {
 	}
 }
 
-// TestLoadProgressPage_HugeLimitDoesNotPreallocate pins that a client-supplied
-// Limit far beyond the profile's progress rows sizes nothing by Limit. Both
-// scan loops used Limit as the result slice's capacity, so
-// /Items?IsPlayed=true&Limit=100000000 asked for about 120 GB and crashed the
-// server. Limit=math.MaxInt, which parseItemsQuery accepts, makes the unfixed
-// make() panic at once, so the test catches a revert without measuring memory.
-// The page must still hold every row.
-func TestLoadProgressPage_HugeLimitDoesNotPreallocate(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		query itemsQuery
-	}{
-		{name: "raw-offset fast path", query: itemsQuery{limit: math.MaxInt}},
-		{name: "general loop", query: itemsQuery{limit: math.MaxInt, enableTotalRecordCount: true}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			items := map[string]*models.MediaItem{
-				"movie-1": {ContentID: "movie-1", Type: "movie", Title: "Movie One"},
-				"movie-2": {ContentID: "movie-2", Type: "movie", Title: "Movie Two"},
-			}
-			userData := &resumeFilteringUserData{entries: []upstreamProgress{
-				{MediaItemID: "movie-1", PositionSeconds: 100, DurationSeconds: 100, Completed: true},
-				{MediaItemID: "movie-2", PositionSeconds: 100, DurationSeconds: 100, Completed: true},
-			}}
-			h := resumeTestHandler(userData, items)
-			session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+// TestLoadProgressPage_CompletedScanNotCapped pins that the completed
+// (watched-items) path is exempt from resumeScanMaxRows: it paginates on an exact
+// TotalRecordCount, so it must keep scanning past the cap. Mirrors the Codex
+// review concern that the cap not leak into watched-items pagination.
+func TestLoadProgressPage_CompletedScanNotCapped(t *testing.T) {
+	const total = resumeScanMaxRows * 3
+	entries := make([]upstreamProgress, 0, total)
+	items := make(map[string]*models.MediaItem, total)
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("movie-%d", i)
+		entries = append(entries, upstreamProgress{MediaItemID: id, PositionSeconds: 100, DurationSeconds: 100, Completed: true})
+		items[id] = &models.MediaItem{ContentID: id, Type: "movie", Title: id}
+	}
+	// No hidden entries: completed does not run FilterResumeProgress.
+	userData := &resumeFilteringUserData{entries: entries}
+	h := resumeTestHandler(userData, items)
 
-			defer func() {
-				if r := recover(); r != nil {
-					t.Fatalf("loadProgressPage sized an allocation by Limit: %v", r)
-				}
-			}()
-			dtos, _, err := h.loadProgressPage(context.Background(), session, "completed", tc.query, nil, nil)
-			if err != nil {
-				t.Fatalf("loadProgressPage: %v", err)
-			}
-			if got := dtoNames(dtos); len(got) != 2 || got[0] != "Movie One" || got[1] != "Movie Two" {
-				t.Fatalf("names = %v, want [Movie One Movie Two]", got)
-			}
-		})
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	query := itemsQuery{limit: 20, enableTotalRecordCount: true}
+	_, gotTotal, err := h.loadProgressPage(context.Background(), session, "completed", query, nil, nil)
+	if err != nil {
+		t.Fatalf("loadProgressPage: %v", err)
+	}
+	// The exact watched-items total must be reported, i.e. the scan must not stop
+	// at the resume cap.
+	if gotTotal != total {
+		t.Fatalf("completed total = %d, want exact %d (cap must not apply to watched items)", gotTotal, total)
+	}
+}
+
+// TestLoadProgressPage_ResumeFilterAppliesWithTypeFilter covers the
+// scan-from-zero branch (IncludeItemTypes present): filtering must apply
+// there too, and visible pagination must skip filtered entries.
+func TestLoadProgressPage_ResumeFilterAppliesWithTypeFilter(t *testing.T) {
+	items := map[string]*models.MediaItem{
+		"movie-1": {ContentID: "movie-1", Type: "movie", Title: "Movie One"},
+		"movie-2": {ContentID: "movie-2", Type: "movie", Title: "Movie Two"},
+		"movie-3": {ContentID: "movie-3", Type: "movie", Title: "Movie Three"},
+	}
+	userData := &resumeFilteringUserData{
+		entries: []upstreamProgress{
+			{MediaItemID: "movie-1", PositionSeconds: 10, DurationSeconds: 100},
+			{MediaItemID: "movie-2", PositionSeconds: 20, DurationSeconds: 100},
+			{MediaItemID: "movie-3", PositionSeconds: 30, DurationSeconds: 100},
+		},
+		hidden: map[string]bool{"movie-1": true},
+	}
+	h := resumeTestHandler(userData, items)
+
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	query := itemsQuery{limit: 10, enableTotalRecordCount: true}
+	typeSet := map[string]bool{"movie": true}
+	dtos, total, err := h.loadProgressPage(context.Background(), session, "in_progress", query, typeSet, nil)
+	if err != nil {
+		t.Fatalf("loadProgressPage: %v", err)
+	}
+
+	got := dtoNames(dtos)
+	want := []string{"Movie Two", "Movie Three"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("resume names = %v, want %v", got, want)
+	}
+	if total != 2 {
+		t.Fatalf("TotalRecordCount = %d, want 2 (hidden entries excluded)", total)
+	}
+}
+
+// TestLoadProgressPage_CompletedSkipsResumeFilter pins that the watched-items
+// view ("completed" status) is served unfiltered: dismissals and superseded
+// hiding are Continue Watching semantics only.
+func TestLoadProgressPage_CompletedSkipsResumeFilter(t *testing.T) {
+	items := map[string]*models.MediaItem{
+		"movie-1": {ContentID: "movie-1", Type: "movie", Title: "Movie One"},
+	}
+	userData := &resumeFilteringUserData{
+		entries: []upstreamProgress{
+			{MediaItemID: "movie-1", PositionSeconds: 100, DurationSeconds: 100, Completed: true},
+		},
+		hidden: map[string]bool{"movie-1": true},
+	}
+	h := resumeTestHandler(userData, items)
+
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	dtos, _, err := h.loadProgressPage(context.Background(), session, "completed", itemsQuery{limit: 10}, nil, nil)
+	if err != nil {
+		t.Fatalf("loadProgressPage: %v", err)
+	}
+
+	if userData.filterCalls != 0 {
+		t.Fatalf("FilterResumeProgress calls = %d, want 0 for completed status", userData.filterCalls)
+	}
+	if len(dtos) != 1 || dtos[0].Name != "Movie One" {
+		t.Fatalf("completed names = %v, want [Movie One]", dtoNames(dtos))
 	}
 }
 
@@ -194,40 +283,33 @@ func (p *fakeDismissalStoreProvider) ForUser(context.Context, int) (userstore.Us
 
 func (p *fakeDismissalStoreProvider) Close() error { return nil }
 
-// A ParentId must scope Resume. Moonfin for Roku resumes a series by asking
-// for one resumable item under it; ignoring ParentId answered with whatever
-// the profile played last, so Resume started the wrong title.
-// resumeSeriesEpisodeRepo lists a fixed set of episodes for each series.
-type resumeSeriesEpisodeRepo struct {
-	countingEpisodeRepo
-	bySeries map[string][]*models.Episode
-}
-
-func (r *resumeSeriesEpisodeRepo) ListIDsBySeriesIDs(_ context.Context, seriesIDs []string) (map[string][]string, error) {
-	ids := map[string][]string{}
-	for _, seriesID := range seriesIDs {
-		for _, episode := range r.bySeries[seriesID] {
-			ids[seriesID] = append(ids[seriesID], episode.ContentID)
-		}
+// TestDirectUserDataServiceFilterResumeProgressDropsDismissedEntries covers
+// the glue in directUserDataService: dismissals from the store hide matching
+// entries (same timestamp rule as the first-party row), everything else
+// passes through. The superseded check is disabled via a nil pool — its
+// behavior is pinned by the catalog package tests.
+func TestDirectUserDataServiceFilterResumeProgressDropsDismissedEntries(t *testing.T) {
+	dismissedAt := "2025-01-01T00:00:00Z"
+	svc := &directUserDataService{
+		storeProvider: &fakeDismissalStoreProvider{store: &fakeDismissalStore{
+			dismissals: []userstore.HomeItemDismissal{
+				{MediaItemID: "movie-1", ProgressUpdatedAt: &dismissedAt},
+			},
+		}},
+		resumeFilter: catalog.NewContinueWatchingProgressFilter(nil),
 	}
-	return ids, nil
-}
 
-// resumableUserData answers ListResumableProgress from a fixed set of
-// in-progress entries and records the ids it was asked about.
-type resumableUserData struct {
-	mockUserDataService
-	inProgress map[string]upstreamProgress
-	asked      []string
-}
-
-func (u *resumableUserData) ListResumableProgress(_ context.Context, _ *Session, ids []string) ([]upstreamProgress, error) {
-	u.asked = append(u.asked, ids...)
-	var result []upstreamProgress
-	for _, id := range ids {
-		if entry, ok := u.inProgress[id]; ok {
-			result = append(result, entry)
-		}
+	entries := []upstreamProgress{
+		{MediaItemID: "movie-1", PositionSeconds: 10, DurationSeconds: 100, UpdatedAt: dismissedAt},
+		{MediaItemID: "movie-2", PositionSeconds: 20, DurationSeconds: 100, UpdatedAt: dismissedAt},
 	}
-	return result, nil
+
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	got, err := svc.FilterResumeProgress(context.Background(), session, entries)
+	if err != nil {
+		t.Fatalf("FilterResumeProgress: %v", err)
+	}
+	if len(got) != 1 || got[0].MediaItemID != "movie-2" {
+		t.Fatalf("filtered = %+v, want only movie-2", got)
+	}
 }

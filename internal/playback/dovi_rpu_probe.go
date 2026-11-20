@@ -3,12 +3,12 @@ package playback
 import (
 	"context"
 	"log/slog"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 // Some Dolby Vision sources carry an RPU that ffmpeg's dovi_rpu bitstream
@@ -176,7 +176,7 @@ func (p *DVRPUProbe) CanStrip(ctx context.Context, bin, inputPath string) bool {
 // inheriting the old verdict, and on the binary because a different ffmpeg
 // build can parse a different set of RPUs.
 func dvRPUProbeKey(bin, inputPath string) (string, bool) {
-	info, err := fspath.Stat(inputPath)
+	info, err := os.Stat(inputPath)
 	if err != nil {
 		return "", false
 	}
@@ -209,7 +209,7 @@ func runDVRPUProbe(ctx context.Context, bin, inputPath string) dvRPUVerdict {
 	probeCtx, cancel := context.WithTimeout(ctx, dvRPUProbeTimeout)
 	defer cancel()
 
-	cmd := fspath.CommandContext(
+	cmd := exec.CommandContext(
 		probeCtx,
 		bin,
 		"-hide_banner",

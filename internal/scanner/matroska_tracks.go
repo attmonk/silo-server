@@ -11,9 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/fspath"
-	"github.com/Silo-Server/silo-server/internal/lang"
-	"github.com/Silo-Server/silo-server/internal/matroska"
 	"github.com/Silo-Server/silo-server/internal/mediaprobe"
 )
 
@@ -36,14 +33,36 @@ type matroskaSubtitleStream struct {
 var errMatroskaLayoutMismatch = errors.New("matroska tracks do not match the probed streams")
 
 const (
-	ffmpegCodecASS    = matroska.FFmpegCodecASS
-	ffmpegCodecSubRip = matroska.FFmpegCodecSubRip
+	ffmpegCodecWebVTT = "webvtt"
+	ffmpegCodecASS    = "ass"
+	ffmpegCodecSubRip = "subrip"
 	// Legacy Matroska codec IDs for ASS and SSA subtitles.
 	matroskaCodecIDASSLegacy = "S_ASS"
 	matroskaCodecIDSSALegacy = "S_SSA"
 	// containerMKV is the normalized container of Matroska and WebM files.
 	containerMKV = "mkv"
 )
+
+// ffmpegMatroskaSubtitleCodecs mirrors the subtitle rows of FFmpeg's
+// ff_mkv_codec_tags. FFmpeg matches a CodecID by prefix and takes the first
+// row that matches, so order matters.
+var ffmpegMatroskaSubtitleCodecs = []struct{ prefix, codec string }{
+	{"D_WEBVTT/SUBTITLES", ffmpegCodecWebVTT},
+	{"D_WEBVTT/CAPTIONS", ffmpegCodecWebVTT},
+	{"D_WEBVTT/DESCRIPTIONS", ffmpegCodecWebVTT},
+	{"D_WEBVTT/METADATA", ffmpegCodecWebVTT},
+	{"S_TEXT/UTF8", ffmpegCodecSubRip},
+	{"S_TEXT/ASCII", "text"},
+	{"S_TEXT/ASS", ffmpegCodecASS},
+	{"S_TEXT/SSA", ffmpegCodecASS},
+	{matroskaCodecIDASSLegacy, ffmpegCodecASS},
+	{matroskaCodecIDSSALegacy, ffmpegCodecASS},
+	{"S_VOBSUB", "dvd_subtitle"},
+	{"S_DVBSUB", "dvb_subtitle"},
+	{"S_HDMV/PGS", "hdmv_pgs_subtitle"},
+	{"S_HDMV/TEXTST", "hdmv_text_subtitle"},
+	{"S_ARIBSUB", "arib_caption"},
+}
 
 // unresolvableMatroskaCodecIDs are legacy aliases FFmpeg accepts but players
 // that identify tracks by TrackNumber do not: Media3's MatroskaExtractor
@@ -53,6 +72,15 @@ const (
 // the planner down a native route that fails and replans; without it the
 // track keeps server extraction.
 var unresolvableMatroskaCodecIDs = map[string]bool{matroskaCodecIDASSLegacy: true, matroskaCodecIDSSALegacy: true}
+
+func ffmpegMatroskaSubtitleCodec(codecID string) string {
+	for _, row := range ffmpegMatroskaSubtitleCodecs {
+		if strings.HasPrefix(codecID, row.prefix) {
+			return row.codec
+		}
+	}
+	return ""
+}
 
 // ffmpegCreatesMatroskaStream reports whether FFmpeg's Matroska demuxer turns
 // a TrackEntry into a stream. It mirrors the checks matroska_parse_tracks
@@ -74,33 +102,17 @@ func ffmpegCreatesMatroskaStream(track mediaprobe.MatroskaTrack) bool {
 	}
 }
 
-// matroskaSubtitleMatch is what the Tracks element says about one probed
-// subtitle stream: its canonical TrackNumber, empty when the match can't
-// corroborate the stream's codec, and, for a stream FFmpeg probed without a
-// codec, the codec the server reads it as through the index
-// (matroska.IndexOnlySubtitleCodec), with IndexOnly set. Language is the
-// entry's canonical LanguageBCP47 tag, empty when it has none or the match
-// can't corroborate the codec.
-type matroskaSubtitleMatch struct {
-	ID        string
-	Codec     string
-	IndexOnly bool
-	Language  string
-}
-
-// matroskaSubtitleTrackIDs matches each probed subtitle stream to its
-// TrackEntry, aligned with subtitles. It returns an error when the Tracks
-// element and the probed layout disagree anywhere, and an empty ID for a
-// track whose codec it cannot corroborate.
+// matroskaSubtitleTrackIDs returns the canonical TrackNumber of each probed
+// subtitle stream, aligned with subtitles. It returns an error when the
+// Tracks element and the probed layout disagree anywhere, and an empty ID for
+// a track whose codec it cannot corroborate.
 //
 // The probed layout is the number of playable video and audio streams plus
 // the subtitle streams. FFmpeg numbers streams in TrackEntry order, so the
 // match holds only when the entries FFmpeg turns into streams have exactly
 // those counts per type and every subtitle stream index lands on a subtitle
-// entry with the same codec. A stream FFmpeg probed without a codec matches
-// an entry whose CodecID it doesn't recognize; only one the server reads
-// through the index gets an ID.
-func matroskaSubtitleTrackIDs(tracks []mediaprobe.MatroskaTrack, videoStreams, audioStreams int, subtitles []matroskaSubtitleStream) ([]matroskaSubtitleMatch, error) {
+// entry with the same codec.
+func matroskaSubtitleTrackIDs(tracks []mediaprobe.MatroskaTrack, videoStreams, audioStreams int, subtitles []matroskaSubtitleStream) ([]string, error) {
 	numbers := make(map[uint64]struct{}, len(tracks))
 	var streams []mediaprobe.MatroskaTrack
 	video, audio, subtitle := 0, 0, 0
@@ -134,7 +146,7 @@ func matroskaSubtitleTrackIDs(tracks []mediaprobe.MatroskaTrack, videoStreams, a
 			errMatroskaLayoutMismatch, video, audio, subtitle, videoStreams, audioStreams, len(subtitles))
 	}
 
-	matches := make([]matroskaSubtitleMatch, len(subtitles))
+	ids := make([]string, len(subtitles))
 	seen := make(map[int]struct{}, len(subtitles))
 	for i, sub := range subtitles {
 		if sub.Index < 0 || sub.Index >= len(streams) {
@@ -148,27 +160,20 @@ func matroskaSubtitleTrackIDs(tracks []mediaprobe.MatroskaTrack, videoStreams, a
 		if track.Type != mediaprobe.MatroskaTrackTypeSubtitle {
 			return nil, fmt.Errorf("%w: stream %d is track type %d", errMatroskaLayoutMismatch, sub.Index, track.Type)
 		}
-		codec := matroska.FFmpegSubtitleCodec(track.CodecID)
+		codec := ffmpegMatroskaSubtitleCodec(track.CodecID)
 		if codec == "" {
-			// FFmpeg probes a CodecID it doesn't recognize as a stream with
-			// no codec, so only such a stream corroborates it.
-			if indexCodec := matroska.IndexOnlySubtitleCodec(track.CodecID); indexCodec != "" && sub.Codec == "" {
-				matches[i] = matroskaSubtitleMatch{ID: strconv.FormatUint(track.Number, 10), Codec: indexCodec, IndexOnly: true,
-					Language: lang.CanonicalTag(track.LanguageBCP47)}
-			}
 			continue
 		}
 		if !strings.EqualFold(codec, sub.Codec) {
 			return nil, fmt.Errorf("%w: stream %d is %q, track %d is %q",
 				errMatroskaLayoutMismatch, sub.Index, sub.Codec, track.Number, track.CodecID)
 		}
-		matches[i].Language = lang.CanonicalTag(track.LanguageBCP47)
 		if unresolvableMatroskaCodecIDs[track.CodecID] {
 			continue
 		}
-		matches[i].ID = strconv.FormatUint(track.Number, 10)
+		ids[i] = strconv.FormatUint(track.Number, 10)
 	}
-	return matches, nil
+	return ids, nil
 }
 
 // matroskaTracksReadTimeout bounds one Tracks read. The read is a few small
@@ -227,7 +232,7 @@ func readMatroskaTracks(ctx context.Context, path string) ([]mediaprobe.Matroska
 }
 
 func readMatroskaTracksFile(path string) ([]mediaprobe.MatroskaTrack, os.FileInfo, error) {
-	f, err := fspath.Open(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -247,16 +252,11 @@ func readMatroskaTracksFile(path string) ([]mediaprobe.MatroskaTrack, os.FileInf
 	return tracks, info, err
 }
 
-// applyMatroskaSubtitleTracks fills what FFprobe leaves out of probed
-// Matroska subtitle tracks: the container track ID, the codec of one FFprobe
-// couldn't name that the server reads through the index, and the region or
-// script of the language. FFprobe reports only the legacy ISO 639-2 Language
-// element, so two tracks muxed as pt-BR and pt-PT both probe as "por"; the
-// entry's LanguageBCP47 overrides it, as the Matroska specification says.
-// Failure is not a probe failure: the tracks keep FFprobe's values and play
-// through extraction.
-func applyMatroskaSubtitleTracks(ctx context.Context, filePath string, probe *ProbeData) {
-	if probe == nil || probe.Container != containerMKV || len(probe.SubtitleTracks) == 0 {
+// applyMatroskaSubtitleTrackIDs fills the container track ID of probed
+// Matroska subtitle tracks that FFprobe left without one. Failure is not a
+// probe failure: the tracks keep an empty ID and play through extraction.
+func applyMatroskaSubtitleTrackIDs(ctx context.Context, filePath string, probe *ProbeData) {
+	if probe == nil || probe.Container != containerMKV || !subtitleTracksMissingContainerID(probe.SubtitleTracks) {
 		return
 	}
 	subtitles := make([]matroskaSubtitleStream, len(probe.SubtitleTracks))
@@ -264,26 +264,27 @@ func applyMatroskaSubtitleTracks(ctx context.Context, filePath string, probe *Pr
 		subtitles[i] = matroskaSubtitleStream{Index: track.Index, Codec: track.Codec}
 	}
 	tracks, _, err := readMatroskaTracks(ctx, filePath)
-	var matches []matroskaSubtitleMatch
+	var ids []string
 	if err == nil {
-		matches, err = matroskaSubtitleTrackIDs(tracks, len(probe.VideoTracks), len(probe.AudioTracks), subtitles)
+		ids, err = matroskaSubtitleTrackIDs(tracks, len(probe.VideoTracks), len(probe.AudioTracks), subtitles)
 	}
 	if err != nil {
-		slog.DebugContext(ctx, "scanner: Matroska subtitle tracks not read",
+		slog.DebugContext(ctx, "scanner: Matroska subtitle track numbers not recorded",
 			"component", "scanner", "path", filePath, "error", err)
 		return
 	}
 	for i := range probe.SubtitleTracks {
-		track := &probe.SubtitleTracks[i]
-		if matches[i].Language != "" {
-			track.Language = matches[i].Language
-		}
-		if track.ContainerTrackID != "" {
-			continue
-		}
-		track.ContainerTrackID = matches[i].ID
-		if matches[i].IndexOnly {
-			track.Codec, track.IndexOnly = matches[i].Codec, true
+		if probe.SubtitleTracks[i].ContainerTrackID == "" {
+			probe.SubtitleTracks[i].ContainerTrackID = ids[i]
 		}
 	}
+}
+
+func subtitleTracksMissingContainerID(tracks []SubtitleTrackInfo) bool {
+	for _, track := range tracks {
+		if track.ContainerTrackID == "" {
+			return true
+		}
+	}
+	return false
 }

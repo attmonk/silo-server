@@ -17,9 +17,7 @@ import { useAdminUserProfiles } from "@/hooks/queries/admin/history";
 import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
 import { useAdminUserDevices } from "@/hooks/queries/admin/userActivity";
 import { useAdminUserCapabilities, useAdminUserSettings } from "@/hooks/queries/admin/users";
-import { useAppLanguage, useT } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
 
 import { userDetailTabSearch } from "../userDetailTabs";
 import { buildPreferenceLevels, type PreferenceLevel } from "./levels";
@@ -51,9 +49,6 @@ function LevelIcon({ level }: { level: PreferenceLevel }) {
  * and edits only what it sets.
  */
 export function PreferencesTab({ user }: { user: AdminUser }) {
-  const t = useT();
-  // Level names and group titles come from a plain helper; rebuild them on a language change.
-  const language = useAppLanguage();
   const [searchParams, setSearchParams] = useSearchParams();
   const settings = useAdminUserSettings(user.id);
   const profiles = useAdminUserProfiles(user.id);
@@ -71,8 +66,7 @@ export function PreferencesTab({ user }: { user: AdminUser }) {
         devices: devices.data ?? [],
         libraryNames: new Map((libraries.data ?? []).map((library) => [library.id, library.name])),
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- the names it builds follow the language
-    [settings.data, profiles.data, devices.data, libraries.data, language],
+    [settings.data, profiles.data, devices.data, libraries.data],
   );
   const levels = useMemo(() => groups.flatMap((group) => group.levels), [groups]);
   const requested = searchParams.get("level");
@@ -96,23 +90,19 @@ export function PreferencesTab({ user }: { user: AdminUser }) {
   );
 
   if (settings.isLoading) {
-    return (
-      <p className="text-muted-foreground py-8 text-center text-sm">
-        {t("web.admin.users.detail.preferences.tab.loading")}
-      </p>
-    );
+    return <p className="text-muted-foreground py-8 text-center text-sm">Loading settings...</p>;
   }
   if (settings.isError) {
     return (
       <p role="alert" className="text-destructive py-8 text-center text-sm">
-        {t("web.admin.users.detail.preferences.tab.loadFailed")}
+        Couldn&apos;t load this user&apos;s settings.
       </p>
     );
   }
   if (!selected) {
     return (
       <p className="surface-panel text-muted-foreground rounded-2xl py-10 text-center text-sm">
-        {t("web.admin.users.detail.preferences.tab.noProfiles")}
+        This account has no profiles with settings yet.
       </p>
     );
   }
@@ -120,29 +110,17 @@ export function PreferencesTab({ user }: { user: AdminUser }) {
   return (
     <div className="grid items-start gap-4 min-[761px]:grid-cols-[minmax(13rem,18rem)_minmax(0,1fr)]">
       <Select value={selected.id} onValueChange={select}>
-        <SelectTrigger
-          aria-label={t("web.admin.users.detail.preferences.tab.levelSelectAria")}
-          className="w-full min-[761px]:hidden"
-        >
+        <SelectTrigger aria-label="Setting level" className="w-full min-[761px]:hidden">
           <SelectValue />
         </SelectTrigger>
-        <SelectContent className={TOUCH_TARGETS}>
+        <SelectContent>
           {groups.map((group) => (
             <SelectGroup key={group.key}>
               <SelectLabel>{group.title}</SelectLabel>
               {group.levels.map((level) => (
                 <SelectItem key={level.id} value={level.id}>
                   {/* The trigger shows only the item, so it carries the profile too. */}
-                  {level.profileName
-                    ? t("web.admin.users.detail.preferences.tab.levelOption", {
-                        profile: level.profileName,
-                        level: level.name,
-                        count: level.entries.length,
-                      })
-                    : t("web.admin.users.detail.preferences.tab.levelOptionNoProfile", {
-                        level: level.name,
-                        count: level.entries.length,
-                      })}
+                  {`${level.profileName ? `${level.profileName} · ` : ""}${level.name} (${level.entries.length})`}
                 </SelectItem>
               ))}
             </SelectGroup>
@@ -151,7 +129,7 @@ export function PreferencesTab({ user }: { user: AdminUser }) {
       </Select>
 
       <nav
-        aria-label={t("web.admin.users.detail.preferences.tab.levelsNavAria")}
+        aria-label="Setting levels"
         className="surface-panel rounded-2xl border-0 p-2 max-[760px]:hidden"
       >
         {groups.map((group) => (
@@ -169,8 +147,8 @@ export function PreferencesTab({ user }: { user: AdminUser }) {
                   aria-current={active ? "true" : undefined}
                   onClick={() => select(level.id)}
                   className={cn(
-                    "flex w-full items-center gap-2.5 rounded-lg py-1.5 pe-3 text-start text-sm transition-colors max-lg:min-h-11",
-                    top ? "ps-3" : "ps-7",
+                    "flex w-full items-center gap-2.5 rounded-lg py-1.5 pr-3 text-left text-sm transition-colors",
+                    top ? "pl-3" : "pl-7",
                     active
                       ? "bg-accent text-foreground font-medium"
                       : "text-foreground/85 hover:bg-accent/50",

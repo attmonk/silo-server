@@ -1,7 +1,5 @@
 import type { components } from "@/api/v2/schema";
-import { t } from "@/i18n";
 import type { PlayerSubtitleInfo } from "../types";
-import { formatDecimal } from "@/lib/numberFormat";
 
 export type StoredSubtitle = components["schemas"]["StoredSubtitle"];
 export type SubtitleSyncState = components["schemas"]["SubtitleSyncState"];
@@ -67,7 +65,7 @@ export function isSyncInProgress(status: SubtitleSyncStatus | undefined): boolea
 export function formatSyncOffset(offsetMs: number): string {
   const seconds = Math.abs(offsetMs) / 1000;
   const sign = offsetMs < 0 ? "−" : "+";
-  return t("web.subtitles.sync.offsetSeconds", { offset: `${sign}${formatDecimal(seconds, 1)}` });
+  return `${sign}${seconds.toFixed(1)} s`;
 }
 
 const FRAME_RATES = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60];
@@ -88,14 +86,11 @@ export function describeSyncScale(scale: number): string | null {
   for (const from of FRAME_RATES) {
     for (const to of FRAME_RATES) {
       if (from !== to && Math.abs(from / to - scale) <= FRAME_RATE_TOLERANCE) {
-        return t("web.subtitles.sync.frameRate", {
-          from: formatDecimal(from, 3, 0),
-          to: formatDecimal(to, 3, 0),
-        });
+        return `${from}→${to} fps`;
       }
     }
   }
-  return t("web.subtitles.sync.speed", { factor: formatDecimal(scale, 4, 0) });
+  return `×${Number(scale.toFixed(4))} speed`;
 }
 
 /** "+2.3 s · 25→23.976 fps": a correction in a few characters. */
@@ -116,11 +111,11 @@ export function syncPhaseLabel(job: SubtitleSyncJob | undefined): string | null 
   if (!job || !isSyncInProgress(job.status)) return null;
   switch (job.phase) {
     case "matching":
-      return t("web.subtitles.sync.phase.matching");
+      return "Matching lines to speech…";
     case "analyzing":
-      return t("web.subtitles.sync.phase.analyzing");
+      return "Listening to the audio…";
     default:
-      return t("web.subtitles.sync.phase.waiting");
+      return "Waiting to start…";
   }
 }
 
@@ -128,13 +123,13 @@ export function syncPhaseLabel(job: SubtitleSyncJob | undefined): string | null 
 export function syncFailureMessage(failure: SubtitleSyncFailure | undefined): string {
   switch (failure) {
     case "subtitle_changed":
-      return t("web.subtitles.sync.failure.subtitleChanged");
+      return "The subtitle changed while it was syncing. Try again.";
     case "no_audio":
-      return t("web.subtitles.sync.failure.noAudio");
+      return "This video has no audio Silo can read.";
     case "unavailable":
-      return t("web.subtitles.sync.failure.unavailable");
+      return "The server is busy. Try again in a few minutes.";
     default:
-      return t("web.subtitles.sync.failure.generic");
+      return "Sync failed. Try again.";
   }
 }
 
@@ -150,24 +145,19 @@ export function syncStatusLabel(
     case "pending":
     case "running": {
       const percent = syncProgressPercent(sync);
-      return percent
-        ? t("web.subtitles.sync.status.syncingPercent", { percent: percent })
-        : t("web.subtitles.sync.status.syncing");
+      return percent ? `Syncing… ${percent}%` : "Syncing…";
     }
     case "no_match":
-      return t("web.subtitles.sync.status.noMatch");
+      return "Doesn't match this video";
     case "failed":
-      return t("web.subtitles.sync.status.failed");
+      return "Sync failed";
     case "already_synced":
-      if (isIdentityTiming(timing)) return t("web.subtitles.sync.status.alreadyInSync");
+      if (isIdentityTiming(timing)) return "Already in sync";
       break;
     case "synced":
-      if (isIdentityTiming(timing)) return t("web.subtitles.sync.status.originalTiming");
-      if (sameTiming(sync.result, timing))
-        return t("web.subtitles.sync.status.synced", { timing: describeTiming(timing) });
+      if (isIdentityTiming(timing)) return "Original timing";
+      if (sameTiming(sync.result, timing)) return `Synced ${describeTiming(timing)}`;
       break;
   }
-  return isIdentityTiming(timing)
-    ? null
-    : t("web.subtitles.sync.status.adjusted", { timing: describeTiming(timing) });
+  return isIdentityTiming(timing) ? null : `Timing adjusted ${describeTiming(timing)}`;
 }

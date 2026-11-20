@@ -5,19 +5,11 @@ import {
   type KeyboardEvent,
 } from "react";
 
-import { useT } from "@/i18n";
 import { formatTime } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
-import {
-  buildAreaPath,
-  buildBandPath,
-  buildLinePath,
-  chartSeriesColor,
-  niceTicks,
-} from "./chartMath";
+import { buildAreaPath, buildLinePath, chartSeriesColor, niceTicks } from "./chartMath";
 import { ChartLegend, ChartTooltip, ChartTooltipRow } from "./chartChrome";
 import { useMeasuredSize } from "./useMeasuredSize";
-import { formatLocale } from "@/lib/appLocale";
 
 export interface LineChartPoint {
   /** Sample timestamp in epoch milliseconds. */
@@ -40,19 +32,6 @@ export interface LineChartOverlay {
   seriesIndex: number;
 }
 
-/**
- * One band of a stacked chart: its own values, drawn on top of the bands before
- * it. Same time grid rule as overlays.
- */
-export interface LineChartStack {
-  /** Stable identity for React; labels (node names) need not be unique. */
-  key: string;
-  label: string;
-  points: readonly LineChartPoint[];
-  /** A `chartSeriesColor` slot, or a neutral token for a catch-all band. */
-  color: string;
-}
-
 export interface LineChartProps {
   points: readonly LineChartPoint[];
   /** Plot height in pixels (axis labels sit outside it); ignored when `fill`. */
@@ -66,12 +45,6 @@ export interface LineChartProps {
   fill?: boolean;
   /** Categorical slot for the series color; single-series charts stay on slot 0. */
   seriesIndex?: number;
-  /**
-   * A color for the primary series that is not a categorical slot, such as a
-   * neutral token for a total drawn under overlays that take the slots.
-   * Overrides `seriesIndex`.
-   */
-  color?: string;
   /** Series name for the hover readout. */
   seriesLabel?: string;
   formatValue?: (value: number) => string;
@@ -93,14 +66,6 @@ export interface LineChartProps {
    * scales to the maximum across every series.
    */
   overlays?: readonly LineChartOverlay[];
-  /**
-   * Draw these bands stacked from the baseline, in order, instead of the
-   * primary line. `points` must then be their sum: it still sets the axis and
-   * the crosshair stops, and the readout lists it as the total under the
-   * bands. Each band keeps the primary's look, a 2px line over a light wash,
-   * so a stacked chart reads as the same chart split up.
-   */
-  stacks?: readonly LineChartStack[];
   ariaLabel: string;
   className?: string;
 }
@@ -114,7 +79,7 @@ const VIEW_WIDTH = 1000;
 const VIEW_HEIGHT = 100;
 
 function defaultFormatValue(value: number): string {
-  return value.toLocaleString(formatLocale());
+  return value.toLocaleString();
 }
 
 /**
@@ -127,22 +92,18 @@ export function LineChart({
   height = 160,
   fill = false,
   seriesIndex = 0,
-  color: colorProp,
-  seriesLabel: seriesLabelProp,
+  seriesLabel = "Value",
   formatValue = defaultFormatValue,
   formatTick,
-  formatTimestamp = (time) => formatTime(time),
+  formatTimestamp = (t) => formatTime(t),
   edgeLabels,
   minTickStep,
   overlays = [],
-  stacks = [],
   ariaLabel,
   className,
 }: LineChartProps) {
-  const t = useT();
-  const seriesLabel = seriesLabelProp ?? t("web.admin.dashboard.chart.value");
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
-  const color = colorProp ?? chartSeriesColor(seriesIndex);
+  const color = chartSeriesColor(seriesIndex);
   const { ref: plotRef, size: plotSize } = useMeasuredSize<HTMLDivElement>();
   const viewWidth = plotSize && plotSize.width > 0 ? plotSize.width : VIEW_WIDTH;
   const viewHeight = plotSize && plotSize.height > 0 ? plotSize.height : VIEW_HEIGHT;
@@ -181,18 +142,6 @@ export function LineChart({
 
     const projected = project(points);
 
-    let base: (number | null)[] = points.map((point) => (point.value === null ? null : 0));
-    const stackPaths = stacks.map((stack) => {
-      const top = base.map((below, index) => {
-        const value = stack.points[index]?.value ?? null;
-        return below === null || value === null ? null : below + value;
-      });
-      const lower = project(base.map((value, index) => ({ t: points[index]?.t ?? 0, value })));
-      const upper = project(top.map((value, index) => ({ t: points[index]?.t ?? 0, value })));
-      base = top;
-      return { top, line: buildLinePath(upper), area: buildBandPath(upper, lower) };
-    });
-
     return {
       ticks,
       top,
@@ -202,10 +151,8 @@ export function LineChart({
       // Overlays are plain lines: a second area wash would stack visually and
       // read as a total, which the overlay is not.
       overlayPaths: overlays.map((overlay) => buildLinePath(project(overlay.points))),
-      stackPaths,
     };
-  }, [points, overlays, stacks, minTickStep, viewWidth, viewHeight]);
-  const stacked = stacks.length > 0;
+  }, [points, overlays, minTickStep, viewWidth, viewHeight]);
 
   // An index is inspectable when any series has a sample there, so a minute
   // where only an overlay saw traffic still gets a crosshair stop.
@@ -270,20 +217,9 @@ export function LineChart({
   const firstPoint = points[0];
   const lastPoint = points[points.length - 1];
 
-  // Time runs left to right in every language; the plot and its labels use physical
-  // coordinates (eslint.config.js PHYSICAL_DIRECTION).
   return (
-    <div dir="ltr" className={cn("w-full", fill && "flex min-h-0 flex-1 flex-col", className)}>
-      {stacked ? (
-        // Top band first, so the legend reads in the order the bands stack.
-        <ChartLegend
-          shape="line"
-          className="mb-1.5 pl-12"
-          entries={[...stacks]
-            .reverse()
-            .map((stack) => ({ id: stack.key, label: stack.label, color: stack.color }))}
-        />
-      ) : overlays.length > 0 ? (
+    <div className={cn("w-full", fill && "flex min-h-0 flex-1 flex-col", className)}>
+      {overlays.length > 0 ? (
         <ChartLegend
           shape="line"
           className="mb-1.5 pl-12"
@@ -336,35 +272,10 @@ export function LineChart({
                 />
               );
             })}
-            {geometry.stackPaths.map((path, index) =>
-              path.area ? (
-                <path
-                  key={`area-${stacks[index]?.key ?? index}`}
-                  d={path.area}
-                  fill={stacks[index]?.color}
-                  opacity={0.12}
-                  stroke="none"
-                />
-              ) : null,
-            )}
-            {geometry.stackPaths.map((path, index) =>
-              path.line ? (
-                <path
-                  key={`line-${stacks[index]?.key ?? index}`}
-                  d={path.line}
-                  fill="none"
-                  stroke={stacks[index]?.color}
-                  strokeWidth={2}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  vectorEffect="non-scaling-stroke"
-                />
-              ) : null,
-            )}
-            {!stacked && geometry.areaPath ? (
+            {geometry.areaPath ? (
               <path d={geometry.areaPath} fill={color} opacity={0.12} stroke="none" />
             ) : null}
-            {!stacked && geometry.linePath ? (
+            {geometry.linePath ? (
               <path
                 d={geometry.linePath}
                 fill="none"
@@ -398,25 +309,7 @@ export function LineChart({
                 className="bg-border pointer-events-none absolute inset-y-0 w-px"
                 style={{ left: `${activeRatio * 100}%` }}
               />
-              {stacked && activeIndex !== null
-                ? geometry.stackPaths.map((path, index) => {
-                    const top = path.top[activeIndex];
-                    return top === null || top === undefined ? null : (
-                      <div
-                        key={stacks[index]?.key ?? index}
-                        aria-hidden="true"
-                        className="pointer-events-none absolute h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full"
-                        style={{
-                          left: `${activeRatio * 100}%`,
-                          top: `${(1 - top / geometry.top) * 100}%`,
-                          backgroundColor: stacks[index]?.color,
-                          boxShadow: "0 0 0 2px var(--card)",
-                        }}
-                      />
-                    );
-                  })
-                : null}
-              {!stacked && activeValue !== null ? (
+              {activeValue !== null ? (
                 <div
                   aria-hidden="true"
                   className="pointer-events-none absolute h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full"
@@ -429,27 +322,10 @@ export function LineChart({
                 />
               ) : null}
               <ChartTooltip xRatio={activeRatio} title={formatTimestamp(activePoint.t)}>
-                {stacked && activeIndex !== null
-                  ? stacks
-                      .map((stack) => ({ stack, value: stack.points[activeIndex]?.value ?? null }))
-                      .filter(
-                        (row): row is { stack: LineChartStack; value: number } =>
-                          row.value !== null,
-                      )
-                      .sort((a, b) => b.value - a.value)
-                      .map(({ stack, value }) => (
-                        <ChartTooltipRow
-                          key={stack.key}
-                          color={stack.color}
-                          label={stack.label}
-                          value={formatValue(value)}
-                        />
-                      ))
-                  : null}
                 {activeValue !== null ? (
                   <ChartTooltipRow
-                    color={stacked ? undefined : color}
-                    label={stacked ? t("web.admin.dashboard.chart.total") : seriesLabel}
+                    color={color}
+                    label={seriesLabel}
                     value={formatValue(activeValue)}
                   />
                 ) : null}
@@ -474,7 +350,7 @@ export function LineChart({
             className="focus-visible:ring-ring absolute inset-0 cursor-crosshair rounded-sm focus-visible:ring-2 focus-visible:outline-none"
             tabIndex={0}
             role="application"
-            aria-label={t("web.admin.dashboard.chart.inspectSamples", { chart: ariaLabel })}
+            aria-label={`${ariaLabel} — use arrow keys to inspect samples`}
             onPointerMove={handlePointerMove}
             onPointerLeave={() => setActiveIndex(null)}
             onBlur={() => setActiveIndex(null)}
