@@ -1,0 +1,613 @@
+import { TriangleAlert } from "lucide-react";
+import { useId, useMemo, useState } from "react";
+
+import type {
+  RateLimitAuthEndpointConfig,
+  RateLimitConfig,
+  RateLimitSessionQuota,
+  RateLimitTierConfig,
+} from "@/api/types";
+import { SettingsPageHeader } from "@/components/settings/SettingsPageHeader";
+import { SettingsSubheading } from "@/components/settings/SettingsSubheading";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useRateLimitConfig, useUpdateRateLimitConfig } from "@/hooks/queries/admin/rateLimits";
+import { useRestartKeys } from "@/hooks/useRestartKeys";
+import { useSettingsForm } from "@/hooks/useSettingsForm";
+import { useReportUnsavedChanges } from "@/hooks/useUnsavedChanges";
+import { useT, type MessageKey } from "@/i18n";
+import { cn } from "@/lib/utils";
+import { FieldGroup } from "./FieldGroup";
+import { SaveBar } from "@/components/SaveBar";
+import {
+  SETTINGS_CONTROL_WIDTH,
+  SETTINGS_NUMBER_WIDTH,
+  SettingField,
+  SettingFieldRow,
+  SettingFieldStatus,
+} from "./SettingField";
+
+// Local media server access goes through the batched settings endpoint. Rate
+// limits do not: they live behind /admin/rate-limits/config and the batch
+// endpoint rejects those keys, so this page drives two writers behind one save
+// bar rather than showing the admin two different Save buttons. Token lifetimes
+// live on Sign-in, with the rest of what decides how long a sign-in lasts, and
+// trusted proxies on General, beside the public URL.
+const LOCAL_MEDIA_SERVERS_KEY = "media_servers.allow_private_destinations";
+const LOCAL_NETWORK_KEYS = [LOCAL_MEDIA_SERVERS_KEY];
+
+const DEFAULT_TIER: RateLimitTierConfig = {
+  requests_per_second: 10,
+  requests_per_minute: 300,
+  burst: 20,
+};
+
+const DEFAULT_AUTH_ENDPOINT: RateLimitAuthEndpointConfig = {
+  requests_per_minute: 20,
+  burst: 10,
+};
+
+const DEFAULT_SESSION_QUOTA: RateLimitSessionQuota = {
+  mode: "log",
+  requests_per_hour: 10000,
+  burst: 30000,
+};
+
+const SESSION_QUOTA_MODE_LABELS: Record<RateLimitSessionQuota["mode"], MessageKey> = {
+  off: "web.admin.settings.security.quotaMode.off",
+  log: "web.admin.settings.security.quotaMode.log",
+  enforce: "web.admin.settings.security.quotaMode.enforce",
+};
+
+const DEFAULT_CONFIG: RateLimitConfig = {
+  enabled: true,
+  backend: "memory",
+  global_requests_per_second: 1000,
+  tiers: {
+    standard: { requests_per_second: 20, requests_per_minute: 1200, burst: 20 },
+    elevated: { requests_per_second: 100, requests_per_minute: 6000, burst: 100 },
+  },
+  ip_requests_per_second: 120,
+  ip_requests_per_minute: 6000,
+  ip_burst: 120,
+  auth_endpoints: {
+    login: { requests_per_minute: 20, burst: 10 },
+    signup: { requests_per_minute: 10, burst: 6 },
+    setup: { requests_per_minute: 10, burst: 6 },
+    password_change: { requests_per_minute: 10, burst: 5 },
+    device_start: { requests_per_minute: 20, burst: 10 },
+    device_lookup: { requests_per_minute: 60, burst: 20 },
+    device_poll: { requests_per_minute: 120, burst: 30 },
+    autoscan_webhook: { requests_per_minute: 60, burst: 30 },
+  },
+  session_quota: DEFAULT_SESSION_QUOTA,
+};
+
+const TIER_LABELS: Record<string, MessageKey> = {
+  standard: "web.admin.settings.security.tier.standard",
+  elevated: "web.admin.settings.security.tier.elevated",
+};
+
+const AUTH_ENDPOINT_LABELS: Record<string, MessageKey> = {
+  login: "web.admin.settings.security.endpoint.login",
+  signup: "web.admin.settings.security.endpoint.signup",
+  setup: "web.admin.settings.security.endpoint.setup",
+  password_change: "web.admin.settings.security.endpoint.passwordChange",
+  device_start: "web.admin.settings.security.endpoint.deviceStart",
+  device_lookup: "web.admin.settings.security.endpoint.deviceLookup",
+  device_poll: "web.admin.settings.security.endpoint.devicePoll",
+  autoscan_webhook: "web.admin.settings.security.endpoint.autoscanWebhook",
+};
+
+interface RateLimitField {
+  value: number;
+  onChange: (value: string) => void;
+}
+
+/** One captioned number box inside a rate-limit row's control column. */
+function RateBox({
+  id,
+  caption,
+  field,
+  disabled,
+}: {
+  id: string;
+  caption: string;
+  field: RateLimitField;
+  disabled: boolean;
+}) {
+  return (
+    <span className="flex flex-col items-end gap-1">
+      <Label htmlFor={id} className="text-muted-foreground text-xs font-normal">
+        {caption}
+      </Label>
+      <Input
+        id={id}
+        type="number"
+        min={1}
+        value={field.value}
+        onChange={(e) => field.onChange(e.target.value)}
+        disabled={disabled}
+        className="w-24 text-end tabular-nums"
+      />
+    </span>
+  );
+}
+
+/**
+ * One labelled row of request budgets. The per-second box is optional because
+ * the public auth endpoints are only budgeted per minute; everything else on
+ * this page uses the full requests/second · requests/minute · burst triad.
+ */
+function RateTriadRow({
+  label,
+  description,
+  perSecond,
+  perMinute,
+  burst,
+  disabled = false,
+}: {
+  label: string;
+  description?: string;
+  perSecond?: RateLimitField;
+  perMinute: RateLimitField;
+  burst: RateLimitField;
+  disabled?: boolean;
+}) {
+  const t = useT();
+  const baseId = useId();
+
+  return (
+    <SettingFieldRow label={label} htmlFor={`${baseId}-rpm`} description={description}>
+      <div className="flex flex-wrap items-end justify-end gap-2.5">
+        {perSecond && (
+          <RateBox
+            id={`${baseId}-rps`}
+            caption={t("web.admin.settings.security.rate.perSecond")}
+            field={perSecond}
+            disabled={disabled}
+          />
+        )}
+        <RateBox
+          id={`${baseId}-rpm`}
+          caption={t("web.admin.settings.security.rate.perMinute")}
+          field={perMinute}
+          disabled={disabled}
+        />
+        <RateBox
+          id={`${baseId}-burst`}
+          caption={t("web.admin.settings.security.rate.burst")}
+          field={burst}
+          disabled={disabled}
+        />
+      </div>
+    </SettingFieldRow>
+  );
+}
+
+export default function SecurityAccessSettings() {
+  const t = useT();
+  const form = useSettingsForm({ keys: useMemo(() => LOCAL_NETWORK_KEYS, []) });
+  const restartKeys = useRestartKeys();
+  const allRestart = (keys: string[]) => keys.every((key) => restartKeys.has(key));
+  const { data: serverConfig, isLoading: rateLimitsLoading } = useRateLimitConfig();
+  const updateConfig = useUpdateRateLimitConfig();
+
+  const localMediaServersAllowed = form.getValue(LOCAL_MEDIA_SERVERS_KEY) === "true";
+
+  // The save endpoint rejects the Redis backend unless Redis is configured, so
+  // mirror that rule on the option itself. The server stays the source of
+  // truth; an older response without the field leaves the option enabled.
+  const redisSelectable = serverConfig?.redis_available !== false;
+
+  // Drift the shared restart banner cannot see: what the limiter in this
+  // process actually runs with, straight from the GET response. The
+  // restart_required flag only covers staged saves — a limiter that failed to
+  // apply the saved backend at boot (say, Redis was unreachable) drifts
+  // without the flag, and a restart alone may not fix it, so the hint states
+  // the mismatch instead of prescribing a restart.
+  const savedBackend = serverConfig?.backend || "memory";
+  const limiterInactive = serverConfig?.enabled === true && serverConfig.active === false;
+  const runningBackend = serverConfig?.active === true ? serverConfig.active_backend : undefined;
+  const runningBackendDiffers = Boolean(runningBackend) && runningBackend !== savedBackend;
+
+  const hydratedConfig = useMemo<RateLimitConfig>(() => {
+    if (!serverConfig) return DEFAULT_CONFIG;
+    return {
+      enabled: serverConfig.enabled,
+      backend: serverConfig.backend || "memory",
+      global_requests_per_second: serverConfig.global_requests_per_second,
+      tiers: {
+        standard: serverConfig.tiers?.standard ?? DEFAULT_CONFIG.tiers.standard!,
+        elevated: serverConfig.tiers?.elevated ?? DEFAULT_CONFIG.tiers.elevated!,
+      },
+      ip_requests_per_second:
+        serverConfig.ip_requests_per_second ?? DEFAULT_CONFIG.ip_requests_per_second,
+      ip_requests_per_minute:
+        serverConfig.ip_requests_per_minute ?? DEFAULT_CONFIG.ip_requests_per_minute,
+      ip_burst: serverConfig.ip_burst ?? DEFAULT_CONFIG.ip_burst,
+      auth_endpoints: Object.fromEntries(
+        Object.keys(AUTH_ENDPOINT_LABELS).map((endpoint) => [
+          endpoint,
+          serverConfig.auth_endpoints?.[endpoint] ??
+            DEFAULT_CONFIG.auth_endpoints[endpoint] ??
+            DEFAULT_AUTH_ENDPOINT,
+        ]),
+      ),
+      session_quota: serverConfig.session_quota ?? DEFAULT_SESSION_QUOTA,
+    };
+  }, [serverConfig]);
+
+  // Keyed on the hydrated snapshot so a refetch that actually changes the saved
+  // config wins over a stale draft instead of silently resurrecting it.
+  const hydratedKey = JSON.stringify([
+    hydratedConfig,
+    serverConfig?.etag,
+    serverConfig?.profileContext?.serverOrigin,
+    serverConfig?.profileContext?.authContextVersion,
+    serverConfig?.profileContext?.profileId,
+  ]);
+  const [configState, setConfigState] = useState<{ key: string; config: RateLimitConfig }>({
+    key: hydratedKey,
+    config: hydratedConfig,
+  });
+  const config = configState.key === hydratedKey ? configState.config : hydratedConfig;
+
+  function updateConfigState(updater: (prev: RateLimitConfig) => RateLimitConfig) {
+    setConfigState((prev) => {
+      const base = prev.key === hydratedKey ? prev.config : hydratedConfig;
+      return { key: hydratedKey, config: updater(base) };
+    });
+  }
+
+  function setNumber(field: (value: number) => void) {
+    return (raw: string) => {
+      const num = parseInt(raw, 10);
+      if (isNaN(num) || num <= 0) return;
+      field(num);
+    };
+  }
+
+  function handleSessionQuotaChange(update: Partial<RateLimitSessionQuota>) {
+    updateConfigState((prev) => ({
+      ...prev,
+      session_quota: { ...(prev.session_quota ?? DEFAULT_SESSION_QUOTA), ...update },
+    }));
+  }
+
+  function handleTierChange(tier: string, field: keyof RateLimitTierConfig, value: number) {
+    updateConfigState((prev) => {
+      const existing: RateLimitTierConfig = prev.tiers[tier] ?? DEFAULT_TIER;
+      return { ...prev, tiers: { ...prev.tiers, [tier]: { ...existing, [field]: value } } };
+    });
+  }
+
+  function handleAuthEndpointChange(
+    endpoint: string,
+    field: keyof RateLimitAuthEndpointConfig,
+    value: number,
+  ) {
+    updateConfigState((prev) => {
+      const existing: RateLimitAuthEndpointConfig =
+        prev.auth_endpoints[endpoint] ?? DEFAULT_AUTH_ENDPOINT;
+      return {
+        ...prev,
+        auth_endpoints: { ...prev.auth_endpoints, [endpoint]: { ...existing, [field]: value } },
+      };
+    });
+  }
+
+  const rateLimitsDirty = JSON.stringify(config) !== JSON.stringify(hydratedConfig);
+  // The rate-limit draft lives outside useSettingsForm, so it has to announce
+  // itself to the unsaved-changes registry on its own — otherwise the
+  // navigation guard and the reload prompt only know about the batched keys.
+  useReportUnsavedChanges(rateLimitsDirty);
+
+  /**
+   * One Save, two writers — and they are ordered, not concurrent. The
+   * rate-limit endpoint validates `backend: redis` against the *persisted*
+   * settings, so firing it alongside the settings batch means it can be judged
+   * against the state the admin is in the middle of replacing.
+   *
+   * A failed writer keeps its own staged edits (neither mutation clears them on
+   * error) and toasts the server's message, so the admin can fix the cause and
+   * hit Save again. The batch failing skips the rate-limit PATCH for the same
+   * reason it goes first: the settings it would be validated against are not
+   * the ones on screen.
+   */
+  async function handleSave() {
+    const intent =
+      rateLimitsDirty && serverConfig
+        ? {
+            config: structuredClone(config),
+            etag: serverConfig.etag,
+            profileContext: serverConfig.profileContext,
+          }
+        : null;
+    try {
+      if (form.dirtyCount > 0) await form.save();
+      if (intent) await updateConfig.mutateAsync(intent);
+    } catch {
+      // Both mutations already surface the failure as a toast; swallowing here
+      // only stops it becoming an unhandled rejection out of the save bar.
+    }
+  }
+
+  function handleDiscard() {
+    setConfigState({ key: hydratedKey, config: hydratedConfig });
+    form.discard();
+  }
+
+  if (form.isLoading || rateLimitsLoading)
+    return (
+      <div
+        className="space-y-6"
+        role="status"
+        aria-label={t("web.admin.settings.security.loading")}
+      >
+        <Skeleton className="h-8 w-48" />
+        <div className="space-y-4">
+          <Skeleton className="h-10 w-full" />
+          <Skeleton className="h-10 w-full" />
+        </div>
+        <div className="space-y-4">
+          <Skeleton className="h-10 w-full" />
+          <Skeleton className="h-10 w-full" />
+        </div>
+        <span className="sr-only">{t("web.admin.settings.security.loading")}</span>
+      </div>
+    );
+
+  const savingRateLimits = updateConfig.isPending;
+  const sessionQuota = config.session_quota ?? DEFAULT_SESSION_QUOTA;
+
+  return (
+    <div className="flex h-full flex-col">
+      <SettingsPageHeader title={t("web.admin.settings.security.title")} />
+
+      <div className="flex-1 space-y-5">
+        <FieldGroup
+          label={t("web.admin.settings.security.localNetwork.group")}
+          restartAll={allRestart(LOCAL_NETWORK_KEYS)}
+        >
+          <SettingField
+            label={t("web.admin.settings.security.localNetwork.label")}
+            description={t("web.admin.settings.security.localNetwork.description")}
+            type="toggle"
+            value={form.getValue(LOCAL_MEDIA_SERVERS_KEY)}
+            onChange={(v) => form.setValue(LOCAL_MEDIA_SERVERS_KEY, v)}
+            restartRequired={restartKeys.has(LOCAL_MEDIA_SERVERS_KEY)}
+          />
+          {localMediaServersAllowed && (
+            <div className="flex items-start gap-2 py-3 text-xs text-amber-500">
+              <TriangleAlert className="mt-0.5 h-4 w-4 flex-shrink-0" />
+              <p>{t("web.admin.settings.security.localNetwork.warning")}</p>
+            </div>
+          )}
+        </FieldGroup>
+
+        <FieldGroup label={t("web.admin.settings.security.rateLimit.group")}>
+          <SettingField
+            label={t("web.admin.settings.security.rateLimit.enable")}
+            type="toggle"
+            value={config.enabled ? "true" : "false"}
+            onChange={(v) => updateConfigState((prev) => ({ ...prev, enabled: v === "true" }))}
+            disabled={savingRateLimits}
+            status={
+              limiterInactive ? (
+                <SettingFieldStatus tone="warn">
+                  {t("web.admin.settings.security.rateLimit.notRunning")}
+                </SettingFieldStatus>
+              ) : undefined
+            }
+          />
+
+          <SettingFieldRow
+            label={t("web.admin.settings.security.backend.label")}
+            htmlFor="rate-limit-backend"
+            description={
+              redisSelectable
+                ? t("web.admin.settings.security.backend.description")
+                : t("web.admin.settings.security.backend.descriptionNoRedis")
+            }
+            status={
+              runningBackendDiffers ? (
+                <SettingFieldStatus tone="warn">
+                  {t("web.admin.settings.security.backend.drift", {
+                    running: runningBackend ?? "",
+                    saved: savedBackend,
+                  })}
+                </SettingFieldStatus>
+              ) : undefined
+            }
+          >
+            <Select
+              value={config.backend}
+              onValueChange={(value) => updateConfigState((prev) => ({ ...prev, backend: value }))}
+              disabled={savingRateLimits}
+            >
+              <SelectTrigger id="rate-limit-backend" className={SETTINGS_CONTROL_WIDTH}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="memory">
+                  {t("web.admin.settings.security.backend.memory")}
+                </SelectItem>
+                <SelectItem value="redis" disabled={!redisSelectable}>
+                  {t("web.admin.settings.security.backend.redis")}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </SettingFieldRow>
+
+          <SettingFieldRow
+            label={t("web.admin.settings.security.global.label")}
+            htmlFor="global-rps"
+            description={t("web.admin.settings.security.global.description")}
+            // The row's unit slot rather than a span beside the input: the
+            // triad rows below have no unit, and an inline one here would
+            // push this box off the column they share.
+            unit={t("web.admin.settings.security.global.unit")}
+          >
+            <Input
+              id="global-rps"
+              type="number"
+              min={1}
+              value={config.global_requests_per_second}
+              onChange={(e) =>
+                setNumber((num) =>
+                  updateConfigState((prev) => ({ ...prev, global_requests_per_second: num })),
+                )(e.target.value)
+              }
+              disabled={savingRateLimits}
+              className={cn("text-end tabular-nums", SETTINGS_NUMBER_WIDTH)}
+            />
+          </SettingFieldRow>
+
+          <RateTriadRow
+            label={t("web.admin.settings.security.perAddress.label")}
+            description={t("web.admin.settings.security.perAddress.description")}
+            disabled={savingRateLimits}
+            perSecond={{
+              value: config.ip_requests_per_second,
+              onChange: setNumber((num) =>
+                updateConfigState((prev) => ({ ...prev, ip_requests_per_second: num })),
+              ),
+            }}
+            perMinute={{
+              value: config.ip_requests_per_minute,
+              onChange: setNumber((num) =>
+                updateConfigState((prev) => ({ ...prev, ip_requests_per_minute: num })),
+              ),
+            }}
+            burst={{
+              value: config.ip_burst,
+              onChange: setNumber((num) =>
+                updateConfigState((prev) => ({ ...prev, ip_burst: num })),
+              ),
+            }}
+          />
+
+          <SettingsSubheading>
+            {t("web.admin.settings.security.session.heading")}
+          </SettingsSubheading>
+          <SettingFieldRow
+            label={t("web.admin.settings.security.session.quotaLabel")}
+            htmlFor="session-quota-mode"
+            description={t("web.admin.settings.security.session.quotaDescription")}
+          >
+            <Select
+              value={sessionQuota.mode}
+              onValueChange={(value) =>
+                handleSessionQuotaChange({ mode: value as RateLimitSessionQuota["mode"] })
+              }
+              disabled={savingRateLimits}
+            >
+              <SelectTrigger id="session-quota-mode" className={SETTINGS_CONTROL_WIDTH}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {Object.entries(SESSION_QUOTA_MODE_LABELS).map(([mode, label]) => (
+                  <SelectItem key={mode} value={mode}>
+                    {t(label)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </SettingFieldRow>
+          <SettingFieldRow
+            label={t("web.admin.settings.security.session.sizeLabel")}
+            htmlFor="session-quota-rph"
+            description={t("web.admin.settings.security.session.sizeDescription")}
+          >
+            <div className="flex flex-wrap items-end justify-end gap-2.5">
+              <RateBox
+                id="session-quota-rph"
+                caption={t("web.admin.settings.security.rate.perHour")}
+                disabled={savingRateLimits || sessionQuota.mode === "off"}
+                field={{
+                  value: sessionQuota.requests_per_hour,
+                  onChange: setNumber((num) =>
+                    handleSessionQuotaChange({ requests_per_hour: num }),
+                  ),
+                }}
+              />
+              <RateBox
+                id="session-quota-burst"
+                caption={t("web.admin.settings.security.rate.burst")}
+                disabled={savingRateLimits || sessionQuota.mode === "off"}
+                field={{
+                  value: sessionQuota.burst,
+                  onChange: setNumber((num) => handleSessionQuotaChange({ burst: num })),
+                }}
+              />
+            </div>
+          </SettingFieldRow>
+
+          <SettingsSubheading>{t("web.admin.settings.security.tiers.heading")}</SettingsSubheading>
+          {Object.keys(TIER_LABELS).map((tier) => {
+            const tierConfig = config.tiers[tier] ?? DEFAULT_TIER;
+            return (
+              <RateTriadRow
+                key={tier}
+                label={t(TIER_LABELS[tier]!)}
+                disabled={savingRateLimits}
+                perSecond={{
+                  value: tierConfig.requests_per_second,
+                  onChange: setNumber((num) => handleTierChange(tier, "requests_per_second", num)),
+                }}
+                perMinute={{
+                  value: tierConfig.requests_per_minute,
+                  onChange: setNumber((num) => handleTierChange(tier, "requests_per_minute", num)),
+                }}
+                burst={{
+                  value: tierConfig.burst,
+                  onChange: setNumber((num) => handleTierChange(tier, "burst", num)),
+                }}
+              />
+            );
+          })}
+
+          <SettingsSubheading>
+            {t("web.admin.settings.security.endpoints.heading")}
+          </SettingsSubheading>
+          {Object.keys(AUTH_ENDPOINT_LABELS).map((endpoint) => {
+            const epConfig = config.auth_endpoints[endpoint] ?? DEFAULT_AUTH_ENDPOINT;
+            return (
+              <RateTriadRow
+                key={endpoint}
+                label={t(AUTH_ENDPOINT_LABELS[endpoint]!)}
+                disabled={savingRateLimits}
+                perMinute={{
+                  value: epConfig.requests_per_minute,
+                  onChange: setNumber((num) =>
+                    handleAuthEndpointChange(endpoint, "requests_per_minute", num),
+                  ),
+                }}
+                burst={{
+                  value: epConfig.burst,
+                  onChange: setNumber((num) => handleAuthEndpointChange(endpoint, "burst", num)),
+                }}
+              />
+            );
+          })}
+        </FieldGroup>
+      </div>
+
+      <SaveBar
+        dirtyCount={form.dirtyCount + (rateLimitsDirty ? 1 : 0)}
+        onSave={() => void handleSave()}
+        onDiscard={handleDiscard}
+        isSaving={form.isSaving || savingRateLimits}
+      />
+    </div>
+  );
+}

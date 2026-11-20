@@ -1,0 +1,181 @@
+package jellycompat
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+func TestPlaybackSessionAuth_CaseInsensitivePlaySessionId(t *testing.T) {
+	now := fixedNow()
+	clock := func() time.Time { return now }
+	sessions := NewSessionStore(30*24*time.Hour, clock)
+	_ = sessions.Put(Session{Token: "compat-tok", StreamAppUserID: 1})
+	playbackStore := NewPlaybackSessionStore(time.Hour, clock)
+	playbackStore.Put(PlaybackSession{ID: "ps-abc", CompatToken: "compat-tok", RouteItemID: "itm", MediaSources: []PlaybackMediaSource{{ID: "x"}}})
+
+	mw := PlaybackSessionAuth(sessions, playbackStore, nil, nil)
+
+	cases := []struct {
+		name     string
+		rawQuery string
+		wantCode int
+	}{
+		// Wholphin's jellyfin-sdk-kotlin direct-play URL: lowercase playSessionId,
+		// no api_key and no auth header. Previously 401'd (case-sensitive lookup).
+		{"lowercase playSessionId (Wholphin)", "static=true&mediaSourceId=x&playSessionId=ps-abc", http.StatusOK},
+		{"canonical PlaySessionId", "PlaySessionId=ps-abc", http.StatusOK},
+		{"unknown play session", "playSessionId=does-not-exist", http.StatusUnauthorized},
+		{"no auth at all", "static=true", http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := requestWithCompatRouteItem(httptest.NewRequest("GET", "/Videos/itm/stream?"+tc.rawQuery, nil), "itm")
+			rec := httptest.NewRecorder()
+			gotSession := false
+			mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if SessionFromContext(r.Context()) != nil {
+					gotSession = true
+				}
+				w.WriteHeader(http.StatusOK)
+			})).ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (body: %s)", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if tc.wantCode == http.StatusOK && !gotSession {
+				t.Fatal("expected authenticated session in context")
+			}
+		})
+	}
+}
+
+// With the default settings, a play session keeps authorizing PlaySessionId-only
+// HLS requests for 24h, so a paused or long play survives past six hours (#2899).
+func TestPlaybackSessionAuth_DefaultLifetime(t *testing.T) {
+	cfg, err := config.LoadFromDB(map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := fixedNow()
+	clock := func() time.Time { return now }
+	deps := withDefaults(Dependencies{Config: cfg, Now: clock})
+	sessions := NewSessionStore(30*24*time.Hour, clock)
+	_ = sessions.Put(Session{Token: "compat-tok", StreamAppUserID: 1})
+	deps.PlaybackStore.Put(PlaybackSession{ID: "ps-abc", CompatToken: "compat-tok", RouteItemID: "itm"})
+	mw := PlaybackSessionAuth(sessions, deps.PlaybackStore, nil, nil)
+
+	for _, tc := range []struct {
+		elapsed  time.Duration
+		wantCode int
+	}{
+		{24*time.Hour - time.Minute, http.StatusOK},
+		{24 * time.Hour, http.StatusUnauthorized},
+	} {
+		now = fixedNow().Add(tc.elapsed)
+		req := requestWithCompatRouteItem(httptest.NewRequest("GET", "/Videos/itm/master.m3u8?PlaySessionId=ps-abc", nil), "itm")
+		rec := httptest.NewRecorder()
+		mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })).ServeHTTP(rec, req)
+		if rec.Code != tc.wantCode {
+			t.Errorf("after %s: status = %d, want %d", tc.elapsed, rec.Code, tc.wantCode)
+		}
+	}
+}
+
+// A PlaySessionId-only media request whose play session cannot be read from
+// the store answers a retryable 503, not a 401 that reads as a revoked grant
+// (#2923). The replica that cached the session keeps serving it, and a static
+// stream that a cached same-address negotiation grants is still served.
+func TestPlaybackSessionAuth_PlaySessionStoreUnavailable(t *testing.T) {
+	const (
+		master = "/Videos/itm/master.m3u8?PlaySessionId=ps-abc"
+		static = "/Videos/itm/stream?static=true&mediaSourceId=src9&PlaySessionId=ps-abc"
+	)
+	sessions := NewSessionStore(30*24*time.Hour, nil)
+	_ = sessions.Put(Session{Token: "compat-tok", StreamAppUserID: 1})
+	pool := newUnreachableCompatPool(t)
+	warm := NewDurableCompatPlaybackStore(pool, time.Hour, nil)
+	warm.Put(PlaybackSession{ID: "ps-abc", CompatToken: "compat-tok", RouteItemID: "itm"})
+	cold := NewDurableCompatPlaybackStore(pool, time.Hour, nil)
+	coldWithGrant := NewDurableCompatPlaybackStore(pool, time.Hour, nil)
+	coldWithGrant.Put(PlaybackSession{
+		ID: "ps-live", CompatToken: "compat-tok", RouteItemID: "itm",
+		ClientIP: "192.0.2.1", ClientPeer: "192.0.2.1", MediaSources: []PlaybackMediaSource{{ID: "src9"}},
+	})
+
+	for _, tc := range []struct {
+		name     string
+		store    CompatPlaybackStore
+		path     string
+		wantCode int
+	}{
+		{"replica holding the session", warm, master, http.StatusOK},
+		{"replica without the session", cold, master, http.StatusServiceUnavailable},
+		{"static stream without a grant", cold, static, http.StatusServiceUnavailable},
+		{"static stream granted by a cached negotiation", coldWithGrant, static, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+			router := chi.NewRouter()
+			guarded := router.With(PlaybackSessionAuth(sessions, tc.store, nil, addressGrantSettings(true)))
+			guarded.Handle("/Videos/{id}/master.m3u8", ok)
+			guarded.Handle("/Videos/{id}/stream", ok)
+			rec := httptest.NewRecorder()
+			clientip.Middleware(clientip.NewResolver(nil))(router).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (body: %s)", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if tc.wantCode == http.StatusServiceUnavailable && rec.Header().Get("Retry-After") == "" {
+				t.Fatal("503 carries no Retry-After")
+			}
+		})
+	}
+}
+
+func TestExtractToken_CaseInsensitiveAPIKey(t *testing.T) {
+	// "ApiKey" is Jellyfin's current query spelling (PascalCase); "api_key" is
+	// the legacy spelling. Native clients (incl. Jellyfin Android TV) build
+	// direct-play /Videos/{id}/stream URLs with "ApiKey", so rejecting it 401s
+	// the stream. Match both, plus the casing variants clients send.
+	for _, key := range []string{"ApiKey", "apikey", "APIKEY", "api_key", "Api_Key", "API_KEY"} {
+		req := httptest.NewRequest("GET", "/Videos/itm/stream?"+key+"=tok123", nil)
+		if got, ok := ExtractToken(req); !ok || got != "tok123" {
+			t.Fatalf("%s: ExtractToken = (%q, %v), want (tok123, true)", key, got, ok)
+		}
+	}
+}
+
+type fakeAPIKeyValidator struct {
+	key *models.APIKey
+}
+
+func (f *fakeAPIKeyValidator) GetByKey(_ context.Context, key string) (*models.APIKey, error) {
+	if f.key != nil && f.key.Key == key {
+		return f.key, nil
+	}
+	return nil, auth.ErrAPIKeyNotFound
+}
+
+func (f *fakeAPIKeyValidator) UpdateLastUsed(context.Context, int64) error {
+	return nil
+}
+
+type fakeAPIKeyUserLoader struct {
+	user *models.User
+}
+
+func (f *fakeAPIKeyUserLoader) GetByID(_ context.Context, id int) (*models.User, error) {
+	if f.user != nil && f.user.ID == id {
+		return f.user, nil
+	}
+	return nil, auth.ErrNotFound
+}

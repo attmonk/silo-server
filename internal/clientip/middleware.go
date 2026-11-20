@@ -1,0 +1,177 @@
+package clientip
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+)
+
+type contextKey string
+
+const clientIPKey contextKey = "client_ip"
+const requestSchemeKey contextKey = "request_scheme"
+const forwardedHostKey contextKey = "forwarded_host"
+
+// peerIPKey holds the transport-level peer address exactly as the listener saw
+// it, before Middleware overwrote RemoteAddr with the resolved client IP.
+const peerIPKey contextKey = "peer_addr"
+
+// forwardedClientUnknownKey marks a request whose resolved client IP is a
+// forwarder's own address; see ForwardedClientUnknown.
+const forwardedClientUnknownKey contextKey = "forwarded_client_unknown"
+
+// Middleware returns chi-compatible middleware that resolves the client IP
+// and stores it in the request context. It also overwrites r.RemoteAddr so
+// that downstream middleware (e.g. chi's Logger) and any code reading
+// RemoteAddr directly sees the real client IP instead of the proxy address.
+//
+// Because the overwrite is destructive, the original transport peer address is
+// preserved in the context as well. Anything that must key on an address a
+// client cannot forge — rate limiters, abuse controls — has to read
+// PeerFromContext rather than RemoteAddr, since a resolved IP is only as
+// trustworthy as the forwarding headers it came from.
+func Middleware(resolver *Resolver) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			peer := r.RemoteAddr
+			scheme := resolver.requestScheme(r)
+			forwardedHost := resolver.forwardedHost(r)
+			resolved, clientUnknown := resolver.resolve(r)
+			ip := normalize(resolved)
+			r.RemoteAddr = ip
+			ctx := context.WithValue(r.Context(), clientIPKey, ip)
+			ctx = context.WithValue(ctx, requestSchemeKey, scheme)
+			ctx = context.WithValue(ctx, forwardedHostKey, forwardedHost)
+			ctx = context.WithValue(ctx, peerIPKey, peer)
+			if clientUnknown {
+				ctx = context.WithValue(ctx, forwardedClientUnknownKey, true)
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// FromContext retrieves the resolved client IP from the request context.
+// Returns empty string if not set.
+func FromContext(ctx context.Context) string {
+	ip, _ := ctx.Value(clientIPKey).(string)
+	return ip
+}
+
+// ForwardedClientUnknown reports whether the request was forwarded for a
+// client the resolver could not identify, so FromContext holds a forwarder's
+// own address. That happens when a peer outside the trusted proxies sends
+// forwarding headers, when a trusted proxy names an untrusted hop that itself
+// forwarded for someone, and when a trusted proxy's headers name no usable
+// address. False when Middleware did not run.
+func ForwardedClientUnknown(ctx context.Context) bool {
+	unknown, _ := ctx.Value(forwardedClientUnknownKey).(bool)
+	return unknown
+}
+
+// PeerFromContext returns the transport peer address (host:port, as the
+// listener reported it) captured before Middleware overwrote RemoteAddr.
+// Returns empty string when the middleware did not run, in which case
+// r.RemoteAddr is still the unmodified peer address.
+func PeerFromContext(ctx context.Context) string {
+	addr, _ := ctx.Value(peerIPKey).(string)
+	return addr
+}
+
+// PeerIP returns the transport peer's IP, normalized like FromContext, so the
+// two compare equal for a direct connection. It returns "" when Middleware did
+// not run or the peer is not an IP address.
+func PeerIP(ctx context.Context) string {
+	addr := PeerFromContext(ctx)
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+	if ip := net.ParseIP(addr); ip != nil {
+		return normalize(ip)
+	}
+	return ""
+}
+
+// SetPeerContext stores a transport peer address in the context. Useful for
+// testing handlers that depend on the clientip middleware without going
+// through the full chain.
+func SetPeerContext(ctx context.Context, addr string) context.Context {
+	return context.WithValue(ctx, peerIPKey, addr)
+}
+
+// SetContext stores a client IP in the context. Useful for testing handlers
+// that depend on the clientip middleware without going through the full chain.
+func SetContext(ctx context.Context, ip string) context.Context {
+	return context.WithValue(ctx, clientIPKey, ip)
+}
+
+// RequestScheme returns the transport scheme or the scheme asserted by a trusted
+// proxy before RemoteAddr was rewritten. Empty means ambiguous proxy metadata.
+// Without Middleware, forwarding headers are never consulted.
+func RequestScheme(r *http.Request) string {
+	if scheme, ok := r.Context().Value(requestSchemeKey).(string); ok {
+		return scheme
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// RequestHost returns the host[:port] the client addressed: ForwardedHost,
+// else the Host header. A proxy that rewrites Host to its upstream address
+// keeps the client's host this way. Without Middleware, forwarding headers are
+// never consulted.
+func RequestHost(r *http.Request) string {
+	if host := ForwardedHost(r); host != "" {
+		return host
+	}
+	return r.Host
+}
+
+// ForwardedHost returns the single X-Forwarded-Host value a trusted proxy
+// sent, or "" when Middleware accepted none: no header, a peer that is not a
+// trusted proxy, or an ambiguous value. It tells a proxy that named the
+// client's host apart from one that left only Host, even when the two match.
+func ForwardedHost(r *http.Request) string {
+	host, _ := r.Context().Value(forwardedHostKey).(string)
+	return host
+}
+
+// RequestOrigin is the origin r arrived on, scheme://host[:port] as
+// SerializeOrigin writes it: the host from RequestHost and the scheme from
+// RequestScheme, so forwarding headers count only from a trusted proxy and
+// only after Middleware ran. Ambiguous proxy scheme metadata names the
+// transport's scheme; a client that compares this origin with the one it
+// configured then sees a mismatch and refuses, never a false match.
+func RequestOrigin(r *http.Request) string {
+	scheme := RequestScheme(r)
+	if scheme == "" {
+		scheme = "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+	}
+	return SerializeOrigin(scheme, RequestHost(r))
+}
+
+// SerializeOrigin is scheme://host[:port] with the scheme and host in lower
+// case, the default port of the scheme left out, IPv6 hosts in brackets, and
+// no path or trailing slash.
+func SerializeOrigin(scheme, host string) string {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	hostURL := url.URL{Host: strings.TrimSpace(host)}
+	name, port := strings.ToLower(hostURL.Hostname()), hostURL.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if strings.Contains(name, ":") {
+		name = "[" + name + "]"
+	}
+	if port != "" {
+		name += ":" + port
+	}
+	return scheme + "://" + name
+}

@@ -1,0 +1,159 @@
+import { createElement, type ReactNode } from "react";
+import { QueryClient, QueryClientProvider, onlineManager } from "@tanstack/react-query";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { setAccessToken, setRefreshToken, setProfileId, setProfileToken } from "@/api/client";
+import { useApplyPluginUpdate, useInstallPlugin, useRestartPluginInstallation } from "./plugins";
+import { adminKeys } from "../keys";
+
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock("sonner", () => ({ toast: { error: toastError, success: vi.fn() } }));
+
+const installation = (id: string, extra: Record<string, unknown> = {}) => ({
+  id,
+  repository_id: "4",
+  plugin_id: "org.example.a",
+  version: "1.0.0",
+  install_path: "/plugins/a",
+  enabled: true,
+  kind: "plugin",
+  update_policy: "auto",
+  source_kind: "silo",
+  updates_paused: false,
+  capabilities: [],
+  global_config_schema: [],
+  user_config_schema: [],
+  routes: [],
+  assets: [],
+  metadata: {},
+  global_configs: [],
+  auth_bindings: [],
+  task_bindings: [],
+  created_at: "2026-09-07T00:00:00.000Z",
+  updated_at: "2026-09-07T00:00:00.000Z",
+  ...extra,
+});
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+const problem = (type: string, status: number, detail = "synthetic") =>
+  new Response(
+    JSON.stringify({
+      type: `https://silo.dev/problems/${type}`,
+      title: type,
+      status,
+      detail,
+      instance: "synthetic",
+    }),
+    { status, headers: { "Content-Type": "application/problem+json" } },
+  );
+function fixture() {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: 3, retryDelay: 0 }, queries: { retry: false } },
+  });
+  return {
+    client,
+    wrapper: ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children),
+  };
+}
+beforeEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
+  setAccessToken("synthetic-admin");
+  setRefreshToken("synthetic-refresh");
+  setProfileId("profile-a");
+  setProfileToken("pin-a");
+  onlineManager.setOnline(true);
+});
+afterEach(() => {
+  cleanup();
+  onlineManager.setOnline(true);
+  vi.unstubAllGlobals();
+});
+
+it("restarts a failed resident and refreshes installation and network status", async () => {
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValue(
+      json(installation("7", { runtime: { resident: true, state: "running", restart_count: 0 } })),
+    );
+  vi.stubGlobal("fetch", fetchMock);
+  const context = fixture();
+  const invalidate = vi.spyOn(context.client, "invalidateQueries");
+  const { result } = renderHook(useRestartPluginInstallation, context);
+  act(() => result.current.mutate(7));
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  expect(fetchMock).toHaveBeenCalledOnce();
+  const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+  expect(String(url)).toBe("/api/v2/admin/plugins/installations/7/restart");
+  expect(init.method).toBe("POST");
+  expect((init.headers as Record<string, string>)["X-Profile-Id"]).toBe("profile-a");
+  expect(result.current.data?.runtime.state).toBe("running");
+  expect(invalidate).toHaveBeenCalledWith({ queryKey: adminKeys.pluginInstallations() });
+  expect(invalidate).toHaveBeenCalledWith({ queryKey: adminKeys.networkAccessStatusRoot() });
+});
+
+it.each(["401", "network"])(
+  "never replays an uncertain %s apply-update under global retry3",
+  async (failure) => {
+    const fetchMock =
+      failure === "network"
+        ? vi.fn().mockRejectedValue(new Error("connection lost"))
+        : vi.fn().mockResolvedValue(problem("authentication_required", 401));
+    vi.stubGlobal("fetch", fetchMock);
+    const { result } = renderHook(useApplyPluginUpdate, fixture());
+    act(() => result.current.mutate(7));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "/api/v2/admin/plugins/installations/7/update",
+    );
+    expect(fetchMock.mock.calls[0]?.[1].method).toBe("POST");
+  },
+);
+
+it.each([
+  [
+    422,
+    "validation_failed",
+    "The downloaded plugin doesn't match the SHA-256 checksum its catalog lists.",
+  ],
+  [
+    503,
+    "dependency_unavailable",
+    "Silo couldn't read the Silo maintained catalog. Try again in a moment.",
+  ],
+] as const)(
+  "shows the server's reason when an install fails with %i",
+  async (status, type, detail) => {
+    toastError.mockReset();
+    const fetchMock = vi.fn().mockResolvedValue(problem(type, status, detail));
+    vi.stubGlobal("fetch", fetchMock);
+    const { result } = renderHook(useInstallPlugin, fixture());
+    act(() =>
+      result.current.mutate({ repository_id: 4, plugin_id: "org.example.a", version: "1.0.0" }),
+    );
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(toastError).toHaveBeenCalledWith(detail);
+  },
+);
+
+it("refreshes the installation list when another install replaced the plugin first", async () => {
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValue(
+      problem(
+        "conflict",
+        409,
+        "Another install or update replaced this plugin while its package downloaded, so Silo didn't install it. Check the installed version and try again.",
+      ),
+    );
+  vi.stubGlobal("fetch", fetchMock);
+  const context = fixture();
+  const invalidate = vi.spyOn(context.client, "invalidateQueries");
+  const { result } = renderHook(useApplyPluginUpdate, context);
+  act(() => result.current.mutate(7));
+  await waitFor(() => expect(result.current.isError).toBe(true));
+  expect(invalidate).toHaveBeenCalledWith({ queryKey: adminKeys.pluginInstallations() });
+});

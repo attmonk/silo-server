@@ -1,0 +1,65 @@
+package recommendations
+
+import (
+	"context"
+	"os"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/database"
+)
+
+// newEngineTestPool mirrors internal/catalog/display_query_filter_test.go: it
+// skips when SILO_TEST_DATABASE_URL is unset and verifies the base schema is
+// present before returning a usable pool.
+func newEngineTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	// The application's pool, so queries run with its vector codecs.
+	pool, err := database.NewPool(ctx, config.DatabaseConfig{URL: dsn})
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(func() { database.ClosePool(pool) })
+	var tableName *string
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.server_settings')::text`).Scan(&tableName); err != nil {
+		t.Fatalf("check server_settings table: %v", err)
+	}
+	if tableName == nil || *tableName == "" {
+		t.Skip("test database has not applied base schema")
+	}
+	return pool
+}
+
+// snapshotEmbeddingLock captures the current embedding lock row (if any) and
+// registers cleanup that restores the original state, so these tests do not
+// leave behind or clobber a real lock.
+func snapshotEmbeddingLock(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	var original *string
+	err := pool.QueryRow(ctx,
+		`SELECT value FROM server_settings WHERE key = $1`,
+		embeddingLockSettingKey,
+	).Scan(&original)
+	if err != nil {
+		original = nil
+	}
+	t.Cleanup(func() {
+		cctx := context.Background()
+		if original == nil {
+			_, _ = pool.Exec(cctx, `DELETE FROM server_settings WHERE key = $1`, embeddingLockSettingKey)
+			return
+		}
+		_, _ = pool.Exec(cctx, `
+			INSERT INTO server_settings (key, value) VALUES ($1, $2)
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+		`, embeddingLockSettingKey, *original)
+	})
+}

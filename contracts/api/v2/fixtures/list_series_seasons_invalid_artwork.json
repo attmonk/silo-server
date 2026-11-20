@@ -1,0 +1,14 @@
+{
+  "type": "https://siloserver.org/docs/api/v2/problems/validation_failed",
+  "title": "Validation failed",
+  "status": 422,
+  "detail": "expected the lowercase literal true or false",
+  "instance": "urn:silo:request:00000000000000000000028c",
+  "errors": [
+    {
+      "location": "query.include_artwork",
+      "code": "invalid_type",
+      "detail": "expected the lowercase literal true or false"
+    }
+  ]
+}

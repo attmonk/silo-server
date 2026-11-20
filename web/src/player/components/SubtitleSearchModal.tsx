@@ -1,0 +1,382 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import type { PlayerConfig } from "../context/PlayerConfigContext";
+import { playerV2 } from "../player-v2";
+import type { SubtitleLanguageDetection, SubtitleResult } from "@/api/types";
+import { SubtitleUploadForm } from "@/components/subtitles/SubtitleUploadForm";
+import { languageOptions } from "../utils/languageNames";
+import { canonicalLanguageWireValue } from "@/lib/languageNames";
+import type { StoredSubtitle } from "../utils/subtitleSync";
+import { formatLocale } from "@/lib/appLocale";
+import { useT } from "@/i18n";
+import { PlayerModalDialog } from "./PlayerModalDialog";
+
+/** Glyph on the close button, which carries a translated label. */
+const CLOSE_GLYPH = "✕";
+/** Spinning glyph while a result downloads; the span carries a translated label. */
+const SPINNER_GLYPH = "⟳";
+
+interface SubtitleSearchModalProps {
+  mediaFileId: number;
+  playerConfig: PlayerConfig;
+  isOpen: boolean;
+  onClose: () => void;
+  /**
+   * Called with the stored subtitle a download or upload created, so the
+   * player can show its automatic sync while it runs.
+   */
+  onSubtitleDownloaded: (
+    subtitle: StoredSubtitle | undefined,
+    source: "download" | "upload",
+  ) => void;
+  /** Let the player snapshot its current subtitle choice before the request. */
+  onDownloadStarted?: () => void;
+  /** False hides the online-search section; manual upload stays available. */
+  onlineSearchEnabled?: boolean;
+}
+
+interface ProviderInfo {
+  abbr: string;
+  color: string;
+}
+
+const providerInfo: Record<string, ProviderInfo> = {
+  opensubtitles: { abbr: "OS", color: "#eab308" },
+  subdl: { abbr: "SDL", color: "#3b82f6" },
+  subsource: { abbr: "SS", color: "#ef4444" },
+  upload: { abbr: "UP", color: "#a855f7" },
+};
+
+function scoreColor(score: number): string {
+  if (score >= 70) return "#22c55e";
+  if (score >= 40) return "#eab308";
+  return "#ef4444";
+}
+
+export function SubtitleSearchModal({
+  mediaFileId,
+  playerConfig,
+  isOpen,
+  onClose,
+  onSubtitleDownloaded,
+  onDownloadStarted,
+  onlineSearchEnabled = true,
+}: SubtitleSearchModalProps) {
+  const t = useT();
+  const [selectedLang, setSelectedLang] = useState("en");
+  const [results, setResults] = useState<SubtitleResult[]>([]);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const modalRef = useRef<HTMLDivElement>(null);
+  const downloadGeneration = useRef(0);
+  const uploadedSubtitle = useRef<StoredSubtitle | undefined>(undefined);
+  useEffect(() => {
+    downloadGeneration.current++;
+    setDownloading(null);
+    return () => {
+      downloadGeneration.current++;
+    };
+  }, [playerConfig, mediaFileId, isOpen]);
+
+  // The provider probe can resolve after the modal opened. If it hides online
+  // search, the focused language select unmounts; keep focus inside the modal.
+  useEffect(() => {
+    if (!isOpen || onlineSearchEnabled) return;
+    const modal = modalRef.current;
+    if (modal && !modal.contains(document.activeElement)) {
+      modal.querySelector<HTMLElement>("button")?.focus();
+    }
+  }, [isOpen, onlineSearchEnabled]);
+
+  const handleSearch = useCallback(async () => {
+    setSearching(true);
+    setError(null);
+    setResults([]);
+    setWarnings([]);
+
+    try {
+      const response = await playerV2(playerConfig, "POST /api/v2/subtitles/search", {
+        body: {
+          media_file_id: String(mediaFileId),
+          languages: [canonicalLanguageWireValue(selectedLang) ?? selectedLang],
+        },
+      });
+      setResults(response.results ?? []);
+      setWarnings(response.warnings ?? []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("web.subtitles.search.searchFailed"));
+    } finally {
+      setSearching(false);
+    }
+  }, [playerConfig, mediaFileId, selectedLang, t]);
+
+  const handleUpload = useCallback(
+    async (input: {
+      mediaFileId: number;
+      file: File;
+      language?: string;
+      languageOverride?: boolean;
+      hearingImpaired: boolean;
+    }) => {
+      const token = playerConfig.getAccessToken(),
+        profile = playerConfig.getProfileId(),
+        pin = playerConfig.getProfileToken?.();
+      const generation = downloadGeneration.current;
+      uploadedSubtitle.current = undefined;
+      const response = await playerV2(playerConfig, "POST /api/v2/subtitles/upload", {
+        form: {
+          media_file_id: String(input.mediaFileId),
+          file: input.file,
+          language: input.language,
+          language_override: input.languageOverride ? "true" : "false",
+          hearing_impaired: input.hearingImpaired ? "true" : "false",
+        },
+      });
+      if (
+        generation !== downloadGeneration.current ||
+        token !== playerConfig.getAccessToken() ||
+        profile !== playerConfig.getProfileId() ||
+        pin !== playerConfig.getProfileToken?.()
+      )
+        throw new DOMException("Subtitle upload context changed", "AbortError");
+      uploadedSubtitle.current = response?.subtitle;
+    },
+    [playerConfig],
+  );
+
+  const handleDetectLanguage = useCallback(
+    async (file: File, fallbackLanguage?: string): Promise<SubtitleLanguageDetection> => {
+      const token = playerConfig.getAccessToken(),
+        profile = playerConfig.getProfileId(),
+        pin = playerConfig.getProfileToken?.();
+      const generation = downloadGeneration.current;
+      const result = await playerV2(playerConfig, "POST /api/v2/subtitles/detect-language", {
+        form: { file, language: fallbackLanguage },
+      });
+      if (
+        generation !== downloadGeneration.current ||
+        token !== playerConfig.getAccessToken() ||
+        profile !== playerConfig.getProfileId() ||
+        pin !== playerConfig.getProfileToken?.()
+      )
+        throw new DOMException("Subtitle detection context changed", "AbortError");
+      return result;
+    },
+    [playerConfig],
+  );
+
+  const handleUploadSuccess = useCallback(() => {
+    onSubtitleDownloaded(uploadedSubtitle.current, "upload");
+    onClose();
+  }, [onSubtitleDownloaded, onClose]);
+
+  const handleDownload = useCallback(
+    async (result: SubtitleResult) => {
+      onDownloadStarted?.();
+      const generation = downloadGeneration.current;
+      const token = playerConfig.getAccessToken();
+      const profile = playerConfig.getProfileId();
+      const pin = playerConfig.getProfileToken?.();
+      const current = () =>
+        generation === downloadGeneration.current &&
+        token === playerConfig.getAccessToken() &&
+        profile === playerConfig.getProfileId() &&
+        pin === playerConfig.getProfileToken?.();
+      const key = `${result.provider}:${result.id}`;
+      setDownloading(key);
+      setError(null);
+
+      try {
+        const response = await playerV2(playerConfig, "POST /api/v2/subtitles/download", {
+          body: {
+            media_file_id: String(mediaFileId),
+            provider: result.provider,
+            subtitle_id: result.id,
+            language: result.language,
+            release_name: result.release_name,
+            score: result.score,
+            hearing_impaired: result.hearing_impaired,
+          },
+        });
+        if (!current()) return;
+        onSubtitleDownloaded(response?.subtitle, "download");
+        onClose();
+      } catch (err) {
+        if (current())
+          setError(err instanceof Error ? err.message : t("web.subtitles.search.downloadFailed"));
+      } finally {
+        if (current()) setDownloading(null);
+      }
+    },
+    [playerConfig, mediaFileId, onSubtitleDownloaded, onDownloadStarted, onClose, t],
+  );
+
+  if (!isOpen) return null;
+
+  return (
+    <PlayerModalDialog
+      label={t("web.subtitles.search.title")}
+      className="w-full max-w-[480px] rounded-lg bg-neutral-900 text-white shadow-xl"
+      onClose={onClose}
+    >
+      <div ref={modalRef}>
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <h2 className="text-sm font-semibold">{t("web.subtitles.search.title")}</h2>
+          <button
+            type="button"
+            className="rounded text-white/60 hover:text-white focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
+            onClick={onClose}
+            aria-label={t("web.subtitles.closeDialog")}
+          >
+            {CLOSE_GLYPH}
+          </button>
+        </div>
+
+        <SubtitleUploadForm
+          mediaFileId={mediaFileId}
+          upload={handleUpload}
+          detectLanguage={handleDetectLanguage}
+          onSuccess={handleUploadSuccess}
+          variant="player"
+          defaultLanguage={selectedLang}
+        />
+
+        {onlineSearchEnabled && (
+          <div className="border-b border-white/10 px-4 py-2">
+            <p className="text-xs font-medium text-white/60">
+              {t("web.subtitles.search.searchOnline")}
+            </p>
+          </div>
+        )}
+
+        {/* Search controls */}
+        {onlineSearchEnabled && (
+          <div className="flex gap-2 px-4 py-3">
+            <select
+              data-autofocus
+              aria-label={t("web.subtitles.search.language")}
+              className="flex-1 rounded bg-neutral-800 px-2 py-1.5 text-sm text-white focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
+              value={selectedLang}
+              onChange={(e) => setSelectedLang(e.target.value)}
+            >
+              {languageOptions().map((lang) => (
+                <option key={lang.code} value={lang.code}>
+                  {lang.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="rounded bg-white/10 px-3 py-1.5 text-sm font-medium hover:bg-white/20 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:opacity-50"
+              onClick={handleSearch}
+              disabled={searching}
+            >
+              {searching ? t("web.subtitles.search.searching") : t("web.subtitles.search.search")}
+            </button>
+          </div>
+        )}
+
+        {/* Error */}
+        {error && (
+          <div
+            role="alert"
+            className="mx-4 mb-3 rounded bg-red-900/40 px-3 py-2 text-xs text-red-300"
+          >
+            {error}
+          </div>
+        )}
+
+        {/* Warnings */}
+        {warnings.length > 0 && (
+          <div role="status" className="mx-4 mb-2 space-y-1">
+            {warnings.map((w, i) => (
+              <div key={i} className="rounded bg-yellow-900/40 px-3 py-1.5 text-xs text-yellow-300">
+                {w}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Results */}
+        {onlineSearchEnabled && (
+          <div className="max-h-[60vh] overflow-y-auto px-4 pb-4">
+            {results.length === 0 && !searching && !error && (
+              <p className="py-6 text-center text-xs text-white/40">
+                {t("web.subtitles.search.prompt")}
+              </p>
+            )}
+
+            {results.map((result) => {
+              const key = `${result.provider}:${result.id}`;
+              const isDownloading = downloading === key;
+              const info = providerInfo[result.provider];
+
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  className="mb-1.5 flex w-full items-center gap-2 rounded bg-white/5 px-3 py-2 text-start hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:opacity-50"
+                  onClick={() => handleDownload(result)}
+                  disabled={downloading !== null}
+                >
+                  {/* Score badge */}
+                  <span
+                    className="shrink-0 rounded px-1.5 py-0.5 text-xs font-bold tabular-nums"
+                    style={{
+                      backgroundColor: `${scoreColor(result.score)}22`,
+                      color: scoreColor(result.score),
+                      border: `1px solid ${scoreColor(result.score)}55`,
+                    }}
+                  >
+                    {result.score}
+                  </span>
+
+                  {/* Release name */}
+                  <span className="min-w-0 flex-1 truncate text-xs">{result.release_name}</span>
+
+                  {/* HI badge */}
+                  {result.hearing_impaired && (
+                    <span className="shrink-0 rounded bg-white/10 px-1 py-0.5 text-[10px] text-white/60">
+                      {t("subtitleSearch.hearingImpaired")}
+                    </span>
+                  )}
+
+                  {/* Download count */}
+                  <span className="shrink-0 text-[10px] text-white/40">
+                    {t("web.subtitles.search.downloads", {
+                      downloads: result.downloads.toLocaleString(formatLocale()),
+                    })}
+                  </span>
+
+                  {/* Provider badge */}
+                  <span
+                    className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold"
+                    style={{
+                      backgroundColor: `${info?.color ?? "#6b7280"}22`,
+                      color: info?.color ?? "#9ca3af",
+                      border: `1px solid ${info?.color ?? "#6b7280"}55`,
+                    }}
+                  >
+                    {info?.abbr ?? result.provider}
+                  </span>
+
+                  {/* Download spinner */}
+                  {isDownloading && (
+                    <span
+                      className="shrink-0 text-xs text-white/60"
+                      aria-label={t("web.subtitles.search.downloading")}
+                    >
+                      {SPINNER_GLYPH}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </PlayerModalDialog>
+  );
+}

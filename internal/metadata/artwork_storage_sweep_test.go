@@ -1,0 +1,387 @@
+package metadata
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/blobstore"
+)
+
+func TestParseArtworkObjectKeyLeavesOriginalUnchanged(t *testing.T) {
+	t.Parallel()
+	// The original variant must map to itself, or every currently-referenced
+	// object would look unreferenced and be deleted.
+	key := "tmdb/people/1352462/profile/original.deadbeef.webp"
+	got, ok := parseArtworkObjectKey(blobstore.ObjectInfo{Key: key})
+	if !ok {
+		t.Fatal("expected the original variant to parse")
+	}
+	if got.original != key {
+		t.Fatalf("original path = %q, want %q", got.original, key)
+	}
+}
+
+func TestParseArtworkObjectKeyRejectsUnrecognizedShapes(t *testing.T) {
+	t.Parallel()
+	// Anything that does not decompose is skipped rather than guessed at:
+	// an unmodelled key is the one case where deleting could destroy
+	// something this code does not understand.
+	for _, key := range []string{
+		"local/movies/31190/poster/original.webp", // no hash segment
+		"local/movies/31190/poster/a.b.c.d.webp",  // too many segments
+		"orphan-at-root.webp",                     // no directory
+		"local/movies/31190/poster/.abc123.webp",  // empty variant
+		"local/movies/31190/poster/w300..webp",    // empty hash
+		"local/movies/31190/poster/w300.abc123.",  // empty extension
+		"local/movies/31190/poster/",              // directory marker
+	} {
+		if _, ok := parseArtworkObjectKey(blobstore.ObjectInfo{Key: key}); ok {
+			t.Errorf("key %q parsed but should have been rejected", key)
+		}
+	}
+}
+
+// fakeArtworkStorage records what the sweep asked it to delete so the
+// destructive path can be asserted rather than inferred.
+type fakeArtworkStorage struct {
+	pages     [][]blobstore.ObjectInfo
+	tokens    []string
+	deleted   []string
+	calls     int
+	deleteErr error
+}
+
+func (f *fakeArtworkStorage) Delete(_ context.Context, keys []string) (int, error) {
+	if f.deleteErr != nil {
+		return 0, f.deleteErr
+	}
+	f.deleted = append(f.deleted, keys...)
+	return len(keys), nil
+}
+
+func (f *fakeArtworkStorage) List(_ context.Context, _, _ string, _ int) ([]blobstore.ObjectInfo, string, error) {
+	if f.calls >= len(f.pages) {
+		return nil, "", nil
+	}
+	page, token := f.pages[f.calls], f.tokens[f.calls]
+	f.calls++
+	return page, token, nil
+}
+
+func ageingObjects(prefix string, n int, age time.Duration) []blobstore.ObjectInfo {
+	when := time.Now().Add(-age)
+	out := make([]blobstore.ObjectInfo, 0, n)
+	for i := 0; i < n; i++ {
+		stamp := when
+		out = append(out, blobstore.ObjectInfo{
+			Key:     fmt.Sprintf("%s/item%d/poster/w300.hash%d.webp", prefix, i, i),
+			ModTime: stamp,
+		})
+	}
+	return out
+}
+
+// sweepWithoutDatabase exercises SweepPrefix with the reference lookup stubbed
+// out, so the guards can be tested without a live catalog. referenced is the
+// set of original-variant paths to treat as still in use.
+func sweepWithoutDatabase(t *testing.T, storage *fakeArtworkStorage, referenced map[string]struct{}, maxPages int) (ArtworkStorageSweepStats, error) {
+	t.Helper()
+	sweeper := &ArtworkStorageSweeper{store: storage, now: time.Now, lookup: pathSetLookup(referenced)}
+	return sweeper.SweepPrefix(context.Background(), "local/", "", maxPages)
+}
+
+// pathSetLookup answers a sweep lookup with the asked paths that are in set.
+func pathSetLookup(set map[string]struct{}) func(context.Context, []string) (map[string]struct{}, error) {
+	return func(_ context.Context, paths []string) (map[string]struct{}, error) {
+		found := make(map[string]struct{})
+		for _, p := range paths {
+			if _, ok := set[p]; ok {
+				found[p] = struct{}{}
+			}
+		}
+		return found, nil
+	}
+}
+
+// densePageStorage lists one page of 200 aged objects, then token.
+func densePageStorage(token string) *fakeArtworkStorage {
+	return &fakeArtworkStorage{
+		pages:  [][]blobstore.ObjectInfo{ageingObjects("local", 200, 72*time.Hour)},
+		tokens: []string{token},
+	}
+}
+
+// A local backend keeps subtitles, diagnostic bundles, job artifacts, and
+// avatars in the same root as artwork. An empty prefix would walk all of them,
+// and parseArtworkObjectKey would read a name like "report.tar.gz" as a
+// revisioned variant and delete it.
+func TestSweepRefusesAnEmptyPrefix(t *testing.T) {
+	t.Parallel()
+	storage := &fakeArtworkStorage{
+		pages:  [][]blobstore.ObjectInfo{ageingObjects("local", 2, 72*time.Hour)},
+		tokens: []string{""},
+	}
+	sweeper := &ArtworkStorageSweeper{store: storage, now: time.Now}
+	for _, prefix := range []string{"", "   "} {
+		if _, err := sweeper.SweepPrefix(context.Background(), prefix, "", 1); err == nil {
+			t.Fatalf("prefix %q: unbounded sweep accepted", prefix)
+		}
+	}
+	if len(storage.deleted) != 0 {
+		t.Fatalf("deleted %v on a refused sweep", storage.deleted)
+	}
+}
+
+func TestSweepDeletesOnlyUnreferencedObjects(t *testing.T) {
+	t.Parallel()
+	objects := ageingObjects("local", 4, 72*time.Hour)
+	referenced := map[string]struct{}{
+		"local/item0/poster/original.hash0.webp": {},
+		"local/item1/poster/original.hash1.webp": {},
+		"local/item2/poster/original.hash2.webp": {},
+	}
+	storage := &fakeArtworkStorage{pages: [][]blobstore.ObjectInfo{objects}, tokens: []string{""}}
+
+	stats, err := sweepWithoutDatabase(t, storage, referenced, 1)
+	if err != nil {
+		t.Fatalf("sweep failed: %v", err)
+	}
+	if stats.Referenced != 3 {
+		t.Fatalf("referenced = %d, want 3", stats.Referenced)
+	}
+	if len(storage.deleted) != 1 || storage.deleted[0] != "local/item3/poster/w300.hash3.webp" {
+		t.Fatalf("deleted %v, want only the unreferenced object", storage.deleted)
+	}
+	if !stats.PrefixDone {
+		t.Fatal("an empty continuation token must mark the prefix finished")
+	}
+}
+
+func TestSweepSkipsObjectsUnderTheAgeFloor(t *testing.T) {
+	t.Parallel()
+	// Nothing is referenced, so only the age floor can save these.
+	storage := &fakeArtworkStorage{
+		pages:  [][]blobstore.ObjectInfo{ageingObjects("local", 5, time.Hour)},
+		tokens: []string{""},
+	}
+	stats, err := sweepWithoutDatabase(t, storage, map[string]struct{}{}, 1)
+	if err != nil {
+		t.Fatalf("sweep failed: %v", err)
+	}
+	if stats.TooNew != 5 {
+		t.Fatalf("too_new = %d, want 5", stats.TooNew)
+	}
+	if len(storage.deleted) != 0 {
+		t.Fatalf("deleted %v; freshly written objects must never be deleted", storage.deleted)
+	}
+}
+
+func TestSweepFailsClosedOnMissingTimestamp(t *testing.T) {
+	t.Parallel()
+	// Storage that reports no modification time gives no way to tell a
+	// just-written object from an old one, so the sweep must not delete it.
+	storage := &fakeArtworkStorage{
+		pages:  [][]blobstore.ObjectInfo{{{Key: "local/item0/poster/w300.hash0.webp"}}},
+		tokens: []string{""},
+	}
+	stats, err := sweepWithoutDatabase(t, storage, map[string]struct{}{}, 1)
+	if err != nil {
+		t.Fatalf("sweep failed: %v", err)
+	}
+	if stats.TooNew != 1 {
+		t.Fatalf("too_new = %d, want 1: an unknown age must fail closed", stats.TooNew)
+	}
+	if len(storage.deleted) != 0 {
+		t.Fatalf("deleted %v; an object of unknown age must never be deleted", storage.deleted)
+	}
+}
+
+func TestSweepStopsInsteadOfDeletingAnAnomalousPage(t *testing.T) {
+	t.Parallel()
+	// A full page where nothing resolves is the signature of a broken
+	// reference check, not an empty catalog.
+	storage := densePageStorage("next")
+	stats, err := sweepWithoutDatabase(t, storage, map[string]struct{}{}, 1)
+	if err == nil {
+		t.Fatal("expected the anomaly guard to stop the sweep")
+	}
+	if !stats.StoppedOnAnomaly {
+		t.Fatal("stats must record that the sweep stopped on an anomaly")
+	}
+	if len(storage.deleted) != 0 {
+		t.Fatalf("deleted %v; the anomaly guard must prevent every deletion on that page", storage.deleted)
+	}
+}
+
+func TestSweepResumesAcrossPagesAndStopsAtMaxPages(t *testing.T) {
+	t.Parallel()
+	referenced := map[string]struct{}{}
+	for i := 0; i < 100; i++ {
+		referenced[fmt.Sprintf("local/item%d/poster/original.hash%d.webp", i, i)] = struct{}{}
+	}
+	storage := &fakeArtworkStorage{
+		pages: [][]blobstore.ObjectInfo{
+			ageingObjects("local", 100, 72*time.Hour),
+			ageingObjects("local", 100, 72*time.Hour),
+			ageingObjects("local", 100, 72*time.Hour),
+		},
+		tokens: []string{"t1", "t2", ""},
+	}
+	stats, err := sweepWithoutDatabase(t, storage, referenced, 2)
+	if err != nil {
+		t.Fatalf("sweep failed: %v", err)
+	}
+	if stats.Pages != 2 {
+		t.Fatalf("pages = %d, want 2: maxPages must bound the run", stats.Pages)
+	}
+	if stats.NextToken != "t2" {
+		t.Fatalf("next token = %q, want %q so the next run resumes here", stats.NextToken, "t2")
+	}
+	if stats.PrefixDone {
+		t.Fatal("a bounded run that stopped early must not claim the prefix is finished")
+	}
+}
+
+// sweepWithGCSchedule is sweepWithoutDatabase plus a stubbed record of the
+// revisions the artwork GC has armed for collection. calls counts how often the
+// sweep consulted it.
+func sweepWithGCSchedule(t *testing.T, storage *fakeArtworkStorage, referenced, scheduled map[string]struct{}, scheduleErr error, calls *int) (ArtworkStorageSweepStats, error) {
+	t.Helper()
+	sweeper := &ArtworkStorageSweeper{store: storage, now: time.Now, lookup: pathSetLookup(referenced)}
+	sweeper.scheduled = func(ctx context.Context, paths []string) (map[string]struct{}, error) {
+		*calls++
+		if scheduleErr != nil {
+			return nil, scheduleErr
+		}
+		return pathSetLookup(scheduled)(ctx, paths)
+	}
+	return sweeper.SweepPrefix(context.Background(), "local/", "", 2)
+}
+
+func originalsFor(n int) map[string]struct{} {
+	out := make(map[string]struct{}, n)
+	for i := 0; i < n; i++ {
+		out[fmt.Sprintf("local/item%d/poster/original.hash%d.webp", i, i)] = struct{}{}
+	}
+	return out
+}
+
+// Artwork replaced in bulk leaves its old revisions next to each other in key
+// order, so a whole page can be queued garbage. When the GC's schedule accounts
+// for it, the sweep must not stop, and it must not delete either: the schedule
+// is not proof, and the GC re-checks references before it deletes.
+func TestSweepLeavesAScheduledDensePageToTheGC(t *testing.T) {
+	t.Parallel()
+	storage := densePageStorage("")
+	calls := 0
+	stats, err := sweepWithGCSchedule(t, storage, map[string]struct{}{}, originalsFor(200), nil, &calls)
+	if err != nil {
+		t.Fatalf("sweep stopped on a page the GC schedule fully accounts for: %v", err)
+	}
+	if stats.StoppedOnAnomaly {
+		t.Fatal("stats must not record an anomaly for a scheduled page")
+	}
+	if len(storage.deleted) != 0 {
+		t.Fatalf("deleted %d objects; a scheduled page must be left to the GC", len(storage.deleted))
+	}
+	if stats.LeftToGC != 200 || !stats.PrefixDone {
+		t.Fatalf("left_to_gc = %d, prefix_done = %v; want 200 and true", stats.LeftToGC, stats.PrefixDone)
+	}
+}
+
+// Skipping a scheduled page must not end the run: the pages after it are
+// swept normally.
+func TestSweepContinuesPastAScheduledPage(t *testing.T) {
+	t.Parallel()
+	second := ageingObjects("other", 100, 72*time.Hour)
+	referenced := map[string]struct{}{}
+	for i := 0; i < 90; i++ {
+		referenced[fmt.Sprintf("other/item%d/poster/original.hash%d.webp", i, i)] = struct{}{}
+	}
+	storage := &fakeArtworkStorage{
+		pages:  [][]blobstore.ObjectInfo{ageingObjects("local", 200, 72*time.Hour), second},
+		tokens: []string{"t1", ""},
+	}
+	calls := 0
+	stats, err := sweepWithGCSchedule(t, storage, referenced, originalsFor(200), nil, &calls)
+	if err != nil {
+		t.Fatalf("sweep failed: %v", err)
+	}
+	if stats.Pages != 2 || stats.LeftToGC != 200 {
+		t.Fatalf("pages = %d, left_to_gc = %d; want 2 and 200", stats.Pages, stats.LeftToGC)
+	}
+	if len(storage.deleted) != 10 {
+		t.Fatalf("deleted %d; want the 10 unreferenced objects on the normal second page", len(storage.deleted))
+	}
+}
+
+// The schedule only counts for the objects it names. A lopsided page it barely
+// accounts for still looks like a broken reference check.
+func TestSweepStillStopsWhenTheGCScheduleDoesNotAccountForThePage(t *testing.T) {
+	t.Parallel()
+	storage := densePageStorage("next")
+	calls := 0
+	stats, err := sweepWithGCSchedule(t, storage, map[string]struct{}{}, originalsFor(10), nil, &calls)
+	if err == nil || !stats.StoppedOnAnomaly {
+		t.Fatalf("expected the anomaly guard to stop the sweep; err=%v", err)
+	}
+	if len(storage.deleted) != 0 {
+		t.Fatalf("deleted %v; nothing on a refused page may be deleted", storage.deleted)
+	}
+}
+
+func TestSweepStopsWhenTheGCScheduleCheckFails(t *testing.T) {
+	t.Parallel()
+	storage := densePageStorage("next")
+	calls := 0
+	_, err := sweepWithGCSchedule(t, storage, map[string]struct{}{}, originalsFor(200), errors.New("db down"), &calls)
+	if err == nil {
+		t.Fatal("a failed GC schedule check must stop the sweep")
+	}
+	if len(storage.deleted) != 0 {
+		t.Fatalf("deleted %v after the GC schedule check failed", storage.deleted)
+	}
+}
+
+// The extra query is only for pages the ratio would otherwise refuse, and a
+// normal page still deletes what is unreferenced.
+func TestSweepConsultsTheGCScheduleOnlyForLopsidedPages(t *testing.T) {
+	t.Parallel()
+	storage := densePageStorage("")
+	calls := 0
+	stats, err := sweepWithGCSchedule(t, storage, originalsFor(150), map[string]struct{}{}, nil, &calls)
+	if err != nil {
+		t.Fatalf("sweep failed: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("GC schedule consulted %d times for a page that was 25%% unreferenced", calls)
+	}
+	if len(storage.deleted) != 50 || stats.LeftToGC != 0 {
+		t.Fatalf("deleted %d, left_to_gc %d; want 50 and 0", len(storage.deleted), stats.LeftToGC)
+	}
+}
+
+// An object the store keeps refusing to delete must not pin the cursor: the
+// task resumes at NextToken, so a cursor left at the failing page would fail
+// there on every run and never sweep the rest of the prefix.
+func TestSweepMovesPastAPageWhoseDeleteFails(t *testing.T) {
+	t.Parallel()
+	storage := &fakeArtworkStorage{
+		pages: [][]blobstore.ObjectInfo{
+			ageingObjects("local", 4, 72*time.Hour),
+			ageingObjects("local", 4, 72*time.Hour),
+		},
+		tokens:    []string{"t1", ""},
+		deleteErr: errors.New("access denied"),
+	}
+	stats, err := sweepWithoutDatabase(t, storage, map[string]struct{}{}, 2)
+	if err == nil {
+		t.Fatal("a failed delete must be reported")
+	}
+	if stats.NextToken != "t1" || stats.PrefixDone {
+		t.Fatalf("next token = %q, prefix done = %v; want the page after the failed one", stats.NextToken, stats.PrefixDone)
+	}
+}

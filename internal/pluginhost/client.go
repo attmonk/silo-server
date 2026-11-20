@@ -1,0 +1,619 @@
+package pluginhost
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
+	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
+)
+
+var (
+	ErrClientNotFound     = errors.New("plugin client not found")
+	ErrCapabilityNotFound = errors.New("plugin capability not found")
+	ErrPluginUnhealthy    = errors.New("plugin is unhealthy")
+)
+
+type Client struct {
+	installationID int
+	startSeq       uint64
+	ingressToken   string
+	manifest       *pluginv1.PluginManifest
+	activity       *activity
+	rpc            *sdkruntime.Client
+	capabilities   map[string]*pluginv1.CapabilityDescriptor
+
+	mu        sync.RWMutex
+	unhealthy bool
+}
+
+func (c *Client) StartSeq() uint64 { return c.startSeq }
+
+type MetadataProviderClient struct {
+	client  pluginv1.MetadataProviderClient
+	timeout time.Duration
+}
+
+type ImageResolverClient struct {
+	client  pluginv1.ImageResolverClient
+	timeout time.Duration
+}
+
+type MarkerProviderClient struct {
+	client  pluginv1.MarkerProviderClient
+	timeout time.Duration
+}
+
+type MediaAnalyzerClient struct {
+	client  pluginv1.MediaAnalyzerClient
+	timeout time.Duration
+}
+
+type ScheduledTaskClient struct {
+	client  pluginv1.ScheduledTaskClient
+	timeout time.Duration
+}
+
+type ScanSourceClient struct {
+	client  pluginv1.ScanSourceClient
+	timeout time.Duration
+}
+
+type RequestRouterClient struct {
+	client  pluginv1.RequestRouterClient
+	timeout time.Duration
+}
+
+type EventConsumerClient struct {
+	client  pluginv1.EventConsumerClient
+	timeout time.Duration
+}
+
+// NotificationChannelClient drives one plugin's notification_channel.v1
+// capabilities. The caller bounds each call; the notification system sets
+// the timeouts the SDK documents.
+type NotificationChannelClient struct {
+	client       pluginv1.NotificationChannelClient
+	capabilityID string
+}
+
+type AuthProviderClient struct {
+	client  pluginv1.AuthProviderClient
+	checks  pluginv1.AuthProviderChecksClient
+	network pluginv1.NetworkIdentityAuthClient
+	timeout time.Duration
+}
+
+type HTTPRoutesClient struct {
+	activity *activity
+	client   pluginv1.HttpRoutesClient
+	timeout  time.Duration
+}
+
+type WatchSyncProviderClient struct {
+	client              pluginv1.WatchSyncProviderClient
+	deviceAuthorization pluginv1.WatchSyncDeviceAuthorizationServiceClient
+	timeout             time.Duration
+}
+
+// NetworkAccessProviderClient drives one network_access_provider.v1 instance.
+type NetworkAccessProviderClient struct {
+	ingressToken string
+	client       pluginv1.NetworkAccessProviderClient
+	timeout      time.Duration
+}
+
+// IngressToken identifies the process that answers these provider RPCs.
+func (c *NetworkAccessProviderClient) IngressToken() string { return c.ingressToken }
+
+func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.PluginManifest, startSeq uint64, used *activity) *Client {
+	capabilities := make(map[string]*pluginv1.CapabilityDescriptor, len(manifest.GetCapabilities()))
+	for _, capability := range manifest.GetCapabilities() {
+		capabilities[capabilityKey(capability.GetType(), capability.GetId())] = capability
+	}
+
+	return &Client{
+		installationID: installationID,
+		activity:       used,
+		startSeq:       startSeq,
+		manifest:       proto.CloneOf(manifest),
+		rpc:            rpc,
+		capabilities:   capabilities,
+	}
+}
+
+func (c *Client) Manifest() *pluginv1.PluginManifest {
+	return proto.CloneOf(c.manifest)
+}
+
+// TestConfiguration tests the draft without configuring the plugin process.
+func (c *Client) TestConfiguration(ctx context.Context, req *pluginv1.TestConfigurationRequest) (*pluginv1.TestConfigurationResponse, error) {
+	c.mu.RLock()
+	unhealthy := c.unhealthy
+	c.mu.RUnlock()
+	if unhealthy {
+		return nil, ErrPluginUnhealthy
+	}
+	if !manifest.SupportsConfigurationCheck(c.manifest) {
+		return nil, ErrCapabilityNotFound
+	}
+	callCtx, cancel := ensureDeadline(ctx, 20*time.Second)
+	defer cancel()
+	return c.rpc.ConfigurationChecks().TestConfiguration(callCtx, req)
+}
+
+func (c *Client) Capabilities() []*pluginv1.CapabilityDescriptor {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	result := make([]*pluginv1.CapabilityDescriptor, 0, len(c.capabilities))
+	for _, capability := range c.capabilities {
+		result = append(result, proto.CloneOf(capability))
+	}
+	return result
+}
+
+func (c *Client) MetadataProvider(capabilityID string) (*MetadataProviderClient, error) {
+	if err := c.requireCapability("metadata_provider.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &MetadataProviderClient{
+		client:  c.rpc.MetadataProvider(),
+		timeout: DefaultMetadataTimeout,
+	}, nil
+}
+
+func (c *Client) ImageResolver(capabilityID string) (*ImageResolverClient, error) {
+	if err := c.requireCapability("image_resolver.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &ImageResolverClient{
+		client:  c.rpc.ImageResolver(),
+		timeout: DefaultMetadataTimeout,
+	}, nil
+}
+
+// NewMarkerProviderClient wraps a marker provider connection with the default
+// call timeout, for callers that hold the gRPC client directly.
+func NewMarkerProviderClient(client pluginv1.MarkerProviderClient) *MarkerProviderClient {
+	return &MarkerProviderClient{client: client, timeout: DefaultMarkerProviderTimeout}
+}
+
+func (c *Client) MarkerProvider(capabilityID string) (*MarkerProviderClient, error) {
+	if err := c.requireCapability("marker_provider.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &MarkerProviderClient{
+		client:  c.rpc.MarkerProvider(),
+		timeout: DefaultMarkerProviderTimeout,
+	}, nil
+}
+
+func (c *Client) MediaAnalyzer(capabilityID string) (*MediaAnalyzerClient, error) {
+	if err := c.requireCapability("media_analyzer.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &MediaAnalyzerClient{
+		client:  c.rpc.MediaAnalyzer(),
+		timeout: DefaultAnalyzerTimeout,
+	}, nil
+}
+
+func (c *Client) ScheduledTask(capabilityID string) (*ScheduledTaskClient, error) {
+	if err := c.requireCapability("scheduled_task.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &ScheduledTaskClient{
+		client:  c.rpc.ScheduledTask(),
+		timeout: DefaultControlTimeout,
+	}, nil
+}
+
+func (c *Client) ScanSource(capabilityID string) (*ScanSourceClient, error) {
+	if err := c.requireCapability("scan_source.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &ScanSourceClient{
+		client:  c.rpc.ScanSource(),
+		timeout: DefaultScanSourceTimeout,
+	}, nil
+}
+
+func (c *Client) RequestRouter(capabilityID string) (*RequestRouterClient, error) {
+	if err := c.requireCapability("request_router.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &RequestRouterClient{
+		client:  c.rpc.RequestRouter(),
+		timeout: DefaultRequestRouterTimeout,
+	}, nil
+}
+
+func (c *Client) EventConsumer(capabilityID string) (*EventConsumerClient, error) {
+	if err := c.requireCapability("event_consumer.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &EventConsumerClient{
+		client:  c.rpc.EventConsumer(),
+		timeout: DefaultEventTimeout,
+	}, nil
+}
+
+func (c *Client) NotificationChannel(capabilityID string) (*NotificationChannelClient, error) {
+	if err := c.requireCapability("notification_channel.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &NotificationChannelClient{client: c.rpc.NotificationChannel(), capabilityID: capabilityID}, nil
+}
+
+func (c *Client) AuthProvider(capabilityID string) (*AuthProviderClient, error) {
+	if err := c.requireCapability("auth_provider.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &AuthProviderClient{
+		client:  c.rpc.AuthProvider(),
+		checks:  c.rpc.AuthProviderChecks(),
+		network: c.rpc.NetworkIdentityAuth(),
+		timeout: DefaultAuthTimeout,
+	}, nil
+}
+
+func (c *Client) HTTPRoutes(capabilityID string) (*HTTPRoutesClient, error) {
+	if err := c.requireCapability("http_routes.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &HTTPRoutesClient{
+		activity: c.activity,
+		client:   c.rpc.HttpRoutes(),
+		timeout:  DefaultRouteTimeout,
+	}, nil
+}
+
+func (c *Client) WatchSyncProvider(capabilityID string) (*WatchSyncProviderClient, error) {
+	if err := c.requireCapability("watch_sync_provider.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &WatchSyncProviderClient{
+		client:              c.rpc.WatchSyncProvider(),
+		deviceAuthorization: c.rpc.WatchSyncDeviceAuthorization(),
+		timeout:             DefaultWatchSyncTimeout,
+	}, nil
+}
+
+// NetworkAccessProvider returns the typed client for the plugin's
+// network_access_provider.v1 capability.
+func (c *Client) NetworkAccessProvider(capabilityID string) (*NetworkAccessProviderClient, error) {
+	if err := c.requireCapability("network_access_provider.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &NetworkAccessProviderClient{
+		client:       c.rpc.NetworkAccessProvider(),
+		ingressToken: c.ingressToken,
+		timeout:      DefaultNetworkAccessTimeout,
+	}, nil
+}
+
+func (c *Client) markUnhealthy() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.unhealthy = true
+}
+
+func (c *Client) requireCapability(capabilityType, capabilityID string) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.unhealthy {
+		return ErrPluginUnhealthy
+	}
+
+	descriptor, ok := c.capabilities[capabilityKey(capabilityType, capabilityID)]
+	if !ok || descriptor == nil {
+		return fmt.Errorf("%w: %s/%s", ErrCapabilityNotFound, capabilityType, capabilityID)
+	}
+	return nil
+}
+
+func (c *MetadataProviderClient) Search(ctx context.Context, req *pluginv1.SearchMetadataRequest) (*pluginv1.SearchMetadataResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Search(callCtx, req)
+}
+
+func (c *MetadataProviderClient) GetMetadata(ctx context.Context, req *pluginv1.GetMetadataRequest) (*pluginv1.GetMetadataResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetMetadata(callCtx, req)
+}
+
+func (c *MetadataProviderClient) GetPersonDetail(ctx context.Context, req *pluginv1.GetPersonDetailRequest) (*pluginv1.GetPersonDetailResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetPersonDetail(callCtx, req)
+}
+
+func (c *MetadataProviderClient) GetSeasons(ctx context.Context, req *pluginv1.GetSeasonsRequest) (*pluginv1.GetSeasonsResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetSeasons(callCtx, req)
+}
+
+func (c *MetadataProviderClient) GetEpisodes(ctx context.Context, req *pluginv1.GetEpisodesRequest) (*pluginv1.GetEpisodesResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetEpisodes(callCtx, req)
+}
+
+func (c *MetadataProviderClient) GetImages(ctx context.Context, req *pluginv1.GetImagesRequest) (*pluginv1.GetImagesResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetImages(callCtx, req)
+}
+
+func (c *MetadataProviderClient) ResolveImageURL(ctx context.Context, req *pluginv1.ResolveImageURLRequest) (*pluginv1.ResolveImageURLResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ResolveImageURL(callCtx, req)
+}
+
+func (c *MetadataProviderClient) ResolveImageURLs(ctx context.Context, req *pluginv1.ResolveImageURLsRequest) (*pluginv1.ResolveImageURLsResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ResolveImageURLs(callCtx, req)
+}
+
+func (c *ImageResolverClient) ResolveImageURL(ctx context.Context, req *pluginv1.ResolveImageURLRequest) (*pluginv1.ResolveImageURLResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ResolveImageURL(callCtx, req)
+}
+
+func (c *ImageResolverClient) ResolveImageURLs(ctx context.Context, req *pluginv1.ResolveImageURLsRequest) (*pluginv1.ResolveImageURLsResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ResolveImageURLs(callCtx, req)
+}
+
+func (c *MarkerProviderClient) FetchMarkers(ctx context.Context, req *pluginv1.FetchMarkersRequest) (*pluginv1.FetchMarkersResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.FetchMarkers(callCtx, req)
+}
+
+func (c *MarkerProviderClient) SubmitMarker(ctx context.Context, req *pluginv1.SubmitMarkerRequest) (*pluginv1.SubmitMarkerResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.SubmitMarker(callCtx, req)
+}
+
+func (c *MarkerProviderClient) GetMarkerProviderStats(ctx context.Context, req *pluginv1.GetMarkerProviderStatsRequest) (*pluginv1.MarkerProviderStatsResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetMarkerProviderStats(callCtx, req)
+}
+
+func (c *MediaAnalyzerClient) Analyze(ctx context.Context, req *pluginv1.AnalyzeMediaRequest) (*pluginv1.AnalyzeMediaResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Analyze(callCtx, req)
+}
+
+func (c *ScheduledTaskClient) Run(ctx context.Context, req *pluginv1.RunScheduledTaskRequest) (*pluginv1.RunScheduledTaskResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Run(callCtx, req)
+}
+
+// PollChanges calls the plugin with the host's per-call deadline. When the
+// call fails because that deadline passed or the caller canceled, the returned
+// error also wraps the context error, so callers can tell a host-side timeout
+// or cancellation (errors.Is) from a status code the plugin chose itself.
+func (c *ScanSourceClient) PollChanges(ctx context.Context, req *pluginv1.PollChangesRequest) (*pluginv1.PollChangesResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	resp, err := c.client.PollChanges(callCtx, req)
+	if err != nil {
+		if ctxErr := callCtx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("%w: %w", ctxErr, err)
+		}
+	}
+	return resp, err
+}
+
+func (c *RequestRouterClient) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pluginv1.FulfillResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Fulfill(callCtx, req)
+}
+
+func (c *RequestRouterClient) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusRequest) (*pluginv1.CheckStatusResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.CheckStatus(callCtx, req)
+}
+
+func (c *RequestRouterClient) ListConfigOptions(ctx context.Context, req *pluginv1.ListConfigOptionsRequest) (*pluginv1.ListConfigOptionsResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ListConfigOptions(callCtx, req)
+}
+
+func (c *RequestRouterClient) TestConnection(ctx context.Context, req *pluginv1.TestConnectionRequest) (*pluginv1.TestConnectionResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.TestConnection(callCtx, req)
+}
+
+func (c *RequestRouterClient) Validate(ctx context.Context, req *pluginv1.ValidateRequest) (*pluginv1.ValidateResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Validate(callCtx, req)
+}
+
+// ValidateDestination asks the plugin whether a destination's settings
+// work. The request names this client's capability.
+func (c *NotificationChannelClient) ValidateDestination(ctx context.Context, req *pluginv1.ValidateNotificationDestinationRequest) (*pluginv1.ValidateNotificationDestinationResponse, error) {
+	req.CapabilityId = c.capabilityID
+	return c.client.ValidateDestination(ctx, req)
+}
+
+// SendNotification asks the plugin to deliver one message. The request
+// names this client's capability.
+func (c *NotificationChannelClient) SendNotification(ctx context.Context, req *pluginv1.SendNotificationRequest) (*pluginv1.SendNotificationResponse, error) {
+	req.CapabilityId = c.capabilityID
+	return c.client.SendNotification(ctx, req)
+}
+
+func (c *EventConsumerClient) HandleEvent(ctx context.Context, req *pluginv1.HandleEventRequest) (*pluginv1.HandleEventResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.HandleEvent(callCtx, req)
+}
+
+func (c *AuthProviderClient) Authenticate(ctx context.Context, req *pluginv1.AuthenticateRequest) (*pluginv1.AuthenticateResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Authenticate(callCtx, req)
+}
+
+func (c *AuthProviderClient) InitAuthorize(ctx context.Context, req *pluginv1.InitAuthorizeRequest) (*pluginv1.InitAuthorizeResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.InitAuthorize(callCtx, req)
+}
+
+func (c *AuthProviderClient) ExchangeCode(ctx context.Context, req *pluginv1.ExchangeCodeRequest) (*pluginv1.AuthenticateResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ExchangeCode(callCtx, req)
+}
+
+// TestConnection asks the plugin to test staged settings. Plugins built
+// before SDK v0.22.0 answer codes.Unimplemented.
+func (c *AuthProviderClient) TestConnection(ctx context.Context, req *pluginv1.AuthTestConnectionRequest) (*pluginv1.AuthTestConnectionResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.checks.TestConnection(callCtx, req)
+}
+
+// CheckAccount re-checks one account with the provider. Plugins built
+// before SDK v0.22.0 answer codes.Unimplemented.
+func (c *AuthProviderClient) CheckAccount(ctx context.Context, req *pluginv1.CheckAccountRequest) (*pluginv1.CheckAccountResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.checks.CheckAccount(callCtx, req)
+}
+
+// AuthenticatePeer asks a network provider who the overlay peer of a request
+// it proxied is. Plugins without the "network" auth mode answer
+// codes.Unimplemented.
+func (c *AuthProviderClient) AuthenticatePeer(ctx context.Context, req *pluginv1.AuthenticatePeerRequest) (*pluginv1.AuthenticateResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.network.AuthenticatePeer(callCtx, req)
+}
+
+// EndSessionUrl asks the plugin for the provider logout URL. Plugins built
+// before SDK v0.22.0 answer codes.Unimplemented.
+func (c *AuthProviderClient) EndSessionUrl(ctx context.Context, req *pluginv1.AuthEndSessionUrlRequest) (*pluginv1.AuthEndSessionUrlResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.checks.EndSessionUrl(callCtx, req)
+}
+
+// Retain keeps this process active while an HTTP response is delivered outside
+// the RPC, including loopback streams. The caller releases it on every exit.
+// Admission shares the idle-stop lock so a stopping process cannot be revived.
+func (c *HTTPRoutesClient) Retain() (func(), error) {
+	c.activity.mu.Lock()
+	defer c.activity.mu.Unlock()
+	if c.activity.stopping {
+		return nil, ErrClientNotFound
+	}
+	c.activity.inFlight++
+	c.activity.last = c.activity.now()
+	return sync.OnceFunc(c.activity.end), nil
+}
+
+func (c *HTTPRoutesClient) Handle(ctx context.Context, req *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Handle(callCtx, req)
+}
+
+func (c *WatchSyncProviderClient) ExchangeAPIKey(ctx context.Context, req *pluginv1.WatchSyncExchangeAPIKeyRequest) (*pluginv1.WatchSyncCredentialResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ExchangeAPIKey(callCtx, req)
+}
+
+func (c *WatchSyncProviderClient) StartDeviceAuthorization(ctx context.Context, req *pluginv1.WatchSyncDeviceAuthorizationServiceStartRequest) (*pluginv1.WatchSyncDeviceAuthorizationServiceStartResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.deviceAuthorization.Start(callCtx, req)
+}
+
+func (c *WatchSyncProviderClient) PollDeviceAuthorization(ctx context.Context, req *pluginv1.WatchSyncDeviceAuthorizationServicePollRequest) (*pluginv1.WatchSyncDeviceAuthorizationServicePollResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.deviceAuthorization.Poll(callCtx, req)
+}
+
+func (c *WatchSyncProviderClient) RefreshCredentials(ctx context.Context, req *pluginv1.WatchSyncRefreshCredentialsRequest) (*pluginv1.WatchSyncCredentialResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.RefreshCredentials(callCtx, req)
+}
+
+func (c *WatchSyncProviderClient) GetAccount(ctx context.Context, req *pluginv1.WatchSyncGetAccountRequest) (*pluginv1.WatchSyncGetAccountResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetAccount(callCtx, req)
+}
+
+func (c *WatchSyncProviderClient) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEventsRequest) (*pluginv1.WatchSyncApplyEventsResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ApplyEvents(callCtx, req)
+}
+
+func (c *WatchSyncProviderClient) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ListRemoteState(callCtx, req)
+}
+
+func (c *NetworkAccessProviderClient) Connect(ctx context.Context, req *pluginv1.NetworkAccessConnectRequest) (*pluginv1.NetworkAccessStatus, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Connect(callCtx, req)
+}
+
+func (c *NetworkAccessProviderClient) Disconnect(ctx context.Context, req *pluginv1.NetworkAccessDisconnectRequest) (*pluginv1.NetworkAccessStatus, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Disconnect(callCtx, req)
+}
+
+func (c *NetworkAccessProviderClient) GetStatus(ctx context.Context, req *pluginv1.NetworkAccessGetStatusRequest) (*pluginv1.NetworkAccessStatus, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetStatus(callCtx, req)
+}
+
+func ensureDeadline(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func capabilityKey(capabilityType, capabilityID string) string {
+	return capabilityType + "\x00" + capabilityID
+}

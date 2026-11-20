@@ -1,0 +1,120 @@
+import { useMutation, useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
+import type { ItemDetail } from "@/api/types";
+import { v2, type V2Result } from "@/api/v2/request";
+import { catalogKeys, progressKeys } from "./keys";
+import { fetchCatalogItemDetail } from "./catalogRead";
+
+interface ContinueWatchingOptions {
+  enabled?: boolean;
+}
+
+/** The first page of the profile's progress list as the v2 contract returns it. */
+export type ProgressList = V2Result<"GET /api/v2/progress">;
+export type ProgressListEntry = ProgressList["items"][number];
+
+export function useProgressList(libraryId?: number, options?: ContinueWatchingOptions) {
+  return useQuery({
+    queryKey: progressKeys.list("in_progress", libraryId),
+    queryFn: () =>
+      v2("GET /api/v2/progress", {
+        query: {
+          status: "in_progress",
+          limit: 20,
+          library_id: libraryId ? String(libraryId) : undefined,
+        },
+      }),
+    enabled: options?.enabled ?? true,
+  });
+}
+
+export interface ContinueWatchingItem {
+  progress: ProgressListEntry;
+  detail: ItemDetail | undefined;
+  isLoading: boolean;
+}
+
+export function useContinueWatching(
+  libraryId?: number,
+  options?: ContinueWatchingOptions,
+): {
+  items: ContinueWatchingItem[];
+  isLoading: boolean;
+} {
+  const enabled = options?.enabled ?? true;
+  const { data: progressData, isLoading: progressLoading } = useProgressList(libraryId, {
+    enabled,
+  });
+
+  const entries = progressData?.items ?? [];
+
+  // The player's On Deck row draws these details as cards, so it keeps its own
+  // card-width copy under a longer key than the detail page's; invalidating the
+  // item's detail still reaches it.
+  const detailQueries = useQueries({
+    queries: entries.map((entry) => ({
+      queryKey: [...catalogKeys.itemDetail(entry.media_item_id), "on-deck"],
+      queryFn: ({ signal }) =>
+        fetchCatalogItemDetail(entry.media_item_id, undefined, { signal }, "onDeck"),
+      enabled: enabled && !!entry.media_item_id,
+      staleTime: 2 * 60 * 1000,
+    })),
+  });
+
+  const items: ContinueWatchingItem[] = entries.map((entry, i) => ({
+    progress: entry,
+    detail: detailQueries[i]?.data,
+    isLoading: detailQueries[i]?.isLoading ?? true,
+  }));
+
+  return {
+    items,
+    isLoading: enabled && progressLoading,
+  };
+}
+
+interface ReportMediaProgressVars {
+  contentId: string;
+  positionSeconds: number;
+  durationSeconds: number;
+  forceOverwrite?: boolean;
+}
+
+export function useReportMediaProgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      contentId,
+      positionSeconds,
+      durationSeconds,
+      forceOverwrite = true,
+    }: ReportMediaProgressVars) => {
+      const result = await v2("POST /api/v2/sync/progress", {
+        body: {
+          items: [
+            {
+              media_item_id: contentId,
+              position_ms: Math.round(positionSeconds * 1000),
+              duration_ms: Math.round(durationSeconds * 1000),
+              force_overwrite: forceOverwrite,
+            },
+          ],
+        },
+      });
+      const failed = result.items.find((item) => item.status === "failure");
+      if (failed?.status === "failure") throw new Error(failed.failure.detail);
+      return result;
+    },
+    onSuccess: (_data, variables) => {
+      // Progress genuinely changed → refresh progress-derived surfaces
+      // (continue-watching etc.). Scope the catalog invalidation to THIS item's
+      // detail rather than all of `catalog`: a progress report fires every ~10s
+      // during playback, and invalidating catalogKeys.all refetched every active
+      // browse/detail query — including the large audiobook author/narrator
+      // group lists — on every tick.
+      queryClient.invalidateQueries({ queryKey: progressKeys.all });
+      queryClient.invalidateQueries({
+        queryKey: catalogKeys.itemDetail(variables.contentId),
+      });
+    },
+  });
+}

@@ -1,0 +1,295 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/artworkurl"
+	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/imageutil"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+const (
+	profileAvatarPresetPrefix = "preset:"
+	profileAvatarUploadPrefix = userstore.AvatarUploadPrefix
+	profileAvatarMaxFileSize  = 10 << 20
+)
+
+var legacyProfileAvatarIDs = map[string]struct{}{
+	"avatar-1": {},
+	"avatar-2": {},
+	"avatar-3": {},
+	"avatar-4": {},
+	"avatar-5": {},
+	"avatar-6": {},
+	"avatar-7": {},
+	"avatar-8": {},
+}
+
+var supportedDiceBearAvatarStyles = map[string]struct{}{
+	"identicon":         {},
+	"initials":          {},
+	"bottts-neutral":    {},
+	"fun-emoji":         {},
+	"pixel-art-neutral": {},
+}
+
+type profileAvatarStore interface{ blobstore.Store }
+
+func normalizePresetAvatarReference(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(value, profileAvatarUploadPrefix) {
+		return "", fmt.Errorf("custom upload avatar references are not allowed in JSON profile updates")
+	}
+	if strings.HasPrefix(value, profileAvatarPresetPrefix) {
+		presetID := strings.TrimPrefix(value, profileAvatarPresetPrefix)
+		if !isKnownPresetAvatarID(presetID) {
+			return "", fmt.Errorf("unknown avatar preset")
+		}
+		return profileAvatarPresetPrefix + presetID, nil
+	}
+	if !isKnownPresetAvatarID(value) {
+		return "", fmt.Errorf("unknown avatar preset")
+	}
+	return profileAvatarPresetPrefix + value, nil
+}
+
+func isKnownPresetAvatarID(id string) bool {
+	if _, ok := legacyProfileAvatarIDs[id]; ok {
+		return true
+	}
+	_, _, ok := parseDiceBearPresetID(id)
+	return ok
+}
+
+func isUploadedAvatarRef(ref string) bool {
+	return userstore.IsUploadedAvatarRef(ref)
+}
+
+func avatarRefReplacesUpload(currentRef, nextRef string) bool {
+	return isUploadedAvatarRef(currentRef) && strings.TrimSpace(currentRef) != strings.TrimSpace(nextRef)
+}
+
+func resolveProfileAvatar(ctx context.Context, store profileAvatarStore, ttl time.Duration, ref string, resolvers ...artworkurl.Resolver) (source string, url string) {
+	trimmed := strings.TrimSpace(ref)
+	if trimmed == "" {
+		return "none", ""
+	}
+	if strings.HasPrefix(trimmed, profileAvatarPresetPrefix) {
+		presetID := strings.TrimPrefix(trimmed, profileAvatarPresetPrefix)
+		if !isKnownPresetAvatarID(presetID) {
+			return "none", ""
+		}
+		return "preset", bundledProfileAvatarURL(presetID)
+	}
+	if strings.HasPrefix(trimmed, profileAvatarUploadPrefix) {
+		if store == nil {
+			return "upload", ""
+		}
+		displayKey := uploadedAvatarDisplayKey(strings.TrimPrefix(trimmed, profileAvatarUploadPrefix))
+		presignTTL := ttl
+		if presignTTL <= 0 {
+			presignTTL = 15 * time.Minute
+		}
+		if direct, ok := store.(blobstore.DirectURLer); ok {
+			if resolved, _, err := direct.DirectURL(ctx, displayKey, presignTTL, 0); err == nil && resolved != "" {
+				return "upload", resolved
+			}
+			return "upload", ""
+		}
+		if len(resolvers) > 0 && resolvers[0] != nil {
+			if resolved, ok := artworkurl.ResolveURLFor(ctx, resolvers[0], displayKey, presignTTL); ok {
+				return "upload", resolved.URL
+			}
+		}
+		return "upload", ""
+	}
+	if isKnownPresetAvatarID(trimmed) {
+		return "preset", bundledProfileAvatarURL(trimmed)
+	}
+	return "none", ""
+}
+
+func bundledProfileAvatarURL(id string) string {
+	if style, seed, ok := parseDiceBearPresetID(id); ok {
+		return diceBearAvatarURL(style, seed)
+	}
+	return "/profile-avatars/" + id + ".svg"
+}
+
+func parseDiceBearPresetID(id string) (style string, seed string, ok bool) {
+	parts := strings.Split(id, ":")
+	if len(parts) != 3 || parts[0] != "dicebear" {
+		return "", "", false
+	}
+	style = strings.TrimSpace(parts[1])
+	seed = strings.TrimSpace(parts[2])
+	if _, supported := supportedDiceBearAvatarStyles[style]; !supported {
+		return "", "", false
+	}
+	if !isSafeAvatarSeed(seed) {
+		return "", "", false
+	}
+	return style, seed, true
+}
+
+func isSafeAvatarSeed(seed string) bool {
+	if seed == "" || len(seed) > 64 {
+		return false
+	}
+	for _, char := range seed {
+		switch {
+		case char >= 'a' && char <= 'z':
+		case char >= 'A' && char <= 'Z':
+		case char >= '0' && char <= '9':
+		case char == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func diceBearAvatarURL(style string, seed string) string {
+	query := url.Values{}
+	query.Set("seed", seed)
+	query.Set("size", "128")
+	query.Set("radius", "24")
+	query.Set("backgroundType", "gradientLinear")
+	return "https://api.dicebear.com/9.x/" + style + "/svg?" + query.Encode()
+}
+
+func profileAvatarPrefix(userID int, profileID string) string {
+	return fmt.Sprintf("profile-avatars/%d/%s", userID, profileID)
+}
+
+func uploadedAvatarOriginalKey(userID int, profileID string) string {
+	return profileAvatarPrefix(userID, profileID) + "/original.webp"
+}
+
+func uploadedAvatarDisplayKey(originalKey string) string {
+	return userstore.AvatarDisplayKey(originalKey)
+}
+
+func deleteUploadedAvatarObjects(ctx context.Context, store profileAvatarStore, userID int, profileID string) error {
+	if store == nil {
+		return nil
+	}
+	_, err := store.DeletePrefix(ctx, profileAvatarPrefix(userID, profileID)+"/")
+	return err
+}
+
+// ProfileAvatarUpload is an avatar upload with its multipart part already
+// extracted and its caller already reduced to an identity.
+type ProfileAvatarUpload struct {
+	UserID    int
+	ProfileID string
+	// ContentType is the part's declared media type; JPEG, PNG and WebP are
+	// accepted.
+	ContentType string
+	File        io.Reader
+}
+
+// UploadAvatar stores a profile's uploaded avatar: the store guard, the
+// profile lookup, the media-type and size checks, the resized variants, the
+// object writes and the profile reference. v1 PUT /profiles/{id}/avatar and
+// v2 uploadProfileAvatar both call it; a failure is an *APIError carrying
+// the v1 status, code and message. The caller must have checked that the
+// upload store is configured (AvatarUploadEnabled) so a missing store is a
+// 503 rather than a bug.
+func (h *ProfileHandler) UploadAvatar(ctx context.Context, up ProfileAvatarUpload) (ProfileView, error) {
+	var none ProfileView
+	if h.AvatarStore == nil {
+		return none, apiError(http.StatusServiceUnavailable, "unavailable", "Avatar upload storage is not configured")
+	}
+	userID, profileID := up.UserID, up.ProfileID
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	profile, err := store.GetProfile(ctx, profileID)
+	if err != nil || profile == nil {
+		return none, apiError(http.StatusNotFound, "not_found", "Profile not found")
+	}
+
+	if posterExtension(up.ContentType) == "" {
+		return none, apiError(http.StatusBadRequest, "bad_request", "Unsupported image type; use JPEG, PNG, or WebP")
+	}
+
+	data, err := io.ReadAll(io.LimitReader(up.File, profileAvatarMaxFileSize+1))
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to read upload")
+	}
+	if len(data) > profileAvatarMaxFileSize {
+		return none, apiError(http.StatusRequestEntityTooLarge, "too_large", "Avatar must be under 10 MB")
+	}
+
+	result, err := imageutil.GenerateSquareVariants(data, []int{256})
+	if errors.Is(err, imageutil.ErrBusy) {
+		return none, apiError(http.StatusServiceUnavailable, "unavailable", "Image processing is busy; try again shortly")
+	}
+	if err != nil {
+		return none, apiError(http.StatusBadRequest, "bad_request", "Invalid image file")
+	}
+
+	originalKey := uploadedAvatarOriginalKey(userID, profileID)
+	for _, variant := range result.Variants {
+		key := profileAvatarPrefix(userID, profileID) + "/" + variant.Key + result.Ext
+		if err := h.AvatarStore.Put(ctx, key, variant.Data); err != nil {
+			return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to store avatar")
+		}
+	}
+
+	avatarRef := profileAvatarUploadPrefix + originalKey
+	if err := store.UpdateProfile(ctx, profileID, userstore.UpdateProfileInput{Avatar: &avatarRef}); err != nil {
+		// Uploaded avatar keys are stable per profile, so rolling back by deleting the
+		// prefix here can remove the avatar the profile still references after a DB failure.
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to save avatar")
+	}
+
+	updatedProfile, err := store.GetProfile(ctx, profileID)
+	if err != nil || updatedProfile == nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to retrieve updated profile")
+	}
+	return h.toProfileResponse(ctx, store, *updatedProfile), nil
+}
+
+// DeleteAvatar clears a profile's uploaded avatar (a preset reference is
+// left alone) and removes its objects. v1 DELETE /profiles/{id}/avatar and
+// v2 deleteProfileAvatar both call it; a failure is an *APIError carrying
+// the v1 status, code and message.
+func (h *ProfileHandler) DeleteAvatar(ctx context.Context, userID int, profileID string) (ProfileView, error) {
+	var none ProfileView
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	profile, err := store.GetProfile(ctx, profileID)
+	if err != nil || profile == nil {
+		return none, apiError(http.StatusNotFound, "not_found", "Profile not found")
+	}
+
+	if isUploadedAvatarRef(profile.Avatar) {
+		emptyRef := ""
+		if err := store.UpdateProfile(ctx, profileID, userstore.UpdateProfileInput{Avatar: &emptyRef}); err != nil {
+			return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to clear avatar")
+		}
+		_ = deleteUploadedAvatarObjects(ctx, h.AvatarStore, userID, profileID)
+	}
+
+	updatedProfile, err := store.GetProfile(ctx, profileID)
+	if err != nil || updatedProfile == nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to retrieve updated profile")
+	}
+	return h.toProfileResponse(ctx, store, *updatedProfile), nil
+}

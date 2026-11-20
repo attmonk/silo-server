@@ -1,0 +1,715 @@
+package playback
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/tonemap"
+)
+
+// fakeSessionRegistry is a GetSession + RegisterReconstructed double.
+type fakeSessionRegistry struct {
+	mu       sync.Mutex
+	sessions map[string]*Session
+	// limitsErr, when non-nil, is returned by RegisterReconstructedWithLimits to
+	// simulate a limit-provider failure (e.g. a transient Postgres error), so the
+	// fail-open admission path can be exercised. A real SessionManager surfaces
+	// such failures wrapped with ErrLimitProviderUnavailable.
+	limitsErr error
+}
+
+func (f *fakeSessionRegistry) GetSession(id string) (*Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if s, ok := f.sessions[id]; ok {
+		return s, nil
+	}
+	return nil, ErrSessionNotFound
+}
+
+func (f *fakeSessionRegistry) RegisterReconstructed(s *Session) *Session {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sessions == nil {
+		f.sessions = map[string]*Session{}
+	}
+	if existing, ok := f.sessions[s.ID]; ok {
+		return existing
+	}
+	f.sessions[s.ID] = s
+	return s
+}
+
+// RegisterReconstructedWithLimits mirrors RegisterReconstructed for the tests.
+func (f *fakeSessionRegistry) RegisterReconstructedWithLimits(_ context.Context, s *Session) (*Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sessions == nil {
+		f.sessions = map[string]*Session{}
+	}
+	if existing, ok := f.sessions[s.ID]; ok {
+		return existing, nil
+	}
+	if f.limitsErr != nil {
+		return nil, f.limitsErr
+	}
+	f.sessions[s.ID] = s
+	return s, nil
+}
+
+func (f *fakeSessionRegistry) RollbackReconstructedToneMap(expected *Session) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if expected == nil || f.sessions[expected.ID] != expected {
+		return false
+	}
+	delete(f.sessions, expected.ID)
+	return true
+}
+
+func (f *fakeSessionRegistry) CaptureReconstructedExecution(sessionID string) (*Session, uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	current := f.sessions[sessionID]
+	if current == nil {
+		return nil, 0
+	}
+	return current, current.streamRevision
+}
+
+func (f *fakeSessionRegistry) ConfirmReconstructedExecution(expected *Session, revision uint64, mode tonemap.Mode, encoderHWAccel string) *Session {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if expected == nil {
+		return nil
+	}
+	current := f.sessions[expected.ID]
+	if current == expected && current.streamRevision == revision {
+		current.ToneMapMode = mode
+		current.TranscodeHWAccel = encoderHWAccel
+	}
+	return current
+}
+
+func TestStartShutdownCleanup_RejectsLaterRegistrationAndSwap(t *testing.T) {
+	m := NewTranscodeManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := m.StartShutdownCleanup(ctx)
+	cancel()
+	<-done
+
+	for _, test := range []struct {
+		name    string
+		publish func(*TranscodeSession) bool
+	}{
+		{name: "register", publish: func(session *TranscodeSession) bool {
+			return m.RegisterTranscodeSession("late-register", session)
+		}},
+		{name: "swap", publish: func(session *TranscodeSession) bool {
+			_, accepted := m.SwapTranscodeSession("late-swap", session)
+			return accepted
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "session")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			session := NewTranscodeSessionForTest(dir)
+			if test.publish(session) {
+				t.Fatal("session was published after shutdown")
+			}
+			if _, err := os.Stat(dir); !os.IsNotExist(err) {
+				t.Fatalf("rejected session cache still exists: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadOrReconstructSession(t *testing.T) {
+	ctx := context.Background()
+	cardPtr := func(c RecipeCard) *RecipeCard { return &c }
+	registered := func(t *testing.T, reg *fakeSessionRegistry) {
+		t.Helper()
+		if _, err := reg.GetSession("s"); err != nil {
+			t.Fatalf("reconstructed session not registered: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name       string
+		live       *Session // registered under its ID before the lookup
+		limitsErr  error
+		id         string // defaults to "s"
+		caller     int
+		card       *RecipeCard
+		wantStatus SessionLoadStatus
+		check      func(*testing.T, *Session, *fakeSessionRegistry)
+	}{
+		{
+			name: "live session, matching owner -> loaded", live: &Session{ID: "s", UserID: 5}, caller: 5, wantStatus: SessionLoaded,
+			check: func(t *testing.T, got *Session, _ *fakeSessionRegistry) {
+				if got == nil || got.ID != "s" {
+					t.Fatalf("session = %+v", got)
+				}
+			},
+		},
+		{name: "live session, mismatched owner -> forbidden", live: &Session{ID: "s", UserID: 5}, caller: 9, wantStatus: SessionForbidden},
+		{name: "live session, zero caller -> loaded (UUID as bearer)", live: &Session{ID: "s", UserID: 5}, caller: 0, wantStatus: SessionLoaded},
+		// A v3 transport that negotiated header-authenticated media never treats its
+		// session UUID as a credential, so the front door refuses an anonymous
+		// caller instead of leaving that rule to each serve handler.
+		{
+			name: "live media-authorized session, zero caller -> unauthorized", live: &Session{ID: "s", UserID: 5, RequireMediaAuthorization: true},
+			caller: 0, wantStatus: SessionUnauthorized,
+			check: func(t *testing.T, got *Session, _ *fakeSessionRegistry) {
+				if got != nil {
+					t.Fatalf("session = %+v, want unauthorized", got)
+				}
+			},
+		},
+		{name: "live media-authorized session, owner -> loaded", live: &Session{ID: "s", UserID: 5, RequireMediaAuthorization: true}, caller: 5, wantStatus: SessionLoaded},
+		{
+			name: "miss + remux token + matching owner -> reconstructed with method", caller: 5,
+			card: cardPtr(NewRemuxRecipeCard("s", 5, "p", 77, true, 2)), wantStatus: SessionLoaded,
+			check: func(t *testing.T, got *Session, reg *fakeSessionRegistry) {
+				if got == nil || got.PlayMethod != PlayRemux || got.MediaFileID != 77 || !got.TranscodeAudio || got.AudioTrackIndex != 2 {
+					t.Fatalf("reconstructed remux session wrong: %+v", got)
+				}
+				registered(t, reg)
+			},
+		},
+		{name: "miss + token + mismatched owner -> missing (reconstruct refuses)", caller: 9, card: cardPtr(NewDirectRecipeCard("s", 5, "p", 77)), wantStatus: SessionMissing},
+		{name: "miss + token for a different session id -> missing", caller: 5, card: cardPtr(NewDirectRecipeCard("other", 5, "p", 77)), wantStatus: SessionMissing},
+		{name: "miss + no token -> missing", id: "nope", caller: 5, wantStatus: SessionMissing},
+		// The fail-open admission surfaces as SessionLoaded (not SessionMissing
+		// -> 404) when the limit provider is transiently unavailable.
+		{
+			name:      "miss + token + provider error -> loaded (fails open)",
+			limitsErr: fmt.Errorf("load session limits: %w", errors.Join(ErrLimitProviderUnavailable, errors.New("db timeout"))),
+			caller:    5, card: cardPtr(NewDirectRecipeCard("s", 5, "p", 77)), wantStatus: SessionLoaded,
+			check: func(t *testing.T, got *Session, reg *fakeSessionRegistry) {
+				if got == nil || got.ID != "s" || got.UserID != 5 {
+					t.Fatalf("admitted session wrong: %+v", got)
+				}
+				registered(t, reg)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := &fakeSessionRegistry{limitsErr: tt.limitsErr}
+			if tt.live != nil {
+				reg.sessions = map[string]*Session{tt.live.ID: tt.live}
+			}
+			m := NewTranscodeManager()
+			m.Sessions = reg
+			id := tt.id
+			if id == "" {
+				id = "s"
+			}
+			got, status := m.LoadOrReconstructSession(ctx, reg.GetSession, id, tt.caller, tt.card)
+			if status != tt.wantStatus {
+				t.Fatalf("status = %v session = %+v, want %v", status, got, tt.wantStatus)
+			}
+			if tt.check != nil {
+				tt.check(t, got, reg)
+			}
+		})
+	}
+}
+
+func TestLoadOrReconstructTranscode_TransientExecutorFailureRetriesWithoutZombie(t *testing.T) {
+	ctx := context.Background()
+	sessions := NewSessionManager(0, 0)
+	m := NewTranscodeManager()
+	m.Sessions = sessions
+	m.Config = func() TranscodeRuntimeConfig { return TranscodeRuntimeConfig{} }
+
+	card := NewRecipeCard(5, "p", 77, "", TranscodeOpts{
+		SessionID:            "s",
+		ToneMapPolicy:        tonemap.PolicySoftwareOnly,
+		ToneMapMode:          tonemap.ModeSoftware,
+		ToneMapSourceKind:    tonemap.SourcePQ,
+		ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3,
+		TargetCodecVideo:     "h264",
+		FastStart:            true,
+	})
+
+	var resolveCalls int
+	m.resolveToneMapExecutor = func(_ context.Context, opts TranscodeOpts) (TranscodeOpts, error) {
+		resolveCalls++
+		provisional, err := sessions.GetSession("s")
+		if err != nil {
+			t.Fatalf("provisional session missing during executor resolution: %v", err)
+		}
+		if provisional.ToneMapMode != "" {
+			t.Fatalf("provisional ToneMapMode = %q, want empty until executor confirmation", provisional.ToneMapMode)
+		}
+		if resolveCalls == 1 {
+			return opts, errors.New("temporary capability probe failure")
+		}
+		opts.ToneMapMode = tonemap.ModeSoftware
+		opts.ToneMapFilter = tonemap.SoftwareFilterHable
+		opts.HWAccel = HWAccelNone
+		return opts, nil
+	}
+	m.startTranscode = func(_ context.Context, opts TranscodeOpts) (*TranscodeSession, error) {
+		return &TranscodeSession{opts: opts}, nil
+	}
+
+	got, runtime, status := m.LoadOrReconstructTranscode(ctx, sessions.GetSession, "s", 5, -1, &card)
+	if status != SessionUnavailable || got != nil || runtime != nil {
+		t.Fatalf("first attempt = status %v session %v runtime %v, want retryable unavailable", status, got, runtime)
+	}
+	if _, err := sessions.GetSession("s"); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("failed attempt left a zombie session: %v", err)
+	}
+
+	got, runtime, status = m.LoadOrReconstructTranscode(ctx, sessions.GetSession, "s", 5, -1, &card)
+	if status != SessionLoaded || got == nil || runtime == nil {
+		t.Fatalf("retry = status %v session %v runtime %v, want loaded", status, got, runtime)
+	}
+	if runtime.Opts().FastStart {
+		t.Fatal("reconstructed runtime retained fresh-start manifest tuning")
+	}
+	if got.ToneMapMode != tonemap.ModeSoftware {
+		t.Fatalf("confirmed ToneMapMode = %q, want software", got.ToneMapMode)
+	}
+	stored, err := sessions.GetSession("s")
+	if err != nil || stored.ToneMapMode != tonemap.ModeSoftware {
+		t.Fatalf("stored confirmed session = %+v, err %v", stored, err)
+	}
+	if resolveCalls != 2 {
+		t.Fatalf("executor resolution calls = %d, want one per attempt", resolveCalls)
+	}
+}
+
+func TestLoadOrReconstructTranscode_FailedAttemptPreservesConcurrentSession(t *testing.T) {
+	ctx := context.Background()
+	sessions := NewSessionManager(0, 0)
+	m := NewTranscodeManager()
+	m.Sessions = sessions
+
+	card := NewRecipeCard(5, "p", 77, "", TranscodeOpts{
+		SessionID:            "s",
+		ToneMapPolicy:        tonemap.PolicySoftwareOnly,
+		ToneMapMode:          tonemap.ModeSoftware,
+		ToneMapSourceKind:    tonemap.SourcePQ,
+		ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3,
+		TargetCodecVideo:     "h264",
+	})
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	m.resolveToneMapExecutor = func(_ context.Context, opts TranscodeOpts) (TranscodeOpts, error) {
+		close(probeStarted)
+		<-releaseProbe
+		return opts, errors.New("temporary capability probe failure")
+	}
+
+	result := make(chan SessionLoadStatus, 1)
+	go func() {
+		_, _, status := m.LoadOrReconstructTranscode(ctx, sessions.GetSession, "s", 5, -1, &card)
+		result <- status
+	}()
+	<-probeStarted
+
+	legitimate := &Session{ID: "s", UserID: 5, PlayMethod: PlayTranscode, ToneMapMode: tonemap.ModeHardware}
+	if err := sessions.StopSession("s"); err != nil {
+		t.Fatalf("replace provisional session: %v", err)
+	}
+	if got := sessions.RegisterReconstructed(legitimate); got != legitimate {
+		t.Fatalf("register concurrent legitimate session = %p, want %p", got, legitimate)
+	}
+	close(releaseProbe)
+
+	if status := <-result; status != SessionUnavailable {
+		t.Fatalf("failed reconstruction status = %v, want unavailable", status)
+	}
+	got, err := sessions.GetSession("s")
+	if err != nil || got.ToneMapMode != tonemap.ModeHardware {
+		t.Fatalf("rollback removed or changed concurrent legitimate session: got %+v err %v", got, err)
+	}
+}
+
+// The crash closures use the matched return of CloseTranscodeSessionIf as the
+// authoritative gate for tearing down the upstream playback session. This test
+// proves that contract end-to-end for the successor case: when a successor is
+// present, the call returns false (so the closure returns early and never stops
+// the successor's session), and a second call with the successor as expected
+// returns true. The closures (handlers.OnFFmpegCrash / jellycompat
+// OnFFmpegCrash) wire `matched` directly to the StopSession/stopPlaybackSessionByID
+// decision, so a false gate guarantees the live session is left intact.
+// TestCloseTranscodeSessionIfSessionGoneFencesTheOutputDirectory: the close
+// removes the session's output directory. A retry that started in between
+// would write its playlist and segments into the directory being removed, so
+// no start may take the session's lifecycle lock until the close is done.
+func TestCloseTranscodeSessionIfSessionGoneFencesTheOutputDirectory(t *testing.T) {
+	m := NewTranscodeManager()
+	rejected := &TranscodeSession{outputDir: t.TempDir()}
+	m.RegisterTranscodeSession("s1", rejected)
+	// Close cancels the process before it removes the directory.
+	startCouldRun := true
+	rejected.cancel = func() {
+		m.lifecycleMu.Lock()
+		lock := m.lifecycleLocks["s1"]
+		m.lifecycleMu.Unlock()
+		if lock == nil {
+			return
+		}
+		if startCouldRun = lock.mu.TryLock(); startCouldRun {
+			lock.mu.Unlock()
+		}
+	}
+
+	if !m.CloseTranscodeSessionIfSessionGone("s1", rejected, func() bool { return false }) {
+		t.Fatal("reported a session for an id that has none")
+	}
+	if startCouldRun {
+		t.Error("a start for the session could take its lifecycle lock while the close was removing the output directory")
+	}
+	if m.GetTranscodeSession("s1") != nil {
+		t.Error("the transcode is still registered")
+	}
+}
+
+func TestCloseTranscodeSessionIf_GateContract(t *testing.T) {
+	m := NewTranscodeManager()
+	dead := &TranscodeSession{}
+	successor := &TranscodeSession{}
+
+	// Reconstruct won the race: successor sits in the slot under the same id.
+	m.RegisterTranscodeSession("s1", successor)
+
+	// Crash teardown for the dead session must not match -> closure must NOT
+	// proceed to stop the (successor's) playback session.
+	if m.CloseTranscodeSessionIf("s1", dead, "") {
+		t.Fatalf("gate must be false while a successor owns the id")
+	}
+	if got := m.GetTranscodeSession("s1"); got != successor {
+		t.Fatalf("successor transcode must survive, got %v", got)
+	}
+
+	// Tearing down the successor itself (the ordinary later stop) must match.
+	if !m.CloseTranscodeSessionIf("s1", successor, "") {
+		t.Fatalf("gate must be true when expected matches the live entry")
+	}
+	if got := m.GetTranscodeSession("s1"); got != nil {
+		t.Fatalf("successor must be removed once it is the expected session, got %v", got)
+	}
+}
+
+// ReconstructSession admission contract. A genuine over-cap rejection must
+// STILL refuse even after the fail-open change: the ErrTooManyStreams /
+// ErrTooManyTranscodes sentinels are not provider errors. The authless
+// transcode delivery routes (HLS master.m3u8 / segment) present no userID, so
+// a zero caller must be allowed and the rebuilt session bound to the card
+// owner. A non-zero caller that does not match the card owner is still refused.
+func TestReconstructSessionAdmission(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name      string
+		limitsErr error
+		card      RecipeCard
+		caller    int
+		wantNil   bool
+	}{
+		{name: "too many streams", limitsErr: ErrTooManyStreams, card: NewDirectRecipeCard("a", 7, "p", 100), caller: 7, wantNil: true},
+		{name: "too many transcodes", limitsErr: ErrTooManyTranscodes, card: NewDirectRecipeCard("a", 7, "p", 100), caller: 7, wantNil: true},
+		{name: "zero caller -> reconstructed, bound to card owner", card: NewDirectRecipeCard("s", 5, "p", 77), caller: 0},
+		{name: "non-zero mismatched caller -> refused", card: NewDirectRecipeCard("s", 5, "p", 77), caller: 9, wantNil: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := &fakeSessionRegistry{limitsErr: tt.limitsErr}
+			m := NewTranscodeManager()
+			m.Sessions = reg
+			got := m.ReconstructSession(ctx, tt.card.SessionID, tt.caller, tt.card)
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("ReconstructSession = %+v, want refused (nil)", got)
+				}
+				if _, err := reg.GetSession("a"); errors.Is(tt.limitsErr, ErrTooManyStreams) && err == nil {
+					t.Fatal("over-cap reconstruct must not register the session")
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("zero caller (UUID-as-bearer route) must reconstruct")
+			}
+			if got.UserID != 5 {
+				t.Fatalf("reconstructed session UserID = %d, want 5 (card owner)", got.UserID)
+			}
+			if _, err := reg.GetSession("s"); err != nil {
+				t.Fatalf("reconstructed session not registered: %v", err)
+			}
+		})
+	}
+}
+
+func TestReconstructLifecycleWaitDoesNotConsumeGlobalSlot(t *testing.T) {
+	m := NewTranscodeManager()
+	m.reconstructSem = make(chan struct{}, 1)
+	m.Config = func() TranscodeRuntimeConfig { return TranscodeRuntimeConfig{TranscodeDir: t.TempDir()} }
+	sessionID := "blocked-reconstruct"
+	unlock := m.LockSessionLifecycle(sessionID)
+	card := NewRecipeCard(1, "profile", 1, "", TranscodeOpts{
+		SessionID: sessionID, InputPath: "/media/movie.mkv",
+		TargetCodecVideo: "h264", SegmentDuration: 2,
+	})
+	done := make(chan struct{})
+	go func() {
+		_, _ = m.ReconstructTranscodeWithError(context.Background(), sessionID, -1, card)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.lifecycleMu.Lock()
+		lock := m.lifecycleLocks[sessionID]
+		refs := 0
+		if lock != nil {
+			refs = lock.refs
+		}
+		m.lifecycleMu.Unlock()
+		if refs == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			unlock()
+			t.Fatal("reconstruct did not begin waiting for the session lifecycle lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	slotRelease, available := m.acquireReconstructSlot(probeCtx)
+	cancel()
+	if available {
+		slotRelease()
+	}
+	// Let the waiter finish before reporting the assertion so no goroutine is
+	// left behind on the failure path.
+	m.RegisterTranscodeSession(sessionID, &TranscodeSession{})
+	unlock()
+	<-done
+	if !available {
+		t.Fatal("session-lock waiter consumed the only global reconstruct slot")
+	}
+}
+
+func TestLockSessionLifecycle_MutualExclusionAndCleanup(t *testing.T) {
+	m := NewTranscodeManager()
+
+	// Two holders of the same key must be mutually exclusive.
+	var counter, maxConcurrent int32
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			unlock := m.LockSessionLifecycle("sess-a")
+			defer unlock()
+			c := atomic.AddInt32(&counter, 1)
+			if c > atomic.LoadInt32(&maxConcurrent) {
+				atomic.StoreInt32(&maxConcurrent, c)
+			}
+			time.Sleep(time.Millisecond)
+			atomic.AddInt32(&counter, -1)
+		}()
+	}
+	wg.Wait()
+	if maxConcurrent != 1 {
+		t.Fatalf("lifecycle lock allowed %d concurrent holders, want 1", maxConcurrent)
+	}
+
+	// Different keys do not block each other and the map drops entries once
+	// released.
+	u1 := m.LockSessionLifecycle("k1")
+	u2 := m.LockSessionLifecycle("k2")
+	m.lifecycleMu.Lock()
+	n := len(m.lifecycleLocks)
+	m.lifecycleMu.Unlock()
+	if n != 2 {
+		t.Fatalf("expected 2 live lifecycle locks, got %d", n)
+	}
+	u1()
+	u2()
+	m.lifecycleMu.Lock()
+	n = len(m.lifecycleLocks)
+	m.lifecycleMu.Unlock()
+	if n != 0 {
+		t.Fatalf("expected lifecycle lock map to drain to 0, got %d", n)
+	}
+}
+
+// A rebuild is shared by every request waiting on it, so once it is admitted
+// the request that triggered it can end without failing the others. Each step
+// here answers an ended request as production does for some recipes: with
+// that request's error.
+func TestReconstructTranscodeOutlivesTriggeringRequest(t *testing.T) {
+	m := NewTranscodeManager()
+	m.Config = func() TranscodeRuntimeConfig {
+		return TranscodeRuntimeConfig{TranscodeDir: t.TempDir(), HWAccel: transcodeHWQSV}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The first step after admission: the request ends here.
+	m.resolveToneMapExecutor = func(stepCtx context.Context, opts TranscodeOpts) (TranscodeOpts, error) {
+		cancel()
+		return opts, stepCtx.Err()
+	}
+	m.autoTranscodePipeline = func(stepCtx context.Context, opts TranscodeOpts) *AutoTranscodePipeline {
+		if stepCtx.Err() != nil {
+			t.Error("fallback order resolved on the ended request's context")
+		}
+		return NewAutoTranscodePipeline(stepCtx, opts)
+	}
+	m.startTranscode = func(stepCtx context.Context, opts TranscodeOpts) (*TranscodeSession, error) {
+		if err := stepCtx.Err(); err != nil {
+			return nil, err
+		}
+		return &TranscodeSession{opts: opts, stderr: newBoundedTailBuffer(stderrTailMaxBytes)}, nil
+	}
+	card := NewRecipeCard(5, "p", 77, "", TranscodeOpts{
+		SessionID: "s", InputPath: "/media/movie.mkv",
+		TargetCodecVideo: "h264", TargetCodecAudio: "aac", SegmentDuration: 2,
+	})
+
+	got, err := m.ReconstructTranscodeWithError(ctx, "s", -1, card)
+	if err != nil || got == nil {
+		t.Fatalf("reconstruct = %v, %v; want the session the other requests wait for", got, err)
+	}
+}
+
+func TestReconstructTranscodeWithoutAutoStartsOnceWithoutWaiting(t *testing.T) {
+	m := NewTranscodeManager()
+	m.Config = func() TranscodeRuntimeConfig {
+		return TranscodeRuntimeConfig{TranscodeDir: t.TempDir(), HWAccel: transcodeHWQSV}
+	}
+	starts := 0
+	m.startTranscode = func(_ context.Context, opts TranscodeOpts) (*TranscodeSession, error) {
+		starts++
+		// Never ready and already exited for a reason other than a decoder
+		// rejection: the session is still returned, as an unwaited one was.
+		return &TranscodeSession{opts: opts, stderr: newBoundedTailBuffer(stderrTailMaxBytes)}, nil
+	}
+	card := NewRecipeCard(5, "p", 77, "", TranscodeOpts{
+		SessionID: "s", InputPath: "/media/movie.mkv",
+		TargetCodecVideo: "h264", TargetCodecAudio: "aac", SegmentDuration: 2,
+	})
+	got, err := m.ReconstructTranscodeWithError(context.Background(), "s", -1, card)
+	if err != nil || got == nil {
+		t.Fatalf("reconstruct = %v, %v; want the single unwaited session", got, err)
+	}
+	if starts != 1 {
+		t.Fatalf("starts = %d, want 1", starts)
+	}
+}
+
+// setRestartHookTimeout sets how long a restart hook may run, for one test.
+func setRestartHookTimeout(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	previous := restartHookTimeout
+	restartHookTimeout = timeout
+	t.Cleanup(func() { restartHookTimeout = previous })
+}
+
+// A restart hook can block on its FFmpeg context, as the throttler's settings
+// read does when the database stalls. Shutdown cleanup must still close the
+// session, which cancels that context, rather than wait for the hook. The
+// hook's own timeout is out of reach here, so only the close can end it.
+func TestStartShutdownCleanup_DoesNotWaitForARestartHook(t *testing.T) {
+	setRestartHookTimeout(t, time.Hour)
+	m := NewTranscodeManager()
+	s := newRunningFakeSession(t)
+	m.RegisterTranscodeSession("hooked", s)
+	hookEntered := make(chan struct{})
+	hookReturned := make(chan struct{})
+	s.SetRestartHook(func(ctx context.Context) {
+		close(hookEntered)
+		<-ctx.Done()
+		close(hookReturned)
+	})
+	restarted := make(chan error, 1)
+	go func() { restarted <- m.RestartSessionLocked(context.Background(), "hooked", s, 0, 0) }()
+	<-hookEntered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := m.StartShutdownCleanup(ctx)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown cleanup waited on a restart hook that only Close can release")
+	}
+	<-hookReturned
+	if err := <-restarted; err != nil {
+		t.Fatalf("restart published before shutdown = %v", err)
+	}
+	requireClosed(t, s, nil)
+}
+
+// A restart holds the session lifecycle lock through its restart hook, and a
+// stop takes that lock before it closes the session, so the stop cannot be
+// the close that cancels a stalled hook. The hook has to run out of time on
+// its own, leaving the FFmpeg process it restarted, still throttled as it
+// was, for the stop to close.
+func TestRestartSessionLocked_StalledRestartHookDoesNotHoldAStop(t *testing.T) {
+	setRestartHookTimeout(t, 30*time.Millisecond)
+	m := NewTranscodeManager()
+	s := newRunningFakeSession(t)
+	m.RegisterTranscodeSession("hooked", s)
+	const throttleSeconds = 120
+	s.StartThrottler(throttleSeconds)
+	hookEntered := make(chan struct{})
+	s.SetRestartHook(func(ctx context.Context) {
+		close(hookEntered)
+		<-ctx.Done()
+	})
+	restarted := make(chan error, 1)
+	go func() { restarted <- m.RestartSessionLocked(context.Background(), "hooked", s, 0, 0) }()
+	<-hookEntered
+
+	type sessionAtStop struct {
+		running         bool
+		throttleSeconds int
+	}
+	atStop := make(chan sessionAtStop, 1)
+	go func() {
+		unlock := m.LockSessionLifecycle("hooked")
+		defer unlock()
+		seen := sessionAtStop{running: s.IsRunning()}
+		s.mu.Lock()
+		if s.throttler != nil {
+			seen.throttleSeconds = s.throttler.thresholdSeconds
+		}
+		s.mu.Unlock()
+		atStop <- seen
+		m.CloseTranscodeSession("hooked", "")
+	}()
+	select {
+	case seen := <-atStop:
+		if !seen.running {
+			t.Fatal("the restart hook's timeout ended the FFmpeg process it restarted")
+		}
+		if seen.throttleSeconds != throttleSeconds {
+			t.Fatalf("throttle after a stalled restart hook = %ds, want the %ds the session had", seen.throttleSeconds, throttleSeconds)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a stop waited on the lifecycle lock behind a restart hook that only its own close could release")
+	}
+	if err := <-restarted; err != nil {
+		t.Fatalf("restart with a stalled hook = %v", err)
+	}
+	// The stop closes the session before it releases the lock.
+	m.LockSessionLifecycle("hooked")()
+	requireClosed(t, s, nil)
+}

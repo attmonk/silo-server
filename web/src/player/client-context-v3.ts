@@ -1,0 +1,331 @@
+/**
+ * Builds the web client's half of the v3 playback contract: the `declared`-tier
+ * capability block and the per-delivery-class context the server negotiates
+ * against.
+ *
+ * The browser can only answer MIME support probes through
+ * `MediaSource.isTypeSupported(...)` and `HTMLMediaElement.canPlayType(...)`, so
+ * every claim here is `declared` evidence (see §3 of
+ * `docs/architecture/playback-protocol-v3.md`). `video_decode[]` carries only
+ * the bit depths a codec's probes accepted: on `declared` an entry can narrow
+ * the flat codec claim but never widen it, and fabricating profile/level
+ * entries we cannot observe would be exactly the dishonest attestation the
+ * tier exists to avoid.
+ */
+
+import {
+  CLAIM_CLIENT_MANAGED_DYNAMIC_RANGE_V3,
+  CLAIM_CLIENT_SELECTED_AUDIO_TRACK_V3,
+  FEATURE_PROGRESSIVE_RANGE_REFUSAL_V3,
+  PROTOCOL_V3,
+  type ClientCodecCapabilitiesV3,
+  type ClientPlaybackContextV3,
+  type DeliveryCapabilityV3,
+  type DeliveryClassV3,
+  type DeliverySubtitleCapabilitiesV3,
+  type HDRCapabilitiesV3,
+} from "./protocol-v3";
+import { onMeteredConnection, readMeasuredBandwidthKbps } from "./bandwidth-probe";
+import { detectFormFactor } from "./form-factor";
+import { isSafariBrowserV3 } from "./utils/hlsEngine";
+import { isChromiumUserAgent } from "./utils/browser";
+import type { EngineCapabilities } from "./engine/capabilities";
+
+/** App version reported to the server for diagnostics. */
+const WEB_APP_VERSION = "web";
+
+/**
+ * Subtitle capabilities of the web player, identical for every delivery class:
+ * the server exposes external and embedded text as session-scoped sidecars,
+ * which it renders as WebVTT or ASS via JASSUB (with container font
+ * attachments). Embedded PGS arrives as a lossless `.sup` sidecar drawn by
+ * usePGSSubtitles. Embedded DVD/DVB bitmaps have no sidecar, so the server
+ * still burns them in; it refuses external bitmap files outright.
+ */
+const WEB_SUBTITLE_CAPABILITIES: DeliverySubtitleCapabilitiesV3 = {
+  embedded_text: true,
+  sidecar_text: true,
+  ass_styling: true,
+  embedded_bitmap: true,
+  sidecar_bitmap: false,
+  font_attachments: true,
+};
+
+export interface HLSSupportProbe {
+  supported: boolean;
+  native: boolean;
+}
+
+/** Detects whether HLS is available and whether the media element handles it natively. */
+export function detectHLSSupport(): HLSSupportProbe {
+  if (typeof document !== "undefined") {
+    try {
+      const video = document.createElement("video");
+      if (video.canPlayType("application/vnd.apple.mpegurl") !== "") {
+        return { supported: true, native: true };
+      }
+    } catch {
+      // Fall through to the hls.js/MSE probe.
+    }
+  }
+  if (typeof MediaSource === "undefined") return { supported: false, native: false };
+  try {
+    // hls.js muxes into fMP4/TS; the baseline it requires is an MSE that can
+    // take an mp4 segment at all.
+    return {
+      supported: MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'),
+      native: false,
+    };
+  } catch {
+    return { supported: false, native: false };
+  }
+}
+
+export interface WebCapabilityProbe {
+  /** Container names the browser reported support for. */
+  containers: string[];
+  /** Video codec names the browser reported support for. */
+  codecsVideo: string[];
+  /** Video codecs supported specifically by direct media-element playback. */
+  progressiveCodecsVideo: string[];
+  /**
+   * Bit depths each probed codec decodes, for codecs whose deeper profile
+   * browsers often refuse (H.264 High 10). Absent codecs are unconstrained.
+   */
+  videoBitDepths?: Record<string, number[]>;
+  /** Audio codec names the browser reported support for. */
+  codecsAudio: string[];
+  /** Audio codecs supported specifically inside progressive MP4 delivery. */
+  progressiveCodecsAudio: string[];
+  /** Largest video size the browser decodes; never derived from the screen. */
+  maxResolution: string;
+  /** Best-effort HDR display detection. */
+  hdr: boolean;
+  /** Structured HDR formats supported by the active browser output path. */
+  hdrDetails: HDRCapabilitiesV3;
+  /** Whether native HLS or hls.js can be used on this browser. */
+  hls: boolean;
+  /** Whether HLS is handled by the browser's native media element. */
+  nativeHLS: boolean;
+}
+
+function union(...lists: readonly (readonly string[])[]): string[] {
+  return Array.from(new Set(lists.flat()));
+}
+
+/**
+ * Builds the `client_capabilities` block. Every list is a flat declaration;
+ * `codecs_video_hardware` mirrors `codecs_video` because a browser exposes no
+ * way to tell software from hardware decode, and on the `declared` tier the
+ * server treats the two lists identically.
+ *
+ * With the browser decode engine on, the device-level lists include what the
+ * engine adds. The server reads these lists for every route and then narrows
+ * each one by its delivery class, and only `original_http` carries the engine's
+ * additions, so remux and HLS routes are unaffected.
+ */
+export function buildClientCapabilitiesV3(
+  probe: WebCapabilityProbe,
+  engine: EngineCapabilities | null = null,
+): ClientCodecCapabilitiesV3 {
+  const codecsVideo = union(
+    probe.codecsVideo,
+    probe.progressiveCodecsVideo,
+    engine?.videoCodecs ?? [],
+  );
+  // The server reads `hardware` only on the strict tiers.
+  const videoDecode = Object.entries(probe.videoBitDepths ?? {}).map(([codec, bitDepths]) => ({
+    codec,
+    bit_depths: bitDepths,
+    hardware: false,
+  }));
+  return {
+    video_evidence: "declared",
+    audio_evidence: "declared",
+    codecs_video: codecsVideo,
+    codecs_video_hardware: codecsVideo,
+    codecs_audio: union(probe.codecsAudio, engine?.audioCodecs ?? []),
+    containers: union(probe.containers, engine?.containers ?? []),
+    max_resolution: probe.maxResolution,
+    hdr: probe.hdr,
+    hdr_details: probe.hdrDetails,
+    ...(videoDecode.length > 0 ? { video_decode: videoDecode } : {}),
+  };
+}
+
+function buildDeliveryCapability(
+  probe: WebCapabilityProbe,
+  overrides: Partial<DeliveryCapabilityV3>,
+): DeliveryCapabilityV3 {
+  return {
+    enabled: true,
+    supported_on_device: true,
+    containers: probe.containers,
+    video_codecs: probe.codecsVideo,
+    audio_decode_codecs: probe.codecsAudio,
+    // A browser cannot bitstream audio to a receiver, and passthrough claims
+    // are only ever honoured under the `exact` tier anyway.
+    audio_passthrough_codecs: [],
+    hdr_details: probe.hdrDetails,
+    subtitles: WEB_SUBTITLE_CAPABILITIES,
+    features: [],
+    // The stream URL carries its own token; the player reloads the source
+    // rather than refreshing headers in place.
+    auth_header_refresh: false,
+    validated_claims: [],
+    transformations: [],
+    ...overrides,
+  };
+}
+
+/**
+ * The browser decode engine's additions to the `original_http` class: what it
+ * decodes on top of the media element, the audio track it can pick from the
+ * whole file, and, when its WebGPU presenter works and the display is SDR, HDR and
+ * Dolby Vision originals (see docs/architecture/web-decode-engine.md). The
+ * engine only presents SDR, so on an HDR display the claim stays off and HDR
+ * sources keep the routes that preserve HDR.
+ */
+function engineOriginalOverrides(
+  probe: WebCapabilityProbe,
+  original: Partial<DeliveryCapabilityV3>,
+  engine: EngineCapabilities,
+): Partial<DeliveryCapabilityV3> {
+  return {
+    ...original,
+    containers: union(probe.containers, engine.containers),
+    video_codecs: union(probe.codecsVideo, engine.videoCodecs),
+    audio_decode_codecs: union(probe.codecsAudio, engine.audioCodecs),
+    validated_claims: [
+      CLAIM_CLIENT_SELECTED_AUDIO_TRACK_V3,
+      ...(engine.hdr && !probe.hdr ? [CLAIM_CLIENT_MANAGED_DYNAMIC_RANGE_V3] : []),
+    ],
+  };
+}
+
+/** Opt-ins that depend on how the calling player recovers, not on the browser. */
+export interface DeliveryRecoveryV3 {
+  /**
+   * The player answers a progressive stream's network error by reopening it at
+   * its current position (VideoPlayer's reconnect). Only then may Chromium opt
+   * into progressive_range_refusal_v1: a player without that reconnect would
+   * treat the refusal as a failed route.
+   */
+  reopensProgressiveAtPosition?: boolean;
+}
+
+/**
+ * Builds the `deliveries` map. `original_http` and `progressive` ride the
+ * `<video>` element directly; `hls` uses hls.js where MSE is available and the
+ * media element's native HLS implementation otherwise. With the decode engine
+ * on, `original_http` also covers what the engine can play.
+ */
+export function buildDeliveriesV3(
+  probe: WebCapabilityProbe,
+  userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "",
+  engine: EngineCapabilities | null = null,
+  recovery: DeliveryRecoveryV3 = {},
+): Partial<Record<DeliveryClassV3, DeliveryCapabilityV3>> {
+  const nonProgressiveHDRDetails: HDRCapabilitiesV3 = {
+    ...probe.hdrDetails,
+    // The Dolby Vision and HDR10 probes cover direct progressive playback
+    // through the media element after Silo normalizes the sample entry. They
+    // say nothing about an untouched original or hls.js' MediaSource path.
+    hdr10: false,
+    dolby_vision_profiles: [],
+    dolby_vision_profile_levels: [],
+  };
+  delete nonProgressiveHDRDetails.hdr10_max_width;
+  delete nonProgressiveHDRDetails.hdr10_max_height;
+  delete nonProgressiveHDRDetails.hdr10_max_frame_rate;
+  delete nonProgressiveHDRDetails.hdr10_max_bitrate_kbps;
+  const nativeHLSPreferred = probe.nativeHLS && isSafariBrowserV3(userAgent);
+  const progressiveHDRDetails = nativeHLSPreferred ? nonProgressiveHDRDetails : probe.hdrDetails;
+  const hlsHDRDetails = nativeHLSPreferred ? probe.hdrDetails : nonProgressiveHDRDetails;
+  const hlsVideoCodecs = nativeHLSPreferred ? probe.progressiveCodecsVideo : probe.codecsVideo;
+  const original: Partial<DeliveryCapabilityV3> = { hdr_details: nonProgressiveHDRDetails };
+  return {
+    original_http: buildDeliveryCapability(
+      probe,
+      engine ? engineOriginalOverrides(probe, original, engine) : original,
+    ),
+    progressive: buildDeliveryCapability(probe, {
+      video_codecs: probe.progressiveCodecsVideo,
+      audio_decode_codecs: probe.progressiveCodecsAudio,
+      hdr_details: progressiveHDRDetails,
+      // Chromium reports a refused mid-stream range as a network error, which
+      // a player that reopens at its position recovers from. Other media
+      // loaders and players keep the plain stream.
+      features:
+        recovery.reopensProgressiveAtPosition && isChromiumUserAgent(userAgent)
+          ? [FEATURE_PROGRESSIVE_RANGE_REFUSAL_V3]
+          : [],
+    }),
+    hls: buildDeliveryCapability(probe, {
+      supported_on_device: probe.hls,
+      ...(probe.hls ? {} : { failure_reason: "media_source_extensions_unavailable" }),
+      containers: ["hls"],
+      video_codecs: hlsVideoCodecs,
+      hdr_details: hlsHDRDetails,
+    }),
+  };
+}
+
+/**
+ * Measured downlink in kbps for the planner's Auto choice: a source that fits
+ * the estimate plays as-is, and only one that does not is converted.
+ *
+ * A fresh measurement from the background bandwidth probe is used, unless the
+ * link is metered (Data Saver or cellular): that measurement was taken on
+ * another link, and a metered one is never probed. `connection.downlink` is
+ * never used: browsers round and cap it (Chromium at 10 Mbps), so it is a
+ * guess, not a measurement. Returns undefined when nothing was measured, which
+ * lets Auto send the source, under any limit the server learned.
+ */
+export function detectBandwidthEstimateKbpsV3(): number | undefined {
+  return onMeteredConnection() ? undefined : readMeasuredBandwidthKbps();
+}
+
+/** Bounded (≤128 chars) opaque platform detail; the server treats it as text. */
+function boundedDetail(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  return trimmed.slice(0, 128);
+}
+
+/**
+ * Builds `client_playback_context`. `output.output_context_id` is deliberately
+ * omitted: the browser exposes no stable identity for the current output route,
+ * and the server only ever compares that token for equality, so a synthesized
+ * value would invalidate plans at random.
+ */
+export function buildClientPlaybackContextV3(
+  probe: WebCapabilityProbe,
+  engine: EngineCapabilities | null = null,
+  recovery: DeliveryRecoveryV3 = {},
+): ClientPlaybackContextV3 {
+  const platformDetails: Record<string, string> = {};
+  const userAgent = boundedDetail(typeof navigator !== "undefined" ? navigator.userAgent : "");
+  if (userAgent) platformDetails["user_agent"] = userAgent;
+  if (typeof window !== "undefined" && typeof window.devicePixelRatio === "number") {
+    platformDetails["device_pixel_ratio"] = String(window.devicePixelRatio);
+  }
+
+  return {
+    protocol_version: PROTOCOL_V3,
+    form_factor: detectFormFactor(),
+    app_version: WEB_APP_VERSION,
+    device: {
+      platform: "web",
+      ...(Object.keys(platformDetails).length > 0 ? { platform_details: platformDetails } : {}),
+    },
+    output: { hdr_details: probe.hdrDetails },
+    deliveries: buildDeliveriesV3(
+      probe,
+      typeof navigator !== "undefined" ? navigator.userAgent : "",
+      engine,
+      recovery,
+    ),
+  };
+}

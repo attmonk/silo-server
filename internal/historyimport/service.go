@@ -1,0 +1,961 @@
+package historyimport
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/workmetrics"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/watchstate"
+)
+
+// signalsNotifyTimeout bounds reporting a run's signal changes, which happens
+// after the run's own context may have ended.
+const signalsNotifyTimeout = 10 * time.Second
+
+// SignalsChangedNotifier records that a profile's recommendation signals
+// changed, so its taste profile and cached recommendations get rebuilt.
+// *recommendations.Worker implements it.
+type SignalsChangedNotifier interface {
+	NotifySignalsChanged(ctx context.Context, userID int, profileID string)
+}
+
+// maxConcurrentRuns limits how many import runs execute simultaneously.
+// Additional runs stay queued until a slot opens. This prevents overwhelming
+// the external server and database when bulk-importing many users at once.
+const maxConcurrentRuns = 5
+
+type Service struct {
+	repo       *Repository
+	matcher    *Matcher
+	emby       *EmbyClient
+	jellyfin   *JellyfinClient
+	plex       *PlexClient
+	watchState *watchstate.Service
+	stores     userstore.UserStoreProvider
+	bgContext  context.Context
+
+	// localNetwork decides whether a server address a user supplied may be on
+	// this server's own network. Nil limits those addresses to the internet.
+	localNetwork *LocalNetworkAccess
+
+	// runSemaphore limits concurrent run goroutines to maxConcurrentRuns.
+	runSemaphore   chan struct{}
+	queueWake      chan struct{}
+	backgroundOnce sync.Once
+
+	// runCancels allows in-process cancellation of running import goroutines.
+	runCancels   map[string]context.CancelFunc
+	runCancelsMu sync.Mutex
+	observers    []Observer
+
+	// seriesDrops and nextUp run the pass hiding the shows a source hid from
+	// its Continue Watching (see SetContinueWatchingStores).
+	seriesDrops SeriesDropStore
+	nextUp      NextUpLister
+	// now dates the drops that pass writes; nil means time.Now.
+	now func() time.Time
+
+	// signals hears once per run that the profile's signals changed. Nil
+	// reports nothing.
+	signals SignalsChangedNotifier
+}
+
+func NewService(bgContext context.Context, repo *Repository, storeProvider userstore.UserStoreProvider) *Service {
+	if bgContext == nil {
+		bgContext = context.Background()
+	}
+	service := &Service{
+		repo:         repo,
+		matcher:      NewMatcher(repo),
+		emby:         NewEmbyClient(),
+		jellyfin:     NewJellyfinClient(),
+		plex:         NewPlexClient(),
+		watchState:   watchstate.NewService(storeProvider),
+		stores:       storeProvider,
+		bgContext:    bgContext,
+		runSemaphore: make(chan struct{}, maxConcurrentRuns),
+		queueWake:    make(chan struct{}, 1),
+		runCancels:   make(map[string]context.CancelFunc),
+	}
+	return service
+}
+
+// StartBackgroundWork activates recovery and dispatch after the resolver and
+// observers have been configured. Construction must not consume persisted jobs.
+func (s *Service) StartBackgroundWork() {
+	s.backgroundOnce.Do(func() { s.startStaleRunMonitor(); s.startImportQueue() })
+}
+
+// SetLocalNetworkAccess installs the policy for server addresses users supply.
+// Without it, those addresses are limited to the public internet.
+func (s *Service) SetLocalNetworkAccess(access *LocalNetworkAccess) {
+	if s != nil {
+		s.localNetwork = access
+	}
+}
+
+// SetSignalsChangedNotifier installs where a run reports that it changed the
+// importing profile's recommendation signals.
+func (s *Service) SetSignalsChangedNotifier(notifier SignalsChangedNotifier) {
+	if s != nil {
+		s.signals = notifier
+	}
+}
+
+// notifySignalsChanged reports a run's signal changes once it ends.
+func (s *Service) notifySignalsChanged(ctx context.Context, userID int, profileID string) {
+	if s.signals == nil {
+		return
+	}
+	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), signalsNotifyTimeout)
+	defer cancel()
+	s.signals.NotifySignalsChanged(notifyCtx, userID, profileID)
+}
+
+// runChangedSignals reports whether a run should report that it changed the
+// profile's recommendation signals: every completed run, and a failed run
+// that had already written progress, history, favorites or watchlist entries,
+// since records are written one by one.
+func runChangedSignals(completed bool, summary ExecutionSummary) bool {
+	return completed || summary.ProgressUpdated > 0 || summary.HistoryCreated > 0 ||
+		summary.FavoritesImported > 0 || summary.WatchlistAdded > 0
+}
+
+func (s *Service) SetStableIdentityResolver(identity *watchstate.StableIdentityResolver) {
+	if s == nil || s.watchState == nil {
+		return
+	}
+	s.watchState = s.watchState.WithStableIdentityResolver(identity)
+}
+
+func (s *Service) registerRunCancel(runID string, cancel context.CancelFunc) {
+	s.runCancelsMu.Lock()
+	s.runCancels[runID] = cancel
+	s.runCancelsMu.Unlock()
+}
+
+func (s *Service) deregisterRunCancel(runID string) {
+	s.runCancelsMu.Lock()
+	delete(s.runCancels, runID)
+	s.runCancelsMu.Unlock()
+}
+
+func (s *Service) cancelRunInProcess(runID string) {
+	s.runCancelsMu.Lock()
+	cancel, ok := s.runCancels[runID]
+	s.runCancelsMu.Unlock()
+	if ok {
+		cancel()
+	}
+}
+
+func (s *Service) ListUserSources(ctx context.Context) ([]Source, error) {
+	if err := s.repo.DeleteExpiredConnectSessions(ctx); err != nil {
+		return nil, err
+	}
+	return s.repo.ListEnabledSources(ctx)
+}
+
+func (s *Service) LoginConnect(ctx context.Context, userID int, input LoginConnectInput) (*ConnectSessionLoginResult, error) {
+	if err := s.repo.DeleteExpiredConnectSessions(ctx); err != nil {
+		return nil, err
+	}
+	authResp, err := s.emby.ConnectAuthenticate(ctx, input.Username, input.Password)
+	if err != nil {
+		return nil, tagUnreachable(err)
+	}
+	servers, err := s.emby.ConnectServers(ctx, authResp.ConnectUserID, authResp.ConnectAccessToken)
+	if err != nil {
+		return nil, tagUnreachable(err)
+	}
+
+	session, err := s.repo.CreateConnectSession(ctx, ConnectSession{
+		ID:                 uuid.NewString(),
+		UserID:             userID,
+		ConnectUserID:      authResp.ConnectUserID,
+		ConnectAccessToken: authResp.ConnectAccessToken,
+		Servers:            servers,
+		ExpiresAt:          time.Now().UTC().Add(connectSessionTTL),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ConnectSessionLoginResult{
+		ConnectSessionID: session.ID,
+		Servers:          toConnectServerResponses(session.Servers),
+		ExpiresAt:        session.ExpiresAt,
+	}, nil
+}
+
+func (s *Service) CreatePlexPin(ctx context.Context, userID int) (*PlexPinResponse, error) {
+	if err := s.repo.DeleteExpiredPlexSessions(ctx); err != nil {
+		return nil, err
+	}
+	pinID, pinCode, err := s.plex.CreatePin(ctx)
+	if err != nil {
+		return nil, tagUnreachable(err)
+	}
+	session, err := s.repo.CreatePlexSession(ctx, PlexSession{
+		ID:        uuid.NewString(),
+		UserID:    userID,
+		PinID:     fmt.Sprintf("%d", pinID),
+		PinCode:   pinCode,
+		ExpiresAt: time.Now().UTC().Add(connectSessionTTL),
+	})
+	if err != nil {
+		return nil, err
+	}
+	authURL := fmt.Sprintf("https://app.plex.tv/auth#?clientID=%s&code=%s&context%%5Bdevice%%5D%%5Bproduct%%5D=%s",
+		url.QueryEscape(plexClientIdentifier),
+		url.QueryEscape(pinCode),
+		url.QueryEscape(plexProduct),
+	)
+	return &PlexPinResponse{
+		SessionID: session.ID,
+		PinCode:   pinCode,
+		AuthURL:   authURL,
+		ExpiresAt: session.ExpiresAt,
+	}, nil
+}
+
+func (s *Service) CheckPlexPin(ctx context.Context, userID int, sessionID string) (*PlexCheckResponse, error) {
+	session, err := s.repo.GetPlexSession(ctx, userID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	if session.AuthToken != "" {
+		return &PlexCheckResponse{
+			Authenticated: true,
+			Servers:       toPlexServerPublicList(session.Servers),
+		}, nil
+	}
+
+	pinID, err := strconv.Atoi(session.PinID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid pin ID in session: %w", err)
+	}
+	authToken, err := s.plex.CheckPin(ctx, pinID)
+	if err != nil {
+		return nil, tagUnreachable(err)
+	}
+	if authToken == "" {
+		return &PlexCheckResponse{Authenticated: false}, nil
+	}
+
+	servers, err := s.plex.GetResources(ctx, authToken)
+	if err != nil {
+		return nil, tagUnreachable(fmt.Errorf("discovering Plex servers: %w", err))
+	}
+	if err := s.repo.UpdatePlexSessionAuth(ctx, session.ID, authToken, servers); err != nil {
+		return nil, err
+	}
+	return &PlexCheckResponse{
+		Authenticated: true,
+		Servers:       toPlexServerPublicList(servers),
+	}, nil
+}
+
+func toPlexServerPublicList(servers []PlexServer) []PlexServerPublic {
+	result := make([]PlexServerPublic, 0, len(servers))
+	for _, s := range servers {
+		result = append(result, PlexServerPublic{
+			Name:             s.Name,
+			ClientIdentifier: s.ClientIdentifier,
+			Owned:            s.Owned,
+			HasRemoteURL:     s.HasRemoteURL,
+			HasLocalURL:      s.HasLocalURL,
+		})
+	}
+	return result
+}
+
+func (s *Service) CreateRun(ctx context.Context, userID int, input CreateRunInput) (*Run, error) {
+	if input.ProfileID == "" {
+		return nil, fmt.Errorf("profile_id is required")
+	}
+
+	exists, err := s.repo.ProfileExistsForUser(ctx, userID, input.ProfileID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrProfileNotFound
+	}
+
+	// Reject an unavailable durable store before exchanging any credentials.
+	if s.repo.cipher == nil {
+		return nil, ErrPersonalCredentialsUnavailable
+	}
+	admission, err := s.preparePersonalRun(ctx, userID, input)
+	if err != nil {
+		return nil, err
+	}
+	created, err := s.repo.enqueuePersonalRun(ctx, admission)
+	if err != nil {
+		return nil, err
+	}
+	s.notifyRun(created)
+	s.wakeImportQueue()
+	return created, nil
+}
+
+// addToWatchlist puts a matched watchlist import onto the importing
+// profile's watchlist (idempotent: the store insert is ON CONFLICT DO
+// NOTHING, so re-imports do not duplicate or reorder entries).
+func (s *Service) addToWatchlist(ctx context.Context, userID int, profileID, mediaItemID string, addedAt time.Time) (bool, error) {
+	if s.stores == nil {
+		return false, fmt.Errorf("watchlist import: user store provider not configured")
+	}
+	store, err := s.stores.ForUser(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("watchlist import: open user store: %w", err)
+	}
+	inserted, err := store.AddToWatchlistAt(ctx, profileID, mediaItemID, addedAt)
+	if err != nil {
+		return false, fmt.Errorf("watchlist import: add %s: %w", mediaItemID, err)
+	}
+	return inserted, nil
+}
+
+func (s *Service) addFavorite(ctx context.Context, userID int, profileID, mediaItemID string) (bool, error) {
+	if s.stores == nil {
+		return false, fmt.Errorf("favorites import: user store provider not configured")
+	}
+	store, err := s.stores.ForUser(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("favorites import: open user store: %w", err)
+	}
+	inserted, err := store.AddFavoriteAt(ctx, profileID, mediaItemID, time.Now().UTC())
+	if err != nil {
+		return false, fmt.Errorf("favorites import: add %s: %w", mediaItemID, err)
+	}
+	return inserted, nil
+}
+
+func (s *Service) executeRun(run *Run, provider Provider) {
+	s.executeRunWithClaim(run, provider, RunClaim{RunID: run.ID}, false)
+}
+
+func (s *Service) executeRunWithClaim(run *Run, provider Provider, claim RunClaim, capacityHeld bool) {
+	parent := s.bgContext
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancelCause(parent)
+	s.registerRunCancel(run.ID, func() { cancel(ErrRunCancellationRequested) })
+	defer s.deregisterRunCancel(run.ID)
+	defer cancel(nil)
+
+	// Wait for a concurrency slot. The run stays in "queued" status until
+	// a slot opens. If the context is cancelled (server shutdown or admin
+	// cancel), the goroutine exits without executing.
+	if !capacityHeld {
+		select {
+		case s.runSemaphore <- struct{}{}:
+			defer func() { <-s.runSemaphore }()
+		case <-ctx.Done():
+			slog.Info("history import: run canceled while queued", "run_id", run.ID)
+			return
+		}
+
+	}
+	ctx, observation := workmetrics.Start(ctx, "history_import", run.CreatedAt)
+	defer workmetrics.Profile(ctx)()
+	defer observation.Finish("unknown")
+	summary := ExecutionSummary{
+		Warnings:         []string{},
+		UnmatchedSamples: []UnmatchedSample{},
+	}
+	completed := false
+	defer func() {
+		if runChangedSignals(completed, summary) {
+			s.notifySignalsChanged(ctx, run.UserID, run.ProfileID)
+		}
+	}()
+	if claim.Generation == 0 {
+		if err := s.repo.MarkRunStarted(ctx, run.ID); err != nil {
+			slog.Error("history import: failed to mark run started", "run_id", run.ID, "error", err)
+			return
+		}
+	}
+	if err := s.repo.validateRunClaim(ctx, claim); err != nil {
+		s.failClaim(ctx, claim, summary, err)
+		return
+	}
+	s.notifyRunByID(ctx, run.ID)
+	stopHeartbeat := s.startClaimHeartbeat(ctx, claim, cancel)
+	defer stopHeartbeat()
+
+	var from *StreamPosition
+	if claim.Generation > 0 {
+		checkpoint, err := s.repo.loadRunCheckpoint(ctx, claim)
+		if err != nil {
+			s.failClaim(ctx, claim, summary, err)
+			return
+		}
+		if checkpoint != nil {
+			from, summary = &checkpoint.Position, checkpoint.Summary
+		}
+	}
+	slog.Info(
+		"history import: started",
+		"run_id", run.ID,
+		"user_id", run.UserID,
+		"profile_id", run.ProfileID,
+		"source_type", run.SourceType,
+		"connection_mode", run.ConnectionMode,
+		"resumed", from != nil,
+	)
+
+	reporter := continueWatchingReporter(provider)
+	apply := runApplier{service: s, run: run, claim: claim, summary: &summary, hiddenWarningAt: -1}
+	if from != nil {
+		apply.checkpointAt = *from
+	}
+	if summary.HiddenSuppressed > 0 {
+		apply.hiddenWarningAt = 0 // restored by the checkpoint; the warning stays first
+	}
+	// A resumed run skips the Continue Watching pass, so it collects nothing for it.
+	if reporter != nil && from == nil {
+		apply.shows = newImportedShows()
+	}
+	// One budget covers every request the provider makes for this run, so a
+	// source cannot multiply the per-listing limits across lookups or sections.
+	err := provider.Stream(withRunBudget(ctx), from, func(batch RecordBatch) error { return apply.apply(ctx, batch) })
+	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
+		// A deploy, shutdown or database failure is not the run's failure: it
+		// continues from its checkpoint.
+		if (s.bgContext.Err() != nil || errors.Is(err, errRunInterrupted)) && s.repo.requeueInterruptedRun(context.WithoutCancel(ctx), claim) {
+			return
+		}
+		s.failClaim(ctx, claim, summary, err)
+		return
+	}
+	slog.Info("history import: source read", "run_id", run.ID, "count", summary.Fetched)
+
+	if reporter != nil {
+		if row, ok := reporter.ContinueWatchingRow(); ok {
+			if err := s.repo.validateRunClaim(ctx, claim); err != nil {
+				s.failClaim(ctx, claim, summary, err)
+				return
+			}
+			s.reconcileRun(ctx, run, row, apply.shows, from != nil, &summary)
+		}
+	}
+
+	if err := s.repo.validateRunClaim(ctx, claim); err != nil {
+		s.failClaim(ctx, claim, summary, err)
+		return
+	}
+	if err := s.repo.completeRun(ctx, claim, summary); err != nil {
+		s.failClaim(ctx, claim, summary, err)
+		return
+	}
+	completed = true
+	observation.Finish("success")
+	s.notifyRunByID(ctx, run.ID)
+	slog.Info(
+		"history import: completed",
+		"run_id", run.ID,
+		"fetched", summary.Fetched,
+		"matched", summary.Matched,
+		"unmatched", summary.Unmatched,
+		"progress_updated", summary.ProgressUpdated,
+		"history_created", summary.HistoryCreated,
+		"favorites_imported", summary.FavoritesImported,
+		"skipped", summary.Skipped,
+		"warnings", len(summary.Warnings),
+	)
+
+	// Only the completed claim may update the unchanged mapping snapshot.
+	if claim.Generation > 0 {
+		if err := s.repo.touchCompletedMapping(ctx, claim); err != nil {
+			slog.WarnContext(ctx, "history import: mapping timestamp update failed", "run_id", run.ID, "error", err)
+		}
+	}
+	// Update the mapping's last_imported_at timestamp for legacy executions.
+	if run.MappingID != nil && claim.Generation == 0 {
+		if err := s.repo.TouchMappingLastImported(s.bgContext, *run.MappingID); err != nil {
+			slog.Warn("history import: failed to touch mapping last_imported_at", "mapping_id", *run.MappingID, "error", err)
+		}
+	}
+}
+
+// reconcileRun runs the Continue Watching pass. A resumed run imported only
+// part of the shows in this process, so judging the rest would be guesswork: it
+// skips the pass and warns, and the next import of the source reconciles them.
+func (s *Service) reconcileRun(ctx context.Context, run *Run, row ContinueWatchingRow, shows *importedShows, resumed bool, summary *ExecutionSummary) {
+	if resumed || shows.failed != nil {
+		slog.WarnContext(ctx, "history import: continue watching pass skipped", "run_id", run.ID, "resumed", resumed)
+		addRunWarning(summary, warnContinueWatchingNotReconciled)
+		return
+	}
+	dropped, err := s.reconcileContinueWatching(ctx, run.UserID, run.ProfileID, row, shows)
+	if err != nil {
+		slog.WarnContext(ctx, "history import: hiding shows hidden at the source failed", "run_id", run.ID, "dropped", dropped, "error", err)
+		addRunWarning(summary, warnContinueWatchingNotReconciled)
+	} else if dropped > 0 {
+		slog.InfoContext(ctx, "history import: hid shows hidden from the source's continue watching", "run_id", run.ID, "dropped", dropped)
+	}
+}
+
+// runApplier applies one run's batches.
+type runApplier struct {
+	service         *Service
+	run             *Run
+	claim           RunClaim
+	summary         *ExecutionSummary
+	hiddenWarningAt int
+	// shows is nil when the provider has no Continue Watching row to compare.
+	shows     *importedShows
+	largeSlot bool
+	// checkpointAt is the position of the last checkpoint written. A stage
+	// that restarts from its first page reports one position for all its
+	// pages, so only its first page writes one: the totals saved must be from
+	// where a resume starts reading again.
+	checkpointAt StreamPosition
+}
+
+// apply matches a batch with one round of catalog reads, writes its records,
+// and checkpoints. Claim validity is checked per batch; the heartbeat also
+// cancels ctx when the claim is lost, which stops the record loop.
+func (a *runApplier) apply(ctx context.Context, batch RecordBatch) error {
+	s := a.service
+	addRunWarning(a.summary, batch.Warnings...)
+	if len(batch.Records) == 0 && batch.Resume.Stage == "" {
+		return nil
+	}
+	if err := s.repo.validateRunClaim(ctx, a.claim); err != nil {
+		return err
+	}
+	if err := a.awaitLargeSlot(ctx); err != nil {
+		return err
+	}
+	matches, reasons, err := matchAllWithReasons(ctx, s.repo.pool, batch.Records)
+	if err != nil && matchFailsAgain(err) {
+		// The database rejected a value, so this batch would fail the same
+		// way on every resume. Match its records one at a time instead, and keep
+		// each record's failure as a warning.
+		matches, reasons, err = a.matchEach(ctx, batch.Records)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %w", errRunInterrupted, err)
+	}
+	// The checkpoint keeps the totals from before this batch, because a
+	// resume reads the batch again and would otherwise count it twice.
+	before := a.summary.snapshot()
+	var episodes []importedEpisode
+	for i, record := range batch.Records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		a.applyRecord(ctx, record, matches[i], reasons[i], &episodes)
+		workmetrics.Progress("history_import")
+	}
+	if a.shows != nil {
+		a.shows.add(ctx, s.seriesDrops, episodes)
+	}
+	s.persistClaimProgress(ctx, a.claim, *a.summary)
+	if a.claim.Generation > 0 && batch.Resume.Stage != "" && batch.Resume != a.checkpointAt {
+		if err := s.repo.saveRunCheckpoint(ctx, a.claim, runCheckpoint{Position: batch.Resume, Summary: before}); err != nil {
+			slog.WarnContext(ctx, "history import: checkpoint write failed", "run_id", a.run.ID, "error", err)
+		} else {
+			a.checkpointAt = batch.Resume
+		}
+	}
+	return nil
+}
+
+// matchFailsAgain reports a match error that retrying will not clear: the
+// database rejected a value from the source (a data exception or a program
+// limit), or matching did not settle. Anything else, such as a lost
+// connection or a shutdown, is the server's failure and the run resumes later.
+func matchFailsAgain(err error) bool {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		return strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "54")
+	}
+	return errors.Is(err, errMatchUnsettled)
+}
+
+// matchEach matches records one at a time. A record whose own match fails the
+// same way is left unmatched with a warning; any other error stops the batch.
+func (a *runApplier) matchEach(ctx context.Context, records []Record) ([]*Match, []string, error) {
+	matches := make([]*Match, len(records))
+	reasons := make([]string, len(records))
+	for i, record := range records {
+		match, reason, err := a.service.matcher.Match(ctx, record)
+		switch {
+		case err == nil:
+			matches[i], reasons[i] = match, reason
+		case matchFailsAgain(err):
+			addRunWarning(a.summary, err.Error())
+		default:
+			return nil, nil, err
+		}
+	}
+	return matches, reasons, nil
+}
+
+func (a *runApplier) recordUnmatched(record Record, reason string) {
+	summary := a.summary
+	summary.Unmatched++
+	if reason != "" {
+		if summary.UnmatchedReasonCounts == nil {
+			summary.UnmatchedReasonCounts = make(map[string]int)
+		}
+		// Reasons name the item's IDs; count by cause so one warning covers
+		// every item that failed the same way. Samples and logs keep the full
+		// reason.
+		summary.UnmatchedReasonCounts[PublicUnmatchedReason(reason)]++
+	}
+	if len(summary.UnmatchedSamples) < maxUnmatchedSamples {
+		summary.UnmatchedSamples = append(summary.UnmatchedSamples, UnmatchedSample{
+			Kind:   record.Kind,
+			Title:  recordTitle(record),
+			Year:   record.Year,
+			Reason: reason,
+		})
+	}
+	if summary.Unmatched <= maxUnmatchedLogSamples {
+		a.service.logUnmatched(a.run.ID, summary.Fetched, record, reason)
+	}
+}
+
+// applyRecord writes one matched record. Its failures become warnings, so one
+// bad item does not end the run.
+func (a *runApplier) applyRecord(ctx context.Context, record Record, match *Match, reason string, episodes *[]importedEpisode) {
+	s, run, summary := a.service, a.run, a.summary
+	if !record.RepeatOfWatch {
+		summary.Fetched++
+	}
+	if match == nil {
+		if !record.RepeatOfWatch {
+			a.recordUnmatched(record, reason)
+		}
+		return
+	}
+	if !record.RepeatOfWatch {
+		summary.Matched++
+	}
+
+	if record.Favorite {
+		inserted, err := s.addFavorite(ctx, run.UserID, run.ProfileID, match.MediaItemID)
+		if err != nil {
+			addRunWarning(summary, err.Error())
+		} else if inserted {
+			summary.FavoritesImported++
+		}
+	}
+	// Watchlist entries carry no watch state: the matched item joins the
+	// importing profile's watchlist and the progress pipeline is skipped.
+	if record.Watchlisted {
+		inserted, err := s.addToWatchlist(ctx, run.UserID, run.ProfileID, match.MediaItemID, record.UpdatedAt)
+		if err != nil {
+			addRunWarning(summary, err.Error())
+		} else if inserted {
+			summary.WatchlistAdded++
+		}
+		return
+	}
+	if record.FavoriteOnly {
+		return
+	}
+
+	outcome, err := s.applyImportedWatch(ctx, run.UserID, run.ProfileID, match.MediaItemID, record)
+	// A write that landed counts even when a later step for the record
+	// failed, so a run that then fails still reports the signal change.
+	if outcome.ProgressWritten {
+		summary.ProgressUpdated++
+	}
+	if outcome.HistoryCreated {
+		summary.HistoryCreated++
+	}
+	if err != nil {
+		addRunWarning(summary, err.Error())
+		return
+	}
+	if record.Kind == KindEpisode && a.shows != nil {
+		*episodes = append(*episodes, newImportedEpisode(match.MediaItemID, record))
+	}
+	if !outcome.ProgressWritten {
+		summary.Skipped++
+	}
+	if outcome.HiddenSuppressed {
+		summary.HiddenSuppressed++
+		summary.Warnings, a.hiddenWarningAt = upsertHiddenHistoryWarning(
+			summary.Warnings, a.hiddenWarningAt, summary.HiddenSuppressed)
+	}
+}
+
+// importedWatchOutcome reports what applyImportedWatch did with one record.
+type importedWatchOutcome struct {
+	ProgressWritten bool
+	HistoryCreated  bool
+	// HiddenSuppressed marks a record for an item the profile removed from its
+	// history. The store refuses the write, and every later run refuses it the
+	// same way, so the run has to say so rather than count a plain skip.
+	HiddenSuppressed bool
+}
+
+// applyImportedWatch uses the selected user store's atomic freshness guard, so
+// replay never replaces progress merely because an import happened later. A
+// record the source dated nothing goes through seedUndatedProgress, which cannot
+// overwrite local activity at all.
+func (s *Service) applyImportedWatch(ctx context.Context, userID int, profileID, itemID string, record Record) (importedWatchOutcome, error) {
+	var outcome importedWatchOutcome
+	store, err := s.stores.ForUser(ctx, userID)
+	if err != nil {
+		return outcome, err
+	}
+	importedAt := record.UpdatedAt
+	if importedAt.IsZero() {
+		importedAt = undatedImportTime
+		outcome.ProgressWritten, outcome.HiddenSuppressed, err = s.seedUndatedProgress(ctx, store, profileID, itemID, record)
+	} else {
+		outcome.ProgressWritten, err = store.SetProgressIfNewer(
+			ctx, profileID, itemID, importedPosition(record), record.DurationSeconds, record.Played, record.UpdatedAt)
+	}
+	if err != nil {
+		return outcome, err
+	}
+	outcome.HistoryCreated, err = s.watchState.RecordImportedHistory(
+		ctx, userID, profileID, itemID, record.DurationSeconds, record.Played, record.LastPlayedAt)
+	if err != nil || !record.HiddenFromResume {
+		return outcome, err
+	}
+	return outcome, dismissImportedResume(ctx, store, profileID, itemID, importedPosition(record), importedAt)
+}
+
+// undatedImportTime dates progress from a record the source gave no play time
+// for, so it loses every freshness comparison.
+var undatedImportTime = time.Unix(0, 0).UTC()
+
+// dismissImportedResume keeps an item the source hid from its Continue Watching
+// out of the profile's Continue Watching, with a dismissal anchored to the
+// imported progress stamp. It acts only while the progress row still holds the
+// imported position and date, written by this run or an earlier one: newer
+// playback in Silo is never hidden, and re-running an import hides entries an
+// earlier run brought in.
+func dismissImportedResume(ctx context.Context, store userstore.UserStore, profileID, itemID string, position float64, importedAt time.Time) error {
+	progress, err := store.GetProgress(ctx, profileID, itemID)
+	// Continue Watching lists any row with a resume point, including a rewatch
+	// of a completed item.
+	if err != nil || progress == nil || progress.PositionSeconds <= 0 {
+		return err
+	}
+	// User stores report updated_at as RFC 3339 in UTC, whole seconds, so the
+	// position tells the import apart from playback within the same second.
+	if progress.PositionSeconds != position || progress.UpdatedAt != importedAt.UTC().Format(time.RFC3339) {
+		return nil
+	}
+	return store.UpsertHomeDismissal(ctx, userstore.HomeItemDismissal{
+		ProfileID:         profileID,
+		Surface:           userstore.HomeSurfaceContinueWatching,
+		MediaItemID:       itemID,
+		ProgressUpdatedAt: &progress.UpdatedAt,
+		DismissedAt:       time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// seedUndatedProgress imports a record the source gave no play time for. The
+// write is dated at the epoch so it loses every freshness comparison: one atomic
+// write that seeds an item the profile has no progress for and can never replace
+// local activity, whatever else is writing to the row at the same moment.
+//
+// That date is also what a history removal refuses, because the store rejects any
+// write at or before the removal. A refusal with nothing visible to have lost to
+// is that removal, and it is permanent — the record never changes, so every later
+// run is refused the same way — so the caller reports it rather than counting an
+// ordinary skip. The read only classifies that counter, so a row written
+// concurrently simply counts as the skip it is.
+func (s *Service) seedUndatedProgress(
+	ctx context.Context,
+	store userstore.UserStore,
+	profileID, itemID string,
+	record Record,
+) (written, hiddenSuppressed bool, err error) {
+	written, err = store.SetProgressIfNewer(
+		ctx, profileID, itemID, importedPosition(record), record.DurationSeconds, record.Played, undatedImportTime)
+	if err != nil || written {
+		return written, false, err
+	}
+	existing, err := store.GetProgress(ctx, profileID, itemID)
+	if err != nil {
+		return false, false, err
+	}
+	return false, existing == nil, nil
+}
+
+// Run failure messages written for users; run monitors show them verbatim.
+const (
+	RunErrorSourceRejected = "Couldn't connect to that server. Check the URL, username, and password and try again."
+	RunErrorStoppedEarly   = "Import stopped early. Some history may already be imported."
+	RunErrorNotCompleted   = "Import couldn't be completed. Please try again."
+	RunErrorSourceTooLarge = "The server sent more data than Silo accepts for one import, so the import stopped."
+)
+
+func userFacingRunError(summary ExecutionSummary, err error) string {
+	if message, refused := ServerAddressMessage(err); refused {
+		return message
+	}
+	if UpstreamHTTPStatus(err) == http.StatusUnauthorized {
+		return RunErrorSourceRejected
+	}
+	if errors.Is(err, ErrUpstreamResponseTooLarge) {
+		return RunErrorSourceTooLarge
+	}
+	if summary.Fetched > 0 || summary.Matched > 0 || summary.ProgressUpdated > 0 || summary.HistoryCreated > 0 || summary.FavoritesImported > 0 {
+		return RunErrorStoppedEarly
+	}
+	return RunErrorNotCompleted
+}
+
+func (s *Service) ListRuns(ctx context.Context, userID, limit int) ([]Run, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	return s.repo.ListRunsForUser(ctx, userID, limit)
+}
+
+// ListRunsPage is the keyset listing behind v2: up to limit runs strictly
+// older than after, newest first, and whether more follow.
+func (s *Service) ListRunsPage(ctx context.Context, userID int, after *RunKey, limit int) ([]Run, bool, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	return s.repo.ListRunsPageForUser(ctx, userID, after, limit)
+}
+
+// ListRunsPageForProfile is ListRunsPage limited to runs that write into
+// profileID.
+func (s *Service) ListRunsPageForProfile(ctx context.Context, userID int, profileID string, after *RunKey, limit int) ([]Run, bool, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	return s.repo.ListRunsPageForProfile(ctx, userID, profileID, after, limit)
+}
+
+// UserStore returns the account's profile store, which callers use to decide
+// which of the account's profiles the acting profile may import for.
+func (s *Service) UserStore(ctx context.Context, userID int) (userstore.UserStore, error) {
+	return s.stores.ForUser(ctx, userID)
+}
+
+func (s *Service) ListActiveRuns(ctx context.Context, userID int) ([]Run, error) {
+	return s.repo.ListActiveRunsForUser(ctx, userID)
+}
+
+func (s *Service) GetRun(ctx context.Context, userID int, runID string) (*Run, error) {
+	return s.repo.GetRunForUser(ctx, userID, runID)
+}
+
+func (s *Service) ListAdminSources(ctx context.Context) ([]Source, error) {
+	return s.repo.ListAdminSources(ctx)
+}
+
+func (s *Service) CreateSource(ctx context.Context, input CreateSourceInput) (*Source, error) {
+	if err := validateSource(Source{Name: input.Name, BaseURL: input.BaseURL, SourceType: input.SourceType}); err != nil {
+		return nil, err
+	}
+	return s.repo.CreateSource(ctx, input)
+}
+
+func resolveConnectionMode(input CreateRunInput) (string, error) {
+	if input.ServerURL != "" {
+		return "", fmt.Errorf("direct server_url imports are no longer supported")
+	}
+	hasConnect := input.ConnectSessionID != ""
+	hasSource := input.SourceID > 0
+	if hasConnect == hasSource {
+		return "", fmt.Errorf("exactly one of connect_session_id or source_id is required")
+	}
+	if hasConnect {
+		return ConnectionModeConnect, nil
+	}
+	return ConnectionModePredefined, nil
+}
+
+func recordTitle(record Record) string {
+	if record.Kind == KindEpisode && record.SeriesTitle != "" {
+		return record.SeriesTitle
+	}
+	return record.Title
+}
+
+func importedPosition(record Record) float64 {
+	if record.Played && record.DurationSeconds > 0 {
+		return record.DurationSeconds
+	}
+	return record.PositionSeconds
+}
+
+func (s *Service) logUnmatched(runID string, processed int, record Record, reason string) {
+	slog.Info(
+		"history import: unmatched item",
+		"run_id", runID,
+		"processed", processed,
+		"kind", record.Kind,
+		"title", record.Title,
+		"year", record.Year,
+		"series_title", record.SeriesTitle,
+		"series_year", record.SeriesYear,
+		"season_number", record.SeasonNumber,
+		"episode_number", record.EpisodeNumber,
+		"tmdb_id", record.TMDBID,
+		"imdb_id", record.IMDbID,
+		"tvdb_id", record.TVDBID,
+		"series_tmdb_id", record.SeriesTMDBID,
+		"series_imdb_id", record.SeriesIMDbID,
+		"series_tvdb_id", record.SeriesTVDBID,
+		"reason", reason,
+	)
+}
+
+func IsNotFoundError(err error) bool {
+	return errors.Is(err, ErrRunNotFound) ||
+		errors.Is(err, ErrSourceNotFound) ||
+		errors.Is(err, ErrProfileNotFound) ||
+		errors.Is(err, ErrConnectSessionNotFound) ||
+		errors.Is(err, ErrPlexSessionNotFound)
+}
+
+func toConnectServerResponses(servers []ConnectServer) []ConnectServerResponse {
+	resp := make([]ConnectServerResponse, 0, len(servers))
+	for _, server := range servers {
+		resp = append(resp, ConnectServerResponse{
+			ServerID:        server.ID,
+			Name:            server.Name,
+			SystemID:        server.SystemID,
+			HasRemoteURL:    server.HasRemoteURL,
+			HasLocalAddress: server.HasLocalURL,
+		})
+	}
+	return resp
+}
+
+func (s *Service) persistClaimProgress(ctx context.Context, claim RunClaim, summary ExecutionSummary) {
+	if err := s.repo.updateRunProgress(ctx, claim, summary); err != nil {
+		return
+	}
+	s.notifyRunByID(ctx, claim.RunID)
+}

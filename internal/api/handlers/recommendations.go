@@ -1,0 +1,928 @@
+package handlers
+
+import (
+	"context"
+	"log/slog"
+	"maps"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/recommendations"
+	"github.com/Silo-Server/silo-server/internal/sections"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+type recommendationsEngine interface {
+	SimilarItems(ctx context.Context, userID int, profileID, itemID string, limit int, filter catalog.AccessFilter) ([]recommendations.ScoredItem, error)
+	SimilarItemsWithReasons(ctx context.Context, userID int, profileID, itemID string, limit int, filter catalog.AccessFilter) ([]recommendations.ScoredItem, error)
+	BecauseYouWatched(ctx context.Context, userID int, profileID string, sourceItemID string, limit int, filter catalog.AccessFilter) ([]recommendations.ScoredItem, error)
+	GetTasteProfileSummary(ctx context.Context, userID int, profileID string) (*recommendations.TasteProfileSummary, error)
+}
+
+// accessibleItemIDFilter keeps the item IDs an access filter admits.
+// *recommendations.Repo implements it.
+type accessibleItemIDFilter interface {
+	FilterAccessibleItemIDs(ctx context.Context, itemIDs []string, filter catalog.AccessFilter) (map[string]struct{}, error)
+}
+
+type recommendationsReader interface {
+	GetForYouMain(ctx context.Context, userID int, profileID string, limit int, filter catalog.AccessFilter) (*recommendations.ForYouRow, error)
+	GetForYouRows(ctx context.Context, userID int, profileID string, limit int, filter catalog.AccessFilter) ([]recommendations.ForYouRow, error)
+	GetSimilarUsersLiked(ctx context.Context, userID int, profileID string, limit int, filter catalog.AccessFilter) ([]recommendations.ScoredItem, error)
+	GetDiscoverRows(ctx context.Context, userID int, profileID string, limit int, filter catalog.AccessFilter) ([]recommendations.ForYouRow, error)
+	GetSection(ctx context.Context, userID int, profileID, kind, key string, limit int, filter catalog.AccessFilter) (*recommendations.ForYouRow, error)
+	GetWatchTonight(ctx context.Context, userID int, profileID string, limit int, filter catalog.AccessFilter) (recommendations.WatchTonightResult, error)
+}
+
+// RecommendationsHandler handles recommendation API endpoints.
+type RecommendationsHandler struct {
+	engine        recommendationsEngine
+	reader        recommendationsReader
+	storeProvider userstore.UserStoreProvider
+	ratingsRepo   *catalog.RatingsRepo
+	recsRepo      *recommendations.Repo
+	signals       *recommendations.SignalReader // watched set as the reader computes it; nil without recsRepo
+	// exclusionSet returns the canonical titles the profile's built rows
+	// leave out (SignalReader.BuildExclusionSet); nil without recsRepo.
+	exclusionSet        func(ctx context.Context, userID int, profileID string) (map[string]struct{}, error)
+	accessibleIDs       accessibleItemIDFilter
+	cardsRepo           discoverCardsRepo // nil without recsRepo
+	enabled             bool
+	Fetcher             discoverFetcher
+	DetailSvc           discoverPresigner
+	CalendarRepo        calendarRepository
+	EpisodeRepo         *catalog.EpisodeRepository
+	WatchTonightFetcher watchTonightSectionFetcher
+	CastFetcher         cardsCastFetcher
+	EbookProgress       EbookReaderProgressLister
+	// RecWorker refreshes the profile when taste seeding adds favorites.
+	// Optional: when nil, nothing is rebuilt until the next scheduled job.
+	RecWorker TasteSeedRefresher
+	nowFn     func() time.Time
+}
+
+// TasteSeedRefresher rebuilds a profile's taste profile and cached rows right
+// after its taste-seed picks are stored, waiting a few seconds for the result
+// so the client's next read shows it. *recommendations.Worker implements it.
+type TasteSeedRefresher interface {
+	RefreshProfileNow(ctx context.Context, userID int, profileID string) bool
+}
+
+type discoverFetcher interface {
+	FetchItemsByContentIDs(ctx context.Context, contentIDs []string, filter catalog.AccessFilter) ([]*models.MediaItem, error)
+	FetchEpisodesByContentIDs(ctx context.Context, contentIDs []string, filter catalog.AccessFilter) ([]*models.MediaItem, map[string]sections.SectionItemMeta, error)
+	ListOverlaySummaries(ctx context.Context, contentIDs []string, filter catalog.AccessFilter) (map[string]*models.OverlaySummary, error)
+}
+
+type discoverPresigner interface {
+	PresignURL(ctx context.Context, path string, variant string) string
+	PresignURLsWithExpiry(ctx context.Context, paths []string, variant string) map[string]catalog.ResolvedImageURL
+}
+
+// featuredCardArtwork resolves recommendation cards' artwork in one batch,
+// keyed by content ID, through the resolver home sections use.
+func (h *RecommendationsHandler) featuredCardArtwork(ctx context.Context, items map[string]*models.MediaItem, art imagesize.Request) map[string]sectionItemImageURLs {
+	if h.DetailSvc == nil || len(items) == 0 {
+		return nil
+	}
+	cards := make([]featuredArtworkCard[string], 0, len(items))
+	for _, id := range slices.Sorted(maps.Keys(items)) {
+		if mi := items[id]; mi != nil {
+			cards = append(cards, featuredArtworkCard[string]{key: mi.ContentID, item: mi})
+		}
+	}
+	return resolveFeaturedArtwork(ctx, h.DetailSvc, cards, art)
+}
+
+// NewRecommendationsHandler creates a new RecommendationsHandler.
+func NewRecommendationsHandler(engine recommendationsEngine, reader recommendationsReader, storeProvider userstore.UserStoreProvider, ratingsRepo *catalog.RatingsRepo, recsRepo *recommendations.Repo, enabled bool) *RecommendationsHandler {
+	h := &RecommendationsHandler{
+		engine:        engine,
+		reader:        reader,
+		storeProvider: storeProvider,
+		ratingsRepo:   ratingsRepo,
+		recsRepo:      recsRepo,
+		enabled:       enabled,
+		nowFn:         time.Now,
+	}
+	if recsRepo != nil {
+		h.signals = recommendations.NewSignalReader(recsRepo, storeProvider)
+		h.exclusionSet = func(ctx context.Context, userID int, profileID string) (map[string]struct{}, error) {
+			// A nil *RatingsRepo in the interface would be called; pass none.
+			if ratingsRepo == nil {
+				return h.signals.BuildExclusionSet(ctx, nil, userID, profileID, h.nowFn())
+			}
+			return h.signals.BuildExclusionSet(ctx, ratingsRepo, userID, profileID, h.nowFn())
+		}
+		h.accessibleIDs = recsRepo
+		h.cardsRepo = recsRepo
+	}
+	return h
+}
+
+// WithUserStoreOutsidePostgres records whether the user store keeps watch
+// progress, favorites and watchlist outside Postgres (the SQLite backend), and
+// returns the handler. Its signal reads then ask the store instead of the
+// Postgres tables.
+func (h *RecommendationsHandler) WithUserStoreOutsidePostgres(outside bool) *RecommendationsHandler {
+	if h != nil {
+		h.signals.WithUserStoreOutsidePostgres(outside)
+	}
+	return h
+}
+
+// --- Response types ---
+
+func (h *RecommendationsHandler) engineUnavailable() bool {
+	return !h.enabled || h.engine == nil
+}
+
+func emptyTasteProfileSummary() recommendations.TasteProfileSummary {
+	return recommendations.TasteProfileSummary{
+		TopGenres:         []string{},
+		FavoriteDirectors: []string{},
+		SignalCounts:      map[string]int{},
+	}
+}
+
+// filterRecommendations removes watched, marked Not interested and rated items
+// from the list.
+func (h *RecommendationsHandler) filterRecommendations(ctx context.Context, userID int, profileID string, items []recommendations.ScoredItem) []recommendations.ScoredItem {
+	items = h.excludeWatchedRecommendations(ctx, userID, profileID, items)
+	return h.excludeRatedRecommendations(ctx, userID, profileID, items)
+}
+
+func (h *RecommendationsHandler) excludeWatchedRecommendations(ctx context.Context, userID int, profileID string, items []recommendations.ScoredItem) []recommendations.ScoredItem {
+	if len(items) == 0 {
+		return items
+	}
+	watchedSet, err := h.skippedItemIDSet(ctx, userID, profileID)
+	if err != nil {
+		slog.WarnContext(ctx, "loading the watched set failed; recommendations are not filtered for it", "component", "api", "user_id", userID, "profile_id", profileID, "error", err)
+		return items
+	}
+	if len(watchedSet) == 0 {
+		return items
+	}
+
+	filtered := make([]recommendations.ScoredItem, 0, len(items))
+	for _, item := range items {
+		if _, ok := watchedSet[item.MediaItemID]; ok {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+// watchedItemIDSet is SignalReader.WatchedItemIDSet, or an empty set when the
+// handler has no recommendations repo.
+func (h *RecommendationsHandler) watchedItemIDSet(ctx context.Context, userID int, profileID string) (map[string]struct{}, error) {
+	if h.signals == nil {
+		return map[string]struct{}{}, nil
+	}
+	return h.signals.WatchedItemIDSet(ctx, userID, profileID)
+}
+
+// skippedItemIDSet is the titles a live recommendation list leaves out for the
+// profile: its watched set and the titles it marked Not interested. The
+// watched set may be shared (see recommendations.WithWatchedSetMemo), so a
+// profile with marks gets a copy. Marks that cannot be read are logged and
+// left out, so a failed read never also undoes the watched filter.
+func (h *RecommendationsHandler) skippedItemIDSet(ctx context.Context, userID int, profileID string) (map[string]struct{}, error) {
+	watched, err := h.watchedItemIDSet(ctx, userID, profileID)
+	if err != nil || h.signals == nil {
+		return watched, err
+	}
+	marks, err := h.signals.NotInterestedMarks(ctx, userID, profileID)
+	if err != nil {
+		slog.WarnContext(ctx, "loading Not interested marks failed; live recommendations are not filtered for them", "component", "api", "user_id", userID, "profile_id", profileID, "error", err)
+		return watched, nil
+	}
+	if len(marks) == 0 {
+		return watched, nil
+	}
+	skipped := maps.Clone(watched)
+	for _, m := range marks {
+		skipped[m.MediaItemID] = struct{}{}
+	}
+	return skipped, nil
+}
+
+// excludeRatedRecommendations drops every title the profile rated, as the
+// recommendation rows do.
+func (h *RecommendationsHandler) excludeRatedRecommendations(ctx context.Context, userID int, profileID string, items []recommendations.ScoredItem) []recommendations.ScoredItem {
+	if len(items) == 0 || h.ratingsRepo == nil {
+		return items
+	}
+
+	itemIDs := make([]string, len(items))
+	for i, item := range items {
+		itemIDs[i] = item.MediaItemID
+	}
+
+	ratings, err := h.ratingsRepo.ListForItems(ctx, userID, profileID, itemIDs)
+	if err != nil {
+		return items
+	}
+
+	filtered := make([]recommendations.ScoredItem, 0, len(items))
+	for _, item := range items {
+		if _, rated := ratings[item.MediaItemID]; rated {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+// --- Discover endpoint ---
+
+type discoverRowResponse struct {
+	Type        string                `json:"type"`
+	Label       string                `json:"label"`
+	SectionKind string                `json:"section_kind,omitempty"`
+	SectionKey  string                `json:"section_key,omitempty"`
+	Items       []sectionItemResponse `json:"items"`
+}
+
+type discoverResponse struct {
+	Rows []discoverRowResponse `json:"rows"`
+}
+
+type sectionDetailResponse struct {
+	Kind  string                `json:"kind"`
+	Key   string                `json:"key,omitempty"`
+	Type  string                `json:"type"`
+	Label string                `json:"label"`
+	Items []sectionItemResponse `json:"items"`
+}
+
+const (
+	discoverForYouMaxItems     = 28
+	discoverUpcomingWindowDays = 14
+	discoverForYouLabel        = recommendations.ForYouLabel
+	sectionDetailDefaultLimit  = recommendations.CacheCandidateLimit
+)
+
+type discoverRowModel struct {
+	Type           string
+	Label          string
+	ClusterIndex   int
+	Items          []recommendations.ScoredItem
+	UpcomingEvents map[string]upcomingEventResponse
+}
+
+type upcomingDiscoverCandidate struct {
+	DisplayID      string
+	Event          upcomingEventResponse
+	AirDateTime    time.Time
+	BaseIndex      int
+	EffectiveIndex int
+	InWatchlist    bool
+	IsFavorite     bool
+}
+
+type combinedForYouItem struct {
+	Item           recommendations.ScoredItem
+	BaseIndex      int
+	EffectiveIndex int
+	HasUpcoming    bool
+	UpcomingEvent  *upcomingEventResponse
+	AirDateTime    time.Time
+}
+
+// itemEnrichment caches the data needed to convert ScoredItem records into
+// sectionItemResponse for a single request.
+type itemEnrichment struct {
+	items    map[string]*models.MediaItem
+	overlays map[string]*models.OverlaySummary
+	states   map[string]*itemUserStateResponse
+}
+
+func (h *RecommendationsHandler) loadItemEnrichment(
+	ctx context.Context,
+	userID int,
+	profileID string,
+	filter catalog.AccessFilter,
+	ids []string,
+) (*itemEnrichment, error) {
+	out := &itemEnrichment{
+		items: map[string]*models.MediaItem{},
+	}
+	if h.Fetcher == nil || len(ids) == 0 {
+		return out, nil
+	}
+
+	mediaItems, err := h.Fetcher.FetchItemsByContentIDs(ctx, ids, filter)
+	if err != nil {
+		slog.ErrorContext(ctx, "Recommendations: fetch items failed", "component", "api", "error", err)
+		return nil, err
+	}
+	for _, mi := range mediaItems {
+		out.items[mi.ContentID] = mi
+	}
+
+	overlays, overlayErr := h.Fetcher.ListOverlaySummaries(ctx, ids, filter)
+	if overlayErr != nil {
+		slog.ErrorContext(ctx, "Recommendations: overlay summaries failed", "component", "api", "error", overlayErr)
+	} else {
+		out.overlays = overlays
+	}
+
+	if h.storeProvider != nil {
+		store, storeErr := h.storeProvider.ForUser(ctx, userID)
+		if storeErr == nil && store != nil {
+			states, stateErr := resolveItemUserStatesWithOptions(ctx, store, profileID, h.EpisodeRepo, mediaItems, itemUserStateOptions{
+				UserID:             userID,
+				EbookProgressStore: h.EbookProgress,
+			})
+			if stateErr == nil {
+				out.states = states
+			}
+		}
+	}
+
+	return out, nil
+}
+
+func (h *RecommendationsHandler) buildSectionItems(
+	ctx context.Context,
+	scoredItems []recommendations.ScoredItem,
+	enrichment *itemEnrichment,
+	upcomingEvents map[string]upcomingEventResponse,
+	artwork map[string]sectionItemImageURLs,
+) []sectionItemResponse {
+	out := make([]sectionItemResponse, 0, len(scoredItems))
+	for _, scored := range scoredItems {
+		mi, ok := enrichment.items[scored.MediaItemID]
+		if !ok || mi == nil {
+			continue
+		}
+		item := sectionItemFromMediaItem(mi)
+		urls := artwork[mi.ContentID]
+		item.PosterURL, item.BackdropURL, item.LogoURL = urls.posterURL, urls.backdropURL, urls.logoURL
+		item.ParentArtwork = episodeParentArtworkView(mi.ParentArtwork, urls.parents)
+		if enrichment.overlays != nil {
+			item.OverlaySummary = enrichment.overlays[mi.ContentID]
+		}
+		if enrichment.states != nil {
+			item.UserState = enrichment.states[mi.ContentID]
+		}
+		if upcomingEvents != nil {
+			if upcomingEvent, ok := upcomingEvents[mi.ContentID]; ok {
+				upcomingEventCopy := upcomingEvent
+				item.UpcomingEvent = &upcomingEventCopy
+			}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func discoverRowModelsFromRecommendations(rows []recommendations.ForYouRow) []discoverRowModel {
+	if len(rows) == 0 {
+		return nil
+	}
+
+	models := make([]discoverRowModel, 0, len(rows))
+	for _, row := range rows {
+		models = append(models, discoverRowModel{
+			Type:         row.Type,
+			Label:        row.Label,
+			ClusterIndex: row.ClusterIndex,
+			Items:        append([]recommendations.ScoredItem(nil), row.Items...),
+		})
+	}
+	return models
+}
+
+// discoverRowSectionKey derives the URL kind/key pair used by the recommendation
+// section detail page from a discover row's type/label/cluster_index. Returns
+// empty strings when the row has no dedicated detail page (so the frontend
+// renders the title without a link).
+func discoverRowSectionKey(rowType, label string, clusterIndex int) (string, string) {
+	switch rowType {
+	case "cluster":
+		// "For You" main row uses Type="cluster" with Label="For You" and no
+		// cluster index assigned. Specific cluster rows have label "Because
+		// you enjoy ...".
+		if label == discoverForYouLabel {
+			return recommendations.SectionKindForYouMain, ""
+		}
+		return recommendations.SectionKindCluster, strconv.Itoa(clusterIndex)
+	case "similar_users_liked":
+		return recommendations.SectionKindSimilarUsers, ""
+	case recommendations.RecTypePopular:
+		return recommendations.SectionKindPopular, ""
+	case recommendations.RecTypeRecentlyAdded:
+		return recommendations.SectionKindRecentlyAdded, ""
+	case recommendations.RecTypeTopRated:
+		return recommendations.SectionKindTopRated, ""
+	case "genre_sampler":
+		// Genre rows are titled "Top <genre>".
+		if name, ok := strings.CutPrefix(label, "Top "); ok && name != "" {
+			return recommendations.SectionKindGenre, name
+		}
+	}
+	return "", ""
+}
+
+func (h *RecommendationsHandler) blendUpcomingIntoDiscoverRows(
+	ctx context.Context,
+	userID int,
+	profileID string,
+	filter catalog.AccessFilter,
+	discoverRows []discoverRowModel,
+	baseRows []recommendations.ForYouRow,
+) ([]discoverRowModel, error) {
+	if h.CalendarRepo == nil {
+		return discoverRows, nil
+	}
+
+	mainRowIndex := indexOfDiscoverForYouRow(discoverRows)
+	if mainRowIndex < 0 {
+		return discoverRows, nil
+	}
+
+	now := time.Now
+	if h.nowFn != nil {
+		now = h.nowFn
+	}
+	nowUTC := now().UTC()
+	start := discoverUTCDate(nowUTC)
+	end := start.AddDate(0, 0, discoverUpcomingWindowDays-1)
+
+	events, err := h.CalendarRepo.ListEvents(ctx, catalog.CalendarFilter{
+		Start:              start,
+		End:                end,
+		AllowedLibraryIDs:  filter.AllowedLibraryIDs,
+		DisabledLibraryIDs: filter.DisabledLibraryIDs,
+		MaturityLimits:     filter.MaturityLimits,
+	})
+	if err != nil {
+		return discoverRows, err
+	}
+	if len(events) == 0 {
+		return discoverRows, nil
+	}
+
+	premiereCandidates := categorizeUpcomingCandidates(events)
+	if len(premiereCandidates) == 0 {
+		return discoverRows, nil
+	}
+
+	displayIDs := collectUpcomingDisplayIDsFromCandidates(premiereCandidates)
+	rankMap, firstSeenItems := buildDiscoverRankingData(baseRows)
+
+	watchlistMap := map[string]bool{}
+	favoritesMap := map[string]bool{}
+	if h.storeProvider != nil && len(displayIDs) > 0 {
+		store, err := h.storeProvider.ForUser(ctx, userID)
+		if err != nil {
+			return discoverRows, err
+		}
+		if store != nil {
+			favoritesMap, err = store.ListFavoritesByMediaItems(ctx, profileID, displayIDs)
+			if err != nil {
+				return discoverRows, err
+			}
+			watchlistMap, err = store.ListWatchlistByMediaItems(ctx, profileID, displayIDs)
+			if err != nil {
+				return discoverRows, err
+			}
+		}
+	}
+
+	watchedSet, err := h.skippedItemIDSet(ctx, userID, profileID)
+	if err != nil {
+		return discoverRows, err
+	}
+
+	lowRatings := map[string]int{}
+	if h.ratingsRepo != nil && len(displayIDs) > 0 {
+		lowRatings, err = h.ratingsRepo.ListForItems(ctx, userID, profileID, displayIDs)
+		if err != nil {
+			return discoverRows, err
+		}
+	}
+
+	discoverRows[mainRowIndex] = mergePremieresIntoDiscoverRow(
+		discoverRows[mainRowIndex],
+		rankMap,
+		firstSeenItems,
+		premiereCandidates,
+		watchedSet,
+		lowRatings,
+		watchlistMap,
+		favoritesMap,
+		nowUTC,
+	)
+
+	return discoverRows, nil
+}
+
+func mergePremieresIntoDiscoverRow(
+	row discoverRowModel,
+	rankMap map[string]int,
+	firstSeenItems map[string]recommendations.ScoredItem,
+	candidates []upcomingDiscoverCandidate,
+	watchedSet map[string]struct{},
+	lowRatings map[string]int,
+	watchlistMap map[string]bool,
+	favoritesMap map[string]bool,
+	now time.Time,
+) discoverRowModel {
+	if len(candidates) == 0 {
+		return row
+	}
+
+	rankedPremieres := rankUpcomingCandidates(
+		candidates,
+		rankMap,
+		watchedSet,
+		lowRatings,
+		watchlistMap,
+		favoritesMap,
+		now,
+	)
+	if len(rankedPremieres) == 0 {
+		return row
+	}
+
+	combined := buildCombinedForYouItems(row.Items, rankMap)
+	for _, candidate := range rankedPremieres {
+		scoredItem, ok := firstSeenItems[candidate.DisplayID]
+		if !ok {
+			scoredItem = recommendations.ScoredItem{MediaItemID: candidate.DisplayID}
+		}
+
+		if existing, ok := combined[candidate.DisplayID]; ok {
+			existing.Item = mergeScoredItem(scoredItem, existing.Item)
+			existing.BaseIndex = candidate.BaseIndex
+			existing.EffectiveIndex = candidate.EffectiveIndex
+			existing.HasUpcoming = true
+			existing.UpcomingEvent = &candidate.Event
+			existing.AirDateTime = candidate.AirDateTime
+			continue
+		}
+
+		combined[candidate.DisplayID] = &combinedForYouItem{
+			Item:           scoredItem,
+			BaseIndex:      candidate.BaseIndex,
+			EffectiveIndex: candidate.EffectiveIndex,
+			HasUpcoming:    true,
+			UpcomingEvent:  &candidate.Event,
+			AirDateTime:    candidate.AirDateTime,
+		}
+	}
+
+	sorted := sortCombinedForYouItems(combined)
+	if len(sorted) > discoverForYouMaxItems {
+		sorted = sorted[:discoverForYouMaxItems]
+	}
+
+	row.Items = make([]recommendations.ScoredItem, 0, len(sorted))
+	row.UpcomingEvents = make(map[string]upcomingEventResponse)
+	for _, item := range sorted {
+		row.Items = append(row.Items, item.Item)
+		if item.HasUpcoming && item.UpcomingEvent != nil {
+			row.UpcomingEvents[item.Item.MediaItemID] = *item.UpcomingEvent
+		}
+	}
+	if len(row.UpcomingEvents) == 0 {
+		row.UpcomingEvents = nil
+	}
+
+	return row
+}
+
+func categorizeUpcomingCandidates(
+	events []catalog.CalendarEvent,
+) []upcomingDiscoverCandidate {
+	premieres := make(map[string]upcomingDiscoverCandidate)
+
+	for _, event := range events {
+		candidate, ok := buildUpcomingCandidate(event)
+		if !ok {
+			continue
+		}
+		if isUpcomingPremiere(event, candidate.Event.Badges) {
+			insertUpcomingCandidate(premieres, candidate)
+		}
+	}
+
+	return upcomingCandidatesFromMap(premieres)
+}
+
+func buildUpcomingCandidate(event catalog.CalendarEvent) (upcomingDiscoverCandidate, bool) {
+	displayID := event.ContentID
+	if event.Type != "movie" {
+		if event.SeriesID == nil || *event.SeriesID == "" {
+			return upcomingDiscoverCandidate{}, false
+		}
+		displayID = *event.SeriesID
+	}
+
+	return upcomingDiscoverCandidate{
+		DisplayID:   displayID,
+		AirDateTime: calendarEventAirDateTime(event),
+		Event: upcomingEventResponse{
+			Type:          event.Type,
+			AirDate:       event.AirDate.Format("2006-01-02"),
+			AirTime:       event.AirTime,
+			EpisodeTitle:  event.EpisodeTitle,
+			SeasonNumber:  event.SeasonNumber,
+			EpisodeNumber: event.EpisodeNumber,
+			Badges:        buildBadges(event),
+		},
+	}, true
+}
+
+func insertUpcomingCandidate(
+	target map[string]upcomingDiscoverCandidate,
+	candidate upcomingDiscoverCandidate,
+) {
+	existing, ok := target[candidate.DisplayID]
+	if !ok || candidate.AirDateTime.Before(existing.AirDateTime) {
+		target[candidate.DisplayID] = candidate
+	}
+}
+
+func upcomingCandidatesFromMap(
+	items map[string]upcomingDiscoverCandidate,
+) []upcomingDiscoverCandidate {
+	if len(items) == 0 {
+		return nil
+	}
+
+	candidates := make([]upcomingDiscoverCandidate, 0, len(items))
+	for _, candidate := range items {
+		candidates = append(candidates, candidate)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if !candidates[i].AirDateTime.Equal(candidates[j].AirDateTime) {
+			return candidates[i].AirDateTime.Before(candidates[j].AirDateTime)
+		}
+		return candidates[i].DisplayID < candidates[j].DisplayID
+	})
+	return candidates
+}
+
+func rankUpcomingCandidates(
+	candidates []upcomingDiscoverCandidate,
+	rankMap map[string]int,
+	watchedSet map[string]struct{},
+	lowRatings map[string]int,
+	watchlistMap map[string]bool,
+	favoritesMap map[string]bool,
+	now time.Time,
+) []upcomingDiscoverCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	ranked := make([]upcomingDiscoverCandidate, 0, len(candidates))
+	savedOnly := make([]upcomingDiscoverCandidate, 0, len(candidates))
+
+	for _, candidate := range candidates {
+		if _, watched := watchedSet[candidate.DisplayID]; watched {
+			continue
+		}
+		if rating, rated := lowRatings[candidate.DisplayID]; rated && rating <= recommendations.DislikedScoreMax {
+			continue
+		}
+
+		candidate.InWatchlist = watchlistMap[candidate.DisplayID]
+		candidate.IsFavorite = favoritesMap[candidate.DisplayID]
+
+		if baseIndex, ok := rankMap[candidate.DisplayID]; ok {
+			candidate.BaseIndex = baseIndex
+			ranked = append(ranked, candidate)
+			continue
+		}
+		if candidate.InWatchlist || candidate.IsFavorite {
+			savedOnly = append(savedOnly, candidate)
+		}
+	}
+
+	sort.SliceStable(savedOnly, func(i, j int) bool {
+		if !savedOnly[i].AirDateTime.Equal(savedOnly[j].AirDateTime) {
+			return savedOnly[i].AirDateTime.Before(savedOnly[j].AirDateTime)
+		}
+		return savedOnly[i].DisplayID < savedOnly[j].DisplayID
+	})
+	for i := range savedOnly {
+		savedOnly[i].BaseIndex = len(rankMap) + i
+		ranked = append(ranked, savedOnly[i])
+	}
+
+	for i := range ranked {
+		ranked[i].EffectiveIndex = effectiveUpcomingIndex(
+			ranked[i].BaseIndex,
+			ranked[i].InWatchlist,
+			ranked[i].IsFavorite,
+			ranked[i].AirDateTime,
+			now,
+		)
+	}
+
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].EffectiveIndex != ranked[j].EffectiveIndex {
+			return ranked[i].EffectiveIndex < ranked[j].EffectiveIndex
+		}
+		if !ranked[i].AirDateTime.Equal(ranked[j].AirDateTime) {
+			return ranked[i].AirDateTime.Before(ranked[j].AirDateTime)
+		}
+		if ranked[i].BaseIndex != ranked[j].BaseIndex {
+			return ranked[i].BaseIndex < ranked[j].BaseIndex
+		}
+		return ranked[i].DisplayID < ranked[j].DisplayID
+	})
+
+	return ranked
+}
+
+func buildDiscoverRankingData(rows []recommendations.ForYouRow) (map[string]int, map[string]recommendations.ScoredItem) {
+	rankMap := make(map[string]int)
+	firstSeenItems := make(map[string]recommendations.ScoredItem)
+	nextIndex := 0
+	for _, row := range rows {
+		for _, item := range row.Items {
+			if _, ok := rankMap[item.MediaItemID]; ok {
+				continue
+			}
+			rankMap[item.MediaItemID] = nextIndex
+			firstSeenItems[item.MediaItemID] = item
+			nextIndex++
+		}
+	}
+	return rankMap, firstSeenItems
+}
+
+func effectiveUpcomingIndex(
+	baseIndex int,
+	inWatchlist bool,
+	isFavorite bool,
+	airDateTime time.Time,
+	now time.Time,
+) int {
+	effectiveIndex := baseIndex
+	if inWatchlist {
+		effectiveIndex -= 6
+	}
+	if isFavorite {
+		effectiveIndex -= 3
+	}
+
+	timeUntilAiring := airDateTime.Sub(now)
+	if timeUntilAiring <= 48*time.Hour {
+		effectiveIndex -= 2
+	} else if timeUntilAiring <= 7*24*time.Hour {
+		effectiveIndex -= 1
+	}
+
+	return effectiveIndex
+}
+
+func collectUpcomingDisplayIDsFromCandidates(candidates []upcomingDiscoverCandidate) []string {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	displayIDs := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if _, ok := seen[candidate.DisplayID]; ok {
+			continue
+		}
+		seen[candidate.DisplayID] = struct{}{}
+		displayIDs = append(displayIDs, candidate.DisplayID)
+	}
+
+	return displayIDs
+}
+
+func isUpcomingPremiere(event catalog.CalendarEvent, badges []string) bool {
+	if event.Type == "movie" {
+		return true
+	}
+	return hasUpcomingBadge(badges, "series_premiere") || hasUpcomingBadge(badges, "season_premiere")
+}
+
+func indexOfDiscoverForYouRow(rows []discoverRowModel) int {
+	for i := range rows {
+		if rows[i].Label == discoverForYouLabel {
+			return i
+		}
+	}
+	return -1
+}
+
+func buildCombinedForYouItems(
+	items []recommendations.ScoredItem,
+	rankMap map[string]int,
+) map[string]*combinedForYouItem {
+	combined := make(map[string]*combinedForYouItem, len(items))
+	nextIndex := len(rankMap)
+	for _, item := range items {
+		baseIndex, ok := rankMap[item.MediaItemID]
+		if !ok {
+			baseIndex = nextIndex
+			nextIndex++
+		}
+		combined[item.MediaItemID] = &combinedForYouItem{
+			Item:           item,
+			BaseIndex:      baseIndex,
+			EffectiveIndex: baseIndex,
+		}
+	}
+	return combined
+}
+
+func mergeScoredItem(
+	primary recommendations.ScoredItem,
+	fallback recommendations.ScoredItem,
+) recommendations.ScoredItem {
+	if primary.Score == 0 {
+		primary.Score = fallback.Score
+	}
+	if primary.Reason == "" {
+		primary.Reason = fallback.Reason
+	}
+	if primary.ReasonDetail == "" {
+		primary.ReasonDetail = fallback.ReasonDetail
+	}
+	return primary
+}
+
+func sortCombinedForYouItems(combined map[string]*combinedForYouItem) []combinedForYouItem {
+	items := make([]combinedForYouItem, 0, len(combined))
+	for _, item := range combined {
+		items = append(items, *item)
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].EffectiveIndex != items[j].EffectiveIndex {
+			return items[i].EffectiveIndex < items[j].EffectiveIndex
+		}
+		if items[i].HasUpcoming != items[j].HasUpcoming {
+			return items[i].HasUpcoming
+		}
+		if items[i].HasUpcoming && items[j].HasUpcoming && !items[i].AirDateTime.Equal(items[j].AirDateTime) {
+			return items[i].AirDateTime.Before(items[j].AirDateTime)
+		}
+		if items[i].BaseIndex != items[j].BaseIndex {
+			return items[i].BaseIndex < items[j].BaseIndex
+		}
+		return items[i].Item.MediaItemID < items[j].Item.MediaItemID
+	})
+
+	return items
+}
+
+func hasUpcomingBadge(badges []string, target string) bool {
+	for _, badge := range badges {
+		if badge == target {
+			return true
+		}
+	}
+	return false
+}
+
+func calendarEventAirDateTime(event catalog.CalendarEvent) time.Time {
+	base := discoverUTCDate(event.AirDate.UTC())
+	if event.AirTime == nil || *event.AirTime == "" {
+		return base
+	}
+
+	layouts := []string{"15:04:05", "15:04"}
+	for _, layout := range layouts {
+		parsed, err := time.Parse(layout, *event.AirTime)
+		if err == nil {
+			return time.Date(
+				base.Year(),
+				base.Month(),
+				base.Day(),
+				parsed.Hour(),
+				parsed.Minute(),
+				parsed.Second(),
+				0,
+				time.UTC,
+			)
+		}
+	}
+
+	return base
+}
+
+func discoverUTCDate(t time.Time) time.Time {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+}

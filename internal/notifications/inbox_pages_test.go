@@ -1,0 +1,137 @@
+package notifications
+
+import (
+	"context"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func inboxPageDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	p := schemaDB(t, "notification_inbox_")
+	if _, err := p.Exec(t.Context(), `CREATE TABLE notification_deliveries (LIKE public.notification_deliveries INCLUDING ALL); CREATE TABLE notification_preferences (LIKE public.notification_preferences INCLUDING ALL)`); err != nil {
+		t.Fatal(err)
+	}
+	// LIKE does not copy triggers. Apply the actual migration in this schema so
+	// concurrency tests exercise the production ordering boundary.
+	migration, err := os.ReadFile("../../migrations/sql/20260906014006_serialize_notification_inbox_order.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	up, _, _ := strings.Cut(string(migration), "-- +goose Down")
+	tx, err := p.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(t.Context())) }()
+	if _, err := tx.Exec(t.Context(), up); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// schemaDB connects to the test database with a fresh schema, dropped after
+// the test, first on the search path: tables a test creates there shadow
+// public's, and the rest of the schema stays visible.
+func schemaDB(t *testing.T, prefix string) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	admin, err := pgxpool.New(t.Context(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := prefix + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quoted := pgx.Identifier{schema}.Sanitize()
+	if _, err = admin.Exec(t.Context(), "CREATE SCHEMA "+quoted); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(context.WithoutCancel(t.Context()), "DROP SCHEMA "+quoted+" CASCADE")
+		admin.Close()
+	})
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
+	cfg.MaxConns = 4
+	p, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	return p
+}
+func TestNotificationInboxCutoffReplayAndTies(t *testing.T) {
+	p := inboxPageDB(t)
+	r := NewDeliveryRepository(p)
+	ctx := t.Context()
+	profile := uuid.NewString()
+	other := uuid.NewString()
+	stamp := time.Now().UTC().Truncate(time.Microsecond)
+	insert := func(id, profile string, at time.Time) {
+		t.Helper()
+		_, err := p.Exec(ctx, `INSERT INTO notification_deliveries(id,user_id,profile_id,type,reason_flags,status,created_at) VALUES($1,1,$2,'request.approved','{}','pending',$3)`, id, profile, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	low := "00000000-0000-0000-0000-000000000001"
+	high := "00000000-0000-0000-0000-000000000002"
+	fresh := "00000000-0000-0000-0000-000000000003"
+	insert(low, profile, stamp)
+	insert(high, profile, stamp)
+	// Inserts receive distinct timestamps from the ordering trigger. Historical
+	// rows can share a timestamp, so set up that tie after insertion.
+	if _, err := p.Exec(ctx, `UPDATE notification_deliveries SET created_at=$1 WHERE id IN ($2,$3)`, stamp, low, high); err != nil {
+		t.Fatal(err)
+	}
+	insert(uuid.NewString(), other, stamp)
+	cutoff, err := r.InboxCutoff(ctx, 1, profile)
+	if err != nil || cutoff.ID != high {
+		t.Fatalf("%+v %v", cutoff, err)
+	}
+	first, more, err := r.ListInboxWindow(ctx, 1, profile, false, 1, nil, cutoff)
+	if err != nil || len(first) != 1 || !more || first[0].ID != high {
+		t.Fatalf("%+v %v %v", first, more, err)
+	}
+	insert(fresh, profile, stamp.Add(time.Microsecond))
+	second, more, err := r.ListInboxWindow(ctx, 1, profile, false, 1, &Cursor{CreatedAt: first[0].CreatedAt, ID: first[0].ID}, cutoff)
+	if err != nil || len(second) != 1 || more || second[0].ID != low {
+		t.Fatalf("%+v %v %v", second, more, err)
+	}
+	for n := range 2 {
+		changed, err := r.MarkReadThrough(ctx, 1, profile, cutoff)
+		if err != nil || changed != int64(2*(1-n)) {
+			t.Fatalf("changed=%d err=%v", changed, err)
+		}
+	}
+	for _, check := range []struct {
+		profile string
+		want    int
+	}{{profile, 1}, {other, 1}} {
+		count, err := r.UnreadCount(ctx, 1, check.profile)
+		if err != nil || count != check.want {
+			t.Fatalf("count=%d err=%v", count, err)
+		}
+	}
+	empty, err := r.InboxCutoff(ctx, 1, uuid.NewString())
+	if err != nil || empty.ID != "" {
+		t.Fatal(empty, err)
+	}
+	if changed, err := r.MarkReadThrough(ctx, 1, profile, empty); err != nil || changed != 0 {
+		t.Fatal(changed, err)
+	}
+}

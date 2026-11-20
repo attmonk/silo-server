@@ -1,0 +1,310 @@
+// @vitest-environment jsdom
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { v2, V2ProblemError } from "@/api/v2/request";
+import AdminApiKeys from "./AdminApiKeys";
+const state = vi.hoisted(() => ({
+  profile: "owner",
+  viewer: 2,
+  users: [{ id: 2, username: "Admin", is_owner: false }],
+  usersPending: false,
+  usersFailed: false,
+  copyTextToClipboard: vi.fn(),
+  toastSuccess: vi.fn(),
+}));
+vi.mock("@/lib/clipboard", () => ({ copyTextToClipboard: state.copyTextToClipboard }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: state.toastSuccess } }));
+vi.mock("@/api/v2/request", async (original) => ({
+  ...(await original<typeof import("@/api/v2/request")>()),
+  v2: vi.fn(),
+}));
+vi.mock("@/api/client", async (original) => ({
+  ...(await original<typeof import("@/api/client")>()),
+  captureProfileRequestContext: () => ({
+    accessToken: "test",
+    authContextVersion: 1,
+    serverOrigin: "",
+    profileId: state.profile,
+    profileToken: null,
+  }),
+  isCapturedProfileAuthorityActive: (c: { profileId: string }) => c.profileId === state.profile,
+}));
+vi.mock("@/hooks/useAuth", () => ({
+  useAuth: () => ({ user: { id: state.viewer }, profile: { id: state.profile } }),
+}));
+vi.mock("@/hooks/queries/admin/users", () => ({
+  useAdminUsers: () =>
+    state.usersPending
+      ? { data: undefined, isPending: true, isError: false }
+      : state.usersFailed
+        ? { data: undefined, isPending: false, isError: true }
+        : { data: state.users, isPending: false, isError: false },
+}));
+const row = {
+  id: "7",
+  user_id: "2",
+  label: "Automation",
+  key_prefix: "sa_12345678",
+  rate_tier: "standard",
+  scopes: [],
+  created_at: "2026-01-01T00:00:00.000Z",
+  username: "Admin",
+};
+function reply(options: unknown, body: unknown, headers: Record<string, string> = {}) {
+  (options as { onResponse?: (r: Response) => void }).onResponse?.(new Response(null, { headers }));
+  return Promise.resolve(body) as never;
+}
+function baseline(op: string, options: unknown) {
+  if (op.endsWith("/capabilities"))
+    return reply(options, {
+      available: true,
+      guarded_configuration: true,
+      scopes: [
+        { name: "admin:monitor:read", description: "Monitor the server read-only." },
+        { name: "libraries:read", description: "Discover libraries." },
+      ],
+      rate_tiers: ["standard", "elevated"],
+    });
+  if (op === "GET /api/v2/admin/api-keys")
+    return reply(options, { items: [row], page: { has_more: false } });
+  if (op === "GET /api/v2/admin/api-keys/{id}") return reply(options, row, { ETag: '"initial"' });
+  throw new Error(op);
+}
+function mount() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: 3 } },
+  });
+  const tree = () => (
+    <QueryClientProvider client={client}>
+      <AdminApiKeys />
+    </QueryClientProvider>
+  );
+  const view = render(tree());
+  return { client, ...view, refresh: () => view.rerender(tree()) };
+}
+class MockResizeObserver implements ResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+beforeEach(() => {
+  HTMLElement.prototype.scrollIntoView = vi.fn();
+  vi.stubGlobal("ResizeObserver", MockResizeObserver);
+  state.profile = "owner";
+  state.viewer = 2;
+  state.users = [{ id: 2, username: "Admin", is_owner: false }];
+  state.usersPending = false;
+  state.usersFailed = false;
+  vi.mocked(v2).mockImplementation(baseline);
+  state.copyTextToClipboard.mockReset().mockResolvedValue(undefined);
+});
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.clearAllMocks();
+});
+it("clears creation-only secret and mutation data on close", async () => {
+  vi.mocked(v2).mockImplementation((op, options) =>
+    op === "POST /api/v2/admin/api-keys"
+      ? reply(
+          options,
+          { ...row, key: "creation-only-secret" },
+          { Location: "/api/v2/admin/api-keys/7" },
+        )
+      : baseline(op, options),
+  );
+  const { client } = mount();
+  await screen.findByText("Automation");
+  expect(screen.getByText("sa_12345678…")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Copy API key/ })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Create Key" }));
+  fireEvent.change(screen.getByLabelText("Label"), { target: { value: "New" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create" }));
+  await screen.findByText("creation-only-secret");
+  await waitFor(() =>
+    expect(
+      JSON.stringify(
+        client
+          .getMutationCache()
+          .getAll()
+          .map((m) => m.state.data),
+      ),
+    ).not.toContain("creation-only-secret"),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  expect(screen.queryByText("creation-only-secret")).toBeNull();
+  expect(
+    JSON.stringify(
+      client
+        .getQueryCache()
+        .getAll()
+        .map((q) => q.state.data),
+    ),
+  ).not.toContain("creation-only-secret");
+});
+it("preserves tier draft on412 and changes tag only after explicit reload", async () => {
+  let reads = 0;
+  vi.mocked(v2).mockImplementation((op, options) => {
+    if (op === "GET /api/v2/admin/api-keys/{id}")
+      return reply(options, row, { ETag: ++reads === 1 ? '"initial"' : '"reloaded"' });
+    if (op === "PUT /api/v2/admin/api-keys/{id}/tier")
+      return Promise.reject(
+        new V2ProblemError(
+          "update",
+          {
+            type: "https://example.invalid/precondition_failed",
+            title: "Changed",
+            status: 412,
+            detail: "Changed",
+            instance: "test",
+          },
+          null,
+          '"conflict"',
+        ),
+      );
+    return baseline(op, options);
+  });
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Edit rate limit for Automation" }));
+  await screen.findByRole("dialog");
+  fireEvent.click(screen.getByRole("combobox", { name: "New rate limit" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Elevated" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save rate limit" }));
+  await screen.findByRole("alert");
+  expect(screen.getByRole("combobox", { name: "New rate limit" }).textContent).toContain(
+    "Elevated",
+  );
+  const writes = () =>
+    vi.mocked(v2).mock.calls.filter(([op]) => op === "PUT /api/v2/admin/api-keys/{id}/tier");
+  expect(writes()).toHaveLength(1);
+  expect(writes()[0]![1]).toMatchObject({
+    headers: { "If-Match": '"initial"' },
+    body: { rate_tier: "elevated" },
+    retryAuthentication: false,
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Reload current key" }));
+  await waitFor(() =>
+    expect(
+      (screen.getByRole("button", { name: "Save rate limit" }) as HTMLButtonElement).disabled,
+    ).toBe(false),
+  );
+  expect(screen.getByRole("combobox", { name: "New rate limit" }).textContent).toContain(
+    "Elevated",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Save rate limit" }));
+  await waitFor(() => expect(writes()).toHaveLength(2));
+  expect(writes()[1]![1]).toMatchObject({ headers: { "If-Match": '"reloaded"' } });
+});
+it("retains failed revocation and never replays it", async () => {
+  vi.mocked(v2).mockImplementation((op, options) =>
+    op.startsWith("DELETE") ? Promise.reject(new Error("Connection lost")) : baseline(op, options),
+  );
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Revoke API key Automation" }));
+  const dialog = await screen.findByRole("dialog");
+  fireEvent.click(within(dialog).getByRole("button", { name: "Revoke" }));
+  await screen.findByRole("alert");
+  expect(screen.getByText("Automation", { selector: "td" })).toBeTruthy();
+  expect(vi.mocked(v2).mock.calls.filter(([op]) => op.startsWith("DELETE"))).toHaveLength(1);
+});
+it("discards the editor on profile change", async () => {
+  const view = mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Edit rate limit for Automation" }));
+  await screen.findByRole("dialog");
+  state.profile = "other";
+  view.refresh();
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+it("offers the Owner's keys only to the Owner", async () => {
+  state.users = [
+    { id: 2, username: "Admin", is_owner: true },
+    { id: 3, username: "Other", is_owner: false },
+  ];
+  state.viewer = 3;
+  mount();
+  await screen.findByText("Automation");
+  expect(screen.queryByRole("button", { name: "Edit rate limit for Automation" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Revoke API key Automation" })).toBeNull();
+  cleanup();
+
+  state.viewer = 2;
+  mount();
+  await screen.findByText("Automation");
+  expect(screen.getByRole("button", { name: "Edit rate limit for Automation" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Revoke API key Automation" })).toBeEnabled();
+});
+
+it.each([
+  ["loads", "usersPending"],
+  ["fails to load", "usersFailed"],
+] as const)("offers no key actions while the account list %s", async (_, flag) => {
+  state[flag] = true;
+  mount();
+  await screen.findByText("Automation");
+  expect(screen.queryByRole("button", { name: "Edit rate limit for Automation" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Revoke API key Automation" })).toBeNull();
+});
+
+const CREATED_KEY = "silo_created_key_9876543210";
+
+async function createKey() {
+  vi.mocked(v2).mockImplementation((op, options) =>
+    op === "POST /api/v2/admin/api-keys"
+      ? reply(options, { ...row, key: CREATED_KEY }, { Location: "/api/v2/admin/api-keys/7" })
+      : baseline(op, options),
+  );
+  mount();
+  await userEvent.click(await screen.findByRole("button", { name: /Create Key/ }));
+  await userEvent.type(screen.getByLabelText("Label"), "Deploy bot");
+  await userEvent.click(screen.getByRole("button", { name: "Create" }));
+  await screen.findByText(CREATED_KEY);
+}
+
+it("closes the create dialog once the new key is copied", async () => {
+  await createKey();
+
+  await userEvent.click(screen.getByRole("button", { name: /Copy & Close/ }));
+
+  await waitFor(() => expect(state.copyTextToClipboard).toHaveBeenCalledWith(CREATED_KEY));
+  expect(state.toastSuccess).toHaveBeenCalledWith("Copied to clipboard");
+  await waitFor(() => expect(screen.queryByText(CREATED_KEY)).not.toBeInTheDocument());
+});
+
+it("keeps the new key on screen when the copy fails", async () => {
+  // The key is only ever shown once, so a failed copy must not close the dialog.
+  state.copyTextToClipboard.mockRejectedValue(new Error("clipboard blocked"));
+  await createKey();
+
+  await userEvent.click(screen.getByRole("button", { name: /Copy & Close/ }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Couldn't copy — select the key and copy it manually",
+  );
+  expect(state.toastSuccess).not.toHaveBeenCalled();
+  expect(screen.getByText(CREATED_KEY)).toBeInTheDocument();
+});
+
+it("sends only the chosen scopes and never an empty scoped key", async () => {
+  vi.mocked(v2).mockImplementation((op, options) =>
+    op === "POST /api/v2/admin/api-keys"
+      ? reply(options, { ...row, key: CREATED_KEY }, { Location: "/api/v2/admin/api-keys/7" })
+      : baseline(op, options),
+  );
+  mount();
+  await userEvent.click(await screen.findByRole("button", { name: /Create Key/ }));
+  await userEvent.type(screen.getByLabelText("Label"), "Monitor");
+  await userEvent.click(screen.getByRole("radio", { name: /Selected scopes/ }));
+  // An empty scope list is a full-access key on the server.
+  expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
+  await userEvent.click(screen.getByRole("checkbox", { name: "admin:monitor:read" }));
+  await userEvent.click(screen.getByRole("button", { name: "Create" }));
+  await screen.findByText(CREATED_KEY);
+  const posts = vi.mocked(v2).mock.calls.filter(([op]) => op === "POST /api/v2/admin/api-keys");
+  expect(posts).toHaveLength(1);
+  expect(posts[0]![1]).toMatchObject({
+    body: { label: "Monitor", scopes: ["admin:monitor:read"] },
+  });
+});

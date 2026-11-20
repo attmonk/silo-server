@@ -1,0 +1,79 @@
+package apiv2
+
+import (
+	"context"
+	"errors"
+	"net/http"
+
+	"github.com/Silo-Server/silo-server/internal/notifications"
+)
+
+const (
+	testAdminApplePushOperation   = "testAdminApplePushNotification"
+	testAdminAndroidPushOperation = "testAdminAndroidPushNotification"
+)
+
+// AdminNotificationPushService is the existing outbox-backed test dispatch.
+// Each call creates a new test attempt; an HTTP retry is a new send request.
+type AdminNotificationPushService interface {
+	SendApplePushTest(ctx context.Context, userID int, profileID, serverDeviceID string) (*notifications.ApplePushTestResult, error)
+	SendAndroidPushTest(ctx context.Context, userID int, profileID, serverDeviceID string) (*notifications.ApplePushTestResult, error)
+}
+
+type AdminNotificationPushTestInput struct {
+	Body struct {
+		ProfileID      ID `json:"profile_id" minLength:"1" doc:"A profile on the authenticated account. A profile or device on another account answers 404, as a device that does not exist does."`
+		ServerDeviceID ID `json:"server_device_id,omitempty"`
+	}
+}
+
+type AdminNotificationPushTestResult struct {
+	AttemptID      ID     `json:"attempt_id"`
+	PushDeviceID   ID     `json:"push_device_id"`
+	ServerDeviceID ID     `json:"server_device_id"`
+	DeliveryID     ID     `json:"delivery_id,omitempty" doc:"The target profile's newest notification, which the test push carried so the device shows its real text; absent when the profile has no notification and the device can show only generic text."`
+	Outcome        string `json:"outcome"`
+	RelayRequestID string `json:"relay_request_id,omitempty"`
+	UpstreamStatus *int   `json:"upstream_status,omitempty"`
+	UpstreamReason string `json:"upstream_reason,omitempty"`
+	FailureMessage string `json:"failure_message,omitempty"`
+}
+type AdminNotificationPushTestOutput struct {
+	Body AdminNotificationPushTestResult
+}
+
+func registerAdminNotificationPush(reg *Registry) {
+	for _, platform := range []struct {
+		path, operation string
+		apple           bool
+	}{
+		{"apple", testAdminApplePushOperation, true},
+		{"fcm", testAdminAndroidPushOperation, false},
+	} {
+		op := Operation{Operation: humaOp(http.MethodPost, Prefix+"/admin/notifications/push/"+platform.path+"/test", platform.operation, "admin", "Dispatch one test push carrying the target profile's newest notification and report its current delivery outcome."), Class: ClassActingAdmin, DemoRestricted: true, ServiceBacked: true, RetrySafety: RetrySafetyNonRetryable}
+		Register(reg, op, func(ctx context.Context, in *AdminNotificationPushTestInput) (*AdminNotificationPushTestOutput, error) {
+			svc := reg.deps.AdminNotificationPush
+			if svc == nil {
+				return nil, unavailable("push delivery")
+			}
+			send := svc.SendAndroidPushTest
+			if platform.apple {
+				send = svc.SendApplePushTest
+			}
+			view, err := send(ctx, claimsFrom(ctx).UserID, string(in.Body.ProfileID), string(in.Body.ServerDeviceID))
+			if err != nil {
+				switch {
+				case errors.Is(err, notifications.ErrPushDeliveryInvalid):
+					return nil, NewProblem(TypeValidationFailed, "Invalid push test target.")
+				case errors.Is(err, notifications.ErrPushDeliveryNotFound):
+					return nil, NewProblem(TypeNotFound, "Push device not found.")
+				case errors.Is(err, notifications.ErrPushDeliveryUnavailable):
+					return nil, unavailable("push delivery")
+				default:
+					return nil, serviceProblem(err)
+				}
+			}
+			return &AdminNotificationPushTestOutput{Body: AdminNotificationPushTestResult{AttemptID: ID(view.AttemptID), PushDeviceID: ID(view.PushDeviceID), ServerDeviceID: ID(view.ServerDeviceID), DeliveryID: ID(view.DeliveryID), Outcome: view.Outcome, RelayRequestID: view.RelayRequestID, UpstreamStatus: view.UpstreamStatus, UpstreamReason: view.UpstreamReason, FailureMessage: view.FailureMessage}}, nil
+		})
+	}
+}

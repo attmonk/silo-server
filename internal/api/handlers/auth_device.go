@@ -1,0 +1,270 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"time"
+
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/ratelimit"
+)
+
+// DeviceLoginPollView is the poll outcome the v1 and v2 handlers both render.
+// Tokens is set only once the request was approved and this poll consumed it.
+type DeviceLoginPollView struct {
+	Status    string
+	PollAfter int
+	// Opened: an approver has looked the pending request up (v2 only).
+	Opened bool
+	// ExpiresAt: the pending request's current expiry (v2 only).
+	ExpiresAt        time.Time
+	Tokens           *TokenPairView
+	ProfileID        string
+	ProfileToken     string
+	Temporary        bool
+	SessionExpiresAt time.Time
+}
+
+// TokenPairView is the credential response shape login, setup, signup and
+// device poll share: the token pair plus the account it authenticates.
+type TokenPairView struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresIn    int
+	User         UserView
+}
+
+// DeviceLoginConfigured reports whether device pairing is wired; the v2
+// capability document reports not_configured otherwise.
+func (h *AuthHandler) DeviceLoginConfigured() bool { return h.device != nil }
+
+// StartDeviceLogin opens a pairing request. v1 POST /auth/device/start and
+// v2 startDeviceLogin both call it; a failure is an *APIError.
+func (h *AuthHandler) StartDeviceLogin(ctx context.Context, input auth.DeviceLoginStartInput) (*auth.DeviceLoginStartResult, error) {
+	if h.device == nil {
+		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Device login is not configured")
+	}
+	result, err := h.device.Start(ctx, input)
+	if err != nil {
+		if errors.Is(err, auth.ErrDeviceLoginBadPurpose) {
+			return nil, fieldError("client_purpose", "Invalid device login purpose")
+		}
+		if errors.Is(err, auth.ErrDeviceLoginBadBinding) {
+			return nil, fieldError("binding", "binding must be 43 characters of unpadded base64url")
+		}
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to start device login")
+	}
+	return result, nil
+}
+
+// LookupDeviceLogin describes a pairing request to the approving browser.
+// v1 GET /auth/device and v2 getDeviceLogin both call it.
+func (h *AuthHandler) LookupDeviceLogin(ctx context.Context, input auth.DeviceLoginLookupInput) (*auth.DeviceLoginInfo, error) {
+	if h.device == nil {
+		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Device login is not configured")
+	}
+	info, err := h.device.Lookup(ctx, input)
+	if err != nil {
+		if errors.Is(err, auth.ErrDeviceLoginNotFound) {
+			return nil, apiError(http.StatusNotFound, "not_found", "Device login request not found")
+		}
+		var attempts *auth.QuickConnectAttemptsError
+		if errors.As(err, &attempts) {
+			return nil, quickConnectAttemptsError(attempts)
+		}
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to load device login")
+	}
+	return info, nil
+}
+
+// DeviceBindingMismatchCode is the error code of a poll of a bound request
+// that lacks its binding secret; v2 answers it as its own problem type.
+const DeviceBindingMismatchCode = "device_binding_mismatch"
+
+// PollDeviceLogin advances the pairing state machine for the waiting device.
+// v1 POST /auth/device/poll and v2 pollDeviceLogin both call it; only v2
+// passes a binding secret.
+func (h *AuthHandler) PollDeviceLogin(ctx context.Context, deviceCode, bindingSecret string) (*DeviceLoginPollView, error) {
+	if h.device == nil {
+		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Device login is not configured")
+	}
+	result, err := h.device.Poll(ctx, deviceCode, bindingSecret)
+	if err != nil {
+		if errors.Is(err, auth.ErrDeviceLoginNotFound) {
+			return nil, apiError(http.StatusNotFound, "not_found", "Device login request not found")
+		}
+		if errors.Is(err, auth.ErrDeviceLoginBindingMismatch) {
+			return nil, apiError(http.StatusForbidden, DeviceBindingMismatchCode, "The binding secret does not match the binding this request was started with")
+		}
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to poll device login")
+	}
+	view := &DeviceLoginPollView{Status: result.Status, PollAfter: result.PollAfter, Opened: result.Opened, ExpiresAt: result.ExpiresAt}
+	if result.TokenPair != nil && result.User != nil {
+		view.Tokens = &TokenPairView{
+			AccessToken:  result.TokenPair.AccessToken,
+			RefreshToken: result.TokenPair.RefreshToken,
+			ExpiresIn:    result.TokenPair.ExpiresIn,
+			User:         buildUserResponse(result.User, effectiveAccountPolicy(ctx, result.User, h.accessGroups), nil, nil),
+		}
+		if result.Temporary {
+			view.ProfileID = result.ProfileID
+			view.ProfileToken = result.ProfileToken
+			view.Temporary = true
+			view.SessionExpiresAt = result.SessionExpiresAt
+		}
+	}
+	return view, nil
+}
+
+// CancelDeviceLogin withdraws the device's own request by its device code
+// and returns the resulting status. Only v2 cancelDeviceLogin calls it; the
+// frozen v1 surface has no cancel route.
+func (h *AuthHandler) CancelDeviceLogin(ctx context.Context, deviceCode string) (string, error) {
+	if h.device == nil {
+		return "", apiError(http.StatusServiceUnavailable, "unavailable", "Device login is not configured")
+	}
+	status, err := h.device.Cancel(ctx, deviceCode)
+	if err != nil {
+		if errors.Is(err, auth.ErrDeviceLoginNotFound) {
+			return "", apiError(http.StatusNotFound, "not_found", "Device login request not found")
+		}
+		return "", apiError(http.StatusInternalServerError, "internal_error", "Failed to cancel device login")
+	}
+	return status, nil
+}
+
+// DeviceLoginDecision is the shared outcome of approve, approve-handoff and
+// deny: the state the request is now in.
+type DeviceLoginDecision struct {
+	Status string
+}
+
+// deviceDecisionSessionError refuses a device decision that does not come
+// from a login session. An approval gives the device a login session of
+// the account, so an API key must not mint one (it would turn a key into a
+// refreshable session), and neither may an impersonation session (the
+// device session would carry no trace of the impersonator). Deny follows
+// the same rule so that only the people who can approve decide. The frozen
+// v1 routes answer with v1's existing 403 forbidden code.
+func deviceDecisionSessionError(ctx context.Context) *APIError {
+	claims := apimw.GetClaims(ctx)
+	if claims != nil && !claims.IsOwnLoginSession() {
+		return apiError(http.StatusForbidden, "forbidden", "Approving or denying a device needs a signed-in session; API keys and impersonation sessions cannot")
+	}
+	return nil
+}
+
+// ApproveDeviceLogin approves a login-purpose pairing request as the caller's
+// account. v1 POST /auth/device/approve and v2 approveDeviceLogin both call it.
+func (h *AuthHandler) ApproveDeviceLogin(ctx context.Context, input auth.DeviceLoginLookupInput, userID int) (DeviceLoginDecision, error) {
+	if h.device == nil {
+		return DeviceLoginDecision{}, apiError(http.StatusServiceUnavailable, "unavailable", "Device login is not configured")
+	}
+	if userID == 0 {
+		return DeviceLoginDecision{}, apiError(http.StatusUnauthorized, "unauthorized", "Authentication required")
+	}
+	if err := deviceDecisionSessionError(ctx); err != nil {
+		return DeviceLoginDecision{}, err
+	}
+	// The approving session is passed on so that a device approved from a
+	// session opened through an external provider inherits its identity.
+	if claims := apimw.GetClaims(ctx); claims != nil {
+		ctx = auth.WithClaims(ctx, claims)
+	}
+	if err := h.device.Approve(ctx, input, userID); err != nil {
+		return DeviceLoginDecision{}, deviceDecisionError(err)
+	}
+	return DeviceLoginDecision{Status: auth.DeviceLoginStatusApproved}, nil
+}
+
+// ApproveDeviceHandoff approves a pairing request for the caller's verified
+// profile: a remote-playback request, or on v2 a Jellyfin Quick Connect
+// request (v1 never sets the lookup's AccountID, so it cannot find one). v1
+// POST /auth/device/approve-handoff and v2 approveDeviceHandoff both call it.
+func (h *AuthHandler) ApproveDeviceHandoff(ctx context.Context, input auth.DeviceLoginLookupInput, userID int, profileID string) (DeviceLoginDecision, error) {
+	if h.device == nil {
+		return DeviceLoginDecision{}, apiError(http.StatusServiceUnavailable, "unavailable", "Device login is not configured")
+	}
+	if userID == 0 || profileID == "" {
+		return DeviceLoginDecision{}, apiError(http.StatusForbidden, "profile_required", "An active verified profile is required")
+	}
+	if err := deviceDecisionSessionError(ctx); err != nil {
+		return DeviceLoginDecision{}, err
+	}
+	// As for ApproveDeviceLogin: the device session inherits the approving
+	// session's provider chain.
+	if claims := apimw.GetClaims(ctx); claims != nil {
+		ctx = auth.WithClaims(ctx, claims)
+	}
+	if err := h.device.ApproveForProfile(ctx, input, userID, profileID); err != nil {
+		return DeviceLoginDecision{}, deviceDecisionError(err)
+	}
+	return DeviceLoginDecision{Status: auth.DeviceLoginStatusApproved}, nil
+}
+
+// DenyDeviceLogin refuses a pairing request. v1 POST /auth/device/deny and
+// v2 denyDeviceLogin both call it.
+func (h *AuthHandler) DenyDeviceLogin(ctx context.Context, input auth.DeviceLoginLookupInput, userID int) (DeviceLoginDecision, error) {
+	if h.device == nil {
+		return DeviceLoginDecision{}, apiError(http.StatusServiceUnavailable, "unavailable", "Device login is not configured")
+	}
+	if userID == 0 {
+		return DeviceLoginDecision{}, apiError(http.StatusUnauthorized, "unauthorized", "Authentication required")
+	}
+	if err := deviceDecisionSessionError(ctx); err != nil {
+		return DeviceLoginDecision{}, err
+	}
+	if err := h.device.Deny(ctx, input, userID); err != nil {
+		return DeviceLoginDecision{}, deviceDecisionError(err)
+	}
+	return DeviceLoginDecision{Status: auth.DeviceLoginStatusDenied}, nil
+}
+
+// deviceDecisionError maps a device-login service failure onto the v1
+// status and code; the cause is kept so a caller can still branch on it.
+func deviceDecisionError(err error) *APIError {
+	var (
+		out      *APIError
+		attempts *auth.QuickConnectAttemptsError
+	)
+	switch {
+	case errors.As(err, &attempts):
+		out = quickConnectAttemptsError(attempts)
+	case errors.Is(err, auth.ErrDeviceLoginNotFound):
+		out = apiError(http.StatusNotFound, "not_found", "Device login request not found")
+	case errors.Is(err, auth.ErrDeviceLoginExpired):
+		out = apiError(http.StatusGone, "expired", "Device login request has expired")
+	case errors.Is(err, auth.ErrDeviceLoginConsumed):
+		out = apiError(http.StatusConflict, "consumed", "Device login request has already been used")
+	case errors.Is(err, auth.ErrDeviceLoginDenied):
+		out = apiError(http.StatusConflict, "denied", "Device login request has already been denied")
+	case errors.Is(err, auth.ErrDeviceLoginCanceled):
+		// v1 keeps its code set: a canceled request answers as denied.
+		out = apiError(http.StatusConflict, "denied", "Device login request was canceled on the device")
+	case errors.Is(err, auth.ErrUserDisabled):
+		out = apiError(http.StatusForbidden, "user_disabled", "User account is disabled")
+	case errors.Is(err, auth.ErrSessionRevoked):
+		out = apiError(http.StatusUnauthorized, "unauthorized", "Login session is no longer valid")
+	case errors.Is(err, auth.ErrDeviceLoginPurpose):
+		out = apiError(http.StatusConflict, "purpose_mismatch", "Device login purpose does not match this approval route")
+	case errors.Is(err, auth.ErrDeviceLoginConflict):
+		out = apiError(http.StatusConflict, "approval_conflict", "Device login request was approved by another identity")
+	case errors.Is(err, auth.ErrDeviceLoginNoProfile):
+		out = apiError(http.StatusNotFound, "profile_not_found", "Profile not found")
+	default:
+		out = apiError(http.StatusInternalServerError, "internal_error", "Device login request failed")
+	}
+	out.cause = err
+	return out
+}
+
+// quickConnectAttemptsError is the 429 a six-digit Quick Connect code
+// answers once the account has tried too many. Both listeners render
+// RetryAfter as the Retry-After header; only v2 can reach it.
+func quickConnectAttemptsError(err *auth.QuickConnectAttemptsError) *APIError {
+	e := apiError(http.StatusTooManyRequests, "rate_limited", "Too many Quick Connect codes tried. Try again later.")
+	e.RetryAfter = ratelimit.RetryAfterSeconds(err.RetryAfter)
+	return e
+}

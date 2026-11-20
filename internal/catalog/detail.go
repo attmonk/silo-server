@@ -1,0 +1,5544 @@
+package catalog
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"net/url"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/ctxerr"
+	"github.com/Silo-Server/silo-server/internal/fspath"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
+	"github.com/Silo-Server/silo-server/internal/lang"
+	"github.com/Silo-Server/silo-server/internal/locationpref"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/overlays"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	"github.com/Silo-Server/silo-server/internal/settingskeys"
+	"github.com/Silo-Server/silo-server/internal/settingsresolve"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// FileVersionFetcher retrieves media files linked to a content ID.
+type FileVersionFetcher interface {
+	GetByContentID(ctx context.Context, contentID string) ([]*models.MediaFile, error)
+	GetByEpisodeID(ctx context.Context, episodeID string) ([]*models.MediaFile, error)
+}
+
+// extraFileFetcher is the optional FileVersionFetcher extension used to
+// resolve files backing local extras (media_extras rows). The concrete
+// *scanner.FileRepository implements it; test fakes may omit it.
+type extraFileFetcher interface {
+	GetByExtraID(ctx context.Context, extraID string) ([]*models.MediaFile, error)
+}
+
+type batchDurationFetcher interface {
+	FirstDurationsByContentIDs(ctx context.Context, ids []string) (map[string]int, error)
+	FirstDurationsByEpisodeIDs(ctx context.Context, ids []string) (map[string]int, error)
+}
+
+// PlaybackProbeEnsurer repairs probe metadata for catalog responses. Neither
+// half of it runs the H.264 bitstream scan: no catalog surface may block on it.
+type PlaybackProbeEnsurer interface {
+	// EnsureProbeOnly does the probe repair alone. Browse surfaces use it — see
+	// prepareBrowseFiles.
+	EnsureProbeOnly(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+	// EnsureCopySafetyCached adds the copy-safety verdict when it is already
+	// known, and never execs ffmpeg. Watch surfaces use it — see
+	// preparePlaybackFiles.
+	EnsureCopySafetyCached(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+}
+
+// CopySafetyRacer resolves an unknown H.264 copy-safety verdict out of band.
+// The watch page asks for it and never waits: the verdict is not part of the
+// response, and any session that later ends up on a stream-copy route for the
+// file is switched off it by the playback-side notifier when the scan lands.
+//
+// It is a narrow injected interface so the catalog keeps no dependency on the
+// playback session machinery that implements it.
+type CopySafetyRacer interface {
+	RaceScan(fileID int)
+}
+
+type ChapterThumbnailQueuer interface {
+	QueueFileIDs(ctx context.Context, fileIDs []int)
+	QueuePriorityFileIDs(ctx context.Context, fileIDs []int)
+	QueuePriorityFileAtPosition(ctx context.Context, fileID int, targetSeconds float64)
+}
+
+// TrickplayAvailability reports the servable seek-bar previews of files.
+type TrickplayAvailability interface {
+	TrickplayGrids(ctx context.Context, fileIDs []int) (map[int]TrickplayGrid, error)
+}
+
+// TrickplayGrid is how a file's published seek-bar previews are laid out:
+// ThumbnailCount thumbnails of Width by Height pixels, one per IntervalMS of
+// media time, TileColumns by TileRows to a sheet. Bandwidth is Jellyfin's
+// bits-per-second estimate for fetching them.
+type TrickplayGrid struct {
+	Width, Height         int
+	TileColumns, TileRows int
+	ThumbnailCount        int
+	IntervalMS            int
+	Bandwidth             int
+}
+
+// ImageResolver resolves image paths (potentially plugin-prefixed) to usable URLs.
+type ImageResolver interface {
+	// ResolveImageURL resolves a single image path. Plugin-prefixed paths (e.g.,
+	// "metadb://images/abc/original.jpg") are resolved via the owning plugin's RPC.
+	// HTTP(S) URLs pass through unchanged. Empty paths return "".
+	//
+	// The variant parameter is a semantic size hint. The vocabulary is "card",
+	// "featured", "large", "full", and "original", and it is an open string:
+	// per the plugin SDK contract a resolver that does not recognize a name
+	// falls back to a usable image rather than failing, so names may be added
+	// here without gating on a plugin capability.
+	ResolveImageURL(ctx context.Context, path string, variant string) string
+
+	// ResolveImageURLs resolves multiple image paths in a single call. Returns a
+	// map from input path to resolved URL. The variant parameter applies to all paths.
+	ResolveImageURLs(ctx context.Context, paths []string, variant string) map[string]string
+}
+
+// ResolvedImageURL carries a resolved URL with optional validity metadata.
+// A nil ExpiresAt means the URL has no known expiry and must not be stored in
+// presign/plugin resolver caches that assume bounded validity.
+type ResolvedImageURL struct {
+	URL       string
+	ExpiresAt *time.Time
+}
+
+type expiringImageResolver interface {
+	ResolveImageURLWithExpiry(ctx context.Context, path string, variant string) ResolvedImageURL
+	ResolveImageURLsWithExpiry(ctx context.Context, paths []string, variant string) map[string]ResolvedImageURL
+}
+
+type WorkSummaryProvider interface {
+	GetSummaryForContentID(ctx context.Context, contentID string, filter AccessFilter) (*WorkSummary, error)
+}
+
+type LiteraryWorkLinker interface {
+	AutoLinkContent(ctx context.Context, contentID string) (string, bool, error)
+}
+
+type WorkSummaryBatchProvider interface {
+	ListSummariesForContentIDs(ctx context.Context, contentIDs []string, filter AccessFilter) (map[string]*WorkSummary, error)
+}
+
+type WorkSummary struct {
+	WorkID  string
+	Title   string
+	Formats []WorkFormatSummary
+}
+
+type WorkFormatSummary struct {
+	Type      string `json:"type"`
+	ContentID string `json:"content_id"`
+	LibraryID int    `json:"library_id,omitempty"`
+}
+
+// ProbedDurationsByContentIDs resolves first-file probed durations when the
+// configured file fetcher supports the optional batch extension.
+func (s *DetailService) ProbedDurationsByContentIDs(ctx context.Context, ids []string) map[string]int {
+	if s == nil || s.fileFetcher == nil || len(ids) == 0 {
+		return nil
+	}
+	fetcher, ok := s.fileFetcher.(batchDurationFetcher)
+	if !ok {
+		return nil
+	}
+	durations, err := fetcher.FirstDurationsByContentIDs(ctx, ids)
+	if err != nil {
+		slog.Warn("failed to fetch probed content durations", "error", err, "id_count", len(ids))
+		return nil
+	}
+	return durations
+}
+
+// ProbedDurationsByEpisodeIDs resolves first-file probed durations when the
+// configured file fetcher supports the optional batch extension.
+func (s *DetailService) ProbedDurationsByEpisodeIDs(ctx context.Context, ids []string) map[string]int {
+	if s == nil || s.fileFetcher == nil || len(ids) == 0 {
+		return nil
+	}
+	fetcher, ok := s.fileFetcher.(batchDurationFetcher)
+	if !ok {
+		return nil
+	}
+	durations, err := fetcher.FirstDurationsByEpisodeIDs(ctx, ids)
+	if err != nil {
+		slog.Warn("failed to fetch probed episode durations", "error", err, "id_count", len(ids))
+		return nil
+	}
+	return durations
+}
+
+// ItemDetail is the full detail response for a single media item, including
+// metadata, file versions, subtitles, intro/credits markers, and presigned image URLs.
+type ItemDetail struct {
+	ContentID     string `json:"content_id"`
+	PlayContentID string `json:"play_content_id,omitempty"`
+	// PlaySeasonNumber is the season of PlayContentID when it is an episode.
+	// The native v2 detail carries it; the frozen v1 detail does not.
+	PlaySeasonNumber *int   `json:"-"`
+	Type             string `json:"type"`
+
+	// Metadata (served inline from Postgres).
+	Title         string `json:"title"`
+	SortTitle     string `json:"sort_title,omitempty"`
+	OriginalTitle string `json:"original_title,omitempty"`
+	// OriginalLanguage feeds the Jellyfin-compat BaseItemDto field; it is
+	// kept out of the native JSON contract.
+	OriginalLanguage string `json:"-"`
+	Year             int    `json:"year,omitempty"`
+	Overview         string `json:"overview,omitempty"`
+	Tagline          string `json:"tagline,omitempty"`
+	// PendingTranslationLanguage, when set, is the viewer's presentation
+	// language that the description is missing — the on-view AI translation
+	// affordance keys off it.
+	PendingTranslationLanguage string `json:"pending_translation_language,omitempty"`
+	// MachineTranslatedFields names the localized fields ("overview",
+	// "tagline") that AI translation wrote. The native v2 document carries it;
+	// the frozen v1 JSON does not.
+	MachineTranslatedFields []string `json:"-"`
+	Runtime                 int      `json:"runtime,omitempty"`
+	ContentRating           string   `json:"content_rating,omitempty"`
+	// AdvisoryAge and AdvisorySource carry the item's advisory to the
+	// v2 renderer. Kept out of this JSON contract the way OriginalLanguage is:
+	// /api/v1 is frozen, so the fields ride the Go struct and apiv2 emits them
+	// under its own names.
+	AdvisoryAge      *int         `json:"-"`
+	AdvisorySource   string       `json:"-"`
+	Genres           []string     `json:"genres"`
+	RatingIMDB       *float64     `json:"rating_imdb,omitempty"`
+	RatingTMDB       *float64     `json:"rating_tmdb,omitempty"`
+	RatingRTCritic   *int         `json:"rating_rt_critic,omitempty"`
+	RatingRTAudience *int         `json:"rating_rt_audience,omitempty"`
+	ImdbID           string       `json:"imdb_id,omitempty"`
+	TmdbID           string       `json:"tmdb_id,omitempty"`
+	TvdbID           string       `json:"tvdb_id,omitempty"`
+	Cast             []CastCredit `json:"cast"`
+	Crew             []CrewCredit `json:"crew"`
+	Studios          []string     `json:"studios"`
+	Networks         []string     `json:"networks"`
+	Countries        []string     `json:"countries,omitempty"`
+	LockedFields     []int        `json:"locked_fields,omitempty"`
+	FirstAirDate     *string      `json:"first_air_date,omitempty"`
+	LastAirDate      *string      `json:"last_air_date,omitempty"`
+	ReleaseDate      *string      `json:"release_date,omitempty"`
+	AirTime          *string      `json:"air_time,omitempty"`
+	AirTimezone      *string      `json:"air_timezone,omitempty"`
+	ShowStatus       string       `json:"show_status,omitempty"`
+
+	// Presigned image URLs.
+	PosterURL         string `json:"poster_url,omitempty"`
+	PosterThumbhash   string `json:"poster_thumbhash,omitempty"`
+	BackdropURL       string `json:"backdrop_url,omitempty"`
+	BackdropThumbhash string `json:"backdrop_thumbhash,omitempty"`
+	LogoURL           string `json:"logo_url,omitempty"`
+
+	// An episode's series poster and backdrop and its season poster, sized
+	// like its own poster and backdrop. apiv2 emits them; /api/v1 is frozen.
+	SeriesPosterURL         string `json:"-"`
+	SeriesPosterThumbhash   string `json:"-"`
+	SeriesBackdropURL       string `json:"-"`
+	SeriesBackdropThumbhash string `json:"-"`
+	SeasonPosterURL         string `json:"-"`
+	SeasonPosterThumbhash   string `json:"-"`
+
+	// Banner, thumb, clear art and disc art, and every backdrop in display
+	// order with the primary first, for movies and series. Kept out of this
+	// JSON contract because /api/v1 is frozen; apiv2 emits them on item
+	// detail. BackdropURLs is filled only on single-item detail; the cached
+	// paths seed the Jellyfin-compatible image tags.
+	BannerURL          string   `json:"-"`
+	BannerThumbhash    string   `json:"-"`
+	ThumbURL           string   `json:"-"`
+	ThumbThumbhash     string   `json:"-"`
+	ClearArtURL        string   `json:"-"`
+	DiscURL            string   `json:"-"`
+	BackdropURLs       []string `json:"-"`
+	BannerPath         string   `json:"-"`
+	ThumbPath          string   `json:"-"`
+	ClearArtPath       string   `json:"-"`
+	DiscPath           string   `json:"-"`
+	ExtraBackdropPaths []string `json:"-"`
+
+	// The stored poster, backdrop and logo paths (localized, when a
+	// localization supplies the artwork) and the item's last modification,
+	// kept out of the JSON contract like the paths above. With the thumbhashes
+	// they seed the Jellyfin-compatible image tags the way list rows do, so an
+	// image keeps one tag across list and detail responses, and the tag still
+	// changes with the artwork and the viewer's language. Set for movies and
+	// series.
+	PosterPath   string    `json:"-"`
+	BackdropPath string    `json:"-"`
+	LogoPath     string    `json:"-"`
+	UpdatedAt    time.Time `json:"-"`
+
+	// Literary work linkage. Present for linked ebook/audiobook items.
+	WorkID      string              `json:"work_id,omitempty"`
+	WorkTitle   string              `json:"work_title,omitempty"`
+	WorkFormats []WorkFormatSummary `json:"work_formats,omitempty"`
+
+	// Series-specific.
+	SeasonCount *int `json:"season_count,omitempty"`
+	// EpisodeMetadataIncomplete is the series row's flag that some episodes
+	// still lack metadata, so item detail can request a refresh without
+	// reading the row again. Not part of any JSON contract.
+	EpisodeMetadataIncomplete bool `json:"-"`
+
+	// Season-specific.
+	SeriesID     string `json:"series_id,omitempty"`
+	SeriesTitle  string `json:"series_title,omitempty"`
+	SeasonNumber *int   `json:"season_number,omitempty"`
+	// SeasonID is an episode's stored season, empty when its season is
+	// synthetic. Not part of any JSON contract; apiv2 finds the themes an
+	// episode inherits with it.
+	SeasonID       string          `json:"-"`
+	EpisodeNumber  *int            `json:"episode_number,omitempty"`
+	EpisodeCount   *int            `json:"episode_count,omitempty"`
+	AirDate        *string         `json:"air_date,omitempty"`
+	IsSpecials     bool            `json:"is_specials,omitempty"`
+	SeasonUserData *SeasonUserData `json:"user_data,omitempty"`
+	UserState      *ItemUserState  `json:"user_state,omitempty"`
+	UserRating     *int            `json:"user_rating,omitempty"` // 1 to 10
+
+	// File versions available for playback.
+	Versions         []FileVersion     `json:"versions"`
+	PlaybackVariants []PlaybackVariant `json:"playback_variants,omitempty"`
+
+	// Remote provider videos (YouTube trailers, teasers, ...) for
+	// movies/series, ordered for display (trailers first, official first).
+	Videos []ItemVideoInfo `json:"videos,omitempty"`
+
+	// Per-source ratings (IMDb, Metacritic, Letterboxd, ...) for movies and
+	// series, in display order. Kept out of this JSON contract because
+	// /api/v1 is frozen; apiv2 emits them as rating_sources.
+	RatingSources []ItemRatingSourceInfo `json:"-"`
+
+	// ViewerCurates is true when the viewer may curate this item's metadata
+	// (admins and accounts with metadata curation), the same check that
+	// shows them file paths. apiv2 gives them every stored rating for the
+	// metadata editor and everyone else only the ratings clients show. Not
+	// part of any JSON contract.
+	ViewerCurates bool `json:"-"`
+
+	// Local extras (scanner-discovered trailers, featurettes, deleted
+	// scenes, ...) playable via their own content_id through /watch.
+	Extras []ItemExtraInfo `json:"extras,omitempty"`
+
+	// Root folder paths for series items (admin-only).
+	FolderPaths []string `json:"folder_paths,omitempty"`
+
+	// Compact overlay badges derived from the best available file.
+	OverlaySummary *models.OverlaySummary `json:"overlay_summary,omitempty"`
+
+	// Aggregated subtitles across all versions.
+	Subtitles []SubtitleInfo `json:"subtitles"`
+
+	// Intro/credits/recap/preview markers (from first file that has them).
+	Intro   *Marker `json:"intro,omitempty"`
+	Credits *Marker `json:"credits,omitempty"`
+	Recap   *Marker `json:"recap,omitempty"`
+	Preview *Marker `json:"preview,omitempty"`
+
+	// Effective subtitle defaults for episode playback derived from
+	// profile, library, and series-level preferences.
+	EffectiveSubtitleLanguage       string                            `json:"-"`
+	HasEffectiveSubtitleLang        bool                              `json:"-"`
+	EffectiveSubtitleMode           string                            `json:"-"`
+	HasEffectiveSubtitleMode        bool                              `json:"-"`
+	EffectiveShowForcedSubtitles    bool                              `json:"-"`
+	HasEffectiveShowForcedSubtitles bool                              `json:"-"`
+	EffectiveSubtitleTrackSignature *userstore.SubtitleTrackSignature `json:"effective_subtitle_track_signature,omitempty"`
+
+	// Effective version defaults for episode playback derived from
+	// series-level sticky preferences.
+	EffectiveVersionResolution *string `json:"effective_version_resolution,omitempty"`
+	EffectiveVersionHDR        *bool   `json:"effective_version_hdr,omitempty"`
+	EffectiveVersionCodecVideo *string `json:"effective_version_codec_video,omitempty"`
+	EffectiveVersionEditionKey *string `json:"effective_version_edition_key,omitempty"`
+
+	// Audiobook-specific detail. Present only when Type == "audiobook".
+	Audiobook *AudiobookDetailExtension `json:"audiobook,omitempty"`
+
+	// Ebook-specific detail. Present only when Type == "ebook".
+	Ebook *EbookDetailExtension `json:"ebook,omitempty"`
+
+	// Manga-specific detail. Present only when Type == "manga".
+	Manga *MangaDetailExtension `json:"manga,omitempty"`
+}
+
+// ItemVideoInfo is the API shape of a remote provider video. It exposes the
+// site reference (site + site_key) rather than internal row identity so
+// clients can build embed/watch URLs without further lookups.
+type ItemVideoInfo struct {
+	Kind       string `json:"kind"`
+	Site       string `json:"site"`
+	SiteKey    string `json:"site_key"`
+	Name       string `json:"name,omitempty"`
+	Language   string `json:"language,omitempty" doc:"Language of the video as the provider reports it, usually ISO 639-1"`
+	IsOfficial bool   `json:"is_official"`
+}
+
+// ItemRatingSourceInfo is one source's rating of an item on a 0-100 scale.
+// Votes is nil when the source did not report a count.
+type ItemRatingSourceInfo struct {
+	Source string
+	Score  float64
+	Votes  *int64
+}
+
+// ItemExtraInfo is the API shape of a local extra. ContentID is a playable
+// watch target (same /watch flow as any item); FileID backs download/direct
+// stream affordances.
+type ItemExtraInfo struct {
+	ContentID       string `json:"content_id"`
+	Kind            string `json:"kind"`
+	Title           string `json:"title,omitempty"`
+	DurationSeconds int    `json:"duration_seconds,omitempty"`
+	FileID          int    `json:"file_id,omitempty"`
+	// The extra's 16:9 card image. Only the V2 and Jellyfin surfaces carry
+	// it; the frozen V1 detail gains no field.
+	StillPath      string `json:"-"`
+	StillURL       string `json:"-"`
+	StillThumbhash string `json:"-"`
+}
+
+type AudiobookDetailExtension struct {
+	Authors              []AudiobookPerson       `json:"authors"`
+	Narrators            []AudiobookPerson       `json:"narrators"`
+	Publisher            string                  `json:"publisher,omitempty"`
+	TotalDurationSeconds int                     `json:"total_duration_seconds"`
+	Series               *AudiobookSeriesGroup   `json:"series,omitempty"`
+	OtherNarrations      []AudiobookNarration    `json:"other_narrations"`
+	Related              AudiobookRelatedContent `json:"related"`
+}
+
+type AudiobookPerson struct {
+	PersonID       string `json:"person_id,omitempty"`
+	Name           string `json:"name"`
+	PhotoURL       string `json:"photo_url,omitempty" format:"uri-reference"`
+	PhotoThumbhash string `json:"photo_thumbhash,omitempty"`
+}
+
+type AudiobookRelatedContent struct {
+	AlsoByAuthor []AudiobookRelatedItem `json:"also_by_author"`
+	Similar      []AudiobookRelatedItem `json:"similar"`
+}
+
+type AudiobookRelatedItem struct {
+	ContentID       string   `json:"content_id"`
+	Title           string   `json:"title"`
+	Year            int      `json:"year,omitempty"`
+	PosterURL       string   `json:"poster_url,omitempty" format:"uri-reference"`
+	PosterThumbhash string   `json:"poster_thumbhash,omitempty" doc:"The poster's ThumbHash, for a blurred preview while poster_url loads"`
+	SeriesIndex     *int     `json:"series_index,omitempty"`
+	DurationSeconds int      `json:"duration_seconds,omitempty" doc:"Audiobooks only: total listening time, summed over the book's files the viewer can play, as the book's own total_duration_seconds is. Absent for ebooks and when no file reports a duration" example:"41520"`
+	Played          bool     `json:"played,omitempty" doc:"The profile finished this book, by the rule a catalog card's user_state.played follows: an audiobook's visible progress or a visible completed history row, an ebook's reading progress. Absent when false and without a profile" example:"true"`
+	ProgressRatio   *float64 `json:"progress_ratio,omitempty" minimum:"0" maximum:"1" doc:"How far the profile is into the book, 0-1: listening position over the progress row's duration for an audiobook, reading progress for an ebook. Present only while the book is started and not played" example:"0.42"`
+}
+
+type AudiobookSeriesGroup struct {
+	Name    string                 `json:"name,omitempty"`
+	Entries []AudiobookRelatedItem `json:"entries"`
+}
+
+type AudiobookNarration struct {
+	ContentID string   `json:"content_id"`
+	Title     string   `json:"title"`
+	Year      int      `json:"year,omitempty"`
+	Narrators []string `json:"narrators"`
+}
+
+type EbookDetailExtension struct {
+	Authors   []AudiobookPerson       `json:"authors"`
+	Publisher string                  `json:"publisher,omitempty"`
+	Series    *AudiobookSeriesGroup   `json:"series,omitempty"`
+	Related   AudiobookRelatedContent `json:"related"`
+}
+
+// MangaDetailExtension is the manga-series detail payload. A manga series item
+// (media_items.type='manga') owns a set of readable chapter items
+// (media_items.type='ebook') linked via the manga_chapters table.
+type MangaDetailExtension struct {
+	Chapters []MangaChapter `json:"chapters"`
+}
+
+// MangaChapter is one chapter of a manga series, ordered by chapter index.
+type MangaChapter struct {
+	ContentID    string   `json:"content_id"`
+	Title        string   `json:"title"`
+	ChapterIndex *float64 `json:"chapter_index,omitempty"`
+	Volume       string   `json:"volume,omitempty"`
+	// Read is true when the current viewer has finished this chapter, mirroring
+	// ebook read state: ebook_reader_progress.progress >= the finished threshold.
+	Read bool `json:"read"`
+	// Progress is the viewer's reading position as a 0..1 fraction, present
+	// only when a progress row exists. The row progress bar uses it.
+	Progress *float64 `json:"progress,omitempty"`
+	// PosterURL is the chapter's extracted cover (presigned), for row thumbnails.
+	PosterURL string `json:"poster_url,omitempty" format:"uri-reference"`
+}
+
+// ItemUserState is per-profile viewer state included in item detail responses.
+type ItemUserState struct {
+	Played      bool `json:"played"`
+	IsFavorite  bool `json:"is_favorite"`
+	InWatchlist bool `json:"in_watchlist"`
+	// NotInterested is served by v2 only; the frozen v1 shape leaves it out.
+	NotInterested bool `json:"-"`
+}
+
+// CastCredit is the item-detail API shape for a cast member.
+type CastCredit struct {
+	Name           string `json:"name"`
+	Character      string `json:"character"`
+	Order          int    `json:"order"`
+	PersonID       string `json:"person_id,omitempty"`
+	TmdbID         string `json:"tmdb_id,omitempty"`
+	TvdbID         string `json:"tvdb_id,omitempty"`
+	ImdbID         string `json:"imdb_id,omitempty"`
+	PlexGUID       string `json:"plex_guid,omitempty"`
+	PhotoURL       string `json:"photo_url,omitempty" format:"uri-reference"`
+	PhotoThumbhash string `json:"photo_thumbhash,omitempty"`
+	// PhotoPath is the stored photo key behind PhotoURL. It is internal: the
+	// Jellyfin compatibility layer signs person image tags over it.
+	PhotoPath string `json:"-"`
+}
+
+// CrewCredit is the item-detail API shape for a crew member.
+type CrewCredit struct {
+	Name           string `json:"name"`
+	Job            string `json:"job"`
+	PersonID       string `json:"person_id,omitempty"`
+	TmdbID         string `json:"tmdb_id,omitempty"`
+	TvdbID         string `json:"tvdb_id,omitempty"`
+	ImdbID         string `json:"imdb_id,omitempty"`
+	PlexGUID       string `json:"plex_guid,omitempty"`
+	PhotoURL       string `json:"photo_url,omitempty" format:"uri-reference"`
+	PhotoThumbhash string `json:"photo_thumbhash,omitempty"`
+	// PhotoPath is internal; see CastCredit.PhotoPath.
+	PhotoPath string `json:"-"`
+}
+
+// PersonCredit represents a person's credit on a media item for API responses.
+type PersonCredit struct {
+	PersonID       int64             `json:"person_id"`
+	Name           string            `json:"name"`
+	Kind           models.PersonKind `json:"kind"`
+	Character      string            `json:"character,omitempty"`
+	SortOrder      int               `json:"order"`
+	TmdbID         string            `json:"tmdb_id,omitempty"`
+	ImdbID         string            `json:"imdb_id,omitempty"`
+	TvdbID         string            `json:"tvdb_id,omitempty"`
+	PlexGUID       string            `json:"plex_guid,omitempty"`
+	PhotoURL       string            `json:"photo_url,omitempty"`
+	PhotoThumbhash string            `json:"photo_thumbhash,omitempty"`
+	// PhotoPath is internal; see CastCredit.PhotoPath.
+	PhotoPath string `json:"-"`
+}
+
+// FileVersion represents a single file version available for playback.
+type FileVersion struct {
+	FileID                   int                    `json:"file_id"`
+	FileName                 string                 `json:"file_name,omitempty"`
+	FilePath                 string                 `json:"file_path,omitempty"`
+	Resolution               string                 `json:"resolution"`
+	CodecVideo               string                 `json:"codec_video"`
+	CodecAudio               string                 `json:"codec_audio"`
+	HDR                      bool                   `json:"hdr"`
+	Container                string                 `json:"container"`
+	FileSize                 int64                  `json:"file_size"`
+	Duration                 int                    `json:"duration"`
+	Bitrate                  int                    `json:"bitrate"`
+	AddedAt                  time.Time              `json:"added_at"`
+	EditionRaw               string                 `json:"edition_raw,omitempty"`
+	EditionKey               string                 `json:"edition_key,omitempty"`
+	PresentationKind         string                 `json:"presentation_kind,omitempty"`
+	PresentationGroupKey     string                 `json:"presentation_group_key,omitempty"`
+	PresentationPartIndex    int                    `json:"presentation_part_index,omitempty"`
+	PresentationPartTotal    int                    `json:"presentation_part_total,omitempty"`
+	MultiEpisodeStart        int                    `json:"multi_episode_start,omitempty"`
+	MultiEpisodeEnd          int                    `json:"multi_episode_end,omitempty"`
+	EffectiveAudioTrackIndex *int                   `json:"effective_audio_track_index,omitempty"`
+	EffectiveAudioLanguage   string                 `json:"effective_audio_language,omitempty"`
+	VideoTracks              []models.VideoTrack    `json:"video_tracks,omitempty"`
+	AudioTracks              []models.AudioTrack    `json:"audio_tracks,omitempty"`
+	SubtitleTracks           []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
+	Chapters                 []VersionChapter       `json:"chapters,omitempty"`
+	Intro                    *Marker                `json:"intro,omitempty"`
+	Credits                  *Marker                `json:"credits,omitempty"`
+	Recap                    *Marker                `json:"recap,omitempty"`
+	Preview                  *Marker                `json:"preview,omitempty"`
+	MarkerSegments           []models.MarkerSegment `json:"-"`
+	MarkerPreviews           []VersionMarkerPreview `json:"-"`
+	// Trickplay is the layout of the file's servable seek-bar previews, nil
+	// when it has none. The v2 watch and Jellyfin views carry it; the frozen
+	// v1 view does not.
+	Trickplay *TrickplayGrid `json:"-"`
+	// Unreadable is models.MediaFile.ProbeRejected: ffprobe rejected the file
+	// and nothing usable is recorded for it, so it cannot play until it is
+	// replaced. Jellyfin PlaybackInfo leaves such versions out. Neither the v1
+	// nor the v2 view carries the flag.
+	Unreadable bool `json:"-"`
+}
+
+// SetMarkers refreshes the marker projection without rebuilding file metadata.
+func (v *FileVersion) SetMarkers(file *models.MediaFile) {
+	v.Intro = markerFromFile(file, markerKindIntro)
+	v.Credits = markerFromFile(file, markerKindCredits)
+	v.Recap = markerFromFile(file, markerKindRecap)
+	v.Preview = markerFromFile(file, markerKindPreview)
+	v.MarkerSegments = models.EffectiveMarkerSegments(file)
+	previews := make([]VersionMarkerPreview, 0, len(v.MarkerPreviews))
+	for _, image := range v.MarkerPreviews {
+		for _, segment := range v.MarkerSegments {
+			if image.MarkerSegment == segment {
+				previews = append(previews, image)
+				break
+			}
+		}
+	}
+	v.MarkerPreviews = previews
+}
+
+func (v FileVersion) EffectiveMarkerSegments() []models.MarkerSegment {
+	file := models.MediaFile{MarkerSegments: v.MarkerSegments}
+	if v.Intro != nil {
+		file.IntroStart, file.IntroEnd = &v.Intro.Start, &v.Intro.End
+	}
+	if v.Credits != nil {
+		file.CreditsStart, file.CreditsEnd = &v.Credits.Start, &v.Credits.End
+	}
+	if v.Recap != nil {
+		file.RecapStart, file.RecapEnd = &v.Recap.Start, &v.Recap.End
+	}
+	if v.Preview != nil {
+		file.PreviewStart, file.PreviewEnd = &v.Preview.Start, &v.Preview.End
+	}
+	return models.EffectiveMarkerSegments(&file)
+}
+
+// PlaybackVariant is one logical watch choice, optionally spanning multiple ordered parts.
+type PlaybackVariant struct {
+	VariantID            string                `json:"variant_id"`
+	EditionRaw           string                `json:"edition_raw,omitempty"`
+	EditionKey           string                `json:"edition_key,omitempty"`
+	PresentationKind     string                `json:"presentation_kind,omitempty"`
+	PresentationGroupKey string                `json:"presentation_group_key,omitempty"`
+	PartCount            int                   `json:"part_count"`
+	TotalDuration        int                   `json:"total_duration,omitempty"`
+	DefaultFileID        int                   `json:"default_file_id,omitempty"`
+	Parts                []PlaybackVariantPart `json:"parts"`
+}
+
+// PlaybackVariantPart contains the interchangeable versions for one ordered part.
+type PlaybackVariantPart struct {
+	PartIndex     int           `json:"part_index"`
+	DefaultFileID int           `json:"default_file_id,omitempty"`
+	TotalDuration int           `json:"total_duration,omitempty"`
+	Versions      []FileVersion `json:"versions"`
+}
+
+// VersionChapter represents one chapter on a playable file version.
+type VersionChapter struct {
+	Index              int     `json:"index"`
+	Title              string  `json:"title"`
+	StartSeconds       float64 `json:"start_seconds"`
+	EndSeconds         float64 `json:"end_seconds"`
+	Source             string  `json:"source"`
+	ThumbnailURL       string  `json:"thumbnail_url,omitempty" format:"uri-reference"`
+	ThumbnailThumbhash string  `json:"thumbnail_thumbhash,omitempty"`
+}
+
+// VersionSubtitleTrack represents one embedded or external subtitle track in a file version.
+type VersionSubtitleTrack struct {
+	Index           int    `json:"index,omitempty"`
+	Language        string `json:"language,omitempty" doc:"Track language from the file: BCP 47 tag, ISO 639-1 where one exists (en, pt-BR); und when the file marks it undetermined. Older scans may carry an ISO 639-2 code or the file's raw tag; an external track's comes from its file name"`
+	Codec           string `json:"codec,omitempty"`
+	Title           string `json:"title,omitempty"`
+	TitleIsFallback bool   `json:"-"` // An external title filled from its file name.
+	EmbeddedTitle   string `json:"embedded_title,omitempty"`
+	Resolution      string `json:"resolution,omitempty"`
+	Forced          bool   `json:"forced"`
+	Default         bool   `json:"default"`
+	HearingImpaired bool   `json:"hearing_impaired"`
+	External        bool   `json:"external"`
+	FileName        string `json:"file_name,omitempty" doc:"An external track's file name; absent for viewers without file-path visibility, except on audiobooks and ebooks"`
+	// IndexOnly is models.SubtitleTrack.IndexOnly, for planners that read
+	// this projection.
+	IndexOnly bool `json:"-"`
+}
+
+// SubtitleInfo represents a subtitle track available for a media item.
+type SubtitleInfo struct {
+	Source          string `json:"source"` // embedded, external
+	Language        string `json:"language" doc:"Subtitle language: BCP 47 tag (en, pt-BR), empty when unknown; older rows may carry a legacy value"`
+	Codec           string `json:"codec,omitempty"`
+	Forced          bool   `json:"forced"`
+	HearingImpaired bool   `json:"hearing_impaired"`
+	Title           string `json:"title,omitempty"`
+}
+
+// Marker represents a time range (intro or credits) together with the provenance
+// of whatever produced it.
+//
+// Confidence has no single scale — local detection, a chapter, and each online
+// provider rate on their own — so a bare number means nothing without Source
+// beside it. Every provenance field is absent on a marker whose file row
+// recorded none.
+type Marker struct {
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+	// The provenance fields are excluded from JSON on purpose. This struct is the
+	// wire shape of the frozen GET /api/v1/watch/{id} response, which carries these
+	// markers directly, so a tag here would add fields to a contract that is closed.
+	// Clients that should see provenance read the v2 marker, which maps from these
+	// Go fields rather than from their JSON.
+	//
+	// Source is the class of source (models.MarkerSource*): "scanner" for local
+	// detection, "plugin"/"online" for a provider, "manual" for a person.
+	Source string `json:"-"`
+	// Provider is the provider that supplied the range — a plugin capability id
+	// such as "introdb", or "built_in" — and is empty for a locally detected or
+	// manually set marker.
+	Provider string `json:"-"`
+	// Confidence is the source's own rating, 0-1, absent when the marker was never
+	// rated. It is a pointer for that reason: an unrated marker is stored as 0, so
+	// a bare float would report a real "0%" for a range nobody rated.
+	Confidence *float64 `json:"-"`
+	// Algorithm identifies the detector, e.g. "chromaprint:v4" or "introdb:v4".
+	Algorithm string `json:"-"`
+}
+
+// SeasonUserData is the profile-scoped progress payload shared across item,
+// season, series, and episode surfaces. Aggregate fields are used for season
+// and series responses; leaf fields are used for movies and episodes.
+type SeasonUserData struct {
+	PositionSeconds float64 `json:"position_seconds,omitempty"`
+	DurationSeconds float64 `json:"duration_seconds,omitempty"`
+	IsInProgress    bool    `json:"is_in_progress,omitempty"`
+	WatchedCount    int     `json:"watched_count"`
+	UnplayedCount   int     `json:"unplayed_count"`
+	InProgressCount int     `json:"in_progress_count"`
+	Played          bool    `json:"played"`
+	LastFileID      *int    `json:"last_file_id,omitempty"`
+	LastResolution  *string `json:"last_resolution,omitempty"`
+	LastHDR         *bool   `json:"last_hdr,omitempty"`
+	LastCodecVideo  *string `json:"last_codec_video,omitempty"`
+	LastEditionKey  *string `json:"last_edition_key,omitempty"`
+}
+
+// WatchDetail is the playback-oriented payload for /watch/{id}.
+type WatchDetail struct {
+	ContentID                       string                            `json:"content_id"`
+	Type                            string                            `json:"type"`
+	Title                           string                            `json:"title"`
+	Year                            int                               `json:"year,omitempty"`
+	Overview                        string                            `json:"overview,omitempty"`
+	EffectiveSubtitleLanguage       string                            `json:"-"`
+	HasEffectiveSubtitleLang        bool                              `json:"-"`
+	EffectiveSubtitleMode           string                            `json:"-"`
+	HasEffectiveSubtitleMode        bool                              `json:"-"`
+	EffectiveShowForcedSubtitles    bool                              `json:"-"`
+	HasEffectiveShowForcedSubtitles bool                              `json:"-"`
+	Versions                        []FileVersion                     `json:"versions"`
+	PlaybackVariants                []PlaybackVariant                 `json:"playback_variants,omitempty"`
+	Subtitles                       []SubtitleInfo                    `json:"subtitles"`
+	Intro                           *Marker                           `json:"intro,omitempty"`
+	Credits                         *Marker                           `json:"credits,omitempty"`
+	Recap                           *Marker                           `json:"recap,omitempty"`
+	Preview                         *Marker                           `json:"preview,omitempty"`
+	UserData                        *SeasonUserData                   `json:"user_data,omitempty"`
+	SeriesID                        string                            `json:"series_id,omitempty"`
+	SeriesTitle                     string                            `json:"series_title,omitempty"`
+	SeasonNumber                    int                               `json:"season_number,omitempty"`
+	EpisodeNumber                   int                               `json:"episode_number,omitempty"`
+	EffectiveSubtitleTrackSignature *userstore.SubtitleTrackSignature `json:"effective_subtitle_track_signature,omitempty"`
+	EffectiveVersionResolution      *string                           `json:"effective_version_resolution,omitempty"`
+	EffectiveVersionHDR             *bool                             `json:"effective_version_hdr,omitempty"`
+	EffectiveVersionCodecVideo      *string                           `json:"effective_version_codec_video,omitempty"`
+	EffectiveVersionEditionKey      *string                           `json:"effective_version_edition_key,omitempty"`
+	// Artwork is mapped explicitly by v2; the frozen v1 JSON omits it.
+	PosterURL         string `json:"-"`
+	PosterThumbhash   string `json:"-"`
+	BackdropURL       string `json:"-"`
+	BackdropThumbhash string `json:"-"`
+}
+
+func (d ItemDetail) MarshalJSON() ([]byte, error) {
+	type itemDetailAlias ItemDetail
+	payload := struct {
+		itemDetailAlias
+		EffectiveSubtitleLanguage    *string `json:"effective_subtitle_language,omitempty"`
+		EffectiveSubtitleMode        *string `json:"effective_subtitle_mode,omitempty"`
+		EffectiveShowForcedSubtitles *bool   `json:"effective_show_forced_subtitles,omitempty"`
+	}{
+		itemDetailAlias: itemDetailAlias(d),
+	}
+	if d.HasEffectiveSubtitleLang {
+		payload.EffectiveSubtitleLanguage = &d.EffectiveSubtitleLanguage
+	}
+	if d.HasEffectiveSubtitleMode {
+		payload.EffectiveSubtitleMode = &d.EffectiveSubtitleMode
+	}
+	if d.HasEffectiveShowForcedSubtitles {
+		payload.EffectiveShowForcedSubtitles = &d.EffectiveShowForcedSubtitles
+	}
+	return json.Marshal(payload)
+}
+
+func (d WatchDetail) MarshalJSON() ([]byte, error) {
+	type watchDetailAlias WatchDetail
+	payload := struct {
+		watchDetailAlias
+		EffectiveSubtitleLanguage    *string `json:"effective_subtitle_language,omitempty"`
+		EffectiveSubtitleMode        *string `json:"effective_subtitle_mode,omitempty"`
+		EffectiveShowForcedSubtitles *bool   `json:"effective_show_forced_subtitles,omitempty"`
+	}{
+		watchDetailAlias: watchDetailAlias(d),
+	}
+	if d.HasEffectiveSubtitleLang {
+		payload.EffectiveSubtitleLanguage = &d.EffectiveSubtitleLanguage
+	}
+	if d.HasEffectiveSubtitleMode {
+		payload.EffectiveSubtitleMode = &d.EffectiveSubtitleMode
+	}
+	if d.HasEffectiveShowForcedSubtitles {
+		payload.EffectiveShowForcedSubtitles = &d.EffectiveShowForcedSubtitles
+	}
+	return json.Marshal(payload)
+}
+
+type subtitleDefaults struct {
+	Language       string
+	HasLanguage    bool
+	Mode           string
+	HasMode        bool
+	ShowForced     bool
+	HasShowForced  bool
+	TrackSignature *userstore.SubtitleTrackSignature
+}
+
+func (d subtitleDefaults) applyToItemDetail(detail *ItemDetail) {
+	detail.EffectiveSubtitleLanguage = d.Language
+	detail.HasEffectiveSubtitleLang = d.HasLanguage
+	detail.EffectiveSubtitleMode = d.Mode
+	detail.HasEffectiveSubtitleMode = d.HasMode
+	detail.EffectiveShowForcedSubtitles = d.ShowForced
+	detail.HasEffectiveShowForcedSubtitles = d.HasShowForced
+	detail.EffectiveSubtitleTrackSignature = d.TrackSignature
+}
+
+func (d subtitleDefaults) applyToWatchDetail(detail *WatchDetail) {
+	detail.EffectiveSubtitleLanguage = d.Language
+	detail.HasEffectiveSubtitleLang = d.HasLanguage
+	detail.EffectiveSubtitleMode = d.Mode
+	detail.HasEffectiveSubtitleMode = d.HasMode
+	detail.EffectiveShowForcedSubtitles = d.ShowForced
+	detail.HasEffectiveShowForcedSubtitles = d.HasShowForced
+	detail.EffectiveSubtitleTrackSignature = d.TrackSignature
+}
+
+type versionDefaults struct {
+	Resolution string
+	HDR        bool
+	CodecVideo string
+	HasAny     bool
+}
+
+var ErrWatchTargetNotPlayable = errors.New("watch target is not directly playable")
+
+// IsWatchTargetNotPlayable reports whether the error means the client sent a
+// valid content ID that is not directly playable.
+func IsWatchTargetNotPlayable(err error) bool {
+	return errors.Is(err, ErrWatchTargetNotPlayable)
+}
+
+// DetailService builds full item detail responses with presigned URLs.
+type DetailService struct {
+	itemRepo       *ItemRepository
+	episodeRepo    *EpisodeRepository
+	seasonRepo     *SeasonRepository
+	personRepo     *PersonRepository
+	itemLocRepo    *MediaItemLocalizationRepository
+	seasonLocRepo  *SeasonLocalizationRepository
+	episodeLocRepo *EpisodeLocalizationRepository
+	folderRepo     interface {
+		GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
+	}
+	fileFetcher       FileVersionFetcher
+	videoRepo         *VideoRepository
+	ratingSourceRepo  *RatingSourceRepository
+	extraRepo         *ExtraRepository
+	backdropRepo      itemBackdropLister
+	rootClaimRepo     *RootClaimRepository
+	groupClaimRepo    *GroupClaimRepository
+	imageResolver     ImageResolver
+	userStoreProvider userstore.UserStoreProvider
+	workSummary       WorkSummaryProvider
+	workLinker        LiteraryWorkLinker
+	originalLangFn    func(context.Context, string) string
+	probeEnsurer      PlaybackProbeEnsurer
+	copySafetyRacer   CopySafetyRacer
+	chapterThumbs     ChapterThumbnailQueuer
+	trickplay         TrickplayAvailability
+
+	// resolver is built once on first use; see settingsResolver.
+	resolverOnce sync.Once
+	resolver     *settingsresolve.Resolver
+}
+
+// NewDetailService creates a new DetailService.
+func NewDetailService(
+	itemRepo *ItemRepository,
+	episodeRepo *EpisodeRepository,
+	seasonRepo *SeasonRepository,
+	personRepo *PersonRepository,
+	fileFetcher FileVersionFetcher,
+) *DetailService {
+	return &DetailService{
+		itemRepo:         itemRepo,
+		episodeRepo:      episodeRepo,
+		seasonRepo:       seasonRepo,
+		personRepo:       personRepo,
+		itemLocRepo:      NewMediaItemLocalizationRepository(itemRepo.pool),
+		seasonLocRepo:    NewSeasonLocalizationRepository(itemRepo.pool),
+		episodeLocRepo:   NewEpisodeLocalizationRepository(itemRepo.pool),
+		videoRepo:        NewVideoRepository(itemRepo.pool),
+		ratingSourceRepo: NewRatingSourceRepository(itemRepo.pool),
+		extraRepo:        NewExtraRepository(itemRepo.pool),
+		backdropRepo:     NewItemBackdropRepository(itemRepo.pool),
+		fileFetcher:      fileFetcher,
+	}
+}
+
+// SetImageResolver sets the plugin-based image resolver for resolving
+// plugin-prefixed image paths (e.g., "metadb://images/abc/original.jpg").
+func (s *DetailService) SetImageResolver(resolver ImageResolver) {
+	s.imageResolver = resolver
+}
+
+// SetUserStoreProvider wires in optional per-user preference lookups.
+func (s *DetailService) SetUserStoreProvider(provider userstore.UserStoreProvider) {
+	s.userStoreProvider = provider
+}
+
+func (s *DetailService) SetWorkSummaryProvider(provider WorkSummaryProvider) {
+	if s != nil {
+		s.workSummary = provider
+	}
+}
+
+func (s *DetailService) SetLiteraryWorkLinker(linker LiteraryWorkLinker) {
+	s.workLinker = linker
+}
+
+func (s *DetailService) SetProbeEnsurer(ensurer PlaybackProbeEnsurer) {
+	s.probeEnsurer = ensurer
+}
+
+// SetCopySafetyRacer wires the out-of-band H.264 copy-safety scan the watch
+// surfaces trigger. Optional: without it an unknown verdict is simply left
+// unknown until a play resolves it.
+func (s *DetailService) SetCopySafetyRacer(racer CopySafetyRacer) {
+	if s != nil {
+		s.copySafetyRacer = racer
+	}
+}
+
+func (s *DetailService) SetChapterThumbnailQueuer(queuer ChapterThumbnailQueuer) {
+	s.chapterThumbs = queuer
+}
+
+// SetTrickplayAvailability wires in the seek-bar preview reader.
+func (s *DetailService) SetTrickplayAvailability(availability TrickplayAvailability) {
+	s.trickplay = availability
+}
+
+// markTrickplay sets Trickplay on versions. Previews are an enhancement, so
+// a failed lookup leaves every version without them.
+func (s *DetailService) markTrickplay(ctx context.Context, versions []FileVersion, availability TrickplayAvailability) {
+	if availability == nil || len(versions) == 0 {
+		return
+	}
+	ids := make([]int, len(versions))
+	for i, v := range versions {
+		ids[i] = v.FileID
+	}
+	grids, err := availability.TrickplayGrids(ctx, ids)
+	if err != nil {
+		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "trickplay lookup failed", "component", "catalog", "error", err)
+		return
+	}
+	for i := range versions {
+		if grid, ok := grids[versions[i].FileID]; ok {
+			versions[i].Trickplay = &grid
+		}
+	}
+}
+
+// prefetchedTrickplay makes the page's availability lookup reusable by each
+// detail builder, including a failed lookup that returned no previews.
+type prefetchedTrickplay map[int]TrickplayGrid
+
+func (p prefetchedTrickplay) TrickplayGrids(context.Context, []int) (map[int]TrickplayGrid, error) {
+	return p, nil
+}
+
+func (s *DetailService) prefetchTrickplay(ctx context.Context, filesByID map[string][]*models.MediaFile) TrickplayAvailability {
+	if s.trickplay == nil {
+		return nil
+	}
+	var fileIDs []int
+	for _, files := range filesByID {
+		for _, file := range files {
+			if file != nil {
+				fileIDs = append(fileIDs, file.ID)
+			}
+		}
+	}
+	grids, err := s.trickplay.TrickplayGrids(ctx, fileIDs)
+	if err != nil {
+		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "trickplay lookup failed", "component", "catalog", "error", err)
+		grids = nil
+	}
+	return prefetchedTrickplay(grids)
+}
+
+func (s *DetailService) SetFolderRepository(repo interface {
+	GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
+}) {
+	s.folderRepo = repo
+}
+
+// SetRootClaimRepository wires in the root claim repo for series folder path lookups.
+func (s *DetailService) SetRootClaimRepository(repo *RootClaimRepository) {
+	s.rootClaimRepo = repo
+}
+
+func (s *DetailService) SetGroupClaimRepository(repo *GroupClaimRepository) {
+	s.groupClaimRepo = repo
+}
+
+func cloneMediaItem(item *models.MediaItem) *models.MediaItem {
+	if item == nil {
+		return nil
+	}
+	cp := *item
+	return &cp
+}
+
+func cloneSeason(season *models.Season) *models.Season {
+	if season == nil {
+		return nil
+	}
+	cp := *season
+	return &cp
+}
+
+func cloneEpisode(ep *models.Episode) *models.Episode {
+	if ep == nil {
+		return nil
+	}
+	cp := *ep
+	return &cp
+}
+
+type presentationLanguageBase struct {
+	target          string
+	libraryFallback string
+	explicit        bool
+}
+
+// resolvePresentationLanguageBase picks the request-wide fallback once. The
+// item-specific original-language rule is applied separately, because one
+// result page can contain several source languages and therefore several
+// localization targets.
+func (s *DetailService) resolvePresentationLanguageBase(ctx context.Context, filter AccessFilter) (presentationLanguageBase, error) {
+	base := presentationLanguageBase{}
+	if explicit := strings.TrimSpace(filter.PresentationLanguage); explicit != "" {
+		base.target = explicit
+		base.explicit = true
+	} else {
+		base.target = strings.TrimSpace(filter.ProfilePreferredLanguage)
+	}
+
+	// A concrete profile/explicit target never needs the library fallback. The
+	// original-language sentinel does: items with no known original language
+	// should still inherit the library rather than lose localization entirely.
+	if base.target != "" && !sameMetadataLanguage(base.target, access.OriginalMetadataLanguage) {
+		return base, nil
+	}
+	if filter.PresentationLibraryID == nil || s.folderRepo == nil {
+		return base, nil
+	}
+	folder, err := s.folderRepo.GetByID(ctx, *filter.PresentationLibraryID)
+	if err != nil {
+		if errors.Is(err, ErrFolderNotFound) {
+			return presentationLanguageBase{}, ErrItemNotFound
+		}
+		return presentationLanguageBase{}, err
+	}
+	base.libraryFallback = strings.TrimSpace(folder.MetadataLanguage)
+	if base.target == "" {
+		base.target = base.libraryFallback
+	}
+	return base, nil
+}
+
+// presentationLanguageForOriginal applies a profile's per-source exception,
+// then resolves the original-language sentinel to the item's concrete catalog
+// language. An explicit request language remains authoritative and bypasses
+// profile exceptions.
+func presentationLanguageForOriginal(base presentationLanguageBase, originalLanguage string, filter AccessFilter) string {
+	original := lang.Canonical(originalLanguage)
+	target := base.target
+	if !base.explicit && original != "" {
+		if override := strings.TrimSpace(filter.MetadataLanguageOverrides[original]); override != "" {
+			target = override
+		}
+	}
+	if sameMetadataLanguage(target, access.OriginalMetadataLanguage) {
+		if original != "" {
+			return original
+		}
+		return base.libraryFallback
+	}
+	return strings.TrimSpace(target)
+}
+
+func (s *DetailService) resolvePresentationLanguage(ctx context.Context, filter AccessFilter, originalLanguage string) (string, error) {
+	base, err := s.resolvePresentationLanguageBase(ctx, filter)
+	if err != nil {
+		return "", err
+	}
+	return presentationLanguageForOriginal(base, originalLanguage, filter), nil
+}
+
+func metadataLanguageMayUseOriginal(filter AccessFilter) bool {
+	if explicit := strings.TrimSpace(filter.PresentationLanguage); explicit != "" {
+		return sameMetadataLanguage(explicit, access.OriginalMetadataLanguage)
+	}
+	return sameMetadataLanguage(filter.ProfilePreferredLanguage, access.OriginalMetadataLanguage) ||
+		len(filter.MetadataLanguageOverrides) > 0
+}
+
+// seriesOriginalLanguage supplies the source language for season and episode
+// rows, which deliberately inherit original_language from their parent series
+// instead of duplicating it in each table.
+func (s *DetailService) seriesOriginalLanguage(ctx context.Context, seriesID string, filter AccessFilter) string {
+	if original := strings.TrimSpace(filter.PresentationOriginalLanguage); original != "" {
+		return original
+	}
+	if !metadataLanguageMayUseOriginal(filter) || s.itemRepo == nil || strings.TrimSpace(seriesID) == "" {
+		return ""
+	}
+	series, err := s.itemRepo.GetByID(ctx, seriesID)
+	if err != nil || series == nil {
+		return ""
+	}
+	return series.OriginalLanguage
+}
+
+// seriesOriginalLanguageChecked is seriesOriginalLanguage with its read
+// error, for the checked pending paths; a missing series has none.
+func (s *DetailService) seriesOriginalLanguageChecked(ctx context.Context, seriesID string, filter AccessFilter) (string, error) {
+	originalBySeries, err := s.seriesOriginalLanguages(ctx, []string{seriesID}, filter)
+	if err != nil {
+		return "", err
+	}
+	return originalBySeries[strings.TrimSpace(seriesID)], nil
+}
+
+// seriesOriginalLanguages is the batch equivalent of seriesOriginalLanguage.
+// A season or episode page usually contains many children of one series; load
+// each distinct parent once so original-language preferences do not introduce
+// an N+1 query on those pages.
+func (s *DetailService) seriesOriginalLanguages(
+	ctx context.Context,
+	seriesIDs []string,
+	filter AccessFilter,
+) (map[string]string, error) {
+	originalBySeries := make(map[string]string)
+	seen := make(map[string]struct{}, len(seriesIDs))
+	distinct := make([]string, 0, len(seriesIDs))
+	for _, seriesID := range seriesIDs {
+		seriesID = strings.TrimSpace(seriesID)
+		if seriesID == "" {
+			continue
+		}
+		if _, exists := seen[seriesID]; exists {
+			continue
+		}
+		seen[seriesID] = struct{}{}
+		distinct = append(distinct, seriesID)
+	}
+
+	if supplied := strings.TrimSpace(filter.PresentationOriginalLanguage); supplied != "" {
+		for _, seriesID := range distinct {
+			originalBySeries[seriesID] = supplied
+		}
+		return originalBySeries, nil
+	}
+	if len(distinct) == 0 || !metadataLanguageMayUseOriginal(filter) || s.itemRepo == nil {
+		return originalBySeries, nil
+	}
+
+	series, err := s.itemRepo.GetByIDs(ctx, distinct)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range series {
+		if item != nil {
+			originalBySeries[item.ContentID] = item.OriginalLanguage
+		}
+	}
+	return originalBySeries, nil
+}
+
+// PendingTranslationLanguage reports the presentation language the item's
+// description is missing: non-empty when the resolved language differs from
+// the item's base metadata language, the base overview has text, and no
+// localized overview exists yet. Clients use it to offer (or auto-run)
+// on-view AI translation; it is pure data, independent of whether the AI
+// feature is enabled. A failed read reports nothing missing.
+func (s *DetailService) PendingTranslationLanguage(ctx context.Context, item *models.MediaItem, filter AccessFilter) string {
+	language, _ := s.PendingTranslationLanguageChecked(ctx, item, filter)
+	return language
+}
+
+// PendingTranslationLanguageChecked is PendingTranslationLanguage with its
+// read errors, for callers that must not mistake a failed read for nothing
+// missing. A presentation library that no longer exists is nothing missing.
+func (s *DetailService) PendingTranslationLanguageChecked(ctx context.Context, item *models.MediaItem, filter AccessFilter) (string, error) {
+	if item == nil || strings.TrimSpace(item.Overview) == "" || s.itemLocRepo == nil {
+		return "", nil
+	}
+	language, err := s.pendingPresentationLanguage(ctx, filter, item.OriginalLanguage)
+	if err != nil || language == "" || sameMetadataLanguage(item.DefaultMetadataLanguage, language) {
+		return "", err
+	}
+	loc, err := s.itemLocRepo.Get(ctx, item.ContentID, language)
+	if err != nil {
+		return "", err
+	}
+	return pendingTranslationLanguageWith(item, language, loc), nil
+}
+
+// pendingTranslationLanguageWith is the shared core of PendingTranslationLanguage:
+// it decides the pending-translation language for an item given a pre-resolved
+// presentation language and the item's localization row (nil when none exists).
+// The batch detail path reuses it after a single bulk localization lookup so it
+// yields an identical result to the per-item method.
+func pendingTranslationLanguageWith(item *models.MediaItem, language string, loc *models.MediaItemLocalization) string {
+	if item == nil || strings.TrimSpace(item.Overview) == "" || language == "" || sameMetadataLanguage(item.DefaultMetadataLanguage, language) {
+		return ""
+	}
+	if loc != nil && loc.Overview != "" {
+		return ""
+	}
+	return language
+}
+
+// PendingSeasonTranslationLanguage is the season-row equivalent of
+// PendingTranslationLanguage. A season page also lists its episodes, so the
+// language is pending while the season overview or any of its episodes'
+// overviews lacks a localization.
+func (s *DetailService) PendingSeasonTranslationLanguage(ctx context.Context, season *models.Season, filter AccessFilter) string {
+	language, _ := s.PendingSeasonTranslationLanguageChecked(ctx, season, filter)
+	return language
+}
+
+// PendingSeasonTranslationLanguageChecked is PendingSeasonTranslationLanguage
+// with its read errors.
+func (s *DetailService) PendingSeasonTranslationLanguageChecked(ctx context.Context, season *models.Season, filter AccessFilter) (string, error) {
+	return s.pendingSeasonTranslationLanguageChecked(ctx, season, filter, nil)
+}
+
+// pendingSeasonTranslationLanguage takes the season's episodes when the
+// caller already listed them; nil lists them here. A failed read reports
+// nothing missing.
+func (s *DetailService) pendingSeasonTranslationLanguage(ctx context.Context, season *models.Season, filter AccessFilter, episodes []*models.Episode) string {
+	language, _ := s.pendingSeasonTranslationLanguageChecked(ctx, season, filter, episodes)
+	return language
+}
+
+// pendingSeasonTranslationLanguageChecked is pendingSeasonTranslationLanguage
+// with its read errors.
+func (s *DetailService) pendingSeasonTranslationLanguageChecked(ctx context.Context, season *models.Season, filter AccessFilter, episodes []*models.Episode) (string, error) {
+	if season == nil || s.seasonLocRepo == nil {
+		return "", nil
+	}
+	original, err := s.seriesOriginalLanguageChecked(ctx, season.SeriesID, filter)
+	if err != nil {
+		return "", err
+	}
+	language, err := s.pendingPresentationLanguage(ctx, filter, original)
+	if err != nil || language == "" {
+		return "", err
+	}
+	if strings.TrimSpace(season.Overview) != "" && !sameMetadataLanguage(season.DefaultMetadataLanguage, language) {
+		loc, err := s.seasonLocRepo.Get(ctx, season.ContentID, language)
+		if err != nil {
+			return "", err
+		}
+		if loc == nil || loc.Overview == "" {
+			return language, nil
+		}
+	}
+	if episodes == nil {
+		if s.episodeRepo == nil {
+			return "", nil
+		}
+		episodes, err = s.episodeRepo.ListBySeasonID(ctx, season.ContentID)
+		if err != nil {
+			return "", err
+		}
+	}
+	missing, err := s.episodesMissingLanguage(ctx, episodes, language)
+	if err != nil || !missing {
+		return "", err
+	}
+	return language, nil
+}
+
+// episodesMissingLanguage reports whether any episode has a description in
+// another language and no localized description for language.
+func (s *DetailService) episodesMissingLanguage(ctx context.Context, episodes []*models.Episode, language string) (bool, error) {
+	if s.episodeLocRepo == nil {
+		return false, nil
+	}
+	ids := make([]string, 0, len(episodes))
+	for _, episode := range episodes {
+		if episode != nil && strings.TrimSpace(episode.Overview) != "" && !sameMetadataLanguage(episode.DefaultMetadataLanguage, language) {
+			ids = append(ids, episode.ContentID)
+		}
+	}
+	if len(ids) == 0 {
+		return false, nil
+	}
+	locs, err := s.episodeLocRepo.GetByEpisodeIDs(ctx, ids, language)
+	if err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		if loc := locs[id]; loc == nil || loc.Overview == "" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// PendingEpisodeTranslationLanguage is the episode-row equivalent of
+// PendingTranslationLanguage.
+func (s *DetailService) PendingEpisodeTranslationLanguage(ctx context.Context, episode *models.Episode, filter AccessFilter) string {
+	language, _ := s.PendingEpisodeTranslationLanguageChecked(ctx, episode, filter)
+	return language
+}
+
+// PendingEpisodeTranslationLanguageChecked is
+// PendingEpisodeTranslationLanguage with its read errors.
+func (s *DetailService) PendingEpisodeTranslationLanguageChecked(ctx context.Context, episode *models.Episode, filter AccessFilter) (string, error) {
+	if episode == nil || strings.TrimSpace(episode.Overview) == "" || s.episodeLocRepo == nil {
+		return "", nil
+	}
+	original, err := s.seriesOriginalLanguageChecked(ctx, episode.SeriesID, filter)
+	if err != nil {
+		return "", err
+	}
+	language, err := s.pendingPresentationLanguage(ctx, filter, original)
+	if err != nil || language == "" || sameMetadataLanguage(episode.DefaultMetadataLanguage, language) {
+		return "", err
+	}
+	loc, err := s.episodeLocRepo.Get(ctx, episode.ContentID, language)
+	if err != nil || (loc != nil && loc.Overview != "") {
+		return "", err
+	}
+	return language, nil
+}
+
+// pendingPresentationLanguage resolves the presentation language for the
+// pending checks, where a presentation library that no longer exists means
+// nothing is missing rather than a failed read.
+func (s *DetailService) pendingPresentationLanguage(ctx context.Context, filter AccessFilter, originalLanguage string) (string, error) {
+	language, err := s.resolvePresentationLanguage(ctx, filter, originalLanguage)
+	if errors.Is(err, ErrItemNotFound) {
+		return "", nil
+	}
+	return language, err
+}
+
+// validatePresentationItemAccess checks that the presentation library holds
+// at least one of contentIDs.
+func (s *DetailService) validatePresentationItemAccess(ctx context.Context, filter AccessFilter, contentIDs ...string) error {
+	if filter.PresentationLibraryID == nil {
+		return nil
+	}
+	membership, err := s.itemRepo.GetItemsInLibrary(ctx, contentIDs, *filter.PresentationLibraryID)
+	if err != nil {
+		return err
+	}
+	for _, contentID := range contentIDs {
+		if membership[contentID] {
+			return nil
+		}
+	}
+	return ErrItemNotFound
+}
+
+// validatePresentationEpisodeAccess accepts the series' library for opted-in
+// native reads, matching the series' episode lists. File access is checked
+// separately; this does not grant access to files in another library.
+func (s *DetailService) validatePresentationEpisodeAccess(ctx context.Context, filter AccessFilter, episode *models.Episode) error {
+	memberIDs := []string{episode.ContentID}
+	if filter.SeriesLibraryCoversEpisodes {
+		memberIDs = append(memberIDs, episode.SeriesID)
+	}
+	return s.validatePresentationItemAccess(ctx, filter, memberIDs...)
+}
+
+func sameMetadataLanguage(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+func (s *DetailService) LocalizeItemModel(ctx context.Context, item *models.MediaItem, filter AccessFilter) (*models.MediaItem, error) {
+	if item == nil {
+		return nil, nil
+	}
+	language, err := s.resolvePresentationLanguage(ctx, filter, item.OriginalLanguage)
+	if err != nil || language == "" || sameMetadataLanguage(item.DefaultMetadataLanguage, language) || s.itemLocRepo == nil {
+		return cloneMediaItem(item), err
+	}
+	loc, err := s.itemLocRepo.Get(ctx, item.ContentID, language)
+	if err != nil {
+		return cloneMediaItem(item), err
+	}
+	return s.localizeItemModelWith(item, language, loc), nil
+}
+
+// loadItemLocalizations resolves each item's target and groups repository reads
+// by that language. The former single-language lookup was correct only while a
+// profile had one global target; source-language exceptions make the grouping
+// necessary to preserve batching without serving one item's localization to
+// another language group.
+func (s *DetailService) loadItemLocalizations(
+	ctx context.Context,
+	items []*models.MediaItem,
+	filter AccessFilter,
+) (map[string]string, map[string]*models.MediaItemLocalization, error) {
+	base, err := s.resolvePresentationLanguageBase(ctx, filter)
+	if err != nil {
+		return nil, nil, err
+	}
+	targets := make(map[string]string, len(items))
+	if s.itemLocRepo == nil {
+		return targets, nil, nil
+	}
+
+	idsByLanguage := make(map[string][]string)
+	seenByLanguage := make(map[string]map[string]struct{})
+	for _, item := range items {
+		if item == nil || item.ContentID == "" {
+			continue
+		}
+		target := presentationLanguageForOriginal(base, item.OriginalLanguage, filter)
+		targets[item.ContentID] = target
+		if target == "" || sameMetadataLanguage(item.DefaultMetadataLanguage, target) {
+			continue
+		}
+		if seenByLanguage[target] == nil {
+			seenByLanguage[target] = make(map[string]struct{})
+		}
+		if _, seen := seenByLanguage[target][item.ContentID]; seen {
+			continue
+		}
+		seenByLanguage[target][item.ContentID] = struct{}{}
+		idsByLanguage[target] = append(idsByLanguage[target], item.ContentID)
+	}
+
+	languages := make([]string, 0, len(idsByLanguage))
+	for language := range idsByLanguage {
+		languages = append(languages, language)
+	}
+	sort.Strings(languages)
+	localizations := make(map[string]*models.MediaItemLocalization)
+	for _, language := range languages {
+		rows, err := s.itemLocRepo.GetByContentIDs(ctx, idsByLanguage[language], language)
+		if err != nil {
+			return nil, nil, err
+		}
+		for contentID, localization := range rows {
+			localizations[contentID] = localization
+		}
+	}
+	return targets, localizations, nil
+}
+
+// localizeItemModelWith applies a pre-resolved localization to item, returning a
+// clone when there is nothing to localize (no language, base language already
+// matches, no localization repo, or no localization row). Shared core of
+// LocalizeItemModel so the batch detail path produces identical models after a
+// single bulk localization lookup.
+func (s *DetailService) localizeItemModelWith(item *models.MediaItem, language string, loc *models.MediaItemLocalization) *models.MediaItem {
+	if language == "" || sameMetadataLanguage(item.DefaultMetadataLanguage, language) || s.itemLocRepo == nil || loc == nil {
+		return cloneMediaItem(item)
+	}
+	return applyItemLocalization(item, loc)
+}
+
+// LocalizeItemModels applies presentation-language localization to a batch of
+// media items with a single lookup. Items without a localization row are
+// returned unchanged; the result preserves input order and length.
+func (s *DetailService) LocalizeItemModels(ctx context.Context, items []*models.MediaItem, filter AccessFilter) ([]*models.MediaItem, error) {
+	if len(items) == 0 {
+		return items, nil
+	}
+	localized := make([]*models.MediaItem, len(items))
+	for i, item := range items {
+		localized[i] = cloneMediaItem(item)
+	}
+	targets, locs, err := s.loadItemLocalizations(ctx, items, filter)
+	if err != nil || s.itemLocRepo == nil {
+		return localized, err
+	}
+	for i, item := range items {
+		if item == nil {
+			continue
+		}
+		if loc := locs[item.ContentID]; loc != nil {
+			localized[i] = s.localizeItemModelWith(item, targets[item.ContentID], loc)
+		}
+	}
+	return localized, nil
+}
+
+func (s *DetailService) LocalizeSeasonModel(ctx context.Context, season *models.Season, filter AccessFilter) (*models.Season, error) {
+	if season == nil {
+		return nil, nil
+	}
+	original := s.seriesOriginalLanguage(ctx, season.SeriesID, filter)
+	language, err := s.resolvePresentationLanguage(ctx, filter, original)
+	if err != nil || language == "" || sameMetadataLanguage(season.DefaultMetadataLanguage, language) || s.seasonLocRepo == nil {
+		return cloneSeason(season), err
+	}
+	loc, err := s.seasonLocRepo.Get(ctx, season.ContentID, language)
+	if err != nil || loc == nil {
+		return cloneSeason(season), err
+	}
+	imagesLocked := false
+	if s.itemRepo != nil {
+		series, err := s.itemRepo.GetByID(ctx, season.SeriesID)
+		if err != nil {
+			return cloneSeason(season), err
+		}
+		if series != nil {
+			imagesLocked = slices.Contains(series.LockedFields, fieldImagesLocked)
+		}
+	}
+	return applySeasonLocalization(season, loc, imagesLocked), nil
+}
+
+// LocalizeSeasonModels applies presentation-language localization to a batch
+// of seasons. Parent series and localization rows are fetched in batches, so
+// original-language preferences do not add one query per season. The result
+// preserves input order and length.
+func (s *DetailService) LocalizeSeasonModels(ctx context.Context, seasons []*models.Season, filter AccessFilter) ([]*models.Season, error) {
+	if len(seasons) == 0 {
+		return seasons, nil
+	}
+	localized := make([]*models.Season, len(seasons))
+	seriesIDs := make([]string, 0, len(seasons))
+	for i, season := range seasons {
+		localized[i] = cloneSeason(season)
+		if season != nil {
+			seriesIDs = append(seriesIDs, season.SeriesID)
+		}
+	}
+
+	base, err := s.resolvePresentationLanguageBase(ctx, filter)
+	if err != nil || s.seasonLocRepo == nil {
+		return localized, err
+	}
+	originalBySeries, err := s.seriesOriginalLanguages(ctx, seriesIDs, filter)
+	if err != nil {
+		return localized, err
+	}
+
+	targets := make(map[string]string, len(seasons))
+	idsByLanguage := make(map[string][]string)
+	seenByLanguage := make(map[string]map[string]struct{})
+	for _, season := range seasons {
+		if season == nil || season.ContentID == "" {
+			continue
+		}
+		target := presentationLanguageForOriginal(base, originalBySeries[season.SeriesID], filter)
+		targets[season.ContentID] = target
+		if target == "" || sameMetadataLanguage(season.DefaultMetadataLanguage, target) {
+			continue
+		}
+		if seenByLanguage[target] == nil {
+			seenByLanguage[target] = make(map[string]struct{})
+		}
+		if _, seen := seenByLanguage[target][season.ContentID]; seen {
+			continue
+		}
+		seenByLanguage[target][season.ContentID] = struct{}{}
+		idsByLanguage[target] = append(idsByLanguage[target], season.ContentID)
+	}
+
+	languages := make([]string, 0, len(idsByLanguage))
+	for language := range idsByLanguage {
+		languages = append(languages, language)
+	}
+	sort.Strings(languages)
+	locs := make(map[string]*models.SeasonLocalization)
+	for _, language := range languages {
+		rows, err := s.seasonLocRepo.GetBySeasonIDs(ctx, idsByLanguage[language], language)
+		if err != nil {
+			return localized, err
+		}
+		for seasonID, localization := range rows {
+			locs[seasonID] = localization
+		}
+	}
+	imageLocksBySeries := make(map[string]bool)
+	if len(locs) > 0 && s.itemRepo != nil {
+		series, err := s.itemRepo.GetByIDs(ctx, seriesIDs)
+		if err != nil {
+			return localized, err
+		}
+		for _, item := range series {
+			if item != nil {
+				imageLocksBySeries[item.ContentID] = slices.Contains(item.LockedFields, fieldImagesLocked)
+			}
+		}
+	}
+	for i, season := range seasons {
+		if season == nil {
+			continue
+		}
+		if loc := locs[season.ContentID]; loc != nil {
+			target := targets[season.ContentID]
+			if target != "" && !sameMetadataLanguage(season.DefaultMetadataLanguage, target) {
+				localized[i] = applySeasonLocalization(season, loc, imageLocksBySeries[season.SeriesID])
+			}
+		}
+	}
+	return localized, nil
+}
+
+func (s *DetailService) LocalizeEpisodeModel(ctx context.Context, episode *models.Episode, filter AccessFilter) (*models.Episode, error) {
+	if episode == nil {
+		return nil, nil
+	}
+	original := s.seriesOriginalLanguage(ctx, episode.SeriesID, filter)
+	language, err := s.resolvePresentationLanguage(ctx, filter, original)
+	if err != nil || language == "" || sameMetadataLanguage(episode.DefaultMetadataLanguage, language) || s.episodeLocRepo == nil {
+		return cloneEpisode(episode), err
+	}
+	loc, err := s.episodeLocRepo.Get(ctx, episode.ContentID, language)
+	if err != nil || loc == nil {
+		return cloneEpisode(episode), err
+	}
+	return applyEpisodeLocalization(episode, loc), nil
+}
+
+// LocalizeEpisodeModels applies presentation-language localization to a batch
+// of episodes with a single lookup. An episode whose description is missing
+// in the presentation language comes back as a copy carrying
+// PendingTranslationLanguage; other episodes without a localization row are
+// returned unchanged. The result preserves input order and length.
+func (s *DetailService) LocalizeEpisodeModels(ctx context.Context, episodes []*models.Episode, filter AccessFilter) ([]*models.Episode, error) {
+	if len(episodes) == 0 {
+		return episodes, nil
+	}
+	base, err := s.resolvePresentationLanguageBase(ctx, filter)
+	if err != nil || s.episodeLocRepo == nil {
+		return episodes, err
+	}
+
+	seriesIDs := make([]string, 0, len(episodes))
+	for _, episode := range episodes {
+		if episode != nil {
+			seriesIDs = append(seriesIDs, episode.SeriesID)
+		}
+	}
+	originalBySeries, err := s.seriesOriginalLanguages(ctx, seriesIDs, filter)
+	if err != nil {
+		return episodes, err
+	}
+
+	targets := make(map[string]string, len(episodes))
+	idsByLanguage := make(map[string][]string)
+	for _, ep := range episodes {
+		if ep == nil || ep.ContentID == "" {
+			continue
+		}
+		target := presentationLanguageForOriginal(base, originalBySeries[ep.SeriesID], filter)
+		targets[ep.ContentID] = target
+		if target == "" || sameMetadataLanguage(ep.DefaultMetadataLanguage, target) {
+			continue
+		}
+		idsByLanguage[target] = append(idsByLanguage[target], ep.ContentID)
+	}
+
+	languages := make([]string, 0, len(idsByLanguage))
+	for language := range idsByLanguage {
+		languages = append(languages, language)
+	}
+	sort.Strings(languages)
+	locs := make(map[string]*models.EpisodeLocalization)
+	for _, language := range languages {
+		rows, err := s.episodeLocRepo.GetByEpisodeIDs(ctx, idsByLanguage[language], language)
+		if err != nil {
+			return episodes, err
+		}
+		for episodeID, localization := range rows {
+			locs[episodeID] = localization
+		}
+	}
+	localized := make([]*models.Episode, len(episodes))
+	for i, ep := range episodes {
+		localized[i] = ep
+		if ep == nil {
+			continue
+		}
+		target := targets[ep.ContentID]
+		if target == "" || sameMetadataLanguage(ep.DefaultMetadataLanguage, target) {
+			continue
+		}
+		loc := locs[ep.ContentID]
+		if loc != nil {
+			localized[i] = applyEpisodeLocalization(ep, loc)
+		}
+		if strings.TrimSpace(ep.Overview) != "" && (loc == nil || loc.Overview == "") {
+			if localized[i] == ep {
+				localized[i] = cloneEpisode(ep)
+			}
+			localized[i].PendingTranslationLanguage = target
+		}
+	}
+	return localized, nil
+}
+
+// GetItemDetail retrieves a full item detail with presigned URLs and file versions.
+func (s *DetailService) GetItemDetail(ctx context.Context, contentID string, filter AccessFilter) (*ItemDetail, error) {
+	return s.GetItemDetailWithOptions(ctx, contentID, filter, ItemDetailOptions{})
+}
+
+// ItemDetailOptions leaves out the parts of one item's detail that a caller
+// never reads. The zero value builds the full detail, and every part that is
+// not skipped is identical to what GetItemDetail returns.
+type ItemDetailOptions struct {
+	// SkipPlaybackPreviews leaves each version's Trickplay and MarkerPreviews
+	// unset. Only the watch and Jellyfin views carry them; resolving them
+	// costs a trickplay query and signing every marker thumbnail.
+	SkipPlaybackPreviews bool
+	// SkipFolderPaths leaves a series' FolderPaths empty, as
+	// ItemDetailBatchOptions.SkipFolderPaths does.
+	SkipFolderPaths bool
+}
+
+// GetItemDetailWithOptions is GetItemDetail without the parts opts skips.
+func (s *DetailService) GetItemDetailWithOptions(ctx context.Context, contentID string, filter AccessFilter, opts ItemDetailOptions) (*ItemDetail, error) {
+	target, err := s.resolveDetailTarget(ctx, contentID, filter)
+	if err != nil {
+		return nil, err
+	}
+	trickplay := s.trickplay
+	if opts.SkipPlaybackPreviews {
+		trickplay = nil
+	}
+	switch {
+	case target.item != nil:
+		// Nothing is prefetched for one item: pf only carries what opts skips.
+		pf := &itemDetailPrefetch{trickplay: trickplay, skipFolderPaths: opts.SkipFolderPaths, skipMarkerPreviews: opts.SkipPlaybackPreviews}
+		detail, err := s.buildMediaItemDetail(ctx, target.item, contentID, filter, pf)
+		if err != nil {
+			return nil, err
+		}
+		s.attachExtraBackdrops(ctx, []*ItemDetail{detail}, filter.Artwork(), true)
+		return detail, nil
+	case target.season != nil:
+		return s.buildSeasonDetail(ctx, target.season, filter)
+	case target.episode != nil:
+		seriesCtx, err := s.buildSeriesDetailContext(ctx, target.episode.SeriesID, filter)
+		if err != nil {
+			return nil, err
+		}
+		seriesCtx.trickplay, seriesCtx.skipMarkerPreviews = trickplay, opts.SkipPlaybackPreviews
+		return s.buildEpisodeDetail(ctx, target.episode, seriesCtx, filter)
+	default:
+		return s.buildExtraItemDetail(ctx, target.extra, filter, trickplay, !opts.SkipPlaybackPreviews)
+	}
+}
+
+const (
+	detailTypeAudiobook = "audiobook"
+	detailTypeEbook     = "ebook"
+	detailTypeEpisode   = "episode"
+	detailTypeExtra     = "extra"
+)
+
+// GetItemVersions builds the browse version selector without loading unrelated
+// presentation data. It shares detail authorization and playback metadata, but
+// does not require localization, credits, artwork, or recommendations to succeed.
+func (s *DetailService) GetItemVersions(ctx context.Context, contentID string, filter AccessFilter) ([]FileVersion, error) {
+	return s.GetItemVersionsWithOptions(ctx, contentID, filter, ItemVersionsOptions{})
+}
+
+// ItemVersionsOptions shapes what GetItemVersionsWithOptions answers.
+type ItemVersionsOptions struct {
+	// HideFileIdentity strips file identity for a viewer who may not see it
+	// (see HideFileIdentity).
+	HideFileIdentity bool
+}
+
+// GetItemVersionsWithOptions is GetItemVersions shaped by opts.
+func (s *DetailService) GetItemVersionsWithOptions(ctx context.Context, contentID string, filter AccessFilter, opts ItemVersionsOptions) ([]FileVersion, error) {
+	target, err := s.resolveDetailTarget(ctx, contentID, filter)
+	if err != nil {
+		return nil, err
+	}
+	var files []*models.MediaFile
+	audioPreferenceContentID := contentID
+	switch {
+	case target.season != nil || (target.item != nil && target.item.Type == playableTypeSeries):
+		return []FileVersion{}, nil
+	case target.item != nil:
+		files, err = s.fileFetcher.GetByContentID(ctx, contentID)
+	case target.episode != nil:
+		files, err = s.fileFetcher.GetByEpisodeID(ctx, contentID)
+		audioPreferenceContentID = target.episode.SeriesID
+	default:
+		fetcher, ok := s.fileFetcher.(extraFileFetcher)
+		if !ok {
+			return nil, ErrItemNotFound
+		}
+		files, err = fetcher.GetByExtraID(ctx, contentID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fetching file versions: %w", err)
+	}
+	files = FilterMediaFilesByAccess(files, filter)
+	if target.item != nil && target.item.Type == detailTypeAudiobook {
+		sortAudiobookMediaFiles(files)
+	}
+	files = s.prepareBrowseFiles(ctx, files)
+	versions, _, _, _, _, _, _ := s.buildPlaybackInfo(ctx, files, filter, audioPreferenceContentID)
+	itemType := detailTypeExtra
+	switch {
+	case target.item != nil:
+		itemType = target.item.Type
+	case target.episode != nil:
+		itemType = detailTypeEpisode
+	}
+	sortVideoVersions(itemType, versions)
+	if opts.HideFileIdentity {
+		HideFileIdentity(versions, itemType)
+	}
+	return versions, nil
+}
+
+// detailTarget is exactly one authorized catalog row. Keeping target resolution
+// shared prevents versions-only reads from drifting from detail access rules.
+type detailTarget struct {
+	item    *models.MediaItem
+	season  *models.Season
+	episode *models.Episode
+	extra   *models.MediaExtra
+}
+
+func (s *DetailService) resolveDetailTarget(ctx context.Context, contentID string, filter AccessFilter) (*detailTarget, error) {
+	item, err := s.itemRepo.GetByID(ctx, contentID)
+	switch {
+	case err == nil:
+		if err := s.itemRepo.EnsureAccessible(ctx, contentID, filter); err != nil {
+			return nil, err
+		}
+		if err := s.validatePresentationItemAccess(ctx, filter, contentID); err != nil {
+			return nil, err
+		}
+		return &detailTarget{item: item}, nil
+	case !errors.Is(err, ErrItemNotFound):
+		return nil, err
+	}
+
+	if s.seasonRepo == nil {
+		return nil, ErrItemNotFound
+	}
+
+	season, err := s.seasonRepo.GetByID(ctx, contentID)
+	if err == nil {
+		if err := s.itemRepo.EnsureAccessible(ctx, season.SeriesID, filter); err != nil {
+			return nil, err
+		}
+		if err := s.validatePresentationItemAccess(ctx, filter, season.SeriesID); err != nil {
+			return nil, err
+		}
+		return &detailTarget{season: season}, nil
+	} else if !errors.Is(err, ErrSeasonNotFound) {
+		return nil, err
+	}
+
+	if s.episodeRepo == nil {
+		return nil, ErrItemNotFound
+	}
+
+	episode, err := s.episodeRepo.GetByID(ctx, contentID)
+	if err != nil {
+		if errors.Is(err, ErrEpisodeNotFound) {
+			if s.extraRepo == nil {
+				return nil, ErrItemNotFound
+			}
+			extra, err := s.extraRepo.GetByID(ctx, contentID)
+			if err != nil {
+				if errors.Is(err, ErrExtraNotFound) {
+					return nil, ErrItemNotFound
+				}
+				return nil, err
+			}
+			if err := s.itemRepo.EnsureAccessible(ctx, extra.ParentID, filter); err != nil {
+				return nil, err
+			}
+			if err := s.validatePresentationItemAccess(ctx, filter, extra.ParentID); err != nil {
+				return nil, err
+			}
+			return &detailTarget{extra: extra}, nil
+		}
+		return nil, err
+	}
+	if err := s.itemRepo.EnsureAccessible(ctx, episode.SeriesID, filter); err != nil {
+		return nil, err
+	}
+	if err := s.validatePresentationEpisodeAccess(ctx, filter, episode); err != nil {
+		return nil, err
+	}
+	return &detailTarget{episode: episode}, nil
+}
+
+// buildExtraItemDetail resolves a local extra as a minimal ItemDetail:
+// title/kind plus the ordinary playback surface (versions, subtitles) built
+// from its backing files. Access control is the parent item's. A nil
+// trickplay and markerPreviews false leave the versions' previews unset.
+func (s *DetailService) buildExtraItemDetail(ctx context.Context, extra *models.MediaExtra, filter AccessFilter, trickplay TrickplayAvailability, markerPreviews bool) (*ItemDetail, error) {
+	fetcher, ok := s.fileFetcher.(extraFileFetcher)
+	if !ok {
+		return nil, ErrItemNotFound
+	}
+	files, err := fetcher.GetByExtraID(ctx, extra.ContentID)
+	if err != nil {
+		return nil, fmt.Errorf("fetching extra files: %w", err)
+	}
+	files = FilterMediaFilesByAccess(files, filter)
+	files = s.prepareBrowseFiles(ctx, files)
+
+	detail := &ItemDetail{
+		ContentID: extra.ContentID,
+		Type:      "extra",
+		Title:     extra.Title,
+		Genres:    []string{},
+		Cast:      []CastCredit{},
+		Crew:      []CrewCredit{},
+		Studios:   []string{},
+		Networks:  []string{},
+	}
+	detail.Versions, detail.PlaybackVariants, detail.Subtitles, detail.Intro, detail.Credits, detail.Recap, detail.Preview = s.buildPlaybackInfoWith(
+		ctx,
+		files,
+		filter,
+		s.newAudioPrefResolver(ctx, filter, extra.ContentID),
+		trickplay,
+		markerPreviews,
+	)
+	sortVideoVersions(detail.Type, detail.Versions)
+	if parent, parentErr := s.itemRepo.GetByID(ctx, extra.ParentID); parentErr == nil {
+		if localized, locErr := s.LocalizeItemModel(ctx, parent, filter); locErr == nil {
+			parent = localized
+		}
+		if detail.Title == "" {
+			detail.Title = parent.Title
+		}
+		// Series fields only for series-owned extras: clients treat a
+		// populated series_id as episodic context (post-roll/next-episode
+		// flows), which is wrong for a movie's extras.
+		if parent.Type == "series" {
+			detail.SeriesID = extra.ParentID
+			detail.SeriesTitle = parent.Title
+		}
+		detail.Year = parent.Year
+	}
+	return detail, nil
+}
+
+// seriesDetailContext caches series-level lookups so a batched episode-detail
+// call doesn't redo them per episode.
+type seriesDetailContext struct {
+	series      *models.MediaItem
+	castCredits []CastCredit
+	crewCredits []CrewCredit
+	versionPref versionDefaults
+	backdropURL string
+	posterURL   string
+	// seasonPosters caches each season's signed poster, so a batch of one
+	// season's episodes signs it once. seasons holds the series' localized
+	// seasons when a batch prefetched them.
+	seasonPosters map[string]seasonPoster
+	seasons       map[string]*models.Season
+	// The viewer's audio and subtitle preferences depend only on the series
+	// and the library a file lives in, so a batch resolves them once per
+	// series (and library) instead of once per episode.
+	audio            *audioPrefResolver
+	subtitleDefaults map[int]subtitleDefaults
+	filesByEpisode   map[string][]*models.MediaFile
+	trickplay        TrickplayAvailability
+	// skipMarkerPreviews leaves each version's MarkerPreviews unset for a
+	// caller that never reads them (see ItemDetailOptions).
+	skipMarkerPreviews bool
+}
+
+// buildSeriesDetailContext loads the parent series row, localizes it, fetches
+// its credits, computes the user's series-level version preference, and
+// presigns the backdrop URL — the work that buildEpisodeDetail used to do
+// inline on every call. Hoisted into a helper so the batch path
+// (GetEpisodeDetailsForSeries) can reuse one context across many episodes.
+func (s *DetailService) buildSeriesDetailContext(ctx context.Context, seriesID string, filter AccessFilter) (*seriesDetailContext, error) {
+	series, err := s.itemRepo.GetByID(ctx, seriesID)
+	if err != nil {
+		return nil, fmt.Errorf("loading parent series: %w", err)
+	}
+	series, err = s.LocalizeItemModel(ctx, series, filter)
+	if err != nil {
+		return nil, fmt.Errorf("localizing episode series detail: %w", err)
+	}
+	castCredits, crewCredits := s.fetchCredits(ctx, seriesID, filter)
+	return &seriesDetailContext{
+		series:           series,
+		castCredits:      castCredits,
+		crewCredits:      crewCredits,
+		versionPref:      s.effectiveVersionDefaults(ctx, filter, seriesID),
+		backdropURL:      s.PresignImageURL(ctx, series.BackdropPath, "backdrop", string(filter.ImageSizeFor(imagesize.SlotBackdrop))),
+		posterURL:        s.PresignImageURL(ctx, series.PosterPath, "poster", string(filter.ImageSizeFor(imagesize.SlotPoster))),
+		seasonPosters:    map[string]seasonPoster{},
+		audio:            s.newAudioPrefResolver(ctx, filter, seriesID),
+		subtitleDefaults: map[int]subtitleDefaults{},
+		trickplay:        s.trickplay,
+	}, nil
+}
+
+// episodeAudioResolver returns the series' shared audio resolver, or a fresh
+// one for an episode of another series.
+func (s *DetailService) episodeAudioResolver(ctx context.Context, seriesCtx *seriesDetailContext, filter AccessFilter, seriesID string) *audioPrefResolver {
+	if seriesID != seriesCtx.series.ContentID {
+		return s.newAudioPrefResolver(ctx, filter, seriesID)
+	}
+	return seriesCtx.audio
+}
+
+// episodeSubtitleDefaults memoizes effectiveSubtitleDefaults for the series by
+// the library that decides the settings scope. An episode of another series
+// resolves its own.
+func (s *DetailService) episodeSubtitleDefaults(ctx context.Context, seriesCtx *seriesDetailContext, filter AccessFilter, seriesID string, files []*models.MediaFile) subtitleDefaults {
+	if seriesID != seriesCtx.series.ContentID {
+		return s.effectiveSubtitleDefaults(ctx, filter, seriesID, files)
+	}
+	libraryID := preferredPlayableLibraryID(files, filter.SelectedFileID)
+	if defaults, ok := seriesCtx.subtitleDefaults[libraryID]; ok {
+		return defaults
+	}
+	defaults := s.effectiveSubtitleDefaults(ctx, filter, seriesID, files)
+	seriesCtx.subtitleDefaults[libraryID] = defaults
+	return defaults
+}
+
+// GetEpisodeDetailsForSeries returns ItemDetails for the requested episodes,
+// hoisting series-level lookups so they run once per series instead of per
+// episode. Used by the jellycompat /Shows/{id}/Episodes endpoint when clients
+// request detail-level fields (Fields=MediaSources,MediaStreams,Chapters,
+// People). Episodes that fail per-episode access checks are skipped silently.
+func (s *DetailService) GetEpisodeDetailsForSeries(
+	ctx context.Context,
+	seriesID string,
+	episodeContentIDs []string,
+	filter AccessFilter,
+) (map[string]*ItemDetail, error) {
+	result := make(map[string]*ItemDetail, len(episodeContentIDs))
+	if len(episodeContentIDs) == 0 || s.episodeRepo == nil {
+		return result, nil
+	}
+	if err := s.itemRepo.EnsureAccessible(ctx, seriesID, filter); err != nil {
+		return nil, err
+	}
+	seriesCtx, err := s.buildSeriesDetailContext(ctx, seriesID, filter)
+	if err != nil {
+		return nil, err
+	}
+	s.prefetchSeasons(ctx, seriesCtx, filter)
+	if fetcher, ok := s.fileFetcher.(interface {
+		ListByEpisodeIDs(context.Context, []string) (map[string][]*models.MediaFile, error)
+	}); ok {
+		files, err := fetcher.ListByEpisodeIDs(ctx, episodeContentIDs)
+		if err == nil {
+			if files == nil {
+				files = map[string][]*models.MediaFile{}
+			}
+			seriesCtx.filesByEpisode = files
+			seriesCtx.trickplay = s.prefetchTrickplay(ctx, files)
+		}
+		// A failed optional batch leaves the per-episode reads in place. Their
+		// existing error handling skips only the detail that could not be built.
+	}
+	// One read for the whole page, rather than one per episode.
+	episodes, err := s.episodeRepo.GetByIDs(ctx, episodeContentIDs)
+	if err != nil {
+		return nil, err
+	}
+	episodesByID := make(map[string]*models.Episode, len(episodes))
+	for _, episode := range episodes {
+		if episode != nil {
+			episodesByID[episode.ContentID] = episode
+		}
+	}
+	// One membership read for the page. Each episode must itself be in the
+	// presentation library, as validatePresentationItemAccess requires of one ID.
+	var inLibrary map[string]bool
+	if filter.PresentationLibraryID != nil {
+		inLibrary, err = s.itemRepo.GetItemsInLibrary(ctx, episodeContentIDs, *filter.PresentationLibraryID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, contentID := range episodeContentIDs {
+		episode := episodesByID[contentID]
+		if episode == nil {
+			continue
+		}
+		if filter.PresentationLibraryID != nil && !inLibrary[contentID] {
+			continue
+		}
+		detail, err := s.buildEpisodeDetail(ctx, episode, seriesCtx, filter)
+		if err != nil {
+			// Skip this episode rather than failing the whole batch — the
+			// caller falls back to list-mapping for any contentID missing
+			// from the result map, matching the prior per-episode loop's
+			// behaviour where one bad detail didn't break the series page.
+			continue
+		}
+		result[contentID] = detail
+	}
+	return result, nil
+}
+
+// fileVersionBatchFetcher is the optional batch form of FileVersionFetcher.
+// When the configured fetcher implements it, GetItemDetailsByIDs loads every
+// page item's media files in one query instead of one per item. Fetchers that
+// don't implement it (e.g. some test fakes) transparently fall back to the
+// per-item GetByContentID path inside buildMediaItemDetail.
+type fileVersionBatchFetcher interface {
+	ListByContentIDs(ctx context.Context, contentIDs []string) (map[string][]*models.MediaFile, error)
+}
+
+// GetItemDetailsByIDs returns full item details for the given content IDs,
+// batching the shared per-item lookups that GetItemDetail otherwise issues
+// one-at-a-time: row load (GetByIDs), access checks (EnsureAccessibleIDs +
+// presentation-library membership), localization, credits, media files, and
+// work summaries. The detail produced for each id matches calling
+// GetItemDetail(id): the same builder (buildMediaItemDetail) assembles it, only
+// fed pre-resolved inputs via itemDetailPrefetch. Any input building block
+// missing a batch form falls back to its inline per-item lookup, so the output
+// never drifts from the unbatched path. The one difference is the URLs that only
+// single-item detail returns: the banner, thumb, clear art and disc art URLs and
+// BackdropURLs are left empty, and their paths are set instead.
+//
+// IDs that are not item-typed media (e.g. episodes or seasons — handled by
+// GetEpisodeDetailsForSeries / GetItemDetail respectively), are access-filtered,
+// or fail to build are simply absent from the result map, mirroring
+// GetItemDetail returning an error so callers fall back to list-level rendering.
+func (s *DetailService) GetItemDetailsByIDs(ctx context.Context, contentIDs []string, filter AccessFilter) (map[string]*ItemDetail, error) {
+	return s.GetItemDetailsByIDsWithOptions(ctx, contentIDs, filter, ItemDetailBatchOptions{})
+}
+
+// ItemDetailBatchOptions leaves out the parts of a batched item detail that a
+// list caller never reads. Each omitted part costs per-item work, so a card
+// list that renders details should skip what it does not show. The zero value
+// builds the full detail, and every part that is not skipped is identical to
+// what GetItemDetailsByIDs returns.
+type ItemDetailBatchOptions struct {
+	// SkipCredits leaves Cast and Crew empty, and with them the audiobook and
+	// ebook people built from the crew.
+	SkipCredits bool
+	// SkipFolderPaths leaves a series' FolderPaths empty. Resolving them costs
+	// up to three queries per series, the last of which loads every episode
+	// file when the series has no group or root claims.
+	SkipFolderPaths bool
+	// SkipSubtitleDefaults leaves a movie's effective subtitle defaults
+	// (EffectiveSubtitle*) unset. Resolving them costs two queries per movie.
+	SkipSubtitleDefaults bool
+}
+
+// GetItemDetailsByIDsWithOptions is GetItemDetailsByIDs without the parts opts
+// skips.
+func (s *DetailService) GetItemDetailsByIDsWithOptions(ctx context.Context, contentIDs []string, filter AccessFilter, opts ItemDetailBatchOptions) (map[string]*ItemDetail, error) {
+	result := make(map[string]*ItemDetail, len(contentIDs))
+	visible, err := s.visibleDetailItems(ctx, contentIDs, filter)
+	if err != nil {
+		return nil, err
+	}
+	if len(visible) == 0 {
+		return result, nil
+	}
+	visibleIDs := make([]string, 0, len(visible))
+	nonSeriesIDs := make([]string, 0, len(visible))
+	var workIDs []string
+	for _, item := range visible {
+		visibleIDs = append(visibleIDs, item.ContentID)
+		if item.Type != "series" {
+			nonSeriesIDs = append(nonSeriesIDs, item.ContentID)
+		}
+		if typeHasLiteraryWork(item.Type) {
+			workIDs = append(workIDs, item.ContentID)
+		}
+	}
+
+	// Localization keeps one lookup per target language. Most profiles still
+	// produce one query; profiles with source-language exceptions produce one
+	// query for each target represented on this page.
+	targetByID, locByID, err := s.loadItemLocalizations(ctx, visible, filter)
+	if err != nil {
+		return nil, fmt.Errorf("localizing item detail: %w", err)
+	}
+
+	// Credits for the whole page in one query.
+	var creditsByID map[string][]models.ItemPerson
+	if s.personRepo != nil && !opts.SkipCredits {
+		creditsByID, err = s.personRepo.ListForItems(ctx, visibleIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Media files (playable versions) for non-series items in one query, when the
+	// fetcher supports batching.
+	var filesByID map[string][]*models.MediaFile
+	batchFetcher, haveFileBatch := s.fileFetcher.(fileVersionBatchFetcher)
+	if haveFileBatch && len(nonSeriesIDs) > 0 {
+		filesByID, err = batchFetcher.ListByContentIDs(ctx, nonSeriesIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	trickplay := s.trickplay
+	if haveFileBatch {
+		trickplay = s.prefetchTrickplay(ctx, filesByID)
+	}
+
+	sideTables, err := s.prefetchItemSideTables(ctx, visible)
+	if err != nil {
+		return nil, err
+	}
+	var audioResolvers map[string]*audioPrefResolver
+	if haveFileBatch {
+		audioResolvers = s.prefetchAudioResolvers(ctx, visible, filesByID, filter)
+	}
+
+	// Work summaries for the whole page in one query, when the provider supports
+	// batching (ListSummariesForContentIDs is the documented batch equivalent of
+	// GetSummaryForContentID). Only book items can have one.
+	var workSummaries map[string]*WorkSummary
+	batchSummary, haveWorkSummaryBatch := s.workSummary.(WorkSummaryBatchProvider)
+	if haveWorkSummaryBatch && len(workIDs) > 0 {
+		workSummaries, err = batchSummary.ListSummariesForContentIDs(ctx, workIDs, filter)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, item := range visible {
+		id := item.ContentID
+		language := targetByID[id]
+		loc := locByID[id]
+		pending := ""
+		if s.itemLocRepo != nil {
+			pending = pendingTranslationLanguageWith(item, language, loc)
+		}
+		pf := &itemDetailPrefetch{
+			haveLocalization:   true,
+			pendingTranslation: pending,
+			localizedItem:      s.localizeItemModelWith(item, language, loc),
+			// Skipped credits count as prefetched, so the builder does not
+			// look them up item by item instead.
+			haveCredits:          s.personRepo != nil || opts.SkipCredits,
+			skipFolderPaths:      opts.SkipFolderPaths,
+			skipSubtitleDefaults: opts.SkipSubtitleDefaults,
+			audioResolver:        audioResolvers[id],
+			trickplay:            trickplay,
+		}
+		if s.personRepo != nil && !opts.SkipCredits {
+			pf.castCredits, pf.crewCredits = splitCastCrew(s.personCredits(ctx, creditsByID[id], filter))
+		}
+		if item.Type != "series" && haveFileBatch {
+			pf.haveFiles = true
+			pf.files = filesByID[id]
+		}
+		if haveWorkSummaryBatch {
+			pf.haveWorkSummary = true
+			pf.workSummary = workSummaries[id]
+		}
+		sideTables.apply(pf, item)
+		detail, err := s.buildMediaItemDetail(ctx, item, id, filter, pf)
+		if err != nil {
+			// Skip rather than fail the batch; the caller falls back to list
+			// rendering for any id missing from the result, matching the
+			// per-item path where one item's build error never breaks the page.
+			continue
+		}
+		result[id] = detail
+	}
+	s.attachExtraBackdrops(ctx, slices.Collect(maps.Values(result)), filter.Artwork(), false)
+	return result, nil
+}
+
+// visibleDetailItems loads the media_items rows for contentIDs that the viewer
+// may see, with access checks batched to match GetItemDetail's per-item
+// EnsureAccessible and validatePresentationItemAccess exactly.
+func (s *DetailService) visibleDetailItems(ctx context.Context, contentIDs []string, filter AccessFilter) ([]*models.MediaItem, error) {
+	if len(contentIDs) == 0 {
+		return nil, nil
+	}
+	items, err := s.itemRepo.GetByIDs(ctx, contentIDs)
+	if err != nil || len(items) == 0 {
+		return nil, err
+	}
+	foundIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		foundIDs = append(foundIDs, item.ContentID)
+	}
+	accessible, err := s.itemRepo.EnsureAccessibleIDs(ctx, foundIDs, filter)
+	if err != nil {
+		return nil, err
+	}
+	presentationOK := func(string) bool { return true }
+	if filter.PresentationLibraryID != nil {
+		membership, err := s.itemRepo.GetItemsInLibrary(ctx, foundIDs, *filter.PresentationLibraryID)
+		if err != nil {
+			return nil, err
+		}
+		presentationOK = func(id string) bool { return membership[id] }
+	}
+	visible := make([]*models.MediaItem, 0, len(items))
+	for _, item := range items {
+		if accessible[item.ContentID] && presentationOK(item.ContentID) {
+			visible = append(visible, item)
+		}
+	}
+	return visible, nil
+}
+
+// itemSideTables holds a page's remote videos, per-source ratings and local
+// extras, which only movies and series carry.
+type itemSideTables struct {
+	haveVideos, haveRatingSources, haveExtras bool
+
+	videos        map[string][]models.ItemVideo
+	ratingSources map[string][]models.ItemRatingSource
+	extras        map[string][]ExtraWithFile
+}
+
+// prefetchItemSideTables loads the side tables for every movie and series on
+// the page, one query per table.
+func (s *DetailService) prefetchItemSideTables(ctx context.Context, items []*models.MediaItem) (itemSideTables, error) {
+	tables := itemSideTables{
+		haveVideos:        s.videoRepo != nil,
+		haveRatingSources: s.ratingSourceRepo != nil,
+		haveExtras:        s.extraRepo != nil,
+	}
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Type == playableTypeMovie || item.Type == playableTypeSeries {
+			ids = append(ids, item.ContentID)
+		}
+	}
+	if len(ids) == 0 {
+		return tables, nil
+	}
+	var err error
+	if tables.haveVideos {
+		if tables.videos, err = s.videoRepo.ListByContentIDs(ctx, ids); err != nil {
+			return tables, err
+		}
+	}
+	if tables.haveRatingSources {
+		if tables.ratingSources, err = s.ratingSourceRepo.ListByContentIDs(ctx, ids); err != nil {
+			return tables, err
+		}
+	}
+	if tables.haveExtras {
+		if tables.extras, err = s.extraRepo.ListWithFilesByParentIDs(ctx, ids); err != nil {
+			return tables, err
+		}
+	}
+	return tables, nil
+}
+
+// apply hands item's prefetched side tables to its detail build.
+func (t itemSideTables) apply(pf *itemDetailPrefetch, item *models.MediaItem) {
+	if item.Type != playableTypeMovie && item.Type != playableTypeSeries {
+		return
+	}
+	id := item.ContentID
+	pf.haveVideos, pf.videos = t.haveVideos, t.videos[id]
+	pf.haveRatingSources, pf.ratingSources = t.haveRatingSources, t.ratingSources[id]
+	pf.haveExtras, pf.extras = t.haveExtras, t.extras[id]
+}
+
+// fetchItemVideos returns the item's remote videos in API shape, honoring a
+// batch prefetch when present. Lookup failures degrade to an empty section.
+func (s *DetailService) fetchItemVideos(ctx context.Context, contentID string, pf *itemDetailPrefetch) []ItemVideoInfo {
+	var videos []models.ItemVideo
+	if pf != nil && pf.haveVideos {
+		videos = pf.videos
+	} else if s.videoRepo != nil {
+		fetched, err := s.videoRepo.GetByContentID(ctx, contentID)
+		if err != nil {
+			slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "failed to fetch item videos", "content_id", contentID, "error", err)
+			return nil
+		}
+		videos = fetched
+	}
+	if len(videos) == 0 {
+		return nil
+	}
+	infos := make([]ItemVideoInfo, 0, len(videos))
+	for _, v := range videos {
+		infos = append(infos, ItemVideoInfo{
+			Kind:       string(v.Kind),
+			Site:       v.Site,
+			SiteKey:    v.SiteKey,
+			Name:       v.Name,
+			Language:   v.Language,
+			IsOfficial: v.IsOfficial,
+		})
+	}
+	return infos
+}
+
+// fetchItemRatingSources returns the item's per-source ratings in API shape,
+// honoring a batch prefetch when present. Lookup failures degrade to no
+// sources.
+func (s *DetailService) fetchItemRatingSources(ctx context.Context, contentID string, pf *itemDetailPrefetch) []ItemRatingSourceInfo {
+	var sources []models.ItemRatingSource
+	if pf != nil && pf.haveRatingSources {
+		sources = pf.ratingSources
+	} else if s.ratingSourceRepo != nil {
+		fetched, err := s.ratingSourceRepo.GetByContentID(ctx, contentID)
+		if err != nil {
+			slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "failed to fetch item rating sources", "content_id", contentID, "error", err)
+			return nil
+		}
+		sources = fetched
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	infos := make([]ItemRatingSourceInfo, 0, len(sources))
+	for _, source := range sources {
+		infos = append(infos, ItemRatingSourceInfo{
+			Source: source.Source,
+			Score:  source.Score,
+			Votes:  source.Votes,
+		})
+	}
+	return infos
+}
+
+// fetchItemExtras returns the item's local extras in API shape, honoring a
+// batch prefetch when present. Lookup failures degrade to an empty section.
+func (s *DetailService) fetchItemExtras(ctx context.Context, contentID string, filter AccessFilter, pf *itemDetailPrefetch) []ItemExtraInfo {
+	var extras []ExtraWithFile
+	if pf != nil && pf.haveExtras {
+		extras = pf.extras
+	} else if s.extraRepo != nil {
+		fetched, err := s.extraRepo.ListWithFilesByParentID(ctx, contentID)
+		if err != nil {
+			slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "failed to fetch item extras", "content_id", contentID, "error", err)
+			return nil
+		}
+		extras = fetched
+	}
+	if len(extras) == 0 {
+		return nil
+	}
+	stillPaths := make([]string, 0, len(extras))
+	for _, e := range extras {
+		stillPaths = append(stillPaths, e.StillPath)
+	}
+	stillURLs := s.PresignImageURLs(ctx, stillPaths, "still", string(filter.ImageSizeFor(imagesize.SlotStill)))
+	infos := make([]ItemExtraInfo, 0, len(extras))
+	for _, e := range extras {
+		info := ItemExtraInfo{
+			ContentID:       e.ContentID,
+			Kind:            string(e.Kind),
+			Title:           e.Title,
+			DurationSeconds: e.Duration,
+			FileID:          e.FileID,
+			StillPath:       e.StillPath,
+			StillURL:        stillURLs[e.StillPath],
+		}
+		if info.StillURL != "" {
+			info.StillThumbhash = e.StillThumbhash
+		}
+		infos = append(infos, info)
+	}
+	return infos
+}
+
+// fetchCredits returns cast and crew credits for the given content ID.
+func (s *DetailService) fetchCredits(ctx context.Context, contentID string, filter AccessFilter) ([]CastCredit, []CrewCredit) {
+	if s.personRepo == nil {
+		return []CastCredit{}, []CrewCredit{}
+	}
+	people, err := s.personRepo.ListForItem(ctx, contentID)
+	if err != nil {
+		people = nil
+	}
+	credits := s.personCredits(ctx, people, filter)
+	return splitCastCrew(credits)
+}
+
+// itemDetailPrefetch carries per-item lookups that GetItemDetailsByIDs resolves
+// once for a whole page so buildMediaItemDetail can skip the equivalent per-item
+// queries. Each piece is opt-in via its "have" flag: when unset, the builder
+// falls back to its normal inline lookup, so the result is byte-for-byte
+// identical to the unbatched GetItemDetail path regardless of which pieces were
+// prefetched. A nil prefetch reproduces the original per-item behavior exactly.
+type itemDetailPrefetch struct {
+	trickplay          TrickplayAvailability
+	haveLocalization   bool
+	pendingTranslation string
+	localizedItem      *models.MediaItem
+	haveCredits        bool
+	castCredits        []CastCredit
+	crewCredits        []CrewCredit
+	haveFiles          bool
+	files              []*models.MediaFile
+	haveWorkSummary    bool
+	workSummary        *WorkSummary
+	haveVideos         bool
+	videos             []models.ItemVideo
+	haveRatingSources  bool
+	ratingSources      []models.ItemRatingSource
+	haveExtras         bool
+	extras             []ExtraWithFile
+	// skipFolderPaths, skipSubtitleDefaults, and skipMarkerPreviews leave
+	// those parts unresolved for a caller that never reads them (see
+	// ItemDetailBatchOptions and ItemDetailOptions).
+	skipFolderPaths      bool
+	skipSubtitleDefaults bool
+	skipMarkerPreviews   bool
+	// audioResolver, when set, carries the item's audio-preference lookups
+	// already resolved for the page (see prefetchAudioResolvers).
+	audioResolver *audioPrefResolver
+}
+
+func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.MediaItem, contentID string, filter AccessFilter, pf *itemDetailPrefetch) (*ItemDetail, error) {
+	var pendingTranslation string
+	if pf != nil && pf.haveLocalization {
+		pendingTranslation = pf.pendingTranslation
+		item = pf.localizedItem
+	} else {
+		// Share the language and row with the pending-translation decision,
+		// just as the batch detail path does.
+		targets, localizations, err := s.loadItemLocalizations(ctx, []*models.MediaItem{item}, filter)
+		var localizedItem *models.MediaItem
+		if err != nil && strings.TrimSpace(item.Overview) != "" && s.itemLocRepo != nil {
+			// PendingTranslationLanguage historically suppressed its lookup
+			// error before the required localization read. Preserve that retry
+			// on failure without repeating successful lookups.
+			localizedItem, err = s.LocalizeItemModel(ctx, item, filter)
+		} else if err == nil {
+			language, loc := targets[item.ContentID], localizations[item.ContentID]
+			if s.itemLocRepo != nil {
+				pendingTranslation = pendingTranslationLanguageWith(item, language, loc)
+			}
+			localizedItem = s.localizeItemModelWith(item, language, loc)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("localizing item detail: %w", err)
+		}
+		item = localizedItem
+	}
+	var castCredits []CastCredit
+	var crewCredits []CrewCredit
+	if pf != nil && pf.haveCredits {
+		castCredits, crewCredits = pf.castCredits, pf.crewCredits
+	} else {
+		castCredits, crewCredits = s.fetchCredits(ctx, contentID, filter)
+	}
+	detail := &ItemDetail{
+		ContentID:                  item.ContentID,
+		Type:                       item.Type,
+		Title:                      item.Title,
+		SortTitle:                  item.SortTitle,
+		OriginalTitle:              item.OriginalTitle,
+		OriginalLanguage:           item.OriginalLanguage,
+		Year:                       item.Year,
+		Overview:                   item.Overview,
+		Tagline:                    item.Tagline,
+		PendingTranslationLanguage: pendingTranslation,
+		MachineTranslatedFields:    item.MachineTranslatedFields,
+		Runtime:                    item.Runtime,
+		ContentRating:              item.ContentRating,
+		AdvisoryAge:                item.AdvisoryAge,
+		AdvisorySource:             item.AdvisorySource,
+		Genres:                     item.Genres,
+		RatingIMDB:                 item.RatingIMDB,
+		RatingTMDB:                 item.RatingTMDB,
+		RatingRTCritic:             item.RatingRTCritic,
+		RatingRTAudience:           item.RatingRTAudience,
+		ImdbID:                     item.ImdbID,
+		TmdbID:                     item.TmdbID,
+		TvdbID:                     item.TvdbID,
+		Cast:                       castCredits,
+		Crew:                       crewCredits,
+		Studios:                    item.Studios,
+		Networks:                   item.Networks,
+		Countries:                  lang.UniqueCountries(item.Countries),
+		LockedFields:               item.LockedFields,
+		FirstAirDate:               item.FirstAirDate,
+		LastAirDate:                item.LastAirDate,
+		ReleaseDate:                item.ReleaseDate,
+		AirTime:                    item.AirTime,
+		AirTimezone:                item.AirTimezone,
+		ShowStatus:                 item.ShowStatus,
+		PosterThumbhash:            item.PosterThumbhash,
+		BackdropThumbhash:          item.BackdropThumbhash,
+		SeasonCount:                item.SeasonCount,
+		EpisodeMetadataIncomplete:  item.EpisodeMetadataIncomplete,
+		Versions:                   []FileVersion{},
+		PlaybackVariants:           []PlaybackVariant{},
+		Subtitles:                  []SubtitleInfo{},
+	}
+
+	// Resolve image URLs: full URLs (TVDB/TMDB) pass through; S3 cached base paths get
+	// variant-resolved and presigned.
+	detail.PosterURL = s.PresignImageURL(ctx, item.PosterPath, "poster", string(filter.ImageSizeFor(imagesize.SlotPoster)))
+	detail.BackdropURL = s.PresignImageURL(ctx, item.BackdropPath, "backdrop", string(filter.ImageSizeFor(imagesize.SlotBackdrop)))
+	detail.LogoURL = s.PresignImageURL(ctx, item.LogoPath, "logo", string(filter.ImageSizeFor(imagesize.SlotLogo)))
+	detail.PosterPath = item.PosterPath
+	detail.BackdropPath = item.BackdropPath
+	detail.LogoPath = item.LogoPath
+	detail.UpdatedAt = item.UpdatedAt
+	copyExtraArtwork(detail, item)
+
+	// File versions and subtitle aggregation only apply to movies.
+	// For series, each episode file shares the series content_id, so
+	// GetByContentID would return every episode — not alternate encodings.
+	if item.Type != "series" {
+		var files []*models.MediaFile
+		if pf != nil && pf.haveFiles {
+			files = pf.files
+		} else {
+			fetched, err := s.fileFetcher.GetByContentID(ctx, contentID)
+			if err != nil {
+				return nil, fmt.Errorf("fetching file versions: %w", err)
+			}
+			files = fetched
+		}
+
+		files = FilterMediaFilesByAccess(files, filter)
+		if item.Type == detailTypeAudiobook {
+			sortAudiobookMediaFiles(files)
+		}
+		files = s.prepareBrowseFiles(ctx, files)
+		availability := s.trickplay
+		if pf != nil {
+			availability = pf.trickplay
+		}
+		// Movie pre-play selectors need the same effective subtitle defaults
+		// the watch payload resolves — including any per-item override saved
+		// from a previous play — so the item detail can't omit them. Scoped to
+		// movies: episodes resolve theirs in buildEpisodeDetail, and other
+		// types have no subtitle selector to feed.
+		withSubtitleDefaults := item.Type == playableTypeMovie && (pf == nil || !pf.skipSubtitleDefaults)
+		var subtitles subtitleDefaults
+		subtitlesResolved := false
+		var audioResolver *audioPrefResolver
+		if pf != nil {
+			audioResolver = pf.audioResolver
+		}
+		if audioResolver == nil {
+			audioResolver = s.newAudioPrefResolver(ctx, filter, item.ContentID)
+			if withSubtitleDefaults {
+				subtitles, subtitlesResolved = s.prefetchMoviePlaybackDefaults(ctx, filter, item, files, audioResolver)
+			}
+		}
+		detail.Versions, detail.PlaybackVariants, detail.Subtitles, detail.Intro, detail.Credits, detail.Recap, detail.Preview = s.buildPlaybackInfoWith(
+			ctx, files, filter, audioResolver, availability, pf == nil || !pf.skipMarkerPreviews,
+		)
+		sortVideoVersions(item.Type, detail.Versions)
+		detail.OverlaySummary = overlays.BuildSummary(files)
+		if withSubtitleDefaults {
+			if !subtitlesResolved {
+				subtitles = s.effectiveSubtitleDefaults(ctx, filter, item.ContentID, files)
+			}
+			subtitles.applyToItemDetail(detail)
+		}
+	}
+
+	// Trailers, extras and per-source ratings apply to movies and series only.
+	if item.Type == "movie" || item.Type == "series" {
+		detail.Videos = s.fetchItemVideos(ctx, contentID, pf)
+		detail.RatingSources = s.fetchItemRatingSources(ctx, contentID, pf)
+		detail.Extras = s.fetchItemExtras(ctx, contentID, filter, pf)
+	}
+
+	if item.Type == detailTypeAudiobook {
+		detail.Audiobook = s.buildAudiobookExtension(ctx, item, detail.Versions, crewCredits, filter)
+	}
+	if item.Type == "ebook" {
+		detail.Ebook = s.buildEbookExtension(ctx, item, crewCredits, filter)
+		// A manga chapter is an ebook item linked to its series; exposing the
+		// linkage lets the reader navigate back/next within the series and
+		// continue-reading cards show the series instead of the chapter.
+		if seriesID, seriesTitle, ok := s.lookupMangaSeriesForChapter(ctx, item.ContentID); ok {
+			detail.SeriesID = seriesID
+			detail.SeriesTitle = seriesTitle
+		}
+	}
+	if item.Type == "manga" {
+		detail.Manga = s.buildMangaExtension(ctx, item, filter)
+	}
+
+	if item.Type == "series" && (pf == nil || !pf.skipFolderPaths) {
+		detail.FolderPaths = s.seriesFolderPaths(ctx, item, contentID)
+	}
+
+	if pf != nil && pf.haveWorkSummary {
+		applyWorkSummaryValue(detail, pf.workSummary)
+	} else {
+		applyWorkSummary(ctx, detail, s.workSummary, filter)
+	}
+	return detail, nil
+}
+
+// itemStatusMatched is the media_items.status of an item matched to provider
+// metadata.
+const itemStatusMatched = "matched"
+
+// seriesFolderPaths resolves a series' folder paths from confirmed claims when
+// available, otherwise from the file links that currently belong to the item.
+// This keeps provisional root-scoped series visible for manual match/admin
+// flows without implying confirmed cross-root ownership.
+func (s *DetailService) seriesFolderPaths(ctx context.Context, item *models.MediaItem, contentID string) []string {
+	if item.Status == itemStatusMatched {
+		if paths := s.claimedSeriesFolderPaths(ctx, contentID); len(paths) > 0 {
+			return paths
+		}
+	}
+	if s.fileFetcher == nil {
+		return nil
+	}
+	files, err := s.fileFetcher.GetByContentID(ctx, contentID)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to fetch series files for folder paths", "component", "catalog", "content_id", contentID, "error", err)
+		return nil
+	}
+	return seriesFolderPathsFromFiles(files)
+}
+
+// claimedSeriesFolderPaths returns a matched series' observed group roots, or
+// failing those its confirmed root claims.
+func (s *DetailService) claimedSeriesFolderPaths(ctx context.Context, contentID string) []string {
+	if s.groupClaimRepo != nil {
+		paths, err := s.groupClaimRepo.ListObservedRootsByContentID(ctx, contentID)
+		if err != nil {
+			slog.WarnContext(ctx, "failed to fetch series group locations", "component", "catalog", "content_id", contentID, "error", err)
+		} else if len(paths) > 0 {
+			return paths
+		}
+	}
+	if s.rootClaimRepo == nil {
+		return nil
+	}
+	roots, err := s.rootClaimRepo.ListByContentID(ctx, contentID)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to fetch series root claims", "component", "catalog", "content_id", contentID, "error", err)
+		return nil
+	}
+	paths := make([]string, len(roots))
+	for i, root := range roots {
+		paths[i] = root.CanonicalRootPath
+	}
+	return paths
+}
+
+// typeHasLiteraryWork reports whether items of itemType can belong to a
+// literary work. A work links an item under its own type, and the
+// literary_work_items format_type CHECK admits only these.
+func typeHasLiteraryWork(itemType string) bool {
+	switch itemType {
+	case detailTypeAudiobook, "ebook", "comic", "manga":
+		return true
+	}
+	return false
+}
+
+func applyWorkSummary(ctx context.Context, detail *ItemDetail, provider WorkSummaryProvider, filter AccessFilter) {
+	if detail == nil || provider == nil || detail.ContentID == "" || !typeHasLiteraryWork(detail.Type) {
+		return
+	}
+	summary, err := provider.GetSummaryForContentID(ctx, detail.ContentID, filter)
+	if err != nil {
+		return
+	}
+	applyWorkSummaryValue(detail, summary)
+}
+
+// applyWorkSummaryValue copies a resolved work summary onto the detail. Shared by
+// the per-item (applyWorkSummary) and batched (GetItemDetailsByIDs) paths so a
+// summary fetched in bulk applies identically. A nil summary is a no-op.
+func applyWorkSummaryValue(detail *ItemDetail, summary *WorkSummary) {
+	if detail == nil || summary == nil {
+		return
+	}
+	detail.WorkID = summary.WorkID
+	detail.WorkTitle = summary.Title
+	detail.WorkFormats = summary.Formats
+}
+
+// personCredits converts ItemPerson slice to PersonCredit slice with presigned URLs.
+func (s *DetailService) personCredits(ctx context.Context, people []models.ItemPerson, filter AccessFilter) []PersonCredit {
+	photoPaths := make([]string, len(people))
+	paths := make([]string, 0, len(people))
+	seen := make(map[string]struct{}, len(people))
+	size := filter.ImageSizeFor(imagesize.SlotPhoto)
+	variant := imagesize.PhotoPluginVariant(size)
+	for i, person := range people {
+		path := person.PhotoPath
+		if path == "" || path == "-" || strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+			continue
+		}
+		// Cached headshots resolve on the profile ladder; an absent size is its
+		// medium rung, the w500 the people endpoints serve, because the stored
+		// original can be up to 3840px tall and no cast card draws that.
+		// Plugin-hosted photos keep the historical large hint above.
+		path = cachedImageVariantPath(path, artworkkey.ImageProfile, string(size))
+		photoPaths[i] = path
+		if _, ok := seen[path]; !ok {
+			seen[path] = struct{}{}
+			paths = append(paths, path)
+		}
+	}
+	photoURLs := s.PresignURLsWithExpiry(ctx, paths, variant)
+	for _, path := range paths {
+		if photoURLs[path].URL == "" {
+			// Partial batch implementations retain their individual fallback.
+			photoURLs[path] = s.PresignURLWithExpiry(ctx, path, variant)
+		}
+	}
+	credits := make([]PersonCredit, 0, len(people))
+	for i, p := range people {
+		pc := PersonCredit{
+			PersonID:  p.ID,
+			Name:      p.Name,
+			Kind:      p.Kind,
+			Character: p.Character,
+			SortOrder: p.SortOrder,
+			TmdbID:    p.TmdbID,
+			ImdbID:    p.ImdbID,
+			TvdbID:    p.TvdbID,
+			PlexGUID:  p.PlexGUID,
+			PhotoPath: p.PhotoPath,
+		}
+		if strings.HasPrefix(p.PhotoPath, "http://") || strings.HasPrefix(p.PhotoPath, "https://") {
+			pc.PhotoURL = ImageURLOrEmpty(p.PhotoPath)
+		} else if photoPaths[i] != "" {
+			pc.PhotoURL = photoURLs[photoPaths[i]].URL
+		}
+		if p.PhotoThumbhash != "" && p.PhotoThumbhash != "-" {
+			pc.PhotoThumbhash = p.PhotoThumbhash
+		}
+		credits = append(credits, pc)
+	}
+	return credits
+}
+
+// splitCastCrew splits PersonCredits into CastCredit and CrewCredit slices
+// for backward-compatible API responses.
+func splitCastCrew(credits []PersonCredit) ([]CastCredit, []CrewCredit) {
+	var cast []CastCredit
+	var crew []CrewCredit
+	for _, pc := range credits {
+		switch pc.Kind {
+		case models.PersonKindActor, models.PersonKindGuestStar:
+			cast = append(cast, CastCredit{
+				Name:           pc.Name,
+				Character:      pc.Character,
+				Order:          pc.SortOrder,
+				PersonID:       strconv.FormatInt(pc.PersonID, 10),
+				TmdbID:         pc.TmdbID,
+				ImdbID:         pc.ImdbID,
+				TvdbID:         pc.TvdbID,
+				PlexGUID:       pc.PlexGUID,
+				PhotoURL:       pc.PhotoURL,
+				PhotoThumbhash: pc.PhotoThumbhash,
+				PhotoPath:      pc.PhotoPath,
+			})
+		default:
+			crew = append(crew, CrewCredit{
+				Name:           pc.Name,
+				Job:            pc.Kind.String(),
+				PersonID:       strconv.FormatInt(pc.PersonID, 10),
+				TmdbID:         pc.TmdbID,
+				ImdbID:         pc.ImdbID,
+				TvdbID:         pc.TvdbID,
+				PlexGUID:       pc.PlexGUID,
+				PhotoURL:       pc.PhotoURL,
+				PhotoThumbhash: pc.PhotoThumbhash,
+				PhotoPath:      pc.PhotoPath,
+			})
+		}
+	}
+	if cast == nil {
+		cast = []CastCredit{}
+	}
+	if crew == nil {
+		crew = []CrewCredit{}
+	}
+	return cast, crew
+}
+
+func (s *DetailService) buildAudiobookExtension(
+	ctx context.Context,
+	item *models.MediaItem,
+	versions []FileVersion,
+	crew []CrewCredit,
+	filter AccessFilter,
+) *AudiobookDetailExtension {
+	if item == nil {
+		return nil
+	}
+	totalDuration := 0
+	for _, version := range versions {
+		if version.Duration > 0 {
+			totalDuration += version.Duration
+		}
+	}
+
+	// The four related-content lookups are independent read-only queries;
+	// run them concurrently so detail latency is the slowest one, not their sum.
+	var (
+		series       *AudiobookSeriesGroup
+		otherNarr    []AudiobookNarration
+		alsoByAuthor []AudiobookRelatedItem
+		similar      []AudiobookRelatedItem
+		wg           sync.WaitGroup
+	)
+	wg.Add(4)
+	go func() { defer wg.Done(); series = s.fetchAudiobookSeries(ctx, item.ContentID, filter) }()
+	go func() { defer wg.Done(); otherNarr = s.fetchAudiobookOtherNarrations(ctx, item.ContentID, filter) }()
+	go func() { defer wg.Done(); alsoByAuthor = s.fetchAudiobookAlsoByAuthor(ctx, item.ContentID, filter) }()
+	go func() { defer wg.Done(); similar = s.fetchAudiobookSimilarByGenres(ctx, item.ContentID, filter) }()
+	wg.Wait()
+	s.applyRelatedBookStates(ctx, detailTypeAudiobook, filter, series, alsoByAuthor, similar)
+
+	return &AudiobookDetailExtension{
+		Authors:              audiobookPeopleFromCrew(crew, models.PersonKindAuthor.String()),
+		Narrators:            audiobookPeopleFromCrew(crew, models.PersonKindNarrator.String()),
+		Publisher:            firstNonEmptyString(item.Studios),
+		TotalDurationSeconds: totalDuration,
+		Series:               series,
+		OtherNarrations:      otherNarr,
+		Related: AudiobookRelatedContent{
+			AlsoByAuthor: alsoByAuthor,
+			Similar:      similar,
+		},
+	}
+}
+
+func (s *DetailService) buildEbookExtension(
+	ctx context.Context,
+	item *models.MediaItem,
+	crew []CrewCredit,
+	filter AccessFilter,
+) *EbookDetailExtension {
+	if item == nil {
+		return nil
+	}
+	// The three related-content lookups are independent read-only queries; run
+	// them concurrently so detail latency is the slowest one, not their sum
+	// (mirrors buildAudiobookExtension).
+	var (
+		series       *AudiobookSeriesGroup
+		alsoByAuthor []AudiobookRelatedItem
+		similar      []AudiobookRelatedItem
+		wg           sync.WaitGroup
+	)
+	wg.Add(3)
+	go func() { defer wg.Done(); series = s.fetchEbookSeries(ctx, item.ContentID, filter) }()
+	go func() { defer wg.Done(); alsoByAuthor = s.fetchEbookAlsoByAuthor(ctx, item.ContentID, filter) }()
+	go func() { defer wg.Done(); similar = s.fetchEbookSimilarByGenres(ctx, item.ContentID, filter) }()
+	wg.Wait()
+	s.applyRelatedBookStates(ctx, detailTypeEbook, filter, series, alsoByAuthor, similar)
+
+	return &EbookDetailExtension{
+		Authors:   audiobookPeopleFromCrew(crew, models.PersonKindAuthor.String()),
+		Publisher: firstNonEmptyString(item.Studios),
+		Series:    series,
+		Related: AudiobookRelatedContent{
+			AlsoByAuthor: alsoByAuthor,
+			Similar:      similar,
+		},
+	}
+}
+
+// buildMangaExtension assembles the manga-series detail payload by listing the
+// series' chapters (ebook items linked via manga_chapters).
+func (s *DetailService) buildMangaExtension(ctx context.Context, item *models.MediaItem, filter AccessFilter) *MangaDetailExtension {
+	if item == nil {
+		return nil
+	}
+	return &MangaDetailExtension{
+		Chapters: s.fetchMangaChapters(ctx, item.ContentID, filter),
+	}
+}
+
+// mangaChaptersQuery is the SQL listing a manga series' chapters in reading
+// order. Chapters with a parsed index sort first (ascending); those without
+// fall back to sort_title. Kept as a package var so the ordering contract can
+// be asserted without a database.
+//
+// Manga chapters are ebook items, so per-chapter read state mirrors the ebook
+// surfaces: a chapter is read when the current viewer's ebook_reader_progress
+// row has progress >= the finished threshold. The LEFT JOIN is scoped by the
+// viewer's user_id + profile_id ($2/$3) and yields false when no row exists.
+var mangaChaptersQuery = fmt.Sprintf(`
+	SELECT m.content_id, m.title, mc.chapter_index, mc.volume,
+	       COALESCE(erp.progress >= %s, false) AS read,
+	       erp.progress::double precision,
+	       COALESCE(m.poster_path, '') AS poster_path
+	FROM manga_chapters mc
+	JOIN media_items m ON m.content_id = mc.chapter_content_id
+	LEFT JOIN ebook_reader_progress erp
+	  ON erp.content_id = mc.chapter_content_id
+	 AND erp.user_id = $2
+	 AND erp.profile_id = $3
+	WHERE mc.series_content_id = $1
+	ORDER BY mc.chapter_index NULLS LAST, m.sort_title
+`, EbookFinishedProgressThresholdSQL)
+
+// fetchMangaChapters returns the ordered chapters for a manga series. It never
+// returns nil so the JSON payload always carries a (possibly empty) array. The
+// access filter supplies the viewer (user_id/profile_id) used to resolve each
+// chapter's per-viewer read state.
+func (s *DetailService) fetchMangaChapters(ctx context.Context, seriesContentID string, filter AccessFilter) []MangaChapter {
+	chapters := make([]MangaChapter, 0, 16)
+	if s == nil || s.itemRepo == nil || s.itemRepo.pool == nil {
+		return chapters
+	}
+	rows, err := s.itemRepo.pool.Query(ctx, mangaChaptersQuery, seriesContentID, filter.UserID, filter.ProfileID)
+	if err != nil {
+		return chapters
+	}
+	defer rows.Close()
+
+	posterPaths := make([]string, 0, 16)
+	for rows.Next() {
+		var (
+			ch         MangaChapter
+			index      *float64
+			volume     *string
+			progress   *float64
+			posterPath string
+		)
+		if err := rows.Scan(&ch.ContentID, &ch.Title, &index, &volume, &ch.Read, &progress, &posterPath); err != nil {
+			return chapters
+		}
+		ch.ChapterIndex = index
+		if volume != nil {
+			ch.Volume = *volume
+		}
+		ch.Progress = progress
+		ch.PosterURL = posterPath // raw path; resolved in one batch below
+		if posterPath != "" {
+			posterPaths = append(posterPaths, posterPath)
+		}
+		chapters = append(chapters, ch)
+	}
+	if err := rows.Err(); err != nil {
+		slog.WarnContext(ctx, "manga chapters: row iteration error", "component", "catalog", "series", seriesContentID, "error", err)
+	}
+	// Presign every chapter poster in one batch rather than per chapter — a
+	// long-running series has hundreds of chapters.
+	resolved := s.PresignImageURLs(ctx, posterPaths, "poster", string(filter.ImageSizeFor(imagesize.SlotPoster)))
+	for i := range chapters {
+		chapters[i].PosterURL = resolved[chapters[i].PosterURL]
+	}
+	return chapters
+}
+
+func audiobookPeopleFromCrew(crew []CrewCredit, job string) []AudiobookPerson {
+	out := make([]AudiobookPerson, 0)
+	for _, credit := range crew {
+		if credit.Job != job || strings.TrimSpace(credit.Name) == "" {
+			continue
+		}
+		out = append(out, AudiobookPerson{
+			PersonID:       credit.PersonID,
+			Name:           credit.Name,
+			PhotoURL:       credit.PhotoURL,
+			PhotoThumbhash: credit.PhotoThumbhash,
+		})
+	}
+	return out
+}
+
+func firstNonEmptyString(values []string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (s *DetailService) presignAudiobookPosterURL(ctx context.Context, posterPath string, filter AccessFilter) string {
+	return s.PresignImageURL(ctx, posterPath, "poster", string(filter.ImageSizeFor(imagesize.SlotPoster)))
+}
+
+func appendAudiobookItemAccessConditions(
+	alias string,
+	filter AccessFilter,
+	conditions *[]string,
+	args *[]any,
+	argIdx *int,
+) bool {
+	return appendLibraryAudiobookAccessConditions(alias, 0, filter, conditions, args, argIdx)
+}
+
+// appendLibraryAudiobookAccessConditions is appendAudiobookItemAccessConditions
+// for a query whose every row is joined to the item's media_item_libraries row
+// in libraryID (0 when the query joins none). That row already proves the item
+// sits in a library, and in an allowed one when libraryID is allowed, so those
+// EXISTS checks are left out. The disabled-library and rating checks stay.
+func appendLibraryAudiobookAccessConditions(
+	alias string,
+	libraryID int,
+	filter AccessFilter,
+	conditions *[]string,
+	args *[]any,
+	argIdx *int,
+) bool {
+	joined := libraryID > 0
+	switch {
+	case filter.AllowedLibraryIDs == nil:
+		if !joined {
+			*conditions = append(*conditions, InSomeLibraryWhere(alias+".content_id"))
+		}
+	case len(filter.AllowedLibraryIDs) == 0:
+		return false
+	case !joined || !slices.Contains(filter.AllowedLibraryIDs, libraryID):
+		*conditions = append(*conditions, fmt.Sprintf(`
+			EXISTS (
+				SELECT 1 FROM media_item_libraries mil_allowed
+				WHERE mil_allowed.content_id = %s.content_id
+				  AND mil_allowed.media_folder_id = ANY($%d)
+			)`, alias, *argIdx))
+		*args = append(*args, filter.AllowedLibraryIDs)
+		*argIdx = *argIdx + 1
+	}
+	if len(filter.DisabledLibraryIDs) > 0 {
+		*conditions = append(*conditions, fmt.Sprintf(`
+			NOT EXISTS (
+				SELECT 1 FROM media_item_libraries mil_disabled
+				WHERE mil_disabled.content_id = %s.content_id
+				  AND mil_disabled.media_folder_id = ANY($%d)
+			)`, alias, *argIdx))
+		*args = append(*args, filter.DisabledLibraryIDs)
+		*argIdx = *argIdx + 1
+	}
+	ApplySectionAccessFilter(alias, AccessFilter{MaturityLimits: filter.MaturityLimits}, conditions, args, argIdx)
+	return true
+}
+
+// relatedBookDurationSQL selects the total listening time of the audiobook at
+// alias: the durations of its present files the viewer may play, summed as
+// total_duration_seconds is. MediaFileAccessSQL is the SQL form of the access
+// rule the detail page filters those files by; like every SQL caller it leaves
+// out the Go-only presentation-library scope, which belongs to the opened
+// book, not to the books beside it. Ebooks have no listening time and select 0.
+func relatedBookDurationSQL(alias, mediaType string, filter AccessFilter, args *[]any, argIdx *int) string {
+	if mediaType != detailTypeAudiobook {
+		return "0"
+	}
+	conditions := []string{
+		"mf.content_id = " + alias + ".content_id",
+		playableFileExists,
+		"mf.duration > 0",
+	}
+	conditions = append(conditions, mediaFileAccessConditions("mf", filter, func(value any) int {
+		*args = append(*args, value)
+		*argIdx = len(*args) + 1
+		return len(*args)
+	})...)
+	return "(SELECT COALESCE(SUM(mf.duration), 0) FROM media_files mf WHERE " + strings.Join(conditions, " AND ") + ")"
+}
+
+// relatedBookState is the profile's state on one related book.
+type relatedBookState struct {
+	played bool
+	ratio  *float64
+}
+
+// applyRelatedBookStates sets Played and ProgressRatio on the related books of
+// a book page, the series entries and the related rows, with one lookup for
+// all of them. Without a profile they stay unset.
+func (s *DetailService) applyRelatedBookStates(ctx context.Context, mediaType string, filter AccessFilter, series *AudiobookSeriesGroup, lists ...[]AudiobookRelatedItem) {
+	if s == nil || filter.UserID == 0 || filter.ProfileID == "" {
+		return
+	}
+	if series != nil {
+		lists = append(lists, series.Entries)
+	}
+	ids := make([]string, 0, 54)
+	seen := make(map[string]struct{}, 54)
+	for _, list := range lists {
+		for _, item := range list {
+			if _, ok := seen[item.ContentID]; !ok {
+				seen[item.ContentID] = struct{}{}
+				ids = append(ids, item.ContentID)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	var states map[string]relatedBookState
+	switch mediaType {
+	case detailTypeAudiobook:
+		states = s.audiobookListeningStates(ctx, filter, ids)
+	case detailTypeEbook:
+		states = s.ebookReadingStates(ctx, filter, ids)
+	}
+	for _, list := range lists {
+		for i := range list {
+			state := states[list[i].ContentID]
+			list[i].Played, list[i].ProgressRatio = state.played, state.ratio
+		}
+	}
+}
+
+// audiobookListeningStates reads the profile's audiobook state through
+// ListProgressWithCompletedHistory, the read a catalog card's
+// user_state.played follows: played on visible completed progress or a
+// visible completed history row, in progress on a visible unfinished
+// position. A failed read leaves every book unset; the rows are decoration.
+func (s *DetailService) audiobookListeningStates(ctx context.Context, filter AccessFilter, ids []string) map[string]relatedBookState {
+	if s.userStoreProvider == nil {
+		return nil
+	}
+	store, err := s.userStoreProvider.ForUser(ctx, filter.UserID)
+	if err != nil || store == nil {
+		return nil
+	}
+	progress, err := userstore.ListProgressWithCompletedHistory(ctx, store, filter.ProfileID, ids)
+	if err != nil {
+		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "related audiobooks: listening state", "component", "catalog", "error", err)
+		return nil
+	}
+	states := make(map[string]relatedBookState, len(progress))
+	for id, p := range progress {
+		switch {
+		case p.Completed:
+			states[id] = relatedBookState{played: true}
+		case p.PositionSeconds > 0 && p.DurationSeconds > 0:
+			states[id] = relatedBookState{ratio: new(min(p.PositionSeconds/p.DurationSeconds, 1))}
+		}
+	}
+	return states
+}
+
+// ebookReadingStates reads the profile's ebook reading progress, finished at
+// the threshold every ebook surface uses (see mangaChaptersQuery). A row the
+// profile hid from history stays out until reading moves it past the hide,
+// as in the ebook progress store's ListByContentIDs.
+func (s *DetailService) ebookReadingStates(ctx context.Context, filter AccessFilter, ids []string) map[string]relatedBookState {
+	if s.itemRepo == nil || s.itemRepo.pool == nil {
+		return nil
+	}
+	rows, err := s.itemRepo.pool.Query(ctx, `
+		SELECT erp.content_id, erp.progress
+		FROM ebook_reader_progress erp
+		WHERE erp.user_id = $1 AND erp.profile_id = $2 AND erp.content_id = ANY($3::text[])
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM user_history_hidden_items hhi
+			WHERE hhi.user_id = erp.user_id
+			  AND hhi.profile_id = erp.profile_id
+			  AND hhi.media_item_id = erp.content_id
+			  AND erp.updated_at <= hhi.hidden_before
+		  )`,
+		filter.UserID, filter.ProfileID, ids)
+	if err != nil {
+		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "related ebooks: reading state", "component", "catalog", "error", err)
+		return nil
+	}
+	defer rows.Close()
+	states := make(map[string]relatedBookState, len(ids))
+	for rows.Next() {
+		var id string
+		var progress float64
+		if err := rows.Scan(&id, &progress); err != nil {
+			return nil
+		}
+		switch {
+		case progress >= models.EbookFinishedProgressThreshold:
+			states[id] = relatedBookState{played: true}
+		case progress > 0:
+			states[id] = relatedBookState{ratio: new(progress)}
+		}
+	}
+	if rows.Err() != nil {
+		return nil
+	}
+	return states
+}
+
+func (s *DetailService) fetchAudiobookAlsoByAuthor(ctx context.Context, contentID string, filter AccessFilter) []AudiobookRelatedItem {
+	return s.fetchBookAlsoByAuthor(ctx, contentID, "audiobook", filter)
+}
+
+func (s *DetailService) fetchEbookAlsoByAuthor(ctx context.Context, contentID string, filter AccessFilter) []AudiobookRelatedItem {
+	return s.fetchBookAlsoByAuthor(ctx, contentID, "ebook", filter)
+}
+
+func (s *DetailService) fetchBookAlsoByAuthor(ctx context.Context, contentID string, mediaType string, filter AccessFilter) []AudiobookRelatedItem {
+	if s == nil || s.itemRepo == nil || s.itemRepo.pool == nil {
+		return []AudiobookRelatedItem{}
+	}
+	args := []any{contentID, models.PersonKindAuthor, mediaType}
+	argIdx := 4
+	conditions := []string{
+		"ip1.content_id = $1",
+		"ip1.kind = $2",
+		"m2.type = $3",
+	}
+	if !appendAudiobookItemAccessConditions("m2", filter, &conditions, &args, &argIdx) {
+		return []AudiobookRelatedItem{}
+	}
+	duration := relatedBookDurationSQL("m2", mediaType, filter, &args, &argIdx)
+	query := fmt.Sprintf(`
+		SELECT m2.content_id, m2.title, COALESCE(m2.year, 0), COALESCE(m2.poster_path, ''),
+			COALESCE(m2.poster_thumbhash, ''), %s
+		FROM item_people ip1
+		JOIN item_people ip2
+		  ON ip2.person_id = ip1.person_id
+		 AND ip2.kind = ip1.kind
+		 AND ip2.content_id <> ip1.content_id
+		JOIN media_items m2 ON m2.content_id = ip2.content_id
+		WHERE %s
+		ORDER BY m2.year DESC NULLS LAST, LOWER(m2.sort_title)
+		LIMIT 12
+	`, duration, strings.Join(conditions, " AND "))
+	rows, err := s.itemRepo.pool.Query(ctx, query, args...)
+	if err != nil {
+		return []AudiobookRelatedItem{}
+	}
+	defer rows.Close()
+
+	out := make([]AudiobookRelatedItem, 0, 12)
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var item AudiobookRelatedItem
+		var posterPath string
+		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &posterPath, &item.PosterThumbhash, &item.DurationSeconds); err != nil {
+			return []AudiobookRelatedItem{}
+		}
+		if _, ok := seen[item.ContentID]; ok {
+			continue
+		}
+		seen[item.ContentID] = struct{}{}
+		item.PosterURL = s.presignAudiobookPosterURL(ctx, posterPath, filter)
+		out = append(out, item)
+	}
+	if rows.Err() != nil {
+		return []AudiobookRelatedItem{}
+	}
+	return out
+}
+
+func (s *DetailService) fetchAudiobookSimilarByGenres(ctx context.Context, contentID string, filter AccessFilter) []AudiobookRelatedItem {
+	return s.fetchBookSimilarByGenres(ctx, contentID, "audiobook", filter)
+}
+
+func (s *DetailService) fetchEbookSimilarByGenres(ctx context.Context, contentID string, filter AccessFilter) []AudiobookRelatedItem {
+	return s.fetchBookSimilarByGenres(ctx, contentID, "ebook", filter)
+}
+
+func (s *DetailService) fetchBookSimilarByGenres(ctx context.Context, contentID string, mediaType string, filter AccessFilter) []AudiobookRelatedItem {
+	if s == nil || s.itemRepo == nil || s.itemRepo.pool == nil {
+		return []AudiobookRelatedItem{}
+	}
+	args := []any{contentID, models.PersonKindAuthor, mediaType}
+	argIdx := 4
+	conditions := []string{
+		"m.type = $3",
+		"m.content_id <> $1",
+		"m.genres && (SELECT array_agg(g) FROM this_genres)",
+		`NOT EXISTS (
+			SELECT 1 FROM item_people ip
+			WHERE ip.content_id = m.content_id
+			  AND ip.kind = $2
+			  AND ip.person_id IN (SELECT person_id FROM this_author)
+		)`,
+	}
+	if !appendAudiobookItemAccessConditions("m", filter, &conditions, &args, &argIdx) {
+		return []AudiobookRelatedItem{}
+	}
+	duration := relatedBookDurationSQL("m", mediaType, filter, &args, &argIdx)
+	query := fmt.Sprintf(`
+		WITH this_genres AS (
+			SELECT unnest(genres) AS g FROM media_items WHERE content_id = $1
+		),
+		this_author AS (
+			SELECT person_id FROM item_people WHERE content_id = $1 AND kind = $2
+		)
+		SELECT m.content_id, m.title, COALESCE(m.year, 0), COALESCE(m.poster_path, ''),
+			COALESCE(m.poster_thumbhash, ''), %s
+		FROM media_items m
+		WHERE %s
+		ORDER BY
+			(
+				SELECT COUNT(*)
+				FROM unnest(m.genres) AS genre(value)
+				WHERE genre.value IN (SELECT g FROM this_genres)
+			) DESC,
+			COALESCE(m.year, 0) DESC,
+			LOWER(m.sort_title)
+		LIMIT 12
+	`, duration, strings.Join(conditions, " AND "))
+	rows, err := s.itemRepo.pool.Query(ctx, query, args...)
+	if err != nil {
+		return []AudiobookRelatedItem{}
+	}
+	defer rows.Close()
+
+	out := make([]AudiobookRelatedItem, 0, 12)
+	for rows.Next() {
+		var item AudiobookRelatedItem
+		var posterPath string
+		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &posterPath, &item.PosterThumbhash, &item.DurationSeconds); err != nil {
+			return []AudiobookRelatedItem{}
+		}
+		item.PosterURL = s.presignAudiobookPosterURL(ctx, posterPath, filter)
+		out = append(out, item)
+	}
+	if rows.Err() != nil {
+		return []AudiobookRelatedItem{}
+	}
+	return out
+}
+
+func (s *DetailService) fetchAudiobookSeries(ctx context.Context, contentID string, filter AccessFilter) *AudiobookSeriesGroup {
+	return s.fetchBookSeries(ctx, contentID, "audiobook", "audiobook_series", filter)
+}
+
+func (s *DetailService) fetchEbookSeries(ctx context.Context, contentID string, filter AccessFilter) *AudiobookSeriesGroup {
+	return s.fetchBookSeries(ctx, contentID, "ebook", "ebook_series", filter)
+}
+
+func (s *DetailService) fetchBookSeries(ctx context.Context, contentID string, mediaType string, tableName string, filter AccessFilter) *AudiobookSeriesGroup {
+	if s == nil || s.itemRepo == nil || s.itemRepo.pool == nil {
+		return nil
+	}
+	switch tableName {
+	case "audiobook_series", "ebook_series":
+	default:
+		return nil
+	}
+	args := []any{contentID, mediaType}
+	argIdx := 3
+	conditions := []string{
+		"root.content_id = $1",
+		"m.type = $2",
+	}
+	if !appendAudiobookItemAccessConditions("m", filter, &conditions, &args, &argIdx) {
+		return nil
+	}
+	duration := relatedBookDurationSQL("m", mediaType, filter, &args, &argIdx)
+	query := fmt.Sprintf(`
+		SELECT
+			m.content_id,
+			m.title,
+			COALESCE(m.year, 0),
+			COALESCE(m.poster_path, ''),
+			COALESCE(m.poster_thumbhash, ''),
+			%s,
+			s.series_name,
+			s.series_index
+		FROM %s root
+		JOIN %s s ON LOWER(s.series_name) = LOWER(root.series_name)
+		JOIN media_items m ON m.content_id = s.content_id
+		WHERE %s
+		ORDER BY s.series_index NULLS LAST, LOWER(m.sort_title)
+		LIMIT 30
+	`, duration, tableName, tableName, strings.Join(conditions, " AND "))
+	rows, err := s.itemRepo.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var seriesName string
+	entries := make([]AudiobookRelatedItem, 0, 16)
+	for rows.Next() {
+		var (
+			item   AudiobookRelatedItem
+			poster string
+			name   string
+			index  *float64
+		)
+		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &poster, &item.PosterThumbhash, &item.DurationSeconds, &name, &index); err != nil {
+			return nil
+		}
+		if seriesName == "" {
+			seriesName = name
+		}
+		if index != nil {
+			n := int(*index)
+			if float64(n) == *index {
+				item.SeriesIndex = &n
+			}
+		}
+		item.PosterURL = s.presignAudiobookPosterURL(ctx, poster, filter)
+		entries = append(entries, item)
+	}
+	if rows.Err() != nil {
+		return nil
+	}
+	if len(entries) < 2 {
+		return nil
+	}
+	return &AudiobookSeriesGroup{Name: seriesName, Entries: entries}
+}
+
+func (s *DetailService) fetchAudiobookOtherNarrations(ctx context.Context, contentID string, filter AccessFilter) []AudiobookNarration {
+	if s == nil || s.itemRepo == nil || s.itemRepo.pool == nil {
+		return []AudiobookNarration{}
+	}
+	const stripRE = `\s*\(?\s*[-:,]?\s*(UK Version:?|US Version:?)?\s*[Rr]ead [Bb]y [^()]+\)?\s*$`
+	args := []any{stripRE, contentID, models.PersonKindAuthor, models.PersonKindNarrator}
+	argIdx := 5
+	conditions := []string{
+		"m.type = 'audiobook'",
+		"m.content_id <> $2",
+		"trim(regexp_replace(m.title, $1, '', 'g')) = (SELECT norm_title FROM this_book)",
+		`EXISTS (
+			SELECT 1 FROM item_people ip
+			WHERE ip.content_id = m.content_id
+			  AND ip.kind = $3
+			  AND ip.person_id IN (SELECT person_id FROM this_author)
+		)`,
+	}
+	if !appendAudiobookItemAccessConditions("m", filter, &conditions, &args, &argIdx) {
+		return []AudiobookNarration{}
+	}
+	query := fmt.Sprintf(`
+		WITH this_book AS (
+			SELECT trim(regexp_replace(title, $1, '', 'g')) AS norm_title
+			FROM media_items WHERE content_id = $2
+		),
+		this_author AS (
+			SELECT person_id FROM item_people WHERE content_id = $2 AND kind = $3
+		)
+		SELECT
+			m.content_id,
+			m.title,
+			COALESCE(m.year, 0),
+			COALESCE(string_agg(DISTINCT NULLIF(BTRIM(p.name), ''), '|||'), '') AS narrators
+		FROM media_items m
+		LEFT JOIN item_people ipn ON ipn.content_id = m.content_id AND ipn.kind = $4
+		LEFT JOIN people p ON p.id = ipn.person_id
+		WHERE %s
+		GROUP BY m.content_id, m.title, m.year
+		ORDER BY m.year DESC NULLS LAST, m.title
+		LIMIT 8
+	`, strings.Join(conditions, " AND "))
+	rows, err := s.itemRepo.pool.Query(ctx, query, args...)
+	if err != nil {
+		return []AudiobookNarration{}
+	}
+	defer rows.Close()
+
+	out := make([]AudiobookNarration, 0, 4)
+	for rows.Next() {
+		var item AudiobookNarration
+		var narrators string
+		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &narrators); err != nil {
+			return []AudiobookNarration{}
+		}
+		item.Narrators = splitDelimitedNames(narrators)
+		out = append(out, item)
+	}
+	if rows.Err() != nil {
+		return []AudiobookNarration{}
+	}
+	return out
+}
+
+func splitDelimitedNames(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return []string{}
+	}
+	parts := strings.Split(raw, "|||")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func seriesFolderPathsFromFiles(files []*models.MediaFile) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(files))
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		path := strings.TrimSpace(file.ObservedRootPath)
+		if path == "" {
+			path = strings.TrimSpace(file.CanonicalRootPath)
+		}
+		if path == "" && strings.TrimSpace(file.FilePath) != "" {
+			path = filepath.Dir(file.FilePath)
+		}
+		if path == "" {
+			continue
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// clearSentinel returns "" for the no-photo sentinel, passing through real values.
+func clearSentinel(s string) string {
+	if s == "-" {
+		return ""
+	}
+	return s
+}
+
+func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Season, filter AccessFilter) (*ItemDetail, error) {
+	series, err := s.itemRepo.GetByID(ctx, season.SeriesID)
+	if err != nil {
+		return nil, fmt.Errorf("loading parent series: %w", err)
+	}
+	localizationFilter := filter
+	localizationFilter.PresentationOriginalLanguage = series.OriginalLanguage
+
+	episodes := []*models.Episode{}
+	if s.episodeRepo != nil {
+		episodes, err = s.episodeRepo.ListBySeasonID(ctx, season.ContentID)
+		if err != nil {
+			return nil, fmt.Errorf("listing season episodes: %w", err)
+		}
+	}
+	pendingTranslation := s.pendingSeasonTranslationLanguage(ctx, season, localizationFilter, episodes)
+	localizedSeason, err := s.LocalizeSeasonModel(ctx, season, localizationFilter)
+	if err != nil {
+		return nil, fmt.Errorf("localizing season detail: %w", err)
+	}
+	season = localizedSeason
+	series, err = s.LocalizeItemModel(ctx, series, localizationFilter)
+	if err != nil {
+		return nil, fmt.Errorf("localizing season series detail: %w", err)
+	}
+
+	title := season.Title
+	if title == "" {
+		if season.SeasonNumber == 0 {
+			title = "Specials"
+		} else {
+			title = fmt.Sprintf("Season %d", season.SeasonNumber)
+		}
+	}
+
+	episodeCount := len(episodes)
+	seasonNumber := season.SeasonNumber
+	castCredits, crewCredits := s.fetchCredits(ctx, season.SeriesID, filter)
+	detail := &ItemDetail{
+		ContentID:                  season.ContentID,
+		Type:                       "season",
+		Title:                      title,
+		OriginalTitle:              season.OriginalTitle,
+		Overview:                   season.Overview,
+		Tagline:                    season.Tagline,
+		ImdbID:                     season.ImdbID,
+		TmdbID:                     season.TmdbID,
+		TvdbID:                     season.TvdbID,
+		PendingTranslationLanguage: pendingTranslation,
+		MachineTranslatedFields:    season.MachineTranslatedFields,
+		PosterThumbhash:            season.PosterThumbhash,
+		BackdropThumbhash:          series.BackdropThumbhash,
+		SeriesID:                   season.SeriesID,
+		SeriesTitle:                series.Title,
+		SeasonNumber:               &seasonNumber,
+		EpisodeCount:               &episodeCount,
+		IsSpecials:                 season.SeasonNumber == 0,
+		LockedFields:               season.LockedFields,
+		Cast:                       castCredits,
+		Crew:                       crewCredits,
+		Versions:                   []FileVersion{},
+		PlaybackVariants:           []PlaybackVariant{},
+		Subtitles:                  []SubtitleInfo{},
+	}
+	if season.AirDate != nil {
+		airDate := season.AirDate.Format("2006-01-02")
+		detail.AirDate = &airDate
+	}
+
+	// A season backdrop an admin picked replaces the series backdrop.
+	backdropPath := series.BackdropPath
+	if season.BackdropPath != "" {
+		backdropPath, detail.BackdropThumbhash = season.BackdropPath, season.BackdropThumbhash
+	}
+	detail.PosterURL = s.PresignImageURL(ctx, season.PosterPath, "poster", string(filter.ImageSizeFor(imagesize.SlotPoster)))
+	detail.BackdropURL = s.PresignImageURL(ctx, backdropPath, "backdrop", string(filter.ImageSizeFor(imagesize.SlotBackdrop)))
+	return detail, nil
+}
+
+// seasonPoster is a season's signed poster and its ThumbHash.
+type seasonPoster struct {
+	url       string
+	thumbhash string
+}
+
+// episodeSeasonPoster returns the poster of an episode's season, signing each
+// season once per series context. Seasons prefetchSeasons loaded are used as
+// they are; any other season is loaded and localized on its own. A missing
+// season has none.
+func (s *DetailService) episodeSeasonPoster(ctx context.Context, seriesCtx *seriesDetailContext, seasonID string, filter AccessFilter) seasonPoster {
+	if seasonID == "" || s.seasonRepo == nil {
+		return seasonPoster{}
+	}
+	if poster, ok := seriesCtx.seasonPosters[seasonID]; ok {
+		return poster
+	}
+	var poster seasonPoster
+	season, ok := seriesCtx.seasons[seasonID]
+	if !ok {
+		var err error
+		season, err = s.seasonRepo.GetByID(ctx, seasonID)
+		switch {
+		case err == nil:
+			season = s.localizeEpisodeSeason(ctx, seriesCtx, season, filter)
+		case !errors.Is(err, ErrSeasonNotFound):
+			// Decoration only: a failed read leaves the season poster absent
+			// rather than failing the detail.
+			slog.WarnContext(ctx, "loading episode season poster", "component", "catalog", "season_id", seasonID, "error", err)
+		}
+	}
+	if season != nil {
+		poster = seasonPoster{
+			url:       s.PresignImageURL(ctx, season.PosterPath, "poster", string(filter.ImageSizeFor(imagesize.SlotPoster))),
+			thumbhash: season.PosterThumbhash,
+		}
+	}
+	if seriesCtx.seasonPosters != nil {
+		seriesCtx.seasonPosters[seasonID] = poster
+	}
+	return poster
+}
+
+// localizeEpisodeSeason localizes a season the way buildSeasonDetail does, so
+// an episode shows the season poster season detail shows this viewer. A
+// failed localization keeps the stored row.
+func (s *DetailService) localizeEpisodeSeason(ctx context.Context, seriesCtx *seriesDetailContext, season *models.Season, filter AccessFilter) *models.Season {
+	localizationFilter := filter
+	localizationFilter.PresentationOriginalLanguage = seriesCtx.series.OriginalLanguage
+	if localized, err := s.LocalizeSeasonModel(ctx, season, localizationFilter); err == nil && localized != nil {
+		return localized
+	}
+	return season
+}
+
+// prefetchSeasons loads and localizes every season of the context's series in
+// one batch, so a series-wide episode batch reads seasons once rather than
+// once per season. A failed read leaves the per-season reads in place.
+func (s *DetailService) prefetchSeasons(ctx context.Context, seriesCtx *seriesDetailContext, filter AccessFilter) {
+	if s.seasonRepo == nil {
+		return
+	}
+	seasons, err := s.seasonRepo.ListBySeries(ctx, seriesCtx.series.ContentID)
+	if err != nil {
+		slog.WarnContext(ctx, "loading series seasons for episode posters", "component", "catalog", "series_id", seriesCtx.series.ContentID, "error", err)
+		return
+	}
+	localizationFilter := filter
+	localizationFilter.PresentationOriginalLanguage = seriesCtx.series.OriginalLanguage
+	if localized, err := s.LocalizeSeasonModels(ctx, seasons, localizationFilter); err == nil && len(localized) == len(seasons) {
+		seasons = localized
+	}
+	seriesCtx.seasons = make(map[string]*models.Season, len(seasons))
+	for _, season := range seasons {
+		if season != nil {
+			seriesCtx.seasons[season.ContentID] = season
+		}
+	}
+}
+
+func (s *DetailService) buildEpisodeDetail(ctx context.Context, episode *models.Episode, seriesCtx *seriesDetailContext, filter AccessFilter) (*ItemDetail, error) {
+	localizationFilter := filter
+	localizationFilter.PresentationOriginalLanguage = seriesCtx.series.OriginalLanguage
+	pendingTranslation := s.PendingEpisodeTranslationLanguage(ctx, episode, localizationFilter)
+	localizedEpisode, err := s.LocalizeEpisodeModel(ctx, episode, localizationFilter)
+	if err != nil {
+		return nil, fmt.Errorf("localizing episode detail: %w", err)
+	}
+	episode = localizedEpisode
+	series := seriesCtx.series
+
+	seasonNumber := episode.SeasonNumber
+	episodeNumber := episode.EpisodeNumber
+	detail := &ItemDetail{
+		ContentID:                  episode.ContentID,
+		Type:                       "episode",
+		Title:                      episode.Title,
+		SortTitle:                  episode.SortTitle,
+		OriginalTitle:              episode.OriginalTitle,
+		Overview:                   episode.Overview,
+		Tagline:                    episode.Tagline,
+		PendingTranslationLanguage: pendingTranslation,
+		MachineTranslatedFields:    episode.MachineTranslatedFields,
+		Runtime:                    episode.Runtime,
+		RatingIMDB:                 episode.RatingIMDB,
+		RatingTMDB:                 episode.RatingTMDB,
+		ImdbID:                     episode.ImdbID,
+		TmdbID:                     episode.TmdbID,
+		TvdbID:                     episode.TvdbID,
+		PosterThumbhash:            episode.StillThumbhash,
+		BackdropThumbhash:          series.BackdropThumbhash,
+		SeriesID:                   episode.SeriesID,
+		SeriesTitle:                series.Title,
+		SeasonNumber:               &seasonNumber,
+		SeasonID:                   episode.SeasonID,
+		EpisodeNumber:              &episodeNumber,
+		LockedFields:               episode.LockedFields,
+		Cast:                       seriesCtx.castCredits,
+		Crew:                       seriesCtx.crewCredits,
+		Versions:                   []FileVersion{},
+		PlaybackVariants:           []PlaybackVariant{},
+		Subtitles:                  []SubtitleInfo{},
+	}
+	if episode.AirDate != nil {
+		airDate := episode.AirDate.Format("2006-01-02")
+		detail.AirDate = &airDate
+	}
+	if episode.Title == "" {
+		detail.Title = fmt.Sprintf("Episode %d", episode.EpisodeNumber)
+	}
+
+	detail.PosterURL = s.PresignImageURL(ctx, episode.StillPath, "still", string(filter.ImageSizeFor(imagesize.SlotPoster)))
+	detail.BackdropURL = seriesCtx.backdropURL
+	detail.SeriesPosterURL, detail.SeriesPosterThumbhash = seriesCtx.posterURL, series.PosterThumbhash
+	detail.SeriesBackdropURL, detail.SeriesBackdropThumbhash = seriesCtx.backdropURL, series.BackdropThumbhash
+	seasonArt := s.episodeSeasonPoster(ctx, seriesCtx, episode.SeasonID, filter)
+	detail.SeasonPosterURL, detail.SeasonPosterThumbhash = seasonArt.url, seasonArt.thumbhash
+
+	files := seriesCtx.filesByEpisode[episode.ContentID]
+	if seriesCtx.filesByEpisode == nil {
+		var err error
+		files, err = s.fileFetcher.GetByEpisodeID(ctx, episode.ContentID)
+		if err != nil {
+			return nil, fmt.Errorf("fetching file versions: %w", err)
+		}
+	}
+	files = FilterMediaFilesByAccess(files, filter)
+	files = s.prepareBrowseFiles(ctx, files)
+	detail.Versions, detail.PlaybackVariants, detail.Subtitles, detail.Intro, detail.Credits, detail.Recap, detail.Preview = s.buildPlaybackInfoWith(
+		ctx,
+		files,
+		filter,
+		s.episodeAudioResolver(ctx, seriesCtx, filter, episode.SeriesID),
+		seriesCtx.trickplay,
+		!seriesCtx.skipMarkerPreviews,
+	)
+	sortVideoVersions(detail.Type, detail.Versions)
+	detail.OverlaySummary = overlays.BuildSummary(files)
+	s.episodeSubtitleDefaults(ctx, seriesCtx, filter, episode.SeriesID, files).applyToItemDetail(detail)
+	versionPref := seriesCtx.versionPref
+	if episode.SeriesID != seriesCtx.series.ContentID {
+		versionPref = s.effectiveVersionDefaults(ctx, filter, episode.SeriesID)
+	}
+	if versionPref.HasAny {
+		if versionPref.Resolution != "" {
+			detail.EffectiveVersionResolution = stringPtr(versionPref.Resolution)
+		}
+		detail.EffectiveVersionHDR = boolPtr(versionPref.HDR)
+		if versionPref.CodecVideo != "" {
+			detail.EffectiveVersionCodecVideo = stringPtr(versionPref.CodecVideo)
+		}
+	}
+
+	return detail, nil
+}
+
+// GetWatchDetail resolves a directly playable content ID into a normalized
+// playback payload. Movies resolve by media item content ID; episodes resolve
+// by episode content ID via their linked series and episode file records.
+func (s *DetailService) GetWatchDetail(ctx context.Context, contentID string, filter AccessFilter) (*WatchDetail, error) {
+	item, err := s.itemRepo.GetByID(ctx, contentID)
+	switch {
+	case err == nil:
+		if err := s.itemRepo.EnsureAccessible(ctx, contentID, filter); err != nil {
+			return nil, err
+		}
+		if err := s.validatePresentationItemAccess(ctx, filter, contentID); err != nil {
+			return nil, err
+		}
+		item, err = s.LocalizeItemModel(ctx, item, filter)
+		if err != nil {
+			return nil, fmt.Errorf("localizing watch item: %w", err)
+		}
+		if item.Type == "series" {
+			return nil, ErrWatchTargetNotPlayable
+		}
+
+		files, err := s.fileFetcher.GetByContentID(ctx, contentID)
+		if err != nil {
+			return nil, fmt.Errorf("fetching watch file versions: %w", err)
+		}
+		files = FilterMediaFilesByAccess(files, filter)
+		files = s.preparePlaybackFiles(ctx, files)
+		s.queueWatchPlaybackFiles(ctx, item.ContentID, item.Type, files)
+		detail := s.newWatchDetail(
+			ctx,
+			item.ContentID,
+			item.Type,
+			item.Title,
+			item.Overview,
+			files,
+			filter,
+			item.ContentID,
+		)
+		detail.Year = item.Year
+		if !filter.OmitWatchArtwork {
+			detail.PosterThumbhash = item.PosterThumbhash
+			detail.BackdropThumbhash = item.BackdropThumbhash
+			detail.PosterURL = s.PresignImageURL(ctx, item.PosterPath, "poster", string(filter.ImageSizeFor(imagesize.SlotPoster)))
+			detail.BackdropURL = s.PresignImageURL(ctx, item.BackdropPath, "backdrop", string(filter.ImageSizeFor(imagesize.SlotBackdrop)))
+		}
+		s.effectiveSubtitleDefaults(ctx, filter, item.ContentID, files).applyToWatchDetail(detail)
+		return detail, nil
+	case !errors.Is(err, ErrItemNotFound):
+		return nil, err
+	}
+
+	if s.episodeRepo == nil {
+		return nil, ErrItemNotFound
+	}
+
+	episode, err := s.episodeRepo.GetByID(ctx, contentID)
+	if err != nil {
+		// Third fallback tier: a local extra (media_extras). Access is the
+		// parent item's; playback reuses the ordinary file/versions pipeline.
+		if errors.Is(err, ErrEpisodeNotFound) {
+			return s.buildExtraWatchDetail(ctx, contentID, filter)
+		}
+		return nil, err
+	}
+	if err := s.itemRepo.EnsureAccessible(ctx, episode.SeriesID, filter); err != nil {
+		return nil, err
+	}
+	if err := s.validatePresentationEpisodeAccess(ctx, filter, episode); err != nil {
+		return nil, err
+	}
+	// Seasons and episodes inherit original_language from the parent series.
+	// Load it before localization and reuse the same row for SeriesTitle below,
+	// avoiding an extra lookup only for profiles that use language exceptions.
+	series, seriesErr := s.itemRepo.GetByID(ctx, episode.SeriesID)
+	localizationFilter := filter
+	if seriesErr == nil && series != nil {
+		localizationFilter.PresentationOriginalLanguage = series.OriginalLanguage
+	}
+	episode, err = s.LocalizeEpisodeModel(ctx, episode, localizationFilter)
+	if err != nil {
+		return nil, fmt.Errorf("localizing episode watch detail: %w", err)
+	}
+
+	files, err := s.fileFetcher.GetByEpisodeID(ctx, episode.ContentID)
+	if err != nil {
+		return nil, fmt.Errorf("fetching episode watch file versions: %w", err)
+	}
+
+	files = FilterMediaFilesByAccess(files, filter)
+	files = s.preparePlaybackFiles(ctx, files)
+	s.queueWatchPlaybackFiles(ctx, episode.ContentID, "episode", files)
+	detail := s.newWatchDetail(
+		ctx,
+		episode.ContentID,
+		"episode",
+		episode.Title,
+		episode.Overview,
+		files,
+		filter,
+		episode.SeriesID,
+	)
+	detail.SeasonNumber = episode.SeasonNumber
+	detail.EpisodeNumber = episode.EpisodeNumber
+	detail.SeriesID = episode.SeriesID
+	s.effectiveSubtitleDefaults(ctx, filter, episode.SeriesID, files).applyToWatchDetail(detail)
+	if versionPref := s.effectiveVersionDefaults(ctx, filter, episode.SeriesID); versionPref.HasAny {
+		if versionPref.Resolution != "" {
+			detail.EffectiveVersionResolution = stringPtr(versionPref.Resolution)
+		}
+		detail.EffectiveVersionHDR = boolPtr(versionPref.HDR)
+		if versionPref.CodecVideo != "" {
+			detail.EffectiveVersionCodecVideo = stringPtr(versionPref.CodecVideo)
+		}
+	}
+
+	if !filter.OmitWatchArtwork {
+		detail.PosterThumbhash = episode.StillThumbhash
+		detail.PosterURL = s.PresignImageURL(ctx, episode.StillPath, "still", string(filter.ImageSizeFor(imagesize.SlotPoster)))
+	}
+
+	if seriesErr == nil && series != nil {
+		series, err = s.LocalizeItemModel(ctx, series, localizationFilter)
+		if err != nil {
+			return nil, fmt.Errorf("localizing series watch detail: %w", err)
+		}
+		detail.SeriesTitle = series.Title
+		detail.Year = series.Year
+		if !filter.OmitWatchArtwork {
+			detail.BackdropThumbhash = series.BackdropThumbhash
+			detail.BackdropURL = s.PresignImageURL(ctx, series.BackdropPath, "backdrop", string(filter.ImageSizeFor(imagesize.SlotBackdrop)))
+		}
+	}
+
+	return detail, nil
+}
+
+// buildExtraWatchDetail resolves a local extra (media_extras) as a watch
+// target. Access control is the parent item's library membership, mirroring
+// how episodes gate on their series.
+func (s *DetailService) buildExtraWatchDetail(ctx context.Context, contentID string, filter AccessFilter) (*WatchDetail, error) {
+	if s.extraRepo == nil {
+		return nil, ErrItemNotFound
+	}
+	extra, err := s.extraRepo.GetByID(ctx, contentID)
+	if err != nil {
+		if errors.Is(err, ErrExtraNotFound) {
+			return nil, ErrItemNotFound
+		}
+		return nil, err
+	}
+	if err := s.itemRepo.EnsureAccessible(ctx, extra.ParentID, filter); err != nil {
+		return nil, err
+	}
+	if err := s.validatePresentationItemAccess(ctx, filter, extra.ParentID); err != nil {
+		return nil, err
+	}
+	fetcher, ok := s.fileFetcher.(extraFileFetcher)
+	if !ok {
+		return nil, ErrItemNotFound
+	}
+	files, err := fetcher.GetByExtraID(ctx, extra.ContentID)
+	if err != nil {
+		return nil, fmt.Errorf("fetching extra watch files: %w", err)
+	}
+	files = FilterMediaFilesByAccess(files, filter)
+	files = s.preparePlaybackFiles(ctx, files)
+	s.queueWatchPlaybackFiles(ctx, extra.ContentID, "extra", files)
+	detail := s.newWatchDetail(
+		ctx,
+		extra.ContentID,
+		"extra",
+		extra.Title,
+		"",
+		files,
+		filter,
+		extra.ParentID,
+	)
+	if parent, parentErr := s.itemRepo.GetByID(ctx, extra.ParentID); parentErr == nil {
+		if localized, locErr := s.LocalizeItemModel(ctx, parent, filter); locErr == nil {
+			parent = localized
+		}
+		if detail.Title == "" {
+			detail.Title = parent.Title
+		}
+		// Series fields only for series-owned extras: players treat a
+		// populated SeriesID as episodic context (post-roll/next-episode
+		// flows), which is wrong for a movie's extras.
+		if parent.Type == "series" {
+			detail.SeriesID = extra.ParentID
+			detail.SeriesTitle = parent.Title
+		}
+		detail.Year = parent.Year
+		if !filter.OmitWatchArtwork {
+			// Like an episode's still, the extra's own image is its poster
+			// when it has one.
+			detail.PosterThumbhash = parent.PosterThumbhash
+			detail.PosterURL = s.PresignImageURL(ctx, parent.PosterPath, "poster", string(filter.ImageSizeFor(imagesize.SlotPoster)))
+			if stillURL := s.PresignImageURL(ctx, extra.StillPath, "still", string(filter.ImageSizeFor(imagesize.SlotPoster))); stillURL != "" {
+				detail.PosterURL, detail.PosterThumbhash = stillURL, extra.StillThumbhash
+			}
+			detail.BackdropThumbhash = parent.BackdropThumbhash
+			detail.BackdropURL = s.PresignImageURL(ctx, parent.BackdropPath, "backdrop", string(filter.ImageSizeFor(imagesize.SlotBackdrop)))
+		}
+	}
+	return detail, nil
+}
+
+func (s *DetailService) newWatchDetail(
+	ctx context.Context,
+	contentID,
+	contentType,
+	title,
+	overview string,
+	files []*models.MediaFile,
+	filter AccessFilter,
+	audioPreferenceContentID string,
+) *WatchDetail {
+	versions, playbackVariants, subtitles, intro, credits, recap, preview := s.buildPlaybackInfo(
+		ctx,
+		files,
+		filter,
+		audioPreferenceContentID,
+	)
+	sortVideoVersions(contentType, versions)
+	return &WatchDetail{
+		ContentID:        contentID,
+		Type:             contentType,
+		Title:            title,
+		Overview:         overview,
+		Versions:         versions,
+		PlaybackVariants: playbackVariants,
+		Subtitles:        subtitles,
+		Intro:            intro,
+		Credits:          credits,
+		Recap:            recap,
+		Preview:          preview,
+	}
+}
+
+// effectiveSubtitleDefaults resolves the subtitle preferences that apply to one
+// item, through the canonical resolver.
+//
+// This used to be four levels of hand-written precedence — profile columns,
+// then a library preference row, then a series preference row, each partially
+// overriding the last through Has* flags. The order lives in the manifest now
+// (profile_series, profile_library, profile_device, profile, default), so this
+// function and the contract cannot disagree about which override wins, and a
+// new scope is a manifest change rather than another branch here.
+//
+// The track signature stays on its specialized table: it identifies a concrete
+// track rather than expressing a preference, so it is not a setting.
+func (s *DetailService) effectiveSubtitleDefaults(
+	ctx context.Context,
+	filter AccessFilter,
+	seriesID string,
+	files []*models.MediaFile,
+) subtitleDefaults {
+	defaults := subtitleDefaults{}
+
+	if s.userStoreProvider == nil || filter.UserID == 0 || filter.ProfileID == "" {
+		return defaults
+	}
+
+	store, err := s.userStoreProvider.ForUser(ctx, filter.UserID)
+	if err != nil || store == nil {
+		return defaults
+	}
+
+	resolved, err := s.settingsResolver().Resolve(ctx, store, subtitleSettingsContext(filter, seriesID, files), subtitleSettingKeys, nil)
+	if err == nil {
+		defaults.applySettings(resolved)
+	}
+
+	if seriesID != "" {
+		if pref, err := store.GetSubtitlePreference(ctx, filter.ProfileID, seriesID); err == nil {
+			defaults.applyPreference(pref)
+		}
+	}
+
+	return defaults
+}
+
+// subtitleSettingKeys are the settings effectiveSubtitleDefaults resolves.
+var subtitleSettingKeys = []string{
+	settingskeys.PlaybackSubtitleLanguage,
+	settingskeys.PlaybackSubtitleMode,
+	settingskeys.PlaybackShowForcedSubtitles,
+}
+
+// subtitleSettingsContext is the context effectiveSubtitleDefaults resolves
+// subtitleSettingKeys in: the library of the file playback would pick, and
+// the series (or movie) the preference rows are stored under.
+func subtitleSettingsContext(filter AccessFilter, seriesID string, files []*models.MediaFile) settingsresolve.Context {
+	rc := settingsresolve.Context{ProfileID: filter.ProfileID, DeviceID: filter.DeviceID}
+	if libraryID := preferredPlayableLibraryID(files, filter.SelectedFileID); libraryID > 0 {
+		rc.LibraryIDs = []int{libraryID}
+	}
+	if seriesID != "" {
+		rc.SeriesIDs = []string{seriesID}
+	}
+	return rc
+}
+
+// applySettings takes the stored subtitle settings from a resolution that
+// includes subtitleSettingKeys; other keys are ignored.
+func (d *subtitleDefaults) applySettings(resolved []settingsresolve.Effective) {
+	for _, eff := range resolved {
+		// A value that resolved to the contract default is not a stored
+		// preference, and the callers distinguish the two through the Has*
+		// flags: an unset language must not read as "the user chose empty".
+		stored := eff.Source != settingscontract.ScopeDefault
+		switch eff.Key {
+		case settingskeys.PlaybackSubtitleLanguage:
+			var language string
+			if json.Unmarshal(eff.Value, &language) == nil && stored {
+				d.Language = language
+				d.HasLanguage = true
+			}
+		case settingskeys.PlaybackSubtitleMode:
+			var mode string
+			if json.Unmarshal(eff.Value, &mode) == nil && stored {
+				d.Mode = mode
+				d.HasMode = true
+			}
+		case settingskeys.PlaybackShowForcedSubtitles:
+			var forced bool
+			if json.Unmarshal(eff.Value, &forced) == nil && stored {
+				d.ShowForced = forced
+				d.HasShowForced = true
+			}
+		}
+	}
+}
+
+// applyPreference takes the track signature from the stored subtitle
+// preference row, which may be nil.
+func (d *subtitleDefaults) applyPreference(pref *userstore.SubtitlePreference) {
+	if pref != nil && pref.TrackSignature != nil && !pref.TrackSignature.IsZero() {
+		d.TrackSignature = pref.TrackSignature
+	}
+}
+
+// settingsResolver lazily builds the resolver over the embedded contract.
+//
+// The contract is validated at startup, so a load failure here is unreachable;
+// returning a resolver with no contract makes Resolve error rather than panic,
+// which degrades this to "no stored preferences" instead of failing the detail
+// request.
+func (s *DetailService) settingsResolver() *settingsresolve.Resolver {
+	s.resolverOnce.Do(func() {
+		contract, err := settingscontract.Load()
+		if err != nil {
+			return
+		}
+		s.resolver = settingsresolve.New(contract)
+	})
+	return s.resolver
+}
+
+func (s *DetailService) effectiveVersionDefaults(
+	ctx context.Context,
+	filter AccessFilter,
+	seriesID string,
+) versionDefaults {
+	defaults := versionDefaults{}
+
+	if seriesID == "" || s.userStoreProvider == nil || filter.UserID == 0 || filter.ProfileID == "" {
+		return defaults
+	}
+
+	store, err := s.userStoreProvider.ForUser(ctx, filter.UserID)
+	if err != nil || store == nil {
+		return defaults
+	}
+
+	pref, err := store.GetSeriesPlaybackPreference(ctx, filter.ProfileID, seriesID)
+	if err != nil || pref == nil {
+		return defaults
+	}
+
+	defaults.Resolution = pref.Resolution
+	defaults.HDR = pref.HDR
+	defaults.CodecVideo = pref.CodecVideo
+	defaults.HasAny = pref.Resolution != "" || pref.CodecVideo != "" || pref.HDR
+	return defaults
+}
+
+func (s *DetailService) resolveOriginalLanguage(ctx context.Context, contentID string) string {
+	if s != nil && s.originalLangFn != nil {
+		return strings.TrimSpace(s.originalLangFn(ctx, contentID))
+	}
+	if s == nil || s.itemRepo == nil || strings.TrimSpace(contentID) == "" {
+		return ""
+	}
+	lang, err := s.itemRepo.GetOriginalLanguage(ctx, contentID)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(lang)
+}
+
+type effectiveAudioSelection struct {
+	Index    int
+	Language string
+}
+
+func resolveSelectedAudioLanguage(
+	file *models.MediaFile,
+	index int,
+	originalLanguage string,
+	useOriginalFallback bool,
+) string {
+	if file != nil && index >= 0 && index < len(file.AudioTracks) {
+		if language := strings.TrimSpace(file.AudioTracks[index].Language); language != "" {
+			return language
+		}
+	}
+	if useOriginalFallback {
+		return strings.TrimSpace(originalLanguage)
+	}
+	return ""
+}
+
+// audioPrefResolver memoizes the user-store lookups behind
+// effectiveAudioSelection that are invariant across the files of a single
+// detail request — the user store, the profile, the item's audio preference,
+// and the resolved original language — plus per-library playback preferences.
+// A multi-track item (e.g. a several-hundred-file audiobook) thus issues each
+// of those queries once per request instead of once per file.
+type audioPrefResolver struct {
+	svc       *DetailService
+	store     userstore.UserStore
+	valid     bool
+	profileID string
+	deviceID  string
+	contentID string
+
+	profileDone bool
+	profileLang string
+
+	audioDone bool
+	audioPref *playback.AudioTrackPreference
+
+	originalDone bool
+	originalLang string
+
+	resolvedLang map[int]string
+}
+
+func (r *audioPrefResolver) profileLanguage(ctx context.Context) string {
+	if !r.profileDone {
+		r.profileDone = true
+		r.profileLang = r.svc.resolvedAudioLanguage(ctx, r.store, settingsresolve.Context{
+			ProfileID: r.profileID,
+		})
+	}
+	return r.profileLang
+}
+
+// newAudioPrefResolver resolves the per-user store once and prepares the
+// memoization caches. The returned resolver is not safe for concurrent use; it
+// is intended to be threaded through a single sequential file loop.
+func (s *DetailService) newAudioPrefResolver(ctx context.Context, filter AccessFilter, audioPreferenceContentID string) *audioPrefResolver {
+	r := &audioPrefResolver{
+		svc:          s,
+		profileID:    filter.ProfileID,
+		deviceID:     filter.DeviceID,
+		contentID:    audioPreferenceContentID,
+		resolvedLang: map[int]string{},
+	}
+	if s.userStoreProvider == nil || filter.UserID == 0 || filter.ProfileID == "" {
+		return r
+	}
+	store, err := s.userStoreProvider.ForUser(ctx, filter.UserID)
+	if err != nil || store == nil {
+		return r
+	}
+	r.store = store
+	r.valid = true
+	return r
+}
+
+// audioPreference returns a fresh copy of the item's stored audio preference
+// (or nil). A copy is returned each call so the caller can resolve the
+// original-language sentinel in place without mutating the memoized value.
+func (r *audioPrefResolver) audioPreference(ctx context.Context) *playback.AudioTrackPreference {
+	if !r.audioDone {
+		r.audioDone = true
+		if strings.TrimSpace(r.contentID) != "" {
+			if pref, prefErr := r.store.GetAudioPreference(ctx, r.profileID, r.contentID); prefErr == nil && pref != nil {
+				r.audioPref = &playback.AudioTrackPreference{
+					AudioTrackIndex: pref.AudioTrackIndex,
+					AudioLanguage:   pref.AudioLanguage,
+					TrackSignature:  pref.TrackSignature,
+				}
+			}
+		}
+	}
+	if r.audioPref == nil {
+		return nil
+	}
+	cp := *r.audioPref
+	return &cp
+}
+
+// audioLanguage resolves with every content identity in context. The language
+// preference lives in the canonical table at profile_series/profile_library/
+// profile_device/profile scopes; the specialized audio row supplies only
+// concrete track identity. Caching by library keeps a multi-file item at one
+// canonical read per distinct folder rather than one read per file.
+func (r *audioPrefResolver) audioLanguage(ctx context.Context, libraryID int) string {
+	if lang, ok := r.resolvedLang[libraryID]; ok {
+		return lang
+	}
+	lang := r.svc.resolvedAudioLanguage(ctx, r.store, r.audioLanguageContext(libraryID))
+	r.resolvedLang[libraryID] = lang
+	return lang
+}
+
+// audioLanguageContext is the context audioLanguage resolves one library's
+// audio language in.
+func (r *audioPrefResolver) audioLanguageContext(libraryID int) settingsresolve.Context {
+	rc := settingsresolve.Context{
+		ProfileID:  r.profileID,
+		DeviceID:   r.deviceID,
+		LibraryIDs: []int{libraryID},
+	}
+	if strings.TrimSpace(r.contentID) != "" {
+		rc.SeriesIDs = []string{r.contentID}
+	}
+	return rc
+}
+
+// resolvedAudioLanguage returns the effective playback.audio_language for one
+// context, or "" when nothing is stored.
+func (s *DetailService) resolvedAudioLanguage(
+	ctx context.Context, store userstore.UserStore, rc settingsresolve.Context,
+) string {
+	resolved, err := s.settingsResolver().Resolve(ctx, store, rc,
+		[]string{settingskeys.PlaybackAudioLanguage}, nil)
+	if err != nil {
+		return ""
+	}
+	return audioLanguageFromResolved(resolved)
+}
+
+// audioLanguageFromResolved reads playback.audio_language from a resolution
+// of that one key, or "" when nothing is stored.
+func audioLanguageFromResolved(resolved []settingsresolve.Effective) string {
+	if len(resolved) == 0 {
+		return ""
+	}
+	// The contract default is null, which means "no preference" — the caller
+	// treats "" the same way, so an unset language needs no special case.
+	var language string
+	if json.Unmarshal(resolved[0].Value, &language) != nil {
+		return ""
+	}
+	return strings.TrimSpace(language)
+}
+
+func (r *audioPrefResolver) originalLanguage(ctx context.Context) string {
+	if !r.originalDone {
+		r.originalDone = true
+		r.originalLang = r.svc.resolveOriginalLanguage(ctx, r.contentID)
+	}
+	return r.originalLang
+}
+
+func (s *DetailService) effectiveAudioSelection(
+	ctx context.Context,
+	filter AccessFilter,
+	audioPreferenceContentID string,
+	file *models.MediaFile,
+) effectiveAudioSelection {
+	return s.effectiveAudioSelectionWith(ctx, s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID), file)
+}
+
+// effectiveAudioSelectionWith computes the selection for one file using a
+// resolver whose request-invariant lookups are shared across every file.
+func (s *DetailService) effectiveAudioSelectionWith(
+	ctx context.Context,
+	r *audioPrefResolver,
+	file *models.MediaFile,
+) effectiveAudioSelection {
+	if file == nil || len(file.AudioTracks) == 0 {
+		return effectiveAudioSelection{}
+	}
+	if r == nil || !r.valid {
+		index := playback.SelectAudioTrack(file.AudioTracks, "", nil)
+		return effectiveAudioSelection{
+			Index:    index,
+			Language: resolveSelectedAudioLanguage(file, index, "", false),
+		}
+	}
+
+	seriesPref := r.audioPreference(ctx)
+	preferredLang := r.audioLanguage(ctx, file.MediaFolderID)
+
+	originalLanguage := ""
+	resolveOriginalLanguage := func() string {
+		if originalLanguage == "" {
+			originalLanguage = r.originalLanguage(ctx)
+		}
+		return originalLanguage
+	}
+
+	usesOriginal := playback.IsOriginalLanguagePreference(preferredLang)
+	if usesOriginal {
+		preferredLang = resolveOriginalLanguage()
+		if preferredLang == "" {
+			// "original" used to fall through to the roaming profile choice
+			// when the item's original language could not be resolved. Keep that
+			// failure behavior while moving the content-scoped read to canonical
+			// storage.
+			preferredLang = r.profileLanguage(ctx)
+			if playback.IsOriginalLanguagePreference(preferredLang) {
+				preferredLang = resolveOriginalLanguage()
+			}
+		}
+	}
+	if seriesPref != nil {
+		// The signature/index remain the concrete selection. Language comes
+		// from canonical resolution so a stale legacy language cannot outrank a
+		// profile_series write made through /settings/values.
+		seriesPref.AudioLanguage = preferredLang
+	}
+
+	index := playback.SelectAudioTrack(file.AudioTracks, preferredLang, seriesPref)
+	return effectiveAudioSelection{
+		Index:    index,
+		Language: resolveSelectedAudioLanguage(file, index, originalLanguage, usesOriginal),
+	}
+}
+
+func (s *DetailService) effectiveAudioTrackIndex(
+	ctx context.Context,
+	filter AccessFilter,
+	audioPreferenceContentID string,
+	file *models.MediaFile,
+) int {
+	return s.effectiveAudioSelection(ctx, filter, audioPreferenceContentID, file).Index
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func intPtr(value int) *int {
+	return &value
+}
+
+func preferredPlayableLibraryID(files []*models.MediaFile, selectedFileID int) int {
+	if selectedFileID > 0 {
+		for _, file := range files {
+			if file != nil && file.ID == selectedFileID {
+				return file.MediaFolderID
+			}
+		}
+	}
+
+	best := bestPlayableFile(files)
+	if best == nil {
+		return 0
+	}
+	return best.MediaFolderID
+}
+
+func bestPlayableFile(files []*models.MediaFile) *models.MediaFile {
+	var best *models.MediaFile
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		if best == nil {
+			best = file
+			continue
+		}
+		switch access.CompareQuality(file.Resolution, best.Resolution) {
+		case 1:
+			best = file
+		case 0:
+			if file.FileSize < best.FileSize {
+				best = file
+			}
+		}
+	}
+	return best
+}
+
+// The four per-file segment kinds, as the marker columns and the API name them.
+const (
+	markerKindIntro   = "intro"
+	markerKindCredits = "credits"
+	markerKindRecap   = "recap"
+	markerKindPreview = "preview"
+)
+
+// markerFromFile lifts one segment kind out of a media file: its range when both
+// bounds are stored, plus the provenance recorded beside it.
+//
+// The provenance lives only in the per-kind column groups
+// (intro_markers_source, …_provider, …_confidence, …_algorithm), so the caller
+// passes the file rather than the bounds.
+func markerFromFile(file *models.MediaFile, kind string) *Marker {
+	if file == nil {
+		return nil
+	}
+
+	var (
+		start, end       *float64
+		source, provider *string
+		confidence       *float64
+		algorithm        *string
+	)
+	switch kind {
+	case markerKindIntro:
+		start, end = file.IntroStart, file.IntroEnd
+		source, provider, confidence, algorithm = file.IntroMarkersSource, file.IntroMarkersProvider, file.IntroMarkersConfidence, file.IntroMarkersAlgorithm
+	case markerKindCredits:
+		start, end = file.CreditsStart, file.CreditsEnd
+		source, provider, confidence, algorithm = file.CreditsMarkersSource, file.CreditsMarkersProvider, file.CreditsMarkersConfidence, file.CreditsMarkersAlgorithm
+	case markerKindRecap:
+		start, end = file.RecapStart, file.RecapEnd
+		source, provider, confidence, algorithm = file.RecapMarkersSource, file.RecapMarkersProvider, file.RecapMarkersConfidence, file.RecapMarkersAlgorithm
+	case markerKindPreview:
+		start, end = file.PreviewStart, file.PreviewEnd
+		source, provider, confidence, algorithm = file.PreviewMarkersSource, file.PreviewMarkersProvider, file.PreviewMarkersConfidence, file.PreviewMarkersAlgorithm
+	default:
+		return nil
+	}
+	if start == nil || end == nil {
+		return nil
+	}
+
+	marker := &Marker{Start: *start, End: *end}
+	if source != nil {
+		marker.Source = *source
+	}
+	if provider != nil {
+		marker.Provider = *provider
+	}
+	if algorithm != nil {
+		marker.Algorithm = *algorithm
+	}
+	if confidence != nil {
+		value := *confidence
+		marker.Confidence = &value
+	}
+	return marker
+}
+
+func sortAudiobookMediaFiles(files []*models.MediaFile) {
+	sort.SliceStable(files, func(i, j int) bool {
+		a, b := files[i], files[j]
+		if a == nil || b == nil {
+			return a != nil
+		}
+		if a.PresentationPartIndex > 0 || b.PresentationPartIndex > 0 {
+			if a.PresentationPartIndex != b.PresentationPartIndex {
+				if a.PresentationPartIndex == 0 {
+					return false
+				}
+				if b.PresentationPartIndex == 0 {
+					return true
+				}
+				return a.PresentationPartIndex < b.PresentationPartIndex
+			}
+		}
+		if a.FilePath != b.FilePath {
+			return strings.Compare(a.FilePath, b.FilePath) < 0
+		}
+		return a.ID < b.ID
+	})
+}
+
+func (s *DetailService) buildPlaybackInfo(
+	ctx context.Context,
+	files []*models.MediaFile,
+	filter AccessFilter,
+	audioPreferenceContentID string,
+) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
+	// Resolve the request-invariant audio preferences once; a multi-track item
+	// would otherwise re-query the profile/preference rows for every file.
+	return s.buildPlaybackInfoWith(ctx, files, filter, s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID), s.trickplay, true)
+}
+
+// buildPlaybackInfoWith is buildPlaybackInfo with a caller-owned audio
+// resolver, so a batch over one series can share it across episodes. A nil
+// availability leaves Trickplay unset, and markerPreviews false leaves
+// MarkerPreviews unset, for a view that shows neither.
+func (s *DetailService) buildPlaybackInfoWith(
+	ctx context.Context,
+	files []*models.MediaFile,
+	filter AccessFilter,
+	audioResolver *audioPrefResolver,
+	availability TrickplayAvailability,
+	markerPreviews bool,
+) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
+	versions := make([]FileVersion, 0, len(files))
+	subtitleSet := make(map[string]SubtitleInfo)
+	var firstIntro, firstCredits, firstRecap, firstPreview *Marker
+
+	for _, f := range files {
+		if f == nil {
+			continue
+		}
+		effectiveAudioSelection := s.effectiveAudioSelectionWith(ctx, audioResolver, f)
+		versionIntro := markerFromFile(f, markerKindIntro)
+		if versionIntro != nil && firstIntro == nil {
+			firstIntro = versionIntro
+		}
+		versionCredits := markerFromFile(f, markerKindCredits)
+		if versionCredits != nil && firstCredits == nil {
+			firstCredits = versionCredits
+		}
+		versionRecap := markerFromFile(f, markerKindRecap)
+		if versionRecap != nil && firstRecap == nil {
+			firstRecap = versionRecap
+		}
+		versionPreview := markerFromFile(f, markerKindPreview)
+		if versionPreview != nil && firstPreview == nil {
+			firstPreview = versionPreview
+		}
+
+		var previews []VersionMarkerPreview
+		if markerPreviews {
+			previews = BuildMarkerPreviews(ctx, f, func(ctx context.Context, paths []string) map[string]ResolvedImageURL {
+				return s.PresignURLsWithExpiry(ctx, paths, "card")
+			})
+		}
+		versions = append(versions, FileVersion{
+			FileID:                   f.ID,
+			FileName:                 fspath.Display(filepath.Base(f.FilePath)),
+			FilePath:                 f.FilePath,
+			Resolution:               f.Resolution,
+			CodecVideo:               f.CodecVideo,
+			CodecAudio:               f.CodecAudio,
+			HDR:                      f.HDR,
+			Container:                f.Container,
+			FileSize:                 f.FileSize,
+			Duration:                 f.Duration,
+			Bitrate:                  f.Bitrate,
+			AddedAt:                  f.CreatedAt,
+			EditionRaw:               f.EditionRaw,
+			EditionKey:               f.EditionKey,
+			PresentationKind:         f.PresentationKind,
+			PresentationGroupKey:     f.PresentationGroupKey,
+			PresentationPartIndex:    f.PresentationPartIndex,
+			PresentationPartTotal:    f.PresentationPartTotal,
+			MultiEpisodeStart:        f.MultiEpisodeStart,
+			MultiEpisodeEnd:          f.MultiEpisodeEnd,
+			EffectiveAudioTrackIndex: intPtr(effectiveAudioSelection.Index),
+			EffectiveAudioLanguage:   effectiveAudioSelection.Language,
+			VideoTracks:              append([]models.VideoTrack(nil), f.VideoTracks...),
+			AudioTracks:              append([]models.AudioTrack(nil), f.AudioTracks...),
+			SubtitleTracks:           buildVersionSubtitleTracks(f),
+			Chapters:                 s.buildVersionChapters(ctx, f),
+			Intro:                    versionIntro,
+			Credits:                  versionCredits,
+			Recap:                    versionRecap,
+			Preview:                  versionPreview,
+			MarkerSegments:           models.EffectiveMarkerSegments(f),
+			MarkerPreviews:           previews,
+			Unreadable:               f.ProbeRejected(),
+		})
+
+		for _, sub := range f.SubtitleTracks {
+			key := fmt.Sprintf("embedded:%s:%s:%v:%v", sub.Language, sub.Codec, sub.Forced, sub.HearingImpaired)
+			if _, exists := subtitleSet[key]; !exists {
+				subtitleSet[key] = SubtitleInfo{
+					Source:          "embedded",
+					Language:        sub.Language,
+					Codec:           sub.Codec,
+					Forced:          sub.Forced,
+					HearingImpaired: sub.HearingImpaired,
+					Title:           sub.Title,
+				}
+			}
+		}
+
+		for _, sub := range f.ExternalSubtitles {
+			key := fmt.Sprintf("external:%s:%s:%v:%v", sub.Language, sub.Format, sub.Forced, sub.HearingImpaired)
+			if _, exists := subtitleSet[key]; !exists {
+				subtitleSet[key] = SubtitleInfo{
+					Source:          subtitleSourceExternal,
+					Language:        sub.Language,
+					Codec:           sub.Format,
+					Forced:          sub.Forced,
+					HearingImpaired: sub.HearingImpaired,
+				}
+			}
+		}
+
+	}
+
+	subtitles := make([]SubtitleInfo, 0, len(subtitleSet))
+	for _, sub := range subtitleSet {
+		subtitles = append(subtitles, sub)
+	}
+
+	s.markTrickplay(ctx, versions, availability)
+	variants := buildPlaybackVariants(versions, filter.SelectedFileID)
+	selectedVersionExists := playbackVersionExists(versions, filter.SelectedFileID)
+	pick := func(field func(v FileVersion) *Marker, fallback *Marker) *Marker {
+		m := selectedPlaybackMarker(versions, variants, filter.SelectedFileID, field)
+		if m == nil && !selectedVersionExists {
+			return fallback
+		}
+		return m
+	}
+	intro := pick(func(v FileVersion) *Marker { return v.Intro }, firstIntro)
+	credits := pick(func(v FileVersion) *Marker { return v.Credits }, firstCredits)
+	recap := pick(func(v FileVersion) *Marker { return v.Recap }, firstRecap)
+	preview := pick(func(v FileVersion) *Marker { return v.Preview }, firstPreview)
+
+	return versions, variants, subtitles, intro, credits, recap, preview
+}
+
+func playbackVersionExists(versions []FileVersion, selectedFileID int) bool {
+	if selectedFileID <= 0 {
+		return false
+	}
+	for _, version := range versions {
+		if version.FileID == selectedFileID {
+			return true
+		}
+	}
+	return false
+}
+
+func selectedPlaybackMarker(
+	versions []FileVersion,
+	variants []PlaybackVariant,
+	selectedFileID int,
+	marker func(FileVersion) *Marker,
+) *Marker {
+	if marker == nil {
+		return nil
+	}
+	if selectedFileID > 0 {
+		for _, version := range versions {
+			if version.FileID == selectedFileID {
+				return marker(version)
+			}
+		}
+	}
+	for _, variant := range variants {
+		if variant.DefaultFileID <= 0 {
+			continue
+		}
+		for _, version := range versions {
+			if version.FileID == variant.DefaultFileID {
+				if matched := marker(version); matched != nil {
+					return matched
+				}
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func buildPlaybackVariants(versions []FileVersion, selectedFileID int) []PlaybackVariant {
+	if len(versions) == 0 {
+		return []PlaybackVariant{}
+	}
+
+	type partBucket struct {
+		PartIndex int
+		Versions  []FileVersion
+	}
+	type variantBucket struct {
+		EditionRaw           string
+		EditionKey           string
+		PresentationKind     string
+		PresentationGroupKey string
+		Parts                map[int]*partBucket
+	}
+
+	byVariant := make(map[string]*variantBucket)
+	order := make([]string, 0)
+
+	for _, version := range versions {
+		variantID := playbackVariantID(version)
+		bucket, ok := byVariant[variantID]
+		if !ok {
+			bucket = &variantBucket{
+				EditionRaw:           version.EditionRaw,
+				EditionKey:           version.EditionKey,
+				PresentationKind:     version.PresentationKind,
+				PresentationGroupKey: version.PresentationGroupKey,
+				Parts:                map[int]*partBucket{},
+			}
+			byVariant[variantID] = bucket
+			order = append(order, variantID)
+		}
+
+		partIndex := version.PresentationPartIndex
+		if partIndex <= 0 {
+			partIndex = 1
+		}
+		part, ok := bucket.Parts[partIndex]
+		if !ok {
+			part = &partBucket{PartIndex: partIndex}
+			bucket.Parts[partIndex] = part
+		}
+		part.Versions = append(part.Versions, version)
+	}
+
+	variants := make([]PlaybackVariant, 0, len(order))
+	for _, variantID := range order {
+		bucket := byVariant[variantID]
+		partIndexes := make([]int, 0, len(bucket.Parts))
+		for partIndex := range bucket.Parts {
+			partIndexes = append(partIndexes, partIndex)
+		}
+		sort.Ints(partIndexes)
+
+		parts := make([]PlaybackVariantPart, 0, len(partIndexes))
+		totalDuration := 0
+		defaultFileID := 0
+		for _, partIndex := range partIndexes {
+			part := bucket.Parts[partIndex]
+			sortFileVersions(part.Versions)
+			defaultVersion := chooseDefaultVariantVersion(part.Versions, selectedFileID)
+			if defaultVersion != nil {
+				if defaultFileID == 0 {
+					defaultFileID = defaultVersion.FileID
+				}
+			}
+			partDuration := 0
+			for _, version := range part.Versions {
+				if version.Duration > partDuration {
+					partDuration = version.Duration
+				}
+			}
+			totalDuration += partDuration
+			parts = append(parts, PlaybackVariantPart{
+				PartIndex:     partIndex,
+				DefaultFileID: fileIDOrZero(defaultVersion),
+				TotalDuration: partDuration,
+				Versions:      part.Versions,
+			})
+		}
+
+		variants = append(variants, PlaybackVariant{
+			VariantID:            variantID,
+			EditionRaw:           bucket.EditionRaw,
+			EditionKey:           bucket.EditionKey,
+			PresentationKind:     bucket.PresentationKind,
+			PresentationGroupKey: bucket.PresentationGroupKey,
+			PartCount:            len(parts),
+			TotalDuration:        totalDuration,
+			DefaultFileID:        defaultFileID,
+			Parts:                parts,
+		})
+	}
+
+	return variants
+}
+
+func playbackVariantID(version FileVersion) string {
+	editionKey := strings.TrimSpace(version.EditionKey)
+	presentationKind := strings.TrimSpace(version.PresentationKind)
+	groupKey := strings.TrimSpace(version.PresentationGroupKey)
+	if editionKey == "" && presentationKind == "" && groupKey == "" {
+		return "default"
+	}
+	return strings.Join([]string{editionKey, presentationKind, groupKey}, "|")
+}
+
+// sortVideoVersions gives a movie, episode or extra's top-level versions the
+// order sortFileVersions gives each playback variant part, so clients read one
+// ranking from either list. Files that start playback (a single file or a
+// multipart presentation's first part) come before later parts, so a caller
+// taking versions[0] as a default never starts mid-title. The files of other
+// types keep the order their builder chose: an audiobook's files are its parts
+// in sequence.
+func sortVideoVersions(itemType string, versions []FileVersion) {
+	switch itemType {
+	case playableTypeMovie, detailTypeEpisode, detailTypeExtra:
+		sortFileVersions(versions)
+		sort.SliceStable(versions, func(i, j int) bool {
+			return !isLaterPart(versions[i]) && isLaterPart(versions[j])
+		})
+	}
+}
+
+func isLaterPart(v FileVersion) bool {
+	return v.PresentationPartIndex > 1
+}
+
+func sortFileVersions(versions []FileVersion) {
+	sort.SliceStable(versions, func(i, j int) bool {
+		a, b := versions[i], versions[j]
+		switch access.CompareQuality(a.Resolution, b.Resolution) {
+		case 1:
+			return true
+		case -1:
+			return false
+		}
+		if a.HDR != b.HDR {
+			return a.HDR
+		}
+		if ra, rb := locationpref.Rank(a.FilePath), locationpref.Rank(b.FilePath); ra != rb {
+			return ra < rb
+		}
+		return a.FileSize > b.FileSize
+	})
+}
+
+func chooseDefaultVariantVersion(versions []FileVersion, selectedFileID int) *FileVersion {
+	if selectedFileID > 0 {
+		for i := range versions {
+			if versions[i].FileID == selectedFileID {
+				return &versions[i]
+			}
+		}
+	}
+	if len(versions) == 0 {
+		return nil
+	}
+	return &versions[0]
+}
+
+func fileIDOrZero(version *FileVersion) int {
+	if version == nil {
+		return 0
+	}
+	return version.FileID
+}
+
+// preparePlaybackFiles repairs probe metadata and stamps the H.264 copy-safety
+// verdict when it is already known. Used by the watch surfaces, where a play is
+// about to be prepared and the verdict is about to matter.
+//
+// It deliberately does not wait for an unknown verdict: the bitstream scan is
+// started in the background instead, so opening the watch page costs nothing
+// even for a file nobody has played yet. No session exists at this point — if
+// one appears and lands on a stream-copy route before the scan finishes, the
+// playback-side notifier switches it off that route when the verdict lands.
+func (s *DetailService) preparePlaybackFiles(ctx context.Context, files []*models.MediaFile) []*models.MediaFile {
+	return s.prepareFiles(ctx, files, true)
+}
+
+// prepareBrowseFiles repairs probe metadata only. Item, episode and extra
+// detail pages never consume the copy-safety verdict — it is not serialized
+// into their responses — so scanning for it there was pure warm-up that cost a
+// multi-second read per H.264 file on remote storage.
+func (s *DetailService) prepareBrowseFiles(ctx context.Context, files []*models.MediaFile) []*models.MediaFile {
+	return s.prepareFiles(ctx, files, false)
+}
+
+func (s *DetailService) prepareFiles(ctx context.Context, files []*models.MediaFile, withCopySafety bool) []*models.MediaFile {
+	if len(files) == 0 {
+		return files
+	}
+
+	prepared := make([]*models.MediaFile, 0, len(files))
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		if s.probeEnsurer != nil {
+			var ensured *models.MediaFile
+			var err error
+			if withCopySafety {
+				ensured, err = s.probeEnsurer.EnsureCopySafetyCached(ctx, file)
+			} else {
+				ensured, err = s.probeEnsurer.EnsureProbeOnly(ctx, file)
+			}
+			if err == nil && ensured != nil {
+				file = ensured
+			}
+		}
+		if withCopySafety && s.copySafetyRacer != nil && file.ID > 0 && file.VideoCopySafetyUnknown() {
+			s.copySafetyRacer.RaceScan(file.ID)
+		}
+		prepared = append(prepared, file)
+	}
+
+	return prepared
+}
+
+func (s *DetailService) queueWatchPlaybackFiles(
+	ctx context.Context,
+	contentID string,
+	contentType string,
+	files []*models.MediaFile,
+) {
+	if s == nil || s.chapterThumbs == nil || len(files) == 0 {
+		return
+	}
+
+	fileIDs := make([]int, 0, len(files))
+	for _, file := range files {
+		if file == nil || file.ID <= 0 {
+			continue
+		}
+		fileIDs = append(fileIDs, file.ID)
+	}
+	if len(fileIDs) == 0 {
+		return
+	}
+
+	slog.InfoContext(ctx,
+		"queueing chapter thumbnails", "component", "catalog",
+		"source",
+		"watch_detail",
+		"content_id",
+		contentID,
+		"content_type",
+		contentType,
+		"file_count",
+		len(fileIDs),
+	)
+	s.chapterThumbs.QueueFileIDs(ctx, fileIDs)
+}
+
+func (s *DetailService) buildVersionChapters(ctx context.Context, file *models.MediaFile) []VersionChapter {
+	if file == nil || len(file.Chapters) == 0 {
+		return []VersionChapter{}
+	}
+
+	paths := make([]string, 0, len(file.Chapters))
+	for _, chapter := range file.Chapters {
+		if chapter.ThumbnailPath != "" {
+			paths = append(paths, chapter.ThumbnailPath)
+		}
+	}
+	resolved := s.PresignURLsWithExpiry(ctx, paths, "card")
+	chapters := make([]VersionChapter, 0, len(file.Chapters))
+	for _, chapter := range file.Chapters {
+		ch := VersionChapter{
+			Index:              chapter.Index,
+			Title:              chapter.Title,
+			StartSeconds:       chapter.StartSeconds,
+			EndSeconds:         chapter.EndSeconds,
+			Source:             chapter.Source,
+			ThumbnailThumbhash: chapter.ThumbnailThumbhash,
+		}
+		if chapter.ThumbnailPath != "" {
+			ch.ThumbnailURL = resolved[chapter.ThumbnailPath].URL
+		}
+		chapters = append(chapters, ch)
+	}
+	return chapters
+}
+
+func buildVersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {
+	tracks := make([]VersionSubtitleTrack, 0, len(file.SubtitleTracks)+len(file.ExternalSubtitles))
+	nextExternalIndex := len(file.VideoTracks) + len(file.AudioTracks)
+	for i, sub := range file.SubtitleTracks {
+		tracks = append(tracks, VersionSubtitleTrack{
+			Index:           sub.Index,
+			Language:        sub.Language,
+			Codec:           sub.Codec,
+			Title:           sub.Title,
+			EmbeddedTitle:   sub.EmbeddedTitle,
+			Resolution:      sub.Resolution,
+			Forced:          sub.Forced,
+			Default:         sub.Default,
+			HearingImpaired: sub.HearingImpaired,
+			External:        sub.External,
+			FileName:        sub.FileName,
+			IndexOnly:       sub.IndexOnly,
+		})
+
+		index := sub.Index
+		if index <= 0 {
+			index = len(file.VideoTracks) + len(file.AudioTracks) + i
+		}
+		if index >= nextExternalIndex {
+			nextExternalIndex = index + 1
+		}
+	}
+	// Zero means "use positional fallback" to downstream consumers and is
+	// omitted from JSON, so external tracks always receive positive indexes.
+	if nextExternalIndex < 1 {
+		nextExternalIndex = 1
+	}
+	for i, sub := range file.ExternalSubtitles {
+		tracks = append(tracks, VersionSubtitleTrack{
+			Index:           nextExternalIndex + i,
+			Language:        sub.Language,
+			Codec:           sub.Format,
+			Title:           firstNonEmpty(sub.Title, sub.FileName()),
+			TitleIsFallback: strings.TrimSpace(sub.Title) == "",
+			EmbeddedTitle:   sub.EmbeddedTitle,
+			Resolution:      sub.Resolution,
+			Forced:          sub.Forced,
+			Default:         sub.Default,
+			HearingImpaired: sub.HearingImpaired,
+			External:        true,
+			FileName:        sub.FileName(),
+		})
+	}
+	return tracks
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// PresignURL resolves an image path to a usable URL:
+//   - Empty/"-" → ""
+//   - http:// or https:// → returned as-is (external provider URLs)
+//   - {plugin_id}:// prefix → resolved via plugin's ResolveImageURL RPC
+//   - Bare path (legacy) → logs warning and returns "" (no longer resolvable)
+//
+// The variant parameter is a semantic size hint forwarded to plugin resolvers:
+// "card", "featured", "large", "full", "original".
+func (s *DetailService) PresignURL(ctx context.Context, path string, variant string) string {
+	return s.PresignURLWithExpiry(ctx, path, variant).URL
+}
+
+// ImageURLOrEmpty returns u when it parses as a URL reference and "" when it
+// does not. Image URLs stored as entered (admin edits, NFO and catalog
+// imports) and those a plugin resolver returns pass through presigning, so a
+// malformed one reads as no image rather than a value the API's uri-reference
+// format refuses.
+func ImageURLOrEmpty(u string) string {
+	if _, err := url.Parse(u); err != nil || strings.Contains(u, `\`) {
+		return ""
+	}
+	return u
+}
+
+// PresignURLWithExpiry resolves an image path and returns expiry metadata when
+// the underlying resolver can state the resolved URL validity window.
+func (s *DetailService) PresignURLWithExpiry(ctx context.Context, path string, variant string) ResolvedImageURL {
+	if path == "" || path == "-" {
+		return ResolvedImageURL{}
+	}
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return ResolvedImageURL{URL: ImageURLOrEmpty(path)}
+	}
+
+	if s.imageResolver != nil {
+		if resolver, ok := s.imageResolver.(expiringImageResolver); ok {
+			resolved := resolver.ResolveImageURLWithExpiry(ctx, path, variant)
+			resolved.URL = ImageURLOrEmpty(resolved.URL)
+			return resolved
+		}
+		return ResolvedImageURL{URL: ImageURLOrEmpty(s.imageResolver.ResolveImageURL(ctx, path, variant))}
+	}
+
+	slog.WarnContext(ctx, "image path could not be resolved", "component", "catalog", "path", path)
+	return ResolvedImageURL{}
+}
+
+// PresignImageURLs resolves multiple image paths to usable URLs with variant
+// support while preserving the original input paths as lookup keys.
+func (s *DetailService) PresignImageURLs(ctx context.Context, paths []string, imageType, size string) map[string]string {
+	resolvedWithExpiry := s.PresignImageURLsWithExpiry(ctx, paths, imageType, size)
+	resolved := make(map[string]string, len(resolvedWithExpiry))
+	for path, value := range resolvedWithExpiry {
+		resolved[path] = value.URL
+	}
+	return resolved
+}
+
+// PresignImageURLsWithExpiry resolves multiple image paths with image-type size
+// normalization while preserving original input paths as lookup keys.
+func (s *DetailService) PresignImageURLsWithExpiry(ctx context.Context, paths []string, imageType, size string) map[string]ResolvedImageURL {
+	if len(paths) == 0 {
+		return map[string]ResolvedImageURL{}
+	}
+
+	variant := sizeToVariant(size)
+	normalizedPaths := make([]string, 0, len(paths))
+	originalsByNormalized := make(map[string][]string, len(paths))
+	for _, path := range paths {
+		if path == "" || path == "-" {
+			continue
+		}
+
+		normalized := path
+		if !strings.HasPrefix(path, "http://") &&
+			!strings.HasPrefix(path, "https://") &&
+			!strings.Contains(path, "://") {
+			normalized = cachedImageVariantPath(path, imageType, size)
+		}
+
+		if _, ok := originalsByNormalized[normalized]; !ok {
+			normalizedPaths = append(normalizedPaths, normalized)
+		}
+		originalsByNormalized[normalized] = append(originalsByNormalized[normalized], path)
+	}
+
+	if len(normalizedPaths) == 0 {
+		return map[string]ResolvedImageURL{}
+	}
+
+	resolvedByNormalized := s.PresignURLsWithExpiry(ctx, normalizedPaths, variant)
+
+	resolved := make(map[string]ResolvedImageURL, len(paths))
+	for _, normalized := range normalizedPaths {
+		value, ok := resolvedByNormalized[normalized]
+		if !ok || value.URL == "" {
+			value = s.PresignURLWithExpiry(ctx, normalized, variant)
+		}
+		for _, original := range originalsByNormalized[normalized] {
+			resolved[original] = value
+		}
+	}
+
+	return resolved
+}
+
+// PresignURLsWithExpiry resolves already-normalized image paths in a single
+// batch, preserving the input path as the lookup key.
+func (s *DetailService) PresignURLsWithExpiry(ctx context.Context, paths []string, variant string) map[string]ResolvedImageURL {
+	if len(paths) == 0 {
+		return map[string]ResolvedImageURL{}
+	}
+	resolved := make(map[string]ResolvedImageURL, len(paths))
+	resolverPaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path == "" || path == "-" {
+			continue
+		}
+		if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+			resolved[path] = ResolvedImageURL{URL: ImageURLOrEmpty(path)}
+			continue
+		}
+		resolverPaths = append(resolverPaths, path)
+	}
+	if s.imageResolver != nil && len(resolverPaths) > 0 {
+		if resolver, ok := s.imageResolver.(expiringImageResolver); ok {
+			for path, value := range resolver.ResolveImageURLsWithExpiry(ctx, resolverPaths, variant) {
+				value.URL = ImageURLOrEmpty(value.URL)
+				resolved[path] = value
+			}
+		} else {
+			for path, resolvedURL := range s.imageResolver.ResolveImageURLs(ctx, resolverPaths, variant) {
+				resolved[path] = ResolvedImageURL{URL: ImageURLOrEmpty(resolvedURL)}
+			}
+		}
+	}
+	for _, path := range resolverPaths {
+		if _, ok := resolved[path]; ok {
+			continue
+		}
+		if s.imageResolver == nil {
+			resolved[path] = s.PresignURLWithExpiry(ctx, path, variant)
+		}
+	}
+	return resolved
+}
+
+// sizeToVariant maps the existing S3 size hints used by the frontend to
+// semantic variant names understood by plugins.
+//
+// An explicitly requested size is resolved by internal/imagesize, which owns
+// the client-facing size contract. Anything else — an absent or unparseable
+// hint — keeps the historical mapping below unchanged.
+func sizeToVariant(size string) string {
+	if _, ok := imagesize.Size(size).TargetWidth(); ok {
+		return imagesize.PluginVariant(imagesize.Size(size))
+	}
+	if parsed, err := imagesize.Parse(size); err == nil && parsed != imagesize.Unset {
+		return imagesize.PluginVariant(parsed)
+	}
+
+	switch size {
+	case "small":
+		return "card"
+	case "medium":
+		return "featured"
+	case "original":
+		return "original"
+	default: // "" (the default in most call sites)
+		return "featured"
+	}
+}
+
+// PresignImageURL resolves an image path to a usable URL with variant support.
+// For cached base paths (bare S3 keys without a scheme), appends the appropriate
+// variant filename and presigns the result. For http(s) URLs and plugin-prefixed
+// paths, delegates to PresignURL with a mapped semantic variant.
+func (s *DetailService) PresignImageURL(ctx context.Context, path, imageType, size string) string {
+	return s.PresignImageURLWithExpiry(ctx, path, imageType, size).URL
+}
+
+// PresignImageURLWithExpiry resolves one image path using the same image type
+// and size normalization as PresignImageURL, retaining URL expiry metadata.
+func (s *DetailService) PresignImageURLWithExpiry(ctx context.Context, path, imageType, size string) ResolvedImageURL {
+	if path == "" || path == "-" {
+		return ResolvedImageURL{}
+	}
+	// Plugin-prefixed paths resolve via plugin with semantic variant.
+	if strings.Contains(path, "://") &&
+		!strings.HasPrefix(path, "http://") &&
+		!strings.HasPrefix(path, "https://") {
+		return s.PresignURLWithExpiry(ctx, path, sizeToVariant(size))
+	}
+	// HTTP URLs pass through.
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return ResolvedImageURL{URL: ImageURLOrEmpty(path)}
+	}
+
+	return s.PresignURLWithExpiry(ctx, cachedImageVariantPath(path, imageType, size), sizeToVariant(size))
+}
+
+func cachedImageVariantPath(path, imageType, size string) string {
+	if strings.Contains(path, "://") {
+		return path
+	}
+	variant := cachedImageVariantKey(artworkkey.ImageTypeOf(path, imageType), size)
+	if variant == "" {
+		return path
+	}
+	return artworkkey.Variant(path, variant)
+}
+
+// imageTypeFromCachedPath returns the image type segment ("poster", "backdrop",
+// "logo", "still") encoded in a cached S3 image path of the form
+// ".../{imageType}/{variant}.{ext}". It returns "" for full URLs,
+// plugin-prefixed paths, or paths with no directory segment.
+func imageTypeFromCachedPath(path string) string {
+	if path == "" || strings.Contains(path, "://") {
+		return ""
+	}
+	lastSlash := strings.LastIndex(path, "/")
+	if lastSlash <= 0 {
+		return ""
+	}
+	dir := path[:lastSlash]
+	return dir[strings.LastIndex(dir, "/")+1:]
+}
+
+// ImageTypeFromCachedPath returns the image type ("poster", "backdrop",
+// "logo", "still", "profile") encoded in a cached S3 image path, or "" when the
+// path is a full URL, plugin-prefixed, or has no directory segment. Callers
+// outside this package need it to pick the variant ladder that governs a path.
+func ImageTypeFromCachedPath(path string) string {
+	return imageTypeFromCachedPath(path)
+}
+
+// BackdropVariantPath rewrites a cached "/original." image path to the
+// requested backdrop variant (e.g. "w1280" or "w1920"). A backdrop slot does not
+// always hold a backdrop: an episode's is frequently its still, whose ladder has
+// no backdrop widths, so requesting one would 404. Any other type gets the
+// widest rung of its own ladder that is no wider than the request (an episode
+// still in a w1920 slot gets w1280). Full URLs, plugin-prefixed paths, and
+// non-"/original." paths pass through unchanged.
+func BackdropVariantPath(path, desiredVariant string) string {
+	if path == "" || strings.Contains(path, "://") || !strings.Contains(path, "/original.") {
+		return path
+	}
+	variant := desiredVariant
+	if imageType := artworkkey.ImageTypeOf(path, artworkkey.ImageBackdrop); imageType != artworkkey.ImageBackdrop {
+		variant = widestRungWithin(imageType, desiredVariant)
+	}
+	if variant == "" {
+		return path
+	}
+	return strings.Replace(path, "/original.", "/"+variant+".", 1)
+}
+
+// widestRungWithin returns the widest rung of imageType's ladder that is no
+// wider than the width rung desired names, or the narrowest rung when every
+// rung is wider. A desired variant that names no width gets the type's
+// default.
+func widestRungWithin(imageType, desired string) string {
+	limit, ok := imagesize.VariantWidthPx(desired)
+	widths := artworkkey.VariantWidths(imageType)
+	if !ok || len(widths) == 0 {
+		return cachedImageVariantKey(imageType, "")
+	}
+	for _, width := range widths {
+		if width <= limit {
+			return "w" + strconv.Itoa(width)
+		}
+	}
+	return "w" + strconv.Itoa(widths[len(widths)-1])
+}
+
+// cachedImageVariantKey picks the cached artwork variant for an image type and
+// the size hint carried on the request.
+//
+// An explicitly requested size is resolved by internal/imagesize, which owns
+// the client-facing size contract and derives its rungs from
+// artworkkey.VariantWidths. Anything else — an absent hint, which is what most
+// call sites pass, or an unparseable one — falls through to the per-type
+// defaults below, which are retained verbatim as the record of what the server
+// returned before image_size existed.
+func cachedImageVariantKey(imageType, size string) string {
+	if _, ok := imagesize.Size(size).TargetWidth(); ok {
+		return imagesize.Variant(imageType, imagesize.Size(size))
+	}
+	if parsed, err := imagesize.Parse(size); err == nil && parsed != imagesize.Unset {
+		return imagesize.Variant(imageType, parsed)
+	}
+
+	if size == "original" {
+		return "original"
+	}
+
+	switch imageType {
+	case "backdrop":
+		if size == "small" {
+			return "w300"
+		}
+		return "w1920"
+	case "logo":
+		return "w500"
+	case "poster", "still":
+		if size == "small" {
+			return "w300"
+		}
+		return "w500"
+	default:
+		if size == "small" {
+			return "w300"
+		}
+		return "w500"
+	}
+}

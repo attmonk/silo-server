@@ -1,0 +1,698 @@
+package notifications
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// ScopeResolver computes the effective library visibility for a
+// (user, profile) outside of a request context. Satisfied by
+// *access.Resolver.
+type ScopeResolver interface {
+	Resolve(ctx context.Context, input access.ResolveInput) (access.Scope, error)
+}
+
+const (
+	interestFlushInterval = 2 * time.Second
+	interestQueryChunk    = 500
+	interestRecomputeTime = 30 * time.Second
+	// interestMaxFlushAttempts bounds requeues of a failing mutation so a
+	// poisoned item cannot retry every flush forever; the periodic rebuild
+	// task repairs whatever gets dropped.
+	interestMaxFlushAttempts = 5
+	// interestMaxPending bounds the queued item mutations, and
+	// interestMaxQueuedRebuilds the queued profile rebuilds: past either,
+	// a mutation or rebuild is dropped (and logged), and the periodic
+	// rebuild task repairs what it would have done.
+	interestMaxPending        = 50_000
+	interestMaxQueuedRebuilds = 1000
+)
+
+type interestMutation struct {
+	userID    int
+	profileID string
+	itemID    string
+}
+
+// InterestUpdater maintains profile_series_interest from user-state
+// mutations. Mutations are queued (cheap, non-blocking) and coalesced by a
+// background loop: bursts like history imports or progress-sync ticks
+// collapse into one recompute per (profile, series) per flush window.
+//
+// Recompute reads source-of-truth state through the userstore interface —
+// user data may live in per-user SQLite stores, so no SQL joins against
+// catalog tables are possible.
+type InterestUpdater struct {
+	pool      *pgxpool.Pool
+	interests *InterestRepository
+	stores    userstore.UserStoreProvider
+	scopes    ScopeResolver
+	drops     droppedSeriesLister
+	logger    *slog.Logger
+
+	mu sync.Mutex
+	// pending maps each queued mutation to how many flushes have already
+	// failed it (transient failures requeue instead of dropping).
+	pending map[interestMutation]int
+	// deferred maps mutations to the time they join pending.
+	deferred map[interestMutation]time.Time
+	// homeChanged records each profile's latest Home removal or restore on
+	// this node, kept for progressSessionGap.
+	homeChanged map[profileKey]time.Time
+	// rebuilds are the profiles whose whole interest is to be rebuilt (a
+	// restore or import of their data), once each however often queued;
+	// flush runs one a tick through rebuildProfile.
+	rebuilds       map[profileKey]bool
+	rebuildProfile func(ctx context.Context, userID int, profileID string) error
+	// dropped counts what the bounds above refused since the last flush.
+	dropped int
+}
+
+// profileKey names one profile on one account. A profile id alone is not
+// unique: every account from before profiles has a profile named "default".
+type profileKey struct {
+	userID    int
+	profileID string
+}
+
+// String renders the key as account/profile for logs and errors.
+func (k profileKey) String() string { return strconv.Itoa(k.userID) + "/" + k.profileID }
+
+// LogValue logs the key as account/profile in every slog handler; the JSON
+// handler would otherwise encode the unexported fields as {}.
+func (k profileKey) LogValue() slog.Value { return slog.StringValue(k.String()) }
+
+// profileKeyArrays splits keys into the parallel account and profile arrays a
+// query matches with (user_id, profile_id) IN (SELECT * FROM unnest($1::int[], $2::text[])).
+func profileKeyArrays(keys []profileKey) ([]int, []string) {
+	userIDs := make([]int, len(keys))
+	profileIDs := make([]string, len(keys))
+	for i, key := range keys {
+		userIDs[i], profileIDs[i] = key.userID, key.profileID
+	}
+	return userIDs, profileIDs
+}
+
+// NewInterestUpdater creates an InterestUpdater.
+func NewInterestUpdater(
+	pool *pgxpool.Pool,
+	interests *InterestRepository,
+	stores userstore.UserStoreProvider,
+	scopes ScopeResolver,
+) *InterestUpdater {
+	updater := &InterestUpdater{
+		pool:      pool,
+		interests: interests,
+		stores:    stores,
+		scopes:    scopes,
+		logger:    slog.Default().With("component", "notifications.interest"),
+		pending:   make(map[interestMutation]int),
+	}
+	if pool != nil {
+		updater.drops = catalog.NewDroppedSeriesRepo(pool)
+	}
+	return updater
+}
+
+// QueueItemMutation records that a profile's relationship to a media item
+// (watch progress, watch history, Home removal) changed. The item is
+// resolved to its parent series asynchronously; movie targets are ignored.
+// Safe to call from hot request paths.
+func (u *InterestUpdater) QueueItemMutation(userID int, profileID, itemID string) {
+	if u == nil || userID <= 0 || profileID == "" || itemID == "" {
+		return
+	}
+	mutation := interestMutation{userID: userID, profileID: profileID, itemID: itemID}
+	u.mu.Lock()
+	if _, queued := u.pending[mutation]; !queued {
+		if len(u.pending) >= interestMaxPending {
+			u.dropped++
+		} else {
+			u.pending[mutation] = 0
+		}
+	}
+	u.mu.Unlock()
+}
+
+// QueueProfileRebuild queues one rebuild of the profile's whole interest,
+// for a change to much of its data at once (a restore or an import),
+// instead of a mutation per item: queued again before it runs, it still
+// runs once.
+func (u *InterestUpdater) QueueProfileRebuild(userID int, profileID string) {
+	if u == nil || userID <= 0 || profileID == "" {
+		return
+	}
+	key := profileKey{userID, profileID}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.rebuilds == nil {
+		u.rebuilds = map[profileKey]bool{}
+	}
+	if !u.rebuilds[key] && len(u.rebuilds) >= interestMaxQueuedRebuilds {
+		u.dropped++
+		return
+	}
+	u.rebuilds[key] = true
+}
+
+// nextRebuild takes one queued profile rebuild.
+func (u *InterestUpdater) nextRebuild() (profileKey, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for key := range u.rebuilds {
+		delete(u.rebuilds, key)
+		return key, true
+	}
+	return profileKey{}, false
+}
+
+// runRebuild runs one queued profile rebuild, if any.
+func (u *InterestUpdater) runRebuild(ctx context.Context) {
+	if u.rebuildProfile == nil {
+		return
+	}
+	key, ok := u.nextRebuild()
+	if !ok {
+		return
+	}
+	if err := u.rebuildProfile(ctx, key.userID, key.profileID); err != nil && ctx.Err() == nil {
+		u.logger.WarnContext(ctx, "interest rebuild of a profile failed", "profile", key, "error", err)
+	}
+}
+
+// QueueItemMutationAfter queues the mutation once delay has passed. Queuing
+// the same mutation again moves its due time later, never earlier.
+func (u *InterestUpdater) QueueItemMutationAfter(userID int, profileID, itemID string, delay time.Duration) {
+	if u == nil || userID <= 0 || profileID == "" || itemID == "" {
+		return
+	}
+	mutation := interestMutation{userID: userID, profileID: profileID, itemID: itemID}
+	due := time.Now().Add(delay)
+	u.mu.Lock()
+	if u.deferred == nil {
+		u.deferred = make(map[interestMutation]time.Time)
+	}
+	if due.After(u.deferred[mutation]) {
+		u.deferred[mutation] = due
+	}
+	u.mu.Unlock()
+}
+
+// noteHomeChange records a change to what Home shows the profile: a removal
+// or restore, or a finished episode, which moves the Next Up anchor.
+func (u *InterestUpdater) noteHomeChange(userID int, profileID string, at time.Time) {
+	if u == nil {
+		return
+	}
+	u.mu.Lock()
+	if u.homeChanged == nil {
+		u.homeChanged = make(map[profileKey]time.Time)
+	}
+	u.homeChanged[profileKey{userID, profileID}] = at
+	u.mu.Unlock()
+}
+
+// changedHomeSince reports whether the profile changed Home on this node
+// after the given time.
+func (u *InterestUpdater) changedHomeSince(userID int, profileID string, since time.Time) bool {
+	if u == nil {
+		return false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	at, ok := u.homeChanged[profileKey{userID, profileID}]
+	return ok && at.After(since)
+}
+
+// promoteDeferred moves deferred mutations due by now into pending and
+// forgets Home changes older than progressSessionGap. The caller holds u.mu.
+func (u *InterestUpdater) promoteDeferred(now time.Time) {
+	for key, at := range u.homeChanged {
+		if now.Sub(at) > progressSessionGap {
+			delete(u.homeChanged, key)
+		}
+	}
+	for mutation, due := range u.deferred {
+		if due.After(now) {
+			continue
+		}
+		delete(u.deferred, mutation)
+		if _, queued := u.pending[mutation]; !queued {
+			u.pending[mutation] = 0
+		}
+	}
+}
+
+// Run drains the mutation queue until ctx is canceled.
+func (u *InterestUpdater) Run(ctx context.Context) {
+	ticker := time.NewTicker(interestFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			u.flush(ctx)
+		}
+	}
+}
+
+func (u *InterestUpdater) flush(ctx context.Context) {
+	u.runRebuild(ctx)
+	u.mu.Lock()
+	u.promoteDeferred(time.Now())
+	if u.dropped > 0 {
+		u.logger.WarnContext(ctx, "interest updates dropped over their bound; the periodic rebuild repairs them", "dropped", u.dropped)
+		u.dropped = 0
+	}
+	if len(u.pending) == 0 {
+		u.mu.Unlock()
+		return
+	}
+	batch := u.pending
+	u.pending = make(map[interestMutation]int)
+	u.mu.Unlock()
+
+	// Transient failures requeue for the next flush instead of dropping the
+	// mutation, which would leave profile_series_interest stale until some
+	// later mutation or the rebuild task happened to touch the series.
+	requeue := make(map[interestMutation]int)
+
+	// Resolve items to series and dedupe to one recompute per
+	// (user, profile, series).
+	type recomputeKey struct {
+		userID    int
+		profileID string
+		seriesID  string
+	}
+	// Resolve every queued item to its series in one query. Marking or
+	// unmarking a whole series queues one mutation per episode, and those
+	// thousands of items collapse to a single series — resolving them
+	// one-at-a-time cost thousands of round-trips before the dedupe below
+	// could discard them.
+	itemIDs := make([]string, 0, len(batch))
+	for mutation := range batch {
+		itemIDs = append(itemIDs, mutation.itemID)
+	}
+	seriesByItem, resolveErr := u.resolveSeriesIDs(ctx, itemIDs)
+	if resolveErr != nil {
+		u.logger.WarnContext(ctx, "interest series resolution failed",
+			"item_count", len(itemIDs), "error", resolveErr)
+	}
+
+	seen := make(map[recomputeKey]struct{}, len(batch))
+	for mutation, failures := range batch {
+		if ctx.Err() != nil {
+			return // shutting down; the rebuild task repairs anything dropped
+		}
+		if resolveErr != nil {
+			// The lookup failed for the whole batch, so no item can be
+			// classified as "not a series". Requeue rather than silently
+			// dropping interest updates.
+			requeue[mutation] = failures + 1
+			continue
+		}
+		seriesID, ok := seriesByItem[mutation.itemID]
+		if !ok {
+			continue // movies and unknown items have no series interest
+		}
+		key := recomputeKey{mutation.userID, mutation.profileID, seriesID}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		recomputeCtx, cancel := context.WithTimeout(ctx, interestRecomputeTime)
+		err := u.RecomputeSeries(recomputeCtx, mutation.userID, mutation.profileID, seriesID)
+		cancel()
+		if err != nil {
+			u.logger.WarnContext(ctx, "interest recompute failed",
+				"user_id", mutation.userID, "profile_id", mutation.profileID,
+				"series_id", seriesID, "error", err)
+			requeue[mutation] = failures + 1
+		}
+	}
+
+	if len(requeue) == 0 {
+		return
+	}
+	u.mu.Lock()
+	for mutation, failures := range requeue {
+		if failures >= interestMaxFlushAttempts {
+			u.logger.WarnContext(ctx, "interest mutation dropped after repeated failures",
+				"item_id", mutation.itemID, "profile_id", mutation.profileID)
+			continue
+		}
+		// A fresh queue of the same mutation (failure count 0) wins; it will
+		// be recomputed either way.
+		if _, queued := u.pending[mutation]; !queued {
+			u.pending[mutation] = failures
+		}
+	}
+	u.mu.Unlock()
+}
+
+// resolveSeriesIDs maps many media item IDs (series, season, or episode) to
+// their series content IDs in one query. Items with no series — movies and
+// unknown IDs — are absent from the result, which is what lets the caller keep
+// treating "missing" as "no series interest". Semantics match resolveSeriesID
+// per item; only the number of round-trips differs.
+func (u *InterestUpdater) resolveSeriesIDs(ctx context.Context, itemIDs []string) (map[string]string, error) {
+	result := make(map[string]string, len(itemIDs))
+	ids := make([]string, 0, len(itemIDs))
+	seen := make(map[string]struct{}, len(itemIDs))
+	for _, itemID := range itemIDs {
+		if itemID == "" {
+			continue
+		}
+		if _, dup := seen[itemID]; dup {
+			continue
+		}
+		seen[itemID] = struct{}{}
+		ids = append(ids, itemID)
+	}
+	if len(ids) == 0 {
+		return result, nil
+	}
+
+	// One branch per item kind, unioned, mirroring the single-item lookup.
+	rows, err := u.pool.Query(ctx, `
+		SELECT content_id, series_id FROM episodes WHERE content_id = ANY($1::text[])
+		UNION ALL
+		SELECT content_id, series_id FROM seasons WHERE content_id = ANY($1::text[])
+		UNION ALL
+		SELECT content_id, content_id FROM media_items WHERE content_id = ANY($1::text[]) AND type = 'series'`,
+		ids,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var itemID, seriesID string
+		if err := rows.Scan(&itemID, &seriesID); err != nil {
+			return nil, err
+		}
+		if seriesID == "" {
+			continue
+		}
+		// An ID matching more than one branch keeps the first row, matching
+		// the single-item query's UNION ALL ... LIMIT 1 ordering.
+		if _, exists := result[itemID]; !exists {
+			result[itemID] = seriesID
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// RecomputeSeries rebuilds the (profile, series) interest rows from
+// source-of-truth user state. It is the single shared path for live updates,
+// backfill, and repair, so all three stay drift-free.
+func (u *InterestUpdater) RecomputeSeries(ctx context.Context, userID int, profileID, seriesID string) error {
+	store, err := u.stores.ForUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("open user store: %w", err)
+	}
+
+	episodeKeys, err := u.loadSeriesEpisodeKeys(ctx, seriesID)
+	if err != nil {
+		return err
+	}
+	episodeIDs := make([]string, 0, len(episodeKeys))
+	for id := range episodeKeys {
+		episodeIDs = append(episodeIDs, id)
+	}
+
+	var inProgress []userstore.WatchProgress
+	started := make([]string, 0, 16)
+	// Home anchors Next Up on the most recently completed episode, ties going
+	// to the later episode. A special anchor moves to the most recent regular
+	// one; see below.
+	anchorKey, hasAnchor := 0, false
+	var anchorAt time.Time
+	regularAnchorKey, hasRegularAnchor := 0, false
+	var regularAnchorAt time.Time
+	hasProgression := false
+	lastCompletedKey := 0
+	hasCompleted := false
+	markCompleted := func(episodeID string) {
+		hasProgression = true
+		if key, ok := episodeKeys[episodeID]; ok && (!hasCompleted || key > lastCompletedKey) {
+			lastCompletedKey = key
+			hasCompleted = true
+		}
+	}
+	for start := 0; start < len(episodeIDs); start += interestQueryChunk {
+		end := min(start+interestQueryChunk, len(episodeIDs))
+		progress, err := store.ListProgressByMediaItems(ctx, profileID, episodeIDs[start:end])
+		if err != nil {
+			return fmt.Errorf("load progress: %w", err)
+		}
+		for episodeID, entry := range progress {
+			hasProgression = true
+			if entry.Completed || entry.PositionSeconds > 0 {
+				started = append(started, episodeID)
+			}
+			if !entry.Completed && entry.PositionSeconds > 0 {
+				entry.MediaItemID = episodeID
+				inProgress = append(inProgress, entry)
+			}
+			if entry.Completed {
+				markCompleted(episodeID)
+				if key, ok := episodeKeys[episodeID]; ok {
+					// Next Up orders completions by the full timestamp, so two
+					// within one second keep their order for the anchor (#2878).
+					at := progressTime(entry)
+					if !hasAnchor || completedLater(at, key, anchorAt, anchorKey) {
+						anchorKey, anchorAt, hasAnchor = key, at, true
+					}
+					if key >= firstRegularEpisodeKey && (!hasRegularAnchor || completedLater(at, key, regularAnchorAt, regularAnchorKey)) {
+						regularAnchorKey, regularAnchorAt, hasRegularAnchor = key, at, true
+					}
+				}
+			}
+		}
+	}
+	// Specials carry no airing position, so Home doesn't let one anchor a
+	// series that has regular seasons: it resumes after the most recent
+	// regular episode, or at the first one (catalog's nextUpAnchorsCTE).
+	var anchor *nextUpAnchor
+	if hasAnchor {
+		anchor = &nextUpAnchor{key: anchorKey, at: anchorAt}
+		if anchorKey < firstRegularEpisodeKey && hasRegularEpisodes(episodeKeys) {
+			anchor.moved = true
+			anchor.key = firstRegularEpisodeKey - 1
+			if hasRegularAnchor {
+				anchor.key, anchor.regularAt, anchor.hasRegularAt = regularAnchorKey, regularAnchorAt, true
+			}
+		}
+	}
+	// Home keeps a partly watched series off Next Up while that progress is
+	// newer than the anchor; so do notifications.
+	partlyWatched := partlyWatchedSinceAnchor(anchor, inProgress, episodeKeys)
+
+	// Completed watch history counts too: history imports and watch-provider
+	// syncs may record a watched-at fact without ever writing a progress row,
+	// and those episodes must still advance the progression cursor. A
+	// completed history entry also counts as started for the cursor walk.
+	for start := 0; start < len(episodeIDs); start += interestQueryChunk {
+		end := min(start+interestQueryChunk, len(episodeIDs))
+		items, err := store.ListCompletedHistoryItems(ctx, userstore.CompletedHistoryItemQuery{
+			ProfileID:    profileID,
+			MediaItemIDs: episodeIDs[start:end],
+		})
+		if err != nil {
+			return fmt.Errorf("load completed history: %w", err)
+		}
+		for _, item := range items {
+			markCompleted(item.MediaItemID)
+			started = append(started, item.MediaItemID)
+		}
+	}
+
+	// The Next Up cursor (next_expected_episode_key) starts after Home's
+	// anchor. A profile with completed history but no completed progress row
+	// (an import, a watch-provider sync) has no Home anchor; it anchors on
+	// the highest completed episode instead, so notifications still follow
+	// it although Home shows no Next Up card. From there the cursor walks past
+	// the listed episodes the profile has started (nextUpCursor).
+	var lastCompleted, nextExpected *int
+	cursorAnchor := lastCompletedKey
+	if anchor != nil {
+		cursorAnchor = anchor.key
+	}
+	if hasCompleted {
+		completed := lastCompletedKey
+		lastCompleted = &completed
+		// Home counts a progress row a history hide covers as started; the
+		// store's listing above leaves those out.
+		postgresStarted, err := u.postgresStartedEpisodes(ctx, userID, profileID, seriesID)
+		if err != nil {
+			return err
+		}
+		cursor := nextUpCursor(cursorAnchor, episodeKeys, slices.Concat(started, postgresStarted))
+		nextExpected = &cursor
+	}
+
+	// Notifications follow Home: a series the profile dropped, whose Next Up
+	// card it removed, or that it is partway through stops notifying. The
+	// progression cursor is kept, so next_up resumes from the right episode
+	// once the removal lapses or the episode is finished.
+	nextUpCandidate := false
+	if hasProgression {
+		var nextUpItems []string
+		if hasAnchor {
+			nextUpItems = episodeIDs
+		}
+		hides, err := u.loadHomeHides(ctx, store, userID, profileID, seriesID, nextUpItems)
+		if err != nil {
+			return err
+		}
+		nextUpCandidate = !hides.dropped && !partlyWatched
+		if nextUpCandidate && len(hides.nextUp) > 0 {
+			// A dismissal hides the card only while its episode is the one
+			// Home shows, so read Home's Next Up card for the series.
+			card, err := u.nextUpEpisode(ctx, userID, profileID, seriesID, cursorAnchor+1, started)
+			if err != nil {
+				return err
+			}
+			nextUpCandidate = hides.nextUpVisible(card)
+		}
+	}
+
+	flags := SeriesInterest{
+		UserID:                  userID,
+		ProfileID:               profileID,
+		SeriesID:                seriesID,
+		NextUpCandidate:         nextUpCandidate,
+		LastCompletedEpisodeKey: lastCompleted,
+		NextExpectedEpisodeKey:  nextExpected,
+	}
+
+	if !nextUpCandidate && lastCompleted == nil {
+		// Nothing can ever notify: drop all rows for the pair.
+		return u.interests.DeleteStaleForProfileSeries(ctx, userID, profileID, seriesID, []int{})
+	}
+
+	libraryIDs, err := u.visibleSeriesLibraries(ctx, userID, profileID, seriesID)
+	if err != nil {
+		return err
+	}
+	if len(libraryIDs) == 0 {
+		return u.interests.DeleteStaleForProfileSeries(ctx, userID, profileID, seriesID, []int{})
+	}
+
+	rows := make([]SeriesInterest, 0, len(libraryIDs))
+	for _, libraryID := range libraryIDs {
+		row := flags
+		row.LibraryID = libraryID
+		rows = append(rows, row)
+	}
+	if err := u.interests.UpsertRows(ctx, rows); err != nil {
+		return err
+	}
+	return u.interests.DeleteStaleForProfileSeries(ctx, userID, profileID, seriesID, libraryIDs)
+}
+
+// completedLater reports whether a completion at (at, key) anchors Next Up
+// over the current one: it is newer, or as new and a later episode.
+func completedLater(at time.Time, key int, currentAt time.Time, currentKey int) bool {
+	return at.After(currentAt) || (at.Equal(currentAt) && key > currentKey)
+}
+
+// loadSeriesEpisodeKeys returns the series' episode keys (content_id ->
+// episode_key).
+func (u *InterestUpdater) loadSeriesEpisodeKeys(ctx context.Context, seriesID string) (map[string]int, error) {
+	rows, err := u.pool.Query(ctx,
+		`SELECT content_id, season_number, episode_number FROM episodes WHERE series_id = $1`,
+		seriesID)
+	if err != nil {
+		return nil, fmt.Errorf("load series episodes: %w", err)
+	}
+	defer rows.Close()
+	episodeKeys := make(map[string]int, 64)
+	for rows.Next() {
+		var contentID string
+		var seasonNumber, episodeNumber int
+		if err := rows.Scan(&contentID, &seasonNumber, &episodeNumber); err != nil {
+			return nil, fmt.Errorf("scan series episode: %w", err)
+		}
+		if !ValidEpisodeOrdinals(seasonNumber, episodeNumber) {
+			continue
+		}
+		episodeKeys[contentID] = EpisodeKey(seasonNumber, episodeNumber)
+	}
+	return episodeKeys, rows.Err()
+}
+
+// visibleSeriesLibraries intersects the series' library memberships with the
+// profile's effective library visibility. The interest index must never
+// assume global library visibility.
+func (u *InterestUpdater) visibleSeriesLibraries(ctx context.Context, userID int, profileID, seriesID string) ([]int, error) {
+	rows, err := u.pool.Query(ctx,
+		`SELECT media_folder_id FROM media_item_libraries WHERE content_id = $1`, seriesID)
+	if err != nil {
+		return nil, fmt.Errorf("load series library memberships: %w", err)
+	}
+	memberships := make([]int, 0, 4)
+	for rows.Next() {
+		var libraryID int
+		if err := rows.Scan(&libraryID); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan series library membership: %w", err)
+		}
+		memberships = append(memberships, libraryID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(memberships) == 0 {
+		return nil, nil
+	}
+
+	scope, err := u.scopes.Resolve(ctx, access.ResolveInput{
+		UserID:              userID,
+		ProfileID:           profileID,
+		SkipPINVerification: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolve profile scope: %w", err)
+	}
+
+	allowed := make(map[int]bool)
+	if scope.AllowedLibraryIDs != nil {
+		for _, id := range scope.AllowedLibraryIDs {
+			allowed[id] = true
+		}
+	}
+	disabled := make(map[int]bool, len(scope.DisabledLibraryIDs))
+	for _, id := range scope.DisabledLibraryIDs {
+		disabled[id] = true
+	}
+
+	visible := make([]int, 0, len(memberships))
+	for _, libraryID := range memberships {
+		if scope.AllowedLibraryIDs != nil && !allowed[libraryID] {
+			continue
+		}
+		if disabled[libraryID] {
+			continue
+		}
+		visible = append(visible, libraryID)
+	}
+	return visible, nil
+}

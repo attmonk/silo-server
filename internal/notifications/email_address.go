@@ -1,0 +1,128 @@
+package notifications
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"html"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/mail"
+)
+
+// emailVerifyTTL bounds how long a verification link stays usable.
+const emailVerifyTTL = 24 * time.Hour
+
+// Errors surfaced by the custom-address flow for the API layer.
+var (
+	ErrEmailInvalidAddress = errors.New("invalid email address")
+	ErrEmailChildProfile   = errors.New("child profiles cannot set a custom notification address")
+	ErrEmailNoLinkBase     = errors.New("no external URL is configured for verification links")
+)
+
+// newEmailToken mints a single-use capability token and its SHA-256 hex
+// digest for at-rest storage.
+func newEmailToken() (token, tokenHash string, err error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("generate email token: %w", err)
+	}
+	token = base64.RawURLEncoding.EncodeToString(raw)
+	return token, hashEmailToken(token), nil
+}
+
+// hashEmailToken returns the at-rest digest of a verification token.
+func hashEmailToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// emailLinkBase is the externally reachable base URL for tokenized email
+// links: the admin's server.public_url setting.
+func (s *System) emailLinkBase(ctx context.Context) string {
+	if base := s.Settings.EmailExternalURL(ctx); base != "" {
+		return base
+	}
+	return s.publicURL
+}
+
+// SetPublicURL wires the server's externally reachable base URL, used as the
+// fallback for verification links when the setting is unavailable. Optional.
+func (s *System) SetPublicURL(url string) {
+	if s != nil {
+		s.publicURL = strings.TrimRight(url, "/")
+	}
+}
+
+// ClearEmailAddress removes the profile's verified address (and any
+// in-flight verification), which also switches the channel off — there is no
+// fallback destination. Restricted to non-child profiles like setting one,
+// so a child session cannot drop a parent-configured destination.
+func (s *System) ClearEmailAddress(ctx context.Context, userID int, profileID string) error {
+	if s == nil || s.EmailPrefs == nil {
+		return nil
+	}
+	if s.profileIsChild(ctx, userID, profileID) {
+		return ErrEmailChildProfile
+	}
+	return s.EmailPrefs.ClearCustomAddress(ctx, userID, profileID)
+}
+
+// VerifyEmailToken consumes a verification token from a clicked link,
+// promoting that profile's pending address to the verified destination.
+func (s *System) VerifyEmailToken(ctx context.Context, token string) (EmailVerifyOutcome, error) {
+	if s == nil || s.EmailPrefs == nil || token == "" {
+		return EmailVerifyInvalid, nil
+	}
+	return s.EmailPrefs.ConsumeVerifyToken(ctx, hashEmailToken(token))
+}
+
+// UnsubscribeEmail handles a tokenized unsubscribe link: the matching
+// profile's email mode switches off.
+func (s *System) UnsubscribeEmail(ctx context.Context, token string) (ok bool, err error) {
+	if s == nil || s.EmailPrefs == nil || token == "" {
+		return false, nil
+	}
+	return s.EmailPrefs.UnsubscribeByToken(ctx, token)
+}
+
+// composeVerificationEmail renders the address-confirmation message.
+func composeVerificationEmail(brand mail.Brand, profileName, verifyURL string) emailContent {
+	who := "your profile"
+	if profileName != "" {
+		who = "the profile “" + profileName + "”"
+	}
+	expiry := "The link expires in 24 hours. If you didn't request this, ignore this email — " +
+		"nothing will be sent to this address."
+	text := fmt.Sprintf(
+		"This address was entered as the notification destination for %s on a Silo server.\n\n"+
+			"To confirm and start receiving notifications here, open this link:\n\n  %s\n\n"+
+			"%s\n", who, verifyURL, expiry)
+
+	var body strings.Builder
+	body.WriteString(mail.EmailParagraph(fmt.Sprintf(
+		"This address was entered as the notification destination for %s on a Silo server.", who)))
+	body.WriteString(mail.EmailParagraph("To confirm and start receiving notifications here:"))
+	body.WriteString(mail.EmailButton(brand, "Confirm this address", verifyURL))
+	body.WriteString(fmt.Sprintf(
+		`<p style="margin:20px 0 0;font:400 12px/1.7 %s;color:%s;">Or paste this link into your browser:<br>`+
+			`<span style="font:400 12px/1.7 %s;word-break:break-all;">%s</span></p>`,
+		mail.EmailFont, mail.EmailColorMuted, mail.EmailFontMono, html.EscapeString(verifyURL)))
+
+	return emailContent{
+		Subject: "Confirm your Silo notification address",
+		Text:    text,
+		HTML: mail.RenderLayout(mail.LayoutOptions{
+			Brand:      brand,
+			Preheader:  "Confirm this address to start receiving Silo notifications.",
+			Title:      "Confirm your notification address",
+			BodyHTML:   body.String(),
+			FooterHTML: html.EscapeString(expiry),
+		}),
+	}
+}

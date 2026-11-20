@@ -1,0 +1,827 @@
+package blobstore
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+type Filesystem struct {
+	root string
+	// identity, when set, is the recorded identity of a root that resolves to
+	// this directory by another path (see SameLocalRoot).
+	identity string
+}
+
+func NewFilesystem(root string) (*Filesystem, error) {
+	abs, err := resolveRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	if err = ensureRoot(abs); err != nil && !temporaryStorageError(err) {
+		return nil, err
+	}
+	return &Filesystem{root: abs}, nil
+}
+
+// LocalIdentity is the Identity a filesystem store rooted at root would report,
+// computed without creating the root. Storage transitions compare it with the
+// active store before any directory exists.
+func LocalIdentity(root string) (string, error) {
+	abs, err := resolveRoot(root)
+	if err != nil {
+		return "", err
+	}
+	return BackendLocal + "|" + abs, nil
+}
+
+func resolveRoot(root string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", fmt.Errorf("artwork filesystem root is empty")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	// Resolve existing ancestor aliases once (for example macOS /var). The
+	// configured root itself and paths within it must still be real directories.
+	parent := filepath.Dir(abs)
+	suffix := filepath.Base(abs)
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(parent)
+		if resolveErr == nil {
+			abs = filepath.Join(resolved, suffix)
+			break
+		}
+		if !os.IsNotExist(resolveErr) || parent == filepath.Dir(parent) {
+			break
+		}
+		suffix = filepath.Join(filepath.Base(parent), suffix)
+		parent = filepath.Dir(parent)
+	}
+	return filepath.Clean(abs), nil
+}
+
+func temporaryStorageError(err error) bool {
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS) || errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESTALE) || errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) || errors.Is(err, syscall.ETIMEDOUT)
+}
+
+// CheckLocalRoot reports whether a filesystem store could open root, without
+// creating anything: it applies NewFilesystem's checks to the components that
+// exist and tolerates the same temporary errors. Settings saves call it so a
+// root that would stop the server at startup is refused before it is stored.
+func CheckLocalRoot(root string) error {
+	abs, err := resolveRoot(root)
+	if err != nil {
+		return err
+	}
+	if err = checkRootComponents(abs); err != nil && !temporaryStorageError(err) {
+		return err
+	}
+	return nil
+}
+
+// checkRootComponents rejects symlinks and non-directories among the existing
+// components of dir, even when a later component is absent.
+func checkRootComponents(dir string) error {
+	current := string(filepath.Separator)
+	for _, component := range strings.Split(strings.TrimPrefix(dir, current), string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("artwork root component is not a directory: %s", current)
+		}
+	}
+	return nil
+}
+
+func ensureRoot(dir string) error {
+	if err := checkRootComponents(dir); err != nil {
+		return err
+	}
+	return os.MkdirAll(dir, 0755)
+}
+
+// check refuses existing symlink components. Root operations additionally enforce
+// containment if a component changes after this check.
+func check(root *os.Root, key string) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
+	parts := strings.Split(key, "/")
+	for i := range parts {
+		info, err := root.Lstat(strings.Join(parts[:i+1], "/"))
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return ErrNotFound
+		}
+	}
+	return nil
+}
+func temporary(root *os.Root, dir, prefix string) (*os.File, string, error) {
+	name := path.Join(dir, fmt.Sprintf("%s%x", prefix, rand.Text()))
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+	if err == nil {
+		err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err != nil {
+			_ = f.Close()
+			_ = root.Remove(name)
+			return nil, "", err
+		}
+	}
+	return f, name, err
+}
+func (f *Filesystem) Put(ctx context.Context, key string, data []byte) error {
+	return f.publish(ctx, key, false, func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+}
+
+// PutStream publishes an object without holding it in memory. The content type
+// is ignored: local objects carry no metadata, and reads derive a media type
+// from the key's extension. Large operational blobs — diagnostic bundles, job
+// artifacts — are written this way.
+//
+// The copy observes ctx. A local reader never blocks on the network, so without
+// this an upload deadline would elapse unnoticed and the object would still be
+// renamed into place; the admin job runner's upload timeout would be inert for
+// exactly the large exports it exists to bound.
+func (f *Filesystem) PutStream(ctx context.Context, key string, r io.Reader, _ string) error {
+	return f.publish(ctx, key, false, func(w io.Writer) error {
+		_, err := io.Copy(w, &contextReader{ctx: ctx, r: r})
+		return err
+	})
+}
+
+// CreateExclusive publishes an object only when nothing is at key. The
+// synced temporary file is hard-linked into place, and link(2) fails when
+// the name exists, so a concurrent writer of the same key is never replaced
+// (a rename would replace it). It returns ErrExists then.
+func (f *Filesystem) CreateExclusive(ctx context.Context, key string, r io.Reader, _ string) error {
+	return f.publish(ctx, key, true, func(w io.Writer) error {
+		_, err := io.Copy(w, &contextReader{ctx: ctx, r: r})
+		return err
+	})
+}
+
+// contextReader fails the next read once ctx is done, so a canceled write stops
+// instead of running to the end of its reader. publish discards the temporary
+// file on any error, so nothing partial is published.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *contextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// publish writes an object through a temporary file and renames it into place,
+// so a crash after it returns cannot leave a caller referencing a key the store
+// does not show. write fills the temporary file. exclusive links it into place
+// instead, failing with ErrExists when the key exists.
+func (f *Filesystem) publish(ctx context.Context, key string, exclusive bool, write func(io.Writer) error) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(f.root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	if err = check(root, key); err != nil {
+		return err
+	}
+	created, err := mkdirAllTracked(root, path.Dir(key))
+	if err != nil {
+		return err
+	}
+	tmp, name, err := temporary(root, path.Dir(key), ".tmp-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tmp.Close(); _ = root.Remove(name) }()
+	// A canceled write also closes the temporary file, so a write or sync
+	// stalled on the disk rather than on its reader fails at its next call
+	// instead of running on after the caller gave up; the deferred remove
+	// deletes it. Cancellation stays armed until the file is synced.
+	closed := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = tmp.Close()
+		close(closed)
+	})
+	if err = tmp.Chmod(0644); err == nil {
+		err = write(tmp)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if !stop() {
+		// The context ended: the file is closed, so report why, whatever
+		// the write or sync saw (often "file already closed").
+		<-closed
+		if err != nil {
+			return fmt.Errorf("%w: %w", context.Cause(ctx), err)
+		}
+		return context.Cause(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	// Nothing is published once the caller gave up.
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if err = place(root, name, key, exclusive); err != nil {
+		return err
+	}
+	// The data is durable once the file is synced, but the name is not until
+	// the directory entry is. A crash between the rename and the directory
+	// flush would leave the catalog referencing a key the store never shows.
+	// Directories this write created are new entries in their parents, so
+	// each parent is flushed too, from the leaf up to the first one that
+	// already existed.
+	if err = syncDir(root, path.Dir(key)); err != nil {
+		return err
+	}
+	for _, dir := range created {
+		if err = syncDir(root, path.Dir(dir)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// place moves a synced temporary file to key: a rename, which replaces an
+// existing object, or for an exclusive create a hard link, which fails with
+// ErrExists when the name exists, and with ErrExclusiveUnsupported where the
+// filesystem has no hard links.
+func place(root *os.Root, name, key string, exclusive bool) error {
+	if !exclusive {
+		return root.Rename(name, key)
+	}
+	err := root.Link(name, key)
+	switch {
+	case errors.Is(err, fs.ErrExist):
+		return ErrExists
+	case errors.Is(err, unix.EPERM), errors.Is(err, unix.ENOTSUP), errors.Is(err, unix.EOPNOTSUPP), errors.Is(err, unix.EMLINK):
+		// The filesystem takes no hard links (exFAT, some SMB and FUSE
+		// mounts answer EPERM). It is not a permission problem: the
+		// temporary file was just created and written in this directory.
+		return fmt.Errorf("%w: %w", ErrExclusiveUnsupported, err)
+	}
+	return err
+}
+
+// mkdirAllTracked creates dir and any missing ancestors inside root and
+// returns the directories it created, deepest first, so the caller can sync
+// each one's parent after publishing a file.
+func mkdirAllTracked(root *os.Root, dir string) ([]string, error) {
+	var missing []string
+	for probe := dir; probe != "." && probe != "/" && probe != ""; probe = path.Dir(probe) {
+		if _, err := root.Stat(probe); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+		missing = append(missing, probe)
+	}
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	if err := root.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	return missing, nil
+}
+
+// syncDir flushes a directory's entries so a published rename survives a
+// crash. Filesystems that do not support fsync on directories report EINVAL
+// or ENOTSUP; the rename itself already ordered the write there.
+func syncDir(root *os.Root, dir string) error {
+	d, err := root.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOTSUP) {
+		return err
+	}
+	return nil
+}
+func fileInfo(key string, info os.FileInfo) ObjectInfo {
+	return ObjectInfo{Key: key, Size: info.Size(), ModTime: info.ModTime(), ETag: "\"" + strconv.FormatInt(info.Size(), 10) + "-" + strconv.FormatInt(info.ModTime().UnixNano(), 36) + "\""}
+}
+func (f *Filesystem) Get(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
+	if err := ValidateKey(key); err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	root, err := os.OpenRoot(f.root)
+	if err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	defer func() { _ = root.Close() }()
+	if err = check(root, key); err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	before, err := root.Lstat(key)
+	if os.IsNotExist(err) {
+		return nil, ObjectInfo{}, ErrNotFound
+	}
+	if err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, ObjectInfo{}, ErrNotFound
+	}
+	file, err := root.Open(key)
+	if os.IsNotExist(err) {
+		err = ErrNotFound
+	}
+	if err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	info, err := file.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = ErrNotFound
+	}
+	if err != nil {
+		_ = file.Close()
+		return nil, ObjectInfo{}, err
+	}
+	return file, fileInfo(key, info), nil
+}
+func (f *Filesystem) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	if err := ValidateKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return ObjectInfo{}, err
+	}
+	root, err := os.OpenRoot(f.root)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer func() { _ = root.Close() }()
+	if err = check(root, key); err != nil {
+		return ObjectInfo{}, err
+	}
+	info, err := root.Lstat(key)
+	if os.IsNotExist(err) {
+		err = ErrNotFound
+	}
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return ObjectInfo{}, ErrNotFound
+	}
+	return fileInfo(key, info), nil
+}
+func prune(root *os.Root, dir string) {
+	for dir != "." {
+		if err := root.Remove(dir); err != nil {
+			return
+		}
+		dir = path.Dir(dir)
+	}
+}
+func (f *Filesystem) Delete(ctx context.Context, keys []string) (int, error) {
+	for _, key := range keys {
+		if err := ValidateKey(key); err != nil {
+			return 0, err
+		}
+	}
+	root, err := os.OpenRoot(f.root)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = root.Close() }()
+	n := 0
+	for _, key := range keys {
+		if err = ctx.Err(); err != nil {
+			return n, err
+		}
+		if err = check(root, key); err != nil {
+			return n, err
+		}
+		err = root.Remove(key)
+		if err != nil && !os.IsNotExist(err) {
+			return n, err
+		}
+		n++
+		prune(root, path.Dir(key))
+	}
+	return n, nil
+}
+func (f *Filesystem) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	prefix = strings.TrimSuffix(prefix, "/")
+	if err := ValidateKey(prefix); err != nil {
+		return 0, err
+	}
+	root, err := os.OpenRoot(f.root)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = root.Close() }()
+	if err = check(root, prefix); err != nil {
+		return 0, err
+	}
+	if _, err = root.Lstat(prefix); os.IsNotExist(err) {
+		return 0, nil
+	}
+	n := 0
+	if err = deleteTree(ctx, root, prefix, &n); err != nil {
+		return n, err
+	}
+	prune(root, path.Dir(prefix))
+	return n, nil
+}
+
+// deleteTree removes name, relative to dir, and everything below it,
+// post-order, so only the entries of the directories on the current path are
+// held in memory. Each directory is removed as soon as its children are gone.
+// It checks ctx before every entry and before every directory removal,
+// stopping with ctx.Err() and leaving the rest for a later call.
+//
+// Each directory is entered through its own *os.Root and its children are
+// removed relative to that handle, so swapping a directory for a symlink
+// mid-walk cannot redirect the removal to another part of the store.
+func deleteTree(ctx context.Context, dir *os.Root, name string, n *int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := dir.Lstat(name)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		if err = deleteChildren(ctx, dir, name, info, n); err != nil {
+			return err
+		}
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if err = dir.Remove(name); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if info.Mode().IsRegular() {
+		*n++
+	}
+	return nil
+}
+
+// deleteBatch is how many directory entries deleteChildren reads at a time.
+var deleteBatch = 256
+
+// deleteChildren empties the directory name, which Lstat reported as want.
+// OpenRoot follows a symlink, so the opened directory must be the same file
+// Lstat saw, and name must still be that directory rather than a symlink to
+// it; otherwise name was replaced after Lstat and is left alone.
+func deleteChildren(ctx context.Context, parent *os.Root, name string, want fs.FileInfo, n *int) error {
+	sub, err := parent.OpenRoot(name)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sub.Close() }()
+	got, err := sub.Stat(".")
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(want, got) {
+		return fmt.Errorf("blobstore: %s changed during delete", name)
+	}
+	// A directory renamed elsewhere and replaced by a symlink to it passes
+	// the check above, so look at name itself again now that it is open.
+	now, err := parent.Lstat(name)
+	if err != nil || now.Mode()&fs.ModeSymlink != 0 || !os.SameFile(want, now) {
+		return fmt.Errorf("blobstore: %s changed during delete", name)
+	}
+	// Read the entries in batches, so a huge directory is not listed in full
+	// before ctx is checked again. As os.RemoveAll does, reopen the directory
+	// after each batch, because removing entries can make a continued read
+	// skip some, and read on past a batch in which nothing could be removed.
+	//
+	// Like RemoveAll, keep going past an entry that cannot be removed so it
+	// does not strand its siblings, and report the first error at the end.
+	// Cancellation still stops the walk at once.
+	var first error
+	for {
+		d, err := sub.Open(".")
+		if err != nil {
+			return err
+		}
+		var read int
+		for {
+			entries, err := d.ReadDir(deleteBatch)
+			if err != nil && !errors.Is(err, io.EOF) {
+				_ = d.Close()
+				return err
+			}
+			read = len(entries)
+			sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+			failed := 0
+			for _, e := range entries {
+				err = deleteTree(ctx, sub, e.Name(), n)
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					_ = d.Close()
+					return err
+				}
+				if err != nil {
+					failed++
+					if first == nil {
+						first = err
+					}
+				}
+			}
+			if read < deleteBatch || failed < read {
+				break
+			}
+		}
+		_ = d.Close()
+		if read < deleteBatch {
+			return first
+		}
+	}
+}
+func (f *Filesystem) List(ctx context.Context, prefix, cursor string, limit int) ([]ObjectInfo, string, error) {
+	if prefix != "" {
+		if err := ValidateKey(strings.TrimSuffix(prefix, "/")); err != nil {
+			return nil, "", err
+		}
+	}
+	root, err := os.OpenRoot(f.root)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { _ = root.Close() }()
+	prefix = strings.TrimSuffix(prefix, "/")
+	start := "."
+	if prefix != "" {
+		if err = check(root, prefix); err != nil {
+			return nil, "", err
+		}
+		start = prefix
+	}
+	out := []ObjectInfo{}
+	// Sort each visited directory by full key order, skipping cursor subtrees.
+	// Stop after the first object beyond the requested page.
+	stop := errors.New("artwork list page complete")
+	cleanupBudget := 32
+	var walk func(string) error
+	walk = func(p string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, err := root.Lstat(p)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if info.IsDir() {
+			if p != "." && p+"/" <= cursor && !strings.HasPrefix(cursor, p+"/") {
+				return nil
+			}
+			dir, err := root.Open(p)
+			if err != nil {
+				return err
+			}
+			entries, err := dir.ReadDir(-1)
+			_ = dir.Close()
+			if err != nil {
+				return err
+			}
+			order := func(e os.DirEntry) string {
+				if e.IsDir() {
+					return e.Name() + "/"
+				}
+				return e.Name()
+			}
+			sort.Slice(entries, func(i, j int) bool { return order(entries[i]) < order(entries[j]) })
+			for _, entry := range entries {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				child := path.Join(p, entry.Name())
+				if strings.HasPrefix(entry.Name(), ".tmp-") || strings.HasPrefix(entry.Name(), ".probe-") {
+					if cleanupBudget > 0 && cleanupTemporary(root, child) {
+						cleanupBudget--
+					}
+					continue
+				}
+				if entry.IsDir() {
+					if child+"/" <= cursor && !strings.HasPrefix(cursor, child+"/") {
+						continue
+					}
+				} else if child <= cursor {
+					continue
+				}
+				if err := walk(child); err != nil {
+					return err
+				}
+			}
+		} else if info.Mode().IsRegular() && p > cursor {
+			out = append(out, fileInfo(p, info))
+			if limit > 0 && len(out) > limit {
+				return stop
+			}
+		}
+		return nil
+	}
+	err = walk(start)
+	if os.IsNotExist(err) {
+		return []ObjectInfo{}, "", nil
+	}
+	if err != nil && !errors.Is(err, stop) {
+		return nil, "", err
+	}
+	next := ""
+	if limit > 0 && len(out) > limit {
+		next = out[limit-1].Key
+		out = out[:limit]
+	}
+	return out, next, nil
+}
+func (f *Filesystem) Probe(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ensureRoot(f.root); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(f.root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	file, name, err := temporary(root, ".", ".probe-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Remove(name) }()
+	_, err = file.WriteString("ok")
+	if err == nil {
+		err = file.Sync()
+	}
+	if e := file.Close(); err == nil {
+		err = e
+	}
+	if err == nil {
+		cleanupRootTemporary(ctx, root)
+	}
+	return err
+}
+
+// Identity is the absolute root, so two mounts of different directories never
+// share a catalog by accident. A store opened on a directory the catalog
+// recorded under another path keeps the recorded identity instead.
+func (f *Filesystem) Identity() string {
+	if f.identity != "" {
+		return f.identity
+	}
+	return BackendLocal + "|" + f.root
+}
+
+// SameLocalRoot reports whether two local identities name the same root once
+// each is resolved the way a store resolves its own root (LocalIdentity):
+// symlinks in the parent directories are followed, the root's own name is
+// not. The paths can differ when a link was added to, or removed from, a
+// parent after the identity was recorded: an image that keeps its state under
+// a linked directory resolves a root the regular image recorded at another
+// path. A recorded root that is itself a link is not followed, because a
+// store refuses a linked root (ensureRoot), so it never matches the directory
+// the link points to.
+func SameLocalRoot(a, b string) bool {
+	rootA, okA := strings.CutPrefix(a, BackendLocal+"|")
+	rootB, okB := strings.CutPrefix(b, BackendLocal+"|")
+	if !okA || !okB || rootA == "" || rootB == "" {
+		return false
+	}
+	if rootA == rootB {
+		return true
+	}
+	resolvedA, errA := LocalIdentity(rootA)
+	resolvedB, errB := LocalIdentity(rootB)
+	return errA == nil && errB == nil && resolvedA == resolvedB
+}
+
+// Location names where a store's objects are. For a local store it is the
+// directory the store opened, through any wrappers; that can differ from an
+// identity recorded under another path, whose links may since point elsewhere.
+// Any other store's location is its identity.
+func Location(store Store) string {
+	for store != nil {
+		switch s := store.(type) {
+		case *Filesystem:
+			return BackendLocal + "|" + s.root
+		case interface{ unwrapStore() Store }:
+			store = s.unwrapStore()
+		default:
+			return store.Identity()
+		}
+	}
+	return ""
+}
+
+var _ Store = (*Filesystem)(nil)
+
+// Remove only abandoned temporary files. Writers hold the lock
+// until publication, including slow writes whose modification time is old.
+func cleanupTemporary(root *os.Root, name string) bool {
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || time.Since(info.ModTime()) < 24*time.Hour {
+		return false
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = file.Close() }()
+	if unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
+		return false
+	}
+	locked, err := file.Stat()
+	if err != nil || !os.SameFile(info, locked) {
+		return false
+	}
+	current, err := root.Lstat(name)
+	if err == nil && os.SameFile(locked, current) && time.Since(current.ModTime()) >= 24*time.Hour {
+		return root.Remove(name) == nil
+	}
+	return false
+}
+
+// Temporary files in the root lie outside the namespaces visited by the sweeper. Stream
+// root entries so cleanup does not allocate a complete directory listing. Fresh
+// and locked files do not consume the deletion quota.
+func cleanupRootTemporary(ctx context.Context, root *os.Root) {
+	dir, err := root.Open(".")
+	if err != nil {
+		return
+	}
+	defer func() { _ = dir.Close() }()
+	remaining := 32
+	for remaining > 0 && ctx.Err() == nil {
+		entries, err := dir.ReadDir(32)
+		for _, entry := range entries {
+			if ctx.Err() != nil {
+				return
+			}
+			if (strings.HasPrefix(entry.Name(), ".probe-") || strings.HasPrefix(entry.Name(), ".tmp-")) && cleanupTemporary(root, entry.Name()) {
+				remaining--
+				if remaining == 0 {
+					return
+				}
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}

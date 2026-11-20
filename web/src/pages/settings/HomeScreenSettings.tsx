@@ -1,0 +1,406 @@
+import type { ActionMenuItem } from "@/components/calm/ActionMenu";
+import type { PageMoreMenuItem } from "@/components/calm/PageMoreMenu";
+import { AddRowDialog } from "@/components/homeRows/addRow/AddRowDialog";
+import { HomePreferencesCard } from "@/components/homeRows/HomePreferencesCard";
+import { HomeRowsPage, type SharedRowMenuItems } from "@/components/homeRows/HomeRowsPage";
+import { RemoveRowDialog } from "@/components/homeRows/RemoveRowDialog";
+import { ResetProfileDialog } from "@/components/homeRows/ResetProfileDialog";
+import { useNewRowHighlight } from "@/components/homeRows/useNewRowHighlight";
+import { useRowFocus } from "@/components/homeRows/useRowFocus";
+import { useRowDialog, useRowLinks } from "@/components/homeRows/useRowLinks";
+import { HomeLayoutImportDialog } from "@/components/sections/HomeLayoutTransfer";
+import { Button } from "@/components/ui/button";
+import { useHomeLayoutExport } from "@/hooks/queries/homeRows/useHomeLayoutExport";
+import { useProfileHomeRowsAdapter } from "@/hooks/queries/homeRows/useProfileHomeRowsAdapter";
+import { useUserLibraries } from "@/hooks/queries/libraries";
+import {
+  useEffectiveSettings,
+  useSetSettingValue,
+  type SettingIdentity,
+} from "@/hooks/queries/settingValues";
+import { useProfileDefaultWriter } from "@/hooks/queries/profileDefaults";
+import { useOptionalAuth } from "@/hooks/useAuth";
+import { useAppLanguage, useT } from "@/i18n";
+import { collectionKind, profilePageName, type CollectionSummary } from "@/lib/homeRows/describe";
+import { pageLabel } from "@/lib/homeRows/pages";
+import type { HomeRow } from "@/lib/homeRows/types";
+import { SETTING_DEFINITIONS, SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
+import {
+  CircleMinus,
+  Download,
+  Pencil,
+  RotateCcw,
+  Star,
+  StarOff,
+  Trash2,
+  Undo2,
+  Upload,
+} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { holdsCollections } from "@/lib/sectionTypes";
+
+const PROFILE_SCOPE: SettingIdentity = { scope: "profile" };
+const HOME_PREFERENCE_KEYS = [
+  SETTING_KEYS.HOME_HIDE_WATCHED_ITEMS,
+  SETTING_KEYS.UI_NEXT_UP_MODE,
+  SETTING_KEYS.UI_NEXT_UP_NEW_RELEASES_FIRST,
+] as const;
+
+/**
+ * Settings > Home Screen: this profile's rows on Home and each library page,
+ * on the same Home rows components as the admin page. Changes save as they
+ * are made and only ever change this profile.
+ */
+/** Something the page needs didn't load, so it can't change until a retry. */
+function LoadFailedNote({
+  message,
+  retryLabel,
+  onRetry,
+}: {
+  message: string;
+  retryLabel: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div
+      role="alert"
+      className="border-warning/40 bg-warning/10 flex flex-wrap items-center gap-3 rounded-2xl border px-4 py-3 text-sm"
+    >
+      <p className="min-w-0 flex-1">{message}</p>
+      <Button size="sm" variant="outline" onClick={onRetry}>
+        {retryLabel}
+      </Button>
+    </div>
+  );
+}
+
+export default function HomeScreenSettings() {
+  const t = useT();
+  const adapter = useProfileHomeRowsAdapter();
+  const { data: libraries } = useUserLibraries();
+  const focus = useRowFocus(adapter.rows, adapter.pending);
+  const label = pageLabel(adapter.page, adapter.pages);
+  const pageName = profilePageName(adapter.page, label);
+  const layoutExport = useHomeLayoutExport();
+  const [importOpen, setImportOpen] = useState(false);
+  const [rowDialog, setRowDialog] = useRowDialog();
+  const [highlightId, setHighlightId] = useNewRowHighlight();
+  // A row added from a link, waiting for its save to land before going back.
+  const landing = useRef<{ ids: string[]; onAdded: (newIds: string[]) => void } | null>(null);
+  const [removing, setRemoving] = useState<HomeRow | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
+  // Set when a confirmed delete takes away the control that opened its dialog.
+  const removedOpener = useRef(false);
+
+  const homePreferences = useEffectiveSettings({ keys: HOME_PREFERENCE_KEYS });
+  const saveHomePreference = useSetSettingValue();
+  const hideWatchedItems =
+    homePreferences.data?.[SETTING_KEYS.HOME_HIDE_WATCHED_ITEMS]?.value === true;
+  const newReleasesFirst =
+    homePreferences.data?.[SETTING_KEYS.UI_NEXT_UP_NEW_RELEASES_FIRST]?.value === true;
+  // Next up is device-overridable, so it saves through the writer that also
+  // clears a device row shadowing the profile's choice.
+  const nextUpWriter = useProfileDefaultWriter(homePreferences.data);
+  const nextUp = homePreferences.data?.[SETTING_KEYS.UI_NEXT_UP_MODE];
+  const nextUpMode = (nextUp?.value ??
+    SETTING_DEFINITIONS[SETTING_KEYS.UI_NEXT_UP_MODE].defaultValue) as string;
+
+  const profileId = useOptionalAuth()?.profile?.id;
+  const collectionOptions = adapter.collections?.options;
+  // Each summary's collection type is translated text; rebuild it on a language change.
+  const language = useAppLanguage();
+  const collectionSummaries = useMemo(
+    () =>
+      new Map<string, CollectionSummary>(
+        (collectionOptions ?? []).map((option) => [
+          option.id,
+          {
+            title: option.title,
+            kind: collectionKind(option.collection_type),
+            // The list also holds collections other profiles shared.
+            yours: Boolean(profileId) && option.creator_profile_id === profileId,
+          },
+        ]),
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- language: the kinds' language
+    [collectionOptions, profileId, language],
+  );
+
+  function openRow(row: HomeRow) {
+    if (!adapter.canEdit) return;
+    void adapter
+      .openEdit(row.id)
+      .then((session) => setRowDialog({ session }))
+      .catch((error: unknown) =>
+        toast.error(
+          error instanceof Error ? error.message : t("web.settings.homeScreen.openRowFailed"),
+        ),
+      );
+  }
+
+  useRowLinks({
+    adapter,
+    catalog: adapter.catalog,
+    catalogFailed: adapter.catalogFailed,
+    // Its saved changes decide whether the page can change.
+    settled: adapter.status === "ready" && !adapter.overridesLoading,
+    onAdd: (seed) => setRowDialog({ session: null, seed }),
+    onEdit: openRow,
+  });
+
+  // Saves are queued, so Add row closes before this one lands. It goes back once
+  // the row is on the page, which may take a later read when the one after the
+  // save fails. A failed save has already said so, and the page stays for
+  // another try.
+  const { pending, rows, lastWriteAt } = adapter;
+  useEffect(() => {
+    const added = landing.current;
+    if (!added || pending) return;
+    const [id] = added.ids;
+    if (rows.some((row) => row.id === id)) {
+      landing.current = null;
+      added.onAdded(added.ids);
+    } else if (!id || lastWriteAt(id) === undefined) {
+      landing.current = null;
+    }
+  }, [pending, rows, lastWriteAt]);
+
+  function confirmRemove() {
+    if (!removing) return;
+    removedOpener.current = true;
+    focus.afterRemoval(removing.id);
+    adapter.remove([removing.id]);
+    setRemoving(null);
+  }
+
+  function skipReturnFocus() {
+    const skip = removedOpener.current;
+    removedOpener.current = false;
+    return skip;
+  }
+
+  function rowMenuItems(row: HomeRow, shared: SharedRowMenuItems): ActionMenuItem[] {
+    const busy = !adapter.canEdit;
+    return [
+      {
+        key: "edit",
+        label: t("web.settings.homeScreen.editRow"),
+        icon: Pencil,
+        disabled: busy,
+        onSelect: () => openRow(row),
+      },
+      ...(row.renamedFrom
+        ? [
+            {
+              key: "original-name",
+              label: t("web.settings.homeScreen.useOriginalName"),
+              icon: Undo2,
+              disabled: busy,
+              onSelect: () => adapter.restoreOriginalName(row.id),
+            },
+          ]
+        : []),
+      {
+        key: "hero",
+        label: row.hero
+          ? t("web.settings.homeScreen.stopHero")
+          : t("web.settings.homeScreen.useHero"),
+        icon: row.hero ? StarOff : Star,
+        // A row of collections has no title to show as the hero.
+        disabled: busy || (!row.hero && holdsCollections(row.sectionType)),
+        onSelect: () => void adapter.setHero(row.id, !row.hero),
+      },
+      shared.moveToTop,
+      shared.moveToBottom,
+      {
+        key: "remove",
+        label: row.own
+          ? t("web.settings.homeScreen.deleteRow")
+          : t("web.settings.homeScreen.removeFromPage", { page: pageName }),
+        icon: row.own ? Trash2 : CircleMinus,
+        destructive: true,
+        group: true,
+        disabled: busy,
+        onSelect: () => setRemoving(row),
+      },
+    ];
+  }
+
+  const moreItems: PageMoreMenuItem[] = [
+    {
+      key: "export",
+      label: layoutExport.running
+        ? t("web.settings.homeScreen.exporting")
+        : t("web.settings.homeScreen.export"),
+      help: t("web.settings.homeScreen.exportHelp"),
+      icon: Download,
+      disabled: !layoutExport.ready || layoutExport.running,
+      onSelect: () => void layoutExport.run(),
+    },
+    {
+      key: "import",
+      label: t("web.settings.homeScreen.import"),
+      help: t("web.settings.homeScreen.importHelp"),
+      icon: Upload,
+      disabled: !layoutExport.libraries,
+      opensDialog: true,
+      onSelect: () => setImportOpen(true),
+    },
+    {
+      key: "reset",
+      label:
+        adapter.page.kind === "home"
+          ? t("web.settings.homeScreen.resetHome")
+          : t("web.settings.homeScreen.resetLibrary", { page: label }),
+      help: t("web.settings.homeScreen.resetHelp"),
+      icon: RotateCcw,
+      group: true,
+      disabled: !adapter.canEdit,
+      opensDialog: true,
+      onSelect: () => setResetOpen(true),
+    },
+  ];
+
+  function handleNextUpModeChange(mode: string) {
+    nextUpWriter
+      .save(SETTING_KEYS.UI_NEXT_UP_MODE, mode)
+      .catch(() => toast.error(t("web.settings.homeScreen.saveFailed")));
+  }
+
+  function resetToServerDefault(key: SettingKey) {
+    // Deletes the profile row so the setting inherits the server default again.
+    nextUpWriter
+      .reset(key)
+      .catch(() => toast.error(t("web.settings.homeScreen.resetPreferenceFailed")));
+  }
+
+  function handleNewReleasesFirstChange(enabled: boolean) {
+    saveHomePreference.mutate(
+      {
+        key: SETTING_KEYS.UI_NEXT_UP_NEW_RELEASES_FIRST,
+        value: enabled,
+        identity: PROFILE_SCOPE,
+      },
+      { onError: () => toast.error(t("web.settings.homeScreen.saveFailed")) },
+    );
+  }
+
+  function handleHideWatchedItemsChange(enabled: boolean) {
+    saveHomePreference.mutate(
+      { key: SETTING_KEYS.HOME_HIDE_WATCHED_ITEMS, value: enabled, identity: PROFILE_SCOPE },
+      { onError: () => toast.error(t("web.settings.homeScreen.saveFailed")) },
+    );
+  }
+
+  let notice = null;
+  if (adapter.overridesFailed) {
+    notice = (
+      <LoadFailedNote
+        message={t("web.settings.homeScreen.overridesFailed")}
+        retryLabel={t("web.settings.homeScreen.reloadRows")}
+        onRetry={() => void adapter.reload()}
+      />
+    );
+  } else if (adapter.overridesLoading) {
+    notice = (
+      <p role="status" className="text-muted-foreground text-sm">
+        {t("web.settings.homeScreen.overridesLoading")}
+      </p>
+    );
+  }
+
+  const editingRow = rowDialog?.session?.row;
+  return (
+    <HomeRowsPage
+      adapter={adapter}
+      title={t("web.settings.homeScreen.title")}
+      subtitle={t("web.settings.homeScreen.subtitle")}
+      focus={focus}
+      collection={(id) => collectionSummaries.get(id)}
+      onOpenRow={adapter.canEdit ? openRow : undefined}
+      highlightRowId={highlightId}
+      rowMenuItems={rowMenuItems}
+      moreItems={moreItems}
+      addRow={{ onClick: () => setRowDialog({ session: null }), disabled: !adapter.canEdit }}
+      notices={notice}
+    >
+      <HomePreferencesCard
+        nextUpMode={nextUpMode}
+        nextUpChosen={nextUp?.source === "profile"}
+        onNextUpModeChange={handleNextUpModeChange}
+        onNextUpReset={() => resetToServerDefault(SETTING_KEYS.UI_NEXT_UP_MODE)}
+        newReleasesFirst={newReleasesFirst}
+        newReleasesFirstChosen={
+          homePreferences.data?.[SETTING_KEYS.UI_NEXT_UP_NEW_RELEASES_FIRST]?.source === "profile"
+        }
+        onNewReleasesFirstChange={handleNewReleasesFirstChange}
+        onNewReleasesFirstReset={() =>
+          resetToServerDefault(SETTING_KEYS.UI_NEXT_UP_NEW_RELEASES_FIRST)
+        }
+        hideWatched={hideWatchedItems}
+        onHideWatchedChange={handleHideWatchedItemsChange}
+        loaded={homePreferences.data !== undefined}
+        disabled={
+          homePreferences.isLoading ||
+          // Without the effective values a save cannot tell which row it overrides.
+          homePreferences.isError ||
+          saveHomePreference.isPending ||
+          nextUpWriter.isSaving
+        }
+      />
+
+      <RemoveRowDialog
+        row={removing}
+        page={adapter.page}
+        pageLabel={label}
+        onConfirm={confirmRemove}
+        onOpenChange={(open) => !open && setRemoving(null)}
+        skipReturnFocus={skipReturnFocus}
+      />
+      <ResetProfileDialog
+        open={resetOpen}
+        page={adapter.page}
+        pageLabel={label}
+        ownTitles={adapter.rows.filter((row) => row.own).map((row) => row.title)}
+        onConfirm={() => {
+          setResetOpen(false);
+          adapter.reset();
+        }}
+        onOpenChange={setResetOpen}
+      />
+      {importOpen && layoutExport.libraries ? (
+        <HomeLayoutImportDialog
+          libraries={layoutExport.libraries}
+          onClose={() => setImportOpen(false)}
+        />
+      ) : null}
+      {rowDialog ? (
+        <AddRowDialog
+          key={rowDialog.key}
+          adapter={adapter}
+          catalog={adapter.catalog}
+          catalogFailed={adapter.catalogFailed}
+          libraries={libraries ?? []}
+          session={rowDialog.session}
+          initialSeed={rowDialog.seed}
+          onClose={() => setRowDialog(null)}
+          onSaved={(newIds) => {
+            const onAdded = rowDialog.seed?.onAdded;
+            if (onAdded) landing.current = { ids: newIds, onAdded };
+            else setHighlightId(newIds[0] ?? null);
+          }}
+          deleteLabel={
+            editingRow && !editingRow.own
+              ? t("web.settings.homeScreen.removeFromPage", { page: pageName })
+              : undefined
+          }
+          onDelete={(session) => {
+            setRowDialog(null);
+            setRemoving(session.row);
+          }}
+        />
+      ) : null}
+    </HomeRowsPage>
+  );
+}

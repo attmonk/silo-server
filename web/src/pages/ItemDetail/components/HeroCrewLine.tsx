@@ -1,0 +1,128 @@
+import ViewTransitionLink from "@/components/ViewTransitionLink";
+import type { CrewMember } from "@/api/types";
+import { buildPersonCatalogHref } from "@/pages/catalogSearchParams";
+import { useT } from "@/i18n";
+
+interface HeroCrewLineProps {
+  crew: CrewMember[];
+  genres?: string[];
+  jobLabel?: string;
+  /**
+   * Crew jobs that can fill the leading credit, in order of preference. The
+   * first job with any credits is used. Series pass Creator, then Director,
+   * so a series without Creator credits keeps showing its directors.
+   */
+  leadJobs?: readonly string[];
+}
+
+const DEFAULT_LEAD_JOBS = ["Director"] as const;
+
+interface CrewPerson {
+  name: string;
+  personId: string;
+}
+
+function CrewNames({ people }: { people: CrewPerson[] }) {
+  const t = useT();
+  return (
+    <>
+      {people.map((p, i) => (
+        <span key={p.name}>
+          {i > 0 && t("web.detail.separator.list")}
+          {p.personId ? (
+            <ViewTransitionLink
+              to={buildPersonCatalogHref(p.personId)}
+              className="text-foreground/70 hover:text-foreground/90 font-medium transition-colors"
+            >
+              {p.name}
+            </ViewTransitionLink>
+          ) : (
+            <span className="text-foreground/70 font-medium">{p.name}</span>
+          )}
+        </span>
+      ))}
+    </>
+  );
+}
+
+export default function HeroCrewLine({
+  crew,
+  genres,
+  jobLabel,
+  leadJobs = DEFAULT_LEAD_JOBS,
+}: HeroCrewLineProps) {
+  const t = useT();
+  const leadLabel = jobLabel ?? t("web.detail.overview.directedBy");
+  const leadJob = leadJobs.find((job) => crew.some((c) => c.job === job));
+  const directors = crew
+    .filter((c) => c.job === leadJob)
+    .map((c): CrewPerson => ({ name: c.name, personId: c.person_id }))
+    .slice(0, 2);
+
+  const writers = crew
+    .filter((c) => c.job === "Writer" || c.job === "Screenplay")
+    .map((c): CrewPerson => ({ name: c.name, personId: c.person_id }))
+    .slice(0, 2);
+
+  // Book/manga credits: shown when the item has Author people (video items
+  // never do, so the section simply doesn't render there).
+  const authors = crew
+    .filter((c) => c.job === "Author")
+    .map((c): CrewPerson => ({ name: c.name, personId: c.person_id }))
+    .slice(0, 3);
+
+  const hasDirectors = directors.length > 0;
+  const hasWriters = writers.length > 0;
+  const hasAuthors = authors.length > 0;
+  const hasGenres = genres && genres.length > 0;
+
+  if (!hasDirectors && !hasWriters && !hasAuthors && !hasGenres) return null;
+
+  return (
+    <div className="text-muted-foreground text-[0.8125rem]">
+      {hasAuthors && (
+        <>
+          <span className="text-muted-foreground/60">{t("web.detail.overview.byAuthors")} </span>
+          <CrewNames people={authors} />
+        </>
+      )}
+      {hasAuthors && (hasDirectors || hasWriters || hasGenres) && (
+        <span className="text-muted-foreground/40 mx-2">{t("web.detail.separator.dot")}</span>
+      )}
+      {hasDirectors && (
+        <>
+          <span className="text-muted-foreground/60">{leadLabel} </span>
+          <CrewNames people={directors} />
+        </>
+      )}
+      {hasDirectors && hasWriters && (
+        <span className="text-muted-foreground/40 mx-2">{t("web.detail.separator.dot")}</span>
+      )}
+      {hasWriters && (
+        <>
+          <span className="text-muted-foreground/60">{t("web.detail.overview.writtenBy")} </span>
+          <CrewNames people={writers} />
+        </>
+      )}
+      {(hasDirectors || hasWriters) && hasGenres && (
+        <span className="text-muted-foreground/40 mx-2">{t("web.detail.separator.dot")}</span>
+      )}
+      {hasGenres &&
+        genres.map((g, i) => (
+          <span key={g}>
+            <span className="text-foreground/60">{g}</span>
+            {/* <wbr /> gives the line a break point between genres; the
+                separator spans alone leave the whole list one unbreakable word. */}
+            {i < genres.length - 1 && (
+              <>
+                <span className="text-muted-foreground/40 mx-1.5">
+                  {t("web.detail.separator.dot")}
+                </span>
+                <wbr />
+              </>
+            )}
+          </span>
+        ))}
+    </div>
+  );
+}

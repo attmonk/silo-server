@@ -1,0 +1,109 @@
+import { useState, type ReactNode } from "react";
+import DefaultArtwork from "@/components/DefaultArtwork";
+import ViewTransitionLink from "@/components/ViewTransitionLink";
+import MediaCarousel from "@/components/MediaCarousel";
+import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
+import { useUICustomization } from "@/hooks/useUICustomization";
+import { carouselCardWidthClasses } from "@/lib/uiCustomization";
+import CardPlayOverlay from "@/components/CardPlayOverlay";
+import { useT } from "@/i18n";
+
+const MAX_MORE_LIKE_THIS_ITEMS = 12;
+
+interface RecommendationGridProps {
+  items: Array<{ content_id: string }>;
+  maxItems?: number;
+}
+
+function RecommendationItemCard({ itemId }: { itemId: string }) {
+  const { data: item } = useCatalogItemDetail(itemId);
+  // Keyed by URL so a re-signed poster is tried again.
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  if (!item) {
+    return <div className="bg-surface aspect-[2/3] animate-pulse rounded-lg" />;
+  }
+  return (
+    <div className="group/card">
+      <div className="group/media relative">
+        <ViewTransitionLink
+          to={`/item/${encodeURIComponent(itemId)}`}
+          aria-label={item.title}
+          className="group block"
+        >
+          <div className="relative aspect-[2/3] overflow-hidden rounded-lg">
+            {item.poster_url && failedUrl !== item.poster_url ? (
+              <img
+                src={item.poster_url}
+                alt={item.title}
+                loading="lazy"
+                decoding="async"
+                onError={() => setFailedUrl(item.poster_url ?? null)}
+                className="h-full w-full object-cover transition-transform group-hover:scale-105"
+              />
+            ) : (
+              <DefaultArtwork mediaType={item.type} />
+            )}
+          </div>
+        </ViewTransitionLink>
+        {item.play_content_id ? (
+          <CardPlayOverlay
+            contentId={item.play_content_id}
+            title={item.title}
+            type={item.type === "movie" ? "movie" : "episode"}
+          />
+        ) : null}
+      </div>
+      <ViewTransitionLink
+        to={`/item/${encodeURIComponent(itemId)}`}
+        className="mt-1.5 block truncate text-sm font-medium hover:underline"
+      >
+        {item.title}
+      </ViewTransitionLink>
+    </div>
+  );
+}
+
+interface MoreLikeThisRowProps<T> {
+  items: T[];
+  itemKey: (item: T) => string;
+  renderItem: (item: T) => ReactNode;
+  maxItems?: number;
+}
+
+/**
+ * The "More Like This" rail on detail pages: poster-width slides inside the
+ * page shell, sized by the viewer's card settings. Library items and titles
+ * known only from TMDB supply their own cards.
+ */
+export function MoreLikeThisRow<T>({
+  items,
+  itemKey,
+  renderItem,
+  maxItems = MAX_MORE_LIKE_THIS_ITEMS,
+}: MoreLikeThisRowProps<T>) {
+  const t = useT();
+  const { cardPresentation } = useUICustomization();
+  const itemLimit = Math.max(0, Math.min(maxItems, MAX_MORE_LIKE_THIS_ITEMS));
+  const posterWidthClasses = carouselCardWidthClasses(cardPresentation.poster_size);
+
+  return (
+    <MediaCarousel title={t("web.recommendations.moreLikeThis")} edgePadding={false}>
+      {items.slice(0, itemLimit).map((item) => (
+        <div key={itemKey(item)} className={posterWidthClasses}>
+          {renderItem(item)}
+        </div>
+      ))}
+    </MediaCarousel>
+  );
+}
+
+export default function RecommendationGrid({ items, maxItems = 12 }: RecommendationGridProps) {
+  return (
+    <MoreLikeThisRow
+      items={items}
+      maxItems={maxItems}
+      itemKey={(item) => item.content_id}
+      renderItem={(item) => <RecommendationItemCard itemId={item.content_id} />}
+    />
+  );
+}

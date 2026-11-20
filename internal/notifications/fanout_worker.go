@@ -1,0 +1,714 @@
+package notifications
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/telemetry"
+	"github.com/Silo-Server/silo-server/internal/workmetrics"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/oklog/ulid/v2"
+)
+
+const (
+	fanoutPollInterval = 15 * time.Second
+	fanoutClaimLimit   = 100
+)
+
+// FanoutWorker consumes unprocessed release_events and materializes
+// notification_deliveries plus realtime dispatch. It is safe to run on
+// multiple nodes: claiming uses FOR UPDATE SKIP LOCKED, delivery inserts are
+// idempotent, and the last-notified cursor update is guarded.
+type FanoutWorker struct {
+	pool        *pgxpool.Pool
+	releases    *ReleaseRepository
+	interests   *InterestRepository
+	deliveries  *DeliveryRepository
+	preferences *PreferencesRepository
+	settings    *Settings
+	scopes      ScopeResolver
+	dispatcher  Dispatcher
+	logger      *slog.Logger
+	nudge       chan struct{}
+
+	// Per-target outboxes: when set, the fanout transaction also enqueues
+	// `pending` attempt rows for each newly inserted delivery — one per
+	// enabled, reason-matching webhook and one per enabled web push
+	// subscription.
+	webhooks    *WebhookRepository
+	rateLimiter *profileRateLimiter
+	// pluginSender picks and enqueues plugin destination attempts;
+	// pluginLimiter bounds them per profile like rateLimiter does webhooks.
+	pluginSender  *pluginDestinationSender
+	pluginLimiter *profileRateLimiter
+	webPush       *WebPushRepository
+	pushDevices   *PushDeviceRepository
+
+	// Watchlist arrivals (SetWatchlistArrivals): who waits for an arriving
+	// title, and whether a request of it tells them instead.
+	watchlist watchlistWaiters
+	requests  requestWaiters
+}
+
+// SetWebhookOutbox wires durable webhook attempt enqueueing into the fanout
+// transaction.
+func (w *FanoutWorker) SetWebhookOutbox(webhooks *WebhookRepository, limiter *profileRateLimiter) {
+	w.webhooks = webhooks
+	w.rateLimiter = limiter
+}
+
+// setPluginDestinationOutbox wires plugin destination attempt enqueueing into
+// the fanout transaction.
+func (w *FanoutWorker) setPluginDestinationOutbox(sender *pluginDestinationSender, limiter *profileRateLimiter) {
+	w.pluginSender = sender
+	w.pluginLimiter = limiter
+}
+
+// SetWebPushOutbox wires durable web push attempt enqueueing into the fanout
+// transaction.
+func (w *FanoutWorker) SetWebPushOutbox(webPush *WebPushRepository) {
+	w.webPush = webPush
+}
+
+// SetPushOutbox wires durable Apple push attempt enqueueing into the fanout
+// transaction.
+func (w *FanoutWorker) SetPushOutbox(pushDevices *PushDeviceRepository) {
+	w.pushDevices = pushDevices
+}
+
+// NewFanoutWorker creates a FanoutWorker. scopes resolves each recipient's
+// current access; without it no episode notification is delivered.
+func NewFanoutWorker(
+	pool *pgxpool.Pool,
+	releases *ReleaseRepository,
+	interests *InterestRepository,
+	deliveries *DeliveryRepository,
+	preferences *PreferencesRepository,
+	settings *Settings,
+	scopes ScopeResolver,
+	dispatcher Dispatcher,
+) *FanoutWorker {
+	return &FanoutWorker{
+		pool:        pool,
+		releases:    releases,
+		interests:   interests,
+		deliveries:  deliveries,
+		preferences: preferences,
+		settings:    settings,
+		scopes:      scopes,
+		dispatcher:  dispatcher,
+		logger:      slog.Default().With("component", "notifications.fanout"),
+		nudge:       make(chan struct{}, 1),
+	}
+}
+
+// Nudge schedules a near-term claim pass (after the settle delay) so
+// notifications feel realtime without tight polling. Non-blocking.
+func (w *FanoutWorker) Nudge() {
+	if w == nil {
+		return
+	}
+	select {
+	case w.nudge <- struct{}{}:
+	default:
+	}
+}
+
+// Run processes release events until ctx is canceled.
+func (w *FanoutWorker) Run(ctx context.Context) {
+	ticker := time.NewTicker(fanoutPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-w.nudge:
+			// Wait out the settle delay so one scan's burst for a series
+			// lands in a single claim batch instead of trickling through.
+			settle := w.settings.SettleDelay(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(settle + time.Second):
+			}
+		}
+		if !w.settings.FanoutEnabled(ctx) {
+			continue
+		}
+		for {
+			processed, err := w.processBatch(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					w.logger.ErrorContext(ctx, "fanout batch failed", "error", err)
+				}
+				break
+			}
+			if processed == 0 {
+				break
+			}
+		}
+	}
+}
+
+// processBatch claims one batch of release events and fans them out. The
+// claim, delivery inserts, cursor updates, and processed marks share one
+// transaction so an event is never marked processed without durable
+// deliveries; reprocessing after a crash is harmless because delivery inserts
+// dedupe. Returns the number of events handled (fanned out + suppressed).
+func (w *FanoutWorker) processBatch(ctx context.Context) (processed int, runErr error) {
+	started := time.Now()
+	settle := w.settings.SettleDelay(ctx)
+
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin fanout tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	claimed, err := w.releases.ClaimUnprocessed(ctx, tx, settle, fanoutClaimLimit)
+	if err != nil {
+		return 0, err
+	}
+	if len(claimed) == 0 {
+		return 0, nil
+	}
+
+	ctx, observation := workmetrics.Start(ctx, "notifications", time.Time{})
+	defer workmetrics.Profile(ctx)()
+	defer func() { observation.Finish(telemetry.Outcome(runErr)) }()
+	// Non-episode kinds (movies, audiobooks, ebooks) have no per-profile
+	// interest and never fan out as episodes; mark them processed immediately
+	// so retention reclaims them. A fresh movie still reaches watchlist
+	// arrivals below, in this transaction. The server-channel sweep reads
+	// events by cursor regardless of processed state.
+	events, others := PartitionEventsByKind(claimed)
+	if err := w.releases.MarkProcessed(ctx, tx, eventIDs(others), nil); err != nil {
+		return 0, err
+	}
+
+	// Suppress events that aged past the staleness horizon before fanout
+	// could run (fanout disabled for a stretch, extended downtime): users
+	// should not receive a backlog of long-stale "new episode" notifications
+	// when the worker comes back.
+	//
+	// No per-series cap applies to the rest: EvaluateRecipient lets only the
+	// lowest available episode at or after a profile's cursor notify, so a
+	// season pack tells each profile about one episode of the series.
+	staleCutoff := time.Now().Add(-w.settings.MaxEventAge(ctx))
+	// A fresh movie can still tell the profiles whose watchlist waits for it.
+	arrivalEvents := make([]ReleaseEvent, 0, len(others))
+	for _, event := range others {
+		if !event.CreatedAt.Before(staleCutoff) {
+			arrivalEvents = append(arrivalEvents, event)
+		}
+	}
+	fanout := make([]ReleaseEvent, 0, len(events))
+	stale := make([]ReleaseEvent, 0)
+	for _, event := range events {
+		if event.CreatedAt.Before(staleCutoff) {
+			stale = append(stale, event)
+		} else {
+			fanout = append(fanout, event)
+		}
+	}
+	if len(stale) > 0 {
+		reason := SuppressedReasonStale
+		if err := w.releases.MarkProcessed(ctx, tx, eventIDs(stale), &reason); err != nil {
+			return 0, err
+		}
+	}
+
+	// Capture the entire batch before acquiring inbox locks. Locking one event
+	// at a time could acquire the same profiles in opposite transaction order.
+	//
+	// An interest row is computed when the profile's relationship to the
+	// series changes, so it can outlive the profile's access: a library
+	// restriction or maturity limit set later leaves the row in place. Only
+	// candidates that can open the episode now are captured, which keeps the
+	// title off every channel for the rest. Eligibility is checked first, so
+	// scopes are resolved only for candidates who would get a delivery;
+	// fanOutEvent evaluates eligibility again under the inbox locks. Access is
+	// checked only here: changing it takes no inbox lock, so a second check
+	// under the locks would not close the gap before commit. A delivery
+	// created in that gap is like one created just before the change.
+	//
+	// A copy of an episode that another library already holds (a 4K library
+	// beside an HD one) is no news to a profile that can open it there, so
+	// that profile is not captured. The delivery dedupe key alone would let
+	// the copy through once retention has removed the first delivery.
+	//
+	// The highest available key below each event's episode is read once per
+	// event, and only for an event with candidates, then reused by the
+	// evaluation under the inbox locks so both passes apply the same rule.
+	earlier, err := w.releases.EarlierEpisodeCopies(ctx, tx, eventIDs(fanout))
+	if err != nil {
+		return 0, err
+	}
+	recipients := newRecipientAccess(w.scopes)
+	candidatesByEvent := make(map[string]map[profileKey]struct{}, len(fanout))
+	highestBelowByEvent := make(map[string]*int, len(fanout))
+	profiles := make(map[string]struct{})
+	for _, event := range fanout {
+		candidates, err := w.interests.ListActiveBySeries(ctx, tx, event.LibraryID, event.SeriesID)
+		if err != nil {
+			return 0, err
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+		highestBelow, err := w.releases.HighestListedEpisodeKeyBelow(ctx, tx, event.SeriesID, event.EpisodeKey)
+		if err != nil {
+			return 0, err
+		}
+		highestBelowByEvent[event.ID] = highestBelow
+		// In a bulk import most events match no candidate's cursor; dropping
+		// them here skips their preference read.
+		candidates = slices.DeleteFunc(candidates, func(candidate SeriesInterest) bool {
+			return !nextUpMatches(candidate, event.EpisodeKey, highestBelow)
+		})
+		if len(candidates) == 0 {
+			continue
+		}
+		prefs, err := w.preferences.GetMany(ctx, tx, candidateProfiles(candidates))
+		if err != nil {
+			return 0, err
+		}
+		captured := make(map[profileKey]struct{}, len(candidates))
+		for _, candidate := range candidates {
+			if _, eligible := EvaluateRecipient(candidate, prefs[candidate.key()], event.EpisodeKey, highestBelow); !eligible {
+				continue
+			}
+			allowed, err := recipients.canOpen(ctx, tx, candidate.UserID, candidate.ProfileID, event.EpisodeID, event.LibraryID)
+			if err != nil {
+				return 0, err
+			}
+			if !allowed {
+				continue
+			}
+			elsewhere, err := recipients.canOpenInAny(ctx, tx, candidate.UserID, candidate.ProfileID, event.EpisodeID, earlier[event.ID])
+			if err != nil {
+				return 0, err
+			}
+			if elsewhere {
+				continue
+			}
+			captured[candidate.key()] = struct{}{}
+			profiles[candidate.ProfileID] = struct{}{}
+		}
+		candidatesByEvent[event.ID] = captured
+	}
+	// A movie, or a series arriving with its first episodes, tells the
+	// profiles whose watchlist waits for it.
+	arrivals, err := w.captureWatchlistArrivals(ctx, tx, recipients, append(arrivalEvents, fanout...), staleCutoff)
+	if err != nil {
+		return 0, err
+	}
+	for _, arrival := range arrivals {
+		profiles[arrival.waiter.ProfileID] = struct{}{}
+	}
+	if err := w.deliveries.LockInboxProfiles(ctx, tx, slices.Sorted(maps.Keys(profiles))); err != nil {
+		return 0, err
+	}
+
+	totalRecipients := 0
+	totalInserted := 0
+	dispatchRows := make([]DeliveryRow, 0, 32)
+	for _, event := range fanout {
+		rows, recipients, err := w.fanOutEvent(ctx, tx, event, highestBelowByEvent[event.ID], candidatesByEvent[event.ID])
+		if err != nil {
+			return 0, fmt.Errorf("fan out event %s: %w", event.ID, err)
+		}
+		totalRecipients += recipients
+		totalInserted += len(rows)
+		dispatchRows = append(dispatchRows, rows...)
+	}
+	arrivalRows, err := w.deliverWatchlistArrivals(ctx, tx, arrivals)
+	if err != nil {
+		return 0, fmt.Errorf("deliver watchlist arrivals: %w", err)
+	}
+	if err := w.releases.MarkProcessed(ctx, tx, eventIDs(fanout), nil); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit fanout tx: %w", err)
+	}
+
+	// Publish realtime events only after the delivery transaction commits.
+	// Failures here are tolerable: the durable rows appear on reconnect.
+	for _, row := range dispatchRows {
+		if err := w.dispatcher.Dispatch(ctx, row); err != nil {
+			w.logger.WarnContext(ctx, "notification dispatch failed",
+				"delivery_id", row.ID, "profile_id", row.ProfileID, "error", err)
+		}
+	}
+	w.dispatchInserted(ctx, arrivalRows)
+
+	w.logger.InfoContext(ctx, "fanout batch processed",
+		"claimed", len(claimed),
+		"non_episode", len(others),
+		"fanned_out", len(fanout),
+		"stale", len(stale),
+		"recipient_count", totalRecipients,
+		"inserted_count", totalInserted,
+		"deduped_count", totalRecipients-totalInserted,
+		"watchlist_arrivals", len(arrivalRows),
+		"duration_ms", time.Since(started).Milliseconds(),
+	)
+	return len(claimed), nil
+}
+
+// fanOutEvent resolves recipients for one release event and inserts
+// deliveries. highestBelow is the event's HighestListedEpisodeKeyBelow,
+// read during capture. Returns dispatch payloads for the rows actually
+// inserted and the candidate recipient count.
+func (w *FanoutWorker) fanOutEvent(ctx context.Context, tx pgx.Tx, event ReleaseEvent, highestBelow *int, capturedProfiles map[profileKey]struct{}) ([]DeliveryRow, int, error) {
+	if len(capturedProfiles) == 0 {
+		return nil, 0, nil
+	}
+	candidates, err := w.interests.ListActiveBySeries(ctx, tx, event.LibraryID, event.SeriesID)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Refresh only captured recipients: prior events (or a transaction that
+	// committed while we waited for the inbox locks) may have advanced their
+	// last-notified cursor. Newly interested profiles are outside this batch's recipient snapshot.
+	candidates = capturedFanoutCandidates(candidates, capturedProfiles)
+	if len(candidates) == 0 {
+		return nil, 0, nil
+	}
+
+	prefs, err := w.preferences.GetMany(ctx, tx, candidateProfiles(candidates))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	pending := make(map[profileKey]pendingDelivery, len(candidates))
+	toInsert := make([]Delivery, 0, len(candidates))
+	for _, candidate := range candidates {
+		flags, eligible := EvaluateRecipient(candidate, prefs[candidate.key()], event.EpisodeKey, highestBelow)
+		if !eligible {
+			continue
+		}
+		flagsJSON, err := json.Marshal(flags)
+		if err != nil {
+			return nil, 0, fmt.Errorf("marshal reason flags: %w", err)
+		}
+		eventID := event.ID
+		libraryID := event.LibraryID
+		seriesID := event.SeriesID
+		episodeID := event.EpisodeID
+		delivery := Delivery{
+			ID:             ulid.Make().String(),
+			ReleaseEventID: &eventID,
+			UserID:         candidate.UserID,
+			ProfileID:      candidate.ProfileID,
+			LibraryID:      &libraryID,
+			SeriesID:       &seriesID,
+			EpisodeID:      &episodeID,
+			Type:           DeliveryTypeEpisodeAvailable,
+			ReasonFlags:    flagsJSON,
+		}
+		pending[candidate.key()] = pendingDelivery{delivery: delivery, flags: flags}
+		toInsert = append(toInsert, delivery)
+	}
+	if len(toInsert) == 0 {
+		return nil, len(candidates), nil
+	}
+
+	inserted, err := w.deliveries.BulkInsert(ctx, tx, toInsert)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Durable dispatch outbox: enqueue per-target attempt rows in the same
+	// transaction so a crash after commit delays webhooks instead of silently
+	// dropping them. Push channels (specs 02-03) plug in here the same way.
+	if err := w.enqueueWebhookOutbox(ctx, tx, inserted, pendingReasonsMatch(pending)); err != nil {
+		return nil, 0, err
+	}
+	if err := w.enqueuePluginDestinationOutbox(ctx, tx, inserted, pendingReasonsMatchDestination(pending)); err != nil {
+		return nil, 0, err
+	}
+	if err := w.enqueueWebPushOutbox(ctx, tx, inserted); err != nil {
+		return nil, 0, err
+	}
+	if err := w.enqueuePushOutbox(ctx, tx, inserted); err != nil {
+		return nil, 0, err
+	}
+
+	notifiedProfiles := make([]profileKey, 0, len(inserted))
+	for _, row := range inserted {
+		notifiedProfiles = append(notifiedProfiles, row.key())
+	}
+	if err := w.interests.GuardedSetLastNotified(ctx, tx, event.LibraryID, event.SeriesID, event.EpisodeKey, notifiedProfiles); err != nil {
+		return nil, 0, err
+	}
+
+	display, err := loadEventDisplay(ctx, tx, event.EpisodeID)
+	if err != nil {
+		return nil, 0, err
+	}
+	dispatchRows := make([]DeliveryRow, 0, len(inserted))
+	for _, row := range inserted {
+		entry, ok := pending[row.key()]
+		if !ok {
+			continue
+		}
+		delivery := entry.delivery
+		delivery.ID = row.ID
+		delivery.CreatedAt = row.CreatedAt
+		seasonNumber := event.SeasonNumber
+		episodeNumber := event.EpisodeNumber
+		dispatchRows = append(dispatchRows, DeliveryRow{
+			Delivery:         delivery,
+			pluginAttempts:   row.pluginAttempts,
+			SeriesTitle:      display.seriesTitle,
+			EpisodeTitle:     display.episodeTitle,
+			SeasonNumber:     &seasonNumber,
+			EpisodeNumber:    &episodeNumber,
+			PosterPath:       display.posterPath,
+			PosterThumbhash:  display.posterThumbhash,
+			PosterSourcePath: display.posterSourcePath,
+		})
+	}
+	return dispatchRows, len(candidates), nil
+}
+
+// pendingDelivery pairs a candidate delivery with its matched reason flags so
+// the outbox enqueue can apply per-webhook reason filters.
+type pendingDelivery struct {
+	delivery Delivery
+	flags    ReasonFlags
+}
+
+// pendingReasonsMatchDestination is pendingReasonsMatch for plugin
+// destinations.
+func pendingReasonsMatchDestination(pending map[profileKey]pendingDelivery) func(InsertedDelivery, PluginDestination) bool {
+	return func(row InsertedDelivery, destination PluginDestination) bool {
+		entry, ok := pending[row.key()]
+		return ok && destination.MatchesReasons(entry.flags)
+	}
+}
+
+// pendingReasonsMatch is the webhook switch for episode deliveries: a webhook
+// gets one when its reason switches match the delivery's flags.
+func pendingReasonsMatch(pending map[profileKey]pendingDelivery) func(InsertedDelivery, Webhook) bool {
+	return func(row InsertedDelivery, hook Webhook) bool {
+		entry, ok := pending[row.key()]
+		return ok && hook.MatchesReasons(entry.flags)
+	}
+}
+
+// insertedProfileKeys lists the distinct account/profile pairs of the
+// inserted deliveries. Channel targets are looked up by both: profile IDs
+// repeat across accounts, and one account's delivery must not reach another
+// account's devices or webhooks.
+func insertedProfileKeys(inserted []InsertedDelivery) []profileKey {
+	seen := make(map[profileKey]struct{}, len(inserted))
+	keys := make([]profileKey, 0, len(inserted))
+	for _, row := range inserted {
+		key := row.key()
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// enqueuePushOutbox inserts pending push attempt rows for each newly inserted
+// delivery and enabled private-push device on every admin-enabled platform
+// (Apple and Android).
+func (w *FanoutWorker) enqueuePushOutbox(ctx context.Context, tx pgx.Tx, inserted []InsertedDelivery) error {
+	if w.pushDevices == nil || len(inserted) == 0 {
+		return nil
+	}
+	platforms := w.settings.EnabledPushPlatforms(ctx)
+	if len(platforms) == 0 {
+		return nil
+	}
+	devicesByProfile, err := w.pushDevices.ListEnabledPushByProfiles(ctx, tx, insertedProfileKeys(inserted), platforms)
+	if err != nil {
+		return err
+	}
+	attempts := make([]PushDeliveryAttempt, 0, len(inserted))
+	for _, row := range inserted {
+		attempts = append(attempts, newPushDeliveryAttempts(row.ID, devicesByProfile[row.key()])...)
+	}
+	return w.pushDevices.EnqueuePushAttempts(ctx, tx, attempts)
+}
+
+// enqueueWebPushOutbox inserts `pending` web push attempt rows for each newly
+// inserted delivery, inside the fanout transaction. Subscriptions have no
+// per-reason filters: profile preferences already gated delivery creation,
+// and the Next Up rule tells a profile about one episode of a season pack.
+func (w *FanoutWorker) enqueueWebPushOutbox(ctx context.Context, tx pgx.Tx, inserted []InsertedDelivery) error {
+	if w.webPush == nil || len(inserted) == 0 || !w.settings.WebPushEnabled(ctx) {
+		return nil
+	}
+	subsByProfile, err := w.webPush.ListEnabledByProfiles(ctx, tx, insertedProfileKeys(inserted))
+	if err != nil {
+		return err
+	}
+	attempts := make([]DeliveryAttempt, 0, len(inserted))
+	for _, row := range inserted {
+		for _, sub := range subsByProfile[row.key()] {
+			attempts = append(attempts, DeliveryAttempt{
+				ID:                     ulid.Make().String(),
+				NotificationDeliveryID: row.ID,
+				TargetID:               sub.ID,
+			})
+		}
+	}
+	return w.webPush.EnqueueAttempts(ctx, tx, attempts)
+}
+
+// enqueueWebhookOutbox inserts `pending` webhook attempt rows for each newly
+// inserted delivery, inside the fanout transaction. Two filters apply: wants,
+// the webhook's switch for the delivery (its reason flags for an episode),
+// and the per-profile delivery rate limit (over-limit notifications stay in
+// the inbox; webhooks just don't fire).
+func (w *FanoutWorker) enqueueWebhookOutbox(ctx context.Context, tx pgx.Tx, inserted []InsertedDelivery, wants func(InsertedDelivery, Webhook) bool) error {
+	if w.webhooks == nil || len(inserted) == 0 || !w.settings.WebhooksEnabled(ctx) {
+		return nil
+	}
+	hooksByProfile, err := w.webhooks.ListEnabledByProfiles(ctx, tx, insertedProfileKeys(inserted))
+	if err != nil {
+		return err
+	}
+	rateLimit := w.settings.WebhooksDeliveriesPerMinute(ctx)
+
+	attempts := make([]DeliveryAttempt, 0, len(inserted))
+	rateLimited := 0
+	for _, row := range inserted {
+		key := row.key()
+		for _, hook := range hooksByProfile[key] {
+			if !wants(row, hook) {
+				continue
+			}
+			if w.rateLimiter != nil && !w.rateLimiter.Allow(key, rateLimit) {
+				rateLimited++
+				continue
+			}
+			attempts = append(attempts, DeliveryAttempt{
+				ID:                     ulid.Make().String(),
+				NotificationDeliveryID: row.ID,
+				TargetID:               hook.ID,
+			})
+		}
+	}
+	if rateLimited > 0 {
+		w.logger.WarnContext(ctx, "webhook deliveries rate limited", "skipped", rateLimited)
+	}
+	return w.webhooks.EnqueueAttempts(ctx, tx, attempts)
+}
+
+// enqueuePluginDestinationOutbox inserts pending plugin destination attempts
+// for each newly inserted delivery, inside the fanout transaction, with the
+// same two filters as webhooks: wants, the destination's switch for the
+// delivery, and a per-profile rate limit. Nothing is queued until the plugin
+// runtime is wired, or for a destination whose plugin is off or removed. It
+// marks the rows an attempt was inserted for, which alone reach the
+// dispatcher.
+func (w *FanoutWorker) enqueuePluginDestinationOutbox(ctx context.Context, tx pgx.Tx, inserted []InsertedDelivery, wants func(InsertedDelivery, PluginDestination) bool) error {
+	if w.pluginSender == nil || len(inserted) == 0 {
+		return nil
+	}
+	byProfile, err := w.pluginSender.enqueueable(ctx, tx, insertedProfileKeys(inserted))
+	if err != nil {
+		return err
+	}
+	attempts := make([]DeliveryAttempt, 0, len(inserted))
+	rateLimited := 0
+	for _, row := range inserted {
+		key := row.key()
+		for _, destination := range byProfile[key] {
+			if !wants(row, destination) {
+				continue
+			}
+			if !w.pluginLimiter.Allow(key, pluginDestinationDeliveriesPerMinute) {
+				rateLimited++
+				continue
+			}
+			attempts = append(attempts, DeliveryAttempt{
+				ID:                     ulid.Make().String(),
+				NotificationDeliveryID: row.ID,
+				TargetID:               destination.ID,
+			})
+		}
+	}
+	if rateLimited > 0 {
+		w.logger.WarnContext(ctx, "plugin destination deliveries rate limited", "skipped", rateLimited)
+	}
+	queued, err := w.pluginSender.repo.EnqueueAttempts(ctx, tx, attempts)
+	for i := range inserted {
+		inserted[i].pluginAttempts = queued[inserted[i].ID]
+	}
+	return err
+}
+
+type eventDisplay struct {
+	seriesTitle      string
+	episodeTitle     string
+	posterPath       string
+	posterThumbhash  string
+	posterSourcePath string
+}
+
+// loadEventDisplay fetches per-event display metadata once and reuses it for
+// every recipient's dispatch payload.
+func loadEventDisplay(ctx context.Context, tx pgx.Tx, episodeID string) (eventDisplay, error) {
+	var display eventDisplay
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(e.title, ''), COALESCE(s.title, ''),
+		       COALESCE(s.poster_path, ''), COALESCE(s.poster_thumbhash, ''),
+		       COALESCE(s.poster_source_path, '')
+		FROM episodes e
+		LEFT JOIN media_items s ON s.content_id = e.series_id
+		WHERE e.content_id = $1`,
+		episodeID,
+	).Scan(&display.episodeTitle, &display.seriesTitle, &display.posterPath,
+		&display.posterThumbhash, &display.posterSourcePath)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return eventDisplay{}, nil
+	}
+	if err != nil {
+		return display, fmt.Errorf("load event display metadata: %w", err)
+	}
+	return display, nil
+}
+
+func eventIDs(events []ReleaseEvent) []string {
+	ids := make([]string, 0, len(events))
+	for _, event := range events {
+		ids = append(ids, event.ID)
+	}
+	return ids
+}
+
+func candidateProfiles(candidates []SeriesInterest) []profileKey {
+	keys := make([]profileKey, 0, len(candidates))
+	for _, candidate := range candidates {
+		keys = append(keys, candidate.key())
+	}
+	return keys
+}
+
+// capturedFanoutCandidates retains refreshed state without admitting profiles
+// whose inbox locks were not included in the transaction-wide acquisition,
+// which also leaves out every candidate that was ineligible or failed the
+// access check when the batch was captured.
+func capturedFanoutCandidates(candidates []SeriesInterest, captured map[profileKey]struct{}) []SeriesInterest {
+	return slices.DeleteFunc(candidates, func(candidate SeriesInterest) bool {
+		_, ok := captured[candidate.key()]
+		return !ok
+	})
+}

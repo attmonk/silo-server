@@ -1,0 +1,976 @@
+package plugins
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+)
+
+type fakeServiceConfigStore struct {
+	configsByInstallation map[int][]*RuntimeConfig
+	puts                  []putGlobalConfigCall
+	putErr                error
+	casFailures           int
+	casCalls              int
+	concurrentUpdates     map[string]any
+}
+
+type putGlobalConfigCall struct {
+	installationID int
+	key            string
+	value          map[string]any
+}
+
+type configurationCheckClient struct {
+	*fakePluginClient
+	check func(context.Context, *pluginv1.TestConfigurationRequest) (*pluginv1.TestConfigurationResponse, error)
+}
+
+func (c *configurationCheckClient) TestConfiguration(ctx context.Context, req *pluginv1.TestConfigurationRequest) (*pluginv1.TestConfigurationResponse, error) {
+	return c.check(ctx, req)
+}
+
+func TestPluginConfigurationCheckDraftIsolation(t *testing.T) {
+	for _, tc := range []struct {
+		name, replacement, wantSecret, message string
+		clear                                  []string
+		response                               *pluginv1.TestConfigurationResponse
+		rpcError                               error
+	}{
+		{name: "blank preserves secret", wantSecret: "saved-secret", response: &pluginv1.TestConfigurationResponse{Ok: true}},
+		{name: "replacement", replacement: "draft-secret", wantSecret: "draft-secret", response: &pluginv1.TestConfigurationResponse{Ok: true}},
+		{name: "clear", clear: []string{"api_key"}, response: &pluginv1.TestConfigurationResponse{Message: "Enter an API key"}, message: "Enter an API key"},
+		{name: "nil response", wantSecret: "saved-secret", message: "Connection check failed"},
+		{name: "missing service", wantSecret: "saved-secret", rpcError: status.Error(codes.Unimplemented, "missing"), message: "not supported"},
+		{name: "transport error", wantSecret: "saved-secret", rpcError: status.Error(codes.Internal, "saved-secret"), message: "could not complete"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := connectionTestManifest(t, "silo.checks", "0.1.0")
+			manifest.Metadata = &structpb.Struct{Fields: map[string]*structpb.Value{"configuration_check": structpb.NewBoolValue(true)}}
+			manifest.GlobalConfigSchema[0].JsonSchema = `{"type":"object","properties":{"api_key":{"type":"string","format":"password"}},"additionalProperties":false}`
+			store := &fakeServiceConfigStore{configsByInstallation: map[int][]*RuntimeConfig{
+				7: {{InstallationID: 7, Key: "connection", Value: map[string]any{"api_key": "saved-secret"}}, {InstallationID: 7, Key: "other", Value: map[string]any{"enabled": true}}},
+			}}
+			calls := 0
+			client := &configurationCheckClient{fakePluginClient: &fakePluginClient{manifest: manifest}}
+			client.check = func(ctx context.Context, req *pluginv1.TestConfigurationRequest) (*pluginv1.TestConfigurationResponse, error) {
+				calls++
+				if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 20*time.Second {
+					t.Fatal("configuration check has no bounded deadline")
+				}
+				values := map[string]map[string]any{}
+				for _, entry := range req.GetConfig() {
+					values[entry.GetKey()] = entry.GetValue().AsMap()
+				}
+				secret, _ := values["connection"]["api_key"].(string)
+				if secret != tc.wantSecret || values["other"]["enabled"] != true {
+					t.Fatal("check did not receive the merged draft and other saved entries")
+				}
+				return tc.response, tc.rpcError
+			}
+			host := &fakeServiceHost{startResult: client}
+			service := &Service{installations: installedPluginStore(t, 7, manifest), configs: store, host: host}
+			err := service.TestGlobalConfigWithClears(t.Context(), 7, "connection", map[string]any{"api_key": tc.replacement}, tc.clear)
+			if tc.message == "" && err != nil || tc.message != "" && (err == nil || !strings.Contains(err.Error(), tc.message)) {
+				t.Fatalf("connection check result = %v, want %q", err, tc.message)
+			}
+			if err != nil && strings.Contains(err.Error(), "saved-secret") {
+				t.Fatal("transport error exposed a secret")
+			}
+			if calls != 1 || len(host.started) != 1 || len(host.stopped) != 1 || host.started[0].InstallationID >= 0 || host.stopped[0] != host.started[0].InstallationID {
+				t.Fatal("check did not clean up its temporary process")
+			}
+			if len(host.started[0].Config) != 0 || client.metadataProviderCalls != 0 {
+				t.Fatal("draft reached Configure or a legacy probe instead of the plugin check")
+			}
+			if len(store.puts) != 0 || store.casCalls != 0 || store.configsByInstallation[7][0].Value["api_key"] != "saved-secret" {
+				t.Fatal("connection check changed the saved configuration")
+			}
+		})
+	}
+}
+
+func TestPreserveStoredSecretsMergesNestedObjectsWithoutMutatingInputs(t *testing.T) {
+	savedConnection := map[string]any{
+		"credentials": map[string]any{
+			"api_key": "clawrouter-e2e-secret",
+			"labels":  []any{"one", "two"},
+		},
+		"endpoint": "https://old.example.invalid",
+	}
+	incomingConnection := map[string]any{
+		"credentials": map[string]any{
+			"account": "updated",
+			"api_key": "  ",
+		},
+		"endpoint": "",
+	}
+	wantSaved := cloneConfigValue(savedConnection)
+	wantIncoming := cloneConfigValue(incomingConnection)
+	store := &fakeServiceConfigStore{configsByInstallation: map[int][]*RuntimeConfig{
+		7: {{
+			InstallationID: 7,
+			Key:            "account",
+			Value:          map[string]any{"connection": savedConnection},
+		}},
+	}}
+	service := &Service{configs: store}
+
+	merged, _, err := service.preserveStoredSecrets(
+		context.Background(),
+		7,
+		"account",
+		map[string]any{"connection": incomingConnection},
+		[][]string{{"connection", "credentials", "api_key"}},
+	)
+	if err != nil {
+		t.Fatalf("preserveStoredSecrets: %v", err)
+	}
+
+	connection, ok := merged["connection"].(map[string]any)
+	if !ok {
+		t.Fatalf("merged connection = %#v, want object", merged["connection"])
+	}
+	credentials, ok := connection["credentials"].(map[string]any)
+	if !ok {
+		t.Fatalf("merged credentials = %#v, want object", connection["credentials"])
+	}
+	if credentials["api_key"] != "clawrouter-e2e-secret" || credentials["account"] != "updated" {
+		t.Fatalf("merged credentials = %#v", credentials)
+	}
+	if connection["endpoint"] != "" {
+		t.Fatalf("merged endpoint = %#v, want blank non-secret value", connection["endpoint"])
+	}
+	credentials["api_key"] = "mutated"
+	credentials["labels"].([]any)[0] = "mutated"
+	connection["endpoint"] = "https://mutated.example.invalid"
+	if !reflect.DeepEqual(savedConnection, wantSaved) {
+		t.Fatalf("saved input mutated: got %#v want %#v", savedConnection, wantSaved)
+	}
+	if !reflect.DeepEqual(incomingConnection, wantIncoming) {
+		t.Fatalf("incoming input mutated: got %#v want %#v", incomingConnection, wantIncoming)
+	}
+
+	replacement, _, err := service.preserveStoredSecrets(
+		context.Background(),
+		7,
+		"account",
+		map[string]any{"connection": map[string]any{
+			"credentials": map[string]any{"api_key": "test-auth-token"},
+		}},
+		[][]string{{"connection", "credentials", "api_key"}},
+	)
+	if err != nil {
+		t.Fatalf("preserveStoredSecrets replacement: %v", err)
+	}
+	replacementConnection := replacement["connection"].(map[string]any)
+	replacementCredentials := replacementConnection["credentials"].(map[string]any)
+	if replacementCredentials["api_key"] != "test-auth-token" {
+		t.Fatalf("replacement credentials = %#v", replacementCredentials)
+	}
+}
+
+func TestSetGlobalConfigWithClearsPreservesAndExplicitlyClearsNestedSecretObject(t *testing.T) {
+	manifest := connectionTestManifest(t, "silo.metadb", "0.0.36")
+	manifest.GlobalConfigSchema[0].JsonSchema = `{
+		"type":"object",
+		"properties":{
+			"connection":{
+				"type":"object",
+				"properties":{
+					"api_key":{"type":"string","format":"password"},
+					"endpoint":{"type":"string"}
+				},
+				"additionalProperties":false
+			},
+			"region":{"type":"string"}
+		},
+		"additionalProperties":false
+	}`
+	manifest.GlobalConfigSchema[0].AdminForm = nil
+	service, store := connectionConfigService(t, manifest, map[string]any{
+		"connection": map[string]any{
+			"api_key":  "clawrouter-e2e-secret",
+			"endpoint": "https://old.example.invalid",
+		},
+		"region": "old",
+	})
+
+	err := service.SetGlobalConfigWithClears(
+		context.Background(),
+		7,
+		"connection",
+		map[string]any{
+			"connection": map[string]any{
+				"api_key":  "",
+				"endpoint": "",
+			},
+			"region": "new",
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.puts) != 1 {
+		t.Fatalf("put calls = %d, want 1", len(store.puts))
+	}
+	connection := store.puts[0].value["connection"].(map[string]any)
+	if connection["api_key"] != "clawrouter-e2e-secret" ||
+		connection["endpoint"] != "" {
+		t.Fatalf("persisted connection = %#v", connection)
+	}
+
+	err = service.SetGlobalConfigWithClears(
+		context.Background(),
+		7,
+		"connection",
+		map[string]any{"region": "new"},
+		[]string{"connection"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.puts) != 2 {
+		t.Fatalf("put calls = %d, want 2", len(store.puts))
+	}
+	if _, present := store.puts[1].value["connection"]; present {
+		t.Fatalf("explicitly cleared connection remained: %#v", store.puts[1].value)
+	}
+}
+
+// TestSetGlobalConfigClearsEmptiedNonSecretFields: an admin who empties a
+// declared non-secret field (an explicit "" or null) clears what was stored,
+// even when the field's schema would refuse an empty value, while a blank
+// secret keeps the stored one and undeclared plugin-owned fields stay.
+func TestSetGlobalConfigClearsEmptiedNonSecretFields(t *testing.T) {
+	manifest := connectionTestManifest(t, "silo.auth.oidc", "0.1.0")
+	manifest.GlobalConfigSchema[0].JsonSchema = `{
+		"type":"object",
+		"properties":{
+			"issuer_url":{"type":"string"},
+			"client_secret":{"type":"string","writeOnly":true},
+			"allowed_groups":{"type":"string"},
+			"scopes":{"type":"string"},
+			"ca_pem":{"type":"string"},
+			"refresh_token_lifetime":{"type":"string","pattern":"^[0-9]+d$"},
+			"max_age":{"type":"integer","minimum":1}
+		},
+		"additionalProperties":false
+	}`
+	manifest.GlobalConfigSchema[0].AdminForm = nil
+	service, store := connectionConfigService(t, manifest, map[string]any{
+		"issuer_url":             "https://idp.example.invalid",
+		"client_secret":          "stored-secret",
+		"allowed_groups":         "silo-users",
+		"scopes":                 "openid groups",
+		"ca_pem":                 "-----BEGIN CERTIFICATE-----",
+		"refresh_token_lifetime": "30d",
+		"max_age":                float64(60),
+		"plugin_owned":           "retained",
+	})
+	submitted := map[string]any{
+		"issuer_url":             "https://idp.example.invalid",
+		"client_secret":          "",
+		"allowed_groups":         "",
+		"scopes":                 "   ",
+		"ca_pem":                 nil,
+		"refresh_token_lifetime": "",
+		"max_age":                nil,
+	}
+
+	// A connection test sees the cleared draft too.
+	staged, err := service.prepareStagedGlobalConfig(context.Background(), 7, manifest, "connection", submitted, nil, func(err error) error { return err })
+	if err != nil {
+		t.Fatalf("staged: %v", err)
+	}
+	if err := service.SetGlobalConfigWithClears(context.Background(), 7, "connection", submitted, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.puts) != 1 {
+		t.Fatalf("put calls = %d, want 1", len(store.puts))
+	}
+	want := map[string]any{
+		"issuer_url":    "https://idp.example.invalid",
+		"client_secret": "stored-secret",
+		"plugin_owned":  "retained",
+	}
+	if !reflect.DeepEqual(store.puts[0].value, want) {
+		t.Fatalf("saved config = %#v, want %#v", store.puts[0].value, want)
+	}
+	// The staged entry changed settings, so the test runs without the
+	// saved secret or undeclared stored fields
+	// (TestStagedConfigReusesSecretsOnlyWithSavedSettings).
+	delete(want, "client_secret")
+	delete(want, "plugin_owned")
+	if !reflect.DeepEqual(staged, want) {
+		t.Fatalf("staged config = %#v, want %#v", staged, want)
+	}
+
+	// Clearing an undeclared field is not a clear: it is validated (and
+	// refused) like any other undeclared value.
+	err = service.SetGlobalConfigWithClears(context.Background(), 7, "connection", map[string]any{"plugin_owned": nil}, nil)
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) || len(store.puts) != 1 {
+		t.Fatalf("undeclared clear: err = %v, puts = %d", err, len(store.puts))
+	}
+}
+
+// stagedSavedPassword is the stored bind_password in
+// TestStagedConfigReusesSecretsOnlyWithSavedSettings.
+const stagedSavedPassword = "saved-bind-password"
+
+type stagedSecretCase struct {
+	name         string
+	submitted    map[string]any
+	clearSecrets []string
+	requireToken bool
+	wantPassword any // nil: absent
+	wantToken    any
+	// wantServerKey is servers.main.key; the zero value means it was
+	// not checked, because the row leaves servers out.
+	wantServerKey any
+	wantErr       bool
+	// sameSettings rows keep undeclared stored fields.
+	sameSettings bool
+}
+
+func stagedSecretStored() map[string]any {
+	return map[string]any{
+		"urls":            "ldaps://directory.example.invalid",
+		"bind_dn":         "cn=silo,dc=example,dc=invalid",
+		"bind_password":   stagedSavedPassword,
+		"ca_pem":          "",
+		"start_tls":       false,
+		"connect_timeout": float64(10),
+		"plugin_owned":    "retained",
+		"service": map[string]any{
+			"endpoint": "https://api.example.invalid",
+			"token":    "saved-token",
+		},
+		"servers": map[string]any{
+			"main": map[string]any{"url": "https://api.example.invalid", "key": "saved-server-key"},
+		},
+	}
+}
+
+// stagedSecretSubmission is the stored entry as the admin form sends it back,
+// secrets left out, after edit.
+func stagedSecretSubmission(edit func(map[string]any)) map[string]any {
+	value := map[string]any{
+		"urls":            "ldaps://directory.example.invalid",
+		"bind_dn":         "cn=silo,dc=example,dc=invalid",
+		"ca_pem":          "",
+		"connect_timeout": 10,
+		"service":         map[string]any{"endpoint": "https://api.example.invalid"},
+	}
+	if edit != nil {
+		edit(value)
+	}
+	return value
+}
+
+func stagedSecretSchema(requireToken bool) string {
+	required := ""
+	if requireToken {
+		required = `,"required":["token"]`
+	}
+	return `{
+		"type":"object",
+		"properties":{
+			"urls":{"type":"string"},
+			"bind_dn":{"type":"string"},
+			"bind_password":{"type":"string","writeOnly":true},
+			"ca_pem":{"type":"string"},
+			"start_tls":{"type":"boolean","default":false},
+			"page_size":{"type":"number","default":100},
+			"connect_timeout":{"type":"number"},
+			"service":{
+				"type":"object",
+				"properties":{
+					"endpoint":{"type":"string"},
+					"token":{"type":"string","writeOnly":true}
+				}` + required + `
+			},
+			"servers":{
+				"type":"object",
+				"additionalProperties":{
+					"type":"object",
+					"properties":{
+						"url":{"type":"string"},
+						"key":{"type":"string","writeOnly":true}
+					}
+				}
+			}
+		}
+	}`
+}
+
+var stagedSecretCases = []stagedSecretCase{
+	{
+		name:         "saved settings with the secret left out",
+		sameSettings: true,
+		submitted:    stagedSecretSubmission(nil),
+		wantPassword: stagedSavedPassword,
+		wantToken:    "saved-token",
+	},
+	{
+		name:         "saved settings with a blank secret and the form default",
+		sameSettings: true,
+		submitted:    stagedSecretSubmission(func(v map[string]any) { v["bind_password"] = ""; v["page_size"] = 100 }),
+		wantPassword: stagedSavedPassword,
+		wantToken:    "saved-token",
+	},
+	{
+		name:      "stored value removed for its default",
+		submitted: stagedSecretSubmission(func(v map[string]any) { v["start_tls"] = nil }),
+	},
+	{
+		name:      "one secret typed, another left out",
+		submitted: stagedSecretSubmission(func(v map[string]any) { v["bind_password"] = "typed-password" }),
+		// The typed secret may itself be a destination, so the
+		// other stored secrets stay behind.
+		wantPassword: "typed-password",
+	},
+	{
+		name:      "changed server",
+		submitted: stagedSecretSubmission(func(v map[string]any) { v["urls"] = "ldap://elsewhere.example.invalid:389" }),
+	},
+	{
+		name:      "changed server with a blank secret",
+		submitted: stagedSecretSubmission(func(v map[string]any) { v["urls"] = "ldap://elsewhere.example.invalid"; v["bind_password"] = " " }),
+	},
+	{
+		name:      "changed CA",
+		submitted: stagedSecretSubmission(func(v map[string]any) { v["ca_pem"] = "-----BEGIN CERTIFICATE-----" }),
+	},
+	{
+		name:      "default replaced by another value",
+		submitted: stagedSecretSubmission(func(v map[string]any) { v["start_tls"] = true }),
+	},
+	{
+		name:      "changed nested endpoint",
+		submitted: stagedSecretSubmission(func(v map[string]any) { v["service"] = map[string]any{"endpoint": "https://elsewhere.example.invalid"} }),
+	},
+	{
+		name: "changed server with typed secrets",
+		submitted: stagedSecretSubmission(func(v map[string]any) {
+			v["urls"] = "ldap://elsewhere.example.invalid"
+			v["bind_password"] = "typed-password"
+			v["service"] = map[string]any{"endpoint": "https://api.example.invalid", "token": "typed-token"}
+		}),
+		wantPassword: "typed-password",
+		wantToken:    "typed-token",
+	},
+	{
+		name:         "saved settings with a cleared secret",
+		sameSettings: true,
+		submitted:    stagedSecretSubmission(nil),
+		clearSecrets: []string{"bind_password"},
+		wantToken:    "saved-token",
+	},
+	{
+		// The admin API never shows an object of secrets, so sending one
+		// is typing it, even with the stored URL and a blank key.
+		name: "same URL inside an object of secrets",
+		submitted: stagedSecretSubmission(func(v map[string]any) {
+			v["servers"] = map[string]any{"main": map[string]any{"url": "https://api.example.invalid", "key": ""}}
+		}),
+		wantServerKey: nil,
+	},
+	{
+		// Matching the stored key must not bring back the other stored
+		// secrets, or the result would confirm the guess.
+		name: "stored key guessed inside an object of secrets",
+		submitted: stagedSecretSubmission(func(v map[string]any) {
+			v["servers"] = map[string]any{"main": map[string]any{"url": "https://api.example.invalid", "key": "saved-server-key"}}
+		}),
+		wantServerKey: "saved-server-key",
+	},
+	{
+		name: "changed URL inside an object of secrets",
+		submitted: stagedSecretSubmission(func(v map[string]any) {
+			v["servers"] = map[string]any{"main": map[string]any{"url": "https://elsewhere.example.invalid", "key": ""}}
+		}),
+		wantServerKey: nil,
+	},
+	{
+		name: "changed server with a secret both typed and cleared",
+		submitted: stagedSecretSubmission(func(v map[string]any) {
+			v["urls"] = "ldap://elsewhere.example.invalid"
+			v["bind_password"] = "typed-password"
+		}),
+		clearSecrets: []string{"bind_password"},
+	},
+	{
+		name:         "changed server with a required secret left out",
+		submitted:    stagedSecretSubmission(func(v map[string]any) { v["urls"] = "ldap://elsewhere.example.invalid" }),
+		requireToken: true,
+		wantErr:      true,
+	},
+}
+
+// TestStagedConfigReusesSecretsOnlyWithSavedSettings: a connection test
+// fills a blank secret from the stored entry only while every other setting
+// matches what was saved, so a staged destination never receives a saved
+// credential (issue #2796).
+func TestStagedConfigReusesSecretsOnlyWithSavedSettings(t *testing.T) {
+	for _, tc := range stagedSecretCases {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := connectionTestManifest(t, "silo.auth.ldap", "0.1.0")
+			manifest.GlobalConfigSchema[0].JsonSchema = stagedSecretSchema(tc.requireToken)
+			manifest.GlobalConfigSchema[0].AdminForm = nil
+			service, _ := connectionConfigService(t, manifest, stagedSecretStored())
+
+			staged, err := service.prepareStagedGlobalConfig(t.Context(), 7, manifest, "connection", tc.submitted, tc.clearSecrets, func(err error) error { return err })
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("staged = %#v, want a validation error", staged)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, present := staged["bind_password"]; (tc.wantPassword == nil && present) || (tc.wantPassword != nil && got != tc.wantPassword) {
+				t.Fatalf("bind_password = %#v (present %v), want %#v", got, present, tc.wantPassword)
+			}
+			serviceValue, _ := staged["service"].(map[string]any)
+			if got, present := serviceValue["token"]; (tc.wantToken == nil && present) || (tc.wantToken != nil && got != tc.wantToken) {
+				t.Fatalf("service.token = %#v (present %v), want %#v", got, present, tc.wantToken)
+			}
+			if _, sent := tc.submitted["servers"]; sent {
+				servers, _ := staged["servers"].(map[string]any)
+				main, _ := servers["main"].(map[string]any)
+				got := main["key"]
+				if tc.wantServerKey == nil && got == "" {
+					got = nil // a blank key is no key
+				}
+				if got != tc.wantServerKey {
+					t.Fatalf("servers.main.key = %#v, want %#v", main["key"], tc.wantServerKey)
+				}
+			}
+			if got, present := staged["plugin_owned"]; present != tc.sameSettings {
+				t.Fatalf("undeclared stored field = %#v (present %v), want present %v", got, present, tc.sameSettings)
+			}
+		})
+	}
+}
+
+func TestSetGlobalConfigPreservesOmittedPluginOwnedFields(t *testing.T) {
+	manifest := connectionTestManifest(t, "silo.metadb", "0.0.36")
+	manifest.GlobalConfigSchema[0].JsonSchema = `{
+		"type":"object",
+		"properties":{
+			"display_name":{"type":"string"},
+			"settings":{
+				"type":"object",
+				"properties":{"endpoint":{"type":"string"}},
+				"additionalProperties":false
+			}
+		},
+		"additionalProperties":false
+	}`
+	manifest.GlobalConfigSchema[0].AdminForm = nil
+	pluginState := map[string]any{
+		"cursor":  "plugin-managed-cursor",
+		"options": []any{"one", "two"},
+	}
+	service, store := connectionConfigService(t, manifest, map[string]any{
+		"display_name": "old",
+		"plugin_state": pluginState,
+		"settings": map[string]any{
+			"endpoint":     "https://example.invalid",
+			"plugin_owned": "retained",
+		},
+	})
+
+	err := service.SetGlobalConfig(
+		context.Background(),
+		7,
+		"connection",
+		map[string]any{"display_name": "new"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.puts) != 1 {
+		t.Fatalf("put calls = %d, want 1", len(store.puts))
+	}
+	if store.puts[0].value["display_name"] != "new" {
+		t.Fatalf("display_name = %#v, want new", store.puts[0].value["display_name"])
+	}
+	if !reflect.DeepEqual(store.puts[0].value["plugin_state"], pluginState) {
+		t.Fatalf(
+			"plugin_state = %#v, want %#v",
+			store.puts[0].value["plugin_state"],
+			pluginState,
+		)
+	}
+	wantSettings := map[string]any{
+		"endpoint":     "https://example.invalid",
+		"plugin_owned": "retained",
+	}
+	if !reflect.DeepEqual(store.puts[0].value["settings"], wantSettings) {
+		t.Fatalf(
+			"settings = %#v, want %#v",
+			store.puts[0].value["settings"],
+			wantSettings,
+		)
+	}
+
+	err = service.SetGlobalConfig(
+		context.Background(),
+		7,
+		"connection",
+		map[string]any{"unexpected": "submitted"},
+	)
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("submitted opaque field error = %v, want ConfigValidationError", err)
+	}
+	if len(store.puts) != 1 {
+		t.Fatalf("invalid submitted field persisted: %#v", store.puts)
+	}
+}
+
+func TestSetGlobalConfigRetriesConcurrentMerge(t *testing.T) {
+	manifest := connectionTestManifest(t, "silo.metadb", "0.0.36")
+	manifest.GlobalConfigSchema[0].JsonSchema = `{
+		"type":"object",
+		"properties":{"display_name":{"type":"string"}}
+	}`
+	manifest.GlobalConfigSchema[0].AdminForm = nil
+	service, store := connectionConfigService(t, manifest, map[string]any{
+		"display_name": "old",
+		"plugin_state": map[string]any{"cursor": "old"},
+	})
+	store.casFailures = 1
+	store.concurrentUpdates = map[string]any{
+		"plugin_state": map[string]any{"cursor": "concurrent"},
+	}
+
+	err := service.SetGlobalConfig(
+		context.Background(),
+		7,
+		"connection",
+		map[string]any{"display_name": "new"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.casCalls != 2 {
+		t.Fatalf("CAS calls = %d, want 2", store.casCalls)
+	}
+	if len(store.puts) != 1 {
+		t.Fatalf("successful writes = %d, want 1", len(store.puts))
+	}
+	if store.puts[0].value["display_name"] != "new" {
+		t.Fatalf("display_name = %#v, want new", store.puts[0].value["display_name"])
+	}
+	wantState := map[string]any{"cursor": "concurrent"}
+	if !reflect.DeepEqual(store.puts[0].value["plugin_state"], wantState) {
+		t.Fatalf(
+			"plugin_state = %#v, want concurrent update %#v",
+			store.puts[0].value["plugin_state"],
+			wantState,
+		)
+	}
+}
+
+func (f *fakeServiceConfigStore) ListGlobalConfigs(
+	_ context.Context,
+	installationID int,
+) ([]*RuntimeConfig, error) {
+	configs := f.configsByInstallation[installationID]
+	result := make([]*RuntimeConfig, 0, len(configs))
+	for _, config := range configs {
+		if config == nil {
+			continue
+		}
+		cloned := *config
+		cloned.Value = cloneConfigMap(config.Value)
+		result = append(result, &cloned)
+	}
+	return result, nil
+}
+
+func (f *fakeServiceConfigStore) PutGlobalConfig(
+	_ context.Context,
+	installationID int,
+	key string,
+	value map[string]any,
+) error {
+	f.puts = append(f.puts, putGlobalConfigCall{
+		installationID: installationID,
+		key:            key,
+		value:          cloneConfigMap(value),
+	})
+	return f.putErr
+}
+
+func (f *fakeServiceConfigStore) CompareAndSwapGlobalConfig(
+	_ context.Context,
+	installationID int,
+	key string,
+	value map[string]any,
+	expectedUpdatedAt *time.Time,
+) (bool, error) {
+	f.casCalls++
+	if f.putErr != nil {
+		return false, f.putErr
+	}
+	configs := f.configsByInstallation[installationID]
+	var existing *RuntimeConfig
+	for _, config := range configs {
+		if config != nil && config.Key == key {
+			existing = config
+			break
+		}
+	}
+	if f.casFailures > 0 {
+		f.casFailures--
+		if existing != nil {
+			for field, update := range f.concurrentUpdates {
+				existing.Value[field] = cloneConfigValue(update)
+			}
+			existing.UpdatedAt = existing.UpdatedAt.Add(time.Second)
+		}
+		return false, nil
+	}
+	switch {
+	case existing == nil && expectedUpdatedAt != nil:
+		return false, nil
+	case existing != nil && (expectedUpdatedAt == nil ||
+		!existing.UpdatedAt.Equal(*expectedUpdatedAt)):
+		return false, nil
+	}
+	if existing == nil {
+		existing = &RuntimeConfig{
+			InstallationID: installationID,
+			Key:            key,
+		}
+		f.configsByInstallation[installationID] = append(configs, existing)
+	}
+	existing.Value = cloneConfigValue(value).(map[string]any)
+	existing.UpdatedAt = existing.UpdatedAt.Add(time.Second)
+	f.puts = append(f.puts, putGlobalConfigCall{
+		installationID: installationID,
+		key:            key,
+		value:          cloneConfigValue(value).(map[string]any),
+	})
+	return true, nil
+}
+
+func TestServiceTestGlobalConfigUsesMergedDraftAndStopsTemporaryInstance(t *testing.T) {
+	manifest := connectionTestManifest(t, "silo.metadb", "0.0.36")
+	metadata, err := structpb.NewStruct(map[string]any{
+		"default_priority": map[string]any{"audiobook": 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
+		Type: "metadata_provider.v1", Id: "audiobook-metadata", DisplayName: "Audiobook Metadata", Metadata: metadata,
+	}}
+	manifest.GlobalConfigSchema[0].JsonSchema = `{"type":"object","properties":{"api_key":{"type":"string","format":"password"}},"required":["api_key"],"additionalProperties":false}`
+	installPath := writeInstalledPluginManifest(t, manifest)
+	host := &fakeServiceHost{
+		startResult: &fakePluginClient{manifest: manifest},
+	}
+	service := &Service{
+		installations: newFakeServiceInstallationStore(&Installation{
+			ID:          42,
+			PluginID:    manifest.GetPluginId(),
+			Version:     manifest.GetVersion(),
+			InstallPath: installPath,
+			Enabled:     false,
+		}),
+		configs: &fakeServiceConfigStore{
+			configsByInstallation: map[int][]*RuntimeConfig{
+				42: {
+					{
+						InstallationID: 42,
+						Key:            "connection",
+						Value: map[string]any{
+							"api_key": "persisted",
+						},
+					},
+					{
+						InstallationID: 42,
+						Key:            "secondary",
+						Value: map[string]any{
+							"enabled": true,
+						},
+					},
+				},
+			},
+		},
+		host: host,
+	}
+
+	if err := service.TestGlobalConfig(context.Background(), 42, "connection", map[string]any{
+		"api_key": "draft",
+	}); err != nil {
+		t.Fatalf("TestGlobalConfig() returned error: %v", err)
+	}
+
+	if len(host.started) != 1 {
+		t.Fatalf("start calls = %d, want 1", len(host.started))
+	}
+	if len(host.stopped) != 1 {
+		t.Fatalf("stop calls = %d, want 1", len(host.stopped))
+	}
+
+	startReq := host.started[0]
+	if startReq.InstallationID >= 0 {
+		t.Fatalf("temporary installation id = %d, want negative id", startReq.InstallationID)
+	}
+	if host.stopped[0] != startReq.InstallationID {
+		t.Fatalf("stopped installation id = %d, want %d", host.stopped[0], startReq.InstallationID)
+	}
+	if len(startReq.Config) != 2 {
+		t.Fatalf("config entries = %d, want 2", len(startReq.Config))
+	}
+
+	valuesByKey := make(map[string]map[string]any, len(startReq.Config))
+	for _, entry := range startReq.Config {
+		valuesByKey[entry.GetKey()] = entry.GetValue().AsMap()
+	}
+	if got := valuesByKey["connection"]["api_key"]; got != "draft" {
+		t.Fatalf("connection api_key = %#v, want draft", got)
+	}
+	if got := valuesByKey["secondary"]["enabled"]; got != true {
+		t.Fatalf("secondary enabled = %#v, want true", got)
+	}
+
+	if err := service.TestGlobalConfig(context.Background(), 42, "connection", map[string]any{
+		"api_key": "second",
+	}); err != nil {
+		t.Fatalf("second TestGlobalConfig() returned error: %v", err)
+	}
+	if len(host.started) != 2 || len(host.stopped) != 2 {
+		t.Fatalf("temporary instances: starts=%d stops=%d, want 2 each", len(host.started), len(host.stopped))
+	}
+	if host.started[0].InstallationID == host.started[1].InstallationID {
+		t.Fatalf("temporary installation ids matched: %d", host.started[0].InstallationID)
+	}
+	for i, request := range host.started {
+		if request.InstallationID >= 0 || host.stopped[i] != request.InstallationID {
+			t.Fatalf("temporary instance %d: start=%d stop=%d", i, request.InstallationID, host.stopped[i])
+		}
+	}
+	if calls := host.startResult.(*fakePluginClient).metadataProviderCalls; calls != 0 {
+		t.Fatalf("audiobook-only metadata provider calls = %d, want 0", calls)
+	}
+
+	err = service.TestGlobalConfigWithClears(
+		context.Background(),
+		42,
+		"connection",
+		map[string]any{},
+		[]string{"api_key"},
+	)
+	var connectionErr *ConnectionTestError
+	if !errors.As(err, &connectionErr) {
+		t.Fatalf("cleared required secret error = %v, want ConnectionTestError", err)
+	}
+	if len(host.started) != 2 || len(host.stopped) != 2 {
+		t.Fatalf("invalid cleared config started an instance: starts=%d stops=%d", len(host.started), len(host.stopped))
+	}
+}
+
+func TestServiceTestGlobalConfigReturnsUnsupportedWithoutStartingPlugin(t *testing.T) {
+	manifest := connectionTestManifest(t, "silo.simple", "0.0.1")
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{
+		{
+			Type:        "scheduled_task.v1",
+			Id:          "refresh",
+			DisplayName: "Refresh",
+		},
+	}
+	host := &fakeServiceHost{}
+	service := &Service{installations: installedPluginStore(t, 7, manifest), host: host}
+
+	err := service.TestGlobalConfig(context.Background(), 7, "connection", map[string]any{
+		"api_key": "draft",
+	})
+	if err == nil {
+		t.Fatal("TestGlobalConfig() returned nil error, want unsupported error")
+	}
+
+	var connectionErr *ConnectionTestError
+	if !errors.As(err, &connectionErr) {
+		t.Fatalf("error = %v, want ConnectionTestError", err)
+	}
+	if !strings.Contains(connectionErr.Error(), "not supported") {
+		t.Fatalf("connection error message = %q, want unsupported message", connectionErr.Error())
+	}
+	if len(host.started) != 0 {
+		t.Fatalf("start calls = %d, want 0", len(host.started))
+	}
+	if len(host.stopped) != 0 {
+		t.Fatalf("stop calls = %d, want 0", len(host.stopped))
+	}
+}
+
+// connectionConfigService serves manifest as installation 7 with stored saved
+// under its "connection" key.
+func connectionConfigService(t *testing.T, manifest *pluginv1.PluginManifest, stored map[string]any) (*Service, *fakeServiceConfigStore) {
+	t.Helper()
+	store := &fakeServiceConfigStore{configsByInstallation: map[int][]*RuntimeConfig{
+		7: {{InstallationID: 7, Key: "connection", Value: stored}},
+	}}
+	return &Service{installations: installedPluginStore(t, 7, manifest), configs: store}, store
+}
+
+func connectionTestManifest(t *testing.T, pluginID, version string) *pluginv1.PluginManifest {
+	t.Helper()
+
+	manifest := testPluginManifest(t, pluginID, version)
+	manifest.GlobalConfigSchema = []*pluginv1.ConfigSchema{
+		{
+			Key:        "connection",
+			Title:      "Connection",
+			Required:   true,
+			JsonSchema: `{"type":"object","properties":{"api_key":{"type":"string"}},"required":["api_key"],"additionalProperties":false}`,
+		},
+	}
+	return manifest
+}
+
+// TestSetGlobalConfigClearsUseAdminFormSecrets: the clear rule takes the
+// public and secret fields from the JSON schema and the admin form alike, so
+// an emptied text field is cleared while a password control whose JSON
+// schema property carries no secret annotation keeps its stored value.
+func TestSetGlobalConfigClearsUseAdminFormSecrets(t *testing.T) {
+	manifest := connectionTestManifest(t, "silo.auth.oidc", "0.1.0")
+	manifest.GlobalConfigSchema[0].JsonSchema = `{"type":"object","properties":{"issuer_url":{"type":"string"},"button_label":{"type":"string"},"api_token":{"type":"string"}}}`
+	manifest.GlobalConfigSchema[0].AdminForm = &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{
+		{Key: "issuer_url"},
+		{Key: "button_label"},
+		{Key: "api_token", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_PASSWORD},
+	}}
+	service, store := connectionConfigService(t, manifest, map[string]any{
+		"issuer_url":   "https://idp.example.invalid",
+		"button_label": "Company SSO",
+		"api_token":    "stored-token",
+	})
+	submitted := map[string]any{"issuer_url": "https://idp.example.invalid", "button_label": "", "api_token": ""}
+	if err := service.SetGlobalConfigWithClears(context.Background(), 7, "connection", submitted, nil); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"issuer_url": "https://idp.example.invalid", "api_token": "stored-token"}
+	if len(store.puts) != 1 || !reflect.DeepEqual(store.puts[0].value, want) {
+		t.Fatalf("saved = %#v, want %#v", store.puts, want)
+	}
+}

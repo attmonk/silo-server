@@ -1,0 +1,564 @@
+package catalog
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type meilisearchClient struct {
+	baseURL    *url.URL
+	apiKey     string
+	httpClient *http.Client
+}
+
+type meilisearchHTTPError struct {
+	StatusCode int
+	Message    string
+	Code       string
+}
+
+func (e *meilisearchHTTPError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("meilisearch HTTP %d: %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("meilisearch HTTP %d", e.StatusCode)
+}
+
+type meilisearchDecodeError struct {
+	Err error
+}
+
+func (e *meilisearchDecodeError) Error() string {
+	if e == nil || e.Err == nil {
+		return "decode meilisearch response"
+	}
+	return "decode meilisearch response: " + e.Err.Error()
+}
+
+func (e *meilisearchDecodeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+type meilisearchTask struct {
+	TaskUID  int64  `json:"taskUid"`
+	IndexUID string `json:"indexUid"`
+	Status   string `json:"status"`
+	Type     string `json:"type"`
+	Error    *struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+		Type    string `json:"type"`
+		Link    string `json:"link"`
+	} `json:"error"`
+}
+
+type meilisearchTaskRef struct {
+	uid     int64
+	hasTask bool
+}
+
+func newMeilisearchTaskRef(uid int64) meilisearchTaskRef {
+	return meilisearchTaskRef{uid: uid, hasTask: true}
+}
+
+type meilisearchSearchRequest struct {
+	Query                string                    `json:"q"`
+	Offset               int                       `json:"offset"`
+	Limit                int                       `json:"limit"`
+	Filter               string                    `json:"filter,omitempty"`
+	AttributesToRetrieve []string                  `json:"attributesToRetrieve"`
+	AttributesToSearchOn []string                  `json:"attributesToSearchOn,omitempty"`
+	MatchingStrategy     string                    `json:"matchingStrategy,omitempty"`
+	Vector               []float32                 `json:"vector,omitempty"`
+	Hybrid               *meilisearchHybridRequest `json:"hybrid,omitempty"`
+	ShowRankingScore     bool                      `json:"showRankingScore,omitempty"`
+	// ShowRankingScoreDetails is set on keyword and people queries only,
+	// whose hits meilisearchKeywordMatchCount compares.
+	ShowRankingScoreDetails bool `json:"showRankingScoreDetails,omitempty"`
+}
+
+type meilisearchHybridRequest struct {
+	Embedder      string  `json:"embedder"`
+	SemanticRatio float64 `json:"semanticRatio"`
+}
+
+type meilisearchSearchHit struct {
+	ContentID string `json:"content_id"`
+	// RankingScore is set only when the request asked for showRankingScore.
+	RankingScore float64 `json:"_rankingScore"`
+	// RankingScoreDetails is set only when the request asked for
+	// showRankingScoreDetails.
+	RankingScoreDetails *meilisearchRankingScoreDetails `json:"_rankingScoreDetails,omitempty"`
+}
+
+// meilisearchRankingScoreDetails is the part of a hit's _rankingScoreDetails
+// that meilisearchKeywordMatchCount reads. Meilisearch omits a rule's object
+// when the rule did not rank the hit, for example words under matchingStrategy
+// all, where every hit matches every word.
+type meilisearchRankingScoreDetails struct {
+	Words     *meilisearchWordsDetail     `json:"words,omitempty"`
+	Typo      *meilisearchTypoDetail      `json:"typo,omitempty"`
+	Proximity *meilisearchProximityDetail `json:"proximity,omitempty"`
+}
+
+type meilisearchWordsDetail struct {
+	MatchingWords    int `json:"matchingWords"`
+	MaxMatchingWords int `json:"maxMatchingWords"`
+}
+
+// missed is how many of the query's words the hit does not match. Hits of
+// different queries compare by it, not by MatchingWords, because a quoted
+// phrase need not count as many words as the same words unquoted.
+func (d *meilisearchWordsDetail) missed() int {
+	return d.MaxMatchingWords - d.MatchingWords
+}
+
+type meilisearchTypoDetail struct {
+	TypoCount int `json:"typoCount"`
+}
+
+type meilisearchProximityDetail struct {
+	Score float64 `json:"score"`
+}
+
+type meilisearchSearchResponse struct {
+	Hits               []meilisearchSearchHit `json:"hits"`
+	Offset             int                    `json:"offset"`
+	Limit              int                    `json:"limit"`
+	EstimatedTotalHits int                    `json:"estimatedTotalHits"`
+	ProcessingTimeMS   int                    `json:"processingTimeMs"`
+	Query              string                 `json:"query"`
+}
+
+// meilisearchMultiSearchQuery is one search in a non-federated /multi-search
+// request: an ordinary search request plus the index it runs on.
+type meilisearchMultiSearchQuery struct {
+	IndexUID string `json:"indexUid"`
+	meilisearchSearchRequest
+}
+
+type meilisearchMultiSearchRequest struct {
+	Queries []meilisearchMultiSearchQuery `json:"queries"`
+}
+
+type meilisearchMultiSearchResponse struct {
+	Results []meilisearchSearchResponse `json:"results"`
+}
+
+type meilisearchStatsResponse struct {
+	NumberOfDocuments int `json:"numberOfDocuments"`
+}
+
+// meilisearchIndexSettings is the subset of an index's settings document that
+// the semantic capability check inspects. Only the embedders block is decoded;
+// all other settings fields are ignored.
+type meilisearchIndexSettings struct {
+	Pagination struct {
+		MaxTotalHits int `json:"maxTotalHits"`
+	} `json:"pagination"`
+	Embedders map[string]meilisearchEmbedderSettings `json:"embedders"`
+}
+
+// meilisearchEmbedderSettings describes a single configured embedder. The
+// capability check requires Source=="userProvided" and Dimensions to match the
+// canonical embedding dimension so Silo-supplied vectors line up with the index.
+type meilisearchEmbedderSettings struct {
+	Source     string `json:"source"`
+	Dimensions int    `json:"dimensions"`
+}
+
+const (
+	// defaultMeilisearchTaskWaitTimeout bounds how long WaitTask polls a
+	// single Meilisearch task when the caller supplies no deadline. Semantic
+	// (vector-embedded) batches can legitimately take many minutes on modest
+	// hardware — and Meilisearch auto-batches consecutive queued document
+	// tasks, so the oldest task's wall-clock completion covers the whole
+	// fused unit. Prod rebuilds died mid-batch with "context deadline
+	// exceeded" at the previous 5-minute value (2026-06-29 twice, 2026-07-08
+	// twice), leaving incremental sync gated on a stale schema version.
+	// Terminal task states (succeeded/failed/canceled) still end the wait
+	// immediately — this only caps waiting on a task that is genuinely still
+	// processing, where giving up guarantees rebuild failure and gains
+	// nothing.
+	defaultMeilisearchTaskWaitTimeout = 2 * time.Hour
+	meilisearchTaskPollInterval       = time.Second
+)
+
+func newMeilisearchClient(rawURL, apiKey string, timeout time.Duration) (*meilisearchClient, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, fmt.Errorf("meilisearch URL is required")
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing meilisearch URL: %w", err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return nil, fmt.Errorf("meilisearch URL must include scheme and host")
+	}
+	if timeout <= 0 {
+		timeout = time.Duration(DefaultMeilisearchTimeoutMS) * time.Millisecond
+	}
+	return &meilisearchClient{
+		baseURL: parsed,
+		apiKey:  strings.TrimSpace(apiKey),
+		httpClient: &http.Client{
+			Timeout: timeout,
+		},
+	}, nil
+}
+
+func (c *meilisearchClient) Health(ctx context.Context) error {
+	var out struct {
+		Status string `json:"status"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/health", nil, &out); err != nil {
+		return err
+	}
+	if out.Status != "available" {
+		return fmt.Errorf("meilisearch health status %q", out.Status)
+	}
+	return nil
+}
+
+// ErrMeilisearchCheckRedirected reports a credentialed connection check that
+// Meilisearch redirected to another scheme, host or port.
+var ErrMeilisearchCheckRedirected = errors.New("meilisearch redirected the connection check to another address")
+
+// ErrMeilisearchCheckKeyRejected reports a connection check whose key, or
+// missing key, Meilisearch refused for an authenticated request.
+var ErrMeilisearchCheckKeyRejected = errors.New("meilisearch rejected the API key")
+
+// checkConnection keeps a credentialed administrative probe at its configured
+// scheme, host and port: it follows redirects within them and reports any
+// other as ErrMeilisearchCheckRedirected. Runtime clients and checks without a
+// key retain their redirect policy.
+//
+// /health answers without a key, so the check then makes two authenticated
+// reads. Listing one index needs the indexes.get action the rebuild cleanup
+// uses. Searching an index under indexPrefix that does not exist needs the
+// search action and an index scope covering Silo's indexes; Meilisearch
+// answers it with index_not_found when the key may search there. Only a 404
+// carrying that code counts, so a proxy's bare 404 fails the check. A 401 or 403
+// from either read is reported as ErrMeilisearchCheckKeyRejected with the
+// status code only, not Meilisearch's error text.
+func (c *meilisearchClient) checkConnection(ctx context.Context, indexPrefix string) error {
+	if c.apiKey != "" {
+		c.httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if !sameCheckAuthority(req.URL, via[0].URL) {
+				return ErrMeilisearchCheckRedirected
+			}
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return nil
+		}
+	}
+	if err := c.Health(ctx); err != nil {
+		return err
+	}
+	if err := checkKeyAccepted(c.do(ctx, http.MethodGet, "/indexes?limit=1", nil, nil)); err != nil {
+		return err
+	}
+	probeUID := indexPrefix + "_rebuild_check"
+	err := c.do(ctx, http.MethodPost, "/indexes/"+url.PathEscape(probeUID)+"/search", meilisearchSearchRequest{}, nil)
+	var httpErr *meilisearchHTTPError
+	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound && strings.EqualFold(strings.TrimSpace(httpErr.Code), "index_not_found") {
+		return nil
+	}
+	return checkKeyAccepted(err)
+}
+
+// checkKeyAccepted reports a 401 or 403 as ErrMeilisearchCheckKeyRejected and
+// returns any other error unchanged.
+func checkKeyAccepted(err error) error {
+	var httpErr *meilisearchHTTPError
+	if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden) {
+		return fmt.Errorf("%w (HTTP %d)", ErrMeilisearchCheckKeyRejected, httpErr.StatusCode)
+	}
+	return err
+}
+
+// sameCheckAuthority reports whether a redirect keeps the scheme, host and
+// effective port the check started at, so "host" and "host:443" match over
+// https. Hosts compare exactly. That is stricter than net/http, which keeps
+// the Authorization header on a redirect to a subdomain.
+func sameCheckAuthority(a, b *url.URL) bool {
+	return a.Scheme == b.Scheme && a.Hostname() == b.Hostname() && checkEffectivePort(a) == checkEffectivePort(b)
+}
+
+func checkEffectivePort(u *url.URL) int {
+	if port, err := strconv.Atoi(u.Port()); err == nil {
+		return port
+	}
+	if u.Scheme == "https" {
+		return 443
+	}
+	return 80
+}
+
+func (c *meilisearchClient) CreateIndex(ctx context.Context, uid string) (meilisearchTaskRef, error) {
+	var task meilisearchTask
+	err := c.do(ctx, http.MethodPost, "/indexes", map[string]string{
+		"uid":        uid,
+		"primaryKey": "content_id",
+	}, &task)
+	if err != nil {
+		var httpErr *meilisearchHTTPError
+		if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusConflict || httpErr.Code == "index_already_exists") {
+			return meilisearchTaskRef{}, nil
+		}
+		return meilisearchTaskRef{}, err
+	}
+	return newMeilisearchTaskRef(task.TaskUID), nil
+}
+
+func (c *meilisearchClient) UpdateSettings(ctx context.Context, uid string, settings map[string]any) (meilisearchTaskRef, error) {
+	var task meilisearchTask
+	if err := c.do(ctx, http.MethodPatch, "/indexes/"+url.PathEscape(uid)+"/settings", settings, &task); err != nil {
+		return meilisearchTaskRef{}, err
+	}
+	return newMeilisearchTaskRef(task.TaskUID), nil
+}
+
+func (c *meilisearchClient) GetSettings(ctx context.Context, uid string) (meilisearchIndexSettings, error) {
+	var out meilisearchIndexSettings
+	if err := c.do(ctx, http.MethodGet, "/indexes/"+url.PathEscape(uid)+"/settings", nil, &out); err != nil {
+		return meilisearchIndexSettings{}, err
+	}
+	return out, nil
+}
+
+func (c *meilisearchClient) Search(ctx context.Context, uid string, req meilisearchSearchRequest) (meilisearchSearchResponse, error) {
+	var out meilisearchSearchResponse
+	err := c.do(ctx, http.MethodPost, "/indexes/"+url.PathEscape(uid)+"/search", req, &out)
+	return out, err
+}
+
+// MultiSearch runs queries in one /multi-search request and returns one
+// response per query, in query order.
+func (c *meilisearchClient) MultiSearch(ctx context.Context, queries []meilisearchMultiSearchQuery) ([]meilisearchSearchResponse, error) {
+	var out meilisearchMultiSearchResponse
+	if err := c.do(ctx, http.MethodPost, "/multi-search", meilisearchMultiSearchRequest{Queries: queries}, &out); err != nil {
+		return nil, err
+	}
+	if len(out.Results) != len(queries) {
+		return nil, &meilisearchDecodeError{Err: fmt.Errorf("multi-search returned %d results for %d queries", len(out.Results), len(queries))}
+	}
+	return out.Results, nil
+}
+
+// AddDocuments sends payload, a JSON array of documents already encoded (see
+// forEachCatalogSearchDocumentPayload), as it is.
+func (c *meilisearchClient) AddDocuments(ctx context.Context, uid string, payload json.RawMessage) (meilisearchTaskRef, error) {
+	if len(payload) == 0 {
+		return meilisearchTaskRef{}, nil
+	}
+	var task meilisearchTask
+	if err := c.do(ctx, http.MethodPost, "/indexes/"+url.PathEscape(uid)+"/documents", payload, &task); err != nil {
+		return meilisearchTaskRef{}, err
+	}
+	return newMeilisearchTaskRef(task.TaskUID), nil
+}
+
+func (c *meilisearchClient) DeleteDocuments(ctx context.Context, uid string, ids []string) (meilisearchTaskRef, error) {
+	ids = compactNonEmptyStrings(ids)
+	if len(ids) == 0 {
+		return meilisearchTaskRef{}, nil
+	}
+	var task meilisearchTask
+	if err := c.do(ctx, http.MethodPost, "/indexes/"+url.PathEscape(uid)+"/documents/delete-batch", ids, &task); err != nil {
+		return meilisearchTaskRef{}, err
+	}
+	return newMeilisearchTaskRef(task.TaskUID), nil
+}
+
+// DeleteIndex removes an index. A missing index is not an error — cleanup of
+// superseded rebuild indexes must be idempotent across crashes and retries.
+func (c *meilisearchClient) DeleteIndex(ctx context.Context, uid string) (meilisearchTaskRef, error) {
+	var task meilisearchTask
+	err := c.do(ctx, http.MethodDelete, "/indexes/"+url.PathEscape(uid), nil, &task)
+	if err != nil {
+		var httpErr *meilisearchHTTPError
+		if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusNotFound || httpErr.Code == "index_not_found") {
+			return meilisearchTaskRef{}, nil
+		}
+		return meilisearchTaskRef{}, err
+	}
+	return newMeilisearchTaskRef(task.TaskUID), nil
+}
+
+type meilisearchIndexListResponse struct {
+	Results []struct {
+		UID string `json:"uid"`
+	} `json:"results"`
+	Offset int `json:"offset"`
+	Limit  int `json:"limit"`
+	Total  int `json:"total"`
+}
+
+// ListIndexUIDs pages through GET /indexes and returns every index uid on the
+// instance. Meilisearch caps the page size, so this loops until the reported
+// total is reached (or a page comes back short/empty).
+func (c *meilisearchClient) ListIndexUIDs(ctx context.Context) ([]string, error) {
+	const pageLimit = 100
+	var uids []string
+	for offset := 0; ; {
+		var out meilisearchIndexListResponse
+		endpoint := fmt.Sprintf("/indexes?limit=%d&offset=%d", pageLimit, offset)
+		if err := c.do(ctx, http.MethodGet, endpoint, nil, &out); err != nil {
+			return nil, err
+		}
+		for _, result := range out.Results {
+			uids = append(uids, result.UID)
+		}
+		offset += len(out.Results)
+		if len(out.Results) == 0 || offset >= out.Total {
+			return uids, nil
+		}
+	}
+}
+
+func (c *meilisearchClient) Stats(ctx context.Context, uid string) (int, error) {
+	var out meilisearchStatsResponse
+	err := c.do(ctx, http.MethodGet, "/indexes/"+url.PathEscape(uid)+"/stats", nil, &out)
+	return out.NumberOfDocuments, err
+}
+
+func (c *meilisearchClient) WaitTask(ctx context.Context, ref meilisearchTaskRef) error {
+	if !ref.hasTask {
+		return nil
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultMeilisearchTaskWaitTimeout)
+		defer cancel()
+	}
+	ticker := time.NewTicker(meilisearchTaskPollInterval)
+	defer ticker.Stop()
+	for {
+		var task meilisearchTask
+		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/tasks/%d", ref.uid), nil, &task); err != nil {
+			return err
+		}
+		switch task.Status {
+		case "succeeded":
+			return nil
+		case "failed", "canceled":
+			if task.Error != nil && task.Error.Message != "" {
+				return fmt.Errorf("meilisearch task %d %s: %s", ref.uid, task.Status, task.Error.Message)
+			}
+			return fmt.Errorf("meilisearch task %d %s", ref.uid, task.Status)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *meilisearchClient) do(ctx context.Context, method, endpoint string, body any, out any) error {
+	if c == nil || c.baseURL == nil || c.httpClient == nil {
+		return fmt.Errorf("meilisearch client is not configured")
+	}
+	reqURL := *c.baseURL
+	endpointPath := endpoint
+	if idx := strings.IndexByte(endpoint, '?'); idx >= 0 {
+		endpointPath = endpoint[:idx]
+		reqURL.RawQuery = endpoint[idx+1:]
+	}
+	reqURL.Path = path.Join(c.baseURL.Path, endpointPath)
+	if strings.HasSuffix(endpointPath, "/") && !strings.HasSuffix(reqURL.Path, "/") {
+		reqURL.Path += "/"
+	}
+
+	var reader io.Reader
+	switch body := body.(type) {
+	case nil:
+	case json.RawMessage:
+		// Already encoded. json.Marshal would validate and copy it, which for
+		// a documents payload means scanning and duplicating tens of MiB.
+		reader = bytes.NewReader(body)
+	default:
+		data, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, reqURL.String(), reader)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		httpErr := &meilisearchHTTPError{StatusCode: resp.StatusCode}
+		var errBody struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		}
+		if data, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024)); readErr == nil && len(data) > 0 {
+			if json.Unmarshal(data, &errBody) == nil {
+				httpErr.Message = errBody.Message
+				httpErr.Code = errBody.Code
+			} else {
+				httpErr.Message = strings.TrimSpace(string(data))
+			}
+		}
+		return httpErr
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return &meilisearchDecodeError{Err: err}
+	}
+	return nil
+}
+
+func compactNonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}

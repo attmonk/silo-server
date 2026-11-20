@@ -1,0 +1,470 @@
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sort"
+	"sync"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/recommendations"
+	"github.com/Silo-Server/silo-server/internal/sections"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// watchTonightSectionFetcher provides access to live Continue Watching
+// and Next Up data for the Watch Tonight handler.
+type watchTonightSectionFetcher interface {
+	FetchNextUpItems(ctx context.Context, userID int, profileID string, libraryID *int, libraryIDs []int, filter catalog.AccessFilter, limit int) ([]*models.MediaItem, map[string]sections.SectionItemMeta, error)
+	FilterDroppedProgress(ctx context.Context, userID int, profileID string, entries []userstore.WatchProgress) ([]userstore.WatchProgress, error)
+}
+
+type watchTonightItemResponse struct {
+	sectionItemResponse
+	WatchTonightSource string `json:"watch_tonight_source"`
+}
+
+type watchTonightResponse struct {
+	Items  []watchTonightItemResponse `json:"items"`
+	IsCold bool                       `json:"is_cold"`
+}
+
+// WatchTonightView is the Watch Tonight list as the v1 handler renders it.
+type WatchTonightView = watchTonightResponse
+
+// WatchTonightItemView is one Watch Tonight card: a section card plus the
+// source it came from.
+type WatchTonightItemView = watchTonightItemResponse
+
+// Source boost multipliers for ranking.
+const (
+	boostCWInTaste    = 1.40 // in-progress AND in taste pool
+	boostNextInTaste  = 1.25 // next-up AND in taste pool
+	baseCWScore       = 2.00 // in-progress items — always rank above pure recommendations (max ~1.2)
+	baseNextUpScore   = 1.50 // next-up items — rank above recommendations but below in-progress
+	watchTonightLimit = 5
+)
+
+// WatchTonight is the Watch Tonight seam: the merged, boosted and enriched
+// list the v1 and v2 handlers both answer. limit must already be validated.
+func (h *RecommendationsHandler) WatchTonight(ctx context.Context, userID int, profileID string, filter catalog.AccessFilter, limit int) (WatchTonightView, error) {
+	return h.watchTonight(ctx, userID, profileID, filter, limit, false)
+}
+
+// watchTonight is WatchTonight. With emptyOnFetchError, a failed item lookup
+// answers the list without items instead of an error, as the frozen v1 route
+// always has.
+func (h *RecommendationsHandler) watchTonight(ctx context.Context, userID int, profileID string, filter catalog.AccessFilter, limit int, emptyOnFetchError bool) (WatchTonightView, error) {
+	// The reader and the filter below each leave out what the profile
+	// watched; read that once.
+	ctx = recommendations.WithWatchedSetMemo(ctx)
+
+	// Fan out: recommendation candidates + live CW/Next-Up in parallel.
+	var (
+		recResult recommendations.WatchTonightResult
+		recErr    error
+
+		cwItems     []scoredCWItem
+		nextUpItems []scoredCWItem
+		liveErr     error
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		if h.reader != nil {
+			recResult, recErr = h.reader.GetWatchTonight(ctx, userID, profileID, limit*3, filter)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		cwItems, nextUpItems, liveErr = h.fetchLiveCWAndNextUp(ctx, userID, profileID, filter, limit)
+	}()
+
+	wg.Wait()
+
+	if recErr != nil {
+		slog.ErrorContext(ctx, "WatchTonight: recommendations fetch failed", "component", "api", "user_id", userID, "error", recErr)
+		return WatchTonightView{}, recommendationsUnavailable("Failed to fetch recommendations")
+	}
+	if liveErr != nil {
+		slog.WarnContext(ctx, "WatchTonight: live CW/NextUp fetch failed, continuing with recs only", "component", "api", "user_id", userID, "error", liveErr)
+	}
+
+	// Filter out already-watched and low-rated items from rec candidates.
+	recResult.Items = h.filterRecommendations(ctx, userID, profileID, recResult.Items)
+
+	// Build taste set from recommendation items for boost lookups.
+	tasteSet := make(map[string]struct{}, len(recResult.Items))
+	for _, item := range recResult.Items {
+		tasteSet[item.MediaItemID] = struct{}{}
+	}
+
+	// Merge everything into a single scored list.
+	byID := make(map[string]mergedItem, len(recResult.Items)+len(cwItems)+len(nextUpItems))
+
+	// Insert recommendation items first.
+	for _, item := range recResult.Items {
+		byID[item.MediaItemID] = mergedItem{
+			scored: item,
+			source: "recommendation",
+		}
+	}
+
+	// Overlay CW items — these should always rank highly since the user
+	// actively started watching them.
+	for _, cw := range cwItems {
+		existing, exists := byID[cw.contentID]
+		if exists {
+			// Item is in both CW and recommendations — boost the rec score.
+			existing.scored.Score *= boostCWInTaste
+			existing.source = "continue_watching"
+			existing.meta = &cw.meta
+			byID[cw.contentID] = existing
+		} else {
+			// Item is in CW only — still high priority.
+			byID[cw.contentID] = mergedItem{
+				scored: recommendations.ScoredItem{
+					MediaItemID: cw.contentID,
+					Score:       baseCWScore,
+					Reason:      "continue_watching",
+				},
+				source: "continue_watching",
+				meta:   &cw.meta,
+			}
+		}
+	}
+
+	// Overlay Next-Up items — next episode of something the user watched.
+	for _, nu := range nextUpItems {
+		existing, exists := byID[nu.contentID]
+		if exists {
+			if existing.source != "continue_watching" {
+				// Item is in both next-up and recommendations — boost.
+				existing.scored.Score *= boostNextInTaste
+				existing.source = "next_up"
+				existing.meta = &nu.meta
+				byID[nu.contentID] = existing
+			}
+			// CW wins over next-up for same item
+		} else {
+			// Item is in next-up only — still high priority.
+			byID[nu.contentID] = mergedItem{
+				scored: recommendations.ScoredItem{
+					MediaItemID: nu.contentID,
+					Score:       baseNextUpScore,
+					Reason:      "next_up",
+				},
+				source: "next_up",
+				meta:   &nu.meta,
+			}
+		}
+	}
+
+	// Sort and trim.
+	merged := make([]mergedItem, 0, len(byID))
+	for _, m := range byID {
+		merged = append(merged, m)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].scored.Score > merged[j].scored.Score
+	})
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+
+	// Collect content IDs for enrichment.
+	contentIDs := make([]string, len(merged))
+	for i, m := range merged {
+		contentIDs[i] = m.scored.MediaItemID
+	}
+
+	// Enrich with full media item details.
+	resp := watchTonightResponse{
+		Items:  make([]watchTonightItemResponse, 0, len(merged)),
+		IsCold: recResult.IsCold && len(cwItems) == 0 && len(nextUpItems) == 0,
+	}
+
+	if len(contentIDs) == 0 {
+		return resp, nil
+	}
+
+	enriched, err := h.enrichItems(ctx, userID, profileID, filter, contentIDs)
+	if err != nil {
+		slog.WarnContext(ctx, "WatchTonight: item details failed", "component", "api", "user_id", userID, "profile_id", profileID, "error", err)
+		if emptyOnFetchError {
+			return resp, nil
+		}
+		return WatchTonightView{}, recommendationsUnavailable("Failed to fetch item details")
+	}
+
+	artwork := h.featuredCardArtwork(ctx, enriched.items, filter.Artwork())
+	for _, m := range merged {
+		mi, ok := enriched.items[m.scored.MediaItemID]
+		if !ok || mi == nil {
+			continue
+		}
+
+		item := h.buildSectionItem(mi, enriched.overlays, enriched.states, artwork[mi.ContentID])
+		item.ItemSource = m.source
+
+		// Apply CW/Next-Up metadata (position, duration, progress).
+		if m.meta != nil {
+			item.PositionSeconds = m.meta.PositionSeconds
+			item.DurationSeconds = m.meta.DurationSeconds
+			item.ProgressUpdatedAt = m.meta.ProgressUpdatedAt
+			if m.meta.SeriesID != nil {
+				item.SeriesID = *m.meta.SeriesID
+			}
+			if m.meta.SeriesTitle != "" {
+				item.SeriesTitle = m.meta.SeriesTitle
+			}
+			if m.meta.SeasonNumber != nil {
+				item.SeasonNumber = m.meta.SeasonNumber
+			}
+			if m.meta.EpisodeNumber != nil {
+				item.EpisodeNumber = m.meta.EpisodeNumber
+			}
+		}
+
+		// Fill in episode metadata from the enrichment step for items that came
+		// through the episodes table (CW/Next-Up episodes).
+		if epMeta, ok := enriched.episodeMeta[m.scored.MediaItemID]; ok {
+			if epMeta.SeriesID != nil && item.SeriesID == "" {
+				item.SeriesID = *epMeta.SeriesID
+			}
+			if epMeta.SeriesTitle != "" && item.SeriesTitle == "" {
+				item.SeriesTitle = epMeta.SeriesTitle
+			}
+			if epMeta.SeasonNumber != nil && item.SeasonNumber == nil {
+				item.SeasonNumber = epMeta.SeasonNumber
+			}
+			if epMeta.EpisodeNumber != nil && item.EpisodeNumber == nil {
+				item.EpisodeNumber = epMeta.EpisodeNumber
+			}
+			item.applyEpisodeCardMeta(&epMeta)
+		}
+
+		resp.Items = append(resp.Items, watchTonightItemResponse{
+			sectionItemResponse: item,
+			WatchTonightSource:  m.source,
+		})
+	}
+
+	return resp, nil
+}
+
+type mergedItem struct {
+	scored recommendations.ScoredItem
+	source string // "continue_watching", "next_up", "recommendation"
+	meta   *sections.SectionItemMeta
+}
+
+type scoredCWItem struct {
+	contentID string
+	meta      sections.SectionItemMeta
+}
+
+// watchTonightProgressMaxPages bounds how many in-progress pages Watch Tonight
+// reads to fill its Continue Watching half after dropped series are removed.
+const watchTonightProgressMaxPages = 5
+
+// progressPageLister pages a profile's watch progress. userstore.UserStore
+// satisfies it.
+type progressPageLister interface {
+	ListProgress(ctx context.Context, profileID, status string, limit, offset int) ([]userstore.WatchProgress, error)
+}
+
+// liveContinueWatchingProgress returns up to limit in-progress entries that do
+// not belong to a dropped series. Dropped entries are removed after the page
+// is read, so it reads further pages until limit entries remain, the source
+// runs out, or watchTonightProgressMaxPages pages were read. A failed
+// dropped-series lookup leaves the entries unfiltered.
+func (h *RecommendationsHandler) liveContinueWatchingProgress(ctx context.Context, store progressPageLister, userID int, profileID string, limit int) ([]userstore.WatchProgress, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var kept []userstore.WatchProgress
+	// Offset pages over a live, updated_at-ordered source can repeat a row
+	// that a concurrent write or a timestamp tie moved across a boundary.
+	seen := make(map[string]struct{}, limit)
+	for page := 0; page < watchTonightProgressMaxPages && len(kept) < limit; page++ {
+		entries, err := store.ListProgress(ctx, profileID, "in_progress", limit, page*limit)
+		if err != nil {
+			return nil, err
+		}
+		raw := len(entries)
+		if h.WatchTonightFetcher != nil && raw > 0 {
+			filtered, dropErr := h.WatchTonightFetcher.FilterDroppedProgress(ctx, userID, profileID, entries)
+			if dropErr != nil {
+				slog.WarnContext(ctx, "WatchTonight: dropped-series filter failed", "component", "api", "user_id", userID, "error", dropErr)
+			} else {
+				entries = filtered
+			}
+		}
+		for _, entry := range entries {
+			if _, dup := seen[entry.MediaItemID]; dup {
+				continue
+			}
+			seen[entry.MediaItemID] = struct{}{}
+			kept = append(kept, entry)
+		}
+		if raw < limit {
+			break
+		}
+	}
+	if len(kept) > limit {
+		kept = kept[:limit]
+	}
+	return kept, nil
+}
+
+// fetchLiveCWAndNextUp fetches live Continue Watching and Next Up items from the user store.
+func (h *RecommendationsHandler) fetchLiveCWAndNextUp(ctx context.Context, userID int, profileID string, filter catalog.AccessFilter, limit int) (cwItems, nextUpItems []scoredCWItem, err error) {
+	if h.storeProvider == nil || userID <= 0 || profileID == "" {
+		return nil, nil, nil
+	}
+
+	// Fetch in-progress items from user store.
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	progressEntries, err := h.liveContinueWatchingProgress(ctx, store, userID, profileID, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, entry := range progressEntries {
+		position := entry.PositionSeconds
+		duration := entry.DurationSeconds
+		updatedAt := entry.UpdatedAt
+		cwItems = append(cwItems, scoredCWItem{
+			contentID: entry.MediaItemID,
+			meta: sections.SectionItemMeta{
+				PositionSeconds:   &position,
+				DurationSeconds:   &duration,
+				ProgressUpdatedAt: &updatedAt,
+				ItemSource:        "in_progress",
+			},
+		})
+	}
+
+	// Fetch next-up items.
+	if h.WatchTonightFetcher != nil {
+		nuItems, nuMeta, nuErr := h.WatchTonightFetcher.FetchNextUpItems(ctx, userID, profileID, nil, nil, filter, limit)
+		if nuErr != nil {
+			slog.WarnContext(ctx, "WatchTonight: next-up fetch failed", "component", "api", "user_id", userID, "error", nuErr)
+		} else {
+			for _, item := range nuItems {
+				meta, ok := nuMeta[item.ContentID]
+				if !ok {
+					continue
+				}
+				nextUpItems = append(nextUpItems, scoredCWItem{
+					contentID: item.ContentID,
+					meta:      meta,
+				})
+			}
+		}
+	}
+
+	return cwItems, nextUpItems, nil
+}
+
+// watchTonightEnrichment is what enrichItems loads for a set of content IDs.
+// An ID missing from items is one the viewer cannot see or that no longer
+// exists.
+type watchTonightEnrichment struct {
+	items       map[string]*models.MediaItem
+	overlays    map[string]*models.OverlaySummary
+	states      map[string]*itemUserStateResponse
+	episodeMeta map[string]sections.SectionItemMeta
+}
+
+// enrichItems fetches full MediaItem objects, overlay summaries, and user states
+// for the given content IDs. Handles both movies/series (from media_items) and
+// episodes (from episodes table) since CW/Next-Up items are episode content IDs.
+// A failed item or episode lookup is an error: answering without the items
+// would look like an empty list. Overlays and user states are decorations and
+// degrade to absent.
+func (h *RecommendationsHandler) enrichItems(ctx context.Context, userID int, profileID string, filter catalog.AccessFilter, contentIDs []string) (watchTonightEnrichment, error) {
+	var out watchTonightEnrichment
+	if h.Fetcher == nil || len(contentIDs) == 0 {
+		return out, nil
+	}
+
+	// Fetch movies/series from media_items table.
+	mediaItems, err := h.Fetcher.FetchItemsByContentIDs(ctx, contentIDs, filter)
+	if err != nil {
+		return out, fmt.Errorf("fetch items: %w", err)
+	}
+
+	out.items = make(map[string]*models.MediaItem, len(mediaItems)*2)
+	for _, mi := range mediaItems {
+		out.items[mi.ContentID] = mi
+	}
+
+	// Also fetch episodes — CW/Next-Up content IDs are typically episode IDs.
+	episodeItems, epMeta, err := h.Fetcher.FetchEpisodesByContentIDs(ctx, contentIDs, filter)
+	if err != nil {
+		return out, fmt.Errorf("fetch episodes: %w", err)
+	}
+	for _, item := range episodeItems {
+		out.items[item.ContentID] = item
+	}
+	out.episodeMeta = epMeta
+	mediaItems = append(mediaItems, episodeItems...)
+
+	overlays, err := h.Fetcher.ListOverlaySummaries(ctx, contentIDs, filter)
+	if err != nil {
+		slog.WarnContext(ctx, "WatchTonight: overlay summaries failed", "component", "api", "error", err)
+	} else {
+		out.overlays = overlays
+	}
+
+	if h.storeProvider != nil {
+		store, storeErr := h.storeProvider.ForUser(ctx, userID)
+		if storeErr == nil && store != nil {
+			states, stateErr := resolveItemUserStatesWithOptions(ctx, store, profileID, h.EpisodeRepo, mediaItems, itemUserStateOptions{
+				UserID:             userID,
+				EbookProgressStore: h.EbookProgress,
+			})
+			if stateErr == nil {
+				out.states = states
+			}
+		}
+	}
+
+	return out, nil
+}
+
+// buildSectionItem constructs a sectionItemResponse from a MediaItem with its
+// resolved artwork (see featuredCardArtwork) and overlay/state lookups.
+func (h *RecommendationsHandler) buildSectionItem(mi *models.MediaItem, overlayMap map[string]*models.OverlaySummary, stateMap map[string]*itemUserStateResponse, urls sectionItemImageURLs) sectionItemResponse {
+	item := sectionItemFromMediaItem(mi)
+	item.PosterURL, item.BackdropURL, item.LogoURL = urls.posterURL, urls.backdropURL, urls.logoURL
+	item.ParentArtwork = episodeParentArtworkView(mi.ParentArtwork, urls.parents)
+	if overlayMap != nil {
+		item.OverlaySummary = overlayMap[mi.ContentID]
+	}
+	if stateMap != nil {
+		item.UserState = stateMap[mi.ContentID]
+	}
+	return item
+}
+
+// Card is the section card the Watch Tonight item wraps.
+func (i watchTonightItemResponse) Card() SectionItemView { return i.sectionItemResponse }
+
+// NewWatchTonightItemView wraps a card with its Watch Tonight source; the
+// v2 tests build views with it since the embedded card is unexported.
+func NewWatchTonightItemView(card SectionItemView, source string) WatchTonightItemView {
+	return watchTonightItemResponse{sectionItemResponse: card, WatchTonightSource: source}
+}

@@ -1,0 +1,705 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ArtworkBackendAuto selects S3 when a public bucket is configured and local
+// storage otherwise. It is the artwork.storage_backend default.
+const ArtworkBackendAuto = "auto"
+
+const artworkBackendAuto = ArtworkBackendAuto
+
+// ServerConfig holds HTTP server settings.
+type ServerConfig struct {
+	Listen    string `yaml:"listen"`
+	Mode      string `yaml:"mode"`
+	LogLevel  string `yaml:"log_level"`
+	LogFormat string `yaml:"log_format"`
+	LogQuiet  string `yaml:"log_quiet"`
+	PublicURL string `yaml:"public_url"`
+	// LANDiscovery advertises the API server on the local network with
+	// DNS-SD (see internal/landiscovery). Settings key server.lan_discovery.
+	LANDiscovery bool `yaml:"-"`
+	// LocalURL is the API server's local-network address for signed-in
+	// clients. Settings key server.local_url; empty when unset.
+	LocalURL string `yaml:"-"`
+}
+
+// DatabaseConfig holds the primary PostgreSQL connection settings.
+type DatabaseConfig struct {
+	URL            string `yaml:"url"`
+	MaxConnections int    `yaml:"max_connections"`
+}
+
+// S3BucketSettings holds the common configuration needed to access a bucket.
+type S3BucketSettings struct {
+	Endpoint  string `yaml:"-"`
+	Region    string `yaml:"-"`
+	PathStyle bool   `yaml:"-"`
+	Bucket    string `yaml:"-"`
+	KeyPrefix string `yaml:"-"`
+	AccessKey string `yaml:"-"`
+	SecretKey string `yaml:"-"`
+}
+
+// S3PublicAssetsSettings holds client-facing asset storage configuration.
+// The bucket may still be private when URLAuth is set to presigned.
+type S3PublicAssetsSettings struct {
+	S3BucketSettings
+	ReadEndpoint string `yaml:"-"` // custom domain / public read endpoint for public or tokenized reads
+	URLAuth      string `yaml:"-"` // "presigned" (default), "public", or "cloudflare_token"
+	TokenSecret  string `yaml:"-"` // HMAC secret for cloudflare_token auth
+	TokenParam   string `yaml:"-"` // query param name (default: "verify")
+	TokenTTL     int    `yaml:"-"` // token lifetime in seconds (default: 10800)
+}
+
+// S3Config holds S3-compatible object storage settings.
+type S3Config struct {
+	Public                S3PublicAssetsSettings `yaml:"-"`
+	Private               S3BucketSettings       `yaml:"-"`
+	UserDB                S3BucketSettings       `yaml:"-"`
+	MetadataPresignExpiry time.Duration          `yaml:"-"`
+}
+
+// s3ConfigRaw is the raw YAML representation with duration strings.
+type s3ConfigRaw struct {
+	// Public assets
+	PublicEndpoint        string `yaml:"public_endpoint"`
+	PublicReadEndpoint    string `yaml:"public_read_endpoint"`
+	PublicRegion          string `yaml:"public_region"`
+	PublicPathStyle       bool   `yaml:"public_path_style"`
+	PublicBucket          string `yaml:"public_bucket"`
+	PublicKeyPrefix       string `yaml:"public_key_prefix"`
+	PublicAccessKey       string `yaml:"public_access_key"`
+	PublicSecretKey       string `yaml:"public_secret_key"`
+	PublicURLAuth         string `yaml:"public_url_auth"`
+	PublicTokenSecret     string `yaml:"public_token_secret"`
+	PublicTokenParam      string `yaml:"public_token_param"`
+	PublicTokenTTL        int    `yaml:"public_token_ttl"`
+	MetadataPresignExpiry string `yaml:"metadata_presign_expiry"`
+
+	// Private internal
+	PrivateEndpoint  string `yaml:"private_endpoint"`
+	PrivateRegion    string `yaml:"private_region"`
+	PrivatePathStyle bool   `yaml:"private_path_style"`
+	PrivateBucket    string `yaml:"private_bucket"`
+	PrivateKeyPrefix string `yaml:"private_key_prefix"`
+	PrivateAccessKey string `yaml:"private_access_key"`
+	PrivateSecretKey string `yaml:"private_secret_key"`
+
+	// Legacy operational aliases retained for YAML import compatibility.
+	OperationalEndpoint       string `yaml:"operational_endpoint"`
+	OperationalPublicEndpoint string `yaml:"operational_public_endpoint"`
+	OperationalRegion         string `yaml:"operational_region"`
+	OperationalPathStyle      bool   `yaml:"operational_path_style"`
+	OperationalBucket         string `yaml:"operational_bucket"`
+	OperationalKeyPrefix      string `yaml:"operational_key_prefix"`
+	OperationalAccessKey      string `yaml:"operational_access_key"`
+	OperationalSecretKey      string `yaml:"operational_secret_key"`
+	OperationalURLAuth        string `yaml:"operational_url_auth"`
+	OperationalTokenSecret    string `yaml:"operational_token_secret"`
+	OperationalTokenParam     string `yaml:"operational_token_param"`
+	OperationalTokenTTL       int    `yaml:"operational_token_ttl"`
+
+	// User DB
+	UserDBEndpoint  string `yaml:"user_db_endpoint"`
+	UserDBRegion    string `yaml:"user_db_region"`
+	UserDBPathStyle bool   `yaml:"user_db_path_style"`
+	UserDBBucket    string `yaml:"user_db_bucket"`
+	UserDBKeyPrefix string `yaml:"user_db_key_prefix"`
+	UserDBAccessKey string `yaml:"user_db_access_key"`
+	UserDBSecretKey string `yaml:"user_db_secret_key"`
+}
+
+// UserDBConfig holds per-user database pool settings.
+type UserDBConfig struct {
+	Backend           string        `yaml:"backend"` // "postgres" (default) or "sqlite"
+	PoolMaxOpen       int           `yaml:"pool_max_open"`
+	IdleTimeout       time.Duration `yaml:"-"`
+	LitestreamSync    time.Duration `yaml:"-"`
+	StaleGraceSeconds int           `yaml:"stale_grace_seconds"`
+}
+
+// userDBConfigRaw is the raw YAML representation with duration strings.
+type userDBConfigRaw struct {
+	Backend           string `yaml:"backend"`
+	PoolMaxOpen       int    `yaml:"pool_max_open"`
+	IdleTimeout       string `yaml:"idle_timeout"`
+	LitestreamSync    string `yaml:"litestream_sync"`
+	StaleGraceSeconds int    `yaml:"stale_grace_seconds"`
+}
+
+// ScannerConfig holds media scanner settings.
+type ScannerConfig struct {
+	Workers                int           `yaml:"workers"`
+	MaxConcurrentLibraries int           `yaml:"max_concurrent_libraries"`
+	MaxConcurrentScoped    int           `yaml:"max_concurrent_scoped"`
+	EmptyTrashAfterScan    bool          `yaml:"-"`
+	FileRemovalGrace       time.Duration `yaml:"-"`
+	// RealtimeMonitoring is the server-wide real-time monitoring switch
+	// (scanner.realtime_monitoring). It hot-reloads; each library also has
+	// its own switch.
+	RealtimeMonitoring bool `yaml:"-"`
+}
+
+// scannerConfigRaw is the raw YAML representation with duration strings.
+type scannerConfigRaw struct {
+	FileRemovalGrace       string `yaml:"file_removal_grace"`
+	Workers                int    `yaml:"workers"`
+	MaxConcurrentLibraries int    `yaml:"max_concurrent_libraries"`
+	MaxConcurrentScoped    int    `yaml:"max_concurrent_scoped"`
+	EmptyTrashAfterScan    bool   `yaml:"empty_trash_after_scan"`
+	RealtimeMonitoring     bool   `yaml:"realtime_monitoring"`
+}
+
+// MatcherConfig holds metadata matching settings.
+type MatcherConfig struct {
+	Workers                        int  `yaml:"workers"`
+	BatchSize                      int  `yaml:"batch_size"`
+	EnableTVSeriesRootQueue        bool `yaml:"enable_tv_series_root_queue"`
+	EnableTVSeriesGroupQueueLegacy bool `yaml:"enable_tv_series_group_queue"`
+}
+
+func (c MatcherConfig) TVSeriesRootQueueEnabled() bool {
+	return c.EnableTVSeriesRootQueue || c.EnableTVSeriesGroupQueueLegacy
+}
+
+// PlaybackConfig holds transcoding and playback settings.
+type PlaybackConfig struct {
+	FFmpegPath              string `yaml:"ffmpeg_path"`
+	TranscodeDir            string `yaml:"transcode_dir"`
+	SegmentRetentionSeconds int    `yaml:"segment_retention_seconds"`
+	HWAccel                 string `yaml:"hw_accel"`
+	// HWDevice is the GPU render device for hardware transcodes. A single
+	// path pins every GPU workload to that device; a comma-separated list
+	// (e.g. "/dev/dri/renderD128,/dev/dri/renderD129") balances workloads
+	// least-loaded across the listed devices. Empty auto-detects.
+	//
+	// Supported topology: balancing applies to QSV/VAAPI render devices
+	// only (NVENC identifies GPUs by CUDA index/UUID and always uses the
+	// first entry). The value is cluster-wide — every transcode node reads
+	// it — so multi-node deployments must expose the listed devices at
+	// identical paths on every node; devices absent on a node fall out of
+	// that node's rotation. The admin hw-accel endpoint reports each node's
+	// inventory so the UI can flag divergence.
+	HWDevice                     string `yaml:"hw_device"`
+	ChapterThumbnailWorkers      int    `yaml:"chapter_thumbnail_workers"`
+	ChapterThumbnailExecution    string `yaml:"chapter_thumbnail_execution"`
+	ChapterThumbnailNodeCapacity int    `yaml:"chapter_thumbnail_node_capacity"`
+	// SubtitleSyncNodeCapacity is how many media sampling runs (subtitle sync
+	// speech decoding) one transcode node admits at once, across every API
+	// server that sends it work (subtitles.sync_node_capacity).
+	SubtitleSyncNodeCapacity int `yaml:"-"`
+	// TrickplayNodeCapacity is how many seek-preview runs one transcode node
+	// admits at once, across every API server that sends it work
+	// (playback.trickplay_node_capacity).
+	TrickplayNodeCapacity int                   `yaml:"-"`
+	TranscodeEnabled      bool                  `yaml:"transcode_enabled"`
+	Routing               PlaybackRoutingPolicy `yaml:"-"`
+	// KeyframePlaylist is playback.copy_keyframe_playlist: copy-remux HLS
+	// from one complete keyframe-planned playlist (#1466).
+	KeyframePlaylist bool `yaml:"-"`
+	// AutomaticBandwidthProbeOff is playback.bandwidth_probe_automatic turned
+	// off, so a zero config keeps automatic speed tests on.
+	AutomaticBandwidthProbeOff bool `yaml:"-"`
+	// BandwidthProbeMaxAgeDays is playback.bandwidth_probe_max_age_days; 0
+	// means DefaultBandwidthProbeMaxAgeDays.
+	BandwidthProbeMaxAgeDays int `yaml:"-"`
+}
+
+// BandwidthProbeMaxAge is how long a connection speed reading lasts.
+func (c PlaybackConfig) BandwidthProbeMaxAge() time.Duration {
+	days := c.BandwidthProbeMaxAgeDays
+	if days <= 0 {
+		days = DefaultBandwidthProbeMaxAgeDays
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
+// RedisConfig holds Redis connection settings.
+type RedisConfig struct {
+	// URL names one Redis server or a Sentinel deployment; see ParseRedisURL.
+	URL string `yaml:"url"`
+	// DB is the redis.db setting. When it is not empty it replaces the
+	// database number in URL; see Options.
+	DB string `yaml:"-"`
+}
+
+// RateLimitConfig holds rate limiting infrastructure settings.
+type RateLimitConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Backend string `yaml:"backend"` // "memory" or "redis"
+}
+
+// AuthConfig holds authentication and token settings.
+type AuthConfig struct {
+	JWTSecret          string        `yaml:"jwt_secret"`
+	AccessTokenExpiry  time.Duration `yaml:"-"`
+	RefreshTokenExpiry time.Duration `yaml:"-"`
+}
+
+// authConfigRaw is the raw YAML representation with duration strings.
+type authConfigRaw struct {
+	JWTSecret          string `yaml:"jwt_secret"`
+	AccessTokenExpiry  string `yaml:"access_token_expiry"`
+	RefreshTokenExpiry string `yaml:"refresh_token_expiry"`
+}
+
+// AudiobookshelfCompatConfig holds the dedicated ABS-compat listener setting.
+// The listener binds its own port (ABS_PORT, default :13378, ABS's
+// conventional port) and serves the full ABS protocol — login, libraries,
+// items, sessions — without colliding with silo's SPA on the main listener.
+// An empty Listen means the listener is disabled.
+type AudiobookshelfCompatConfig struct {
+	Listen string `yaml:"-"`
+}
+
+// WithBootstrapListen returns the config of a process started with ABS_PORT:
+// an enabled listener moves to listen, a disabled one stays disabled. An empty
+// listen changes nothing.
+func (c AudiobookshelfCompatConfig) WithBootstrapListen(listen string) AudiobookshelfCompatConfig {
+	if c.Listen != "" && listen != "" {
+		c.Listen = listen
+	}
+	return c
+}
+
+// JellyfinCompatConfig holds compatibility proxy settings.
+type JellyfinCompatConfig struct {
+	Enabled               bool          `yaml:"enabled"`
+	Listen                string        `yaml:"listen"`
+	PublicURL             string        `yaml:"public_url"`
+	EmulatedServerVersion string        `yaml:"emulated_server_version"`
+	ServerID              string        `yaml:"server_id"`
+	ServerName            string        `yaml:"server_name"`
+	WebEnabled            bool          `yaml:"web_enabled"`
+	WebVersion            string        `yaml:"web_version"`
+	WebDir                string        `yaml:"web_dir"`
+	WebInstallDir         string        `yaml:"web_install_dir"`
+	SessionTTL            time.Duration `yaml:"-"`
+	PlaybackSessionTTL    time.Duration `yaml:"-"`
+}
+
+// jellyfinCompatConfigRaw is the raw YAML representation with duration strings.
+type jellyfinCompatConfigRaw struct {
+	Enabled               bool   `yaml:"enabled"`
+	Listen                string `yaml:"listen"`
+	PublicURL             string `yaml:"public_url"`
+	EmulatedServerVersion string `yaml:"emulated_server_version"`
+	ServerID              string `yaml:"server_id"`
+	ServerName            string `yaml:"server_name"`
+	WebEnabled            bool   `yaml:"web_enabled"`
+	WebVersion            string `yaml:"web_version"`
+	WebDir                string `yaml:"web_dir"`
+	WebInstallDir         string `yaml:"web_install_dir"`
+	SessionTTL            string `yaml:"session_ttl"`
+	PlaybackSessionTTL    string `yaml:"playback_session_ttl"`
+	// AddressStreamGrantEnabled is imported only when the file sets it, so
+	// an absent key leaves the server default in force.
+	AddressStreamGrantEnabled *bool `yaml:"address_stream_grant_enabled"`
+}
+
+// RecommendationsConfig holds AI recommendation engine settings.
+type RecommendationsConfig struct {
+	Enabled                bool    `yaml:"-"`
+	EmbeddingProviderID    string  `yaml:"-"` // resolved into EmbeddingBaseURL and EmbeddingAuthToken
+	EmbeddingBaseURL       string  `yaml:"-"`
+	EmbeddingModel         string  `yaml:"-"`
+	EmbeddingAuthToken     string  `yaml:"-"`
+	EmbeddingsCron         string  `yaml:"-"`
+	TasteProfilesCron      string  `yaml:"-"`
+	RecommendationsCron    string  `yaml:"-"`
+	TasteDecayHalfLifeDays float64 `yaml:"-"`
+	DiversityLambda        float64 `yaml:"-"`
+	CowatchCron            string  `yaml:"-"`
+	// EmbeddingsJobTimeout bounds a single embedding backfill run. A local
+	// CPU embedder over a large catalog needs hours, so this defaults to 24h
+	// (replacing a hardcoded 30m that truncated large first-run backfills).
+	EmbeddingsJobTimeout time.Duration `yaml:"-"`
+}
+
+// AIConfig holds the shared connection settings for Silo's AI features
+// (subtitle translation, metadata translation, Whisper ASR): one
+// OpenAI-compatible endpoint the operator can point at OpenAI, Groq, a local
+// Ollama/llama.cpp server, etc., with an optional separate endpoint for audio
+// transcription (operators often run a dedicated Whisper server). Settings
+// load from the ai.* keys, falling back to the legacy subtitle_ai.* rows.
+type AIConfig struct {
+	AuthMode        string `yaml:"-"`
+	ReasoningEffort string `yaml:"-"`
+	ServiceTier     string `yaml:"-"`
+	// TextProviderID selects the API-key text provider in ai.providers;
+	// BaseURL and APIKey are its resolved chat endpoint and key.
+	TextProviderID string `yaml:"-"`
+	BaseURL        string `yaml:"-"`
+	APIKey         string `yaml:"-"`
+	ChatModel      string `yaml:"-"`
+	// SpeechProviderID selects the speech-to-text provider; ASRBaseURL and
+	// ASRAPIKey are its resolved endpoint and key, empty when none is chosen.
+	SpeechProviderID  string `yaml:"-"`
+	ASRBaseURL        string `yaml:"-"`
+	ASRAPIKey         string `yaml:"-"`
+	ASRModel          string `yaml:"-"`
+	MaxConcurrentJobs int    `yaml:"-"` // one shared bound across all AI job services
+}
+
+// SubtitleAIConfig holds the subtitle-AI feature toggles and tuning. The
+// endpoint connection lives in AIConfig.
+type SubtitleAIConfig struct {
+	Enabled           bool `yaml:"-"` // on-demand translation
+	TranscribeEnabled bool `yaml:"-"` // Whisper ASR generation
+	BatchSize         int  `yaml:"-"`
+	ContextNeighbors  int  `yaml:"-"`
+	// ASRChunkSeconds is the audio chunk length per transcription request
+	// (15..600). Shorter chunks bound Whisper timestamp drift on long files;
+	// longer chunks mean fewer requests and fewer boundary word-clips.
+	ASRChunkSeconds int `yaml:"-"`
+	// LiveASRChunkSeconds is the smaller per-request chunk length for
+	// session-attached live subtitle jobs (15..600).
+	LiveASRChunkSeconds int `yaml:"-"`
+	// TranscribeQuotaJobs caps how many transcription jobs each non-admin user
+	// may start per rolling quota period (0 = unlimited).
+	TranscribeQuotaJobs int `yaml:"-"`
+	// TranscribeQuotaPeriod is the rolling quota window: "day", "week", "month".
+	TranscribeQuotaPeriod string `yaml:"-"`
+}
+
+// MetadataAIConfig holds the metadata translation feature toggles. The
+// endpoint connection lives in AIConfig.
+type MetadataAIConfig struct {
+	Enabled bool `yaml:"-"`
+	// OnView controls viewer-triggered description translation on detail
+	// pages: "off" (default), "button" (explicit chip), or "auto" (translate
+	// on view with a loading animation).
+	OnView string `yaml:"-"`
+}
+
+// DownloadConfig holds server-wide download policy settings.
+type DownloadConfig struct {
+	Enabled              bool          `yaml:"-"`
+	ServerBandwidthBPS   int64         `yaml:"-"` // server-wide bytes/sec cap (0 = unlimited)
+	UserBandwidthBPS     int64         `yaml:"-"` // per-user bytes/sec across all their downloads (0 = unlimited)
+	MaxConcurrentPerUser int           `yaml:"-"` // max downloads per user being prepared, or queued or transferring at account level (0 = unlimited)
+	MaxPerPeriod         int           `yaml:"-"` // max downloads per user per period (0 = unlimited)
+	PeriodDuration       time.Duration `yaml:"-"` // rolling window for MaxPerPeriod
+
+	// Downloads v2 (offline sync for mobile). The prepare-to-file pipeline that
+	// consumes these ships in Phase 3; they are parsed default-off from Phase 0.
+	TranscodeEnabled      bool   `yaml:"-"` // server gate for transcode-to-file (default false)
+	ArtifactDir           string `yaml:"-"` // prepared-artifact output volume ("" = default under the transcode dir)
+	MaxConcurrentPrepares int    `yaml:"-"` // encode/remux worker-pool size (default 2)
+	ArtifactMaxBytes      int64  `yaml:"-"` // storage budget for prepared artifacts at each location (0 = none)
+	// ArtifactCacheHours is how long a prepared file no download is waiting
+	// on stays after its last use; 0 deletes it once nothing needs it and it
+	// has gone unused for ten minutes, the grace that protects a download
+	// being linked to it.
+	ArtifactCacheHours int `yaml:"-"`
+	// ArtifactDiskCeilingPercent is the filesystem fill at which clean-up
+	// deletes cached prepared files early, whatever the budget says.
+	ArtifactDiskCeilingPercent int `yaml:"-"`
+
+	// Playback transcode switches that also govern converted downloads, read
+	// from their playback setting keys so both surfaces follow one toggle.
+	Allow4KTranscode  bool `yaml:"-"` // allow_4k_transcode: 4K sources may be converted
+	AllowHEVCEncoding bool `yaml:"-"` // playback.allow_hevc_encoding: HEVC output when the device decodes it
+}
+
+// PolicyConfig holds embedded policy engine settings.
+type PolicyConfig struct {
+	EvalTimeoutMS              int    `yaml:"-"` // per-decision evaluation timeout in milliseconds
+	EditorEnabled              bool   `yaml:"-"` // advanced policy editor/API surface
+	DecisionLogVerbosity       string `yaml:"-"` // digest or verbose
+	DecisionLogScopeSampleRate int    `yaml:"-"` // log one successful scope decision in N
+	DecisionLogRetentionDays   int    `yaml:"-"` // policy decision log retention window
+}
+
+// MarkersConfig holds local marker detection settings.
+type MarkersConfig struct {
+	// DetectionWorkers is how many seasons intro detection analyzes at once,
+	// which also bounds its ffmpeg processes.
+	DetectionWorkers int `yaml:"-"`
+}
+
+// MetadataConfig holds metadata pipeline settings.
+type MetadataConfig struct {
+	CacheImages bool `yaml:"-"`
+	// ImageWorkers is how many artwork encodes run at once. Zero means one
+	// per CPU core.
+	ImageWorkers int `yaml:"-"`
+	// PersonRefreshPerMinute caps background person metadata lookups per API
+	// node (metadata.person_refresh_per_minute).
+	PersonRefreshPerMinute int `yaml:"-"`
+	// FallbackLanguage is the language refreshes fall back to before the
+	// original language (metadata.fallback_language). Empty means none: the
+	// setting's "original" value. An empty stored setting is the default, en.
+	FallbackLanguage string `yaml:"-"`
+}
+
+// ClientIPConfig holds client IP resolution settings.
+type ClientIPConfig struct {
+	// TrustedProxies is the comma-separated CIDR list of reverse proxies
+	// whose X-Forwarded-For headers are trusted ("" = built-in defaults).
+	TrustedProxies string `yaml:"-"`
+}
+
+type ArtworkConfig struct {
+	StorageBackend string `yaml:"storage_backend"`
+	LocalPath      string `yaml:"local_path"`
+}
+
+// Config is the top-level configuration for Silo.
+type Config struct {
+	Server               ServerConfig               `yaml:"server"`
+	Database             DatabaseConfig             `yaml:"database"`
+	S3                   S3Config                   `yaml:"-"`
+	UserDB               UserDBConfig               `yaml:"-"`
+	Scanner              ScannerConfig              `yaml:"-"`
+	Matcher              MatcherConfig              `yaml:"matcher"`
+	Artwork              ArtworkConfig              `yaml:"artwork"`
+	Metadata             MetadataConfig             `yaml:"-"`
+	Markers              MarkersConfig              `yaml:"-"`
+	Playback             PlaybackConfig             `yaml:"playback"`
+	Redis                RedisConfig                `yaml:"redis"`
+	RateLimit            RateLimitConfig            `yaml:"rate_limiting"`
+	Auth                 AuthConfig                 `yaml:"-"`
+	JellyfinCompat       JellyfinCompatConfig       `yaml:"-"`
+	AudiobookshelfCompat AudiobookshelfCompatConfig `yaml:"-"`
+	Recommendations      RecommendationsConfig      `yaml:"-"`
+	AI                   AIConfig                   `yaml:"-"`
+	SubtitleAI           SubtitleAIConfig           `yaml:"-"`
+	MetadataAI           MetadataAIConfig           `yaml:"-"`
+	Download             DownloadConfig             `yaml:"-"`
+	Policy               PolicyConfig               `yaml:"-"`
+	ClientIP             ClientIPConfig             `yaml:"-"`
+	TMDBAPIKey           string                     `yaml:"-"`
+	MDBListAPIKey        string                     `yaml:"-"`
+}
+
+// configRaw is used for initial YAML unmarshaling with string durations.
+type configRaw struct {
+	Server         ServerConfig            `yaml:"server"`
+	Database       DatabaseConfig          `yaml:"database"`
+	S3             s3ConfigRaw             `yaml:"s3"`
+	UserDB         userDBConfigRaw         `yaml:"user_db"`
+	Scanner        scannerConfigRaw        `yaml:"scanner"`
+	Artwork        ArtworkConfig           `yaml:"artwork"`
+	Matcher        MatcherConfig           `yaml:"matcher"`
+	Playback       PlaybackConfig          `yaml:"playback"`
+	Redis          RedisConfig             `yaml:"redis"`
+	RateLimit      RateLimitConfig         `yaml:"rate_limiting"`
+	Auth           authConfigRaw           `yaml:"auth"`
+	JellyfinCompat jellyfinCompatConfigRaw `yaml:"jellyfin_compat"`
+}
+
+var validModes = map[string]bool{
+	"integrated": true,
+	"api":        true,
+	"proxy":      true,
+	"transcode":  true,
+	"frontend":   true,
+}
+
+// dayRegexp matches duration strings with "d" suffix (e.g., "30d").
+var dayRegexp = regexp.MustCompile(`^(\d+)d$`)
+
+var defaultJellyfinCompatServerID = uuid.NewSHA1(
+	uuid.NameSpaceURL,
+	[]byte("https://silo.local/jellycompat"),
+).String()
+
+const playbackTranscodeDirSettingKey = "playback.transcode_dir"
+const downloadArtifactDirSettingKey = "download.artifact_dir"
+
+// Prepared-download retention settings.
+const (
+	DownloadArtifactCacheHoursSettingKey      = "download.artifact_cache_hours"
+	DownloadArtifactDiskCeilingSettingKey     = "download.artifact_disk_ceiling_percent"
+	DefaultDownloadArtifactCacheHours         = 72
+	MaxDownloadArtifactCacheHours             = 720
+	DefaultDownloadArtifactDiskCeilingPercent = 85
+	// The ceiling stays at or below the 95% scratch fill at which a node stops
+	// taking playback sessions, so prepared files alone never trip it.
+	MinDownloadArtifactDiskCeilingPercent = 50
+	MaxDownloadArtifactDiskCeilingPercent = 95
+)
+
+// DefaultTranscodeDir is the fallback playback.transcode_dir; download
+// artifacts default to a sibling directory (see EffectiveDownloadArtifactDir).
+const DefaultTranscodeDir = "/tmp/silo-transcode"
+
+// EffectiveDownloadArtifactDir resolves the shared prepared-download artifact
+// root. Keeping this path rule in config lets API and transcode-node processes
+// independently derive the same destination from the same live settings.
+func EffectiveDownloadArtifactDir(artifactDir, transcodeDir string) string {
+	if artifactDir != "" {
+		return artifactDir
+	}
+	if transcodeDir == "" {
+		transcodeDir = DefaultTranscodeDir
+	}
+	// Clean first: with a trailing slash, filepath.Dir("/srv/transcode/") is
+	// "/srv/transcode", which would nest the artifact root INSIDE the transcode
+	// dir — where the orphaned-transcode sweep deletes non-active
+	// subdirectories, i.e. it would delete prepared downloads.
+	return filepath.Join(filepath.Dir(filepath.Clean(transcodeDir)), "silo-download-artifacts")
+}
+
+const DefaultJellyfinCompatEmulatedServerVersion = "12.1.0"
+const DefaultJellyfinWebVersion = "12.1"
+const DefaultJellyfinWebInstallDir = "/var/lib/silo/compat/jellyfin-web"
+const DefaultJellyfinWebDir = DefaultJellyfinWebInstallDir + "/current"
+
+// defaultJellyfinCompatPlaybackSessionTTL matches playback.MaxTokenTTL, the
+// lifetime the compat router gives a play session when nothing overrides it.
+const defaultJellyfinCompatPlaybackSessionTTL = "24h"
+
+// parseDuration parses a duration string that supports Go's time.ParseDuration
+// formats plus a custom "Nd" format for days.
+// ParseDuration reads a duration setting as the server does: a Go duration,
+// or a whole number of days ("30d").
+func ParseDuration(s string) (time.Duration, error) { return parseDuration(s) }
+
+func parseDuration(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty duration string")
+	}
+
+	// Check for day format first (e.g., "30d")
+	if matches := dayRegexp.FindStringSubmatch(s); matches != nil {
+		days, err := strconv.Atoi(matches[1])
+		if err != nil {
+			return 0, fmt.Errorf("invalid day duration %q: %w", s, err)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+
+	// Fall back to standard Go duration parsing
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	return d, nil
+}
+
+// setDefaults returns a configRaw with all default values populated.
+func setDefaults() *configRaw {
+	return &configRaw{
+		Server: ServerConfig{
+			Listen:    ":8080",
+			Mode:      "integrated",
+			LogLevel:  "info",
+			LogFormat: "text",
+		},
+		Database: DatabaseConfig{
+			MaxConnections: 20,
+		},
+		S3: s3ConfigRaw{
+			PublicPathStyle:       true,
+			PrivatePathStyle:      true,
+			OperationalPathStyle:  true,
+			UserDBPathStyle:       true,
+			MetadataPresignExpiry: "4h",
+		},
+		UserDB: userDBConfigRaw{
+			Backend:           "postgres",
+			PoolMaxOpen:       500,
+			IdleTimeout:       "12h",
+			LitestreamSync:    "1s",
+			StaleGraceSeconds: 120,
+		},
+		Scanner: scannerConfigRaw{
+			Workers:                8,
+			MaxConcurrentLibraries: 1,
+			MaxConcurrentScoped:    2,
+			RealtimeMonitoring:     true,
+		},
+		Artwork: ArtworkConfig{StorageBackend: artworkBackendAuto, LocalPath: "/var/lib/silo/artwork"},
+		Matcher: MatcherConfig{
+			Workers:                 8,
+			BatchSize:               500,
+			EnableTVSeriesRootQueue: true,
+		},
+		Playback: PlaybackConfig{
+			FFmpegPath:                   "",
+			TranscodeDir:                 DefaultTranscodeDir,
+			SegmentRetentionSeconds:      600,
+			HWAccel:                      "auto",
+			ChapterThumbnailWorkers:      1,
+			ChapterThumbnailExecution:    "local",
+			ChapterThumbnailNodeCapacity: 1,
+			SubtitleSyncNodeCapacity:     1,
+			TrickplayNodeCapacity:        1,
+			TranscodeEnabled:             true,
+		},
+		RateLimit: RateLimitConfig{
+			Enabled: true,
+			Backend: "memory",
+		},
+		Auth: authConfigRaw{
+			AccessTokenExpiry:  "8h",
+			RefreshTokenExpiry: "30d",
+		},
+		JellyfinCompat: jellyfinCompatConfigRaw{
+			Enabled:               false,
+			Listen:                ":8097",
+			PublicURL:             "http://127.0.0.1:8097",
+			EmulatedServerVersion: DefaultJellyfinCompatEmulatedServerVersion,
+			ServerID:              defaultJellyfinCompatServerID,
+			ServerName:            "Silo",
+			WebEnabled:            true,
+			WebVersion:            DefaultJellyfinWebVersion,
+			WebDir:                DefaultJellyfinWebDir,
+			WebInstallDir:         DefaultJellyfinWebInstallDir,
+			SessionTTL:            "87600h",
+			PlaybackSessionTTL:    defaultJellyfinCompatPlaybackSessionTTL,
+		},
+	}
+}
+
+// Validate checks that all required fields are set and values are valid.
+func (c *Config) Validate() error {
+	var errs []string
+
+	if c.Server.Mode == "" || !validModes[c.Server.Mode] {
+		errs = append(errs, fmt.Sprintf("server.mode %q is invalid; must be one of: %s",
+			c.Server.Mode, strings.Join(validModesList(), ", ")))
+	}
+
+	// Database required for integrated, api, proxy, and transcode modes.
+	needsDB := c.Server.Mode == "integrated" || c.Server.Mode == "api" ||
+		c.Server.Mode == "proxy" || c.Server.Mode == "transcode"
+	if needsDB && c.Database.URL == "" {
+		errs = append(errs, "database.url is required for "+c.Server.Mode+" mode")
+	}
+
+	// Redis required for proxy and transcode modes.
+	needsRedis := c.Server.Mode == "proxy" || c.Server.Mode == "transcode"
+	if needsRedis && c.Redis.URL == "" {
+		errs = append(errs, "redis.url is required for "+c.Server.Mode+" mode")
+	}
+
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// validModesList returns the valid modes as a sorted slice for error messages.
+func validModesList() []string {
+	modes := make([]string, 0, len(validModes))
+	for m := range validModes {
+		modes = append(modes, m)
+	}
+	sort.Strings(modes)
+	return modes
+}

@@ -1,0 +1,719 @@
+package scanqueue
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/oklog/ulid/v2"
+
+	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/scantrigger"
+)
+
+const (
+	ModeLibrary = "library"
+	ModeSubtree = "subtree"
+	ModeFile    = "file"
+
+	StatusAccepted  = "accepted"
+	StatusRunning   = "running"
+	StatusCompleted = "completed"
+	StatusFailed    = "failed"
+	StatusCancelled = "cancelled"
+
+	TriggerAdminItemRefresh    = "admin_item_refresh"
+	TriggerAdminLibraryRefresh = "admin_library_refresh"
+
+	libraryClaimAdvisoryLockID int64 = 8_500_001
+)
+
+// Direct scan triggers execute synchronously in adminjob executors, outside scan queue workers.
+var directScanTriggers = []string{TriggerAdminItemRefresh, TriggerAdminLibraryRefresh}
+
+var ErrScanRunNotFound = errors.New("scan run not found")
+
+type CreateInput struct {
+	LibraryID       int
+	Mode            string
+	Path            string
+	Trigger         string
+	AutoscanEventID *int64
+}
+
+type Repository struct {
+	pool *pgxpool.Pool
+}
+
+func NewRepository(pool *pgxpool.Pool) *Repository {
+	return &Repository{pool: pool}
+}
+
+const scanRunColumns = `id, media_folder_id, mode, path, trigger, status, result_payload,
+	error_message, autoscan_event_id, followup_trigger, requested_at, started_at, completed_at, heartbeat_at, updated_at`
+
+func scanRunRow(row pgx.Row) (*models.ScanRun, error) {
+	var run models.ScanRun
+	if err := row.Scan(
+		&run.ID,
+		&run.MediaFolderID,
+		&run.Mode,
+		&run.Path,
+		&run.Trigger,
+		&run.Status,
+		&run.ResultPayload,
+		&run.ErrorMessage,
+		&run.AutoscanEventID,
+		&run.FollowupTrigger,
+		&run.RequestedAt,
+		&run.StartedAt,
+		&run.CompletedAt,
+		&run.HeartbeatAt,
+		&run.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrScanRunNotFound
+		}
+		return nil, fmt.Errorf("scan scan run row: %w", err)
+	}
+	return &run, nil
+}
+
+func scanRunRows(rows pgx.Rows) ([]*models.ScanRun, error) {
+	defer rows.Close()
+
+	runs := make([]*models.ScanRun, 0)
+	for rows.Next() {
+		run, err := scanRunRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate scan runs: %w", err)
+	}
+	return runs, nil
+}
+
+func (r *Repository) Create(ctx context.Context, input CreateInput) (*models.ScanRun, bool, error) {
+	return r.createOrCoalesce(ctx, r.pool, input)
+}
+
+// createOrCoalesce inserts an accepted run for input's scope, or, when an
+// accepted or running run already owns that scope, coalesces input into it
+// and reports created=false. The insert names idx_scan_runs_active_scope as
+// its conflict arbiter, so a claimed scope is an ordinary empty result rather
+// than a unique violation Postgres would log as an ERROR; any other conflict
+// still fails. If the owning run finishes between the insert and the
+// coalesce, the scope is free again and the insert is retried once.
+func (r *Repository) createOrCoalesce(ctx context.Context, db dbExecutor, input CreateInput) (*models.ScanRun, bool, error) {
+	for range 2 {
+		run, err := scanRunRow(db.QueryRow(ctx, `
+			INSERT INTO scan_runs (
+				id, media_folder_id, mode, path, trigger, status, autoscan_event_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (media_folder_id, mode, path) WHERE status IN ('accepted', 'running') DO NOTHING
+			RETURNING `+scanRunColumns,
+			ulid.Make().String(),
+			input.LibraryID,
+			input.Mode,
+			input.Path,
+			input.Trigger,
+			StatusAccepted,
+			input.AutoscanEventID,
+		))
+		if err == nil {
+			return run, true, nil
+		}
+		if !errors.Is(err, ErrScanRunNotFound) {
+			return nil, false, fmt.Errorf("create scan run: %w", err)
+		}
+
+		existing, err := r.coalesceIntoActive(ctx, db, input)
+		if err == nil {
+			return existing, false, nil
+		}
+		if !errors.Is(err, ErrScanRunNotFound) {
+			return nil, false, err
+		}
+	}
+	return nil, false, fmt.Errorf("create scan run: scope stayed claimed with no active run: %w", ErrScanRunNotFound)
+}
+
+// coalesceIntoActive returns the accepted or running run that already owns
+// input's scope. An accepted run has not started, so it will see whatever the
+// new request is about. A running run may already have walked the scope, so
+// the request is recorded on it as an owed follow-up: when the run finishes,
+// one more scan of the same scope is enqueued with the request's trigger.
+// Direct admin triggers are never recorded because queue workers do not claim
+// them; a follow-up carrying one would sit until the stale janitor failed it.
+//
+// An admin's request for a file's exact path is owed as a follow-up unless the
+// run already carries such a trigger as its follow-up, or as its own trigger
+// while it has not started: only that trigger lets the file scan import a file
+// the library's ignore files exclude (scantrigger.FileScanContext). It
+// replaces an automatic follow-up, which its own scan of the scope covers.
+func (r *Repository) coalesceIntoActive(ctx context.Context, db dbExecutor, input CreateInput) (*models.ScanRun, error) {
+	requeue := !isDirectTrigger(input.Trigger)
+	explicitFile := input.Mode == ModeFile && scantrigger.ExplicitPathTrigger(input.Trigger)
+	return scanRunRow(db.QueryRow(ctx, `
+		UPDATE scan_runs
+		SET followup_trigger = CASE
+				WHEN `+oweFollowupSQL+` THEN $7
+				ELSE followup_trigger
+			END,
+			updated_at = CASE
+				WHEN `+oweFollowupSQL+` THEN NOW()
+				ELSE updated_at
+			END
+		WHERE id = (
+			SELECT id
+			FROM scan_runs
+			WHERE media_folder_id = $1
+			  AND mode = $2
+			  AND path = $3
+			  AND status = ANY($4)
+			ORDER BY requested_at ASC
+			LIMIT 1
+		)
+		RETURNING `+scanRunColumns,
+		input.LibraryID,
+		input.Mode,
+		input.Path,
+		[]string{StatusAccepted, StatusRunning},
+		requeue,
+		StatusRunning,
+		input.Trigger,
+		explicitFile,
+		[]string{scantrigger.TriggerPath, scantrigger.TriggerLibraryIDPath},
+	))
+}
+
+// oweFollowupSQL is coalesceIntoActive's test for recording the request as the
+// run's follow-up.
+const oweFollowupSQL = `$5 AND (
+					(status = $6 AND followup_trigger = '')
+					OR ($8 AND NOT followup_trigger = ANY($9) AND (status = $6 OR NOT trigger = ANY($9)))
+				)`
+
+type dbExecutor interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func isDirectTrigger(trigger string) bool {
+	for _, direct := range directScanTriggers {
+		if trigger == direct {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Repository) CreateBatch(ctx context.Context, inputs []CreateInput) ([]*models.ScanRun, []bool, error) {
+	if len(inputs) == 0 {
+		return []*models.ScanRun{}, []bool{}, nil
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin scan run batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	runs := make([]*models.ScanRun, 0, len(inputs))
+	created := make([]bool, 0, len(inputs))
+	for _, input := range inputs {
+		run, wasCreated, err := r.createOrCoalesce(ctx, tx, input)
+		if err != nil {
+			return nil, nil, err
+		}
+		runs = append(runs, run)
+		created = append(created, wasCreated)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("commit scan run batch: %w", err)
+	}
+	return runs, created, nil
+}
+
+func (r *Repository) GetActiveByScope(ctx context.Context, libraryID int, mode, path string) (*models.ScanRun, error) {
+	return scanRunRow(r.pool.QueryRow(ctx, `
+		SELECT `+scanRunColumns+`
+		FROM scan_runs
+		WHERE media_folder_id = $1
+		  AND mode = $2
+		  AND path = $3
+		  AND status = ANY($4)
+		ORDER BY requested_at ASC
+		LIMIT 1`,
+		libraryID,
+		mode,
+		path,
+		[]string{StatusAccepted, StatusRunning},
+	))
+}
+
+// Start transitions a newly created direct scan run to running. Queue workers
+// normally perform this transition while claiming accepted work; synchronous
+// admin refreshes use it before invoking the same ingest pipeline directly.
+func (r *Repository) Start(ctx context.Context, id string) (*models.ScanRun, error) {
+	return scanRunRow(r.pool.QueryRow(ctx, `
+		UPDATE scan_runs
+		SET status = $2,
+			started_at = NOW(),
+			heartbeat_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = $3
+		RETURNING `+scanRunColumns,
+		id,
+		StatusRunning,
+		StatusAccepted,
+	))
+}
+
+func (r *Repository) ListActive(ctx context.Context) ([]*models.ScanRun, error) {
+	return r.listActive(ctx, 0)
+}
+
+func (r *Repository) ListActiveLimit(ctx context.Context, limit int) ([]*models.ScanRun, error) {
+	return r.listActive(ctx, limit)
+}
+
+func (r *Repository) listActive(ctx context.Context, limit int) ([]*models.ScanRun, error) {
+	query := `
+		SELECT ` + scanRunColumns + `
+		FROM scan_runs
+		WHERE status = ANY($1)
+		ORDER BY requested_at ASC`
+	args := []any{[]string{StatusAccepted, StatusRunning}}
+	if limit > 0 {
+		query += ` LIMIT $2`
+		args = append(args, limit)
+	}
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list active scan runs: %w", err)
+	}
+	return scanRunRows(rows)
+}
+
+func (r *Repository) ClaimNextAccepted(ctx context.Context, maxRunningLibraries, maxRunningScoped int) (*models.ScanRun, error) {
+	if maxRunningLibraries < 1 {
+		maxRunningLibraries = 1
+	}
+	if maxRunningScoped < 1 {
+		maxRunningScoped = 1
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("begin scan claim transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var locked bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, libraryClaimAdvisoryLockID).Scan(&locked); err != nil {
+		return nil, fmt.Errorf("lock scan claim: %w", err)
+	}
+	if !locked {
+		return nil, tx.Commit(ctx)
+	}
+
+	var runningLibraries int
+	// Direct runs execute outside the queue, so they do not consume queue worker concurrency.
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM scan_runs
+		WHERE mode = $1
+		  AND status = $2
+		  AND trigger <> ALL($3)`,
+		ModeLibrary,
+		StatusRunning,
+		directScanTriggers,
+	).Scan(&runningLibraries); err != nil {
+		return nil, fmt.Errorf("count running library scan runs: %w", err)
+	}
+
+	var runningScoped int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM scan_runs
+		WHERE mode = ANY($1)
+		  AND status = $2
+		  AND trigger <> ALL($3)`,
+		[]string{ModeSubtree, ModeFile},
+		StatusRunning,
+		directScanTriggers,
+	).Scan(&runningScoped); err != nil {
+		return nil, fmt.Errorf("count running scoped scan runs: %w", err)
+	}
+
+	canClaimLibrary := runningLibraries < maxRunningLibraries
+	canClaimScoped := runningScoped < maxRunningScoped
+	if !canClaimLibrary && !canClaimScoped {
+		return nil, tx.Commit(ctx)
+	}
+
+	var id string
+	if err := tx.QueryRow(ctx, `
+			SELECT id
+			FROM scan_runs
+			WHERE status = $1
+			  AND trigger <> ALL($6)
+			  AND (
+				($2 AND mode = $3) OR
+				($4 AND mode = ANY($5))
+			  )
+			ORDER BY requested_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1`,
+		StatusAccepted,
+		canClaimLibrary,
+		ModeLibrary,
+		canClaimScoped,
+		[]string{ModeSubtree, ModeFile},
+		directScanTriggers,
+	).Scan(&id); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, tx.Commit(ctx)
+		}
+		return nil, fmt.Errorf("claim scan run: %w", err)
+	}
+
+	run, err := scanRunRow(tx.QueryRow(ctx, `
+		UPDATE scan_runs
+		SET status = $2,
+			started_at = NOW(),
+			heartbeat_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $1
+		RETURNING `+scanRunColumns,
+		id,
+		StatusRunning,
+	))
+	if err != nil {
+		return nil, fmt.Errorf("mark scan run running: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit scan claim: %w", err)
+	}
+	return run, nil
+}
+
+// TouchHeartbeat keeps the claim that started at startedAt alive. It reports
+// ErrScanRunNotFound once the run is no longer running under that claim: it
+// was canceled, possibly on another replica, or requeued as stale and perhaps
+// claimed again.
+func (r *Repository) TouchHeartbeat(ctx context.Context, id string, startedAt *time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE scan_runs
+		SET heartbeat_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = $2
+		  AND started_at IS NOT DISTINCT FROM $3`,
+		id,
+		StatusRunning,
+		startedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("touch scan heartbeat: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrScanRunNotFound
+	}
+	return nil
+}
+
+// UpdateProgress records progress for the claim that started at startedAt, and
+// reports ErrScanRunNotFound once the run is no longer that running claim.
+func (r *Repository) UpdateProgress(ctx context.Context, id string, startedAt *time.Time, result *evt.ScanRunResult) (*models.ScanRun, error) {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal scan progress: %w", err)
+	}
+	return scanRunRow(r.pool.QueryRow(ctx, `
+		UPDATE scan_runs
+		SET result_payload = $2,
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = $3
+		  AND started_at IS NOT DISTINCT FROM $4
+		RETURNING `+scanRunColumns,
+		id,
+		payload,
+		StatusRunning,
+		startedAt,
+	))
+}
+
+// Complete marks a running run completed. startedAt is the claim finishing
+// it: a run that is no longer running under that claim is left alone and
+// reported as ErrScanRunNotFound. When a request for the same scope was
+// coalesced into the run while it was running, the owed follow-up scan is
+// enqueued in the same transaction; see CompleteWithFollowUp to observe it.
+func (r *Repository) Complete(ctx context.Context, id string, startedAt *time.Time, result *evt.ScanRunResult) (*models.ScanRun, error) {
+	run, _, err := r.CompleteWithFollowUp(ctx, id, startedAt, result)
+	return run, err
+}
+
+// CompleteWithFollowUp is Complete returning the follow-up run it enqueued,
+// or nil when none was owed.
+func (r *Repository) CompleteWithFollowUp(ctx context.Context, id string, startedAt *time.Time, result *evt.ScanRunResult) (*models.ScanRun, *models.ScanRun, error) {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal scan result: %w", err)
+	}
+	return r.finish(ctx, id, `
+		UPDATE scan_runs
+		SET status = $2,
+			result_payload = $3,
+			error_message = '',
+			completed_at = NOW(),
+			heartbeat_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = $4
+		  AND started_at IS NOT DISTINCT FROM $5
+		RETURNING `+scanRunColumns,
+		id, StatusCompleted, payload, StatusRunning, startedAt)
+}
+
+// Fail marks a running run failed, under the same claim rule as Complete. An
+// owed follow-up is still enqueued: the request that was coalesced into this
+// run has not been served, and a follow-up only exists because a new request
+// arrived, so a persistently failing scope cannot loop on its own.
+func (r *Repository) Fail(ctx context.Context, id string, startedAt *time.Time, errorMessage string) (*models.ScanRun, error) {
+	run, _, err := r.FailWithFollowUp(ctx, id, startedAt, errorMessage)
+	return run, err
+}
+
+// FailWithFollowUp is Fail returning the follow-up run it enqueued, or nil.
+func (r *Repository) FailWithFollowUp(ctx context.Context, id string, startedAt *time.Time, errorMessage string) (*models.ScanRun, *models.ScanRun, error) {
+	return r.finish(ctx, id, `
+		UPDATE scan_runs
+		SET status = $2,
+			error_message = $3,
+			completed_at = NOW(),
+			heartbeat_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = $4
+		  AND started_at IS NOT DISTINCT FROM $5
+		RETURNING `+scanRunColumns,
+		id, StatusFailed, errorMessage, StatusRunning, startedAt)
+}
+
+// finish applies a terminal-status update and, when the finished run owes a
+// follow-up, inserts one accepted run for the same scope in the same
+// transaction. The insert cannot collide with the partial unique index: the
+// row it would collide with is the one this transaction just finished.
+func (r *Repository) finish(ctx context.Context, id string, updateSQL string, args ...any) (*models.ScanRun, *models.ScanRun, error) {
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin scan run finish: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	run, err := scanRunRow(tx.QueryRow(ctx, updateSQL, args...))
+	if err != nil {
+		return nil, nil, err
+	}
+	var followUp *models.ScanRun
+	if run.FollowupTrigger != "" {
+		followUp, err = scanRunRow(tx.QueryRow(ctx, `
+			INSERT INTO scan_runs (
+				id, media_folder_id, mode, path, trigger, status, autoscan_event_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			RETURNING `+scanRunColumns,
+			ulid.Make().String(),
+			run.MediaFolderID,
+			run.Mode,
+			run.Path,
+			run.FollowupTrigger,
+			StatusAccepted,
+			run.AutoscanEventID,
+		))
+		if err != nil {
+			return nil, nil, fmt.Errorf("enqueue follow-up scan run for %q: %w", id, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("commit scan run finish: %w", err)
+	}
+	return run, followUp, nil
+}
+
+func (r *Repository) CancelAcceptedByLibrary(ctx context.Context, libraryID int) ([]*models.ScanRun, error) {
+	rows, err := r.pool.Query(ctx, `
+		UPDATE scan_runs
+		SET status = $2,
+			completed_at = NOW(),
+			updated_at = NOW()
+		WHERE media_folder_id = $1
+		  AND status = $3
+		RETURNING `+scanRunColumns,
+		libraryID,
+		StatusCancelled,
+		StatusAccepted,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cancel accepted scan runs: %w", err)
+	}
+	return scanRunRows(rows)
+}
+
+func (r *Repository) MarkCancelled(ctx context.Context, id string) (*models.ScanRun, bool, error) {
+	run, err := scanRunRow(r.pool.QueryRow(ctx, `
+		UPDATE scan_runs
+		SET status = $2,
+			completed_at = NOW(),
+			heartbeat_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = ANY($3)
+		RETURNING `+scanRunColumns,
+		id,
+		StatusCancelled,
+		[]string{StatusAccepted, StatusRunning},
+	))
+	if err == nil {
+		return run, true, nil
+	}
+	if !errors.Is(err, ErrScanRunNotFound) {
+		return nil, false, err
+	}
+	run, err = r.GetByID(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	return run, false, nil
+}
+
+// CancelClaim marks a run canceled for the worker holding the claim that
+// started at startedAt. Unlike MarkCancelled, which an admin cancel applies to
+// any active run, it reports ErrScanRunNotFound, and changes nothing, once the
+// run is no longer running under that claim.
+func (r *Repository) CancelClaim(ctx context.Context, id string, startedAt *time.Time) (*models.ScanRun, error) {
+	return scanRunRow(r.pool.QueryRow(ctx, `
+		UPDATE scan_runs
+		SET status = $2,
+			completed_at = NOW(),
+			heartbeat_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = $3
+		  AND started_at IS NOT DISTINCT FROM $4
+		RETURNING `+scanRunColumns,
+		id,
+		StatusCancelled,
+		StatusRunning,
+		startedAt,
+	))
+}
+
+// Requeue returns a running run to the queue so a worker claims it again,
+// keeping any owed follow-up and dropping the interrupted attempt's progress.
+// startedAt is the claim being given up: a run that was requeued as stale and
+// claimed again since has a new start time and is left alone. It reports
+// false, with the run's current row, when the run is no longer that running
+// claim, for example because an admin cancel landed first.
+func (r *Repository) Requeue(ctx context.Context, id string, startedAt *time.Time) (*models.ScanRun, bool, error) {
+	run, err := scanRunRow(r.pool.QueryRow(ctx, `
+		UPDATE scan_runs
+		SET status = $2,
+			result_payload = '{}'::jsonb,
+			started_at = NULL,
+			heartbeat_at = NULL,
+			completed_at = NULL,
+			error_message = '',
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = $3
+		  AND started_at IS NOT DISTINCT FROM $4
+		RETURNING `+scanRunColumns,
+		id,
+		StatusAccepted,
+		StatusRunning,
+		startedAt,
+	))
+	if err == nil {
+		return run, true, nil
+	}
+	if !errors.Is(err, ErrScanRunNotFound) {
+		return nil, false, err
+	}
+	run, err = r.GetByID(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	return run, false, nil
+}
+
+func (r *Repository) GetByID(ctx context.Context, id string) (*models.ScanRun, error) {
+	return scanRunRow(r.pool.QueryRow(ctx, `
+		SELECT `+scanRunColumns+`
+		FROM scan_runs
+		WHERE id = $1`,
+		id,
+	))
+}
+
+// RequeueStaleRunning returns to the queue every worker run whose heartbeat is
+// older than staleAfter, measured on the database clock that stamped it. Like
+// Requeue, it drops the abandoned attempt's progress.
+func (r *Repository) RequeueStaleRunning(ctx context.Context, staleAfter time.Duration) (int, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE scan_runs
+		SET status = $2,
+			result_payload = '{}'::jsonb,
+			started_at = NULL,
+			heartbeat_at = NULL,
+			completed_at = NULL,
+			error_message = '',
+			updated_at = NOW()
+		WHERE status = $1
+		  AND COALESCE(heartbeat_at, started_at, requested_at) < NOW() - make_interval(secs => $3)
+		  AND trigger <> ALL($4)`,
+		StatusRunning,
+		StatusAccepted,
+		staleAfter.Seconds(),
+		directScanTriggers,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("requeue stale scan runs: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// FailStaleDirect fails every direct run whose heartbeat is older than
+// staleAfter, measured on the database clock that stamped it.
+func (r *Repository) FailStaleDirect(ctx context.Context, staleAfter time.Duration) (int, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE scan_runs
+		SET status = $2,
+			error_message = $3,
+			completed_at = NOW(),
+			heartbeat_at = NOW(),
+			updated_at = NOW()
+		WHERE status = ANY($1)
+		  AND COALESCE(heartbeat_at, started_at, requested_at) < NOW() - make_interval(secs => $4)
+		  AND trigger = ANY($5)`,
+		[]string{StatusAccepted, StatusRunning},
+		StatusFailed,
+		"abandoned direct scan run",
+		staleAfter.Seconds(),
+		directScanTriggers,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("fail stale direct scan runs: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}

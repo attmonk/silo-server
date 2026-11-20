@@ -1,0 +1,284 @@
+package opslog
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"reflect"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/logredact"
+)
+
+type Handler struct {
+	inner      slog.Handler
+	writer     Writer
+	capture    slog.Level
+	nodeID     string
+	static     map[string]any
+	groupNames []string
+}
+
+type skipCaptureKey struct{}
+
+// withoutCapture marks ctx so Handler passes its records to the inner handler
+// only. The consumer logs through it, which keeps the pipeline from writing
+// its own failures back into itself.
+func withoutCapture(ctx context.Context) context.Context {
+	return context.WithValue(ctx, skipCaptureKey{}, true)
+}
+
+func NewHandler(inner slog.Handler, writer Writer, capture slog.Level, nodeID string) slog.Handler {
+	return &Handler{
+		inner:   inner,
+		writer:  writer,
+		capture: capture,
+		nodeID:  nodeID,
+		static:  map[string]any{},
+	}
+}
+
+func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level) || level >= h.capture
+}
+
+func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
+	if err := h.inner.Handle(ctx, r); err != nil {
+		return err
+	}
+	if h.writer == nil || r.Level < h.capture {
+		return nil
+	}
+	if ctx != nil && ctx.Value(skipCaptureKey{}) != nil {
+		return nil
+	}
+
+	attrs := make(map[string]any, len(h.static)+8)
+	for k, v := range h.static {
+		attrs[k] = v
+	}
+	r.Attrs(func(attr slog.Attr) bool {
+		h.addAttr(attrs, attr, "")
+		return true
+	})
+	attrs = redactAttrs(attrs)
+
+	component, _ := attrs["component"].(string)
+	if component == "" {
+		component = inferComponent(r.Message)
+	}
+	requestID, _ := attrs["request_id"].(string)
+	sessionID, _ := attrs["session_id"].(string)
+	playbackSessionID, _ := attrs["playback_session_id"].(string)
+	clientIP, _ := attrs["client_ip"].(string)
+	if clientIP == "" {
+		clientIP, _ = attrs["remote_addr"].(string)
+	}
+	// The column is an inet. A remote address carries a port, and one row
+	// the column refuses fails the insert of its whole batch.
+	clientIP = normalizeClientIP(clientIP)
+	nodeID := h.nodeID
+	if attrNodeID, _ := attrs["node_id"].(string); attrNodeID != "" {
+		nodeID = attrNodeID
+	}
+	var userID *int
+	switch v := attrs["user_id"].(type) {
+	case int:
+		value := v
+		userID = &value
+	case int64:
+		value := int(v)
+		userID = &value
+	case float64:
+		value := int(v)
+		userID = &value
+	}
+
+	h.writer.Write(Entry{
+		Timestamp:         time.Now().UTC(),
+		Level:             strings.ToLower(r.Level.String()),
+		Component:         component,
+		Message:           r.Message,
+		RequestID:         requestID,
+		UserID:            userID,
+		SessionID:         sessionID,
+		PlaybackSessionID: playbackSessionID,
+		ClientIP:          clientIP,
+		NodeID:            nodeID,
+		Attrs:             attrs,
+	})
+	return nil
+}
+
+func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	next := &Handler{
+		inner:      h.inner.WithAttrs(attrs),
+		writer:     h.writer,
+		capture:    h.capture,
+		nodeID:     h.nodeID,
+		static:     map[string]any{},
+		groupNames: append([]string(nil), h.groupNames...),
+	}
+	for k, v := range h.static {
+		next.static[k] = v
+	}
+	for _, attr := range attrs {
+		next.addAttr(next.static, attr, "")
+	}
+	return next
+}
+
+func (h *Handler) WithGroup(name string) slog.Handler {
+	return &Handler{
+		inner:      h.inner.WithGroup(name),
+		writer:     h.writer,
+		capture:    h.capture,
+		nodeID:     h.nodeID,
+		static:     cloneMap(h.static),
+		groupNames: append(append([]string(nil), h.groupNames...), name),
+	}
+}
+
+func (h *Handler) addAttr(dst map[string]any, attr slog.Attr, prefix string) {
+	attr.Value = attr.Value.Resolve()
+	key := attr.Key
+	if prefix != "" {
+		key = prefix + "." + key
+	}
+	if len(h.groupNames) > 0 && prefix == "" {
+		key = strings.Join(append(append([]string(nil), h.groupNames...), attr.Key), ".")
+	}
+	if attr.Value.Kind() == slog.KindGroup {
+		nextPrefix := key
+		for _, child := range attr.Value.Group() {
+			h.addAttr(dst, child, nextPrefix)
+		}
+		return
+	}
+	dst[key] = attrValue(attr.Value)
+}
+
+func attrValue(v slog.Value) any {
+	switch v.Kind() {
+	case slog.KindString:
+		return v.String()
+	case slog.KindInt64:
+		return v.Int64()
+	case slog.KindUint64:
+		return v.Uint64()
+	case slog.KindFloat64:
+		return v.Float64()
+	case slog.KindBool:
+		return v.Bool()
+	case slog.KindDuration:
+		return v.Duration().String()
+	case slog.KindTime:
+		return v.Time().UTC().Format(time.RFC3339Nano)
+	case slog.KindAny:
+		// Error types from errors.New and fmt.Errorf have no exported fields
+		// and would encode as {}, hiding the failure cause. Record the text,
+		// as the console handler does.
+		if err, ok := v.Any().(error); ok && err != nil {
+			return errorText(err)
+		}
+		return snapshot(v.Any())
+	default:
+		return v.String()
+	}
+}
+
+// errorText records an error's message for the stored entry. Requested URLs
+// inside the chain are sanitized with logredact.SanitizeURLError, the same
+// helper transport errors pass through elsewhere, so signed stream URLs and
+// query-string tokens are not written to the database. Secret key=value pairs
+// left in plain text, such as a plugin's gRPC status description, are masked
+// with logredact.RedactSecretAssignments. A URL quoted in the text rather
+// than carried as a *url.Error (a presigned S3 URL in an SDK error, say) loses
+// its query, fragment and userinfo, and logredact.SanitizeText masks userinfo
+// in other schemes' URLs. A typed-nil pointer
+// that satisfies error is recorded as a placeholder instead of calling Error
+// on a nil receiver, and a panicking Error method is contained.
+func errorText(err error) (text string) {
+	if rv := reflect.ValueOf(err); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return fmt.Sprintf("<nil %T>", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			text = fmt.Sprintf("<%T: Error panicked>", err)
+		}
+	}()
+	msg := logredact.SanitizeURLError(err).Error()
+	msg = urlInText.ReplaceAllStringFunc(msg, sanitizeURLToken)
+	return logredact.SanitizeText(logredact.RedactSecretAssignments(msg))
+}
+
+// snapshot encodes a value the caller still owns, such as a map, slice or
+// pointer. The consumer encodes Attrs on its own goroutine seconds later, or
+// longer while Postgres is down, and a caller that changed a logged map in the
+// meantime would race that encode; for a map, the race is a fatal runtime
+// error. Encoding now also records the value as it was when it was logged.
+func snapshot(v any) any {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprint(v)
+	}
+	return json.RawMessage(raw)
+}
+
+// urlInText matches an http(s) URL token inside free text. It takes the
+// whole non-space run, so text glued to a query or fragment is dropped with
+// it, and anything unparseable fails closed.
+var urlInText = regexp.MustCompile(`(?i)https?://\S+`)
+
+// sanitizeURLToken removes the userinfo, query and fragment of a URL token
+// and masks signed-token path segments. Trailing quotes and punctuation, such
+// as the `":` after a *url.Error's quoted URL, stay outside the URL so they
+// are neither escaped into its path nor make it unparseable; a run of
+// punctuation cannot hold a credential. A token with no part that can hold
+// one is kept as written, the same rule logredact uses for requested URLs.
+func sanitizeURLToken(token string) string {
+	raw := strings.TrimRight(token, `"'),.:;>]}!`)
+	if !logredact.URLMayHoldCredential(raw) {
+		return token
+	}
+	return logredact.SanitizeURL(raw) + token[len(raw):]
+}
+
+func inferComponent(message string) string {
+	if prefix, _, ok := strings.Cut(message, ":"); ok {
+		prefix = strings.TrimSpace(prefix)
+		if prefix != "" {
+			return prefix
+		}
+	}
+	return "app"
+}
+
+func redactAttrs(attrs map[string]any) map[string]any {
+	redacted := make(map[string]any, len(attrs))
+	for k, v := range attrs {
+		if shouldRedact(k) {
+			redacted[k] = "[REDACTED]"
+			continue
+		}
+		redacted[k] = v
+	}
+	return redacted
+}
+
+// shouldRedact delegates to the shared logredact detection so the DB path and
+// the console/file/OTLP sinks stay in lock-step on what counts as a secret key.
+func shouldRedact(key string) bool {
+	return logredact.SecretKey(key)
+}
+
+func cloneMap(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}

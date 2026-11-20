@@ -1,0 +1,279 @@
+import { useMemo, useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { v2 } from "@/api/v2/request";
+import {
+  effectiveSettingsQueryKey,
+  isDefinitiveSettingMutationRejection,
+  isSettingValueMissing,
+  useClearSettingValue,
+  useEffectiveSettings,
+  useSetSettingValue,
+  useSettingsCapabilities,
+  type EffectiveSettingsMap,
+} from "@/hooks/queries/settingValues";
+import type { SettingIdentity } from "@/hooks/queries/settingValues";
+import { SETTING_KEYS, SETTINGS_API_VERSION, type SettingKey } from "@/lib/settingsContract";
+import { catalogKeys, sectionKeys, settingsKeys } from "@/hooks/queries/keys";
+import { storage } from "@/utils/storage";
+import {
+  isOverlaySupportedBy,
+  overlayPrefsForServer,
+  parseOverlayPrefs,
+  serializeOverlayPrefs,
+  storedOverlayIds,
+  supportsOverlayStyles,
+  withoutUnlistedImages,
+  type CardOverlayPrefs,
+  type OverlayId,
+  type OverlayImage,
+  type OverlayServerSupport,
+} from "@/lib/overlays";
+import {
+  normalizeCardQuickActionMode,
+  type EnabledCardQuickActionMode,
+} from "@/lib/cardQuickActions";
+
+/** Card overlay preferences are profile-wide in the contract (no device scope). */
+const PROFILE_SCOPE: SettingIdentity = { scope: "profile" };
+
+const BADGE_KEYS = [SETTING_KEYS.UI_CARD_OVERLAYS, SETTING_KEYS.UI_CARD_OVERLAYS_ENABLED] as const;
+const QUICK_ACTION_KEYS = [
+  SETTING_KEYS.UI_CARD_QUICK_ACTIONS,
+  SETTING_KEYS.UI_CARD_QUICK_ACTIONS_ENABLED,
+] as const;
+const OVERLAY_KEYS = [...BADGE_KEYS, ...QUICK_ACTION_KEYS] as const;
+
+/** The independently resettable halves of the card overlay preferences. */
+export type OverlayPrefsPart = "badges" | "quickActions";
+
+const PART_KEYS: Record<OverlayPrefsPart, readonly SettingKey[]> = {
+  badges: BADGE_KEYS,
+  quickActions: QUICK_ACTION_KEYS,
+};
+
+// Overlay booleans are inherit-with-override, not a policy gate: the server
+// setting is only the default for profiles that have not chosen, and an
+// explicit profile choice wins in either direction.
+function inheritBoolean(userValue: unknown, serverDefault: boolean): boolean {
+  return typeof userValue === "boolean" ? userValue : serverDefault;
+}
+
+const NO_IMAGES: readonly OverlayImage[] = [];
+
+// The server-wide overlay defaults live in server_settings, not the
+// user-settings contract, so this endpoint stays alongside the canonical
+// values API. It also lists the images an administrator uploaded.
+export function useOverlayConfig() {
+  return useQuery({
+    queryKey: settingsKeys.overlayConfig(),
+    queryFn: () => v2("GET /api/v2/settings/overlay-config"),
+    staleTime: 60_000,
+  });
+}
+
+export function useOverlayPrefs() {
+  // The effective endpoint requires a profile header; without one the user
+  // has no stored preference and the admin defaults apply on their own.
+  const profileId = storage.get(storage.KEYS.PROFILE_ID);
+  const hasProfile = Boolean(profileId);
+  const { data: effective, isLoading: userLoading } = useEffectiveSettings({
+    keys: OVERLAY_KEYS,
+    enabled: hasProfile,
+  });
+  const { data: config, isLoading: configLoading } = useOverlayConfig();
+  const { data: capabilities } = useSettingsCapabilities({ enabled: hasProfile });
+  const manifestRevision =
+    capabilities?.api_version === SETTINGS_API_VERSION ? capabilities.manifest_revision : undefined;
+  const { mutate: setSettingValue } = useSetSettingValue();
+  const clearValue = useClearSettingValue();
+  const queryClient = useQueryClient();
+  const effectiveQueryKey = useMemo(
+    () => effectiveSettingsQueryKey({ keys: OVERLAY_KEYS, profileId: profileId ?? undefined }),
+    // The active profile is part of effectiveSettingsQueryKey. Recompute the
+    // target when profile selection changes rather than writing into the
+    // previous profile's cache entry.
+    [profileId],
+  );
+
+  // The server counts seasons and episodes for cards only while the profile
+  // draws the availability badge. Cards cached before it was turned on carry
+  // no counts, so they are read again once the choice is saved.
+  const refetchAvailabilityCards = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: catalogKeys.all });
+    void queryClient.invalidateQueries({ queryKey: sectionKeys.all });
+  }, [queryClient]);
+
+  const setProfileValue = useCallback(
+    (key: SettingKey, value: unknown, onSaved?: () => void) => {
+      // Writing a stored value back unchanged is a no-op: skip the network
+      // round-trip and the downstream re-render cascade.
+      if (effective?.[key]?.value === value) return;
+      queryClient.setQueryData<EffectiveSettingsMap>(effectiveQueryKey, (current) => ({
+        ...current,
+        [key]: { key, value, source: "profile", scope: "profile" },
+      }));
+      setSettingValue(
+        { key, value, identity: PROFILE_SCOPE },
+        {
+          onSuccess: onSaved,
+          // The shared mutation invalidates on success and ambiguous errors.
+          // A definitive rejection never reached storage, so refetch instead of
+          // restoring a snapshot: rapid successive writes make any snapshot an
+          // unpersisted optimistic value, while a refetch reconciles the cache
+          // with what the server actually stored.
+          onError: (error) => {
+            if (isDefinitiveSettingMutationRejection(error)) {
+              void queryClient.invalidateQueries({ queryKey: effectiveQueryKey });
+            }
+          },
+        },
+      );
+    },
+    [effective, effectiveQueryKey, queryClient, setSettingValue],
+  );
+
+  // The contract default is null — "no preference expressed" — which is what
+  // lets the server-wide admin default apply; a stored value wins outright.
+  const userValue = effective?.[SETTING_KEYS.UI_CARD_OVERLAYS]?.value ?? null;
+  const serverSupport = useMemo<OverlayServerSupport>(
+    () => ({ manifestRevision, storedIds: storedOverlayIds(userValue) }),
+    [manifestRevision, userValue],
+  );
+  const overlaysEnabledUserValue = effective?.[SETTING_KEYS.UI_CARD_OVERLAYS_ENABLED]?.value;
+  const quickActionUserValue = effective?.[SETTING_KEYS.UI_CARD_QUICK_ACTIONS]?.value ?? null;
+  const quickActionsEnabledUserValue =
+    effective?.[SETTING_KEYS.UI_CARD_QUICK_ACTIONS_ENABLED]?.value;
+
+  const prefs = useMemo(() => {
+    // User setting takes priority; fall back to admin defaults
+    const source = userValue ?? config?.defaults ?? null;
+    return parseOverlayPrefs(source);
+  }, [userValue, config?.defaults]);
+  const images = config?.images ?? NO_IMAGES;
+  const renderPrefs = useMemo(
+    () => withoutUnlistedImages(prefs, new Set(images.map((image) => image.ref))),
+    [prefs, images],
+  );
+
+  // Absent server config (including while it loads), overlays are on — the
+  // shipped default — and quick actions are off.
+  const overlaysEnabled = inheritBoolean(overlaysEnabledUserValue, config?.enabled !== false);
+  const quickActionsEnabled = inheritBoolean(
+    quickActionsEnabledUserValue,
+    config?.quick_actions_enabled === true,
+  );
+  const configuredQuickActionMode = normalizeCardQuickActionMode(
+    quickActionUserValue ?? config?.quick_actions_default,
+  );
+
+  const setPrefs = useCallback(
+    (next: CardOverlayPrefs) => {
+      // The server rejects the whole document over one overlay id it does not
+      // accept, so those ids never reach it.
+      const storable = overlayPrefsForServer(next, serverSupport);
+      // Avoid a network round-trip and downstream re-render cascade when
+      // the user toggles a control to its current value. Comparison goes
+      // through the parser so key ordering in the stored JSON is irrelevant.
+      if (
+        userValue != null &&
+        serializeOverlayPrefs(
+          overlayPrefsForServer(parseOverlayPrefs(userValue), serverSupport),
+        ) === serializeOverlayPrefs(storable)
+      ) {
+        return;
+      }
+      const turnsAvailabilityOn =
+        storable.items.availability?.enabled === true && !prefs.items.availability?.enabled;
+      setProfileValue(
+        SETTING_KEYS.UI_CARD_OVERLAYS,
+        storable,
+        turnsAvailabilityOn ? refetchAvailabilityCards : undefined,
+      );
+    },
+    [serverSupport, userValue, prefs, setProfileValue, refetchAvailabilityCards],
+  );
+
+  const isOverlaySupported = useCallback(
+    (id: OverlayId) => isOverlaySupportedBy(id, serverSupport),
+    [serverSupport],
+  );
+
+  const setOverlaysEnabled = useCallback(
+    (next: boolean) =>
+      setProfileValue(
+        SETTING_KEYS.UI_CARD_OVERLAYS_ENABLED,
+        next,
+        next && prefs.items.availability?.enabled ? refetchAvailabilityCards : undefined,
+      ),
+    [prefs, setProfileValue, refetchAvailabilityCards],
+  );
+
+  const setQuickActionMode = useCallback(
+    (next: EnabledCardQuickActionMode) => {
+      // Compare against the mode the control displays, not a differently
+      // normalized reading of the stored value: an unrecognized stored value
+      // displays the admin default, which must stay selectable.
+      if (quickActionUserValue != null && configuredQuickActionMode === next) return;
+      setProfileValue(SETTING_KEYS.UI_CARD_QUICK_ACTIONS, next);
+    },
+    [configuredQuickActionMode, quickActionUserValue, setProfileValue],
+  );
+
+  const setQuickActionsEnabled = useCallback(
+    (next: boolean) => setProfileValue(SETTING_KEYS.UI_CARD_QUICK_ACTIONS_ENABLED, next),
+    [setProfileValue],
+  );
+
+  const resetPrefs = useCallback(
+    async (part: OverlayPrefsPart) => {
+      await Promise.all(
+        PART_KEYS[part].map(async (key) => {
+          try {
+            await clearValue.mutateAsync({ key, identity: PROFILE_SCOPE });
+          } catch (error) {
+            // A missing scoped value already means this part of the preference
+            // is inheriting from the server default.
+            if (!isSettingValueMissing(error)) throw error;
+          }
+        }),
+      );
+      // The server-wide default the profile now follows may draw the badge.
+      if (part === "badges") refetchAvailabilityCards();
+    },
+    [clearValue, refetchAvailabilityCards],
+  );
+
+  const overrides = (keys: readonly SettingKey[]) =>
+    keys.some((key) => effective?.[key]?.source === "profile");
+  const hasBadgeOverride = overrides(BADGE_KEYS);
+  const hasQuickActionOverride = overrides(QUICK_ACTION_KEYS);
+
+  // While either query is in flight, report null prefs instead of built-in
+  // defaults: rendering defaults first would flash badges that vanish (or
+  // change) the moment the user's own config or the server default loads.
+  const isLoading = (hasProfile && userLoading) || configLoading;
+
+  return {
+    prefs: overlaysEnabled && !isLoading ? renderPrefs : null,
+    // The full document, badges on or off, for settings screens.
+    editablePrefs: prefs,
+    images,
+    imageUploadsAvailable: config?.image_uploads_available === true,
+    supportsStyles: supportsOverlayStyles(serverSupport),
+    setPrefs,
+    isOverlaySupported,
+    overlaysEnabled,
+    setOverlaysEnabled,
+    quickActionMode:
+      quickActionsEnabled && !isLoading ? configuredQuickActionMode : ("none" as const),
+    quickActionPreference: configuredQuickActionMode,
+    setQuickActionMode,
+    quickActionsEnabled,
+    setQuickActionsEnabled,
+    resetPrefs,
+    hasBadgeOverride,
+    hasQuickActionOverride,
+    isResetting: clearValue.isPending,
+    isLoading,
+  };
+}

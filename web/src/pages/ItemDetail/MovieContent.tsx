@@ -1,0 +1,476 @@
+import { useCallback, useMemo, useState } from "react";
+import { useLocation, useNavigate } from "react-router";
+import { leafUserData, type FileVersion, type ItemDetail } from "@/api/types";
+import type { PlayerSubtitleTrackSignature, PrePlaySubtitleSelection } from "@/player/types";
+import { useRedetectItemMarkers, useRefreshItemMetadata } from "@/hooks/queries/items";
+import { useAdminMarkerCapabilities } from "@/hooks/queries/admin/markers";
+import { useLibraryCapabilities } from "@/hooks/queries/admin/libraries";
+import { useSimilarItems } from "@/hooks/queries/recommendations";
+import { useDeleteSubtitlePreference, useSetSubtitlePreference } from "@/hooks/queries/subtitles";
+import { usePrePlayAudioSelection } from "./usePrePlayAudioSelection";
+import { useAuth } from "@/hooks/useAuth";
+import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
+import { useAmbientColor } from "@/hooks/useAmbientColor";
+import { useCurrentProfile } from "@/hooks/useCurrentProfile";
+import CastCarousel from "@/components/CastCarousel";
+import MovieBoxSetRow from "@/components/boxsets/MovieBoxSetRow";
+import { buildCrewGroups } from "@/components/castCrewGroups";
+import DownloadVersionPicker from "@/components/DownloadVersionPicker";
+import EditMetadataDialog from "@/components/EditMetadataDialog";
+import MediaLocations from "@/components/MediaLocations";
+import MatchItemDialog from "@/components/MatchItemDialog";
+import SplitItemDialog from "@/components/SplitItemDialog";
+import PageBack from "@/components/PageBack";
+import RecommendationGrid from "@/components/RecommendationGrid";
+import DetailHero from "./DetailHero";
+import DetailLayout, { DetailSection } from "./DetailLayout";
+import { useOnViewTranslation } from "@/hooks/useOnViewTranslation";
+import MetadataBadges from "./components/MetadataBadges";
+import TrailersSection from "./components/TrailersSection";
+import ExtrasSection from "./components/ExtrasSection";
+import QualityBadges from "./components/QualityBadges";
+import ScoreRow from "./components/ScoreRow";
+import HeroCrewLine from "./components/HeroCrewLine";
+import MediaUserActionBar from "./components/MediaUserActionBar";
+import MediaInfoDialog from "./components/MediaInfoDialog";
+import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
+import {
+  selectDefaultPlaybackVariantVersion,
+  selectedDownloadVersions,
+  selectedStartVersion,
+} from "./components/versionRankingUtils";
+import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
+import { RecommendationGridSkeleton } from "./components/SectionSkeletons";
+import { resolveLeafPrimaryAction } from "./itemDetailLayout";
+import {
+  canCurateMetadata as canCurateMetadataForUser,
+  canEditMarkers as canEditMarkersForUser,
+} from "@/lib/permissions";
+import { formatRuntimeMinutes } from "@/lib/mediaFormat";
+import { useQualityPreferenceState } from "@/hooks/queries/qualityPreference";
+import { useDetailWatchTogether } from "@/pages/watchtogether/DetailWatchTogether";
+import { hasMachineTranslation } from "./components/machineTranslation";
+import { useT } from "@/i18n";
+
+export default function MovieContent({
+  item,
+  libraryId,
+  showAdvisoryAge,
+}: {
+  item: ItemDetail & { type: "movie" };
+  /** The page's ?libraryId= scope; the match and split dialogs search in it. */
+  libraryId?: number;
+  showAdvisoryAge?: boolean;
+}) {
+  const t = useT();
+  const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
+    useOnViewTranslation(item);
+  const navigate = useNavigate();
+  const { search } = useLocation();
+  // Follow the item to its new content ID, keeping the query string (such as
+  // ?libraryId=) so the page keeps its library scope.
+  const followReplacedItem = (contentID: string) =>
+    navigate({ pathname: `/item/${contentID}`, search }, { replace: true });
+  useAmbientColor(item.backdrop_thumbhash);
+  const { user } = useAuth();
+  const isAdmin = useIsActingAdmin();
+  const { profile: currentProfile } = useCurrentProfile();
+  // The resolution cap comes from the settings contract, where the quality
+  // picker writes; the profile column it falls back to is only the pre-cutover
+  // choice, since that picker no longer mirrors into it.
+  const { preference: qualityPreference, settled: qualitySettled } = useQualityPreferenceState(
+    currentProfile?.quality_preference,
+  );
+  const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
+  const canEditMarkers = canEditMarkersForUser(user, currentProfile);
+
+  const refreshMetadataMutation = useRefreshItemMetadata();
+  const redetectMarkersMutation = useRedetectItemMarkers();
+  // Movies have no re-detect action on an API node without redetect-markers
+  // or movie credits.
+  const markerCapabilities = useAdminMarkerCapabilities(isAdmin);
+  const capabilities = useLibraryCapabilities(isAdmin).data;
+  const canManageTrickplay =
+    capabilities?.trickplay === true && capabilities.trickplay_supported === true;
+  const canRedetectMovieCredits =
+    markerCapabilities.data?.redetect_markers === true &&
+    markerCapabilities.data?.movie_credits === true;
+  const deleteSubtitlePreference = useDeleteSubtitlePreference();
+  const setSubtitlePreference = useSetSubtitlePreference();
+  const scopedItem = useMemo(
+    () => (libraryId === undefined ? item : { ...item, library_id: libraryId }),
+    [item, libraryId],
+  );
+
+  const [editOpen, setEditOpen] = useState(false);
+  const [matchOpen, setMatchOpen] = useState(false);
+  const [splitOpen, setSplitOpen] = useState(false);
+  const [downloadOpen, setDownloadOpen] = useState(false);
+  const [subtitleSearchOpen, setSubtitleSearchOpen] = useState(false);
+  const [mediaInfoOpen, setMediaInfoOpen] = useState(false);
+  const crewGroups = useMemo(() => buildCrewGroups(item.crew ?? [], "Director"), [item.crew]);
+  const [mediaInfoFileId, setMediaInfoFileId] = useState<number | null>(null);
+
+  // Version selection state — drives the Play button and inline stream popovers.
+  const userData = leafUserData(item.user_data);
+  const [selectedEditionKey, setSelectedEditionKey] = useState<string | undefined>(undefined);
+  const defaultSelectedVersion = useMemo(
+    () =>
+      selectDefaultPlaybackVariantVersion(
+        item.versions,
+        item.playback_variants,
+        userData,
+        qualityPreference,
+        selectedEditionKey,
+      ),
+    [qualityPreference, selectedEditionKey, item.playback_variants, item.versions, userData],
+  );
+  const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
+  const pickedVersion = useMemo(
+    () =>
+      manualSelectedFileId != null
+        ? (item.versions.find((version) => version.file_id === manualSelectedFileId) ?? null)
+        : null,
+    [manualSelectedFileId, item.versions],
+  );
+  const selectedVersion = pickedVersion ?? defaultSelectedVersion;
+  const selectedMediaSummary = useMemo(
+    () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
+    [item.playback_variants, item.runtime, selectedVersion],
+  );
+  const openMediaInfo = useCallback(
+    (fileId?: number) => {
+      setMediaInfoFileId(fileId ?? selectedVersion?.file_id ?? null);
+      setMediaInfoOpen(true);
+    },
+    [selectedVersion?.file_id],
+  );
+  const audioSelection = usePrePlayAudioSelection(
+    item.content_id,
+    item.content_id,
+    selectedVersion,
+  );
+  const clearAudioSelection = audioSelection.clear;
+  const [subtitleSelectionMode, setSubtitleSelectionMode] = useState<"auto" | "off" | "explicit">(
+    "auto",
+  );
+  const [explicitSubtitleSelection, setExplicitSubtitleSelection] =
+    useState<PrePlaySubtitleSelection | null>(null);
+
+  // Reset selection when navigating to a different movie (adjust state during render).
+  const [prevContentId, setPrevContentId] = useState(item.content_id);
+  const [prevSelectedFileId, setPrevSelectedFileId] = useState(selectedVersion?.file_id);
+  if (prevContentId !== item.content_id) {
+    setPrevContentId(item.content_id);
+    setManualSelectedFileId(null);
+    setSelectedEditionKey(undefined);
+    setSubtitleSelectionMode("auto");
+    setExplicitSubtitleSelection(null);
+  } else if (selectedEditionKey === undefined && qualitySettled && defaultSelectedVersion) {
+    setSelectedEditionKey(defaultSelectedVersion.edition_key ?? "");
+  }
+  if (prevSelectedFileId !== selectedVersion?.file_id) {
+    setPrevSelectedFileId(selectedVersion?.file_id);
+    setSubtitleSelectionMode("auto");
+    setExplicitSubtitleSelection(null);
+  }
+  const handleSelectVersion = useCallback(
+    (version: FileVersion | null) => {
+      setManualSelectedFileId(version?.file_id ?? null);
+      if (version) setSelectedEditionKey(version.edition_key ?? "");
+      // Track indexes belong to a file, so another version starts from Auto.
+      clearAudioSelection();
+      setSubtitleSelectionMode("auto");
+      setExplicitSubtitleSelection(null);
+    },
+    [clearAudioSelection],
+  );
+
+  const handleSelectEdition = useCallback(
+    (key: string) => {
+      setSelectedEditionKey(key);
+      handleSelectVersion(null);
+    },
+    [handleSelectVersion],
+  );
+  const downloadVersions = useMemo(
+    () => selectedDownloadVersions(selectedVersion, item.playback_variants, qualityPreference),
+    [selectedVersion, item.playback_variants, qualityPreference],
+  );
+  const restartVersion = useMemo(
+    () => selectedStartVersion(selectedVersion, item.playback_variants, qualityPreference),
+    [selectedVersion, item.playback_variants, qualityPreference],
+  );
+
+  const handleSelectSubtitle = (selection: PrePlaySubtitleSelection) => {
+    setSubtitleSelectionMode("explicit");
+    setExplicitSubtitleSelection(selection);
+    // Persist as this movie's override so the choice sticks across visits,
+    // exactly like a manual in-player selection.
+    setSubtitlePreference.mutate({
+      prefId: item.content_id,
+      selection,
+    });
+  };
+
+  const handleSelectSubtitleOff = () => {
+    setSubtitleSelectionMode("off");
+    setExplicitSubtitleSelection(null);
+    setSubtitlePreference.mutate({
+      prefId: item.content_id,
+      selection: null,
+    });
+  };
+
+  const handleResetSubtitleSelection = () => {
+    setSubtitleSelectionMode("auto");
+    setExplicitSubtitleSelection(null);
+    // "Auto" also clears the persisted override saved by a manual in-player
+    // selection, so profile-level auto selection applies to this movie again.
+    deleteSubtitlePreference.mutate(item.content_id);
+  };
+
+  const primaryAction = resolveLeafPrimaryAction(item, t("web.detail.actions.play"));
+  const watchTogether = useDetailWatchTogether({
+    item,
+    target:
+      item.versions.length > 0
+        ? {
+            content_id: item.content_id,
+            title: item.title,
+            subtitle: item.year ? String(item.year) : undefined,
+            poster_url: item.poster_url,
+            poster_thumbhash: item.poster_thumbhash,
+          }
+        : null,
+  });
+  const restartHref =
+    primaryAction.resuming && item.versions.length > 0
+      ? `/watch/${item.content_id}?restart=1`
+      : undefined;
+  const { data: similarData, isLoading: similarLoading } = useSimilarItems(item.content_id);
+
+  const preferredSubtitleTrackSignature: PlayerSubtitleTrackSignature | null =
+    item.effective_subtitle_track_signature
+      ? {
+          source:
+            item.effective_subtitle_track_signature.source === "downloaded"
+              ? "downloaded"
+              : item.effective_subtitle_track_signature.source === "external"
+                ? "external"
+                : item.effective_subtitle_track_signature.source === "embedded"
+                  ? "embedded"
+                  : undefined,
+          language: item.effective_subtitle_track_signature.language,
+          codec: item.effective_subtitle_track_signature.codec,
+          label: item.effective_subtitle_track_signature.label,
+          forced: item.effective_subtitle_track_signature.forced,
+          hearing_impaired: item.effective_subtitle_track_signature.hearing_impaired,
+        }
+      : null;
+
+  const title = item.title ?? "";
+  const year = item.year ? String(item.year) : "";
+  const firstStudio = (item.studios ?? [])[0];
+
+  return (
+    <DetailLayout
+      hero={
+        <DetailHero
+          title={title}
+          topNav={<PageBack />}
+          context={t("web.detail.hero.typeMovie")}
+          studioLabel={firstStudio}
+          backdropUrl={item.backdrop_url}
+          backdropThumbhash={item.backdrop_thumbhash}
+          posterUrl={item.poster_url}
+          posterThumbhash={item.poster_thumbhash}
+          logoUrl={item.logo_url}
+          tagline={item.tagline || undefined}
+          metadata={
+            <div className="flex flex-wrap items-center gap-2">
+              <MetadataBadges
+                year={year || undefined}
+                contentRating={item.content_rating || undefined}
+                advisoryAge={showAdvisoryAge ? (item.advisory_age ?? undefined) : undefined}
+                advisorySource={item.advisory_source || undefined}
+                duration={formatRuntimeMinutes(selectedMediaSummary.durationMinutes) || undefined}
+              />
+              <QualityBadges summary={selectedMediaSummary} />
+            </div>
+          }
+          scoreRow={<ScoreRow ratings={item.ratings} />}
+          overview={item.overview}
+          overviewTranslating={overviewTranslating}
+          onTranslateOverview={onTranslateOverview}
+          overviewMachineTranslated={hasMachineTranslation(item.machine_translated_fields)}
+          taglineMachineTranslated={hasMachineTranslation(
+            item.machine_translated_fields,
+            "tagline",
+          )}
+          crewLine={<HeroCrewLine crew={item.crew ?? []} genres={item.genres} />}
+          actions={
+            <MediaUserActionBar
+              item={item}
+              contentId={item.content_id}
+              watchTogether={watchTogether.menu}
+              playHref={item.versions.length > 0 ? `/watch/${item.content_id}` : undefined}
+              playLabel={primaryAction.label}
+              playProgress={primaryAction.progress}
+              restartHref={restartHref}
+              resumePositionSeconds={
+                item.user_data && "position_seconds" in item.user_data
+                  ? item.user_data.position_seconds
+                  : undefined
+              }
+              resumeDurationSeconds={
+                item.user_data && "duration_seconds" in item.user_data
+                  ? item.user_data.duration_seconds
+                  : undefined
+              }
+              resumeResolution={
+                item.user_data && "last_resolution" in item.user_data
+                  ? item.user_data.last_resolution
+                  : undefined
+              }
+              resumeHdr={
+                item.user_data && "last_hdr" in item.user_data ? item.user_data.last_hdr : undefined
+              }
+              onRefresh={
+                canCurateMetadata
+                  ? (mode) =>
+                      refreshMetadataMutation.mutate({
+                        item,
+                        mode,
+                        onReplaced: followReplacedItem,
+                      })
+                  : undefined
+              }
+              isRefreshing={refreshMetadataMutation.isPending}
+              onRedetectMarkers={
+                isAdmin && canRedetectMovieCredits
+                  ? (kind) => redetectMarkersMutation.mutate({ itemId: item.content_id, kind })
+                  : undefined
+              }
+              redetectKind="credits"
+              isRedetectingMarkers={redetectMarkersMutation.isPending}
+              isAdmin={isAdmin}
+              canCurateMetadata={canCurateMetadata}
+              canEditMarkers={canEditMarkers}
+              canManageTrickplay={canManageTrickplay}
+              onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
+              onMatchItem={canCurateMetadata ? () => setMatchOpen(true) : undefined}
+              onSplitItem={
+                canCurateMetadata && item.versions.length > 1 ? () => setSplitOpen(true) : undefined
+              }
+              onShowMediaInfo={item.versions.length > 0 ? () => openMediaInfo() : undefined}
+              versions={item.versions}
+              playbackVariants={item.playback_variants}
+              selectedVersion={selectedVersion}
+              restartVersion={restartVersion}
+              versionPicked={pickedVersion != null}
+              onSelectVersion={handleSelectVersion}
+              onSelectEdition={handleSelectEdition}
+              onDownload={
+                user?.download_allowed && item.versions.length > 0
+                  ? () => setDownloadOpen(true)
+                  : undefined
+              }
+              onSearchSubtitles={
+                item.versions.length > 0 ? () => setSubtitleSearchOpen(true) : undefined
+              }
+              qualityPreference={qualityPreference}
+              audioSelectionMode={audioSelection.mode}
+              explicitAudioTrackIndex={audioSelection.explicitIndex}
+              onSelectAudioTrack={audioSelection.select}
+              onResetAudioSelection={audioSelection.reset}
+              prePlaySubtitleMode={subtitleSelectionMode}
+              explicitSubtitleSelection={explicitSubtitleSelection}
+              onSelectSubtitle={handleSelectSubtitle}
+              onSelectSubtitleOff={handleSelectSubtitleOff}
+              onResetSubtitleSelection={handleResetSubtitleSelection}
+              preferredSubtitleLanguage={item.effective_subtitle_language}
+              preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
+              subtitleMode={item.effective_subtitle_mode as "off" | "auto" | "always" | undefined}
+              showForcedSubtitles={item.effective_show_forced_subtitles}
+            />
+          }
+        />
+      }
+      overlays={
+        <>
+          {canCurateMetadata && (
+            <EditMetadataDialog item={item} open={editOpen} onOpenChange={setEditOpen} />
+          )}
+          {canCurateMetadata && (
+            <MatchItemDialog
+              key={item.content_id}
+              item={scopedItem}
+              open={matchOpen}
+              onOpenChange={setMatchOpen}
+              onReplaced={followReplacedItem}
+            />
+          )}
+          {canCurateMetadata && (
+            <SplitItemDialog
+              key={`split-${item.content_id}`}
+              item={scopedItem}
+              open={splitOpen}
+              onOpenChange={setSplitOpen}
+            />
+          )}
+          <DownloadVersionPicker
+            open={downloadOpen}
+            onOpenChange={setDownloadOpen}
+            versions={downloadVersions}
+            partsInOrder
+            title={title}
+          />
+          <SubtitleSearchDialog
+            open={subtitleSearchOpen}
+            onOpenChange={setSubtitleSearchOpen}
+            version={selectedVersion}
+            title={title}
+          />
+          <MediaInfoDialog
+            open={mediaInfoOpen}
+            onOpenChange={setMediaInfoOpen}
+            versions={item.versions}
+            title={title}
+            initialFileId={mediaInfoFileId}
+          />
+          {watchTogether.sheet}
+        </>
+      }
+    >
+      {((item.cast?.length ?? 0) > 0 || crewGroups.some((g) => g.members.length > 0)) && (
+        <DetailSection title={t("web.detail.sections.castAndCrew")}>
+          <CastCarousel cast={item.cast ?? []} crewGroups={crewGroups} limit={12} prefetchPeople />
+        </DetailSection>
+      )}
+
+      {/* Local extras play in Silo, so they lead; YouTube videos follow. */}
+      {item.extras && item.extras.length > 0 && <ExtrasSection extras={item.extras} />}
+
+      {item.videos && item.videos.length > 0 && <TrailersSection videos={item.videos} />}
+
+      <MovieBoxSetRow contentId={item.content_id} libraryId={libraryId} />
+
+      {/* More Like This */}
+      {similarLoading ? (
+        <RecommendationGridSkeleton />
+      ) : (
+        similarData?.items &&
+        similarData.items.length > 0 && <RecommendationGrid items={similarData.items} />
+      )}
+
+      {canCurateMetadata && (
+        <MediaLocations
+          title={t("web.detail.sections.mediaLocations")}
+          versions={item.versions}
+          onShowMediaInfo={openMediaInfo}
+        />
+      )}
+    </DetailLayout>
+  );
+}

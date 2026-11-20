@@ -1,0 +1,510 @@
+package catalog
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+const LibraryCollectionVisibilityVisible = "visible"
+
+// AccessFilter captures effective viewer access constraints for catalog reads.
+type AccessFilter struct {
+	AllowedLibraryIDs     []int
+	AllowedContentIDs     []string
+	DisabledLibraryIDs    []int // libraries whose membership globally hides an item
+	PresentationLibraryID *int
+	// ScopeFilesToLibrary limits file versions to PresentationLibraryID when
+	// both are set. Callers opt in per read from the server setting
+	// catalog.scope_versions_to_library; playback and watch-together reads never
+	// set it, so an item always plays from its full accessible version list.
+	ScopeFilesToLibrary bool
+	// SeriesLibraryCoversEpisodes presents an episode under PresentationLibraryID
+	// when the library holds its series, even if it holds none of the episode's
+	// files, the way the series' season and episode lists already validate. The
+	// native v2 catalog and watch reads and on-view translation request set it;
+	// v1 and jellycompat leave it off and keep the episode's own libraries.
+	SeriesLibraryCoversEpisodes bool
+	PresentationLanguage        string
+	// ProfilePreferredLanguage is the viewer profile's preferred metadata
+	// language. Presentation language resolves: explicit PresentationLanguage
+	// → ProfilePreferredLanguage → the library's metadata_language.
+	ProfilePreferredLanguage string
+	// MetadataLanguageOverrides maps an item's original language to a target
+	// language before ProfilePreferredLanguage is used as the fallback.
+	MetadataLanguageOverrides map[string]string
+	// PresentationOriginalLanguage supplies a parent series' original language
+	// while localizing season and episode rows, which do not duplicate it.
+	PresentationOriginalLanguage string
+	// MaturityLimits are the viewer's content-rating ceiling, unrated-title
+	// policy, and advisory-age limit, copied from access.Scope as one value.
+	// Code that narrows a filter to its maturity restrictions copies this
+	// whole field (AccessFilter{MaturityLimits: f.MaturityLimits}) so no limit
+	// can be dropped along the way. ApplyMaturityLimits turns it into SQL.
+	access.MaturityLimits
+	MaxPlaybackQuality string
+	SelectedFileID     int
+	UserID             int
+	ProfileID          string
+	// DeviceID identifies the requesting client for device-scoped setting
+	// resolution. It does not participate in catalog access control.
+	DeviceID string
+	// ImageSize is the artwork size the client asked for on this request, and
+	// like DeviceID it does not participate in access control. It rides here
+	// because detail building fans out through a dozen helpers that already
+	// carry the filter, and every artwork URL in one response has to agree on a
+	// size. Unset means the caller expressed no preference, and the per-context
+	// defaults apply. See internal/imagesize.
+	ImageSize imagesize.Size
+	// ImageWidths are the client's per-slot target widths, which override
+	// ImageSize for their slot. Read artwork sizes through ImageSizeFor. Like
+	// ImageSize it only shapes artwork URLs, so it stays out of every key
+	// derived from the filter's encoding.
+	ImageWidths imagesize.Widths `json:"-"`
+	// OmitWatchArtwork skips presentation-only artwork in watch detail for
+	// legacy responses and internal source selection. It does not change access.
+	OmitWatchArtwork bool
+	// NamePrefix, when non-empty, restricts results to items whose
+	// LOWER(COALESCE(NULLIF(BTRIM(sort_title),''), title)) starts with the
+	// given (case-insensitive) prefix. Pushed into the SQL WHERE clause so
+	// the predicate can use idx_media_items_sort_key.
+	NamePrefix string
+	// ExcludedMediaTypes lists media_items.type values the viewer's surface
+	// never exposes (e.g. the Jellyfin compat layer excludes "audiobook" and
+	// "podcast" — they're served by the ABS-compat API instead). Applied by
+	// every query builder that consumes an AccessFilter.
+	ExcludedMediaTypes []string
+}
+
+// LibraryScope resolves the libraries a read may touch: the requested
+// libraries (none requested means every library), limited to
+// AllowedLibraryIDs, minus DisabledLibraryIDs. A nil AllowedLibraryIDs is
+// unrestricted; an empty non-nil one grants no library.
+//
+// none reports that no library survived, and the caller must then match
+// nothing: an empty scope must never be read as "no library filter". When
+// none is false, a non-nil ids is the complete scope, already free of disabled
+// libraries, in request order (or allowlist order when nothing was
+// requested). A nil ids with none false means the read is not narrowed to
+// particular libraries; the caller still has to exclude DisabledLibraryIDs
+// itself, because "every library but these" has no ID list here.
+//
+// The rule compares IDs only. A requested library that does not exist stays
+// in the scope and simply matches no rows.
+func (f AccessFilter) LibraryScope(requested []int) (ids []int, none bool) {
+	if len(requested) == 0 {
+		if f.AllowedLibraryIDs == nil {
+			return nil, false
+		}
+		requested = f.AllowedLibraryIDs
+	} else if f.AllowedLibraryIDs != nil {
+		requested = intersectInts(requested, f.AllowedLibraryIDs)
+	}
+	ids = make([]int, 0, len(requested))
+	for _, id := range requested {
+		if !intInSlice(id, f.DisabledLibraryIDs) {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, true
+	}
+	return ids, false
+}
+
+// CanAccessLibraryCollection reports whether a visible server collection is
+// reachable through at least one library in the viewer's effective scope.
+// Collections without explicit library scope retain their legacy unrestricted
+// visibility, but restricted viewers cannot address them by ID.
+func CanAccessLibraryCollection(collection *models.LibraryCollection, filter AccessFilter) bool {
+	if collection == nil || collection.Visibility != LibraryCollectionVisibilityVisible {
+		return false
+	}
+	if len(collection.LibraryIDs) == 0 {
+		return filter.AllowedLibraryIDs == nil && len(filter.DisabledLibraryIDs) == 0
+	}
+	_, none := filter.LibraryScope(collection.LibraryIDs)
+	return !none
+}
+
+func applyAccessFilter(alias string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	applyAccessFilterKeyed(alias, alias+".content_id", filter, conditions, args, argIdx)
+}
+
+// applyEpisodeRelationAccessFilter is applyAccessFilter for rows of
+// episodeCatalogBaseRelation, whose content_id is the episode's and whose
+// ratings are its series': an episode passes through its series' allowance
+// (episode_series_id).
+func applyEpisodeRelationAccessFilter(alias string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	applyAccessFilterKeyed(alias, alias+".episode_series_id", filter, conditions, args, argIdx)
+}
+
+func applyAccessFilterKeyed(alias, allowedKey string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	applyMaturityLimits(alias, allowedKey, filter.MaturityLimits, conditions, args, argIdx)
+	if len(filter.ExcludedMediaTypes) > 0 {
+		*conditions = append(*conditions, fmt.Sprintf("NOT (%s.type = ANY($%d))", alias, *argIdx))
+		*args = append(*args, filter.ExcludedMediaTypes)
+		*argIdx = *argIdx + 1
+	}
+}
+
+// contentRatingCeilingSQL renders a maturity ceiling as a SQL condition over
+// alias, comparing the stored minimum age against the value bound at
+// placeholder argIdx.
+//
+// The comparison is against the stored minimum age, never the display string:
+// content_rating is free text written verbatim by whichever provider won the
+// merge ("15", "FSK 16", "DE:16", "tv-ma"), and only the age makes those
+// comparable with a "PG-13" ceiling. media_items.content_rating_age and
+// episode_catalog_entries.content_rating_age hold the age that
+// access.Normalize resolved when the rating was written.
+//
+// A title whose rating carries no age is governed by the server setting
+// access.unrated_content, which reaches the filter as AllowUnratedContent.
+func contentRatingCeilingSQL(alias string, allowUnrated bool, argIdx int) string {
+	column := alias + ".content_rating_age"
+	if allowUnrated {
+		return fmt.Sprintf("(%s IS NULL OR %s <= $%d)", column, column, argIdx)
+	}
+	return fmt.Sprintf("(%s IS NOT NULL AND %s <= $%d)", column, column, argIdx)
+}
+
+// advisoryAgeLimitSQL renders an advisory-age limit as a SQL condition over
+// alias. By default a title with no advisory age passes: advisory coverage is
+// partial (the provider that supplies it is rate limited), so a missing
+// advisory means "not looked up yet", and the content-rating ceiling alone
+// decides such a title. A profile that requires an advisory age fails closed
+// instead and sees only titles rated at or under the limit, the same shape
+// contentRatingCeilingSQL gives an unrated title under a ceiling.
+// media_items.advisory_age and its episode_catalog_entries copy hold the age.
+func advisoryAgeLimitSQL(alias string, hideUnadvised bool, argIdx int) string {
+	column := alias + ".advisory_age"
+	if hideUnadvised {
+		return fmt.Sprintf("(%s IS NOT NULL AND %s <= $%d)", column, column, argIdx)
+	}
+	return fmt.Sprintf("(%s IS NULL OR %s <= $%d)", column, column, argIdx)
+}
+
+// ApplyMaturityLimits appends the filter's maturity limits for alias — the
+// content-rating ceiling and the advisory-age limit, ANDed — binding each limit
+// as an argument. It is the single place those limits become SQL, so every
+// catalog read, including query builders outside this package, enforces the
+// same predicates. alias must expose content_rating_age and advisory_age, and
+// content_id for the profile's allowed titles (media_items). A filter with no
+// limits appends nothing.
+//
+// A title in AllowedTitleIDs passes the limits whatever its rating:
+// "(limits) OR alias.content_id = ANY(allowed)". Episode rows pass through
+// their series' allowance instead: the episode_catalog_entries read model
+// uses ApplyEpisodeMaturityLimits, and episodeCatalogBaseRelation rows use
+// applyEpisodeRelationAccessFilter.
+func ApplyMaturityLimits(alias string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	applyMaturityLimits(alias, alias+".content_id", filter.MaturityLimits, conditions, args, argIdx)
+}
+
+// ApplyEpisodeMaturityLimits is ApplyMaturityLimits for episode rows that
+// carry their own copy of the series' rating and a series_id
+// (episode_catalog_entries): an episode passes through its series' allowance.
+func ApplyEpisodeMaturityLimits(alias string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	applyMaturityLimits(alias, alias+".series_id", filter.MaturityLimits, conditions, args, argIdx)
+}
+
+// matchNothingSQL is the predicate an unusable maturity ceiling renders.
+const matchNothingSQL = "1 = 0"
+
+func applyMaturityLimits(alias, allowedKey string, limits access.MaturityLimits, conditions *[]string, args *[]any, argIdx *int) {
+	limitConds := maturityLimitConditions(alias, limits, args, argIdx)
+	if len(limitConds) == 0 {
+		return
+	}
+	if len(limits.AllowedTitleIDs) == 0 {
+		*conditions = append(*conditions, limitConds...)
+		return
+	}
+	*conditions = append(*conditions, fmt.Sprintf("((%s) OR %s = ANY($%d))",
+		strings.Join(limitConds, " AND "), allowedKey, *argIdx))
+	*args = append(*args, limits.AllowedTitleIDs)
+	*argIdx = *argIdx + 1
+}
+
+// maturityLimitConditions renders the content-rating ceiling and the
+// advisory-age limit for alias, binding each as an argument; together they
+// are ANDed. An unusable ceiling renders matchNothingSQL alone and binds
+// nothing.
+func maturityLimitConditions(alias string, limits access.MaturityLimits, args *[]any, argIdx *int) []string {
+	var conds []string
+	// access.HasCeiling, not a trimmed emptiness test: a stored " " is a set
+	// ceiling nothing resolves under, so it falls through to the fail-closed
+	// branch below instead of silently lifting the ceiling.
+	if access.HasCeiling(limits.MaxContentRating) {
+		ceilingAge, ok := access.AgeForCeiling(limits.MaxContentRating)
+		if !ok {
+			// A ceiling that resolves to no age (unrated, or unrecognized) is
+			// unusable, and an unusable parental control fails closed.
+			return []string{matchNothingSQL}
+		}
+		conds = append(conds, contentRatingCeilingSQL(alias, limits.AllowUnratedContent, *argIdx))
+		*args = append(*args, *ceilingAge)
+		*argIdx = *argIdx + 1
+	}
+	if limits.MaxAdvisoryAge > 0 {
+		conds = append(conds, advisoryAgeLimitSQL(alias, limits.HidesUnadvised(), *argIdx))
+		*args = append(*args, limits.MaxAdvisoryAge)
+		*argIdx = *argIdx + 1
+	}
+	return conds
+}
+
+// libraryAccessConditions returns the per-item library allow/deny predicates
+// gating keyColumn's membership rows in media_item_libraries (e.g.
+// "mi.content_id", or "e.series_id" for episode access resolved through the
+// parent series). allowedIdx and disabledIdx are 1-based SQL placeholder
+// positions for the allowed/disabled folder-ID arrays; 0 means that restriction
+// is not active.
+//
+// The predicates are independent EXISTS / NOT EXISTS subqueries — never
+// allow/deny checks against one joined membership row. The single-join form
+// leaks: an item linked to BOTH a passing library and a disabled one satisfies
+// the predicates via the passing row (audit 2026-05-01 §3.3; review finding C3).
+//
+// When only a disabled list is active, positive membership is still required:
+// orphan items (no media_item_libraries link — mid-scan, stale rows from a
+// removed library, or metadata-refresh inserts not yet linked) must not become
+// visible to a restricted viewer through a vacuous NOT EXISTS. When an allowed
+// list is active it already implies membership, so no extra EXISTS is added.
+func libraryAccessConditions(keyColumn string, allowedIdx, disabledIdx int) []string {
+	var conditions []string
+	if allowedIdx > 0 {
+		conditions = append(conditions, fmt.Sprintf(
+			"EXISTS (SELECT 1 FROM media_item_libraries mil WHERE mil.content_id = %s AND mil.media_folder_id = ANY($%d))",
+			keyColumn, allowedIdx))
+	}
+	if disabledIdx > 0 {
+		if allowedIdx == 0 {
+			conditions = append(conditions, fmt.Sprintf(
+				"EXISTS (SELECT 1 FROM media_item_libraries mil WHERE mil.content_id = %s)",
+				keyColumn))
+		}
+		conditions = append(conditions, fmt.Sprintf(
+			"NOT EXISTS (SELECT 1 FROM media_item_libraries mil WHERE mil.content_id = %s AND mil.media_folder_id = ANY($%d))",
+			keyColumn, disabledIdx))
+	}
+	return conditions
+}
+
+// appendLibraryAccessConditions binds the filter's library restrictions as args
+// and appends the matching libraryAccessConditions predicates for keyColumn.
+func appendLibraryAccessConditions(keyColumn string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	var allowedIdx, disabledIdx int
+	if filter.AllowedLibraryIDs != nil {
+		*args = append(*args, filter.AllowedLibraryIDs)
+		allowedIdx = *argIdx
+		*argIdx = *argIdx + 1
+	}
+	if len(filter.DisabledLibraryIDs) > 0 {
+		*args = append(*args, filter.DisabledLibraryIDs)
+		disabledIdx = *argIdx
+		*argIdx = *argIdx + 1
+	}
+	*conditions = append(*conditions, libraryAccessConditions(keyColumn, allowedIdx, disabledIdx)...)
+}
+
+// InSomeLibraryWhere requires the media item whose content ID is
+// contentIDExpr to belong to at least one library. Listings that name no
+// library apply it for every viewer, an unrestricted administrator included:
+// an item in no library is either gone or held only by the scanner's file
+// removal grace until a replacement file relinks it (see
+// docs/architecture/missing-files.md), and its library pages already leave it
+// out. Reads by ID do not apply it.
+func InSomeLibraryWhere(contentIDExpr string) string {
+	return "EXISTS (SELECT 1 FROM media_item_libraries in_library WHERE in_library.content_id = " + contentIDExpr + ")"
+}
+
+// appendListedLibraryAccessConditions is appendLibraryAccessConditions for
+// listings such as search: with no library restriction it still applies
+// InSomeLibraryWhere. Reads by ID keep using appendLibraryAccessConditions.
+func appendListedLibraryAccessConditions(keyColumn string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	if filter.AllowedLibraryIDs == nil && len(filter.DisabledLibraryIDs) == 0 {
+		*conditions = append(*conditions, InSomeLibraryWhere(keyColumn))
+		return
+	}
+	appendLibraryAccessConditions(keyColumn, filter, conditions, args, argIdx)
+}
+
+// ApplyLibraryAccessFilter appends the canonical item-level library allow/deny
+// predicates for keyColumn. It is exported for query builders outside the
+// catalog package that must enforce the same dual-membership invariant.
+func ApplyLibraryAccessFilter(keyColumn string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	appendLibraryAccessConditions(keyColumn, filter, conditions, args, argIdx)
+}
+
+// episodeParentSeriesIDExpr resolves an episode row to its parent series for
+// listing queries that do not already project series_id. The subquery is a PK
+// lookup on episodes.content_id.
+func episodeParentSeriesIDExpr(episodeIDExpr string) string {
+	return fmt.Sprintf("(SELECT e_parent.series_id FROM episodes e_parent WHERE e_parent.content_id = %s)", episodeIDExpr)
+}
+
+// appendEpisodeParentLibraryAccess applies the series-level dual-membership
+// predicates that detail and playback already enforce via
+// EnsureAccessible(series_id). Episode file membership (episode_libraries) can
+// diverge from series membership for multi-folder shows; listing without this
+// check surfaces episodes of a globally hidden series as unopenable tiles.
+// Callers that already join episodes or a read model should pass the projected
+// series ID directly to avoid a redundant correlated lookup.
+func appendEpisodeParentLibraryAccess(seriesIDExpr string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	appendLibraryAccessConditions(seriesIDExpr, filter, conditions, args, argIdx)
+}
+
+func appendEpisodeParentLibraryAccessByEpisodeID(episodeIDExpr string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	appendEpisodeParentLibraryAccess(episodeParentSeriesIDExpr(episodeIDExpr), filter, conditions, args, argIdx)
+}
+
+// ApplySectionAccessFilter applies non-library access constraints to section queries.
+func ApplySectionAccessFilter(alias string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	applyAccessFilter(alias, filter, conditions, args, argIdx)
+}
+
+// FileAllowedByAccess reports whether a media file fits within the viewer's
+// effective access policy.
+func FileAllowedByAccess(file *models.MediaFile, filter AccessFilter) bool {
+	if file == nil {
+		return false
+	}
+	if filter.AllowedLibraryIDs != nil && !intInSlice(file.MediaFolderID, filter.AllowedLibraryIDs) {
+		return false
+	}
+	if len(filter.DisabledLibraryIDs) > 0 && intInSlice(file.MediaFolderID, filter.DisabledLibraryIDs) {
+		return false
+	}
+	return access.QualityAllowed(file.Resolution, filter.MaxPlaybackQuality)
+}
+
+func intInSlice(value int, values []int) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+// FilterMediaFilesByAccess drops file versions the viewer cannot access —
+// the FileAllowedByAccess predicate — and, when the read opted in through
+// ScopeFilesToLibrary, versions stored outside the presentation library. The
+// library scope is Go-only: MediaFileAccessSQL does not mirror it because no
+// SQL caller sets a presentation library.
+func FilterMediaFilesByAccess(files []*models.MediaFile, filter AccessFilter) []*models.MediaFile {
+	scopeLibrary := filter.ScopeFilesToLibrary && filter.PresentationLibraryID != nil
+	unrestricted := filter.AllowedLibraryIDs == nil &&
+		!scopeLibrary &&
+		len(filter.DisabledLibraryIDs) == 0 &&
+		strings.TrimSpace(filter.MaxPlaybackQuality) == ""
+	if len(files) == 0 || unrestricted {
+		return files
+	}
+
+	filtered := make([]*models.MediaFile, 0, len(files))
+	for _, file := range files {
+		if FileAllowedByAccess(file, filter) &&
+			(!scopeLibrary || file.MediaFolderID == *filter.PresentationLibraryID) {
+			filtered = append(filtered, file)
+		}
+	}
+	return filtered
+}
+
+// SQLTrimSpaceChars is a PostgreSQL E-string holding exactly the runes Go's
+// strings.TrimSpace strips: ASCII whitespace plus every rune with the Unicode
+// White_Space property. Pass it as BTRIM's second argument wherever SQL has to
+// trim a value the way Go would, so a resolution such as "\u00a02160p" ranks
+// the same on both sides instead of falling through to the ELSE branch.
+//
+// Use octal \013 for vertical tab; PostgreSQL treats \v as a literal v. The
+// \uXXXX escapes need a UTF-8 database, which Silo requires anyway.
+const SQLTrimSpaceChars = `E' \t\n\013\f\r\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004` +
+	`\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000'`
+
+// MediaFileQualityCeilingSQL renders the playback-quality ceiling as a SQL
+// condition over the given media_files alias, or "" when the filter sets no
+// ceiling. It mirrors access.QualityAllowed, trimming whitespace the way Go
+// does (see SQLTrimSpaceChars).
+func MediaFileQualityCeilingSQL(alias string, maxPlaybackQuality string) string {
+	quality := access.NormalizePlaybackQuality(maxPlaybackQuality)
+	if quality == "" {
+		return ""
+	}
+	maxRank := 3
+	if quality == access.PlaybackQuality4K {
+		maxRank = 4
+	}
+	return fmt.Sprintf(`CASE UPPER(BTRIM(COALESCE(%s.resolution, ''), %s))
+		WHEN '480P' THEN 1 WHEN '720P' THEN 2 WHEN '1080P' THEN 3
+		WHEN '2160P' THEN 4 WHEN '4320P' THEN 5 ELSE 0 END <= %d`, alias, SQLTrimSpaceChars, maxRank)
+}
+
+// EpisodePlayableUnderCeilingSQL renders, for the episode whose content ID is
+// episodeExpr, the condition that a present file linked to it or spanning it
+// passes FileAllowedByAccess, or "" when the filter sets no playback-quality
+// ceiling. An episode that fails it has no version the viewer may play, so
+// episode lists leave it out rather than offer a title that cannot start.
+// bind records a value and returns its placeholder position, as for
+// mediaFileAccessConditions.
+func EpisodePlayableUnderCeilingSQL(episodeExpr string, filter AccessFilter, bind func(any) int) string {
+	if MediaFileQualityCeilingSQL("mf", filter.MaxPlaybackQuality) == "" {
+		return ""
+	}
+	fileAccess := strings.Join(mediaFileAccessConditions("mf", filter, bind), " AND ")
+	return `(EXISTS (
+		SELECT 1 FROM media_files mf
+		WHERE mf.episode_id = ` + episodeExpr + `
+		  AND mf.missing_since IS NULL
+		  AND ` + fileAccess + `
+	) OR ` + SpanningEpisodeFileExistsSQL(episodeExpr, fileAccess) + `)`
+}
+
+// MediaFileAccessSQL renders FileAllowedByAccess as SQL conditions over the
+// given media_files alias, appending any bind values to args and numbering
+// placeholders from the resulting argument positions. Callers must append the
+// returned args in order.
+//
+// This is the SQL mirror of FileAllowedByAccess and must stay in step with it:
+// it exists so queries that would otherwise ship every candidate file to Go can
+// filter and reduce inside PostgreSQL instead.
+func MediaFileAccessSQL(alias string, filter AccessFilter, args []any) ([]string, []any) {
+	conditions := mediaFileAccessConditions(alias, filter, func(value any) int {
+		args = append(args, value)
+		return len(args)
+	})
+	return conditions, args
+}
+
+// mediaFileAccessConditions is MediaFileAccessSQL for callers that number
+// placeholders themselves: bind records a value and returns its position.
+func mediaFileAccessConditions(alias string, filter AccessFilter, bind func(any) int) []string {
+	conditions := make([]string, 0, 3)
+	if filter.AllowedLibraryIDs != nil {
+		conditions = append(conditions, fmt.Sprintf("%s.media_folder_id = ANY($%d)", alias, bind(filter.AllowedLibraryIDs)))
+	}
+	if len(filter.DisabledLibraryIDs) > 0 {
+		conditions = append(conditions, fmt.Sprintf("NOT (%s.media_folder_id = ANY($%d))", alias, bind(filter.DisabledLibraryIDs)))
+	}
+	if ceiling := MediaFileQualityCeilingSQL(alias, filter.MaxPlaybackQuality); ceiling != "" {
+		conditions = append(conditions, ceiling)
+	}
+	return conditions
+}
+
+// ImageSizeFor is the size to resolve one artwork slot at: the slot's target
+// width when the client gave one, else ImageSize.
+func (f AccessFilter) ImageSizeFor(slot imagesize.Slot) imagesize.Size {
+	return f.Artwork().For(slot)
+}
+
+// Artwork is the client's artwork preference for this request.
+func (f AccessFilter) Artwork() imagesize.Request {
+	return imagesize.Request{Size: f.ImageSize, Widths: f.ImageWidths}
+}

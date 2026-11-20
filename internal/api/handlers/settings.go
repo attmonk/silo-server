@@ -1,0 +1,876 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	"github.com/Silo-Server/silo-server/internal/settingskeys"
+	"github.com/Silo-Server/silo-server/internal/settingsmigrate"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// deviceSeenThrottle bounds how often a device's last_seen_at is refreshed from
+// request traffic. Device-setting reads each registered the device (an upsert
+// on a single per-device row), so a page that fetches many settings serialized
+// hundreds of upserts on that row's lock. Skipping the upsert when the device
+// was seen within this window removes the contention while keeping last_seen
+// fresh to within the window.
+const deviceSeenThrottle = 5 * time.Minute
+
+const SubtitleAppearanceSettingKey = "subtitle_appearance"
+const (
+	legacyAndroidNextUpPromptSettingKey = "player.next_up_prompt_seconds"
+	canonicalNextUpPromptSettingKey     = "playback.next_up_prompt_seconds"
+)
+const (
+	libraryPageStateSettingKey         = "ui.library_page_state"
+	rememberLibraryPageStateSettingKey = "ui.remember_library_page_state"
+	searchMediaScopeSettingKey         = "search.media_scope"
+	dateFormatSettingKey               = "ui.date_format"
+	timeFormatSettingKey               = "ui.time_format"
+)
+
+const (
+	deviceIDHeader       = "X-Silo-Device-Id"
+	deviceNameHeader     = "X-Silo-Device-Name"
+	devicePlatformHeader = "X-Silo-Device-Platform"
+	clientFamilyHeader   = "X-Silo-Client-Family"
+)
+
+// ServerSettingReader reads individual keys from the server_settings table.
+type ServerSettingReader interface {
+	Get(ctx context.Context, key string) (string, error)
+}
+
+// SettingsHandler handles user-scoped settings endpoints.
+type SettingsHandler struct {
+	storeProvider  userstore.UserStoreProvider
+	serverSettings ServerSettingReader
+	// DeviceSightings registers the request's device; the router shares one
+	// instance across every handler that records sightings.
+	DeviceSightings *DeviceSightings
+	EventsHub       *evt.Hub
+	// RecWorker is told when a profile's hidden libraries change. Optional.
+	RecWorker SignalsChangedNotifier
+}
+
+// NewSettingsHandler creates a new SettingsHandler.
+func NewSettingsHandler(provider userstore.UserStoreProvider) *SettingsHandler {
+	return &SettingsHandler{
+		storeProvider:   provider,
+		DeviceSightings: NewDeviceSightings(),
+	}
+}
+
+// SetServerSettings configures the optional server settings reader for overlay config etc.
+func (h *SettingsHandler) SetServerSettings(reader ServerSettingReader) {
+	h.serverSettings = reader
+}
+
+// --- Request/Response types ---
+
+type effectiveSettingResponse struct {
+	Key               string `json:"key"`
+	ProfileID         string `json:"profile_id,omitempty"`
+	UserValue         string `json:"user_value,omitempty"`
+	DeviceValue       string `json:"device_value,omitempty"`
+	EffectiveValue    string `json:"effective_value"`
+	Source            string `json:"source"`
+	HasDeviceOverride bool   `json:"has_device_override"`
+	DeviceID          string `json:"device_id,omitempty"`
+	DeviceName        string `json:"device_name,omitempty"`
+	DevicePlatform    string `json:"device_platform,omitempty"`
+	UpdatedAt         string `json:"updated_at,omitempty"`
+}
+
+type EffectiveSubtitleAppearanceView struct {
+	Key               string `json:"key"`
+	ProfileID         string `json:"profile_id,omitempty"`
+	GlobalValue       string `json:"global_value"`
+	DeviceValue       string `json:"device_value,omitempty"`
+	EffectiveValue    string `json:"effective_value"`
+	HasDeviceOverride bool   `json:"has_device_override"`
+	DeviceID          string `json:"device_id,omitempty"`
+	DeviceName        string `json:"device_name,omitempty"`
+	DevicePlatform    string `json:"device_platform,omitempty"`
+	UpdatedAt         string `json:"updated_at,omitempty"`
+}
+
+type settingsScope string
+
+const (
+	scopeUser   settingsScope = "user"
+	scopeDevice settingsScope = "device"
+)
+
+type settingSpec struct {
+	Scope        settingsScope
+	DefaultValue string
+	Validate     func(string) error
+}
+
+var settingsRegistry = map[string]settingSpec{
+	"playback.preferred_quality": {
+		Scope:        scopeDevice,
+		DefaultValue: "auto",
+		Validate: validateEnumSetting("playback.preferred_quality",
+			"auto", "original", "2160p", "1080p-high", "1080p-medium", "1080p", "1080p-8",
+			"720p-high", "720p-medium", "720p", "480p", "420p", "328p"),
+	},
+	"playback.audio_language": {
+		Scope:        scopeDevice,
+		DefaultValue: "",
+		Validate:     validateLanguageTagSetting("playback.audio_language"),
+	},
+	"playback.auto_skip_intro": {
+		Scope:        scopeDevice,
+		DefaultValue: "false",
+		Validate:     validateBoolSetting("playback.auto_skip_intro"),
+	},
+	"playback.auto_skip_credits": {
+		Scope:        scopeDevice,
+		DefaultValue: "false",
+		Validate:     validateBoolSetting("playback.auto_skip_credits"),
+	},
+	"playback.auto_skip_recap": {
+		Scope:        scopeDevice,
+		DefaultValue: "false",
+		Validate:     validateBoolSetting("playback.auto_skip_recap"),
+	},
+	"playback.auto_play_next_preview": {
+		Scope:        scopeDevice,
+		DefaultValue: "false",
+		Validate:     validateBoolSetting("playback.auto_play_next_preview"),
+	},
+	"playback.auto_play_next": {
+		Scope:        scopeDevice,
+		DefaultValue: "true",
+		Validate:     validateBoolSetting("playback.auto_play_next"),
+	},
+	canonicalNextUpPromptSettingKey: {
+		Scope:        scopeDevice,
+		DefaultValue: "30",
+		Validate:     validateIntRange(canonicalNextUpPromptSettingKey, 0, 120),
+	},
+	SubtitleAppearanceSettingKey: {
+		Scope:        scopeDevice,
+		DefaultValue: "",
+		Validate:     validateJSONSetting(SubtitleAppearanceSettingKey),
+	},
+	libraryPageStateSettingKey: {
+		Scope:        scopeDevice,
+		DefaultValue: "",
+		Validate:     validateJSONSetting(libraryPageStateSettingKey),
+	},
+	rememberLibraryPageStateSettingKey: {
+		Scope:        scopeDevice,
+		DefaultValue: "true",
+		Validate:     validateBoolSetting(rememberLibraryPageStateSettingKey),
+	},
+	// Preferred default scope for global/catalog search. "video" keeps
+	// results to movies and series; "all" mixes audiobooks in.
+	searchMediaScopeSettingKey: {
+		Scope:        scopeUser,
+		DefaultValue: "video",
+		Validate: validateEnumSetting(searchMediaScopeSettingKey,
+			"all", "video", "audiobook"),
+	},
+	// Preferred display formats for dates and clock times. "auto" defers to
+	// the client's locale default.
+	dateFormatSettingKey: {
+		Scope:        scopeUser,
+		DefaultValue: "auto",
+		Validate: validateEnumSetting(dateFormatSettingKey,
+			"auto", "DD/MM/YYYY", "MM/DD/YYYY", "YYYY-MM-DD"),
+	},
+	timeFormatSettingKey: {
+		Scope:        scopeUser,
+		DefaultValue: "auto",
+		Validate:     validateEnumSetting(timeFormatSettingKey, "auto", "12h", "24h"),
+	},
+	"player.hdr_enabled": {
+		Scope:        scopeDevice,
+		DefaultValue: "true",
+		Validate:     validateBoolSetting("player.hdr_enabled"),
+	},
+	"player.dolby_vision_enabled": {
+		Scope:        scopeDevice,
+		DefaultValue: "true",
+		Validate:     validateBoolSetting("player.dolby_vision_enabled"),
+	},
+	"player.dv_profile7_hdr10_fallback": {
+		Scope:        scopeDevice,
+		DefaultValue: "false",
+		Validate:     validateBoolSetting("player.dv_profile7_hdr10_fallback"),
+	},
+	"player.seek_cache_enabled": {
+		Scope:        scopeDevice,
+		DefaultValue: "true",
+		Validate:     validateBoolSetting("player.seek_cache_enabled"),
+	},
+	"player.playback_speed": {
+		Scope:        scopeDevice,
+		DefaultValue: "1",
+		// Range only, no step: this endpoint accepted any in-range speed
+		// before the contract landed, and v1 rules forbid turning an existing
+		// 204 into a 400 before the coordinated cutover. The typed mutation
+		// endpoint enforces the manifest's 0.05 step, and the migration snaps
+		// historical off-step values onto the grid rather than dropping them.
+		Validate: validateFloatRange("player.playback_speed", 0.25, 3.0),
+	},
+	"player.audio_sync_ms": {
+		Scope:        scopeDevice,
+		DefaultValue: "0",
+		Validate:     validateIntRange("player.audio_sync_ms", -5000, 5000),
+	},
+	"player.subtitle_sync_ms": {
+		Scope:        scopeDevice,
+		DefaultValue: "0",
+		Validate:     validateIntRange("player.subtitle_sync_ms", -10000, 10000),
+	},
+	"player.video_gravity": {
+		Scope:        scopeDevice,
+		DefaultValue: "fit",
+		Validate:     validateEnumSetting("player.video_gravity", "fit", "fill", "stretch"),
+	},
+	"player.orientation_mode": {
+		Scope:        scopeDevice,
+		DefaultValue: "landscapeLocked",
+		Validate:     validateEnumSetting("player.orientation_mode", "landscapeLocked", "rotateFreely"),
+	},
+}
+
+// --- Handler methods ---
+
+// DeviceSettingCommand is one device-scoped setting write or delete: the
+// account, the acting profile, the device the client declared in its headers,
+// and the setting key.
+type DeviceSettingCommand struct {
+	UserID    int
+	ProfileID string
+	Device    DeviceMetadata
+	Key       string
+}
+
+// validateDeviceSettingTarget canonicalizes the key and refuses a target v1
+// refuses: an empty or non-device key, or a request that names no device.
+func validateDeviceSettingTarget(cmd *DeviceSettingCommand) error {
+	if cmd.Key == "" {
+		return fieldError("key", "Setting key is required")
+	}
+	cmd.Key = canonicalDeviceSettingKey(cmd.Key)
+	if !keyUsesDeviceScope(cmd.Key) {
+		return fieldError("key", fmt.Sprintf("%s is not a %s setting", cmd.Key, scopeDevice))
+	}
+	if cmd.Device.DeviceID == "" {
+		return fieldError("device_id", "Device id is required")
+	}
+	return nil
+}
+
+// DeviceMetadataFromHeaders reads the device headers the v1 routes read, with
+// the same clamps.
+func DeviceMetadataFromHeaders(h http.Header) DeviceMetadata {
+	return NewDeviceMetadata(h.Get(deviceIDHeader), h.Get(deviceNameHeader), h.Get(devicePlatformHeader))
+}
+
+// NewDeviceMetadata applies the header clamps to already-read values.
+func NewDeviceMetadata(id, name, platform string) DeviceMetadata {
+	return DeviceMetadata{
+		DeviceID:       clampHeaderValue(id, 128),
+		DeviceName:     clampHeaderValue(headerText(name), MaxDeviceNameRunes),
+		DevicePlatform: clampHeaderValue(headerText(platform), 40),
+	}
+}
+
+// headerText returns a display header value as valid UTF-8, which the device
+// registry needs to store it. A value that is not valid UTF-8 is read as
+// ISO-8859-1, the charset HTTP header text historically used: a Tizen TV sends
+// a French name such as "Téléviseur" that way.
+func headerText(value string) string {
+	if utf8.ValidString(value) {
+		return value
+	}
+	runes := make([]rune, len(value))
+	for i := range len(value) {
+		runes[i] = rune(value[i])
+	}
+	return string(runes)
+}
+
+// SetDeviceSetting validates and stores a device-scoped setting for the
+// acting profile, keeping the canonical runtime settings in sync. v1 PUT
+// /settings/device/{key} and v2 updateSubtitleAppearanceDeviceOverride both
+// go through it; a *APIError is a decision the caller renders.
+func (h *SettingsHandler) SetDeviceSetting(ctx context.Context, cmd DeviceSettingCommand, value string) error {
+	if err := validateDeviceSettingTarget(&cmd); err != nil {
+		return err
+	}
+	if err := validateRegisteredSetting(cmd.Key, value, scopeDevice); err != nil {
+		return fieldError("value", err.Error())
+	}
+	store, err := h.storeProvider.ForUser(ctx, cmd.UserID)
+	if err != nil {
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	entry := userstore.DeviceSettingEntry{
+		ProfileID:      cmd.ProfileID,
+		DeviceID:       cmd.Device.DeviceID,
+		DeviceName:     cmd.Device.DeviceName,
+		DevicePlatform: cmd.Device.DevicePlatform,
+		Key:            cmd.Key,
+		Value:          value,
+	}
+	if err := h.syncLegacyDeviceSetting(ctx, store, cmd.UserID, entry, &value); err != nil {
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to set device setting")
+	}
+	return nil
+}
+
+// DeleteDeviceSetting removes a device-scoped setting for the acting profile
+// (and its legacy alias row), refreshing the device registry as the v1 route
+// does. v1 DELETE /settings/device/{key} and v2
+// deleteSubtitleAppearanceDeviceOverride both go through it.
+func (h *SettingsHandler) DeleteDeviceSetting(ctx context.Context, cmd DeviceSettingCommand) error {
+	if err := validateDeviceSettingTarget(&cmd); err != nil {
+		return err
+	}
+	store, err := h.storeProvider.ForUser(ctx, cmd.UserID)
+	if err != nil {
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	h.registerRequestDevice(ctx, store, cmd.ProfileID, cmd.Device)
+
+	entry := userstore.DeviceSettingEntry{ProfileID: cmd.ProfileID, DeviceID: cmd.Device.DeviceID, Key: cmd.Key}
+	if err := h.syncLegacyDeviceSetting(ctx, store, cmd.UserID, entry, nil); err != nil {
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to delete device setting")
+	}
+	return nil
+}
+
+func planLegacyRuntimeSettings(key string, value *string) ([]profileSettingSync, error) {
+	contract, err := settingscontract.Load()
+	if err != nil {
+		return nil, fmt.Errorf("loading settings contract: %w", err)
+	}
+	planner := settingsmigrate.New(contract, settingscontract.ObjectSchemas())
+	if value == nil {
+		keys := planner.RuntimeKeys(key)
+		if len(keys) == 0 {
+			return nil, fmt.Errorf("%s has no canonical runtime target", key)
+		}
+		out := make([]profileSettingSync, 0, len(keys))
+		for _, canonicalKey := range keys {
+			out = append(out, profileSettingSync{key: canonicalKey})
+		}
+		return out, nil
+	}
+	planned, err := planner.PlanRuntimeValue(key, *value)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]profileSettingSync, 0, len(planned))
+	for _, mutation := range planned {
+		out = append(out, profileSettingSync{key: mutation.Key, value: mutation.Value})
+	}
+	return out, nil
+}
+
+// syncLegacyDeviceSetting mirrors a shipped device-setting mutation to its
+// profile_device canonical rows. Alias cleanup participates in the same
+// transaction, so a failure cannot leave the two spellings disagreeing.
+func (h *SettingsHandler) syncLegacyDeviceSetting(
+	ctx context.Context,
+	store userstore.UserStore,
+	userID int,
+	entry userstore.DeviceSettingEntry,
+	value *string,
+) error {
+	writes, err := planLegacyRuntimeSettings(entry.Key, value)
+	if err != nil {
+		// Keep the established loose JSON endpoint compatible when a syntactically
+		// valid legacy document cannot satisfy the stricter canonical schema.
+		slog.WarnContext(ctx, "legacy device setting has no canonical representation; preserving legacy write",
+			"component", "api", "key", entry.Key, "error", err)
+		writes = nil
+	}
+	base := userstore.SettingIdentity{
+		Scope:     settingscontract.ScopeProfileDevice,
+		ProfileID: entry.ProfileID, DeviceID: entry.DeviceID,
+	}
+	return applyLegacyPreferenceSettingsSync(ctx, store, h.EventsHub, userID, base, writes,
+		func(tx userstore.PreferenceSettingsWriter) error {
+			if value == nil {
+				if legacyKey, ok := legacyDeviceSettingKey(entry.Key); ok {
+					if err := tx.DeleteDeviceSetting(ctx, entry.ProfileID, entry.DeviceID, legacyKey); err != nil {
+						return err
+					}
+				}
+				return tx.DeleteDeviceSetting(ctx, entry.ProfileID, entry.DeviceID, entry.Key)
+			}
+			entry.Value = *value
+			if err := tx.SetDeviceSetting(ctx, entry); err != nil {
+				return err
+			}
+			if legacyKey, ok := legacyDeviceSettingKey(entry.Key); ok {
+				return tx.DeleteDeviceSetting(ctx, entry.ProfileID, entry.DeviceID, legacyKey)
+			}
+			return nil
+		})
+}
+
+// planInheritedLegacyUserSettings captures the account-wide settings a newly
+// created profile must inherit while the old generic routes remain mounted.
+// Profile creation calls this inside the same preference transaction as the
+// insert; PostgreSQL's per-user advisory lock and SQLite's write transaction
+// serialize it with the account-setting fan-out path.
+func planInheritedLegacyUserSettings(
+	ctx context.Context,
+	store interface {
+		ListSettings(context.Context) ([]userstore.SettingEntry, error)
+	},
+) ([]profileSettingSync, error) {
+	entries, err := store.ListSettings(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing legacy user settings: %w", err)
+	}
+	var out []profileSettingSync
+	for _, entry := range entries {
+		if !keyUsesUserScope(entry.Key) {
+			continue
+		}
+		value := entry.Value
+		planned, err := planLegacyRuntimeSettings(entry.Key, &value)
+		if err != nil {
+			slog.WarnContext(ctx, "legacy user setting cannot seed a new canonical profile",
+				"component", "api", "key", entry.Key, "error", err)
+			continue
+		}
+		out = append(out, planned...)
+	}
+	return out, nil
+}
+
+// EffectiveSubtitleAppearance resolves the subtitle_appearance setting for
+// the acting profile on the declared device (device override over the
+// profile-wide value), refreshing the device registry as a side effect. v1
+// GET /settings/subtitle_appearance/effective and v2
+// getEffectiveSubtitleAppearance both answer from it.
+func (h *SettingsHandler) EffectiveSubtitleAppearance(ctx context.Context, userID int, profileID string, device DeviceMetadata) (EffectiveSubtitleAppearanceView, error) {
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return EffectiveSubtitleAppearanceView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	h.registerRequestDevice(ctx, store, profileID, device)
+
+	resolved, err := h.resolveEffectiveSetting(ctx, store, profileID, device, SubtitleAppearanceSettingKey)
+	if err != nil {
+		return EffectiveSubtitleAppearanceView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to get setting")
+	}
+
+	return EffectiveSubtitleAppearanceView{
+		Key:               SubtitleAppearanceSettingKey,
+		ProfileID:         resolved.ProfileID,
+		GlobalValue:       resolved.UserValue,
+		DeviceValue:       resolved.DeviceValue,
+		EffectiveValue:    resolved.EffectiveValue,
+		HasDeviceOverride: resolved.HasDeviceOverride,
+		DeviceID:          resolved.DeviceID,
+		DeviceName:        resolved.DeviceName,
+		DevicePlatform:    resolved.DevicePlatform,
+		UpdatedAt:         resolved.UpdatedAt,
+	}, nil
+}
+
+type DeviceMetadata struct {
+	DeviceID       string
+	DeviceName     string
+	DevicePlatform string
+}
+
+func deviceMetadataFromRequest(r *http.Request) DeviceMetadata {
+	return DeviceMetadataFromHeaders(r.Header)
+}
+
+func (h *SettingsHandler) registerRequestDevice(
+	ctx context.Context,
+	store userstore.UserStore,
+	profileID string,
+	device DeviceMetadata,
+) {
+	h.DeviceSightings.Record(ctx, store, profileID, device)
+}
+
+func clampHeaderValue(value string, maxLen int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= maxLen {
+		return value
+	}
+	return string(runes[:maxLen])
+}
+
+func validateRegisteredSetting(key, value string, expectedScope settingsScope) error {
+	key = canonicalDeviceSettingKey(key)
+	spec, ok := settingsRegistry[key]
+	if !ok {
+		return nil
+	}
+	if spec.Scope != expectedScope {
+		return fmt.Errorf("%s is not a %s setting", key, expectedScope)
+	}
+	if spec.Validate == nil {
+		return nil
+	}
+	return spec.Validate(value)
+}
+
+// keyUsesUserScope reports whether a key is stored at account scope by the
+// legacy endpoints.
+//
+// This used to return true for any *unregistered* key, which is the extension
+// bag: a client could invent a production setting unilaterally and the server
+// stored it as an unvalidated string. That is how six ui.* settings and five
+// orphan keys reached production untyped, and closing it is the point of the
+// contract.
+//
+// An unknown key is now simply not a user setting, so the legacy write path
+// rejects it and the canonical API — which validates against the manifest — is
+// the only way to store anything new. That includes the jellycompat:* keys the
+// Jellyfin DisplayPreferences blobs once rode this table under: they live in
+// the dedicated jellycompat_displayprefs table now, and this API neither
+// accepts nor surfaces them.
+func keyUsesUserScope(key string) bool {
+	key = canonicalDeviceSettingKey(key)
+	spec, ok := settingsRegistry[key]
+	return ok && spec.Scope == scopeUser
+}
+
+func keyUsesDeviceScope(key string) bool {
+	key = canonicalDeviceSettingKey(key)
+	spec, ok := settingsRegistry[key]
+	return ok && spec.Scope == scopeDevice
+}
+
+func isMigratedPlaybackSetting(key string) bool {
+	key = canonicalDeviceSettingKey(key)
+	switch key {
+	case "playback.preferred_quality",
+		"playback.audio_language",
+		"playback.auto_skip_intro",
+		"playback.auto_skip_credits",
+		"playback.auto_play_next",
+		canonicalNextUpPromptSettingKey:
+		return true
+	default:
+		return false
+	}
+}
+
+// canonicalDeviceSettingKey keeps the Android key shipped before the server's
+// canonical playback namespace was finalized working without storing two
+// independent values. New clients should use playback.next_up_prompt_seconds.
+func canonicalDeviceSettingKey(key string) string {
+	if key == legacyAndroidNextUpPromptSettingKey {
+		return canonicalNextUpPromptSettingKey
+	}
+	return key
+}
+
+func legacyDeviceSettingKey(key string) (string, bool) {
+	if canonicalDeviceSettingKey(key) == canonicalNextUpPromptSettingKey {
+		return legacyAndroidNextUpPromptSettingKey, true
+	}
+	return "", false
+}
+
+// getDeviceSettingWithLegacyFallback is a read-only canonical-first lookup for
+// the Android key used before the playback namespace was finalized. Canonical
+// PUT and DELETE requests own migration and cleanup.
+func getDeviceSettingWithLegacyFallback(
+	ctx context.Context,
+	store userstore.UserStore,
+	profileID, deviceID, key string,
+) (*userstore.DeviceSettingEntry, error) {
+	override, err := store.GetDeviceSetting(ctx, profileID, deviceID, key)
+	if err != nil || override != nil {
+		return override, err
+	}
+
+	legacyKey, ok := legacyDeviceSettingKey(key)
+	if !ok {
+		return nil, nil
+	}
+	return store.GetDeviceSetting(ctx, profileID, deviceID, legacyKey)
+}
+
+func usesLegacyUserFallback(key string) bool {
+	return key == SubtitleAppearanceSettingKey
+}
+
+func validateEnumSetting(key string, allowed ...string) func(string) error {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, value := range allowed {
+		allowedSet[value] = struct{}{}
+	}
+	return func(value string) error {
+		if _, ok := allowedSet[value]; ok {
+			return nil
+		}
+		return fmt.Errorf("%s must be one of %s", key, strings.Join(allowed, ", "))
+	}
+}
+
+func validateBoolSetting(key string) func(string) error {
+	return func(value string) error {
+		if value == "true" || value == "false" {
+			return nil
+		}
+		return fmt.Errorf("%s must be true or false", key)
+	}
+}
+
+func validateIntRange(key string, min, max int) func(string) error {
+	return func(value string) error {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("%s must be an integer", key)
+		}
+		if parsed < min || parsed > max {
+			return fmt.Errorf("%s must be between %d and %d", key, min, max)
+		}
+		return nil
+	}
+}
+
+func validateFloatRange(key string, min, max float64) func(string) error {
+	return validateFloatRangeStep(key, min, max, 0)
+}
+
+// validateFloatRangeStep enforces the range and, when step is positive, that
+// the value sits on the step grid anchored at min.
+//
+// The step check delegates to settingscontract.StepAligned so this endpoint
+// enforces exactly what contracts/settings/v1/manifest.json declares. Before
+// this, player.playback_speed advertised a 0.05 step that nothing enforced, so
+// the server happily stored 0.26 — a value no client's stepper can represent
+// and that every client would silently snap on the next write.
+func validateFloatRangeStep(key string, min, max, step float64) func(string) error {
+	return func(value string) error {
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("%s must be a number", key)
+		}
+		if math.IsNaN(parsed) || parsed < min || parsed > max {
+			return fmt.Errorf("%s must be between %g and %g", key, min, max)
+		}
+		if !settingscontract.StepAligned(parsed, min, step) {
+			return fmt.Errorf("%s must be a multiple of %g starting from %g", key, step, min)
+		}
+		return nil
+	}
+}
+
+// validateLanguageTagSetting accepts a BCP 47 language tag, or the empty string.
+//
+// The empty string is the legacy wire form for "no preference": the string-only
+// settings API has no way to send null, and both the Android and web clients
+// send "" to clear the choice. The contract expresses the same state as null,
+// which is why every language definition there is nullable.
+//
+// Anything else must be a well-formed tag. The previous check was "32
+// characters or fewer", so the server accepted "!!!" for a field the manifest
+// declares as language_tag — and stored it where track matching would silently
+// never match.
+func validateLanguageTagSetting(key string) func(string) error {
+	return func(value string) error {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return nil
+		}
+		if _, ok := settingscontract.NormalizeLanguageTag(trimmed); !ok {
+			return fmt.Errorf("%s must be a BCP 47 language tag such as en or en-US", key)
+		}
+		return nil
+	}
+}
+
+func validateJSONSetting(key string) func(string) error {
+	return func(value string) error {
+		var decoded any
+		if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+			return fmt.Errorf("%s must be valid JSON", key)
+		}
+		return nil
+	}
+}
+
+func (h *SettingsHandler) resolveEffectiveSetting(
+	ctx context.Context,
+	store userstore.UserStore,
+	profileID string,
+	device DeviceMetadata,
+	key string,
+) (effectiveSettingResponse, error) {
+	requestedKey := key
+	key = canonicalDeviceSettingKey(key)
+	spec, hasSpec := settingsRegistry[key]
+	resolved := effectiveSettingResponse{
+		Key:            requestedKey,
+		ProfileID:      profileID,
+		DeviceID:       device.DeviceID,
+		DeviceName:     device.DeviceName,
+		DevicePlatform: device.DevicePlatform,
+	}
+
+	if hasSpec && spec.Scope == scopeDevice {
+		resolved.EffectiveValue = ""
+		resolved.Source = "default"
+		if spec.DefaultValue != "" {
+			resolved.EffectiveValue = spec.DefaultValue
+		} else {
+			resolved.Source = "unset"
+		}
+		if device.DeviceID != "" {
+			override, err := getDeviceSettingWithLegacyFallback(ctx, store, profileID, device.DeviceID, key)
+			if err != nil {
+				return effectiveSettingResponse{}, err
+			}
+			if override != nil {
+				resolved.DeviceValue = override.Value
+				resolved.EffectiveValue = override.Value
+				resolved.Source = "device"
+				resolved.HasDeviceOverride = true
+				resolved.DeviceName = override.DeviceName
+				resolved.DevicePlatform = override.DevicePlatform
+				resolved.UpdatedAt = override.UpdatedAt
+				return resolved, nil
+			}
+			if isMigratedPlaybackSetting(key) {
+				legacyValue, err := store.GetSetting(ctx, key)
+				if err != nil {
+					return effectiveSettingResponse{}, err
+				}
+				if legacyValue != "" {
+					entry := userstore.DeviceSettingEntry{
+						ProfileID:      profileID,
+						DeviceID:       device.DeviceID,
+						DeviceName:     device.DeviceName,
+						DevicePlatform: device.DevicePlatform,
+						Key:            key,
+						Value:          legacyValue,
+					}
+					if err := store.SetDeviceSetting(ctx, entry); err != nil {
+						return effectiveSettingResponse{}, err
+					}
+					resolved.DeviceValue = legacyValue
+					resolved.EffectiveValue = legacyValue
+					resolved.Source = "device"
+					resolved.HasDeviceOverride = true
+					return resolved, nil
+				}
+			}
+		}
+		if usesLegacyUserFallback(key) {
+			legacyValue, err := store.GetSetting(ctx, key)
+			if err != nil {
+				return effectiveSettingResponse{}, err
+			}
+			if legacyValue != "" {
+				resolved.UserValue = legacyValue
+				resolved.EffectiveValue = legacyValue
+				resolved.Source = "user"
+				return resolved, nil
+			}
+		}
+		return resolved, nil
+	}
+
+	userValue, err := store.GetSetting(ctx, key)
+	if err != nil {
+		return effectiveSettingResponse{}, err
+	}
+	resolved.UserValue = userValue
+	resolved.EffectiveValue = userValue
+	resolved.Source = "user"
+
+	if resolved.EffectiveValue != "" {
+		return resolved, nil
+	}
+
+	if hasSpec && spec.DefaultValue != "" {
+		resolved.EffectiveValue = spec.DefaultValue
+		resolved.Source = "default"
+		return resolved, nil
+	}
+
+	resolved.Source = "unset"
+	return resolved, nil
+}
+
+const defaultCardQuickActionMode = "both"
+
+// isCardQuickActionMode reports whether v is one of the ui.card_quick_actions
+// enum members, read from the settings contract so a new mode never has to be
+// re-listed here.
+func isCardQuickActionMode(v string) bool {
+	contract, err := settingscontract.Load()
+	if err != nil {
+		return false
+	}
+	def, ok := contract.Lookup(settingskeys.UiCardQuickActions)
+	if !ok {
+		return false
+	}
+	for _, member := range def.ValueSchema.Values {
+		if member.Value == v {
+			return true
+		}
+	}
+	return false
+}
+
+// OverlayConfigView is returned by GET /settings/overlay-config.
+type OverlayConfigView struct {
+	Enabled             bool   `json:"enabled"`
+	Defaults            string `json:"defaults,omitempty"`
+	QuickActionsEnabled bool   `json:"quick_actions_enabled"`
+	QuickActionsDefault string `json:"quick_actions_default"`
+}
+
+// OverlayConfig reads the server-wide overlay defaults. v1 GET
+// /settings/overlay-config and v2 getOverlayConfig both answer from it; a
+// missing server-settings reader yields the built-in defaults.
+func (h *SettingsHandler) OverlayConfig(ctx context.Context) OverlayConfigView {
+	resp := OverlayConfigView{
+		Enabled:             true,
+		QuickActionsEnabled: false,
+		QuickActionsDefault: defaultCardQuickActionMode,
+	}
+
+	if h.serverSettings != nil {
+		if v, _ := h.serverSettings.Get(ctx, "overlays.enabled"); v == "false" {
+			resp.Enabled = false
+		}
+		if v, _ := h.serverSettings.Get(ctx, "defaults.card_overlays"); v != "" {
+			resp.Defaults = v
+		}
+		if v, _ := h.serverSettings.Get(ctx, "defaults.card_quick_actions_enabled"); v == "true" {
+			resp.QuickActionsEnabled = true
+		}
+		if v, _ := h.serverSettings.Get(ctx, "defaults.card_quick_actions"); isCardQuickActionMode(v) {
+			resp.QuickActionsDefault = v
+		}
+	}
+	return resp
+}

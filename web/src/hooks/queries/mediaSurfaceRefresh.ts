@@ -1,0 +1,775 @@
+import type { Query, QueryClient } from "@tanstack/react-query";
+import { API_READ_TIMEOUT_MS } from "@/api/requestDeadline";
+import type {
+  HomeSectionItemsResponse,
+  ItemDetail,
+  SeasonDetailResponse,
+  SeasonsResponse,
+  SectionItem,
+} from "@/api/types";
+import {
+  adminKeys,
+  calendarKeys,
+  catalogKeys,
+  collectionKeys,
+  episodeKeys,
+  favoriteKeys,
+  historyKeys,
+  itemKeys,
+  libraryCollectionKeys,
+  personKeys,
+  progressKeys,
+  recKeys,
+  sectionKeys,
+  shuffleKeys,
+  watchlistKeys,
+} from "./keys";
+import { sectionShowsWholeList } from "./homeRowLimit";
+import { PERSONAL_STATE_WRITE_KEY } from "./personalStateWrites";
+import {
+  activeCatalogQueryMatchesLibrary,
+  activeSectionQueryMatchesLibrary,
+  isLibraryLayoutQueryKey,
+} from "@/lib/queryInvalidation";
+import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
+
+interface InvalidateMediaSurfaceOptions {
+  itemId?: string;
+  // The item's series, when the event names it. Watched and progress events
+  // carry it for episodes and seasons, so the series and its seasons refresh
+  // even when this client has never cached the item (#796).
+  seriesId?: string;
+  libraryId?: number;
+  watchedKeys?: Array<readonly unknown[]>;
+  skipItemDetail?: boolean;
+  /**
+   * Skip every query whose key names itemId, for an item that moved to a new
+   * content ID: refetching its old ID would only return 404.
+   */
+  skipItemQueries?: boolean;
+  skipSimilarItems?: boolean;
+  // Items already found related to itemId, such as through a watch detail
+  // dropped since (dropInactiveWatchDetail), which was the only link from an
+  // episode to its series.
+  knownRelatedIds?: ReadonlySet<string>;
+  // The item may be one this client has never seen, such as an episode a
+  // scan just added. Only catalog events can say so; progress, favorite and
+  // watchlist events are about items that already exist.
+  itemMayBeNew?: boolean;
+  // Set internally for such an item when nothing in the cache names it,
+  // with the items owning the cached lists, whose detail (a season's
+  // episode count) changes with them.
+  refreshItemKeyedLists?: boolean;
+  listOwnerIds?: ReadonlySet<string>;
+  /**
+   * Refresh catalog lists now, even while a list page is on its first read,
+   * for a change the viewer must not keep seeing, such as losing access to a
+   * library. See holdCatalogListsForFirstReads.
+   */
+  skipFirstReadHold?: boolean;
+}
+
+const MEDIA_SURFACE_REFRESH_DELAY_MS = 600;
+// Upper bound on how long coalescing may postpone a refresh. Without it a
+// sustained event stream (a history import, a watch-provider sync) re-arms the
+// timer indefinitely and the surfaces never refresh at all.
+const MEDIA_SURFACE_REFRESH_MAX_WAIT_MS = 3000;
+const MEDIA_SURFACE_PREFIXES = [
+  itemKeys.all,
+  progressKeys.all,
+  historyKeys.all,
+  favoriteKeys.all,
+  watchlistKeys.all,
+  personKeys.all,
+  adminKeys.playbackHistory({}).slice(0, 2),
+];
+const scheduledInvalidations = new WeakMap<
+  QueryClient,
+  Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      deadline: number;
+      options: InvalidateMediaSurfaceOptions;
+    }
+  >
+>();
+const owedDetailRefreshes = new WeakMap<QueryClient, Set<string>>();
+
+// Writing data marks a query fresh. A detail that was already invalidated,
+// such as by another device's metadata save while no page showed it, still
+// owes a refetch (refetchDetailWhenWritesSettle).
+export function updateCatalogItemDetail(
+  queryClient: QueryClient,
+  itemId: string,
+  updater: (detail: ItemDetail) => ItemDetail,
+) {
+  const filters = { predicate: (query: Query) => isItemDetailQueryKey(query.queryKey, itemId) };
+  const owesRefetch = queryClient
+    .getQueryCache()
+    .findAll(filters)
+    .some((query) => query.state.isInvalidated);
+  queryClient.setQueriesData<ItemDetail>(filters, (current) =>
+    current ? updater(current) : current,
+  );
+  if (owesRefetch) refetchDetailWhenWritesSettle(queryClient, itemId);
+}
+
+// A read made while a write is pending can miss it and replace the write's
+// patch, and the toggles' own refreshes skip the item's detail. So an owed
+// detail is invalidated once no personal-state write is pending: overlapping
+// writes share one refetch after the last of them, and a patch with no write
+// behind it, such as a realtime event's, refetches at once.
+function refetchDetailWhenWritesSettle(queryClient: QueryClient, itemId: string) {
+  const waiting = owedDetailRefreshes.get(queryClient);
+  if (waiting) {
+    waiting.add(itemId);
+    return;
+  }
+  const owed = new Set([itemId]);
+  owedDetailRefreshes.set(queryClient, owed);
+  const refetchOnceSettled = () => {
+    if (queryClient.isMutating({ mutationKey: PERSONAL_STATE_WRITE_KEY }) > 0) return;
+    unsubscribe();
+    owedDetailRefreshes.delete(queryClient);
+    void queryClient.invalidateQueries({
+      predicate: (query) => [...owed].some((id) => isItemDetailQueryKey(query.queryKey, id)),
+    });
+  };
+  const unsubscribe = queryClient.getMutationCache().subscribe(refetchOnceSettled);
+  refetchOnceSettled();
+}
+
+// Callers must await this before writing optimistic state. The default
+// `revert: true` restores the pre-fetch snapshot and leaves the query idle;
+// `revert: false` would instead put an in-flight query into an error state
+// carrying a CancelledError, which surfaces as a bogus "CancelledError" toast.
+export function cancelItemDetailQueries(queryClient: QueryClient, itemId: string) {
+  return queryClient.cancelQueries({
+    predicate: (query) => isItemDetailQueryKey(query.queryKey, itemId),
+  });
+}
+
+// dropInactiveWatchDetail drops a closed player's cached watch detail for an
+// item whose resume position changed, at once: the player starts from that
+// detail's position while it refetches. The detail may be the only link from
+// an episode to its series, so the items it led to are returned for the
+// media surface refresh (knownRelatedIds). An open player's query is active
+// and keeps its data. Undefined when there was nothing to drop.
+export function dropInactiveWatchDetail(
+  queryClient: QueryClient,
+  itemId: string,
+): ReadonlySet<string> | undefined {
+  const filters = { queryKey: [...itemKeys.all, "watchDetail", itemId], type: "inactive" } as const;
+  if (queryClient.getQueryCache().findAll(filters).length === 0) return undefined;
+  const related = relatedItemIds(queryClient, itemId);
+  queryClient.removeQueries(filters);
+  return related;
+}
+
+export function removeItemFromHomeSectionCaches(
+  queryClient: QueryClient,
+  itemId: string,
+  sectionType?: string | ReadonlySet<string>,
+) {
+  queryClient.setQueriesData<HomeSectionItemsResponse>(
+    {
+      predicate: (query) =>
+        Array.isArray(query.queryKey) &&
+        query.queryKey[0] === sectionKeys.homeItemsRoot()[0] &&
+        query.queryKey[1] === sectionKeys.homeItemsRoot()[1] &&
+        query.queryKey[2] === sectionKeys.homeItemsRoot()[2],
+    },
+    (current) => {
+      if (!current?.section) {
+        return current;
+      }
+      if (
+        typeof sectionType === "string"
+          ? current.section.section_type !== sectionType
+          : sectionType && !sectionType.has(current.section.section_type)
+      ) {
+        return current;
+      }
+      const kept = (item: SectionItem) => item.content_id !== itemId;
+      const nextItems = current.section.items.filter(kept);
+      if (nextItems.length === current.section.items.length) {
+        return current;
+      }
+      const section = {
+        ...current.section,
+        total_count: Math.max(
+          0,
+          current.section.total_count - (current.section.items.length - nextItems.length),
+        ),
+        items: nextItems,
+      };
+      // A row cut at its limit can hold more than its count says, so losing a
+      // card must not make it read as its whole list.
+      if (!sectionShowsWholeList(current.section) && sectionShowsWholeList(section)) {
+        section.total_count = nextItems.length + 1;
+      }
+      return {
+        ...current,
+        // A completed row's shown cards lose the removed ones, so none of its
+        // later cards moves up into them (see dropCrossSectionDuplicates).
+        ...(current.shown !== undefined && {
+          shown: current.section.items.slice(0, current.shown).filter(kept).length,
+        }),
+        section,
+      };
+    },
+  );
+}
+
+function isWatchDetailQueryKey(queryKey: readonly unknown[]) {
+  return queryKey[0] === "items" && queryKey[1] === "watchDetail";
+}
+
+export function isItemDetailQueryKey(queryKey: unknown, itemId: string) {
+  return (
+    Array.isArray(queryKey) &&
+    ((queryKey[0] === "catalog" &&
+      queryKey[1] === "items" &&
+      queryKey[2] === itemId &&
+      queryKey[3] === "detail") ||
+      (queryKey[0] === "items" && queryKey[1] === "detail" && queryKey[2] === itemId))
+  );
+}
+
+function queryKeyStartsWith(queryKey: readonly unknown[], prefix: readonly unknown[]) {
+  return (
+    prefix.length <= queryKey.length &&
+    prefix.every((part, index) => {
+      const candidate = queryKey[index];
+      if (Object.is(part, candidate)) return true;
+      if (
+        typeof part !== "object" ||
+        part === null ||
+        typeof candidate !== "object" ||
+        candidate === null
+      ) {
+        return false;
+      }
+      return JSON.stringify(part) === JSON.stringify(candidate);
+    })
+  );
+}
+
+// Only these shapes are narrowed by itemId. episodeKeys.byItem is left out on
+// purpose: it is invalidated only through watchedKeys, and mapping it here
+// would change which episode lists a refresh touches.
+function getQueryKeyItemId(queryKey: readonly unknown[]): string | undefined {
+  if (!Array.isArray(queryKey) || queryKey.length < 2) return undefined;
+  if (
+    queryKey[0] === "items" &&
+    (queryKey[1] === "detail" || queryKey[1] === "watchDetail" || queryKey[1] === "markers") &&
+    typeof queryKey[2] === "string"
+  ) {
+    return queryKey[2];
+  }
+  // A series' season list, season detail and episodes are keyed by series.
+  if (
+    queryKey[0] === "catalog" &&
+    (queryKey[1] === "items" || queryKey[1] === "series") &&
+    typeof queryKey[2] === "string"
+  ) {
+    return queryKey[2];
+  }
+  // ratingKeys.list() shares the ["ratings", x] shape; "list" is not an item ID.
+  if (queryKey[0] === "ratings" && typeof queryKey[1] === "string" && queryKey[1] !== "list") {
+    return queryKey[1];
+  }
+  return undefined;
+}
+
+// The item whose episodes or seasons a cached list query holds: an episode
+// list belongs to its season (or series), a season list to its series.
+function listOwnerId(queryKey: readonly unknown[]): string | undefined {
+  if (queryKey[0] === "catalog" && queryKey[1] === "series" && typeof queryKey[2] === "string") {
+    return queryKey[2];
+  }
+  return getQueryKeyItemId(queryKey);
+}
+
+function listedChildIds(data: unknown): string[] {
+  if (typeof data !== "object" || data === null) return [];
+  const ids: string[] = [];
+  for (const field of ["episodes", "seasons"] as const) {
+    const list = (data as Record<string, unknown>)[field];
+    if (!Array.isArray(list)) continue;
+    for (const entry of list) {
+      const id = (entry as { content_id?: unknown } | null)?.content_id;
+      if (typeof id === "string") ids.push(id);
+    }
+  }
+  return ids;
+}
+
+// relatedItemIds is itemId plus the items whose cached state derives from it,
+// as far as the cache shows: its parents (the series named by its detail, and
+// the season or series whose cached list holds it, and theirs) and its
+// children (the episodes or seasons its own cached lists hold, the cached
+// details that name it as their series, and theirs).
+// Realtime events and watched marks name only the item itself, so narrowing
+// to that one ID would leave an open season grid, series watched totals or a
+// marked season's episodes stale.
+//
+// seriesId is the item's series when the event names it. The series and its
+// cached seasons are related even when nothing cached links the item to them;
+// the series' other episodes are not, since one episode's change doesn't move
+// them.
+export function relatedItemIds(
+  queryClient: QueryClient,
+  itemId: string,
+  seriesId?: string,
+): Set<string> {
+  // Index season identities before the links, then walk them, so a
+  // series with many cached seasons and episodes costs two cache scans,
+  // not one per item.
+  const childrenOf = new Map<string, string[]>();
+  const parentsOf = new Map<string, string[]>();
+  const queries = queryClient.getQueryCache().getAll();
+  const seasonIds = new Map<string, Map<number, string>>();
+  const rememberSeason = (
+    seriesId: string,
+    season: Pick<ItemDetail, "content_id" | "season_number"> | undefined,
+  ) => {
+    if (!season?.content_id || season.season_number == null) return;
+    let seasons = seasonIds.get(seriesId);
+    if (!seasons) {
+      seasons = new Map();
+      seasonIds.set(seriesId, seasons);
+    }
+    seasons.set(season.season_number, season.content_id);
+  };
+  for (const query of queries) {
+    const owner = listOwnerId(query.queryKey);
+    if (!owner) continue;
+    if (query.queryKey[0] === "catalog" && query.queryKey[1] === "series") {
+      for (const season of (query.state.data as SeasonsResponse | undefined)?.seasons ?? []) {
+        rememberSeason(owner, season);
+      }
+      rememberSeason(owner, (query.state.data as SeasonDetailResponse | undefined)?.season);
+    }
+    if (isItemDetailQueryKey(query.queryKey, owner)) {
+      const detail = query.state.data as ItemDetail | undefined;
+      if (detail?.type === "season" && detail.series_id) {
+        rememberSeason(detail.series_id, detail);
+      }
+    }
+  }
+  const add = (edges: Map<string, string[]>, from: string, to: string) => {
+    const list = edges.get(from);
+    if (list) list.push(to);
+    else edges.set(from, [to]);
+  };
+  const link = (parent: string, child: string) => {
+    if (parent === child) return;
+    add(childrenOf, parent, child);
+    add(parentsOf, child, parent);
+  };
+  for (const query of queries) {
+    const owner = listOwnerId(query.queryKey);
+    if (!owner) continue;
+    // Numbered season episode keys name the series, while their members
+    // belong to the season whose identity the first pass found.
+    const numberedSeason =
+      query.queryKey[0] === "catalog" &&
+      query.queryKey[1] === "series" &&
+      query.queryKey[5] === "episodes" &&
+      typeof query.queryKey[4] === "number"
+        ? seasonIds.get(owner)?.get(query.queryKey[4])
+        : undefined;
+    if (numberedSeason) link(owner, numberedSeason);
+    for (const child of listedChildIds(query.state.data)) link(numberedSeason ?? owner, child);
+    // A season's detail is cached under its series, so its own ID is only
+    // in the data.
+    const seasonId = (query.state.data as { season?: { content_id?: unknown } } | undefined)?.season
+      ?.content_id;
+    if (typeof seasonId === "string") link(owner, seasonId);
+    if (isItemDetailQueryKey(query.queryKey, owner) || isWatchDetailQueryKey(query.queryKey)) {
+      const detail = query.state.data as ItemDetail | undefined;
+      const seriesId = detail?.series_id;
+      // A detail names its series, and derives its series title, backdrop
+      // and credits from it. A season page opened directly has no cached
+      // season list, so this edge is how a series change reaches it. A
+      // playing episode's watch detail names it too, so its progress
+      // reaches the series' watched summary.
+      if (seriesId) {
+        link(seriesId, owner);
+        const seasonId =
+          detail.season_number == null
+            ? undefined
+            : seasonIds.get(seriesId)?.get(detail.season_number);
+        if (seasonId) link(seasonId, owner);
+      }
+    }
+  }
+
+  const related = new Set([itemId]);
+  const walk = (edges: Map<string, string[]>) => {
+    const pending = [itemId];
+    while (pending.length > 0) {
+      for (const next of edges.get(pending.pop() as string) ?? []) {
+        if (!related.has(next)) {
+          related.add(next);
+          pending.push(next);
+        }
+      }
+    }
+  };
+  walk(parentsOf);
+  walk(childrenOf);
+  if (seriesId && seriesId !== itemId) {
+    related.add(seriesId);
+    for (const season of seasonIds.get(seriesId)?.values() ?? []) related.add(season);
+  }
+  return related;
+}
+
+function shouldInvalidateMediaSurfaceQuery(
+  queryKey: readonly unknown[],
+  options: InvalidateMediaSurfaceOptions,
+  relatedIds?: ReadonlySet<string>,
+) {
+  if (options.skipItemDetail && options.itemId && isItemDetailQueryKey(queryKey, options.itemId)) {
+    return false;
+  }
+  if (options.skipItemQueries && options.itemId && queryKey.includes(options.itemId)) {
+    return false;
+  }
+
+  if (options.itemId) {
+    const targetItemId = getQueryKeyItemId(queryKey);
+    // Keys for related items (see relatedItemIds) or named in watchedKeys (a
+    // watched episode's season or series, say) belong to other item IDs by
+    // design; don't narrow them away.
+    if (
+      targetItemId &&
+      targetItemId !== options.itemId &&
+      !relatedIds?.has(targetItemId) &&
+      !isWatchedKey(queryKey, options) &&
+      !(
+        options.refreshItemKeyedLists &&
+        (isItemKeyedListQuery(queryKey) ||
+          (options.listOwnerIds?.has(targetItemId) && isItemDetailQueryKey(queryKey, targetItemId)))
+      )
+    ) {
+      return false;
+    }
+  }
+
+  if (queryKeyStartsWith(queryKey, catalogKeys.all)) {
+    return activeCatalogQueryMatchesLibrary(queryKey, options.libraryId);
+  }
+  if (queryKeyStartsWith(queryKey, sectionKeys.all)) {
+    return (
+      !isLibraryLayoutQueryKey(queryKey) &&
+      activeSectionQueryMatchesLibrary(queryKey, options.libraryId)
+    );
+  }
+  if (queryKeyStartsWith(queryKey, recKeys.all)) {
+    return !(options.skipSimilarItems && queryKey[1] === "similar");
+  }
+  if (queryKeyStartsWith(queryKey, libraryCollectionKeys.all)) {
+    return options.libraryId === undefined || queryKey[2] === options.libraryId;
+  }
+
+  if (MEDIA_SURFACE_PREFIXES.some((prefix) => queryKeyStartsWith(queryKey, prefix))) {
+    return true;
+  }
+
+  return isWatchedKey(queryKey, options);
+}
+
+// isItemKeyedListQuery reports a list of a series' or season's children, keyed
+// by the parent: a season list, a season's detail and episodes, or an item's
+// episodes. A new child can't be traced to its parent's lists from the cache.
+function isItemKeyedListQuery(queryKey: readonly unknown[]): boolean {
+  return queryKey[0] === "catalog" && (queryKey[1] === "series" || queryKey[3] === "episodes");
+}
+
+// isWatchedKey is a prefix match on purpose: everything under a watched key
+// (a watched season's or episode's detail variants) changes with it, so it is
+// exempt from the itemId narrowing too. Don't tighten it to an exact match.
+// An item key also matches a watched key for the same item in any library:
+// watched keys carry the "default" library segment, while an item opened
+// through its library caches under that library's ID.
+function isWatchedKey(queryKey: readonly unknown[], options: InvalidateMediaSurfaceOptions) {
+  const targetItemId = getQueryKeyItemId(queryKey);
+  return (options.watchedKeys ?? []).some(
+    (key) =>
+      queryKeyStartsWith(queryKey, key) ||
+      (targetItemId !== undefined &&
+        getQueryKeyItemId(key) === targetItemId &&
+        queryKeyStartsWith(queryKey, key.slice(0, 2))),
+  );
+}
+
+export async function invalidateMediaSurfaceQueries(
+  queryClient: QueryClient,
+  options: InvalidateMediaSurfaceOptions = {},
+) {
+  // Duplicate refetches are held down by the coalescing scheduler below, not by
+  // `cancelRefetch: false` — reusing an in-flight request would let a response
+  // that predates the mutation satisfy the invalidation and land in the cache
+  // as fresh.
+  const relatedIds = options.itemId
+    ? relatedItemIds(queryClient, options.itemId, options.seriesId)
+    : undefined;
+  options.knownRelatedIds?.forEach((id) => relatedIds?.add(id));
+  // A new item nothing in the cache knows about, such as an episode a scan
+  // just added, can't be traced to the season or series lists that should now
+  // show it, so its event refreshes every such list. Other items' detail
+  // stays narrowed away. A caller that names the keys it changed
+  // (watchedKeys) has scoped it already.
+  const scoped =
+    options.itemMayBeNew &&
+    options.itemId &&
+    !options.watchedKeys?.length &&
+    relatedIds?.size === 1 &&
+    !cacheHasItemDetail(queryClient, options.itemId)
+      ? { ...options, refreshItemKeyedLists: true, listOwnerIds: itemKeyedListOwners(queryClient) }
+      : options;
+  const matches = (query: Query) =>
+    shouldInvalidateMediaSurfaceQuery(query.queryKey, scoped, relatedIds);
+  const runningLetterIndexes = refetchLetterIndexesWhenDone(queryClient, matches);
+  const holdsCatalogLists =
+    !options.skipFirstReadHold && holdCatalogListsForFirstReads(queryClient, matches);
+  await queryClient.invalidateQueries({
+    predicate: (query) =>
+      matches(query) &&
+      !runningLetterIndexes.has(query) &&
+      !(holdsCatalogLists && isCatalogListQuery(query)),
+  });
+}
+
+const CATALOG_LIST_KEY = [...catalogKeys.all, "list"] as const;
+// How long a sweep waits for each catalog page on its first read, from when
+// the hold first sees it: as long as a read may take before the client gives
+// up on it, so every read that can still land does, however late in the hold
+// it started.
+const CATALOG_LIST_READ_HOLD_MS = API_READ_TIMEOUT_MS;
+const heldCatalogListSweeps = new WeakMap<QueryClient, Array<(query: Query) => boolean>>();
+
+function isCatalogListQuery(query: Query) {
+  return queryKeyStartsWith(query.queryKey, CATALOG_LIST_KEY);
+}
+
+function firstCatalogListReads(queryClient: QueryClient, matches: (query: Query) => boolean) {
+  return queryClient.getQueryCache().findAll({
+    queryKey: CATALOG_LIST_KEY,
+    fetchStatus: "fetching",
+    predicate: (query) => query.state.data === undefined && matches(query),
+  });
+}
+
+// A catalog page on its first read has nothing to show until it lands. A
+// sweep refetches page 0, and page 0 coming back under a new snapshot re-keys
+// every later page: the first read loses its last observer, which aborts it,
+// and the page starts over under the new key with no earlier page to stand in
+// for it. A jump deep into a large title-ordered library takes longer than a
+// scan's sweep window to seek, so during a scan it never landed. While a list
+// page of the sweep is on its first read, the sweep leaves the catalog lists
+// alone and sweeps them once no first read remains that started within the
+// last CATALOG_LIST_READ_HOLD_MS; a read that runs past that fails on the
+// client anyway. Sweeps arriving meanwhile join the held one. A page already
+// shown still reloads under the new snapshot, showing what it held until
+// then. Returns whether the sweep must leave the lists alone.
+function holdCatalogListsForFirstReads(
+  queryClient: QueryClient,
+  matches: (query: Query) => boolean,
+): boolean {
+  const held = heldCatalogListSweeps.get(queryClient);
+  if (held) {
+    held.push(matches);
+    return true;
+  }
+  if (firstCatalogListReads(queryClient, matches).length === 0) return false;
+  const sweeps = [matches];
+  heldCatalogListSweeps.set(queryClient, sweeps);
+  const anySweep = (query: Query) => sweeps.some((match) => match(query));
+  void (async () => {
+    // When the hold first saw each first read; each gets its own deadline.
+    const seenAt = new Map<Query, number>();
+    const pendingReads = () => {
+      const now = Date.now();
+      return firstCatalogListReads(queryClient, anySweep).filter((query) => {
+        const seen = seenAt.get(query) ?? now;
+        seenAt.set(query, seen);
+        return now - seen < CATALOG_LIST_READ_HOLD_MS;
+      });
+    };
+    try {
+      let reads = pendingReads();
+      while (reads.length > 0) {
+        const nextDeadline = Math.min(
+          ...reads.map((query) => (seenAt.get(query) ?? 0) + CATALOG_LIST_READ_HOLD_MS),
+        );
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          Promise.allSettled(reads.map((query) => query.promise)),
+          new Promise((resolve) => (timer = setTimeout(resolve, nextDeadline - Date.now()))),
+        ]);
+        clearTimeout(timer);
+        reads = pendingReads();
+      }
+    } finally {
+      // Always release the hold, or every later sweep would join one that
+      // never ends and the lists would stop refreshing.
+      heldCatalogListSweeps.delete(queryClient);
+    }
+    await queryClient.invalidateQueries({
+      predicate: (query) => isCatalogListQuery(query) && anySweep(query),
+    });
+  })();
+  return true;
+}
+
+// itemKeyedListOwners is the items whose children a cached list holds.
+function itemKeyedListOwners(queryClient: QueryClient): Set<string> {
+  const owners = new Set<string>();
+  for (const query of queryClient.getQueryCache().getAll()) {
+    const owner = isItemKeyedListQuery(query.queryKey) ? listOwnerId(query.queryKey) : undefined;
+    if (owner) owners.add(owner);
+  }
+  return owners;
+}
+
+// A pending query or a markers-only read does not establish item ancestry.
+function cacheHasItemDetail(queryClient: QueryClient, itemId: string): boolean {
+  return queryClient
+    .getQueryCache()
+    .getAll()
+    .some(
+      (query) =>
+        getQueryKeyItemId(query.queryKey) === itemId &&
+        (isItemDetailQueryKey(query.queryKey, itemId) || isWatchDetailQueryKey(query.queryKey)) &&
+        query.state.data != null,
+    );
+}
+
+// Reads that carry localized titles and descriptions beyond the media surfaces:
+// the families a viewer access change refetches, shuffle cards, collection
+// peeks, the Home-row editor's peeks, previews and curated-title search, and
+// the Watch Together picker's rows and catalog searches (pickerKeys in the
+// picker's usePickerData; its room presence and member state are not localized).
+const LOCALIZED_READ_PREFIXES = [
+  collectionKeys.all,
+  episodeKeys.all,
+  calendarKeys.all,
+  shuffleKeys.all,
+  ["collection-peek"],
+  ["home-row-peek"],
+  ["home-row-preview"],
+  ["curatedListPicker"],
+  ["watch-party", "picker"],
+  ["watch-party", "search"],
+  ["watch-party", "recently-added"],
+];
+
+function isLocalizedMediaQuery(query: Query) {
+  return (
+    shouldInvalidateMediaSurfaceQuery(query.queryKey, {}) ||
+    LOCALIZED_READ_PREFIXES.some((prefix) => queryKeyStartsWith(query.queryKey, prefix))
+  );
+}
+
+/**
+ * Refreshes the localized media reads after the viewer's metadata language
+ * changes. A request still in flight would answer in the old language and land
+ * as fresh: TanStack reuses a running request that has no data yet instead of
+ * restarting it, and an observer-less one (Home rows, prefetches) is never
+ * refetched. So those requests are cancelled before the reads are invalidated.
+ * Resolves once the reads are marked stale; mounted screens refetch on their
+ * own, and Home's load queue restarts right away.
+ */
+export async function refreshLocalizedMediaQueries(queryClient: QueryClient) {
+  await queryClient.cancelQueries({ predicate: isLocalizedMediaQuery });
+  void queryClient.invalidateQueries({ predicate: isLocalizedMediaQuery });
+  bumpHomeRefreshSignal(queryClient);
+}
+
+// A letter index sorts the whole result and a browse count counts it, either
+// of which on a large library can outlast a scan's invalidation window, so
+// cancelling and restarting them on every sweep would keep them from ever
+// finishing. A running read finishes instead, and one more read follows it so
+// changes made while it ran still land. Returns the running reads, for the
+// sweep to leave alone.
+function refetchLetterIndexesWhenDone(
+  queryClient: QueryClient,
+  matches: (query: Query) => boolean,
+): Set<Query> {
+  const running = [catalogKeys.allLetters, catalogKeys.allCounts].flatMap((queryKey) =>
+    queryClient.getQueryCache().findAll({ queryKey, fetchStatus: "fetching", predicate: matches }),
+  );
+  for (const query of running) {
+    const refetchAfter = () =>
+      queryClient.invalidateQueries(
+        { queryKey: query.queryKey, exact: true },
+        { cancelRefetch: false },
+      );
+    void query.promise?.then(refetchAfter, refetchAfter);
+  }
+  return new Set(running);
+}
+
+export function scheduleMediaSurfaceInvalidation(
+  queryClient: QueryClient,
+  options: InvalidateMediaSurfaceOptions = {},
+) {
+  let clientInvalidations = scheduledInvalidations.get(queryClient);
+  if (!clientInvalidations) {
+    clientInvalidations = new Map();
+    scheduledInvalidations.set(queryClient, clientInvalidations);
+  }
+
+  const key = `${options.itemId ?? "all"}:${options.libraryId ?? "all"}`;
+  const existing = clientInvalidations.get(key);
+  if (existing) clearTimeout(existing.timer);
+
+  const mergedOptions: InvalidateMediaSurfaceOptions = {
+    ...existing?.options,
+    ...options,
+    // Skipping is safe only when every coalesced caller has already supplied
+    // the canonical detail state. A single full-refresh request must win.
+    skipItemDetail: existing
+      ? Boolean(existing.options.skipItemDetail && options.skipItemDetail)
+      : options.skipItemDetail,
+    skipItemQueries: existing
+      ? Boolean(existing.options.skipItemQueries && options.skipItemQueries)
+      : options.skipItemQueries,
+    skipSimilarItems: existing
+      ? Boolean(existing.options.skipSimilarItems && options.skipSimilarItems)
+      : options.skipSimilarItems,
+    knownRelatedIds:
+      existing?.options.knownRelatedIds || options.knownRelatedIds
+        ? new Set([
+            ...(existing?.options.knownRelatedIds ?? []),
+            ...(options.knownRelatedIds ?? []),
+          ])
+        : undefined,
+    watchedKeys: [...(existing?.options.watchedKeys ?? []), ...(options.watchedKeys ?? [])],
+    // A later event without a series (one whose lookup failed, say) mustn't
+    // drop the series an earlier event for the same item named.
+    seriesId: options.seriesId ?? existing?.options.seriesId,
+  };
+  const now = Date.now();
+  const deadline = existing?.deadline ?? now + MEDIA_SURFACE_REFRESH_MAX_WAIT_MS;
+  const timer = setTimeout(
+    () => {
+      clientInvalidations?.delete(key);
+      // Home reads its sections through one-shot `fetchQuery` calls with no
+      // observers, so the signal has to be bumped after the invalidation lands
+      // or Home re-reads a cache that is still marked fresh.
+      void invalidateMediaSurfaceQueries(queryClient, mergedOptions).then(
+        () => bumpHomeRefreshSignal(queryClient),
+        () => bumpHomeRefreshSignal(queryClient),
+      );
+    },
+    Math.max(0, Math.min(MEDIA_SURFACE_REFRESH_DELAY_MS, deadline - now)),
+  );
+
+  clientInvalidations.set(key, { timer, deadline, options: mergedOptions });
+}

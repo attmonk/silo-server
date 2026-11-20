@@ -1,0 +1,109 @@
+import { useState } from "react";
+import DefaultArtwork from "@/components/DefaultArtwork";
+import ViewTransitionLink from "@/components/ViewTransitionLink";
+import { decodeThumbhash } from "@/lib/thumbhash";
+import {
+  formatUpcomingSubtitle,
+  formatUpcomingTime,
+  upcomingBadgeClass,
+  upcomingBadgeLabel,
+} from "@/lib/upcomingEventPresentation";
+import type { CalendarEvent } from "@/hooks/queries/calendar";
+import { useAppLanguage, useT } from "@/i18n";
+
+export default function CalendarEventCard({ event }: { event: CalendarEvent }) {
+  const t = useT();
+  // The subtitle, air time and badges come from plain helpers; follow language changes.
+  useAppLanguage();
+  const [loaded, setLoaded] = useState(false);
+  // Keyed by URL so a re-signed poster is tried again.
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  const thumbhashUrl = event.poster_thumbhash ? decodeThumbhash(event.poster_thumbhash) : "";
+  const watched = event.watched === true;
+
+  const href =
+    event.type === "movie"
+      ? `/item/${event.content_id}`
+      : `/item/${event.series_id ?? event.content_id}`;
+
+  const subtitle = formatUpcomingSubtitle(event);
+  const airTime = formatUpcomingTime(event.air_time, event.air_at);
+
+  return (
+    <div className="media-card group/card">
+      <ViewTransitionLink
+        to={href}
+        aria-label={event.title}
+        className="block overflow-hidden rounded-xl"
+      >
+        <div
+          className={`media-card-image relative aspect-[2/3] ${watched ? "opacity-60 grayscale" : ""}`}
+          style={
+            thumbhashUrl
+              ? {
+                  backgroundImage: `url(${thumbhashUrl})`,
+                  backgroundSize: "cover",
+                  backgroundPosition: "center",
+                }
+              : undefined
+          }
+        >
+          {event.poster_url && failedUrl !== event.poster_url ? (
+            <img
+              src={event.poster_url}
+              alt={event.title}
+              className={`h-full w-full object-cover transition-opacity duration-300 ${loaded ? "opacity-100" : "opacity-0"}`}
+              loading="lazy"
+              onLoad={() => setLoaded(true)}
+              onError={() => setFailedUrl(event.poster_url ?? null)}
+            />
+          ) : (
+            !thumbhashUrl && (
+              // Every calendar entry that isn't a movie belongs to a series.
+              <DefaultArtwork mediaType={event.type === "movie" ? "movie" : "episode"} />
+            )
+          )}
+          <div className="from-background/70 pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t to-transparent opacity-90" />
+          {event.badges.length > 0 && (
+            <div className="absolute start-2.5 top-2.5 flex flex-wrap gap-1">
+              {event.badges.map((badge) => (
+                <span
+                  key={badge}
+                  className={`rounded-full border px-2 py-0.5 text-[10px] leading-none font-semibold tracking-wide uppercase backdrop-blur-sm ${upcomingBadgeClass(badge)}`}
+                >
+                  {upcomingBadgeLabel(badge)}
+                </span>
+              ))}
+            </div>
+          )}
+          {watched && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+              <span
+                className="bg-background/70 text-foreground flex h-8 w-8 items-center justify-center rounded-full text-base backdrop-blur-sm"
+                aria-label={t("web.calendar.watched")}
+              >
+                {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- a check mark glyph, labelled above */}
+                {"✓"}
+              </span>
+            </div>
+          )}
+        </div>
+      </ViewTransitionLink>
+      <ViewTransitionLink to={href} className="block px-1 pt-3">
+        <div
+          className={`truncate text-[14px] font-semibold tracking-tight ${watched ? "text-muted-foreground" : ""}`}
+        >
+          {event.title}
+        </div>
+        {subtitle ? (
+          <div className="text-muted-foreground mt-1 truncate text-[11px] font-medium tracking-[0.14em] uppercase">
+            {subtitle}
+          </div>
+        ) : null}
+        {airTime ? (
+          <div className="text-muted-foreground mt-0.5 text-[11px] font-medium">{airTime}</div>
+        ) : null}
+      </ViewTransitionLink>
+    </div>
+  );
+}

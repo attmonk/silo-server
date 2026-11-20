@@ -1,0 +1,78 @@
+import { Link, Navigate, useLocation, useSearchParams } from "react-router";
+import { Smartphone } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { AuthBackground } from "@/components/auth/AuthBackground";
+import { buildWatchPartyDeepLink, detectMobilePlatform } from "@/lib/appDeepLink";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { useT } from "@/i18n";
+
+/**
+ * Landing page for shared Watch Party invitations (`/rooms/join?token=`).
+ *
+ * Silo runs on arbitrary domains, so the store apps can't claim these links
+ * as universal links; on a phone they open in the browser. This page sits
+ * outside the auth wrapper so a phone that isn't signed in to the web UI can
+ * still hand the invitation to the app. It offers a user-tapped silo:// link
+ * and never fires it automatically: there is no installed-app check, and a
+ * miss shows an OS error. Everywhere else it forwards to the authenticated
+ * hub, which auto-joins from the same query string.
+ */
+export default function WatchPartyInvite() {
+  const [searchParams] = useSearchParams();
+  const { search } = useLocation();
+  const token = searchParams.get("token")?.trim() ?? "";
+  const hubHref = `/rooms${search}`;
+  const appLink =
+    token && hasWatchPartyApp() ? buildWatchPartyDeepLink(window.location.origin, token) : null;
+
+  if (!appLink) return <Navigate to={hubHref} replace />;
+  return <AppHandoff appLink={appLink} hubHref={hubHref} />;
+}
+
+/**
+ * Only the Apple app handles silo://watch-party so far. silo-android's intent
+ * filter doesn't list the host yet, so a tap there would do nothing; add
+ * "android" here once it does.
+ */
+function hasWatchPartyApp(): boolean {
+  const ua = navigator.userAgent;
+  // iPadOS Safari reports a Mac user agent; touch support tells it apart.
+  const iPad = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
+  return detectMobilePlatform(ua) === "ios" || iPad;
+}
+
+function AppHandoff({ appLink, hubHref }: { appLink: string; hubHref: string }) {
+  const t = useT();
+  useDocumentTitle(t("web.watchTogether.invite.documentTitle"));
+  return (
+    <div className="auth-shell">
+      <AuthBackground />
+      <Card className="auth-card glass panel-border w-full max-w-sm border-0">
+        <CardHeader>
+          <CardTitle className="text-3xl font-extrabold tracking-[-0.04em]">
+            {t("web.watchTogether.invite.title")}
+          </CardTitle>
+          <CardDescription className="mt-2 text-sm leading-6">
+            {t("web.watchTogether.invite.body")}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Button asChild size="lg" className="h-12 w-full text-base font-semibold">
+            <a href={appLink}>
+              <Smartphone className="me-2 h-5 w-5" /> {t("web.watchTogether.invite.openApp")}
+            </a>
+          </Button>
+          <p className="text-muted-foreground text-center text-xs">
+            {t("web.watchTogether.invite.notInstalled")}
+          </p>
+          <Button asChild variant="outline" className="w-full">
+            <Link to={hubHref} replace>
+              {t("web.watchTogether.invite.continueBrowser")}
+            </Link>
+          </Button>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

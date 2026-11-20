@@ -1,0 +1,280 @@
+package jellycompat
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/noderouting"
+	"github.com/Silo-Server/silo-server/internal/playback"
+)
+
+func TestCompatLocalHLSRouteAllowedHonorsHardPolicyBoundaries(t *testing.T) {
+	tests := []struct {
+		name     string
+		workload noderouting.Workload
+		mutate   func(*config.PlaybackRoutingPolicy)
+		want     bool
+	}{
+		{name: "remux default", workload: noderouting.WorkloadRemux, want: true},
+		{name: "remux worker only", workload: noderouting.WorkloadRemux, mutate: func(policy *config.PlaybackRoutingPolicy) {
+			policy.RemuxExecution = config.PlaybackExecutionWorkerOnly
+		}},
+		{name: "remux proxy only", workload: noderouting.WorkloadRemux, mutate: func(policy *config.PlaybackRoutingPolicy) {
+			policy.RemuxEgress = config.PlaybackEgressProxyOnly
+		}},
+		{name: "video default", workload: noderouting.WorkloadVideoTranscode, want: true},
+		{name: "video worker only", workload: noderouting.WorkloadVideoTranscode, mutate: func(policy *config.PlaybackRoutingPolicy) {
+			policy.VideoTranscodeExecution = config.PlaybackExecutionWorkerOnly
+		}},
+		{name: "video proxy only", workload: noderouting.WorkloadVideoTranscode, mutate: func(policy *config.PlaybackRoutingPolicy) {
+			policy.VideoTranscodeEgress = config.PlaybackEgressProxyOnly
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			policy := config.DefaultPlaybackRoutingPolicy()
+			if test.mutate != nil {
+				test.mutate(&policy)
+			}
+			if got := compatLocalHLSRouteAllowed(test.workload, policy); got != test.want {
+				t.Fatalf("compatLocalHLSRouteAllowed() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCompatWorkerHLSRouteAllowedHonorsHardExecutionBoundaries(t *testing.T) {
+	tests := []struct {
+		name     string
+		workload noderouting.Workload
+		mutate   func(*config.PlaybackRoutingPolicy)
+		want     bool
+	}{
+		{name: "remux default", workload: noderouting.WorkloadRemux, want: true},
+		{name: "remux API only", workload: noderouting.WorkloadRemux, mutate: func(policy *config.PlaybackRoutingPolicy) {
+			policy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		}},
+		{name: "video default", workload: noderouting.WorkloadVideoTranscode, want: true},
+		{name: "video API only", workload: noderouting.WorkloadVideoTranscode, mutate: func(policy *config.PlaybackRoutingPolicy) {
+			policy.VideoTranscodeExecution = config.PlaybackExecutionAPIOnly
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			policy := config.DefaultPlaybackRoutingPolicy()
+			if test.mutate != nil {
+				test.mutate(&policy)
+			}
+			if got := compatWorkerHLSRouteAllowed(test.workload, policy); got != test.want {
+				t.Fatalf("compatWorkerHLSRouteAllowed() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCompatChildHLSRoutesRequireBoundPolicyCompliantTransport(t *testing.T) {
+	tests := []struct {
+		name       string
+		segment    bool
+		recipe     string
+		assignment playback.NodeRoutingAssignment
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "manifest rejects unbound route", wantStatus: http.StatusConflict, wantCode: compatPlaybackRouteUnboundCode},
+		{name: "segment rejects unbound route", segment: true, wantStatus: http.StatusConflict, wantCode: compatPlaybackRouteUnboundCode},
+		{
+			name: "manifest rejects recipe outside committed workload", recipe: "local",
+			assignment: playback.NodeRoutingAssignment{
+				Workload: string(noderouting.WorkloadRemux), Execution: string(noderouting.ExecutionTranscode),
+				Egress: string(noderouting.EgressAPI),
+			},
+			wantStatus: http.StatusServiceUnavailable, wantCode: compatRoutingPolicyUnsatisfiedCode,
+		},
+		{
+			name: "manifest rejects API relay outside committed proxy route", recipe: "remote",
+			assignment: playback.NodeRoutingAssignment{
+				Workload: string(noderouting.WorkloadVideoTranscode), Execution: string(noderouting.ExecutionTranscode),
+				ExecutionNodeURL: "http://worker-1", Egress: string(noderouting.EgressProxy),
+			},
+			wantStatus: http.StatusServiceUnavailable, wantCode: compatRoutingPolicyUnsatisfiedCode,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := testCompatSource(NewResourceIDCodec(), testCompatVersion())
+			var recipe *playback.RecipeCard
+			if test.recipe != "" {
+				card := playback.NewRecipeCard(7, "profile-1", source.FileID, "", playback.TranscodeOpts{SessionID: "upstream-1"})
+				if test.recipe == "remote" {
+					card.TranscodeNodeURL = "http://worker-1"
+				}
+				recipe = &card
+			}
+			var assignment *playback.NodeRoutingAssignment
+			if test.assignment.Workload != "" {
+				copy := test.assignment
+				assignment = &copy
+			}
+			store := NewPlaybackSessionStore(0, nil)
+			store.Put(PlaybackSession{
+				ID: "play-1", CompatToken: "compat-token", RouteItemID: "item-1", UpstreamSessionID: "upstream-1",
+				UpstreamPlayMethod: "transcode",
+				MediaSources:       []PlaybackMediaSource{source}, Recipe: recipe, RoutingAssignment: assignment,
+			})
+			handler := &PlaybackHandler{playbackStore: store}
+
+			request := httptest.NewRequest(http.MethodGet, "/Videos/item-1/hls/play-1/stream.m3u8", nil)
+			routeCtx := chi.NewRouteContext()
+			routeCtx.URLParams.Add("id", "item-1")
+			routeCtx.URLParams.Add("playlistId", "play-1")
+			if test.segment {
+				routeCtx.URLParams.Add("segmentId", "0")
+				routeCtx.URLParams.Add("segmentContainer", "ts")
+			}
+			ctx := context.WithValue(t.Context(), chi.RouteCtxKey, routeCtx)
+			ctx = context.WithValue(ctx, compatSessionKey, &Session{Token: "compat-token", StreamAppUserID: 7})
+			recorder := httptest.NewRecorder()
+			if test.segment {
+				handler.HandleHLSSegment(recorder, request.WithContext(ctx))
+			} else {
+				handler.HandleHLSManifest(recorder, request.WithContext(ctx))
+			}
+
+			if recorder.Code != test.wantStatus || !strings.Contains(recorder.Body.String(), `"Error":"`+test.wantCode+`"`) {
+				t.Fatalf("response = %d %s, want %d %s", recorder.Code, recorder.Body.String(), test.wantStatus, test.wantCode)
+			}
+		})
+	}
+}
+
+func TestEnsureUpstreamPlaybackClearsStaleHLSRouteOnMethodSwitch(t *testing.T) {
+	for _, method := range []string{"direct", "remux"} {
+		t.Run(method, func(t *testing.T) {
+			source := testCompatSource(NewResourceIDCodec(), testCompatVersion())
+			recipe := playback.NewRecipeCard(7, "profile-1", source.FileID, "", playback.TranscodeOpts{SessionID: "old-upstream"})
+			assignment := playback.NodeRoutingAssignment{
+				Workload: string(noderouting.WorkloadVideoTranscode), Execution: string(noderouting.ExecutionAPI),
+				Egress: string(noderouting.EgressAPI),
+			}
+			store := NewPlaybackSessionStore(time.Hour, nil)
+			store.Put(PlaybackSession{
+				ID: "play-1", CompatToken: "compat-token", RouteItemID: "item-1",
+				UpstreamSessionID: "old-upstream", UpstreamPlayMethod: "transcode",
+				MediaSources: []PlaybackMediaSource{source}, Recipe: &recipe, RoutingAssignment: &assignment,
+			})
+			manager := &testCompatSessionManager{sessions: map[string]*playback.Session{
+				"old-upstream": {ID: "old-upstream", UserID: 7, MediaFileID: source.FileID, PlayMethod: playback.PlayTranscode},
+			}}
+			handler := &PlaybackHandler{playbackStore: store, sessionMgr: manager, tm: playback.NewTranscodeManager()}
+
+			updated, err := handler.ensureUpstreamPlayback(
+				t.Context(),
+				&Session{Token: "compat-token", StreamAppUserID: 7, ProfileID: "profile-1"},
+				"play-1", source, method,
+			)
+			if err != nil {
+				t.Fatalf("switch upstream method: %v", err)
+			}
+			if updated.UpstreamPlayMethod != method || updated.UpstreamSessionID == "old-upstream" {
+				t.Fatalf("updated upstream = %q/%q, want fresh %s session", updated.UpstreamPlayMethod, updated.UpstreamSessionID, method)
+			}
+			if updated.Recipe != nil || updated.RoutingAssignment != nil {
+				t.Fatalf("stale HLS route survived method switch: recipe=%#v assignment=%#v", updated.Recipe, updated.RoutingAssignment)
+			}
+
+			for _, endpoint := range []struct {
+				name    string
+				segment bool
+			}{
+				{name: "manifest"},
+				{name: "segment", segment: true},
+			} {
+				t.Run(endpoint.name, func(t *testing.T) {
+					request := httptest.NewRequest(http.MethodGet, "/Videos/item-1/hls/play-1/stream.m3u8", nil)
+					routeCtx := chi.NewRouteContext()
+					routeCtx.URLParams.Add("id", "item-1")
+					routeCtx.URLParams.Add("playlistId", "play-1")
+					if endpoint.segment {
+						routeCtx.URLParams.Add("segmentId", "0")
+						routeCtx.URLParams.Add("segmentContainer", "ts")
+					}
+					ctx := context.WithValue(t.Context(), chi.RouteCtxKey, routeCtx)
+					ctx = context.WithValue(ctx, compatSessionKey, &Session{Token: "compat-token", StreamAppUserID: 7})
+					recorder := httptest.NewRecorder()
+					if endpoint.segment {
+						handler.HandleHLSSegment(recorder, request.WithContext(ctx))
+					} else {
+						handler.HandleHLSManifest(recorder, request.WithContext(ctx))
+					}
+					if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), `"Error":"`+compatPlaybackRouteUnboundCode+`"`) {
+						t.Fatalf("child response = %d %s, want unbound-route conflict", recorder.Code, recorder.Body.String())
+					}
+					if manager.startCalls != 1 {
+						t.Fatalf("upstream starts = %d, want only the method-switch start", manager.startCalls)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestMethodSwitchEndsTheReplacedSession covers the session a Jellyfin
+// method switch leaves behind: whether this replica held its copy or not,
+// the switch records it as replaced once the play has moved to the new
+// session, and a copy held elsewhere is recorded from its identity.
+func TestMethodSwitchEndsTheReplacedSession(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		held       bool
+		startFails bool
+	}{
+		{name: "copy held here", held: true},
+		{name: "copy held elsewhere"},
+		{name: "replacement fails to start", held: true, startFails: true},
+	} {
+		held := tc.held
+		t.Run(tc.name, func(t *testing.T) {
+			source := testCompatSource(NewResourceIDCodec(), testCompatVersion())
+			store := NewPlaybackSessionStore(time.Hour, nil)
+			store.Put(PlaybackSession{
+				ID: "play-1", CompatToken: "compat-token", RouteItemID: "item-1",
+				UpstreamSessionID: "old-upstream", UpstreamPlayMethod: "transcode", UpstreamMediaFileID: source.FileID,
+				MediaSources: []PlaybackMediaSource{source},
+			})
+			manager := &testCompatSessionManager{sessions: map[string]*playback.Session{}}
+			if tc.startFails {
+				manager.startErr = errors.New("start failed")
+			}
+			if held {
+				manager.sessions["old-upstream"] = &playback.Session{ID: "old-upstream", UserID: 7, ProfileID: "profile-1", MediaFileID: source.FileID, PlayMethod: playback.PlayTranscode, Position: 600}
+			}
+			handler := &PlaybackHandler{playbackStore: store, sessionMgr: manager, tm: playback.NewTranscodeManager()}
+			updated, err := handler.ensureUpstreamPlayback(t.Context(),
+				&Session{Token: "compat-token", StreamAppUserID: 7, ProfileID: "profile-1"}, "play-1", source, "direct")
+			if tc.startFails != (err != nil) || (err == nil && updated.UpstreamSessionID == "old-upstream") {
+				t.Fatalf("switch = %+v, %v", updated, err)
+			}
+			if len(manager.detached) != 1 {
+				t.Fatalf("detached ends = %+v, want the replaced session once", manager.detached)
+			}
+			end := manager.detached[0]
+			wantPosition := float64(playback.PositionUnknown)
+			if held {
+				wantPosition = 600
+			}
+			if end.reason != playback.EndReasonReplaced || end.session.ID != "old-upstream" || end.session.UserID != 7 ||
+				!end.session.IsJellyfinCompat || end.session.Position != wantPosition {
+				t.Fatalf("replaced end = %+v reason %q", end.session, end.reason)
+			}
+		})
+	}
+}

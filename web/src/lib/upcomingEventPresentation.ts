@@ -1,0 +1,95 @@
+import { codeNumber, t } from "@/i18n";
+import { formatTime, preferredDateLocale } from "@/lib/datetime";
+
+interface UpcomingPresentationEvent {
+  /** "movie", "episode", or "season_premiere"; the v2 contract leaves this open. */
+  type: string;
+  air_date: string;
+  air_time?: string | null;
+  air_at?: string | null;
+  episode_title?: string | null;
+  season_number?: number | null;
+  episode_number?: number | null;
+  badges: string[];
+}
+
+// Every client shows these labels in capitals: PREMIERE, NEW SEASON, FINALE,
+// DIGITAL, PHYSICAL.
+export function upcomingBadgeLabel(badge: string): string {
+  switch (badge) {
+    case "series_premiere":
+      return t("web.calendar.event.badge.seriesPremiere");
+    case "season_premiere":
+      return t("web.calendar.event.badge.seasonPremiere");
+    case "finale":
+      return t("web.calendar.event.badge.finale");
+    case "digital":
+      return t("web.calendar.event.badge.digital");
+    case "physical":
+      return t("web.calendar.event.badge.physical");
+    default:
+      return badge;
+  }
+}
+
+export function upcomingBadgeClass(badge: string): string {
+  switch (badge) {
+    case "series_premiere":
+    case "season_premiere":
+      return "border-primary/40 bg-primary/20 text-primary";
+    case "finale":
+      return "border-orange-800/55 bg-orange-950/90 text-orange-50 shadow-sm backdrop-blur-none";
+    case "digital":
+      return "border-sky-800/55 bg-sky-950/90 text-sky-50 shadow-sm backdrop-blur-none";
+    case "physical":
+      return "border-emerald-800/55 bg-emerald-950/90 text-emerald-50 shadow-sm backdrop-blur-none";
+    default:
+      return "border-border/50 bg-surface";
+  }
+}
+
+export function formatUpcomingSubtitle(event: UpcomingPresentationEvent): string {
+  if (
+    (event.type === "episode" || event.type === "season_premiere") &&
+    event.season_number != null
+  ) {
+    const season = event.season_number;
+    const title = event.episode_title;
+    if (event.episode_number != null) {
+      const code = { season: codeNumber(season), episode: codeNumber(event.episode_number) };
+      return title
+        ? t("web.calendar.event.episodeTitled", { ...code, title })
+        : t("web.calendar.event.episode", code);
+    }
+    return title
+      ? t("web.calendar.event.seasonTitled", { season, title })
+      : t("web.calendar.event.season", { season });
+  }
+
+  if (event.type === "movie") {
+    return t("web.calendar.event.movie");
+  }
+
+  return "";
+}
+
+export function formatUpcomingDate(airDate: string): string {
+  return new Date(`${airDate}T00:00:00`).toLocaleDateString(preferredDateLocale(), {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+export function formatUpcomingTime(airTime?: string | null, airAt?: string | null): string | null {
+  if (airAt) {
+    const date = new Date(airAt);
+    if (!Number.isNaN(date.getTime())) {
+      return formatTime(date);
+    }
+  }
+  if (!airTime) {
+    return null;
+  }
+  return formatTime(new Date(`2000-01-01T${airTime}`));
+}

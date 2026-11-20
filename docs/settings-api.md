@@ -1,0 +1,1167 @@
+# Canonical Settings API
+
+> **API lifecycle:** this documents the stable `/api/v2` native contract, which locks with Silo
+> 1.0. See [the native API contract](architecture/api-contract.md).
+
+The canonical settings API stores typed user preferences from the shared
+settings contract. Client implementations should discover the server contract
+before rendering controls or writing a value; do not keep a separate list of
+keys, scopes, enum members, or defaults.
+
+## The stable surface
+
+Silo 1.0's stable settings surface is the `settings` section of the native `/api/v2` contract
+(`contracts/api/v2/openapi.json`, tag `settings`). It serves the shared settings contract and
+resolves values with `internal/settingsresolve`. Everything in this section is taken from the
+operation declarations in `internal/apiv2/settings.go` and the committed fixtures under
+`contracts/api/v2/fixtures/`.
+
+All paths below are absolute. Errors are RFC 9457 problem documents; a rejected request member is
+`422` `validation_failed` with an `errors[]` entry whose `location` names the member
+(`query.keys`, `path.key`, `body.value`, `header.X-Silo-Device-Id`, …).
+
+### Operations
+
+| Operation                                | Method and path                                      |
+| ---------------------------------------- | ---------------------------------------------------- |
+| `getSettingsContract`                    | `GET /api/v2/settings/contract`                      |
+| `getSettingsContractCapabilities`        | `GET /api/v2/settings/contract/capabilities`         |
+| `getOverlayConfig`                       | `GET /api/v2/settings/overlay-config`                |
+| `getEffectiveSubtitleAppearance`         | `GET /api/v2/settings/subtitle-appearance/effective` |
+| `updateSubtitleAppearanceDeviceOverride` | `PUT /api/v2/settings/device/subtitle-appearance`    |
+| `deleteSubtitleAppearanceDeviceOverride` | `DELETE /api/v2/settings/device/subtitle-appearance` |
+| `listPluginSettings`                     | `GET /api/v2/settings/plugins`                       |
+| `getPluginSettings`                      | `GET /api/v2/settings/plugins/{installation_id}`     |
+| `updatePluginSettings`                   | `PUT /api/v2/settings/plugins/{installation_id}`     |
+| `listSettingValues`                      | `GET /api/v2/settings/values`                        |
+| `listEffectiveSettings`                  | `GET /api/v2/settings/values/effective`              |
+| `resolveEffectiveSettings`               | `POST /api/v2/settings/values/effective`             |
+| `updateNavigationShortcut`               | `PUT /api/v2/settings/values/nav.shortcuts/item`     |
+| `getSettingValue`                        | `GET /api/v2/settings/values/{key}`                  |
+| `updateSettingValue`                     | `PUT /api/v2/settings/values/{key}`                  |
+| `deleteSettingValue`                     | `DELETE /api/v2/settings/values/{key}`               |
+
+The untyped v1 settings routes had no v2 successor; see
+[v1-scope.md](architecture/v1-scope.md). The admin projection is not part of the settings
+section; it has its own operations, `listAdminUserSettingValues` (`GET /api/v2/admin/users/{id}/settings/values`),
+`setAdminUserSettingValue` (`PUT /api/v2/admin/users/{id}/settings/values/{key}`) and
+`deleteAdminUserSettingValue` (`DELETE /api/v2/admin/users/{id}/settings/values/{key}`).
+
+`X-Profile-Id` is required on every `/settings/values…` operation, on the subtitle-appearance
+operations and on the device-override mutations; it is optional on the contract, capabilities,
+overlay-config and plugin operations. `X-Profile-Token` is optional everywhere.
+
+### Contract discovery and capabilities
+
+`GET /api/v2/settings/contract` returns the canonical public manifest bytes and their `ETag`,
+with `Cache-Control: private, no-cache`. A conditional
+`If-None-Match` GET is not carried yet; it lands with the foundation caching rules, so a v2
+client compares the `ETag` (or the capability document's `contract_etag`) itself and re-fetches.
+
+`GET /api/v2/settings/contract/capabilities` returns eleven settings-specific members plus the
+common `revision`, `state` and `allowed` fields. The previous numeric `revision` is now
+`manifest_revision`; string `revision` identifies the complete authorized capability document.
+All fourteen fields are present, and `scopes` and `client_families` are never null. This capability
+read supports `ETag` and `If-None-Match` revalidation with `Cache-Control: private, no-cache`;
+a matching authorized representation returns a bodyless `304`.
+
+Example configured response (`get_settings_contract_capabilities_ok.json`; the opaque revision
+is illustrative):
+
+<!-- prettier-ignore -->
+```json
+{
+  "api_version": 1,
+  "revision": "opaque-capability-revision",
+  "manifest_revision": 12,
+  "state": "available",
+  "allowed": true,
+  "contract_etag": "\"etag-12\"",
+  "definition_count": 40,
+  "scopes": [
+    "account",
+    "profile"
+  ],
+  "client_families": [
+    "tv",
+    "web"
+  ],
+  "supports_batched_effective": true,
+  "supports_idempotent_writes": true,
+  "supports_atomic_shortcuts": true,
+  "supports_device_rename": true,
+  "supports_overlay_images": false
+}
+```
+
+The web client reads `api_version`, `manifest_revision` and `contract_etag` from this document, gates
+each vendored definition on `manifest_revision >= introduced_in` plus `supports_batched_effective`, and
+gates the shortcut editor on `supports_atomic_shortcuts`. Read `supports_idempotent_writes` with
+care: no settings write declares `X-Silo-Mutation-Id` (see "Writes have no mutation id" below),
+so a client must not rely on replay semantics while the flag is `true`. The web client masks the
+flag to `false` for exactly this reason. `supports_overlay_images` says the server keeps the card overlay image library
+described under "Overlay configuration" below.
+
+### Overlay configuration
+
+`GET /api/v2/settings/overlay-config` returns the server-wide card overlay defaults: `enabled`,
+`defaults` (the administrator's `ui.card_overlays` document as a JSON string, absent when none
+is set), `quick_actions_enabled` and `quick_actions_default`, and two more members:
+
+- `images` lists the card overlay image library in upload order, always present and possibly
+  empty. Each entry has `ref`, `name`, `url`, `width` and `height`. A card overlay document names
+  an image by `ref`; `url` is `/api/v2/overlay-images/{ref}`, a public read whose bytes never
+  change for a ref, served `immutable`. A failed library read degrades to an empty list instead
+  of failing the configuration every card depends on.
+- `image_uploads_available` says whether the server has the asset storage
+  `uploadAdminOverlayImage` needs. Without it the library stays empty.
+
+Administrators manage the library with `uploadAdminOverlayImage` and `deleteAdminOverlayImage`;
+see [admin-api.md](admin-api.md#card-overlay-images).
+
+### Query parameters are repeated, not comma-separated
+
+Every list-valued query parameter is sent once per value. `keys=<csv>` becomes
+`keys=a&keys=b`; the same rule applies to `library_ids` and `series_ids` on
+`listEffectiveSettings`. A comma inside a value is part of the key name and will be rejected as
+an unknown key.
+
+The examples in this section mirror the committed v2 fixtures, which use `ui.theme`. That
+key is deprecated and no client reads it (see [Retired theme settings](#retired-theme-settings));
+the request and response mechanics are the same for every key.
+
+```http
+GET /api/v2/settings/values?scope=profile&keys=ui.theme&keys=playback.preferred_quality
+GET /api/v2/settings/values/effective?keys=ui.theme&library_ids=3&library_ids=7
+```
+
+`scope` is a required enum on `listSettingValues`, `getSettingValue`, `updateSettingValue` and
+`deleteSettingValue`: `account`, `profile`, `profile_client`, `profile_device`, `profile_library`
+or `profile_series`. The identity members are `profile_id`, `device_id`, `library_id` and
+`series_id` as query parameters, and `X-Silo-Client-Family`, `X-Silo-Device-Id`,
+`X-Silo-Device-Name` and `X-Silo-Device-Platform` as headers (see
+[Request identity headers](#request-identity-headers)). Library ids and profile ids are string
+`ID`s; `updated_at` is an instant.
+
+### Collections use the `{items}` envelope
+
+Every settings collection uses the common collection envelope `{items: [...]}`. The setting-value collections keep `revision` beside
+`items`. These collections are unpaginated — they are bounded by the requested keys or the
+installed plugins — so `page` is never present.
+
+`GET /api/v2/settings/values/effective?keys=ui.theme&keys=playback.preferred_quality`
+(`list_effective_settings_ok.json`):
+
+```json
+{
+  "items": [
+    {
+      "key": "ui.theme",
+      "value": "cinema-light",
+      "source": "profile",
+      "definition_revision": 3,
+      "updated_at": "2026-01-02T03:04:05.678Z",
+      "source_context": {
+        "profile_id": "p-owner"
+      },
+      "scope": "profile",
+      "profile_id": "p-owner"
+    },
+    {
+      "key": "playback.preferred_quality",
+      "value": "auto",
+      "source": "default",
+      "definition_revision": 3
+    }
+  ],
+  "revision": 8
+}
+```
+
+Each effective item carries the resolved `value`, its `source` scope, `definition_revision`, the
+constraint members when a policy constrained it, and — when a stored row won — `source_context`
+plus the winning row's own scope and identity members. A default winner has none of the row
+members.
+
+A definition marked `admin_default` (today `ui.title_art`, `ui.next_up_mode` and
+`ui.next_up_new_releases_first`) can have its default replaced for the
+whole server by an administrator. The value is stored as JSON text in the server setting
+`defaults.<key>` (for example `defaults.ui.title_art`), written through the admin settings API and
+validated against the definition's value schema; an empty value removes it. A viewer with no stored
+row at any allowed scope then resolves to the administrator's value, still with `source: "default"`
+and no row members, because the viewer did not choose it. Returning to that inherited value means
+deleting the stored rows, not writing the default. Changing an administrator default publishes one
+`user_settings.changed` event addressed to every viewer rather than to one account (see
+[realtime-api.md](realtime-api.md#personal-event-recipients)), carrying the setting key and
+`scope: "default"`, so a client subscribed to the `user_settings` channel can re-read its effective
+values; other clients see the new default on their next effective read. On a server with several
+nodes, a node that can read its settings answers with the previous default for at most 10 seconds
+after the event, so a client that keeps what it read should read once more after that. The server
+applies the same value wherever it reads the setting itself, such as the Next Up row and ordering in
+home sections and in Jellyfin `/Shows/NextUp`.
+
+### Batch effective resolution
+
+`POST /api/v2/settings/values/effective` resolves one bounded list of keys under several content
+contexts in one store read; use it for a grid or list instead of one GET per item. The body is
+`{keys, contexts}`; both are required and non-empty at the schema, unknown members are rejected,
+and each context is `{context_id, library_id | series_id}` with `library_id` as a string `ID`.
+The response preserves the requested key order, including repeated keys. Each `context_id` is an
+opaque caller token: whitespace is retained, and uniqueness is checked on the exact token. Empty
+or whitespace-only tokens are rejected.
+
+The batch resolves for the acting profile and declared device, so the operation declares only the
+device and client-family headers: the `profile_id`, `device_id`, `library_ids` and `series_ids`
+query parameters of the single-shot GET are not accepted here.
+
+`contexts` is bounded at 100 entries (`maxItems`), not the 200 the seam's content-id budget might
+suggest. The seam bounds the *ids* in one request at 200 — the same budget the single-shot GET
+spends on `library_ids` plus `series_ids` — and a context may name both a `library_id` and a
+`series_id`, so declaring 200 contexts would advertise a capacity the seam refuses as soon as
+more than 100 contexts name both. Halving the declared bound keeps every valid context shape
+inside one request and leaves the store query untouched; a 101st context is a 422 at
+`body.contexts`.
+
+A repeated key returns its stored value once per mention, and the batch returns it again in every
+context. The stored values in one `resolveEffectiveSettings` or `listSettingValues` response are
+therefore bounded at 16 MiB in total; a request past that bound is a 422 at `body.keys`
+(`query.keys` on `listSettingValues`).
+
+```http
+POST /api/v2/settings/values/effective
+X-Profile-Id: <profile-id>
+X-Silo-Client-Family: web
+Content-Type: application/json
+
+{"keys":["ui.theme"],"contexts":[{"context_id":"row-1","library_id":"3"},{"context_id":"row-2","series_id":"tv:12345"}]}
+```
+
+Response (`resolve_effective_settings_ok.json`); each item is `{context_id, settings}` in
+request order:
+
+```json
+{
+  "items": [
+    {
+      "context_id": "row-1",
+      "settings": [
+        {
+          "key": "ui.theme",
+          "value": "cinema-light",
+          "source": "profile",
+          "definition_revision": 3,
+          "updated_at": "2026-01-02T03:04:05.678Z",
+          "source_context": {
+            "profile_id": "p-owner"
+          },
+          "scope": "profile",
+          "profile_id": "p-owner"
+        }
+      ]
+    },
+    {
+      "context_id": "row-2",
+      "settings": [
+        {
+          "key": "ui.theme",
+          "value": "cinema-light",
+          "source": "profile",
+          "definition_revision": 3,
+          "updated_at": "2026-01-02T03:04:05.678Z",
+          "source_context": {
+            "profile_id": "p-owner"
+          },
+          "scope": "profile",
+          "profile_id": "p-owner"
+        }
+      ]
+    }
+  ],
+  "revision": 8
+}
+```
+
+An empty `contexts` list is refused at the schema (`resolve_effective_settings_contexts_required.json`):
+
+```json
+{
+  "type": "https://siloserver.org/docs/api/v2/problems/validation_failed",
+  "title": "Validation failed",
+  "status": 422,
+  "detail": "expected array length >= 1",
+  "instance": "urn:silo:request:000000000000000000000038",
+  "errors": [
+    {
+      "location": "body.contexts",
+      "code": "out_of_range",
+      "detail": "expected array length >= 1"
+    }
+  ]
+}
+```
+
+### Unknown keys are `422`, not `404`
+
+A key the settings contract does not define is request input, not a missing resource, so the
+server answers `422` `validation_failed` at the key's declared location: `query.keys` on the list
+and effective GETs, `body.keys` on the batch POST, `path.key` on the single-key operations. The
+same rule covers the whole-document refusal of `nav.shortcuts` on `updateSettingValue` and
+`deleteSettingValue` and every other rejected request member.
+
+`404` is kept for a real missing resource: `getSettingValue` and `deleteSettingValue` when nothing
+is stored at the scope, a `profile_id`, `device_id` or `library_id` that names nothing, and a
+plugin installation id that names nothing (numeric or not; identifiers are opaque).
+
+`GET /api/v2/settings/values/effective?keys=no.such` (`list_effective_settings_unknown_key.json`):
+
+```json
+{
+  "type": "https://siloserver.org/docs/api/v2/problems/validation_failed",
+  "title": "Validation failed",
+  "status": 422,
+  "detail": "No setting named no.such exists in this server's contract",
+  "instance": "urn:silo:request:000000000000000000000035",
+  "errors": [
+    {
+      "location": "query.keys",
+      "code": "invalid",
+      "detail": "No setting named no.such exists in this server's contract"
+    }
+  ]
+}
+```
+
+### Writes have no mutation id
+
+`updateSettingValue` and `updateNavigationShortcut` declare no `X-Silo-Mutation-Id` header; a
+client sends none, and there is no idempotent replay. The reason is sequencing: idempotent replay
+is a foundation concern for every v2 mutation, and the foundation mutation-retry work owns it.
+Until it lands, a client retries a write as a plain desired-state
+`PUT`: the same body converges on the same stored value, and the shortcut mutation is still
+atomic on the server (an already-satisfied mutation is a successful no-op that does not advance
+the revision). Once the header is declared on both writes, the web client's compile-time guard
+flips and `supports_idempotent_writes` becomes meaningful.
+
+`updateSettingValue` accepts `{value}`, validated and normalized against the key's `value_schema`
+(a refusal is `422` at `body.value`), and answers `200` with the same
+stored row `getSettingValue` serves. `deleteSettingValue` answers `204`.
+
+`updateNavigationShortcut` accepts `{item, present}`; both are required at the schema. `item` is
+an extension bag whose members the contract's `navigation-shortcuts.json` schema fixes. The
+response is the stored `nav.shortcuts` row as a `SettingValue`. See
+[Atomic navigation shortcuts](#atomic-navigation-shortcuts) for the mutation rules.
+
+```http
+PUT /api/v2/settings/values/nav.shortcuts/item
+X-Profile-Id: <profile-id>
+Content-Type: application/json
+
+{"item":{"type":"section","library_id":7,"section_id":"recent","label":"Recently Added"},"present":true}
+```
+
+### Device override and plugin writes answer `200` with the document
+
+`PUT /api/v2/settings/device/subtitle-appearance` takes a `{value}` body (the appearance as a
+JSON document in a string; only JSON validity is checked) and answers `200` with the resolved
+`EffectiveSubtitleAppearance`, the same document
+`GET /api/v2/settings/subtitle-appearance/effective` serves.
+`X-Silo-Device-Id` is a required declared header on both device-override mutations (a missing id
+is `422` at `header.X-Silo-Device-Id`); `DELETE` answers `204`, including when no override
+existed. The device headers declare length bounds (128/120/40), so an over-long value is a `422`.
+
+`PUT /api/v2/settings/plugins/{installation_id}` takes `{values}`, an extension bag of strings
+whose keys the plugin's `user_config_schema` defines; a refusal by the plugin is `422` at
+`body.values`. It answers `200` with the same `{installation, values}` document
+`getPluginSettings` serves. `values` is `{}` rather than null when the account has none. An
+installation carries no administrator-form descriptor; no user-settings client renders one.
+
+```http
+PUT /api/v2/settings/plugins/3
+Content-Type: application/json
+
+{"values":{"region":"eu"}}
+```
+
+Response (`update_plugin_settings_ok.json`):
+
+```json
+{
+  "installation": {
+    "id": "3",
+    "plugin_id": "org.example.subtitles",
+    "version": "1.2.0",
+    "user_config_schema": [
+      {
+        "key": "region",
+        "title": "Region",
+        "description": "",
+        "json_schema": "{\"type\":\"string\"}",
+        "required": false
+      }
+    ],
+    "routes": [
+      {
+        "id": "dashboard",
+        "method": "GET",
+        "path": "/dashboard",
+        "access": "user",
+        "navigable": true,
+        "navigation_label": "Dashboard",
+        "navigation_kind": "user",
+        "static_asset": false
+      }
+    ],
+    "assets": [],
+    "category": "Tools"
+  },
+  "values": {
+    "region": "eu"
+  }
+}
+```
+
+A missing `values` member (`update_plugin_settings_values_required.json`):
+
+```json
+{
+  "type": "https://siloserver.org/docs/api/v2/problems/validation_failed",
+  "title": "Validation failed",
+  "status": 422,
+  "detail": "expected required property values to be present",
+  "instance": "urn:silo:request:000000000000000000000029",
+  "errors": [
+    {
+      "location": "body.values",
+      "code": "required",
+      "detail": "expected required property values to be present"
+    }
+  ]
+}
+```
+
+`GET /api/v2/settings/plugins` returns the same installation objects in `{items}`
+(`list_plugin_settings_ok.json`); an installation id that names nothing is `404`
+(`get_plugin_settings_not_found.json`):
+
+```json
+{
+  "type": "https://siloserver.org/docs/api/v2/problems/not_found",
+  "title": "Not found",
+  "status": 404,
+  "detail": "Plugin installation not found",
+  "instance": "urn:silo:request:000000000000000000000026"
+}
+```
+
+## Public branding
+
+Branding remains public so it can render before sign-in:
+
+| Method | Path | Response |
+|---|---|---|
+| GET | `/api/v2/theme/capabilities` | Branding and asset-storage availability |
+| GET | `/api/v2/theme/branding` | Server name, login subtitle, optional accent color and asset URLs, storage availability |
+| GET / HEAD | `/api/v2/branding/assets/{kind}` | Image bytes or matching headers without a body |
+
+Discovery uses the existing branding service. When dependencies are absent,
+configuration returns default branding; capabilities
+report availability explicitly. Discovery responses are not cached. The bundled web
+uses these v2 reads. Native server-identity discovery must adopt the same public
+endpoint through its negotiated API-version handling.
+
+Asset URLs include `?v=<content-reference>`. Only an exact current reference receives
+immutable caching; a stale reference returns `404`, so newer bytes cannot be cached
+under an older content URL. An unversioned request uses `Cache-Control: public,
+no-cache` and revalidates. ETags support `If-Match` and `If-None-Match`, including
+weak read matches and lists. `304` retains the validator and cache headers. Images
+preserve the branding content-security policy and `nosniff`, including SVG favicons.
+A valid kind without a configured asset returns `404`; missing asset storage returns
+`503`. Assets use the raw HTTP registry rather than JSON encoding.
+
+The web client has one theme, Cinema Dark. The only customization is the
+administrator's accent color (`branding.accent_color`), which the web client
+reads from the branding document and applies to the primary action color, the
+focus ring and the sidebar accent, turning the labels on those surfaces white
+when white reads better on the accent. A stored value that is not a `#rgb` or
+`#rrggbb` hex color is ignored, as email ignores it. Email buttons, the shell's `theme-color` and
+the web app manifest use it too. The branding document has no default theme
+or light-theme logo URLs, and the API has no theme overrides or theme catalog.
+
+### Retired theme settings
+
+Manifest revision 12 deprecates `ui.theme`, `ui.custom_theme_vars` and
+`ui.custom_css`. They were web-only, and the web client no longer reads or writes
+them. Migration `20260926233851_retire_profile_themes` (SQLite user store schema
+v29) deleted every stored value at every scope. The definitions stay published, so
+a write from a stale cached web bundle still succeeds, but nothing reads the value.
+
+### Viewer library discovery
+
+`GET /api/v2/user/libraries` returns an `items` collection of enabled libraries
+visible to the account or selected household profile. Each item contains a string
+`id`, `name`, `type`, `sort_order`, and optional `poster_url`. The projection
+excludes storage paths and administrator scan metadata. The configuration list
+retains complete enumeration in `sort_order`, then ID order, as library
+administration does; it does not claim database-bounded paging.
+
+The profile header is optional. When supplied it must belong to the account and
+pass PIN verification, and the resolved viewer policy controls library access.
+Without a profile, the existing account-policy fallback applies. Library rows
+with `enabled=false` are excluded in both cases. An explicitly empty library
+allowlist returns `items: []`. Optional poster signing uses the existing expiry
+and omits the URL on signing failure.
+
+By default, libraries the profile hid itself (`ui.disabled_library_ids`) appear
+for an unrestricted scope but not for a scope with a library limit (account,
+profile, or policy override). `include_hidden=true` lists them for a limited
+scope too, for a screen that shows a hidden library again; the web
+Settings → Libraries page sends it, and navigation should not. Libraries outside
+the account's or the profile's library limit, or removed by a policy override,
+stay out either way: the viewer scope reports the hidden libraries the policy
+would otherwise allow (`hidden_library_ids` in the scope decision), and the list
+adds only those. `supports_include_hidden` on the capability response advertises
+the parameter.
+
+`GET /api/v2/user/libraries/capabilities` exposes `available` under the same
+authority rules. Both operations remain registered when the service is absent;
+discovery returns `available: false`, and listing returns `dependency_unavailable`.
+The bundled web keeps numeric library IDs at its UI boundary, rejects unsafe
+numeric conversions, and fences responses/cache keys against account/profile
+changes. Apple and Android have existing library-discovery callers and require
+coordinated adoption before this migration row is ratified. Jellyfin's separate
+library projection is unchanged.
+
+### Administrator device metadata
+
+`GET /api/v2/admin/devices` returns a paginated `items` collection;
+`GET /api/v2/admin/devices/{user_id}/{device_id}` returns one device's metadata.
+Both require acting-administrator authority. Account IDs are strings; device IDs
+remain opaque and are scoped to their account. Profile identities and counts stay
+separate from the login account. Timestamps use UTC milliseconds, with absent or
+unparseable historical metadata represented as null.
+
+The list preserves descending activity order, followed by username, device name,
+and device ID; account ID resolves ties. Signed cursors bind this position to the
+actor, selected profile and page size. This is a live list: registration or
+settings changes can reorder entries between pages. Each page still enumerates
+all account stores using the existing concurrency limit of eight. Response paging
+does not imply a database-bounded query or a snapshot. The web collects up to
+100 pages of 100 records and rejects missing/repeated continuations or overflow
+without publishing a partial list.
+
+Device summaries merge registrations, legacy settings and canonical settings,
+deduplicating mirrored keys. Detail's `settings` array retains legacy compatibility
+rows; it is **not** a complete list of canonical overrides. Existing web editors
+continue to read and write the administrator settings-values API for those
+values. Metadata reads capture account/profile authority and discard stale
+responses. No playback-session control, login revocation, push registration or
+settings mutation is added by these reads.
+
+`GET /api/v2/admin/devices/capabilities` returns `available` for the same
+administrator authority. Missing account/store dependencies produce
+`dependency_unavailable` from the metadata reads. No Apple, Android or Jellyfin
+administrator-device metadata consumer was found.
+
+### Browser OAuth login handshake
+
+The OAuth sign-in and linking flows (web and native starts, the provider
+callback, completion codes, browser binding, PKCE and account linking) are
+specified in [auth-api.md](auth-api.md#oauth-sign-in-flows), with the rules
+behind them in
+[external-sign-in.md](architecture/external-sign-in.md#oauth-flows).
+Providers register the callback URI `/api/v2/auth/oauth/{install_id}/callback`
+on the public URL, the only callback the server issues.
+
+### External watch-state webhook receiver
+
+`POST /api/v2/webhook-sync/webhooks/{secret}` accepts existing Plex multipart,
+Emby JSON/form/multipart, and Jellyfin JSON deliveries. The connection secret is
+resolved before reading the body; an ambient bearer token or profile does not
+replace this proof. Secret rotation immediately invalidates the previous URL.
+No browser Origin is required for these server-to-server deliveries.
+
+The receiver limits the complete body to 10 MiB before provider parsing or
+watch-state side effects, including bodies with unknown or understated lengths.
+Oversize requests return a 413 `payload_too_large` problem. Multipart resources
+are cleaned up after parsing. The shared application processor retains explicit profile
+mapping, provider normalization, watch-state behavior and delivery logging with
+bounded sanitized body excerpts. A processed delivery returns bodyless 204,
+including ignored, skipped or unmatched events. Malformed payloads return 400,
+unknown secrets 404, and internal failures a safe 500 problem. Known-connection
+rejections retain delivery logs. This synchronous operation is non-retryable.
+Missing required fields or trailing data after the JSON document count as malformed;
+a well-formed notification of a type Silo does not use is ignored.
+
+Watch-state rules:
+
+- An event changes only the Silo profile explicitly mapped to its external user.
+  An unmapped user's event is skipped and is not replayed after mapping.
+- Plex: `media.scrobble` marks the item watched; `media.pause` and `media.stop`
+  record the event's `viewOffset`. The server's item metadata supplies identity
+  and runtime only, because its view state belongs to the connection token's
+  owner. Plex events carry no timestamp, so Silo uses the receipt time, and a
+  resent `media.pause` or `media.stop` counts as a new event that rewrites its
+  position. After a scrobble, including one that newer Silo progress kept from
+  applying, further events for the same user and item (a repeated scrobble, a
+  stop in the credits) are ignored until a `media.play` starts a new playback. A
+  `media.play` needs no metadata lookup or catalog match. Plex sends no webhook
+  for manual watched or unwatched marks.
+- Jellyfin: `PlaybackStop` records position and `played_to_completion`.
+  `UserDataSaved` with save reason `TogglePlayed` marks the item played or
+  unplayed by its `played` boolean, and is malformed without one; other save
+  reasons are ignored. The payload `timestamp` orders events and must parse.
+- For one external user and item, an event older than the last applied one is
+  dropped, and an event with the same timestamp applies only if it completes the
+  item or advances the position by at least five seconds. A replayed delivery
+  with its original timestamp (Jellyfin, Emby) therefore has no further effect,
+  and a replayed completion cannot undo a later unplayed mark. Silo progress for
+  the profile at least as recent as the event, compared in whole seconds, also
+  wins, including over an unplayed mark, unless it is the write of the last
+  event applied for that external user and item, recognized by its time and
+  position. There is no exactly-once guarantee beyond these rules.
+
+A Plex connection's `base_url` follows the history import rule for server
+addresses: it must be on the public internet unless the account is an admin or
+an admin turned on `media_servers.allow_private_destinations`. Creating a
+connection with a refused address returns `422 validation_failed`, and a delivery whose metadata lookup is refused records that
+message as the connection's last error. See
+[Outbound address guard](architecture/outbound-address-guard.md).
+
+Responses set `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
+`GET /api/v2/webhook-sync/capabilities` exposes `available` and `max_body_bytes`.
+Connection list/create/update and secret rotation emit
+`/api/v2/webhook-sync/webhooks/{secret}` receiver URLs. An external server still
+configured with a retired `/api/v1/webhook-sync/...` or `/api/v1/plex-sync/...`
+URL gets `410 Gone` until it is given the current URL.
+The web management screen consumes the emitted URL. No native receiver or
+management caller was found; no Jellyfin-protocol endpoint needs migration.
+
+Connection management is account-wide and requires the existing
+[household-manager authority](architecture/api-contract.md#credential-continuity):
+the primary profile, with PIN verification when it has a PIN. This covers every
+`/api/v2/webhook-sync/connections` operation, reads included, because the list
+returns each receiver URL with its secret, the event log shows what mapped
+profiles watched, and mappings choose which profile an external user writes to.
+The account's admin role never widens a selected secondary profile's authority.
+A request without a profile is accepted only in the admin cases that rule
+allows, and a key declaring a locked primary profile cannot use its skipped PIN
+check as verification. Refusals are `403 permission_denied` or
+`profile_verification_required`. The receiver is unaffected, since the secret
+authenticates it. The web offers the page to the primary profile, and to an acting
+admin with no profile selected, whom the API refuses once any profile is limited.
+
+### Revision-guarded onboarding
+
+`GET /api/v2/onboarding/flow?surface=web|phone|tv` returns the current tour
+manifest, filtered by live feature gates, surface and the active profile's child
+status. Unknown step kinds remain skippable. `GET /api/v2/onboarding/state`
+returns `tour_id`, optional `last_step`, optional UTC `completed_at`/`skipped_at`,
+and `done`, with a strong opaque ETag scoped to the account, profile and tour.
+Untouched state has its own validator. Conditional reads support 304.
+
+`PUT /api/v2/onboarding/progress` requires the exact state `If-Match` validator.
+Its body contains the current `tour_id`, optional `last_step`, and optional
+`completed` or `skipped` flags. Supplying both terminal flags is invalid. Missing
+If-Match returns 428, a stale validator returns 412 with the current ETag, and
+`If-Match: *` returns 400 because existence alone cannot order progress. A stale
+tour returns 409. Success returns the acknowledged state and its new ETag.
+The three routes require a verified active profile; progress is demo-restricted.
+`GET /api/v2/onboarding/capabilities` exposes `available` and `revision_guarded`.
+
+Both SQLite and PostgreSQL atomically check revisions on insertion/update.
+Database triggers advance the revision on every write, so a concurrent write
+invalidates a held validator. Completed/skipped timestamps remain monotonic. The
+migration adds a revision column without changing existing state.
+
+Clients serialize intents for a captured account/profile, wait for each response
+before advancing/dismissing, and use only the acknowledged next ETag. Progress is
+`non_retryable`: on 412 or an uncertain response, stop and reload canonical state.
+Never fetch a fresh validator merely to replay an old intent. The web follows
+this sequence and requires reload after failure. Apple and Android adoption must
+apply the same rule before these migration rows can be ratified. Jellyfin has no
+onboarding counterpart.
+
+
+## Settings semantics
+
+These rules apply to the settings operations above and to the administrator
+projection. A client whose vendored contract is newer than the advertised
+`manifest_revision` must hide definitions and features introduced after that
+revision, and any capability flag it depends on that is missing fails closed.
+
+### Request identity headers
+
+Authenticated settings routes use the active account and profile from the
+normal Silo session. The contextual headers below identify which client is
+resolving or writing an override.
+
+| Header                 | When required                                                                                               | Meaning                                                                                                                                     |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `X-Profile-Id`         | All `/api/v2/settings/values…` operations                                                                   | Active household profile.                                                                                                                   |
+| `X-Silo-Device-Id`     | A `profile_device` explicit request, or an effective request containing a key that permits `profile_device` | Stable exact-device identity.                                                                                                               |
+| `X-Silo-Client-Family` | Required for a `profile_client` explicit request; optional on effective reads                               | Closed like-client identity: `tv`, `mobile`, `tablet`, `desktop`, or `web`. A valid value includes the like-client layer; absence skips it. |
+
+Client family is intentionally independent of the free-form
+`X-Silo-Device-Platform` display metadata. The server never guesses one from
+the other. Send the exact lower-case family:
+
+| Client                  | Family    |
+| ----------------------- | --------- |
+| tvOS or Android TV      | `tv`      |
+| iPhone or Android phone | `mobile`  |
+| iPad or Android tablet  | `tablet`  |
+| macOS                   | `desktop` |
+| Browser                 | `web`     |
+
+#### App identity headers
+
+Separately from the family, every first-party client should send its own app
+identity on playback requests. These are server-wide contextual headers, not
+settings-specific: the playback session stores them, the admin Activity page
+renders them ("Silo Android TV 1.0.0 (build 5)"), and playback decision logs
+carry them so a report can be tied to an exact build.
+
+| Header                  | Clamp | Meaning                                                                                                          |
+| ----------------------- | ----- | ---------------------------------------------------------------------------------------------------------------- |
+| `X-Silo-Client`         | 128   | Product name, e.g. `Silo Android TV`, `Silo iOS`.                                                                |
+| `X-Silo-Client-Version` | 64    | Marketing version, e.g. `1.0.0`. Sent verbatim and displayed verbatim — do not pre-shorten it.                   |
+| `X-Silo-Client-Build`   | 64    | Opaque per-platform build identifier (Android `versionCode`, Apple `CFBundleVersion`). Never parsed or compared. |
+| `X-Silo-Client-Channel` | 32    | Opaque distribution channel: `release`, `beta`, `sideload`, `dev`. Stored verbatim; `release` is not displayed.  |
+
+Values are trimmed and truncated to the clamp above — never rejected, because an
+identity label must not be able to fail a playback start. The
+clamp counts characters, not bytes, matching `maxLength` in the v3 request
+schemas, and is applied where the request is read rather than where the session
+is created so the decision logs and `playback_route_events` observe it too.
+Nothing is validated against an enum either, so a client may introduce a new
+channel without a server change.
+
+The playback operations also declare `X-Client-Name`,
+`X-Client-Version`, `X-Client-Build`, and `X-Client-Channel`. A request with a
+non-blank `X-Client-Name` takes its whole identity from that set; a request
+without one takes it from the `X-Silo-Client*` set above when `X-Silo-Client` is
+non-blank. The two sets are never mixed field by field.
+
+`POST /api/v2/playback/start` accepts `client_playback_context.app_version`,
+`.app_build`, and `.app_channel` as a body-level fallback for clients that cannot
+set the headers on every request. The headers win field by field when both are
+present, and the fallback applies **only to a client that sent `X-Silo-Client`**:
+`client_playback_context` carries no app name, so nothing in the body can
+identify a client that did not name itself — such a session is labeled from its
+user agent, and its `app_version` is a free-form platform string rather than the
+marketing version `client_version` promises.
+
+### Remote scopes
+
+Every stored value has exactly one identity. Context fields not named by the
+selected scope must be absent.
+
+| Scope             | Identity after account        |
+| ----------------- | ----------------------------- |
+| `account`         | none                          |
+| `profile`         | `profile_id`                  |
+| `profile_client`  | `profile_id`, `client_family` |
+| `profile_device`  | `profile_id`, `device_id`     |
+| `profile_library` | `profile_id`, `library_id`    |
+| `profile_series`  | `profile_id`, `series_id`     |
+
+The manifest's `allowed_scopes` decides where each key may be written, and its
+`resolution_order` decides precedence. `profile_client` values roam only among
+like clients. For example, a TV value applies to tvOS and Android TV but not to
+a phone or browser.
+
+### Explicit values
+
+Use the explicit operations to edit or clear one scope, without resolving
+inherited values:
+
+- `listSettingValues` (`GET /api/v2/settings/values?keys=<key>&scope=<scope>`)
+  returns every requested key with `is_set`; unset rows remain in the response.
+- `getSettingValue` returns one stored value or `404`.
+- `updateSettingValue` accepts `{"value": <typed JSON>}`.
+- `deleteSettingValue` removes the row so inheritance applies again.
+
+`library_id` and `series_id` are query parameters for their matching scopes.
+An explicitly managed device may be named with `device_id`, subject to the
+profile/device authorization checks. The self-service `profile_client` scope
+takes its family only from `X-Silo-Client-Family`.
+
+Example: share a TV menu between tvOS and Android TV clients.
+
+```http
+PUT /api/v2/settings/values/nav.primary_menu?scope=profile_client
+Authorization: Bearer <token>
+X-Profile-Id: <profile-id>
+X-Silo-Client-Family: tv
+Content-Type: application/json
+
+{"value":{"items":[{"type":"builtin","destination":"home"},{"type":"library","library_id":7,"label":"Movies"}]}}
+```
+
+Stored-value responses include `client_family` when the source or explicit row
+is at `profile_client`.
+
+#### Superseded keys and the write mirror
+
+A definition may be marked `deprecated: true` in the manifest. It is still
+served, still readable and still writable — old clients depend on it — but new
+clients should read and write its replacement. The generated bindings carry the
+flag (`deprecated` on the TypeScript `SettingDefinition`, a `Deprecated` /
+`DEPRECATED` list in the Go, Kotlin and Swift bindings), so a client can hide a
+superseded control without a hand-kept list of key names. A client that offers
+both spellings as separate controls gives one preference two homes, and the
+mirror below means editing either silently rewrites the other.
+
+Revision 7 deprecates `playback.auto_skip_intro` in favor of
+`playback.intro_skip_mode`, whose three members say what the boolean could not:
+`never` (no prompt at all), `ask` (offer a Skip Intro button, what the boolean's
+`false` always did) and `always` (skip it and offer an undo). The default is
+`ask`, so an untouched profile behaves identically across the cutover.
+
+For one release the server keeps the pair in step, so a preference set on any
+client shows up correctly on the others:
+
+| Request                                                                                                   | Server also does                                                                                                                                                                                        |
+| --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PUT` of `playback.auto_skip_intro`                                                                       | writes `playback.intro_skip_mode` at the same identity: `true → "always"`, `false → "ask"`                                                                                                              |
+| `PUT` of `playback.intro_skip_mode`                                                                       | writes `playback.auto_skip_intro` at the same identity: `"always" → true`, otherwise `false`                                                                                                            |
+| `DELETE` of either                                                                                        | removes the other at the same identity                                                                                                                                                                  |
+| Profile create or update with `auto_skip_intro`                                                           | writes both keys at `profile` scope                                                                                                                                                                     |
+| `PUT` or `DELETE` of either key at `profile` scope                                                        | sets `user_profiles.auto_skip_intro` to what the pair now resolves to — the written value, or the contract default once the row is cleared — so the profile DTO stays truthful for clients that read it |
+
+Everything in that table commits as one transaction — both rows and the legacy
+profile column — on `DELETE` as well as `PUT`. A request that fails changes
+nothing. The response is always the
+stored value of the key the request addressed; the companion row is not
+reported. Only the addressed key raises a `user_settings.changed` event and an
+audit record.
+
+`DELETE` still answers `404 not_found` when the key it names has no value at
+that scope. If a companion is nonetheless found there — a state only a partial
+failure predating the transactional path could produce — it is cleared anyway,
+because a stray companion goes on resolving as an explicit choice that no retry
+can reach.
+
+Surfaces that count stored overrides — the device list's `changed_count`, the
+admin device summaries' `override_count` — count the pair once. It is one
+preference held in two spellings, so counting rows would both overstate a
+device's customization and drop by one, fleet-wide, on the day the mirror is
+retired.
+
+The boolean direction is lossy on purpose: a client that only understands the
+switch sees `never` as `false` and shows the button. Such a client that then
+flips the switch overwrites `never`, which is accepted for the overlap window
+and is why the mirror is temporary. Once every client reads the enum, a
+follow-up removes the mirror. Design: `docs/design/2026-08-16-intro-skip-mode.md`.
+
+#### Atomic navigation shortcuts
+
+`nav.shortcuts` is a profile-wide catalog shared by TV, mobile, desktop, and
+web clients. Self-service clients must mutate one destination at a time instead
+of replacing that shared document:
+
+```http
+PUT /api/v2/settings/values/nav.shortcuts/item
+Authorization: Bearer <token>
+X-Profile-Id: <profile-id>
+Content-Type: application/json
+
+{"item":{"type":"section","library_id":7,"section_id":"recent","label":"Recently Added"},"present":true}
+```
+
+The item is one member of `navigation-shortcuts.json`: a library, section, or
+collection (whose `collection_id` is a string and whose `library_id` is
+optional). Identity is exactly the schema's semantic identity:
+
+- library: `type + library_id`
+- section: `type + library_id + section_id`
+- collection: `type + optional library_id + collection_id`
+
+`present: true` appends an absent item or refreshes the label of an existing
+identity in place without reordering it. `present: false` removes that identity;
+the supplied label is validated but ignored for matching. The server atomically
+rebases on concurrent edits, enforces the full schema and 256-item cap, and
+returns the normal stored-value object containing the complete resulting
+`value`, row `revision`, and `updated_at`. An already-satisfied operation is a
+successful no-op and does not increment the revision. Removing from a catalog
+that has never been stored returns `{"items":[]}` at revision `0` with no
+`updated_at`.
+
+A retry resends the same desired state: an already-applied mutation is a no-op
+(see [Writes have no mutation id](#writes-have-no-mutation-id)). A rare exhausted
+contention loop returns a retryable `409` conflict. Malformed envelopes, unknown
+envelope fields, item schema failures (including unknown item fields) and cap
+failures return `422 validation_failed`.
+
+`updateSettingValue` and `deleteSettingValue` refuse `nav.shortcuts` with `422`
+at `path.key`, so a whole-document mutation cannot erase concurrent item edits
+or reset the row revision. The administrator `setAdminUserSettingValue` retains
+whole-document `PUT` for explicit repair work, but `deleteAdminUserSettingValue`
+refuses it for the same revision-history reason. An admin clears the catalog with
+`{"value":{"items":[]}}`, which advances the row revision, or replaces it with
+another validated document.
+
+### Effective values
+
+- `listEffectiveSettings` resolves several keys for the request profile, device,
+  and client family. Omitting `keys` resolves all remote definitions.
+- `resolveEffectiveSettings` resolves a bounded list of content contexts in one
+  store read (see [Batch effective resolution](#batch-effective-resolution)).
+
+An effective request must include the device header when any requested
+definition permits an exact-device override. The family header is optional:
+absence skips the `profile_client` layer, while a non-empty invalid family is
+rejected. First-party clients should send their
+family so like-device preferences participate in resolution. Each response
+includes its source scope and source context; `client_family` is included for a
+family-scoped winner.
+
+### Device registry
+
+The device registry lists each device a profile uses, with its name, platform
+and `last_seen_at`. `GET /api/v2/devices` and the administrator device reads
+list it. A profile can also give its entry a `custom_name` through
+`PATCH /api/v2/devices/{device_id}`; `GET /api/v2/devices` returns it when set,
+and clients show it in place of the reported name. Registration below never
+changes it (see [API contract](architecture/api-contract.md#self-service-device-settings)). The server registers the device named by `X-Silo-Device-Id`, with the
+optional `X-Silo-Device-Name` and `X-Silo-Device-Platform`, for the acting
+profile when the device:
+
+- resolves effective values (`listEffectiveSettings` or `resolveEffectiveSettings`);
+- starts playback (see [Playback API](playback-api.md#start));
+- writes one of its own `profile_device` values;
+- creates a download.
+
+A request that names another device with `device_id`, or another profile with
+`profile_id`, registers nothing: inspecting a device's settings does not show
+that the profile is using it. Settings and playback requests made in an
+administrator's view-as (impersonation) session register nothing either: the
+device is the administrator's, not the profile's. Settings and playback
+requests refresh a given profile and device at most once every five minutes per
+server process, so `last_seen_at` can trail actual use by that long. On those
+requests a failed registration is logged and does not fail the request, and the
+device's next request retries it.
+
+### Admin projection
+
+Admin operations require acting-admin authorization:
+
+- `listAdminUserSettingValues` (`GET /api/v2/admin/users/{id}/settings/values`)
+  lists every stored row across all scopes.
+- `setAdminUserSettingValue` (`PUT /api/v2/admin/users/{id}/settings/values/{key}?scope=<scope>`)
+  writes through the same contract validation and normalization as the
+  self-service operation.
+- `deleteAdminUserSettingValue` (`DELETE /api/v2/admin/users/{id}/settings/values/{key}?scope=<scope>`)
+  clears the selected row.
+
+Admin requests name profile/context identity with query parameters because the
+target user is not the admin's active session. In particular,
+`scope=profile_client` requires both `profile_id` and `client_family` query
+parameters; it does not use `X-Silo-Client-Family`.
+
+```http
+PUT /api/v2/admin/users/42/settings/values/ui.card_presentation?scope=profile_client&profile_id=main&client_family=tv
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{"value":{"poster_size":"large","caption":"title_metadata"}}
+```
+
+The five accepted `client_family` values are also returned by
+`getSettingsContractCapabilities` so admin tooling does not need to invent them.
+
+### Artwork storage settings
+
+The server admin settings include `artwork.storage_backend` (`auto`, `local`, or
+`s3`) and `artwork.local_path` (an absolute filesystem path, defaulting to
+`/var/lib/silo/artwork`). Artwork storage settings take effect after a server
+restart.
+
+A write of `artwork.local_path` is refused with a `422` validation problem when
+a local store could not open that folder: the path names an existing file or
+symbolic link, or a path inside a file. The check applies whichever backend is
+selected, since startup and storage transitions refuse such a folder too. The
+field error is at `body.values.artwork.local_path` (batch) or `body.value`
+(single key), with code `invalid`. The check runs on the server that takes the
+write and creates no folders; a folder that does not exist yet is accepted and
+created at startup.
+
+The first write to the assets store records its storage identity; writes to a
+shared local root count too. At startup, Silo records any configured private
+bucket, even if it is empty. A direct settings write that changes a recorded
+location is rejected with `409` (problem type `conflict` in `/api/v2`;
+`artwork_storage_locked` in the frozen `/api/v1`): a change of `artwork.storage_backend`, of
+`artwork.local_path` for a local store, of `s3.public_endpoint`,
+`s3.public_bucket`, or `s3.public_key_prefix` for an S3 store, or of
+`s3.private_bucket` on either backend. While a private bucket is configured, its
+`s3.private_endpoint` and `s3.private_key_prefix` are locked too, and the legacy
+`s3.operational_*` aliases count as the keys they fill. When only the private
+bucket is recorded, only its keys are locked. Adding a public bucket
+while an `auto` backend is recorded as local is also rejected, since it would
+change what `auto` resolves to. Re-saving the current values is accepted, and a
+key prefix compares after trimming slashes. Locked locations change through a
+managed storage transition (see `docs/admin-settings-api.md`).
+`GET /api/v2/admin/server/status` reports `artwork_storage.locked` for the
+artwork location and `artwork_storage.private_locked` for the operational
+location. `artwork_storage.status_known` is true only when the server read the
+settings successfully; when false, the lock values must not be used to permit
+location edits.
+Selecting `s3` without a configured `s3.public_bucket`, or clearing the bucket
+while `s3` is selected, is rejected as `invalid_settings`.
+
+`metadata.image_workers` sizes the pool that downloads and encodes provider
+artwork in parallel. The same per-server limit also covers manual refreshes
+and copies of local artwork found next to media files. `0`, the default, runs
+one encode per CPU core.
+Each encode is single-threaded in libvips, so the pool is the only source of
+parallelism; a lower value keeps a shared household server responsive during a
+first scan, a higher one finishes the backlog sooner. The value is capped by the
+process memory limit at one worker per 512 MiB and applies to the next run
+without a restart.
+
+`metadata.fallback_language` is the language metadata refreshes use when
+providers have no title, description, or episode text in a library's metadata
+language. It defaults to `en`; any registered two-letter ISO 639-1 code is
+accepted, and `original` turns the fallback off so the original language is
+used, as before the setting existed. A refresh that writes an item in its base
+language fetches the missing text in the fallback language and stores it there.
+Gaps the fallback language cannot fill keep the original-language text. A
+manual refresh asks for fallback text even where text is stored. A scheduled
+refresh asks only for fields that have no stored text, and not again for text
+no language had on an earlier pass.
+Text in another library's language row is never filled: those rows fall back to
+the base row when read.
+
+The setting also orders artwork. With it on, posters rank library language,
+fallback language, English, textless, then any other language, and logos,
+banners, and other titled artwork rank library language, fallback language,
+English, language-neutral, then any other language. This applies to English
+libraries too, where a textless poster now beats one titled in another
+language. With it off, a poster in any language still beats a textless one.
+The setting applies without a restart.
+
+`metadata.cache_images` defaults to `true` on fresh installations. It no longer
+requires a public S3 bucket because local artwork storage is available. With it
+off, clients load item artwork straight from the providers: refreshes select no
+local artwork (sidecar files, files or image URLs an NFO names, extra
+backdrops), nothing is copied into artwork storage, and NFO text still applies.
+Artwork stored earlier goes back to its providers through a hidden task that
+runs at startup, daily, and when the setting is turned off: a stored copy of
+provider artwork serves its provider source again, and a matched movie or
+series whose poster, backdrop, or logo has no provider source, or that keeps
+extra backdrops, or that a storage recovery left without artwork, is queued
+for a metadata refresh at most once a week. The item keeps that art until a
+refresh finds a provider image. A localized copy saved without any source is
+cleared, so the item's or season's own artwork shows. Items with locked
+artwork keep what they have; choosing artwork in Edit Metadata locks it, for a
+season or episode on the whole series. Banner, landscape thumb, clear art, and
+disc art come only from local files, so copies already stored stay. Nothing is
+deleted directly; the artwork revision GC collects the displaced copies. Frames
+taken from a video, the extras' stills and the posters of movies with no
+poster, are stored regardless of the setting.
+Turning the setting back on caches artwork for later refreshes; the Backfill
+Metadata Images task stores the provider artwork already served by URL.
+
+`catalog.scope_versions_to_library` (default `false`) makes a library-scoped v2
+catalog read return only the versions stored in the `library_id` it was given.
+It is server-wide, applies without a restart, and never affects playback; see
+"Library-scoped version lists" in [catalog-api.md](catalog-api.md).
+
+`catalog.extra_rating_sources` (default empty) lists, comma-separated, the
+external rating sources clients show in addition to IMDb and TMDB, which always
+show. The sources are the ones metadata plugins declare (see "Rating sources"
+in [catalog-api.md](catalog-api.md)); `GET /api/v2/admin/rating-sources` lists
+them. A name must match `^[a-z][a-z0-9_]{0,31}$`; a name no enabled plugin
+declares is kept but shows nothing. It is
+server-wide and applies within seconds, without a restart; see "Ratings on
+title pages" in [catalog-api.md](catalog-api.md).
+
+`scanner.realtime_monitoring` (default `true`) is the server-wide real-time
+monitoring switch: Silo scans library folders automatically when their files
+change. A library is monitored only while this setting, the library's own
+`realtime_monitoring` switch (see [libraries-api.md](libraries-api.md)), and the
+library itself are all on. The setting applies without a restart.
+
+`access.unrated_content` (`hide` or `allow`, default `hide`) decides whether a
+profile with a content-rating ceiling sees titles that have no rating: an empty
+rating or an explicit marker such as `NR` or `Not Rated`. A rating the server
+cannot read is hidden from every ceilinged profile regardless. The setting covers
+titles in the library; request discovery keeps hiding TMDB titles that have no US
+certification from ceilinged profiles. The setting is
+server-wide and applies within seconds, without a restart. Ceilings compare
+minimum viewer ages, so a ceiling from any national system limits titles rated
+in any other; a US ceiling admits its whole tier (`PG-13` admits `TV-14`, `R`
+admits `NC-17`). The setting does not apply to a profile's advisory-age limit
+(`max_advisory_age`). Whether that limit hides a title with no advisory age is
+a per-profile choice, `require_advisory_age`, not this server-wide setting; see
+"Advisory age" in [catalog-api.md](catalog-api.md).
+
+## Forward and rewind intervals
+
+Revision 9 adds four profile-wide preferences. The backend stores and validates
+these values; each client applies them to its own relative-seek actions.
+
+| Key                                     | Default |
+| --------------------------------------- | ------- |
+| `player.video_skip_back_seconds`        | 10      |
+| `player.video_skip_forward_seconds`     | 30      |
+| `player.audiobook_skip_back_seconds`    | 10      |
+| `player.audiobook_skip_forward_seconds` | 30      |
+
+Each value is a numeric enum in seconds: `5`, `10`, `15`, `30`, `45`, `60`, or
+`90`. Only `profile` scope is allowed; an unset preference resolves to its
+contract default. The preference follows the active household profile across
+client families and devices. It does not belong to the whole login account.
+
+Discover support through the settings capability and manifest endpoints before
+reading or writing these keys. Use the existing effective read, profile-scoped
+PUT/DELETE, and `user_settings.changed` invalidation flow. No playback protocol
+or database schema change is required. On an older server, or one whose
+capabilities could not be read, a client uses the contract defaults for video
+and any interval this browser or device stored locally for audiobooks; neither
+state authorizes a write to the server.
+
+Clients should use one resolved interval per media type and direction for
+buttons, keyboard shortcuts, gestures, minimized players, and supported media
+controls. Labels must show the interval the action will use. Settings changes
+apply to subsequent actions without restarting playback. Explicit timestamp
+seeks, chapter navigation, automatic marker skipping, and resume rewind are
+separate operations and do not use these intervals.
+
+Legacy browser-local audiobook intervals have no profile identity. Importing
+must be an explicit user action that identifies the values and explains their
+profile-wide effect. The two writes are independent: report each failure and
+retain legacy values for retry instead of claiming an atomic import.
+
+The standalone web player receives resolved intervals from its host rather
+than calling the settings API itself. Media Session relative-seek handlers use
+the configured interval even if an operating system supplies its own default
+`seekOffset`. Browser-native fullscreen controls may perform seeks internally
+without dispatching those handlers; there is no portable API to configure that
+UI, and such controls are not guaranteed to honor these preferences.
+
+Native adoption is tracked in [Apple #267](https://github.com/Silo-Server/silo-apple/issues/267)
+and [Android #300](https://github.com/Silo-Server/silo-android/issues/300).
+Jellyfin clients keep their own seek controls; this does not extend the
+Jellyfin protocol.
+
+## App language
+
+Revision 28 adds `ui.app_language`, the language of a client's menus, buttons and messages. It
+is a nullable `language_tag` stored at `profile` or `profile_device` and resolved
+`profile_device` → `profile` → `default`. The default `null` means "follow the device or browser
+language". The value is an open tag that the server canonicalizes on write (`pt_br` is stored as
+`pt-BR`); the `app_languages` option set is an advisory list. A client applies a stored tag only
+when it ships that language, matched as it matches the device language list (`es-MX` → `es`,
+`zh-CN` → `zh-Hans`), and otherwise behaves as if the value were `null`. Its picker still shows a
+stored tag it does not ship, so a re-save never erases the profile's choice. It is unrelated to
+the spoken-language and text preferences `playback.audio_language`, `playback.subtitle_language`
+and `catalog.metadata_language`.
+
+A household parent sets it for another profile on the account with the usual
+`PUT /api/v2/settings/values/ui.app_language?scope=profile&profile_id=<id>`, and an administrator
+uses `setAdminUserSettingValue`. Jellyfin clients choose their own interface language; this does
+not extend the Jellyfin protocol.
+
+How each client matches, loads and applies the language is in
+[the client translation architecture](architecture/i18n.md).

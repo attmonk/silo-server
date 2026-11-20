@@ -1,0 +1,38 @@
+// Package apiv2 embeds the committed API v2 contract artifacts so every
+// consumer reads the exact bytes that were checked in: internal/routeinventory
+// and the server binary, which serves and digests the OpenAPI artifact through
+// internal/apiv2.
+//
+// This package deliberately contains nothing but the embed directives; loading
+// and validation live in the packages above.
+package apiv2
+
+import "embed"
+
+// FS holds route-inventory.json, the breaking-change approvals with their schema, and
+// the contract fixtures (fixtures/*.json) with their index schema.
+// The post-lock marker LOCKED is deliberately not embedded: it is read from
+// the working tree by the diff command, never by the binary.
+//
+//go:embed route-inventory.json breaking-approvals.json breaking-approvals.schema.json fixtures.schema.json fixtures/*.json
+var FS embed.FS
+
+// FixturesDir is the directory inside FS holding the contract fixtures and
+// their index.json; FixturesSchemaPath is the index's JSON Schema.
+// TestContractFixtures in internal/apiv2 generates them (make apiv2-fixtures)
+// and internal/contractspec validates every body against the OpenAPI schema
+// the index names.
+const (
+	FixturesDir        = "fixtures"
+	FixturesSchemaPath = "fixtures.schema.json"
+)
+
+// OpenAPI is the committed contracts/api/v2/openapi.json, byte for byte. The
+// server serves these bytes at /api/v2/openapi.json and reports their SHA-256
+// as the contract digest in /api/v2/system/info; it never regenerates the
+// document from runtime wiring. cmd/apiv2-openapi generates the file from the
+// Go registries (make apiv2-openapi); make verify-apiv2-openapi and
+// TestCommittedArtifactMatchesRouter in internal/apiv2 fail when it is stale.
+//
+//go:embed openapi.json
+var OpenAPI []byte

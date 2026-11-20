@@ -1,0 +1,434 @@
+package downloadprepare
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
+)
+
+// testNodeKeys signs every request in these tests as a transcode node whose
+// key is "secret".
+var testNodeKeys = nodeauthtest.NodeKey("secret")
+
+func TestHTTPPreparerSendsAuthenticatedRecipe(t *testing.T) {
+	var got Request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/downloads/prepare" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if !nodeauthtest.Signed(r, "secret") {
+			t.Fatalf("request is not signed: Authorization = %q", r.Header.Get("Authorization"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(Result{ArtifactID: got.ArtifactID, FileSize: 123})
+	}))
+	defer server.Close()
+
+	want := Request{ArtifactID: "job-1", InputPath: "/media/movie.mkv", TargetCodecVideo: "h264", TargetCodecAudio: "aac"}
+	result, err := (HTTPPreparer{}).Prepare(context.Background(), server.URL+"/", testNodeKeys, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != (Result{ArtifactID: "job-1", FileSize: 123}) {
+		t.Fatalf("result = %+v", result)
+	}
+	if got != want {
+		t.Fatalf("request = %+v, want %+v", got, want)
+	}
+}
+
+func TestResultJSONCarriesToneMapAttestationAndOmitsItForOrdinaryArtifacts(t *testing.T) {
+	toneMapped := Result{
+		ArtifactID:                       "artifact-tone-map",
+		FileSize:                         123,
+		ToneMapRecipeVersion:             "1",
+		ToneMapMode:                      tonemap.ModeSoftware,
+		ToneMapSourceRevisionFingerprint: "0123456789abcdef",
+	}
+	wire, err := json.Marshal(toneMapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Result
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded != toneMapped {
+		t.Fatalf("result round trip = %+v, want %+v", decoded, toneMapped)
+	}
+
+	ordinary, err := json.Marshal(Result{ArtifactID: "artifact-ordinary", FileSize: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(ordinary); got != `{"artifact_id":"artifact-ordinary","file_size":42}` {
+		t.Fatalf("ordinary result JSON = %s", got)
+	}
+}
+
+// TestRequestRoundTripPreservesFrozenToneMapRecipe verifies remote requests retain executor facts.
+func TestRequestRoundTripPreservesFrozenToneMapRecipe(t *testing.T) {
+	revision := tonemap.SourceRevision{MediaFileID: 42, FileSize: 100, FileModifiedUnixNano: 200, StreamSignature: "stream"}
+	want := playback.TranscodeOpts{
+		InputPath: "/media/hdr.mkv", ToneMapPolicy: tonemap.PolicyHardwareThenSoftware,
+		ToneMapMode: tonemap.ModeHardware, ToneMapSourceKind: tonemap.SourcePQ,
+		ToneMapFilter: "tonemap_vaapi", ToneMapRecipeVersion: playback.TransformationHDRToSDRToneMapRecipeVersionV3,
+		ToneMapPreflightRequired: true, ToneMapSourceRevision: revision,
+		ToneMapDVConfigPresent: true, ToneMapDVBLCompatIDPresent: true, ToneMapDVBLPresent: true, ToneMapDVRPUPresent: true,
+		TargetCodecVideo: "h264", TargetCodecAudio: "aac", SourceAudioChannels: 6, TargetAudioChannels: 2, TargetAudioBitrateKbps: 256,
+	}
+	request := NewRequest("artifact-1", want)
+	wire, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	var decoded Request
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+	got := decoded.TranscodeOpts("/usr/bin/ffmpeg", "qsv", "/dev/dri/renderD128", nil)
+	if got.ToneMapPolicy != want.ToneMapPolicy || got.ToneMapMode != want.ToneMapMode ||
+		got.ToneMapSourceKind != want.ToneMapSourceKind || got.ToneMapRecipeVersion != want.ToneMapRecipeVersion ||
+		got.ToneMapPreflightRequired != want.ToneMapPreflightRequired || got.ToneMapSourceRevision != revision ||
+		got.SourceAudioChannels != want.SourceAudioChannels || got.TargetAudioChannels != want.TargetAudioChannels || got.TargetAudioBitrateKbps != want.TargetAudioBitrateKbps {
+		t.Fatalf("tone-map request round trip = %+v, want %+v", got, want)
+	}
+	if !got.ToneMapDVConfigPresent || !got.ToneMapDVBLCompatIDPresent || !got.ToneMapDVBLPresent || !got.ToneMapDVRPUPresent {
+		t.Fatalf("Dolby Vision source presence flags were lost: %+v", got)
+	}
+	if got.ToneMapFilter != "" {
+		t.Fatalf("node request trusted a server-selected filter: %q", got.ToneMapFilter)
+	}
+}
+
+func TestRequestExecutionFingerprintBindsRecipeButNotArtifactHandle(t *testing.T) {
+	base := Request{
+		ArtifactID: "attempt-a", InputPath: "/media/hdr.mkv", SourceVideoCodec: "h264",
+		SourceVideoProfile: "High 10", SourceVideoBitDepth: 10, SoftwareVideoDecode: true,
+		ToneMapPolicy: tonemap.PolicySoftwareOnly, ToneMapMode: tonemap.ModeSoftware,
+		ToneMapSourceKind: tonemap.SourcePQ, ToneMapRecipeVersion: playback.TransformationHDRToSDRToneMapRecipeVersionV3,
+		ToneMapPreflightRequired: true, ToneMapSourceRevision: tonemap.SourceRevision{MediaFileID: 42, FileSize: 100},
+		ToneMapDVConfigPresent: true, ToneMapDVBLCompatIDPresent: true, ToneMapDVBLPresent: true, ToneMapDVRPUPresent: true,
+		TargetCodecVideo: "h264", TargetCodecAudio: "aac", TargetResolution: "1080p",
+		TargetBitrateKbps: 8000, AudioTrackIndex: 1,
+		AudioRecipeVersion:  playback.TransformationAudioToAACRecipeVersionV3,
+		SourceAudioChannels: 6, TargetAudioChannels: 2, TargetAudioBitrateKbps: 256, TotalDuration: 7200,
+	}
+	want := base.ExecutionFingerprint()
+	if want == "" {
+		t.Fatal("ExecutionFingerprint() is empty")
+	}
+	handleOnly := base
+	handleOnly.ArtifactID = "attempt-b"
+	if got := handleOnly.ExecutionFingerprint(); got != want {
+		t.Fatalf("artifact handle changed execution fingerprint: %q != %q", got, want)
+	}
+	changed := base
+	changed.SoftwareVideoDecode = false
+	if got := changed.ExecutionFingerprint(); got == want {
+		t.Fatal("byte-affecting software decode did not change execution fingerprint")
+	}
+	changed = base
+	changed.AudioRecipeVersion = base.AudioRecipeVersion + "-changed"
+	if got := changed.ExecutionFingerprint(); got == want {
+		t.Fatal("byte-affecting audio recipe version did not change execution fingerprint")
+	}
+	changed = base
+	changed.SourceAudioChannels = 8
+	if got := changed.ExecutionFingerprint(); got == want {
+		t.Fatal("byte-affecting source channel count did not change execution fingerprint")
+	}
+	changed = base
+	changed.TargetAudioChannels = 6
+	if got := changed.ExecutionFingerprint(); got == want {
+		t.Fatal("byte-affecting target channel count did not change execution fingerprint")
+	}
+	changed = base
+	changed.TargetAudioBitrateKbps = 320
+	if got := changed.ExecutionFingerprint(); got == want {
+		t.Fatal("byte-affecting target audio bitrate did not change execution fingerprint")
+	}
+	changed = base
+	changed.TotalDuration++
+	if got := changed.ExecutionFingerprint(); got == want {
+		t.Fatal("byte-affecting duration did not change execution fingerprint")
+	}
+	// A node must leave an audiobook's cover art out, so the flag travels and
+	// an older node that drops it cannot return the matching fingerprint.
+	changed = NewRequest("attempt-a", playback.TranscodeOpts{InputPath: "/media/book.flac", TargetCodecVideo: "copy", TargetCodecAudio: "aac", AudioOnly: true})
+	wire, err := json.Marshal(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Request
+	if err := json.Unmarshal(wire, &decoded); err != nil || !decoded.TranscodeOpts("ffmpeg", "none", "", nil).AudioOnly {
+		t.Fatalf("audio-only flag lost on the wire: %s %v", wire, err)
+	}
+	dropped := decoded
+	dropped.AudioOnly = false
+	if dropped.ExecutionFingerprint() == decoded.ExecutionFingerprint() {
+		t.Fatal("audio-only flag did not change execution fingerprint")
+	}
+}
+
+// The source frame rate reaches the node, which reads the encode's progress
+// from it, and leaves the fingerprint alone: it changes no bytes, and an
+// older node that drops it must still return the matching fingerprint.
+func TestRequestCarriesTheFrameRateOutsideTheFingerprint(t *testing.T) {
+	opts := playback.TranscodeOpts{InputPath: "/media/movie.mkv", TargetCodecVideo: "h264", TargetCodecAudio: "aac", TotalDuration: 600, SourceFrameRate: 24}
+	request := NewRequest("attempt-a", opts)
+	wire, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Request
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if got := decoded.TranscodeOpts("ffmpeg", "none", "", nil).SourceFrameRate; got != 24 {
+		t.Fatalf("node frame rate = %v, want 24 (%s)", got, wire)
+	}
+	olderNode := decoded
+	olderNode.SourceFrameRate = 0
+	if olderNode.ExecutionFingerprint() != decoded.ExecutionFingerprint() {
+		t.Fatal("the frame rate changed the execution fingerprint")
+	}
+}
+
+func TestRequestExecutionAttestationIncludesExplicitAudioOutput(t *testing.T) {
+	if (Request{}).ExecutionAttestationRequested() {
+		t.Fatal("ordinary legacy request unexpectedly requires a receipt")
+	}
+	for _, request := range []Request{
+		{TargetAudioChannels: 1},
+		{TargetAudioBitrateKbps: 256},
+	} {
+		if !request.ExecutionAttestationRequested() {
+			t.Fatalf("explicit audio output did not require a receipt: %+v", request)
+		}
+	}
+}
+
+func TestRequestValidToneMapAttestationRequiresCompleteCurrentRecipe(t *testing.T) {
+	valid := Request{
+		ToneMapPolicy: tonemap.PolicySoftwareOnly, ToneMapMode: tonemap.ModeSoftware,
+		ToneMapSourceKind: tonemap.SourcePQ, ToneMapRecipeVersion: playback.TransformationHDRToSDRToneMapRecipeVersionV3,
+		ToneMapSourceRevision: tonemap.SourceRevision{MediaFileID: 1, FileSize: 8},
+	}
+	if !valid.ValidToneMapAttestation() {
+		t.Fatal("complete current tone-map recipe was not valid for attestation")
+	}
+	for _, mutate := range []func(*Request){
+		func(req *Request) { req.ToneMapPolicy = tonemap.PolicyNone },
+		func(req *Request) { req.ToneMapMode = "" },
+		func(req *Request) { req.ToneMapSourceKind = "" },
+		func(req *Request) { req.ToneMapRecipeVersion = "stale" },
+		func(req *Request) { req.ToneMapSourceRevision = tonemap.SourceRevision{} },
+	} {
+		req := valid
+		mutate(&req)
+		if req.ValidToneMapAttestation() {
+			t.Fatalf("incomplete or stale recipe was valid for attestation: %+v", req)
+		}
+	}
+}
+
+// A node URL that request() normalizes (an escaped path prefix, surrounding
+// whitespace) must be signed in its normalized form, or the worker behind a
+// prefix-stripping reverse proxy refuses the request.
+func TestHTTPPreparerSignsNormalizedNodeURLPrefix(t *testing.T) {
+	worker := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !nodeauthtest.Signed(r, "secret") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Length", "42")
+	})
+	for _, tc := range []struct {
+		name, strip, prefix, pad string
+	}{
+		{name: "escaped prefix", strip: "/worker", prefix: "/%77orker"},
+		{name: "padded URL", strip: "/node1", prefix: "/node1", pad: " "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.StripPrefix(tc.strip, worker))
+			defer server.Close()
+			nodeURL := tc.pad + server.URL + tc.prefix + tc.pad
+			result, err := HTTPPreparer{}.Stat(t.Context(), nodeURL, testNodeKeys, "artifact-1")
+			if err != nil || result.FileSize != 42 {
+				t.Fatalf("Stat = (%+v, %v), want a signed request the worker accepts", result, err)
+			}
+		})
+	}
+}
+
+func TestHTTPPreparerStatRecoversToneMapAttestationFromHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "42")
+		w.Header().Set("X-Silo-Tone-Map-Recipe-Version", "1")
+		w.Header().Set("X-Silo-Tone-Map-Mode", "software")
+		w.Header().Set("X-Silo-Tone-Map-Source-Revision-Fingerprint", "0123456789abcdef")
+	}))
+	defer server.Close()
+
+	result, err := (HTTPPreparer{}).Stat(context.Background(), server.URL, testNodeKeys, "artifact-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Result{
+		ArtifactID:                       "artifact-1",
+		FileSize:                         42,
+		ToneMapRecipeVersion:             "1",
+		ToneMapMode:                      tonemap.ModeSoftware,
+		ToneMapSourceRevisionFingerprint: "0123456789abcdef",
+	}
+	if result != want {
+		t.Fatalf("Stat = %+v, want %+v", result, want)
+	}
+}
+
+func TestHTTPPreparerStatRejectsOversizedAttestationHeader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "42")
+		w.Header().Set("X-Silo-Tone-Map-Recipe-Version", strings.Repeat("x", 1025))
+	}))
+	defer server.Close()
+
+	if _, err := (HTTPPreparer{}).Stat(context.Background(), server.URL, testNodeKeys, "artifact-1"); err == nil {
+		t.Fatal("Stat accepted an oversized attestation header")
+	}
+}
+
+func TestHTTPPreparerDeleteStopsStalledErrorBodyRead(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	started := time.Now()
+	err := (HTTPPreparer{ReadIdleTimeout: 50 * time.Millisecond}).Delete(
+		context.Background(), server.URL, testNodeKeys, "artifact-stalled-delete",
+	)
+	if !errors.Is(err, ErrRelayReadIdle) {
+		t.Fatalf("Delete error = %v, want ErrRelayReadIdle", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled delete response took %s, want a bounded failure", elapsed)
+	}
+}
+
+func TestDefaultPrepareClientHasNoResponseHeaderDeadline(t *testing.T) {
+	transport, ok := defaultPrepareHTTPClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T", defaultPrepareHTTPClient.Transport)
+	}
+	if transport.ResponseHeaderTimeout != 0 {
+		t.Fatalf("prepare response header timeout = %s, want none", transport.ResponseHeaderTimeout)
+	}
+}
+
+func TestHTTPPreparerPrepareStopsStalledResultBodyRead(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	started := time.Now()
+	_, err := (HTTPPreparer{ReadIdleTimeout: 50 * time.Millisecond}).Prepare(
+		context.Background(), server.URL, testNodeKeys, Request{ArtifactID: "artifact-stalled-result"},
+	)
+	if !errors.Is(err, ErrRelayReadIdle) {
+		t.Fatalf("Prepare error = %v, want ErrRelayReadIdle", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled result read took %s, want a bounded failure", elapsed)
+	}
+}
+
+func TestCopyResponseHeadersDoesNotExposeOriginArtifactFilename(t *testing.T) {
+	src := http.Header{
+		"Content-Disposition": {`attachment; filename="opaque-artifact.mp4"`},
+		"Content-Type":        {"video/mp4"},
+		"Content-Length":      {"42"},
+	}
+	dst := make(http.Header)
+	CopyResponseHeaders(dst, src)
+	if got := dst.Get("Content-Disposition"); got != "" {
+		t.Fatalf("Content-Disposition = %q, want omitted", got)
+	}
+	if dst.Get("Content-Type") != "video/mp4" || dst.Get("Content-Length") != "42" {
+		t.Fatalf("copied headers = %v", dst)
+	}
+}
+
+func TestHTTPPreparerOpenStopsStalledBodyRead(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	resp, err := (HTTPPreparer{ReadIdleTimeout: 50 * time.Millisecond}).Open(
+		context.Background(), server.URL, testNodeKeys, "artifact-stalled", http.MethodGet, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	started := time.Now()
+	_, err = io.ReadAll(resp.Body)
+	if !errors.Is(err, ErrRelayReadIdle) {
+		t.Fatalf("ReadAll error = %v, want ErrRelayReadIdle", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled read took %s, want a bounded failure", elapsed)
+	}
+}
+
+func TestRequestLogSessionIDIsExcludedFromFingerprintAndValidated(t *testing.T) {
+	opts := playback.TranscodeOpts{InputPath: "/media/a.mkv", TargetCodecVideo: "h264", TargetCodecAudio: "aac",
+		SessionID: playback.DownloadPrepareLogSessionID("art-1")}
+	labeled := NewRequest("attempt-1", opts)
+	if labeled.LogSessionID != "download-prepare-art-1" {
+		t.Fatalf("log session = %q", labeled.LogSessionID)
+	}
+	opts.SessionID = ""
+	if NewRequest("attempt-2", opts).ExecutionFingerprint() != labeled.ExecutionFingerprint() {
+		t.Fatal("the log label changed the execution fingerprint")
+	}
+	if got := labeled.TranscodeOpts("ffmpeg", "none", "", nil).SessionID; got != "download-prepare-art-1" {
+		t.Fatalf("node session id = %q", got)
+	}
+	labeled.LogSessionID = "some-playback-session"
+	if got := labeled.TranscodeOpts("ffmpeg", "none", "", nil).SessionID; got != "" {
+		t.Fatalf("node accepted foreign log session %q", got)
+	}
+}

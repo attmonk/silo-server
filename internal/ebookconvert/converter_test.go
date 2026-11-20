@@ -1,0 +1,149 @@
+package ebookconvert
+
+import (
+	"archive/zip"
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func newTestConverter(t *testing.T) *Converter {
+	t.Helper()
+	c, err := NewConverter(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("NewConverter: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	return c
+}
+
+func TestConvert_DRMFreeProducesValidEpub(t *testing.T) {
+	for _, fixture := range []string{"sample-ncx.mobi", "sample-cp1252.mobi"} {
+		t.Run(fixture, func(t *testing.T) {
+			c := newTestConverter(t)
+			dst := filepath.Join(t.TempDir(), "out.epub")
+			if err := c.Convert(context.Background(), filepath.Join("testdata", fixture), dst); err != nil {
+				t.Fatalf("Convert: %v", err)
+			}
+			// Independently re-validate the delivered file is a real EPUB.
+			assertValidEpub(t, dst)
+		})
+	}
+}
+
+func TestConvert_DRMProtectedRejected(t *testing.T) {
+	c := newTestConverter(t)
+	dst := filepath.Join(t.TempDir(), "out.epub")
+	err := c.Convert(context.Background(), filepath.Join("testdata", "sample-drm-v1.mobi"), dst)
+	if !errors.Is(err, ErrDRMProtected) {
+		t.Fatalf("got %v, want ErrDRMProtected", err)
+	}
+	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+		t.Fatalf("DRM source must not produce an output file, but %s exists", dst)
+	}
+}
+
+func TestConvert_OversizeRejected(t *testing.T) {
+	c, err := NewConverter(context.Background(), Options{MaxSourceBytes: 1024})
+	if err != nil {
+		t.Fatalf("NewConverter: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	dst := filepath.Join(t.TempDir(), "out.epub")
+	if err := c.Convert(context.Background(), filepath.Join("testdata", "sample-ncx.mobi"), dst); !errors.Is(err, ErrSourceTooLarge) {
+		t.Fatalf("got %v, want ErrSourceTooLarge", err)
+	}
+}
+
+func TestConvert_CorruptSourceFails(t *testing.T) {
+	c := newTestConverter(t)
+	bad := filepath.Join(t.TempDir(), "bad.mobi")
+	if err := os.WriteFile(bad, []byte("not a mobi file at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "out.epub")
+	if err := c.Convert(context.Background(), bad, dst); !errors.Is(err, ErrConversionFailed) {
+		t.Fatalf("got %v, want ErrConversionFailed", err)
+	}
+}
+
+func TestConvert_ContextCancelled(t *testing.T) {
+	c := newTestConverter(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled before the conversion starts
+	dst := filepath.Join(t.TempDir(), "out.epub")
+	if err := c.Convert(ctx, filepath.Join("testdata", "sample-ncx.mobi"), dst); err == nil {
+		t.Fatal("expected error on canceled context")
+	}
+}
+
+func TestValidateEpub_RejectsNonEpubZip(t *testing.T) {
+	// A zip that is not an EPUB (no mimetype-first) must be rejected.
+	p := filepath.Join(t.TempDir(), "plain.zip")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, _ := zw.Create("hello.txt")
+	_, _ = w.Write([]byte("hi"))
+	_ = zw.Close()
+	_ = f.Close()
+	if err := validateEpub(p); err == nil {
+		t.Fatal("expected validateEpub to reject a non-EPUB zip")
+	}
+}
+
+// classifyRunError must propagate a caller's deadline as context.DeadlineExceeded
+// (CR review): reclassifying it as a conversion failure breaks upstream
+// cancellation handling and would poison the negative cache.
+func TestClassifyRunError_ParentDeadlinePropagates(t *testing.T) {
+	parent, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+	defer cancel()
+	run := parent // run derives from parent, so it is also past-deadline
+	err := classifyRunError(parent, run, context.DeadlineExceeded, time.Minute, "mobitool output")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded propagated", err)
+	}
+	if errors.Is(err, ErrConversionFailed) || errors.Is(err, ErrConversionTimedOut) {
+		t.Fatalf("a caller deadline must not be reclassified as a conversion verdict: %v", err)
+	}
+}
+
+func assertValidEpub(t *testing.T, path string) {
+	t.Helper()
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatalf("open epub: %v", err)
+	}
+	defer zr.Close()
+	if len(zr.File) == 0 || zr.File[0].Name != "mimetype" {
+		t.Fatalf("first entry not mimetype")
+	}
+	rc, _ := zr.File[0].Open()
+	mt, _ := io.ReadAll(rc)
+	rc.Close()
+	if strings.TrimSpace(string(mt)) != "application/epub+zip" {
+		t.Fatalf("bad mimetype %q", mt)
+	}
+	var hasContainer, hasContent bool
+	for _, fl := range zr.File {
+		if fl.Name == "META-INF/container.xml" {
+			hasContainer = true
+		}
+		if strings.HasPrefix(fl.Name, "OEBPS/") {
+			hasContent = true
+		}
+	}
+	if !hasContainer {
+		t.Fatal("missing META-INF/container.xml")
+	}
+	if !hasContent {
+		t.Fatal("no OEBPS content")
+	}
+}

@@ -1,0 +1,426 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/artworkurl"
+	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// CollectionHandler handles personal collection CRUD endpoints.
+type CollectionHandler struct {
+	storeProvider      userstore.UserStoreProvider
+	LibraryCollections collectionPreferenceLibraryReader
+	Executor           *catalog.QueryExecutor
+	ItemReader         collectionMutationItemReader
+	ArtworkStore       blobstore.Store
+	ArtworkResolver    artworkurl.Resolver
+	// HTTPClient fetches poster_source_url images. Any profile supplies those
+	// URLs, so the fetch reaches public addresses only (newCollectionImageClient,
+	// with no netguard.WithPrivateAccess).
+	HTTPClient *http.Client
+	// CollectionOwners resolves the owner's access for another profile's
+	// shared collection; without it those collections cannot be read.
+	CollectionOwners catalog.PersonalCollectionAccess
+	// ItemPosters signs catalog item posters for smart previews;
+	// ArtworkResolver signs only stored collection artwork keys.
+	ItemPosters itemPosterSigner
+	// Collages serves and builds the collage a collection without an
+	// uploaded or imported poster shows; nil when artwork storage is not
+	// configured.
+	Collages *catalog.PersonalCollectionCollages
+	// MemberCounts counts the members a viewer sees in hand-picked and
+	// imported collections and remembers the counts between reads; nil
+	// counts on every read.
+	MemberCounts *catalog.PersonalCollectionMemberCounts
+}
+
+// itemPosterSigner resolves item poster paths to delivery URLs in one batch;
+// catalog.DetailService implements it.
+type itemPosterSigner interface {
+	PresignImageURLs(ctx context.Context, paths []string, imageType, size string) map[string]string
+}
+
+// NewCollectionHandler creates a new CollectionHandler.
+func NewCollectionHandler(provider userstore.UserStoreProvider) *CollectionHandler {
+	return &CollectionHandler{storeProvider: provider, HTTPClient: newCollectionImageClient()}
+}
+
+// --- Request/Response types ---
+
+type PersonalCollectionCreateRequest struct {
+	Name                       string          `json:"name"`
+	CollectionType             string          `json:"collection_type"`
+	IsShared                   bool            `json:"is_shared"`
+	QueryDefinition            json.RawMessage `json:"query_definition"`
+	SortConfig                 json.RawMessage `json:"sort_config"`
+	DisplayQueryDefinition     json.RawMessage `json:"display_query_definition"`
+	IncludeInServerCollections bool            `json:"include_in_server_collections"`
+	PosterSourceURL            string          `json:"poster_source_url"`
+	// Description is set only by the /api/v2 adapter; the frozen /api/v1
+	// create never accepted one and still ignores it.
+	Description string `json:"-"`
+}
+
+type PersonalCollectionUpdateRequest struct {
+	Name                       *string                `json:"name"`
+	Description                *string                `json:"description"`
+	IsShared                   *bool                  `json:"is_shared"`
+	QueryDefinition            json.RawMessage        `json:"query_definition"`
+	SortConfig                 json.RawMessage        `json:"sort_config"`
+	SourceURL                  *string                `json:"source_url"`
+	MaxItems                   *int                   `json:"max_items"`
+	LibraryIDs                 *[]int                 `json:"library_ids"`
+	DisplayQueryDefinition     json.RawMessage        `json:"display_query_definition"`
+	IncludeInServerCollections *bool                  `json:"include_in_server_collections"`
+	PosterSourceURL            *string                `json:"poster_source_url"`
+	GroupID                    optionalNullableString `json:"group_id"`
+	// SyncSchedule is a cadence name (see usercollections.AllowedSyncSchedules)
+	// or "" to stop syncing. Set only by the /api/v2 adapter; the frozen
+	// /api/v1 update never accepted one and still ignores it.
+	SyncSchedule *string `json:"-"`
+}
+
+type PersonalCollectionView struct {
+	ID               string `json:"id"`
+	ProfileID        string `json:"profile_id"`
+	CreatorProfileID string `json:"creator_profile_id"`
+	Name             string `json:"name"`
+	Description      string `json:"description,omitempty"`
+	CollectionType   string `json:"collection_type"`
+	IsShared         bool   `json:"is_shared"`
+	// AllowedProfileIDs is the /api/v1 bridge's report of who sees the
+	// collection; only the v1 handlers fill it (v1CollectionAudience).
+	AllowedProfileIDs          []string        `json:"allowed_profile_ids"`
+	QueryDefinition            json.RawMessage `json:"query_definition"`
+	SortConfig                 json.RawMessage `json:"sort_config"`
+	SortOrder                  int             `json:"sort_order"`
+	GroupID                    *string         `json:"group_id"`
+	SourceURL                  string          `json:"source_url,omitempty"`
+	SourceConfig               json.RawMessage `json:"source_config,omitempty"`
+	SyncSchedule               string          `json:"sync_schedule,omitempty"`
+	NextSyncAt                 string          `json:"next_sync_at,omitempty"`
+	LastSyncAt                 string          `json:"last_sync_at,omitempty"`
+	LastSyncStatus             string          `json:"last_sync_status,omitempty"`
+	LastSyncMessage            string          `json:"last_sync_message,omitempty"`
+	DisplayQueryDefinition     json.RawMessage `json:"display_query_definition,omitempty"`
+	ItemCount                  int             `json:"item_count"`
+	IncludeInServerCollections bool            `json:"include_in_server_collections"`
+	PosterURL                  string          `json:"poster_url,omitempty"`
+	PosterThumbhash            string          `json:"poster_thumbhash,omitempty"`
+	// PosterIsCollage reports that PosterURL is the collection's collage for
+	// the reading profile rather than an uploaded or imported poster. Only
+	// /api/v2 reads show collages and carry it.
+	PosterIsCollage bool   `json:"-"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
+type PersonalCollectionListView struct {
+	Collections []PersonalCollectionView `json:"collections"`
+	Groups      []CollectionGroupView    `json:"groups"`
+}
+
+type CollectionCapabilitiesView struct {
+	// DisplayFilterFields are the catalog query fields a personal-collection
+	// display filter may use. Clients build a display_query_definition fragment
+	// from these rather than a bespoke enum.
+	DisplayFilterFields       []string                           `json:"display_filter_fields"`
+	DisplayFilterPresets      CollectionDisplayFilterPresetsView `json:"display_filter_presets"`
+	CollectionDefaultSort     bool                               `json:"collection_default_sort"`
+	CollectionSortPreferences bool                               `json:"collection_sort_preferences"`
+	EffectiveCollectionSort   bool                               `json:"effective_collection_sort"`
+	// SortPreferenceKinds are the collection_kind values this server accepts on
+	// the sort-preference endpoints. CollectionSortPreferences alone cannot
+	// distinguish a server that also stores the personal-list kinds
+	// ('watchlist', 'favorites') from one that rejects them.
+	SortPreferenceKinds []string `json:"sort_preference_kinds"`
+	// PosterCollages reports that /api/v2 personal collection reads show a
+	// collage when a collection has no uploaded or imported poster. The
+	// frozen /api/v1 body does not carry it.
+	PosterCollages bool `json:"-"`
+}
+
+type CollectionDisplayFilterPresetsView struct {
+	Watched []string `json:"watched"`
+	Media   []string `json:"media"`
+}
+
+type CollectionGroupView struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Slug            string `json:"slug"`
+	DefaultSortMode string `json:"default_sort_mode"`
+	SortOrder       int    `json:"sort_order"`
+}
+
+type CollectionGroupCreateRequest struct {
+	Name            string `json:"name"`
+	Slug            string `json:"slug"`
+	DefaultSortMode string `json:"default_sort_mode"`
+}
+
+type CollectionGroupUpdateRequest struct {
+	Name            *string `json:"name"`
+	Slug            *string `json:"slug"`
+	DefaultSortMode *string `json:"default_sort_mode"`
+}
+
+type PersonalCollectionItemView struct {
+	Title        string `json:"-"` // Catalog title for v2 membership; v1 stays unchanged.
+	CollectionID string `json:"collection_id"`
+	MediaItemID  string `json:"media_item_id"`
+	Position     int    `json:"position"`
+	AddedAt      string `json:"added_at"`
+}
+
+type PersonalCollectionItemsView struct {
+	Items []PersonalCollectionItemView `json:"items"`
+}
+
+type PersonalCollectionPreviewRequest struct {
+	QueryDefinition json.RawMessage `json:"query_definition"`
+	Limit           int             `json:"limit"`
+	// WithPosters signs each item's poster. Only the /api/v2 adapter sets it;
+	// the frozen /api/v1 body drops posters, so it skips the presign batch.
+	WithPosters bool `json:"-"`
+}
+
+type PersonalCollectionPreviewView struct {
+	Items []PersonalCollectionPreviewItemView `json:"items"`
+	Total int                                 `json:"total"`
+}
+
+type PersonalCollectionPreviewItemView struct {
+	ContentID string `json:"content_id"`
+	Title     string `json:"title"`
+	Type      string `json:"type"`
+	// PosterURL is emitted by the /api/v2 adapter only; the frozen /api/v1
+	// preview body never carried a poster.
+	PosterURL string `json:"-"`
+}
+
+// --- Handler methods ---
+
+// --- Helpers ---
+
+func toCollectionResponse(c userstore.Collection) PersonalCollectionView {
+	queryDefinition := defaultJSON([]byte(c.QueryDefinition))
+	sortConfig := defaultJSON([]byte(c.SortConfig))
+	resp := PersonalCollectionView{
+		ID:                         c.ID,
+		ProfileID:                  c.ProfileID,
+		CreatorProfileID:           c.CreatorProfileID,
+		Name:                       c.Name,
+		Description:                c.Description,
+		CollectionType:             c.CollectionType,
+		IsShared:                   c.IsShared,
+		QueryDefinition:            queryDefinition,
+		SortConfig:                 sortConfig,
+		SortOrder:                  c.SortOrder,
+		GroupID:                    c.GroupID,
+		SourceURL:                  c.SourceURL,
+		LastSyncStatus:             c.LastSyncStatus,
+		LastSyncMessage:            c.LastSyncMessage,
+		ItemCount:                  c.ItemCount,
+		IncludeInServerCollections: c.IncludeInServerCollections,
+		PosterURL:                  c.PosterURL,
+		PosterThumbhash:            c.PosterThumbhash,
+		CreatedAt:                  c.CreatedAt,
+		UpdatedAt:                  c.UpdatedAt,
+	}
+	if strings.TrimSpace(c.DisplayQueryDefinition) != "" {
+		resp.DisplayQueryDefinition = json.RawMessage(c.DisplayQueryDefinition)
+	}
+	if c.SourceConfig != "" && c.SourceConfig != "{}" {
+		resp.SourceConfig = json.RawMessage(c.SourceConfig)
+	}
+	if c.SyncSchedule != nil {
+		resp.SyncSchedule = *c.SyncSchedule
+	}
+	if c.NextSyncAt != nil {
+		resp.NextSyncAt = c.NextSyncAt.UTC().Format(time.RFC3339)
+	}
+	if c.LastSyncAt != nil {
+		resp.LastSyncAt = c.LastSyncAt.UTC().Format(time.RFC3339)
+	}
+	return resp
+}
+
+func defaultJSON(raw []byte) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	return json.RawMessage(raw)
+}
+
+func normalizeQueryDefinitionJSON(raw []byte, allowPersonalizedSorts, allowPersonalizedFields bool) (json.RawMessage, error) {
+	return catalog.NormalizeQueryDefinitionJSON(raw, allowPersonalizedSorts, allowPersonalizedFields)
+}
+
+func normalizeSmartCollectionQueryDefinitionJSON(raw []byte, allowPersonalizedSorts, allowPersonalizedFields bool) (json.RawMessage, error) {
+	return catalog.NormalizeSmartCollectionQueryJSON(raw, allowPersonalizedSorts, allowPersonalizedFields)
+}
+
+// smartCollectionNeedsRule is why a smart collection with no complete rule is
+// refused: its empty rules would match every title.
+const smartCollectionNeedsRule = "A smart collection needs at least one rule with a field, an operator and a value"
+
+// requireSmartCollectionRule refuses a smart collection's normalized
+// query_definition when it holds no rule complete enough to filter, as a
+// validation error at query_definition.groups. Only /api/v2 applies it: /api/v1
+// is frozen, and restores keep collections saved before the check.
+func requireSmartCollectionRule(queryDefinition json.RawMessage) error {
+	var definition catalog.QueryDefinition
+	if len(queryDefinition) > 0 {
+		if err := json.Unmarshal(queryDefinition, &definition); err != nil {
+			return fieldError("query_definition", "Invalid query_definition")
+		}
+	}
+	if definition.HasCompleteRule() {
+		return nil
+	}
+	return fieldError("query_definition.groups", smartCollectionNeedsRule)
+}
+
+// adminSmartRuleCheck applies requireSmartCollectionRule to an admin update
+// that would leave the collection Smart: to the rules it sends, or, when it
+// switches a collection to Smart without sending any, to the stored rules that
+// switch activates. An update that leaves the rules alone, such as a rename or
+// a visibility change, keeps a collection saved before the check working.
+func adminSmartRuleCheck(existingType string, existingRules json.RawMessage, req AdminCollectionUpdate, rules json.RawMessage) error {
+	collectionType := existingType
+	if req.CollectionType != nil {
+		collectionType = *req.CollectionType
+	}
+	switch {
+	case collectionType != collectionTypeSmart:
+		return nil
+	case len(req.QueryDefinition) > 0:
+		return requireSmartCollectionRule(rules)
+	case existingType != collectionTypeSmart:
+		return requireSmartCollectionRule(existingRules)
+	}
+	return nil
+}
+
+func firstNonEmptyCollection(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// processCollectionPoster prepares a poster, from uploaded bytes or else from
+// sourceURL, and stores it on the given collection. It is a no-op when there
+// is neither. The caller is responsible for ensuring the request profile owns
+// the collection, and answers a failure through personalCollectionPosterError.
+func (h *CollectionHandler) processCollectionPoster(
+	ctx context.Context,
+	store userstore.UserStore,
+	collectionID, requestProfileID string,
+	data []byte,
+	sourceURL string,
+) error {
+	poster, err := h.prepareCollectionPoster(ctx, data, sourceURL)
+	if err != nil || poster == nil {
+		return err
+	}
+	return h.storeCollectionPoster(ctx, store, collectionID, requestProfileID, poster)
+}
+
+// preparedCollectionPoster is a personal collection poster decoded into the
+// variants to store, under the content revision of its source bytes.
+type preparedCollectionPoster struct {
+	variants *collectionImageVariants
+	revision string
+}
+
+// prepareCollectionPoster decodes a poster: the uploaded bytes data, or else
+// the image at sourceURL. It answers nil when there is neither. Nothing is
+// stored: create calls it before its insert, so a poster it cannot use, or a
+// server too busy to decode it, creates nothing and the request is safe to
+// repeat.
+func (h *CollectionHandler) prepareCollectionPoster(
+	ctx context.Context,
+	data []byte,
+	sourceURL string,
+) (*preparedCollectionPoster, error) {
+	source := strings.TrimSpace(sourceURL)
+	fileData := data
+	if fileData == nil && source == "" {
+		return nil, nil
+	}
+	if h.ArtworkStore == nil {
+		return nil, errors.New("poster upload requires configured artwork storage")
+	}
+	if fileData == nil {
+		downloaded, err := downloadCollectionImageURL(ctx, h.HTTPClient, source)
+		if err != nil {
+			return nil, fmt.Errorf("poster source: %w", err)
+		}
+		fileData = downloaded
+	}
+
+	variants, err := generateCollectionImageVariants(fileData, collectionPosterWidths)
+	if err != nil {
+		return nil, fmt.Errorf("poster: %w", err)
+	}
+	return &preparedCollectionPoster{variants: variants, revision: collectionImageRevision(fileData)}, nil
+}
+
+// storeCollectionPoster writes a prepared poster and points the collection at
+// it. It decodes nothing, so the server being busy cannot fail it. The caller
+// is responsible for ensuring the request profile owns the collection.
+func (h *CollectionHandler) storeCollectionPoster(
+	ctx context.Context,
+	store userstore.UserStore,
+	collectionID, requestProfileID string,
+	poster *preparedCollectionPoster,
+) error {
+	artwork := h.ArtworkStore
+	existing, err := store.GetCollection(ctx, collectionID)
+	if err != nil {
+		return fmt.Errorf("loading collection: %w", err)
+	}
+	// Revisioned keys (issue #1258) put the replacement under a new key, so
+	// the current poster stays in place until the new path is committed.
+	basePath := collectionImageDir(userCollectionImagePrefix, collectionID, collectionImagePoster)
+	s3Path, err := storeCollectionImageVariants(ctx, artwork, basePath, poster.revision, poster.variants)
+	if err != nil {
+		return fmt.Errorf("poster: %w", err)
+	}
+
+	if err := store.UpdateCollection(ctx, userstore.UpdateCollectionInput{
+		ID:               collectionID,
+		RequestProfileID: requestProfileID,
+		PosterURL:        &s3Path,
+		PosterThumbhash:  &poster.variants.thumbhash,
+	}); err != nil {
+		if strings.Contains(err.Error(), "creator") {
+			return apiError(http.StatusForbidden, "forbidden", "Only the creator can edit this collection")
+		}
+		return fmt.Errorf("persisting poster: %w", err)
+	}
+	cleanUpReplacedCollectionImage(ctx, artwork, userCollectionImagePrefix, collectionID, collectionImagePoster, existing.PosterURL, func(ctx context.Context) (string, error) {
+		current, err := store.GetCollection(ctx, collectionID)
+		if err != nil {
+			return "", err
+		}
+		return current.PosterURL, nil
+	})
+	return nil
+}
+
+// previewCollectionRequest is shared with the library collection bridge handler.
+type previewCollectionRequest = PersonalCollectionPreviewRequest

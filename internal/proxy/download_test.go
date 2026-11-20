@@ -1,0 +1,216 @@
+package proxy
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/downloadprepare"
+	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
+	"github.com/Silo-Server/silo-server/internal/streamtoken"
+)
+
+type recordingArtifactMissReporter struct {
+	artifactID       string
+	originNodeURL    string
+	originArtifactID string
+}
+
+func (r *recordingArtifactMissReporter) ReportRemoteArtifactMissing(_ context.Context, artifactID, originNodeURL, originArtifactID string) error {
+	r.artifactID = artifactID
+	r.originNodeURL = originNodeURL
+	r.originArtifactID = originArtifactID
+	return nil
+}
+
+func newDownloadProxyServer(t *testing.T, secret string) *Server {
+	t.Helper()
+	srv := NewServer(testWatcher(secret), nil)
+	srv.SetNodeKeys(nodeauthtest.NodeKey(secret))
+	return srv
+}
+
+func TestProxyDownloadServesAuthorizedRange(t *testing.T) {
+	const secret = "download-proxy-secret"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "prepared movie.mp4")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	token := signToken(t, streamtoken.Claims{
+		SessionID:        "download-1",
+		MediaPath:        path,
+		PlayMethod:       streamtoken.PlayMethodDownload,
+		UserID:           7,
+		ProfileID:        "profile-1",
+		MediaFileID:      42,
+		DownloadFilename: "Heat (1995).mp4",
+	}, secret, time.Minute)
+
+	req := httptest.NewRequest(http.MethodGet, "/downloads/file/"+token, nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rr := httptest.NewRecorder()
+	newDownloadProxyServer(t, secret).Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != "2345" {
+		t.Fatalf("body = %q, want %q", rr.Body.String(), "2345")
+	}
+	// The API names the download; the file's own name stays on the server.
+	if got := rr.Header().Get("Content-Disposition"); !strings.Contains(got, "Heat") || strings.Contains(got, "prepared movie") {
+		t.Fatalf("Content-Disposition = %q", got)
+	}
+}
+
+func TestProxyDownloadRelaysNodeLocalArtifactRange(t *testing.T) {
+	const secret = "download-proxy-secret"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/downloads/artifacts/artifact-1" {
+			t.Errorf("origin path = %q", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusBadRequest)
+			return
+		}
+		if !nodeauthtest.Signed(r, secret) {
+			t.Errorf("origin request is not signed: Authorization = %q", r.Header.Get("Authorization"))
+			http.Error(w, "unexpected authorization", http.StatusBadRequest)
+			return
+		}
+		if got := r.Header.Get("Range"); got != "bytes=2-5" {
+			t.Errorf("origin Range = %q", got)
+			http.Error(w, "unexpected range", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Disposition", `attachment; filename="artifact-1.mp4"`)
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("Content-Range", "bytes 2-5/10")
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, "2345")
+	}))
+	defer origin.Close()
+	token := signToken(t, streamtoken.Claims{
+		SessionID:          "download-remote-1",
+		PlayMethod:         streamtoken.PlayMethodDownload,
+		TranscodeNode:      origin.URL,
+		DownloadArtifactID: "artifact-1",
+		DownloadFilename:   "Movie Final.mp4",
+		UserID:             7,
+	}, secret, time.Minute)
+
+	req := httptest.NewRequest(http.MethodGet, "/downloads/file/"+token, nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rr := httptest.NewRecorder()
+	newDownloadProxyServer(t, secret).Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusPartialContent || rr.Body.String() != "2345" {
+		t.Fatalf("status = %d body = %q", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Range"); got != "bytes 2-5/10" {
+		t.Fatalf("Content-Range = %q", got)
+	}
+	if got := rr.Header().Get("Content-Disposition"); !strings.Contains(got, "Movie Final.mp4") || strings.Contains(got, "artifact-1.mp4") {
+		t.Fatalf("Content-Disposition = %q", got)
+	}
+}
+
+func TestProxyDownloadToneMapTokenRequiresCompleteAttestation(t *testing.T) {
+	const secret = "download-proxy-secret"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("incomplete token reached origin")
+	}))
+	defer origin.Close()
+	token := signToken(t, streamtoken.Claims{
+		SessionID: "download-attested", PlayMethod: streamtoken.PlayMethodToneMapDownload,
+		TranscodeNode: origin.URL, DownloadArtifactID: "artifact-1",
+	}, secret, time.Minute)
+	rr := httptest.NewRecorder()
+	newDownloadProxyServer(t, secret).Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/downloads/file/"+token, nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestProxyDownloadAcceptsCompleteToneMapAttestationToken(t *testing.T) {
+	const secret = "download-proxy-secret"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		downloadprepare.SetResultHeaders(w.Header(), downloadprepare.Result{FileSize: 5, ExecutionFingerprint: "fingerprint"})
+		_, _ = w.Write([]byte("bytes"))
+	}))
+	defer origin.Close()
+	token := signToken(t, streamtoken.Claims{
+		SessionID: "download-attested", PlayMethod: streamtoken.PlayMethodToneMapDownload,
+		TranscodeNode: origin.URL, DownloadArtifactID: "artifact-1",
+		DownloadArtifactSize: 5, DownloadExecutionFingerprint: "fingerprint",
+	}, secret, time.Minute)
+	rr := httptest.NewRecorder()
+	newDownloadProxyServer(t, secret).Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/downloads/file/"+token, nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "bytes" {
+		t.Fatalf("status = %d, body = %q", rr.Code, rr.Body.String())
+	}
+}
+
+func TestProxyDownloadRejectsExpiredToken(t *testing.T) {
+	const secret = "download-proxy-secret"
+	token := signToken(t, streamtoken.Claims{
+		SessionID:  "download-expired",
+		MediaPath:  "/media/movie.mkv",
+		PlayMethod: streamtoken.PlayMethodDownload,
+	}, secret, -time.Minute)
+
+	req := httptest.NewRequest(http.MethodHead, "/downloads/file/"+token, nil)
+	rr := httptest.NewRecorder()
+	newDownloadProxyServer(t, secret).Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+// countingTransport counts the requests sent through it.
+type countingTransport struct {
+	requests int
+}
+
+func (c *countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.requests++
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// The shared node client waits for response headers without a deadline, which
+// only a transcode rebuild justifies. An artifact download must keep the
+// artifact client's bounded header wait, so it must not go through that client.
+func TestProxyDownloadArtifactRelayKeepsBoundedHeaderWait(t *testing.T) {
+	const secret = "download-proxy-secret"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = io.WriteString(w, "0123")
+	}))
+	defer origin.Close()
+	token := signToken(t, streamtoken.Claims{
+		SessionID:          "download-remote-bounded",
+		PlayMethod:         streamtoken.PlayMethodDownload,
+		TranscodeNode:      origin.URL,
+		DownloadArtifactID: "artifact-1",
+		UserID:             7,
+	}, secret, time.Minute)
+
+	server := newDownloadProxyServer(t, secret)
+	relay := &countingTransport{}
+	server.httpClient = &http.Client{Transport: relay}
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/downloads/file/"+token, nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "0123" {
+		t.Fatalf("status = %d body = %q", rr.Code, rr.Body.String())
+	}
+	if relay.requests != 0 {
+		t.Fatalf("artifact download sent %d request(s) through the unbounded node relay client", relay.requests)
+	}
+}

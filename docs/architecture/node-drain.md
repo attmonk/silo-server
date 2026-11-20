@@ -1,0 +1,146 @@
+# Transcode node drain
+
+A draining transcode node takes no new work and keeps serving the sessions it
+already runs, so stopping, upgrading or scaling down a node does not cut its
+streams. Proxy nodes do not drain: a proxy holds no session it could finish on
+its own, so nothing could tell when stopping it is safe.
+
+## Entering and leaving a drain
+
+A node drains for either of two reasons:
+
+- **An administrator's request.** `POST /api/v2/admin/nodes/{id}/drain` sets
+  `stream_nodes.drain_requested`; `POST .../resume` clears it. Both are
+  naturally idempotent and refuse a proxy with `409`. The column is operational
+  state, not configuration: `track_stream_node_configuration` does not compare
+  it, so a drain does not move the node's admin revision or its `config_etag`.
+- **SIGTERM.** A transcode node that receives SIGTERM or SIGINT drains before
+  it shuts down. It waits until it has no work left, until
+  `SILO_NODE_DRAIN_TIMEOUT` passes (a Go duration or whole seconds, default
+  `10m`; `0` turns the drain off), or until a second signal arrives, and then
+  runs the ordinary shutdown, which ends whatever is left. A SIGTERM drain
+  cannot be resumed. It does not wait at all while the API refuses the node's
+  key (`key_rejected`, after a key rotation, the node's deletion, or a clock
+  more than 30 seconds off): no relay can reach the node's sessions and no stop
+  can reach the node, so the node logs that it is shutting down without
+  waiting and shuts down. The state is read when the drain begins and once a
+  second while it waits, so a key rejected mid-drain also ends the wait. An
+  administrator's drain, the timeout and the second signal behave the same
+  whatever the key state.
+
+`GET /api/v2/admin/nodes/capabilities` advertises `drain: true`.
+
+## What a draining node does
+
+The node is `draining` when it received SIGTERM or when its own
+`stream_nodes` row carries a drain request. The request reaches the node as
+`drain_requested` in its configuration document from the API
+(`GET /api/internal/nodes/self/config`, read by `nodeconfig.Remote`; see
+[transcode nodes](transcode-nodes.md#configuration)): at every
+30-second poll, and at once when the API that recorded a drain or resume calls
+the node's `/admin/reload-config`, best effort. A document whose only change is
+the drain request keeps the node's config pointer, since a new pointer makes
+starts already in flight refuse. A drain already in force when the node starts
+is read with its first configuration.
+
+While draining, the node:
+
+- refuses `POST /transcode/start` with a plain-text `503 node is draining`
+  before any tone-map preflight, unless the start replaces a session the node
+  already runs. Both API retry loops (`playback_v3.go`, `jellycompat/streams.go`)
+  exclude a node on any non-`202` start and try the next one. A Jellyfin
+  audio-track switch re-posts the same session id, so a replacement is
+  admitted;
+- refuses download preparation, trickplay extraction, chapter-thumbnail
+  extraction and media sampling with the `503` shapes their clients already
+  treat as an unavailable node;
+- rebuilds a lost session (one the 10-minute idle reaper closed while its
+  viewer was paused), and starts a progressive remux for a reconnect or seek,
+  only until it has reported itself drained. Once a health check has read
+  `drained`, whoever read it may stop the node, so from then on it starts
+  neither and the client's next plan moves the session;
+- keeps serving manifests, segments, segment acks, `DELETE /transcode/{id}`,
+  prepared-artifact reads and deletes, progressive remux requests, status and
+  metrics, and restarts FFmpeg for its own sessions on a seek.
+
+The node is `drained` once it is draining, its active job count (HLS
+sessions, progressive remuxes, preparations and trickplay runs) is zero, and
+none of the requests that start or carry work is in flight: transcode starts,
+session rebuilds, download preparations and prepared-download transfers,
+trickplay, chapter thumbnail and media-sample runs, and progressive remuxes. That covers work the
+job count does not, and work admitted just before the drain began but not yet
+counted. An HLS session whose FFmpeg reached the end of the file stays counted
+until the client stops it or the idle reaper closes it. Drained says nothing
+about prepared downloads stored on the node: they stay served while it runs and
+are unavailable while it is stopped.
+
+`GET /api/v1/health` answers `200` in every phase, with `status` `ok`,
+`draining` or `drained`. Anything else would make the node pool treat the node
+as dead and stop routing its sessions. When a drain starts (an admin request,
+SIGTERM, or one in force at startup), stops, and reaches drained, the node calls
+`POST /api/internal/nodes/self/health-changed` with a five-second timeout; the
+API that receives it publishes `cache.EventNodeDrainChanged` (payload: the
+node's `stream_nodes` id), so every API server rechecks it at once instead of at
+its next 30-second sweep. A call that fails is logged, and the sweep finds the
+change.
+
+## What the API servers do
+
+`nodepool.CheckNodeReport` reads the health `status` into
+`stream_nodes.drain_state` (`none`, `draining`, `drained`), written with the
+other health columns by every check. A node that does not answer, or predates
+draining, reads as `none`. Lifting a set request and a URL repoint also reset
+it to `none`: the state described the lifted request, or another machine. A
+node draining for SIGTERM sees the request change, announces, and reports
+`draining` again on the recheck. Lifting a request that was not set keeps the
+state, since the node would announce nothing. `Node.Draining()` is
+true when `drain_requested` is set or `drain_state` is not `none`, and
+`Node.TakesNewWork()` is enabled, healthy and not draining.
+
+The API rechecks a node when it announces a change, at most one check per node
+at a time, plus one more when announcements arrived during it. The health
+checker runs one check of a node at a time, from the sweep or a recheck, so a
+sweep answer from before the change cannot land after the recheck.
+
+A draining node stays in the pools, so it is still health-checked, its jobs
+still count against a shared GPU, and its prepared downloads are still served.
+New placement skips it: `ReserveTranscodeWorkWith`, `TranscodeWorkAvailableWith`
+and `Reservations.Reserve` exclude it (`Reserve` reports `CapacityExhausted`
+when it was the only node), v3 capability planning and Jellyfin negotiation of
+a Dolby Vision strip or an HEVC encode do not count what it advertises, and
+session planning admits it only as the session's current transcode node, and
+only until it reports `drained`. That exception keeps a Jellyfin stream alive
+when its client asks for the master playlist again, which plans the session
+once more; a v3 seek or quality change asks the node for a new transport,
+which the node refuses, and the session moves. Once the node reports `drained`
+it runs no session, so a returning Jellyfin client is planned on another node
+and the runtime recorded on the drained node is not adopted.
+
+The web admin nodes page shows `Draining · N transcodes left` while work
+remains and `Drained · safe to stop` only once the node itself reports
+`drained`. A request the node has not read yet, or a node too old to report,
+stays at `Draining`. A node draining without a request (a stop signal, or a
+resume it has not read yet) shows `Draining` and `Drained · no work left`
+without claiming which.
+
+## Deployment
+
+The orchestrator's stop timeout must outlast the drain, or it kills the node
+mid-drain:
+
+- **Docker Compose** defaults to a 10-second grace before SIGKILL.
+  `docker-compose.yml` reads `stop_grace_period` from `SILO_STOP_GRACE_PERIOD`,
+  which a node's `.env` sets to the drain timeout plus a minute for the
+  shutdown that follows (`11m` for the default).
+- **Kubernetes** pods need `terminationGracePeriodSeconds` of at least
+  `SILO_NODE_DRAIN_TIMEOUT` plus 60 seconds. Keep the liveness and readiness
+  probes on `GET /api/v1/health`; it answers `200` while draining, so a draining
+  pod is not restarted. A node's registered URL must keep reaching that one pod
+  while it drains: register each node by its own address (its pod IP, a per-pod
+  name from a headless Service with `publishNotReadyAddresses`, or a Service
+  that selects only that pod). Kubernetes marks a terminating pod not ready in
+  its EndpointSlices, and kube-proxy keeps sending it traffic only while it
+  passes readiness and the Service has no other ready endpoint, which holds for
+  a per-node Service.
+- A rolling upgrade can drain a node ahead of time with the drain action, wait
+  for `drained`, then stop it; the stop then completes at once.

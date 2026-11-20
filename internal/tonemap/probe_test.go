@@ -1,0 +1,532 @@
+package tonemap
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// TestDecodeProbeFixtureCoversPascalNVDECMinimum prevents the embedded decoder
+// sample from regressing below the minimum frame size accepted by Pascal NVDEC.
+func TestDecodeProbeFixtureCoversPascalNVDECMinimum(t *testing.T) {
+	ffprobePath, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe is not installed")
+	}
+	fixturePath, cleanup, err := writeDecodeProbeFixture()
+	if err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	defer cleanup()
+
+	output, err := exec.Command(
+		ffprobePath,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height,pix_fmt",
+		"-of", "json",
+		fixturePath,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("probe fixture: %v: %s", err, output)
+	}
+	var result struct {
+		Streams []struct {
+			Width  int    `json:"width"`
+			Height int    `json:"height"`
+			PixFmt string `json:"pix_fmt"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode fixture metadata: %v: %s", err, output)
+	}
+	if len(result.Streams) != 1 {
+		t.Fatalf("fixture streams = %d, want 1", len(result.Streams))
+	}
+	const pascalNVDECMinimumDimension = 144
+	stream := result.Streams[0]
+	if stream.Width < pascalNVDECMinimumDimension || stream.Height < pascalNVDECMinimumDimension {
+		t.Fatalf("fixture dimensions = %dx%d, must be at least %dx%d for Pascal NVDEC", stream.Width, stream.Height, pascalNVDECMinimumDimension, pascalNVDECMinimumDimension)
+	}
+	if stream.PixFmt != "yuv420p10le" {
+		t.Fatalf("fixture pixel format = %q, want yuv420p10le", stream.PixFmt)
+	}
+}
+
+// TestDecodeProbeFixtureIsMain10 pins the fixture's HEVC profile by reading
+// the SPS profile_tier_level directly, so it holds without ffprobe. Intel
+// VAAPI/QSV decoders accept general_profile_idc 2 (Main 10) and refuse 4
+// (Rext); a Rext fixture makes every hardware tone-map smoke fail while the
+// software smoke, which decodes Rext, still passes.
+func TestDecodeProbeFixtureIsMain10(t *testing.T) {
+	data, err := base64.StdEncoding.DecodeString(decodeProbeFixtureBase64)
+	if err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	const (
+		nalSPS         = 33
+		hevcMain10IDC  = 2
+		nalHeaderBytes = 2
+		spsPrefixBytes = 1 // sps_video_parameter_set_id, max_sub_layers_minus1, temporal_id_nesting
+	)
+	for i := 0; i+3 < len(data); i++ {
+		if data[i] != 0 || data[i+1] != 0 || data[i+2] != 1 {
+			continue
+		}
+		header := i + 3
+		if (data[header]>>1)&0x3f != nalSPS {
+			continue
+		}
+		ptl := header + nalHeaderBytes + spsPrefixBytes
+		if ptl >= len(data) {
+			t.Fatal("fixture SPS is truncated")
+		}
+		if got := data[ptl] & 0x1f; got != hevcMain10IDC {
+			t.Fatalf("fixture general_profile_idc = %d, want %d (Main 10)", got, hevcMain10IDC)
+		}
+		return
+	}
+	t.Fatal("fixture has no SPS NAL unit")
+}
+
+func TestProbePartialHardwareCapabilitiesExpire(t *testing.T) {
+	resetProbeCache(t)
+	now := time.Unix(100, 0)
+	hardwareReady := false
+	calls := 0
+	runner := listingRunner(&calls, videoToolboxListing, "libx264 h264_videotoolbox", func(args string) ([]byte, error) {
+		if strings.Contains(args, "-hwaccel videotoolbox") && !hardwareReady {
+			return nil, errors.New("VideoToolbox session temporarily unavailable")
+		}
+		return nil, nil
+	})
+
+	got, err := probeCached(t.Context(), "/ffmpeg-partial", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("partial probe error = %v", err)
+	}
+	if len(got) != 1 || !got.Supports(ModeSoftware, SourcePQ) || got.Supports(ModeHardware, SourcePQ) {
+		t.Fatalf("partial probe = %#v, want software only", got)
+	}
+	firstCalls := calls
+	hardwareReady = true
+	got, err = probeCached(t.Context(), "/ffmpeg-partial", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("cached partial probe error = %v", err)
+	}
+	if calls != firstCalls || got.Supports(ModeHardware, SourcePQ) {
+		t.Fatalf("partial probe was not cached until expiry: calls = %d, capabilities = %#v", calls, got)
+	}
+
+	now = now.Add(probeNegativeTTL + time.Second)
+	got, err = probeCached(t.Context(), "/ffmpeg-partial", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("retried partial probe error = %v", err)
+	}
+	if calls == firstCalls || !got.Supports(ModeHardware, SourcePQ) {
+		t.Fatalf("expired partial probe was not retried: calls = %d, capabilities = %#v", calls, got)
+	}
+}
+
+func TestProbeIncompleteSourceKindCapabilitiesExpire(t *testing.T) {
+	resetProbeCache(t)
+	now := time.Unix(100, 0)
+	allKindsReady := false
+	calls := 0
+	runner := listingRunner(&calls, videoToolboxListing, "libx264 h264_videotoolbox", func(args string) ([]byte, error) {
+		if !allKindsReady && strings.Contains(args, SourceParameters(SourceHLGBT709)) {
+			return nil, errors.New("executor session temporarily unavailable")
+		}
+		return nil, nil
+	})
+
+	got, err := probeCached(t.Context(), "/ffmpeg-subset", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("subset probe error = %v", err)
+	}
+	if len(got) != 2 || !got.Supports(ModeSoftware, SourcePQ) || !got.Supports(ModeHardware, SourcePQ) ||
+		got.Supports(ModeSoftware, SourceHLGBT709) || got.Supports(ModeHardware, SourceHLGBT709) {
+		t.Fatalf("subset probe = %#v, want both executors without HLG BT.709", got)
+	}
+	firstCalls := calls
+	allKindsReady = true
+	got, err = probeCached(t.Context(), "/ffmpeg-subset", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("cached subset probe error = %v", err)
+	}
+	if calls != firstCalls || got.Supports(ModeSoftware, SourceHLGBT709) || got.Supports(ModeHardware, SourceHLGBT709) {
+		t.Fatalf("subset probe was not cached until expiry: calls = %d, capabilities = %#v", calls, got)
+	}
+
+	now = now.Add(probeNegativeTTL + time.Second)
+	got, err = probeCached(t.Context(), "/ffmpeg-subset", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("retried subset probe error = %v", err)
+	}
+	if calls == firstCalls || !got.Supports(ModeSoftware, SourceHLGBT709) || !got.Supports(ModeHardware, SourceHLGBT709) {
+		t.Fatalf("expired subset probe was not retried: calls = %d, capabilities = %#v", calls, got)
+	}
+}
+
+func TestProbeCommandDeadlineIsTransientAndNotCached(t *testing.T) {
+	resetProbeCache(t)
+	calls := 0
+	runner := func(context.Context, string, ...string) ([]byte, error) {
+		calls++
+		return nil, context.DeadlineExceeded
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		capabilities, err := probeCached(context.Background(), "/ffmpeg-timeout", BackendSoftware, "", runner, time.Now)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("probe error = %v, want context deadline", err)
+		}
+		if len(capabilities) != 0 {
+			t.Fatalf("timed-out probe capabilities = %#v", capabilities)
+		}
+	}
+	if calls != 4 {
+		t.Fatalf("timed-out listing calls = %d, want two fresh listing commands per attempt", calls)
+	}
+}
+
+// TestProbeCacheInvalidatesWhenFFmpegBinaryChangesInPlace verifies that a
+// positive result is rechecked after the configured executable is replaced.
+func TestProbeCacheInvalidatesWhenFFmpegBinaryChangesInPlace(t *testing.T) {
+	resetProbeCache(t)
+	ffmpegPath := filepath.Join(t.TempDir(), "ffmpeg")
+	if err := os.WriteFile(ffmpegPath, []byte("first"), 0o755); err != nil {
+		t.Fatalf("write first FFmpeg binary: %v", err)
+	}
+	calls := 0
+	runner := listingRunner(&calls, softwareListing, "libx264", nil)
+
+	got, err := probeCached(context.Background(), ffmpegPath, BackendSoftware, "", runner, time.Now)
+	if err != nil {
+		t.Fatalf("first probe error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("first probe = %#v", got)
+	}
+	firstCalls := calls
+	got, err = probeCached(context.Background(), ffmpegPath, BackendSoftware, "", runner, time.Now)
+	if err != nil {
+		t.Fatalf("cached probe error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("cached probe = %#v", got)
+	}
+	if calls != firstCalls {
+		t.Fatalf("unchanged binary reran probe: calls = %d, want %d", calls, firstCalls)
+	}
+
+	if err := os.WriteFile(ffmpegPath, []byte("replacement-binary"), 0o755); err != nil {
+		t.Fatalf("replace FFmpeg binary: %v", err)
+	}
+	got, err = probeCached(context.Background(), ffmpegPath, BackendSoftware, "", runner, time.Now)
+	if err != nil {
+		t.Fatalf("probe after replacement error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("probe after replacement = %#v", got)
+	}
+	if calls == firstCalls {
+		t.Fatal("replaced FFmpeg binary reused stale positive capabilities")
+	}
+}
+
+// TestProbeCallerCancellationDoesNotCancelSharedProbe verifies one request cannot abort shared discovery.
+func TestProbeCallerCancellationDoesNotCancelSharedProbe(t *testing.T) {
+	resetProbeCache(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var starts atomic.Int32
+	var sharedCancelled atomic.Bool
+	runner := func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		if starts.Add(1) == 1 {
+			close(started)
+		}
+		select {
+		case <-release:
+			return nil, errors.New("unavailable")
+		case <-ctx.Done():
+			sharedCancelled.Store(true)
+			return nil, ctx.Err()
+		}
+	}
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	type probeResult struct {
+		capabilities Capabilities
+		err          error
+	}
+	first := make(chan probeResult, 1)
+	go func() {
+		capabilities, err := probeCached(firstCtx, "/ffmpeg-shared", BackendSoftware, "", runner, time.Now)
+		first <- probeResult{capabilities: capabilities, err: err}
+	}()
+	<-started
+	second := make(chan probeResult, 1)
+	go func() {
+		capabilities, err := probeCached(context.Background(), "/ffmpeg-shared", BackendSoftware, "", runner, time.Now)
+		second <- probeResult{capabilities: capabilities, err: err}
+	}()
+	cancelFirst()
+	select {
+	case result := <-first:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("canceled caller error = %v, want context.Canceled", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled caller did not stop waiting")
+	}
+	close(release)
+	select {
+	case result := <-second:
+		if result.err != nil {
+			t.Fatalf("remaining caller error = %v", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remaining caller did not receive the shared probe result")
+	}
+	if sharedCancelled.Load() {
+		t.Fatal("caller cancellation propagated into the shared probe context")
+	}
+}
+
+// resetProbeCache clears shared probe state between tests. It delegates to the
+// exported invalidation so tests exercise the same seam the operator-facing
+// re-probe action uses.
+func resetProbeCache(t *testing.T) {
+	t.Helper()
+	InvalidateProbeCache()
+}
+
+// listingRunner answers FFmpeg's -filters and -encoders listings with the given
+// text and hands every other command, its arguments joined by spaces, to smoke
+// (a nil smoke succeeds). A non-nil calls counts every command, listings
+// included.
+func listingRunner(calls *int, filters, encoders string, smoke func(args string) ([]byte, error)) CommandRunner {
+	return func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if calls != nil {
+			*calls++
+		}
+		switch {
+		case len(args) > 0 && args[len(args)-1] == "-filters":
+			return []byte(filters), nil
+		case len(args) > 0 && args[len(args)-1] == "-encoders":
+			return []byte(encoders), nil
+		case smoke == nil:
+			return nil, nil
+		}
+		return smoke(strings.Join(args, " "))
+	}
+}
+
+// videoToolboxListing lists every filter the software and VideoToolbox
+// executors need.
+const videoToolboxListing = " .S. zscale V->V\n .S. tonemap V->V\n .S. scale_vt V->V\n .S. hwdownload V->V\n .S. sidedata V->V\n"
+
+// softwareListing lists every filter the tonemapx software executor needs.
+const softwareListing = " .S. zscale V->V\n .S. tonemapx V->V\n .S. sidedata V->V\n"
+
+// A tone-map probe outlives its caller by design, so a component that released
+// its own claim on the GPU when its call returned can leave smoke encodes
+// running with nothing accounting for them. The count is what lets the transcode
+// node's re-probe gate see that.
+func TestProbesInFlightCountsADetachedProbe(t *testing.T) {
+	awaitNoProbesInFlight(t)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	// The probe runs several commands; only the first needs to announce itself.
+	var announce, released sync.Once
+	t.Cleanup(func() { released.Do(func() { close(release) }) })
+
+	// The probe has to be running before the caller gives up, or the flight
+	// finishes on the canceled context and there is nothing detached to count.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := probeCached(ctx, "ffmpeg", BackendQSV, "/dev/dri/renderD128",
+			func(context.Context, string, ...string) ([]byte, error) {
+				announce.Do(func() { close(started) })
+				<-release
+				return nil, errors.New("probe abandoned")
+			}, time.Now)
+		done <- err
+	}()
+
+	<-started
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("an abandoned probe reported success")
+	}
+
+	// Checked the instant the caller returned, which is when its own claim on
+	// the encoder goes away while the smoke encode keeps running.
+	if got := ProbesInFlight(); got < 1 {
+		t.Fatalf("ProbesInFlight() = %d the moment the caller returned, want at least 1", got)
+	}
+	released.Do(func() { close(release) })
+	awaitNoProbesInFlight(t)
+}
+
+// awaitNoProbesInFlight waits for every claim on the encoder to be released,
+// including ones detached from a caller that has already returned. Waiting on
+// the counter rather than on a delay keeps this independent of machine load.
+func awaitNoProbesInFlight(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if got := ProbesInFlight(); got == 0 {
+			return
+		} else if time.Now().After(deadline) {
+			t.Fatalf("ProbesInFlight() = %d, want every detached probe released", got)
+		}
+		runtime.Gosched()
+	}
+}
+
+// TestProbeSmokesOptionalKindsOnlyOnCapableExecutors verifies the Dolby Vision
+// kind is tried and advertised only where the filter can apply an RPU, and the
+// full-range PQ kind only on the software executor, whose filters read each
+// frame's range.
+func TestProbeSmokesOptionalKindsOnlyOnCapableExecutors(t *testing.T) {
+	tests := []struct {
+		name         string
+		backend      string
+		filters      string
+		encoders     string
+		wantSoftware bool
+		wantHardware bool
+	}{
+		{name: "tonemapx and QSV OpenCL", backend: BackendQSV, filters: " .S. zscale V->V\n .S. tonemapx V->V\n .S. sidedata V->V\n .S. tonemap_opencl V->V\n .S. hwmap V->V\n .S. scale_vaapi V->V\n .S. overlay_opencl VV->V\n .S. scale_opencl V->V\n", encoders: "libx264 h264_qsv", wantSoftware: true, wantHardware: true},
+		{name: "tonemapx and NVENC CUDA", backend: BackendNVENC, filters: " .S. zscale V->V\n .S. tonemapx V->V\n .S. sidedata V->V\n .S. tonemap_cuda V->V\n .S. scale_cuda V->V\n", encoders: "libx264 h264_nvenc", wantSoftware: true, wantHardware: true},
+		{name: "Hable and VAAPI", backend: BackendVAAPI, filters: " .S. zscale V->V\n .S. tonemap V->V\n .S. sidedata V->V\n .S. tonemap_vaapi V->V\n .S. scale_vaapi V->V\n", encoders: "libx264 h264_vaapi"},
+		{name: "tonemapx and VideoToolbox", backend: BackendVideoToolbox, filters: " .S. zscale V->V\n .S. tonemapx V->V\n .S. sidedata V->V\n .S. scale_vt V->V\n .S. hwdownload V->V\n", encoders: "libx264 h264_videotoolbox", wantSoftware: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dolbyVisionSmokes []string
+			runner := listingRunner(nil, tt.filters, tt.encoders, func(args string) ([]byte, error) {
+				if strings.Contains(args, "apply_dovi=1") {
+					dolbyVisionSmokes = append(dolbyVisionSmokes, args)
+				}
+				return nil, nil
+			})
+			got := ProbeWithRunner(context.Background(), "/ffmpeg", tt.backend, "", runner)
+			if got.Supports(ModeSoftware, SourceDolbyVision) != tt.wantSoftware || got.Supports(ModeHardware, SourceDolbyVision) != tt.wantHardware {
+				t.Fatalf("capabilities = %#v, want software %t hardware %t", got, tt.wantSoftware, tt.wantHardware)
+			}
+			for _, kind := range StandardSourceKinds() {
+				if !got.Supports(ModeSoftware, kind) || !got.Supports(ModeHardware, kind) {
+					t.Fatalf("capabilities = %#v, lost standard kind %q", got, kind)
+				}
+			}
+			if !got.Supports(ModeSoftware, SourcePQFullRange) || got.Supports(ModeHardware, SourcePQFullRange) {
+				t.Fatalf("capabilities = %#v, want full-range PQ on software only", got)
+			}
+			wantSmokes := 0
+			if tt.wantSoftware {
+				wantSmokes++
+			}
+			if tt.wantHardware {
+				wantSmokes++
+			}
+			if len(dolbyVisionSmokes) != wantSmokes {
+				t.Fatalf("Dolby Vision smokes = %q, want %d", dolbyVisionSmokes, wantSmokes)
+			}
+		})
+	}
+}
+
+// TestProbeRefusedDolbyVisionSmokeStaysCached verifies that an FFmpeg build
+// refusing apply_dovi yields a complete inventory instead of a re-probe every
+// negative-cache interval.
+func TestProbeRefusedDolbyVisionSmokeStaysCached(t *testing.T) {
+	resetProbeCache(t)
+	now := time.Unix(100, 0)
+	calls := 0
+	runner := listingRunner(&calls, softwareListing, "libx264", func(args string) ([]byte, error) {
+		if strings.Contains(args, "apply_dovi") {
+			return []byte("Option 'apply_dovi' not found"), errors.New("exit status 1")
+		}
+		return nil, nil
+	})
+	got, err := probeCached(t.Context(), "/ffmpeg-no-dovi", BackendSoftware, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("probe error = %v", err)
+	}
+	if got.Supports(ModeSoftware, SourceDolbyVision) || !got.Supports(ModeSoftware, SourcePQ) {
+		t.Fatalf("capabilities = %#v, want PQ without Dolby Vision", got)
+	}
+	firstCalls := calls
+	now = now.Add(24 * time.Hour)
+	if _, err := probeCached(t.Context(), "/ffmpeg-no-dovi", BackendSoftware, "", runner, func() time.Time { return now }); err != nil {
+		t.Fatalf("cached probe error = %v", err)
+	}
+	if calls != firstCalls {
+		t.Fatalf("probe reran after a refused Dolby Vision smoke: calls = %d, want %d", calls, firstCalls)
+	}
+}
+
+// TestProbeTransientDolbyVisionSmokeFailureRetries verifies that a Dolby
+// Vision smoke failing for any reason other than a refused apply_dovi option,
+// including its own command deadline, keeps the standard kinds and is retried
+// after probeUnsettledDolbyVisionTTL instead of being cached as unsupported.
+func TestProbeTransientDolbyVisionSmokeFailureRetries(t *testing.T) {
+	tests := []struct {
+		name   string
+		output []byte
+		err    error
+	}{
+		{name: "device busy", output: []byte("Device creation failed: -12."), err: errors.New("exit status 1")},
+		{name: "own deadline", err: context.DeadlineExceeded},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetProbeCache(t)
+			now := time.Unix(100, 0)
+			calls, dolbyVisionFailures := 0, 1
+			runner := listingRunner(&calls, softwareListing, "libx264", func(args string) ([]byte, error) {
+				if strings.Contains(args, "apply_dovi=1") && dolbyVisionFailures > 0 {
+					dolbyVisionFailures--
+					return tt.output, tt.err
+				}
+				return nil, nil
+			})
+			probe := func() Capabilities {
+				t.Helper()
+				got, err := probeCached(t.Context(), "/ffmpeg-dovi-busy", BackendSoftware, "", runner, func() time.Time { return now })
+				if err != nil {
+					t.Fatalf("probe error = %v", err)
+				}
+				return got
+			}
+			if got := probe(); got.Supports(ModeSoftware, SourceDolbyVision) || !got.Supports(ModeSoftware, SourcePQ) {
+				t.Fatalf("first capabilities = %#v, want PQ without Dolby Vision", got)
+			}
+			firstCalls := calls
+			now = now.Add(probeUnsettledDolbyVisionTTL - time.Second)
+			probe()
+			if calls != firstCalls {
+				t.Fatalf("probe reran before the unsettled Dolby Vision TTL: calls = %d, want %d", calls, firstCalls)
+			}
+			now = now.Add(2 * time.Second)
+			if got := probe(); !got.Supports(ModeSoftware, SourceDolbyVision) {
+				t.Fatalf("retried capabilities = %#v, want Dolby Vision once the smoke passes", got)
+			}
+		})
+	}
+}

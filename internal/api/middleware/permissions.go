@@ -1,0 +1,244 @@
+package middleware
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"slices"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+type PermissionUserLoader interface {
+	GetByID(ctx context.Context, id int) (*models.User, error)
+}
+
+type MetadataTargetLibraryResolver interface {
+	ResolveMetadataTargetLibraryIDs(ctx context.Context, contentID string) ([]int, error)
+}
+
+type PermissionMiddleware struct {
+	users        PermissionUserLoader
+	libraries    MetadataTargetLibraryResolver
+	checkPrimary PrimaryProfileChecker       // nil disables the acting-admin profile policy
+	household    HouseholdProfileRequirement // nil disables the profile-less acting-admin check
+	groups       access.GroupPolicyProvider  // nil means "no access groups"
+}
+
+// NewPermissionMiddleware creates the legacy permission middleware. The
+// optional group policy provider mirrors NewPolicyPermissionMiddleware and is
+// what lets an inherited (NULL) library list resolve to the group's list
+// instead of reading as unrestricted.
+func NewPermissionMiddleware(
+	users PermissionUserLoader,
+	libraries MetadataTargetLibraryResolver,
+	checkPrimary PrimaryProfileChecker,
+	household HouseholdProfileRequirement,
+	groups ...access.GroupPolicyProvider,
+) *PermissionMiddleware {
+	var groupProvider access.GroupPolicyProvider
+	if len(groups) > 0 {
+		groupProvider = groups[0]
+	}
+	return &PermissionMiddleware{users: users, libraries: libraries, checkPrimary: checkPrimary, household: household, groups: groupProvider}
+}
+
+// RequireMetadataCurationForItem allows acting admins or users with
+// metadata_curation permission when every library containing the target item
+// is within the user's assigned libraries. A nil user library list means
+// unrestricted library access. An admin declaring a non-primary profile does
+// not get the admin bypass (see actingAdminAllowed) and is held to the same
+// explicitly-assigned-permission bar as everyone else.
+func (m *PermissionMiddleware) RequireMetadataCurationForItem(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := GetClaims(r.Context())
+		if claims == nil {
+			writeUnauthorized(w, "Authentication required", ReasonAuthenticationRequired)
+			return
+		}
+		if claims.Role == "admin" {
+			var checkPrimary PrimaryProfileChecker
+			var household HouseholdProfileRequirement
+			if m != nil {
+				checkPrimary, household = m.checkPrimary, m.household
+			}
+			actingAdmin, err := actingAdminAllowed(r, claims, checkPrimary, household)
+			if err != nil {
+				writePermissionError(w, http.StatusInternalServerError, "internal_error", "Failed to verify active profile")
+				return
+			}
+			if actingAdmin {
+				next.ServeHTTP(w, r.WithContext(access.WithMetadataCurationAuthorizer(r.Context(), func(ctx context.Context, _ []int) error { return ctx.Err() })))
+				return
+			}
+		}
+		if m == nil || m.users == nil || m.libraries == nil {
+			writeForbidden(w, "Metadata curation permission required")
+			return
+		}
+
+		contentID := chi.URLParam(r, "id")
+		if contentID == "" {
+			writePermissionErrorReason(w, http.StatusBadRequest, "bad_request", itemIDRequiredMsg, ReasonItemIDRequired)
+			return
+		}
+
+		user, err := m.users.GetByID(r.Context(), claims.UserID)
+		if err != nil || user == nil || !user.Enabled {
+			writeForbidden(w, "Metadata curation permission required")
+			return
+		}
+		// Resolve through the inherit/override policy so the access group's
+		// permission mask and inherited library list apply. A failed lookup
+		// fails closed, matching the PDP-backed gate. An admin reaching this
+		// point was refused the acting-admin bypass (non-primary profile
+		// declared, or no profile on a household that requires one), so only
+		// an explicitly assigned permission counts (groups never mask admins).
+		effective, err := access.EffectivePolicyForUser(r.Context(), user, m.groups)
+		if err != nil || !slices.Contains(auth.PolicyPermissions(effective), string(auth.PermissionMetadataCuration)) {
+			writeForbidden(w, "Metadata curation permission required")
+			return
+		}
+
+		targetLibraries, err := m.libraries.ResolveMetadataTargetLibraryIDs(r.Context(), contentID)
+		if err != nil {
+			writePermissionError(w, http.StatusInternalServerError, "internal_error", "Failed to resolve item libraries")
+			return
+		}
+		if len(targetLibraries) == 0 {
+			writePermissionError(w, http.StatusNotFound, "not_found", "Item not found")
+			return
+		}
+		if !metadataTargetWithinUserLibraries(effective.LibraryIDs, targetLibraries) {
+			writeForbidden(w, "Item is outside your assigned libraries")
+			return
+		}
+
+		scope := access.MetadataCurationScope{LibraryIDs: slices.Clone(effective.LibraryIDs)}
+		ctx := access.WithMetadataCurationScope(r.Context(), scope)
+		next.ServeHTTP(w, r.WithContext(access.WithMetadataCurationAuthorizer(ctx, scope.Authorizer())))
+	})
+}
+
+// RequireMarkerEdit allows an acting admin or an enabled account with an
+// explicit, group-allowed marker_edit grant. Production uses the PDP gate.
+func (m *PermissionMiddleware) RequireMarkerEdit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := GetClaims(r.Context())
+		if claims == nil {
+			writeUnauthorized(w, "Authentication required", ReasonAuthenticationRequired)
+			return
+		}
+		if m == nil || m.users == nil {
+			writeForbidden(w, "Marker editing permission required")
+			return
+		}
+		user, err := m.users.GetByID(r.Context(), claims.UserID)
+		if err != nil || user == nil || !user.Enabled {
+			writeForbidden(w, "Marker editing permission required")
+			return
+		}
+		if claims.Role == "admin" {
+			actingAdmin, err := actingAdminAllowed(r, claims, m.checkPrimary, m.household)
+			if err != nil {
+				writePermissionError(w, http.StatusInternalServerError, "internal_error", "Failed to verify active profile")
+				return
+			}
+			if actingAdmin {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		effective, err := access.EffectivePolicyForUser(r.Context(), user, m.groups)
+		if err != nil || !slices.Contains(auth.PolicyPermissions(effective), string(auth.PermissionMarkerEdit)) {
+			writeForbidden(w, "Marker editing permission required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func metadataTargetWithinUserLibraries(allowed []int, target []int) bool {
+	if allowed == nil {
+		return true
+	}
+	if len(target) == 0 {
+		return false
+	}
+	allowedSet := make(map[int]struct{}, len(allowed))
+	for _, id := range allowed {
+		allowedSet[id] = struct{}{}
+	}
+	for _, id := range target {
+		if _, ok := allowedSet[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+type PGMetadataTargetLibraryResolver struct {
+	Pool *pgxpool.Pool
+}
+
+func NewPGMetadataTargetLibraryResolver(pool *pgxpool.Pool) *PGMetadataTargetLibraryResolver {
+	return &PGMetadataTargetLibraryResolver{Pool: pool}
+}
+
+func (r *PGMetadataTargetLibraryResolver) ResolveMetadataTargetLibraryIDs(ctx context.Context, contentID string) ([]int, error) {
+	if r == nil || r.Pool == nil {
+		return nil, fmt.Errorf("database not configured")
+	}
+	rows, err := r.Pool.Query(ctx, `
+		WITH target_root AS (
+			SELECT mi.content_id
+			FROM media_items mi
+			WHERE mi.content_id = $1
+			UNION
+			SELECT s.series_id
+			FROM seasons s
+			WHERE s.content_id = $1
+			UNION
+			SELECT e.series_id
+			FROM episodes e
+			WHERE e.content_id = $1
+		)
+		SELECT DISTINCT mil.media_folder_id
+		FROM target_root tr
+		JOIN media_item_libraries mil ON mil.content_id = tr.content_id
+		ORDER BY mil.media_folder_id`, contentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func writePermissionError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(errorResponse{Error: code, Message: message})
+}
+
+// writePermissionErrorReason is writePermissionError plus the machine-readable
+// reason that tells this denial apart from another with the same code. The
+// response body is identical either way.
+func writePermissionErrorReason(w http.ResponseWriter, status int, code, message, reason string) {
+	recordDenialReason(w, reason)
+	writePermissionError(w, status, code, message)
+}

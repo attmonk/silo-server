@@ -1,0 +1,468 @@
+package plugins
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-server/internal/pluginhost"
+)
+
+// ConfigValidationError indicates that the caller supplied an invalid key or
+// a value that did not match the plugin's manifest global_config_schema.
+// Callers (the admin HTTP handler) should map this to a 400-equivalent
+// response.
+type ConfigValidationError struct {
+	Message string
+	Cause   error
+}
+
+func (e *ConfigValidationError) Error() string { return e.Message }
+func (e *ConfigValidationError) Unwrap() error { return e.Cause }
+
+// SetGlobalConfig validates a single global-config entry against the plugin's
+// manifest schema, persists it, and stops the running plugin so the next
+// invocation rebinds with the new configuration. Used by the admin HTTP
+// handler at PUT /api/admin/plugins/installations/{id}/config.
+func (s *Service) SetGlobalConfig(
+	ctx context.Context,
+	installationID int,
+	key string,
+	value map[string]any,
+) error {
+	return s.SetGlobalConfigWithClears(ctx, installationID, key, value, nil)
+}
+
+// SetGlobalConfigWithClears saves one config entry while preserving redacted
+// secret fields the browser left blank. A secret is removed only when its key
+// appears in clearSecrets, making credential deletion an explicit action.
+func (s *Service) SetGlobalConfigWithClears(
+	ctx context.Context,
+	installationID int,
+	key string,
+	value map[string]any,
+	clearSecrets []string,
+) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return &ConfigValidationError{Message: "config key is required"}
+	}
+	if s.configs == nil {
+		return fmt.Errorf("plugin config store not configured")
+	}
+
+	_, manifest, err := s.loadForManifestRead(ctx, installationID, false)
+	if err != nil {
+		return err
+	}
+
+	if value == nil {
+		value = map[string]any{}
+	}
+	secretFields := GlobalConfigSecretFields(manifest, key)
+	secretPaths := GlobalConfigSecretPaths(manifest, key)
+	clearSet, err := validatedSecretClearSet(key, secretFields, clearSecrets)
+	if err != nil {
+		return &ConfigValidationError{Message: err.Error(), Cause: err}
+	}
+	const maxConfigSaveAttempts = 5
+	saved := false
+	for attempt := 0; attempt < maxConfigSaveAttempts; attempt++ {
+		merged, expectedUpdatedAt, err := s.mergeStoredConfig(
+			ctx,
+			installationID,
+			key,
+			value,
+			secretPaths,
+		)
+		if err != nil {
+			return err
+		}
+		if err := applyGlobalConfigClears(manifest, key, merged, value, clearSet); err != nil {
+			return &ConfigValidationError{Message: err.Error(), Cause: err}
+		}
+
+		swapped, err := s.configs.CompareAndSwapGlobalConfig(
+			ctx,
+			installationID,
+			key,
+			merged,
+			expectedUpdatedAt,
+		)
+		if err != nil {
+			return fmt.Errorf("persist plugin config: %w", err)
+		}
+		if swapped {
+			saved = true
+			break
+		}
+	}
+	if !saved {
+		return fmt.Errorf("persist plugin config: concurrent updates did not settle")
+	}
+	return s.afterGlobalConfigSaved(ctx, installationID)
+}
+
+// afterGlobalConfigSaved restarts the plugin on its new configuration and
+// notifies lifecycle hooks.
+func (s *Service) afterGlobalConfigSaved(ctx context.Context, installationID int) error {
+	var stopErr error
+	if s.host != nil {
+		if err := s.host.Stop(installationID); err != nil && !errors.Is(err, pluginhost.ErrClientNotFound) {
+			stopErr = fmt.Errorf("reload plugin after config update: %w", err)
+		}
+	}
+	// A reconfigured resident gets a fresh failure budget; the lifecycle
+	// reconcile below starts it again.
+	s.resident.Reset(installationID)
+	// Configuration is part of metadata match input identity. Notify hooks
+	// after the old process has been stopped so resolver reloads observe the new
+	// runtime. The durable config changed even when stopping failed, so hooks
+	// still run before returning that error and parked rows are not left asleep.
+	s.OnLifecycleChange(ctx)
+	// The config save advanced runtime_generation in the same transaction;
+	// both the lifecycle event above and a proxy's poll replace stale processes.
+	return stopErr
+}
+
+func validatedSecretClearSet(
+	configKey string,
+	secretFields []string,
+	clearSecrets []string,
+) (map[string]struct{}, error) {
+	clearSet := secretFieldSet(clearSecrets)
+	allowedSecrets := secretFieldSet(secretFields)
+	for field := range clearSet {
+		if _, ok := allowedSecrets[field]; !ok {
+			return nil, fmt.Errorf("%s is not a secret field in config %s", field, configKey)
+		}
+	}
+	return clearSet, nil
+}
+
+// preserveStoredSecrets merges a staged entry over the stored one the way a
+// save would and also returns the stored entry it merged over (nil when none
+// is saved). The stored map is the store's own value and must not be changed.
+func (s *Service) preserveStoredSecrets(
+	ctx context.Context,
+	installationID int,
+	key string,
+	value map[string]any,
+	secretPaths [][]string,
+) (merged, stored map[string]any, err error) {
+	stored, _, err = s.storedGlobalConfigEntry(ctx, installationID, key, len(secretPaths) > 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return mergeConfigOverStored(stored, value, secretPaths), stored, nil
+}
+
+func (s *Service) mergeStoredConfig(
+	ctx context.Context,
+	installationID int,
+	key string,
+	value map[string]any,
+	secretPaths [][]string,
+) (map[string]any, *time.Time, error) {
+	existing, expectedUpdatedAt, err := s.storedGlobalConfigEntry(ctx, installationID, key, len(secretPaths) > 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return mergeConfigOverStored(existing, value, secretPaths), expectedUpdatedAt, nil
+}
+
+// storedGlobalConfigEntry loads one saved entry and its version. Without a
+// config store there is nothing saved, which is an error only when the
+// caller needs stored secrets.
+func (s *Service) storedGlobalConfigEntry(
+	ctx context.Context,
+	installationID int,
+	key string,
+	needsStore bool,
+) (map[string]any, *time.Time, error) {
+	if s.configs == nil {
+		if needsStore {
+			return nil, nil, fmt.Errorf("plugin config store not configured")
+		}
+		return nil, nil, nil
+	}
+	configs, err := s.configs.ListGlobalConfigs(ctx, installationID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load existing plugin config: %w", err)
+	}
+	for _, config := range configs {
+		if config != nil && config.Key == key {
+			updatedAt := config.UpdatedAt
+			return config.Value, &updatedAt, nil
+		}
+	}
+	return nil, nil, nil
+}
+
+// mergeConfigOverStored overlays a submitted entry on the stored one. A
+// secret the submission leaves blank keeps its stored value, including
+// secrets nested inside submitted objects.
+func mergeConfigOverStored(
+	existing map[string]any,
+	value map[string]any,
+	secretPaths [][]string,
+) map[string]any {
+	merged := make(map[string]any, len(existing)+len(value))
+	for field, saved := range existing {
+		merged[field] = cloneConfigValue(saved)
+	}
+	for field, incoming := range value {
+		merged[field] = cloneConfigValue(incoming)
+	}
+	if len(secretPaths) == 0 {
+		return merged
+	}
+	pathsByField := make(map[string][][]string)
+	for _, path := range secretPaths {
+		if len(path) == 0 {
+			continue
+		}
+		pathsByField[path[0]] = append(pathsByField[path[0]], path[1:])
+	}
+	for field, nestedSecretPaths := range pathsByField {
+		incoming, present := value[field]
+		saved, savedPresent := existing[field]
+		if !present {
+			continue
+		}
+		incomingObject, incomingIsObject := incoming.(map[string]any)
+		savedObject, savedIsObject := saved.(map[string]any)
+		if savedPresent && incomingIsObject && savedIsObject {
+			merged[field] = mergeConfigObjects(savedObject, incomingObject, nestedSecretPaths)
+			continue
+		}
+		incomingString, isString := incoming.(string)
+		if !isString || strings.TrimSpace(incomingString) != "" {
+			continue
+		}
+		if savedPresent {
+			merged[field] = cloneConfigValue(saved)
+		}
+	}
+	return merged
+}
+
+// applyGlobalConfigClears finishes a merged config entry and validates it:
+// it removes the secrets in clearSet, drops the fields the admin cleared
+// (dropClearedConfigFields) and checks the declared projection against the
+// schema. Both a save and a staged connection test use it.
+func applyGlobalConfigClears(
+	manifest *pluginv1.PluginManifest,
+	key string,
+	merged map[string]any,
+	value map[string]any,
+	clearSet map[string]struct{},
+) error {
+	removeGlobalConfigClears(manifest, key, merged, value, clearSet)
+	return validateMergedGlobalConfig(manifest, key, merged, value)
+}
+
+// removeGlobalConfigClears removes the secrets in clearSet and the fields the
+// admin cleared from a merged entry.
+func removeGlobalConfigClears(
+	manifest *pluginv1.PluginManifest,
+	key string,
+	merged map[string]any,
+	value map[string]any,
+	clearSet map[string]struct{},
+) {
+	for field := range clearSet {
+		delete(merged, field)
+	}
+	dropClearedConfigFields(manifest, key, merged, value)
+}
+
+// validateMergedGlobalConfig checks a finished entry's declared projection
+// against the schema.
+func validateMergedGlobalConfig(
+	manifest *pluginv1.PluginManifest,
+	key string,
+	merged map[string]any,
+	value map[string]any,
+) error {
+	projection := globalConfigValidationProjection(manifest, key, merged, value)
+	return ValidateGlobalConfigValue(manifest, key, projection)
+}
+
+// dropClearedConfigFields removes from merged every declared, non-secret
+// top-level field the admin sent as an explicit empty string or null, so
+// the plugin's default applies: a save merges into the stored value, so an
+// emptied field must clear what was stored rather than keep it (or store an
+// empty value that fails its schema). A field holding a secret, or secrets
+// nested inside it, is left to the secret merge: a blank secret keeps the
+// stored one and only clear_secrets removes it. Fields the schema and admin
+// form do not declare (plugin-owned state) are never cleared this way.
+func dropClearedConfigFields(
+	manifest *pluginv1.PluginManifest,
+	key string,
+	merged map[string]any,
+	value map[string]any,
+) {
+	public, _ := GlobalConfigFieldSets(manifest, key)
+	for _, field := range public {
+		if incoming, sent := value[field]; sent && isClearedConfigValue(incoming) {
+			delete(merged, field)
+		}
+	}
+}
+
+// isClearedConfigValue reports whether a submitted config value asks to
+// clear its field: null or a blank string.
+func isClearedConfigValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	text, isString := value.(string)
+	return isString && strings.TrimSpace(text) == ""
+}
+
+func globalConfigValidationProjection(
+	manifest *pluginv1.PluginManifest,
+	key string,
+	merged map[string]any,
+	submitted map[string]any,
+) map[string]any {
+	projection := make(map[string]any)
+	schema := globalConfigSchema(manifest, key)
+	if schema != nil {
+		var document any
+		if json.Unmarshal([]byte(schema.GetJsonSchema()), &document) == nil {
+			projection = projectDeclaredConfigObject(
+				merged,
+				[]any{document},
+				document,
+			)
+		}
+	}
+	overlaySubmittedConfig(projection, submitted, merged)
+	return projection
+}
+
+func projectDeclaredConfigObject(
+	value map[string]any,
+	schemaNodes []any,
+	root any,
+) map[string]any {
+	properties := make(map[string][]any)
+	for _, node := range schemaNodes {
+		collectTopLevelSchemaProperties(node, root, make(map[string]bool), properties)
+	}
+	projected := make(map[string]any, len(properties))
+	for field, fieldSchemas := range properties {
+		saved, present := value[field]
+		if !present {
+			continue
+		}
+		savedObject, isObject := saved.(map[string]any)
+		if isObject {
+			projected[field] = projectDeclaredConfigObject(savedObject, fieldSchemas, root)
+			continue
+		}
+		projected[field] = cloneConfigValue(saved)
+	}
+	return projected
+}
+
+func overlaySubmittedConfig(
+	projection map[string]any,
+	submitted map[string]any,
+	merged map[string]any,
+) {
+	for field, submittedValue := range submitted {
+		mergedValue, present := merged[field]
+		if !present {
+			delete(projection, field)
+			continue
+		}
+		submittedObject, submittedIsObject := submittedValue.(map[string]any)
+		mergedObject, mergedIsObject := mergedValue.(map[string]any)
+		if submittedIsObject && mergedIsObject {
+			projectedObject, _ := projection[field].(map[string]any)
+			if projectedObject == nil {
+				projectedObject = make(map[string]any)
+			}
+			overlaySubmittedConfig(projectedObject, submittedObject, mergedObject)
+			projection[field] = projectedObject
+			continue
+		}
+		projection[field] = cloneConfigValue(mergedValue)
+	}
+}
+
+func mergeConfigObjects(
+	saved map[string]any,
+	incoming map[string]any,
+	secretPaths [][]string,
+) map[string]any {
+	merged := make(map[string]any, len(saved)+len(incoming))
+	for key, value := range saved {
+		merged[key] = cloneConfigValue(value)
+	}
+	for key, value := range incoming {
+		nestedSecretPaths, wholeValueSecret := childSecretPaths(secretPaths, key)
+		if text, isString := value.(string); wholeValueSecret &&
+			isString && strings.TrimSpace(text) == "" {
+			if savedValue, present := saved[key]; present {
+				merged[key] = cloneConfigValue(savedValue)
+				continue
+			}
+		}
+		incomingObject, incomingIsObject := value.(map[string]any)
+		savedObject, savedIsObject := saved[key].(map[string]any)
+		if incomingIsObject && savedIsObject {
+			if wholeValueSecret {
+				nestedSecretPaths = append(nestedSecretPaths, nil)
+			}
+			merged[key] = mergeConfigObjects(savedObject, incomingObject, nestedSecretPaths)
+			continue
+		}
+		merged[key] = cloneConfigValue(value)
+	}
+	return merged
+}
+
+func childSecretPaths(paths [][]string, key string) (nested [][]string, wholeValue bool) {
+	for _, path := range paths {
+		if len(path) == 0 {
+			wholeValue = true
+			continue
+		}
+		if path[0] != key {
+			continue
+		}
+		if len(path) == 1 {
+			wholeValue = true
+			continue
+		}
+		nested = append(nested, path[1:])
+	}
+	return nested, wholeValue
+}
+
+func cloneConfigValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, entry := range typed {
+			cloned[key] = cloneConfigValue(entry)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, entry := range typed {
+			cloned[index] = cloneConfigValue(entry)
+		}
+		return cloned
+	default:
+		return value
+	}
+}

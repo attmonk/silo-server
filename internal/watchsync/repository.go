@@ -1,0 +1,2335 @@
+package watchsync
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/secret"
+)
+
+type Repository interface {
+	UpdateConnectionSettings(context.Context, string, int, string, *ConnectionVersion, ConnectionUpdate, func(Connection) error) (Connection, error)
+	GetServerSetting(ctx context.Context, key string) (string, error)
+	UpsertAuthSession(ctx context.Context, session DeviceAuthSession) (DeviceAuthSession, error)
+	GetAuthSession(ctx context.Context, id string) (DeviceAuthSession, error)
+	UpsertConnection(ctx context.Context, conn Connection) (Connection, error)
+	UpdateConnectionSyncState(ctx context.Context, id string, update ConnectionSyncUpdate) error
+	UpdateConnectionTokens(ctx context.Context, expected, updated Connection) (Connection, error)
+	GetConnection(ctx context.Context, provider string, userID int, profileID string) (Connection, bool, error)
+	GetConnectionByID(ctx context.Context, id string) (Connection, bool, error)
+	DeleteConnection(ctx context.Context, provider string, userID int, profileID string) error
+	ListConnectionsDueForSync(ctx context.Context, now time.Time) ([]Connection, error)
+	DeferConnectionsForAccount(ctx context.Context, provider, providerAccountID string, until time.Time, lastError string) (int, error)
+	AdmitSyncRun(ctx context.Context, conn Connection, run SyncRun) (syncRunAdmission, error)
+	CompleteSyncRun(ctx context.Context, run SyncRun) (SyncRun, error)
+	ListSyncRuns(ctx context.Context, connectionID string, limit int) ([]SyncRun, error)
+	ListLocalWatchEventConnections(ctx context.Context, userID int, profileID string, kind LocalWatchEventKind) ([]Connection, error)
+	ListListEventConnections(ctx context.Context, userID int, profileID string, list ListKind) ([]Connection, error)
+	UpsertHistoryExports(ctx context.Context, exports []HistoryExport) error
+	ListPendingHistoryExports(ctx context.Context, connectionID string, after HistoryExportCursor, limit int) ([]HistoryExport, error)
+	ListPendingHistoryExportsByHistoryIDs(ctx context.Context, connectionID string, historyIDs []string, limit int) ([]HistoryExport, error)
+	MarkHistoryExportStatus(ctx context.Context, id string, status string, lastError string) error
+	MarkHistoryExportSatisfiedByScrobble(ctx context.Context, connectionID string, historyID string) error
+	UpsertListItemStates(ctx context.Context, states []ListItemState) error
+	// AddListItemTitleIDs adds IDs to a title row's title IDs; see
+	// ListItemState.TitleIDs.
+	AddListItemTitleIDs(ctx context.Context, connectionID string, kind ListKind, mediaItemID string, ids []string) error
+	ListListItemStates(ctx context.Context, connectionID string, kind ListKind) ([]ListItemState, error)
+	ListPendingListItemExports(ctx context.Context, connectionID string, kind ListKind, limit int) ([]ListItemState, error)
+	ListPendingListItemRemovals(ctx context.Context, connectionID string, kind ListKind, limit int) ([]ListItemState, error)
+	ListListItemsWithSharedKeyHeld(ctx context.Context, connectionID string, kind ListKind, mediaItemIDs []string) (map[string]bool, error)
+	MarkListItemExported(ctx context.Context, connectionID string, kind ListKind, mediaItemID string, exportedAt time.Time) error
+	MarkListItemRemoteRemoved(ctx context.Context, connectionID string, kind ListKind, mediaItemID string, removedAt time.Time) error
+	MarkListItemLocalRemoved(ctx context.Context, connectionID string, kind ListKind, mediaItemID string, removedAt time.Time) error
+	MarkListItemError(ctx context.Context, connectionID string, kind ListKind, mediaItemID, lastError string) error
+	// SetListItemProviderKey changes only a row's provider key, so it can't
+	// undo a presence change written after the caller read the row.
+	SetListItemProviderKey(ctx context.Context, connectionID string, kind ListKind, mediaItemID, key string) error
+	// WatchlistTitlesSince returns when the connection's first watchlist
+	// import that keeps titles outside the library finished, or nil before it.
+	WatchlistTitlesSince(ctx context.Context, connectionID string) (*time.Time, error)
+	// MarkWatchlistTitlesSince records that import finishing, once, at the
+	// database's clock, the one list item created_at uses.
+	MarkWatchlistTitlesSince(ctx context.Context, connectionID string) error
+	ListRatingEventConnections(ctx context.Context, userID int, profileID string) ([]Connection, error)
+	ListRatingSyncStates(ctx context.Context, connectionID, providerAccountID string, mediaItemIDs []string) ([]RatingSyncState, error)
+	UpsertRatingSyncStates(ctx context.Context, states []RatingSyncState) error
+	DeleteRatingSyncStates(ctx context.Context, connectionID, providerAccountID string, mediaItemIDs []string) error
+	ClearRatingSyncStates(ctx context.Context, connectionID, keepAccountID string) error
+	UpdateRatingCursors(ctx context.Context, connectionID, providerAccountID string, remove []string, set map[string]string) error
+	WithRatingSyncLock(ctx context.Context, connectionID string, wait bool, fn func(context.Context) error) (bool, error)
+	WithTokenRefreshLock(ctx context.Context, connectionID string, fn func(context.Context) error) error
+	ListDroppedEventConnections(ctx context.Context, userID int, profileID string) ([]Connection, error)
+	ListDroppedSyncStates(ctx context.Context, connectionID, providerAccountID string, seriesIDs []string) ([]DroppedSyncState, error)
+	UpsertDroppedSyncStates(ctx context.Context, states []DroppedSyncState) error
+	DeleteDroppedSyncStates(ctx context.Context, connectionID, providerAccountID string, seriesIDs []string) error
+	ClearDroppedSyncStates(ctx context.Context, connectionID, keepAccountID string) error
+	ListScrobbleConnections(ctx context.Context, userID int, profileID string) ([]Connection, error)
+	UpsertScrobbleSession(ctx context.Context, event ScrobbleEvent, connectionID string, action string) error
+	PrepareConfirmedScrobbleStop(ctx context.Context, event ScrobbleEvent, connectionID string, staleBefore time.Time) (confirmedStopPreparation, time.Time, error)
+	CompleteConfirmedScrobbleStop(ctx context.Context, playbackSessionID string, connectionID string, progress float64, historyID string, claimVersion time.Time, stopSentAt time.Time) error
+	FailConfirmedScrobbleStop(ctx context.Context, playbackSessionID string, connectionID string, progress float64, historyID string, claimVersion time.Time, lastError string) error
+	UpdateScrobbleSession(ctx context.Context, playbackSessionID string, connectionID string, action string, progress float64, historyID string, lastError string, stopSentAt *time.Time) error
+	ListOpenScrobbleSessions(ctx context.Context) ([]ScrobbleSession, error)
+	ListPendingScrobbleReconciliations(ctx context.Context) ([]ScrobbleSession, error)
+	MarkScrobbleHistoryReconciled(ctx context.Context, playbackSessionID, connectionID string, reconciledAt time.Time) error
+	ListScrobbleStops(ctx context.Context, connectionID string, mediaItemIDs []string) (map[string][]time.Time, error)
+}
+
+type confirmedStopPreparation uint8
+
+const (
+	confirmedStopPrepared confirmedStopPreparation = iota
+	confirmedStopAlreadySent
+	confirmedStopInProgress
+)
+
+var errConfirmedStopClaimLost = errors.New("confirmed scrobble stop claim lost")
+
+// connectionColumns is the canonical select/returning column list for
+// watch_provider_connections, in the exact order scanConnection reads. Sharing
+// it across every read query keeps the column set and scan order in lockstep.
+const connectionColumns = `
+	id::text, provider, user_id, profile_id, provider_account_id, provider_username,
+	access_token, refresh_token, token_expires_at, plugin_credentials, import_watched_enabled,
+	import_progress_enabled, export_watched_enabled, export_unwatched_enabled,
+	import_favorites_enabled, export_favorites_enabled, sync_favorite_removals_enabled,
+	import_watchlist_enabled, export_watchlist_enabled, sync_watchlist_removals_enabled,
+	sync_watchlist_order_enabled, scrobble_enabled, import_ratings_enabled,
+	export_ratings_enabled, sync_dropped_enabled, last_inbound_sync_at,
+	last_progress_sync_at, last_outbound_sync_at, last_favorites_sync_at,
+	last_watchlist_sync_at, last_scrobble_error_at, last_error,
+	rate_limited_until, sync_cursors, connection_settings, created_at, updated_at`
+
+// syncRunColumns is the canonical select/returning column list for
+// watch_provider_sync_runs, in the exact order scanSyncRun reads.
+const syncRunColumns = `
+	id::text, connection_id::text, trigger, status, provider,
+	inbound_watched_found, inbound_watched_imported,
+	inbound_progress_found, inbound_progress_imported,
+	outbound_found, outbound_sent, inbound_favorites_found,
+	inbound_favorites_imported, outbound_favorites_found,
+	outbound_favorites_sent, favorite_removals_sent,
+	inbound_watchlist_found, inbound_watchlist_imported,
+	outbound_watchlist_found, outbound_watchlist_sent, watchlist_removals_sent,
+	inbound_ratings_found, inbound_ratings_imported,
+	outbound_ratings_found, outbound_ratings_sent,
+	warning, error, started_at, completed_at, created_at`
+
+// listItemKeyHeldElsewhere is true when another library item of the same kind,
+// still on the local list, holds the provider key of the list row aliased item.
+// Removing that key from the provider would take the other item off too.
+const listItemKeyHeldElsewhere = `EXISTS (
+	SELECT 1 FROM watch_provider_list_items other
+	WHERE other.connection_id = item.connection_id
+	  AND other.list_kind = item.list_kind
+	  AND item.provider_item_key <> ''
+	  AND other.provider_item_key <> ''
+	  AND other.provider_item_key = item.provider_item_key
+	  AND other.kind = item.kind
+	  AND other.media_item_id <> item.media_item_id
+	  AND other.local_present = true
+	  AND EXISTS (SELECT 1 FROM media_items m WHERE m.content_id = other.media_item_id)
+)`
+
+// listItemStateColumns is the canonical select column list for
+// watch_provider_list_items, in the exact order scanListItemStates reads.
+const listItemStateColumns = `
+	id::text, connection_id::text, list_kind, media_item_id, provider_item_key, kind, title, year,
+	remote_present, local_present, last_seen_remote_at, last_seen_local_at,
+	last_exported_at, last_removed_remote_at, last_removed_local_at, last_error, created_at, updated_at, title_ids`
+
+type PostgresRepository struct {
+	pool   *pgxpool.Pool
+	cipher *secret.Cipher
+	now    func() time.Time
+	// ratingLock serializes a connection's rating reconciliation; see
+	// WithRatingSyncLock.
+	ratingLock connectionLock
+	// tokenRefreshLock serializes a connection's token refresh; see
+	// WithTokenRefreshLock.
+	tokenRefreshLock connectionLock
+}
+
+// connectionLock is one class of cluster-wide advisory lock keyed by
+// connection. Each class keeps its own admission state, so holding a lock of
+// one class never waits on a slot or session of another.
+type connectionLock struct {
+	// class namespaces the advisory lock keys so classes cannot collide.
+	class int32
+	// name labels errors.
+	name string
+	// slots admits one caller per connection on this node, so waiters cannot
+	// pile up database sessions.
+	slots sync.Map
+	// sessions caps the lock sessions this node holds at once across all
+	// connections; see sessionLimit.
+	sessionsOnce sync.Once
+	sessions     chan struct{}
+}
+
+// maxLockSessions bounds the database sessions one node opens for each lock
+// class, which sit outside the pool's own limit.
+const maxLockSessions = 4
+
+// sessionLimit returns the semaphore of lock sessions, sized to at most
+// maxLockSessions and never more than the pool's own size, so a small
+// deployment adds at most as many sessions per class as it configured.
+func (l *connectionLock) sessionLimit(pool *pgxpool.Pool) chan struct{} {
+	l.sessionsOnce.Do(func() {
+		limit := min(maxLockSessions, max(1, int(pool.Config().MaxConns)))
+		l.sessions = make(chan struct{}, limit)
+	})
+	return l.sessions
+}
+
+func NewPostgresRepository(pool *pgxpool.Pool, cipher *secret.Cipher) *PostgresRepository {
+	r := &PostgresRepository{pool: pool, cipher: cipher, now: time.Now}
+	r.ratingLock.class, r.ratingLock.name = ratingSyncLockClass, "rating sync"
+	r.tokenRefreshLock.class, r.tokenRefreshLock.name = tokenRefreshLockClass, "token refresh"
+	return r
+}
+
+// TokenAAD binds an access/refresh token ciphertext to its connection. It uses
+// the stable UNIQUE business key (provider, user_id, profile_id) rather than the
+// surrogate id, because UpsertConnection lets Postgres assign/keep the id (ON
+// CONFLICT), so the id is not known before the write — the tuple is, and it
+// identifies the row just as uniquely. The secret backfill builds the same
+// key for rows it encrypts.
+func TokenAAD(column, provider string, userID int, profileID string) string {
+	return secret.RowAAD("watch_provider_connections", column, provider+":"+strconv.Itoa(userID)+":"+profileID)
+}
+
+func authStateAAD(provider string, userID int, profileID string) string {
+	return secret.RowAAD("watch_provider_auth_sessions", "device_code", provider+":"+strconv.Itoa(userID)+":"+profileID)
+}
+
+func (r *PostgresRepository) GetServerSetting(ctx context.Context, key string) (string, error) {
+	var value string
+	err := r.pool.QueryRow(ctx, `SELECT value FROM server_settings WHERE key = $1`, key).Scan(&value)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("server_settings get %q: %w", key, err)
+	}
+	// This repo reads watchsync.<provider>.client_id/client_secret (sensitive
+	// settings) directly, bypassing the settings decorator, so apply the same
+	// read-path decryption here.
+	out, err := r.cipher.DecryptIfEncrypted(value, secret.SettingsAAD(key))
+	if err != nil {
+		return "", fmt.Errorf("decrypt server_settings %q: %w", key, err)
+	}
+	return out, nil
+}
+
+// SetServerSetting stores a plain, non-secret server setting.
+func (r *PostgresRepository) SetServerSetting(ctx context.Context, key, value string) error {
+	if _, err := r.pool.Exec(ctx,
+		`INSERT INTO server_settings (key, value) VALUES ($1, $2)
+		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		key, value,
+	); err != nil {
+		return fmt.Errorf("server_settings set %q: %w", key, err)
+	}
+	return nil
+}
+
+// HasConnections reports whether any profile is connected to providerKey.
+func (r *PostgresRepository) HasConnections(ctx context.Context, providerKey string) (bool, error) {
+	var exists bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM watch_provider_connections WHERE provider = $1)`,
+		providerKey,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check %s watch provider connections: %w", providerKey, err)
+	}
+	return exists, nil
+}
+
+func (r *PostgresRepository) UpsertAuthSession(
+	ctx context.Context,
+	session DeviceAuthSession,
+) (DeviceAuthSession, error) {
+	deviceCode, err := r.cipher.Encrypt(session.DeviceCode, authStateAAD(session.Provider, session.UserID, session.ProfileID))
+	if err != nil {
+		return DeviceAuthSession{}, fmt.Errorf("encrypt watch provider authorization state: %w", err)
+	}
+	row := r.pool.QueryRow(ctx, `
+		INSERT INTO watch_provider_auth_sessions (
+			id, provider, user_id, profile_id, device_code, user_code,
+			verification_url, interval_seconds, expires_at, completed_at
+		)
+		VALUES (
+			COALESCE(NULLIF($1, '')::uuid, gen_random_uuid()),
+			$2, $3, $4, $5, $6, $7, $8, $9, $10
+		)
+		ON CONFLICT (id) DO UPDATE SET
+			provider = EXCLUDED.provider,
+			user_id = EXCLUDED.user_id,
+			profile_id = EXCLUDED.profile_id,
+			device_code = EXCLUDED.device_code,
+			user_code = EXCLUDED.user_code,
+			verification_url = EXCLUDED.verification_url,
+			interval_seconds = EXCLUDED.interval_seconds,
+			expires_at = EXCLUDED.expires_at,
+			completed_at = EXCLUDED.completed_at,
+			updated_at = now()
+		RETURNING
+			id::text, provider, user_id, profile_id, device_code, user_code,
+			verification_url, interval_seconds, expires_at, completed_at
+	`,
+		session.ID,
+		session.Provider,
+		session.UserID,
+		session.ProfileID,
+		deviceCode,
+		session.UserCode,
+		session.VerificationURL,
+		session.IntervalSeconds,
+		session.ExpiresAt,
+		session.CompletedAt,
+	)
+	saved, err := r.scanDeviceAuthSession(row)
+	if err != nil {
+		return DeviceAuthSession{}, fmt.Errorf("upsert watch provider auth session: %w", err)
+	}
+	return saved, nil
+}
+
+func (r *PostgresRepository) GetAuthSession(ctx context.Context, id string) (DeviceAuthSession, error) {
+	row := r.pool.QueryRow(ctx, `
+		SELECT
+			id::text, provider, user_id, profile_id, device_code, user_code,
+			verification_url, interval_seconds, expires_at, completed_at
+		FROM watch_provider_auth_sessions
+		WHERE id = $1::uuid
+	`, id)
+	session, err := r.scanDeviceAuthSession(row)
+	if err != nil {
+		return DeviceAuthSession{}, fmt.Errorf("get watch provider auth session %q: %w", id, err)
+	}
+	return session, nil
+}
+
+func (r *PostgresRepository) UpsertConnection(ctx context.Context, conn Connection) (Connection, error) {
+	accessToken, err := r.cipher.Encrypt(conn.AccessToken, TokenAAD("access_token", conn.Provider, conn.UserID, conn.ProfileID))
+	if err != nil {
+		return Connection{}, fmt.Errorf("encrypt watch access token: %w", err)
+	}
+	refreshToken, err := r.cipher.Encrypt(conn.RefreshToken, TokenAAD("refresh_token", conn.Provider, conn.UserID, conn.ProfileID))
+	if err != nil {
+		return Connection{}, fmt.Errorf("encrypt watch refresh token: %w", err)
+	}
+	pluginCredentials, err := r.encodePluginCredentials(conn)
+	if err != nil {
+		return Connection{}, err
+	}
+	row := r.pool.QueryRow(ctx, `
+		INSERT INTO watch_provider_connections (
+			id, provider, user_id, profile_id, provider_account_id, provider_username,
+			access_token, refresh_token, token_expires_at, plugin_credentials, import_watched_enabled,
+			import_progress_enabled, export_watched_enabled, export_unwatched_enabled,
+			import_favorites_enabled, export_favorites_enabled, sync_favorite_removals_enabled,
+			import_watchlist_enabled, export_watchlist_enabled, sync_watchlist_removals_enabled,
+			sync_watchlist_order_enabled, scrobble_enabled, last_inbound_sync_at, last_progress_sync_at,
+			last_outbound_sync_at, last_favorites_sync_at, last_watchlist_sync_at, last_scrobble_error_at,
+			last_error, rate_limited_until, sync_cursors, import_ratings_enabled, export_ratings_enabled,
+			sync_dropped_enabled, connection_settings
+		)
+		VALUES (
+			COALESCE(NULLIF($1, '')::uuid, gen_random_uuid()),
+			$2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+			$15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31::jsonb,
+			$32, $33, $34, $35::jsonb
+		)
+		ON CONFLICT (provider, user_id, profile_id) DO UPDATE SET
+			provider_account_id = EXCLUDED.provider_account_id,
+			provider_username = EXCLUDED.provider_username,
+			access_token = EXCLUDED.access_token,
+			refresh_token = EXCLUDED.refresh_token,
+			token_expires_at = EXCLUDED.token_expires_at,
+			plugin_credentials = EXCLUDED.plugin_credentials,
+			last_inbound_sync_at = EXCLUDED.last_inbound_sync_at,
+			last_progress_sync_at = EXCLUDED.last_progress_sync_at,
+			last_outbound_sync_at = EXCLUDED.last_outbound_sync_at,
+			last_favorites_sync_at = EXCLUDED.last_favorites_sync_at,
+			last_watchlist_sync_at = EXCLUDED.last_watchlist_sync_at,
+			last_scrobble_error_at = EXCLUDED.last_scrobble_error_at,
+			last_error = EXCLUDED.last_error,
+			rate_limited_until = EXCLUDED.rate_limited_until,
+			sync_cursors = EXCLUDED.sync_cursors,
+			updated_at = GREATEST(clock_timestamp(), watch_provider_connections.updated_at + interval '1 microsecond')
+		RETURNING `+connectionColumns+`
+	`,
+		conn.ID,
+		conn.Provider,
+		conn.UserID,
+		conn.ProfileID,
+		conn.ProviderAccountID,
+		conn.ProviderUsername,
+		accessToken,
+		refreshToken,
+		conn.TokenExpiresAt,
+		pluginCredentials,
+		conn.ImportWatchedEnabled,
+		conn.ImportProgressEnabled,
+		conn.ExportWatchedEnabled,
+		conn.ExportUnwatchedEnabled,
+		conn.ImportFavoritesEnabled,
+		conn.ExportFavoritesEnabled,
+		conn.SyncFavoriteRemovalsEnabled,
+		conn.ImportWatchlistEnabled,
+		conn.ExportWatchlistEnabled,
+		conn.SyncWatchlistRemovalsEnabled,
+		conn.SyncWatchlistOrderEnabled,
+		conn.ScrobbleEnabled,
+		conn.LastInboundSyncAt,
+		conn.LastProgressSyncAt,
+		conn.LastOutboundSyncAt,
+		conn.LastFavoritesSyncAt,
+		conn.LastWatchlistSyncAt,
+		conn.LastScrobbleErrorAt,
+		conn.LastError,
+		conn.RateLimitedUntil,
+		encodeSyncCursors(conn.SyncCursors),
+		conn.ImportRatingsEnabled,
+		conn.ExportRatingsEnabled,
+		conn.SyncDroppedEnabled,
+		encodeStoredConnectionSettings(conn.ConnectionSettings),
+	)
+	saved, err := r.scanConnection(row)
+	if err != nil {
+		return Connection{}, fmt.Errorf("upsert watch provider connection: %w", err)
+	}
+	return saved, nil
+}
+
+// UpdateConnectionSyncState writes one flow's bookkeeping to the saved
+// connection with id. Tokens, credentials and settings are never written, so
+// a token refresh during a long sync survives it, and a connection that was
+// disconnected meanwhile stays gone: there is no row to update, and no error.
+// A cleared error is kept while a deferral that has not ended explains it.
+func (r *PostgresRepository) UpdateConnectionSyncState(ctx context.Context, id string, update ConnectionSyncUpdate) error {
+	if id == "" {
+		return nil
+	}
+	if _, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_connections
+		SET last_inbound_sync_at = COALESCE($2::timestamptz, last_inbound_sync_at),
+		    last_progress_sync_at = COALESCE($3::timestamptz, last_progress_sync_at),
+		    last_outbound_sync_at = COALESCE($4::timestamptz, last_outbound_sync_at),
+		    last_favorites_sync_at = COALESCE($5::timestamptz, last_favorites_sync_at),
+		    last_watchlist_sync_at = COALESCE($6::timestamptz, last_watchlist_sync_at),
+		    last_error = CASE
+		        WHEN $7::text IS NULL THEN last_error
+		        WHEN $7::text = '' AND rate_limited_until > $9::timestamptz THEN last_error
+		        ELSE $7::text
+		    END,
+		    rate_limited_until = CASE
+		        WHEN $8::timestamptz IS NOT NULL THEN $8::timestamptz
+		        WHEN rate_limited_until <= $9::timestamptz THEN NULL
+		        ELSE rate_limited_until
+		    END,
+		    sync_cursors = sync_cursors || $10::jsonb,
+		    updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+		WHERE id = $1::uuid
+	`,
+		id,
+		update.LastInboundSyncAt,
+		update.LastProgressSyncAt,
+		update.LastOutboundSyncAt,
+		update.LastFavoritesSyncAt,
+		update.LastWatchlistSyncAt,
+		update.LastError,
+		update.RateLimitedUntil,
+		update.ClearRateLimitBy,
+		encodeSyncCursors(mergeSyncCursors(nil, update.SyncCursors)),
+	); err != nil {
+		return fmt.Errorf("update watch provider connection sync state: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) GetConnection(
+	ctx context.Context,
+	provider string,
+	userID int,
+	profileID string,
+) (Connection, bool, error) {
+	row := r.pool.QueryRow(ctx, `
+		SELECT `+connectionColumns+`
+		FROM watch_provider_connections
+		WHERE provider = $1 AND user_id = $2 AND profile_id = $3
+	`, provider, userID, profileID)
+	conn, err := r.scanConnection(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Connection{}, false, nil
+	}
+	if err != nil {
+		return Connection{}, false, fmt.Errorf("get watch provider connection: %w", err)
+	}
+	return conn, true, nil
+}
+
+func (r *PostgresRepository) GetConnectionByID(ctx context.Context, id string) (Connection, bool, error) {
+	row := r.pool.QueryRow(ctx, `
+		SELECT `+connectionColumns+`
+		FROM watch_provider_connections
+		WHERE id = $1::uuid
+	`, id)
+	conn, err := r.scanConnection(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Connection{}, false, nil
+	}
+	if err != nil {
+		return Connection{}, false, fmt.Errorf("get watch provider connection by id: %w", err)
+	}
+	return conn, true, nil
+}
+
+func (r *PostgresRepository) DeleteConnection(
+	ctx context.Context,
+	provider string,
+	userID int,
+	profileID string,
+) error {
+	_, err := r.pool.Exec(ctx, `
+		DELETE FROM watch_provider_connections
+		WHERE provider = $1 AND user_id = $2 AND profile_id = $3
+	`, provider, userID, profileID)
+	if err != nil {
+		return fmt.Errorf("delete watch provider connection: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) ListConnectionsDueForSync(
+	ctx context.Context,
+	now time.Time,
+) ([]Connection, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+connectionColumns+`
+		FROM watch_provider_connections
+		WHERE provider <> ''
+			AND (rate_limited_until IS NULL OR rate_limited_until <= $1)
+			AND (
+				import_watched_enabled
+				OR import_progress_enabled
+				OR export_watched_enabled
+				OR import_favorites_enabled
+				OR export_favorites_enabled
+				OR sync_favorite_removals_enabled
+				OR import_watchlist_enabled
+				OR export_watchlist_enabled
+				OR sync_watchlist_removals_enabled
+				OR scrobble_enabled
+				OR import_ratings_enabled
+				OR export_ratings_enabled
+				OR sync_dropped_enabled
+			)
+		ORDER BY provider, user_id, profile_id
+	`, now)
+	if err != nil {
+		return nil, fmt.Errorf("list due watch provider connections: %w", err)
+	}
+	defer rows.Close()
+
+	var conns []Connection
+	for rows.Next() {
+		conn, scanErr := r.scanConnection(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan due watch provider connection: %w", scanErr)
+		}
+		conns = append(conns, conn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate due watch provider connections: %w", err)
+	}
+	return conns, nil
+}
+
+// DeferConnectionsForAccount stamps rate_limited_until on every connection
+// bound to the same provider account. Provider rate limits apply to the API
+// key/account, not the Silo profile, so all sibling connections must sit out
+// the same window.
+func (r *PostgresRepository) DeferConnectionsForAccount(
+	ctx context.Context,
+	provider string,
+	providerAccountID string,
+	until time.Time,
+	lastError string,
+) (int, error) {
+	if strings.TrimSpace(providerAccountID) == "" {
+		return 0, nil
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_connections
+		SET rate_limited_until = $1, last_error = $2, updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+		WHERE provider = $3 AND provider_account_id = $4
+	`, until, lastError, provider, providerAccountID)
+	if err != nil {
+		return 0, fmt.Errorf("defer watch provider connections for account: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+func createSyncRun(ctx context.Context, tx pgx.Tx, run SyncRun) (SyncRun, error) {
+	if run.Status == "" {
+		run.Status = string(SyncRunStatusRunning)
+	}
+	if run.StartedAt.IsZero() {
+		run.StartedAt = time.Now().UTC()
+	}
+	row := tx.QueryRow(ctx, `
+		INSERT INTO watch_provider_sync_runs (
+			connection_id, trigger, status, provider,
+			inbound_watched_found, inbound_watched_imported,
+			inbound_progress_found, inbound_progress_imported,
+			outbound_found, outbound_sent, inbound_favorites_found,
+			inbound_favorites_imported, outbound_favorites_found,
+			outbound_favorites_sent, favorite_removals_sent,
+			inbound_watchlist_found, inbound_watchlist_imported,
+			outbound_watchlist_found, outbound_watchlist_sent, watchlist_removals_sent,
+			warning, error, started_at, completed_at,
+			inbound_ratings_found, inbound_ratings_imported,
+			outbound_ratings_found, outbound_ratings_sent
+		)
+		VALUES (
+			$1::uuid, $2, $3, $4,
+			$5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+			$16, $17, $18, $19, $20, $21, $22, $23, $24,
+			$25, $26, $27, $28
+		)
+		RETURNING `+syncRunColumns+`
+	`, run.ConnectionID, run.Trigger, run.Status, run.Provider,
+		run.InboundWatchedFound, run.InboundWatchedImported,
+		run.InboundProgressFound, run.InboundProgressImported,
+		run.OutboundFound, run.OutboundSent, run.InboundFavoritesFound,
+		run.InboundFavoritesImported, run.OutboundFavoritesFound,
+		run.OutboundFavoritesSent, run.FavoriteRemovalsSent,
+		run.InboundWatchlistFound, run.InboundWatchlistImported,
+		run.OutboundWatchlistFound, run.OutboundWatchlistSent, run.WatchlistRemovalsSent,
+		run.Warning, run.Error, run.StartedAt, run.CompletedAt,
+		run.InboundRatingsFound, run.InboundRatingsImported,
+		run.OutboundRatingsFound, run.OutboundRatingsSent)
+	created, err := scanSyncRun(row)
+	if err != nil {
+		return SyncRun{}, fmt.Errorf("scan created watch provider sync run: %w", err)
+	}
+	return created, nil
+}
+
+func completeSyncRun(ctx context.Context, tx pgx.Tx, run SyncRun) (SyncRun, error) {
+	row := tx.QueryRow(ctx, `
+		UPDATE watch_provider_sync_runs
+		SET status = $2,
+			inbound_watched_found = $3,
+			inbound_watched_imported = $4,
+			inbound_progress_found = $5,
+			inbound_progress_imported = $6,
+			outbound_found = $7,
+			outbound_sent = $8,
+			inbound_favorites_found = $9,
+			inbound_favorites_imported = $10,
+			outbound_favorites_found = $11,
+			outbound_favorites_sent = $12,
+			favorite_removals_sent = $13,
+			inbound_watchlist_found = $14,
+			inbound_watchlist_imported = $15,
+			outbound_watchlist_found = $16,
+			outbound_watchlist_sent = $17,
+			watchlist_removals_sent = $18,
+			warning = $19,
+			error = $20,
+			completed_at = $21,
+			inbound_ratings_found = $22,
+			inbound_ratings_imported = $23,
+			outbound_ratings_found = $24,
+			outbound_ratings_sent = $25
+		WHERE id = $1::uuid
+		RETURNING `+syncRunColumns+`
+	`, run.ID, run.Status, run.InboundWatchedFound, run.InboundWatchedImported,
+		run.InboundProgressFound, run.InboundProgressImported, run.OutboundFound, run.OutboundSent,
+		run.InboundFavoritesFound, run.InboundFavoritesImported, run.OutboundFavoritesFound,
+		run.OutboundFavoritesSent, run.FavoriteRemovalsSent,
+		run.InboundWatchlistFound, run.InboundWatchlistImported, run.OutboundWatchlistFound,
+		run.OutboundWatchlistSent, run.WatchlistRemovalsSent,
+		run.Warning, run.Error, run.CompletedAt,
+		run.InboundRatingsFound, run.InboundRatingsImported,
+		run.OutboundRatingsFound, run.OutboundRatingsSent)
+	completed, err := scanSyncRun(row)
+	if err != nil {
+		return SyncRun{}, fmt.Errorf("complete watch provider sync run: %w", err)
+	}
+	return completed, nil
+}
+
+func (r *PostgresRepository) GetLatestSyncRun(ctx context.Context, connectionID string) (SyncRun, bool, error) {
+	row := r.pool.QueryRow(ctx, `
+		SELECT `+syncRunColumns+`
+		FROM watch_provider_sync_runs
+		WHERE connection_id = $1::uuid
+		ORDER BY started_at DESC, created_at DESC
+		LIMIT 1
+	`, connectionID)
+	run, err := scanSyncRun(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SyncRun{}, false, nil
+	}
+	if err != nil {
+		return SyncRun{}, false, fmt.Errorf("get latest watch provider sync run: %w", err)
+	}
+	return run, true, nil
+}
+
+func (r *PostgresRepository) ListSyncRuns(ctx context.Context, connectionID string, limit int) ([]SyncRun, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+syncRunColumns+`
+		FROM watch_provider_sync_runs
+		WHERE connection_id = $1::uuid
+		ORDER BY started_at DESC, created_at DESC
+		LIMIT $2
+	`, connectionID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list watch provider sync runs: %w", err)
+	}
+	defer rows.Close()
+	var runs []SyncRun
+	for rows.Next() {
+		run, err := scanSyncRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan watch provider sync run: %w", err)
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate watch provider sync runs: %w", err)
+	}
+	return runs, nil
+}
+
+func (r *PostgresRepository) ListLocalWatchEventConnections(
+	ctx context.Context,
+	userID int,
+	profileID string,
+	kind LocalWatchEventKind,
+) ([]Connection, error) {
+	var predicate string
+	switch kind {
+	case LocalWatchEventMarkedWatched:
+		predicate = "export_watched_enabled = true"
+	default:
+		return nil, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+connectionColumns+`
+		FROM watch_provider_connections
+		WHERE user_id = $1 AND profile_id = $2 AND `+predicate+`
+			AND (rate_limited_until IS NULL OR rate_limited_until <= now())
+		ORDER BY provider
+	`, userID, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("list local watch event connections: %w", err)
+	}
+	defer rows.Close()
+
+	var conns []Connection
+	for rows.Next() {
+		conn, scanErr := r.scanConnection(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan local watch event connection: %w", scanErr)
+		}
+		conns = append(conns, conn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate local watch event connections: %w", err)
+	}
+	return conns, nil
+}
+
+// ListListEventConnections returns connections that export the given list kind,
+// i.e. should mirror a local add/remove on that list to the provider.
+func (r *PostgresRepository) ListListEventConnections(
+	ctx context.Context,
+	userID int,
+	profileID string,
+	list ListKind,
+) ([]Connection, error) {
+	column := "export_favorites_enabled"
+	if list == ListKindWatchlist {
+		column = "export_watchlist_enabled"
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+connectionColumns+`
+		FROM watch_provider_connections
+		WHERE user_id = $1 AND profile_id = $2 AND `+column+` = true
+			AND (rate_limited_until IS NULL OR rate_limited_until <= now())
+		ORDER BY provider
+	`, userID, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("list %s event connections: %w", list, err)
+	}
+	defer rows.Close()
+
+	var conns []Connection
+	for rows.Next() {
+		conn, scanErr := r.scanConnection(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan %s event connection: %w", list, scanErr)
+		}
+		conns = append(conns, conn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate %s event connections: %w", list, err)
+	}
+	return conns, nil
+}
+
+// ListRatingEventConnections returns the profile's connections that send
+// ratings, i.e. should mirror a local rating change to the provider.
+func (r *PostgresRepository) ListRatingEventConnections(ctx context.Context, userID int, profileID string) ([]Connection, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+connectionColumns+`
+		FROM watch_provider_connections
+		WHERE user_id = $1 AND profile_id = $2 AND export_ratings_enabled = true
+			AND (rate_limited_until IS NULL OR rate_limited_until <= now())
+		ORDER BY provider
+	`, userID, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("list rating event connections: %w", err)
+	}
+	defer rows.Close()
+
+	var conns []Connection
+	for rows.Next() {
+		conn, scanErr := r.scanConnection(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan rating event connection: %w", scanErr)
+		}
+		conns = append(conns, conn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rating event connections: %w", err)
+	}
+	return conns, nil
+}
+
+// ListRatingSyncStates returns a connection's agreed ratings with the given
+// provider account. Rows agreed with another account are ignored, so a sync
+// still running for an account the connection has since left cannot feed its
+// rows into the new account's merge. A nil mediaItemIDs returns every state;
+// otherwise only the listed items.
+func (r *PostgresRepository) ListRatingSyncStates(ctx context.Context, connectionID, providerAccountID string, mediaItemIDs []string) ([]RatingSyncState, error) {
+	query := `
+		SELECT connection_id::text, provider_account_id, media_item_id, kind, provider_item_key, synced_rating, remote_seen
+		FROM watch_provider_rating_items
+		WHERE connection_id = $1::uuid AND provider_account_id = $2`
+	args := []any{connectionID, providerAccountID}
+	if mediaItemIDs != nil {
+		query += ` AND media_item_id = ANY($3)`
+		args = append(args, mediaItemIDs)
+	}
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list rating sync states: %w", err)
+	}
+	defer rows.Close()
+	var states []RatingSyncState
+	for rows.Next() {
+		var state RatingSyncState
+		if err := rows.Scan(&state.ConnectionID, &state.ProviderAccountID, &state.MediaItemID, &state.Kind, &state.ProviderItemKey, &state.SyncedRating, &state.RemoteSeen); err != nil {
+			return nil, fmt.Errorf("scan rating sync state: %w", err)
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rating sync states: %w", err)
+	}
+	return states, nil
+}
+
+// UpsertRatingSyncStates records agreed ratings. A row is written only while
+// its connection is still bound to the row's provider account, so a run that
+// outlived a rebind cannot take a row back from the new account. The binding
+// is checked under a share lock on the connection row, held until the rows are
+// written: a rebind waits for the write and then clears what it wrote, and a
+// write that follows a rebind finds no match and writes nothing.
+func (r *PostgresRepository) UpsertRatingSyncStates(ctx context.Context, states []RatingSyncState) error {
+	if len(states) == 0 {
+		return nil
+	}
+	return pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		pairs := make([]ratingBinding, len(states))
+		for i, state := range states {
+			pairs[i] = ratingBinding{state.ConnectionID, state.ProviderAccountID}
+		}
+		bound, err := lockBoundRatingAccounts(ctx, tx, pairs)
+		if err != nil {
+			return err
+		}
+		kept := states[:0:0]
+		for _, state := range states {
+			if bound[ratingBinding{state.ConnectionID, state.ProviderAccountID}] {
+				kept = append(kept, state)
+			}
+		}
+		return upsertRatingSyncStates(ctx, tx, kept)
+	})
+}
+
+type ratingBinding struct{ connectionID, providerAccountID string }
+
+// lockBoundRatingAccounts share-locks the connections of the given
+// (connection, account) pairs and reports which pairs are still bound. Rating
+// and dropped-show sync states share it.
+func lockBoundRatingAccounts(ctx context.Context, tx pgx.Tx, bindings []ratingBinding) (map[ratingBinding]bool, error) {
+	pairs := make(map[ratingBinding]bool)
+	for _, binding := range bindings {
+		pairs[binding] = false
+	}
+	for pair := range pairs {
+		var found bool
+		err := tx.QueryRow(ctx, `
+			SELECT true FROM watch_provider_connections
+			WHERE id = $1::uuid AND provider_account_id = $2
+			FOR SHARE
+		`, pair.connectionID, pair.providerAccountID).Scan(&found)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("lock rating connection: %w", err)
+		}
+		pairs[pair] = found
+	}
+	return pairs, nil
+}
+
+func upsertRatingSyncStates(ctx context.Context, tx pgx.Tx, states []RatingSyncState) error {
+	if len(states) == 0 {
+		return nil
+	}
+	connectionIDs := make([]string, len(states))
+	accountIDs := make([]string, len(states))
+	mediaItemIDs := make([]string, len(states))
+	kinds := make([]string, len(states))
+	keys := make([]string, len(states))
+	ratings := make([]int32, len(states))
+	seen := make([]bool, len(states))
+	for i, state := range states {
+		connectionIDs[i] = state.ConnectionID
+		accountIDs[i] = state.ProviderAccountID
+		mediaItemIDs[i] = state.MediaItemID
+		kinds[i] = state.Kind
+		keys[i] = state.ProviderItemKey
+		ratings[i] = int32(state.SyncedRating)
+		seen[i] = state.RemoteSeen
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO watch_provider_rating_items (
+			connection_id, provider_account_id, media_item_id, kind, provider_item_key, synced_rating, remote_seen
+		)
+		SELECT input.connection_id::uuid, input.provider_account_id, input.media_item_id, input.kind,
+			input.provider_item_key, input.synced_rating, input.remote_seen
+		FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::smallint[], $7::boolean[])
+			AS input(connection_id, provider_account_id, media_item_id, kind, provider_item_key, synced_rating, remote_seen)
+		ON CONFLICT (connection_id, media_item_id) DO UPDATE SET
+			provider_account_id = EXCLUDED.provider_account_id,
+			kind = CASE WHEN EXCLUDED.kind <> '' THEN EXCLUDED.kind ELSE watch_provider_rating_items.kind END,
+			provider_item_key = CASE
+				WHEN EXCLUDED.provider_item_key <> '' THEN EXCLUDED.provider_item_key
+				ELSE watch_provider_rating_items.provider_item_key
+			END,
+			synced_rating = EXCLUDED.synced_rating,
+			remote_seen = EXCLUDED.remote_seen,
+			updated_at = now()
+	`, connectionIDs, accountIDs, mediaItemIDs, kinds, keys, ratings, seen)
+	if err != nil {
+		return fmt.Errorf("upsert rating sync states: %w", err)
+	}
+	return nil
+}
+
+// DeleteRatingSyncStates forgets agreed ratings recorded for one provider
+// account, leaving rows another account has since agreed on.
+func (r *PostgresRepository) DeleteRatingSyncStates(ctx context.Context, connectionID, providerAccountID string, mediaItemIDs []string) error {
+	if len(mediaItemIDs) == 0 {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `
+		DELETE FROM watch_provider_rating_items
+		WHERE connection_id = $1::uuid AND provider_account_id = $2 AND media_item_id = ANY($3)
+	`, connectionID, providerAccountID, mediaItemIDs)
+	if err != nil {
+		return fmt.Errorf("delete rating sync states: %w", err)
+	}
+	return nil
+}
+
+// Advisory lock classes, one per connectionLock.
+const (
+	ratingSyncLockClass   = 0x57535254
+	tokenRefreshLockClass = 0x57535446
+)
+
+// WithRatingSyncLock runs fn while holding a cluster-wide advisory lock for the
+// connection's rating reconciliation. Every node runs the scheduled sync, so
+// without it two runs could interleave their reads and writes and leave the
+// agreed ratings describing an older state than the provider holds.
+//
+// With wait false it reports false when the lock is held elsewhere; with wait
+// true it blocks until the lock is free or ctx ends.
+func (r *PostgresRepository) WithRatingSyncLock(ctx context.Context, connectionID string, wait bool, fn func(context.Context) error) (bool, error) {
+	return r.withConnectionLock(ctx, &r.ratingLock, connectionID, wait, fn)
+}
+
+// WithTokenRefreshLock runs fn while holding a cluster-wide advisory lock for
+// the connection's token refresh, waiting until the lock is free or ctx ends.
+func (r *PostgresRepository) WithTokenRefreshLock(ctx context.Context, connectionID string, fn func(context.Context) error) error {
+	_, err := r.withConnectionLock(ctx, &r.tokenRefreshLock, connectionID, true, fn)
+	return err
+}
+
+// withConnectionLock runs fn while holding lock's advisory lock for
+// connectionID. With wait false it reports false when the lock is held
+// elsewhere; with wait true it blocks until the lock is free or ctx ends. The
+// lock lives on its own database session opened outside the pool, so holding
+// it never takes a pool connection that fn needs, even in a one-connection
+// pool. On this node only one caller per connection holds or waits for that
+// session, and at most maxLockSessions sessions per class are open at once.
+// Closing the session releases the lock, including when a node dies.
+func (r *PostgresRepository) withConnectionLock(ctx context.Context, lock *connectionLock, connectionID string, wait bool, fn func(context.Context) error) (bool, error) {
+	slotValue, _ := lock.slots.LoadOrStore(connectionID, make(chan struct{}, 1))
+	slot, ok := slotValue.(chan struct{})
+	if !ok {
+		return false, fmt.Errorf("%s lock slot has type %T", lock.name, slotValue)
+	}
+	if wait {
+		select {
+		case slot <- struct{}{}:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	} else {
+		select {
+		case slot <- struct{}{}:
+		default:
+			return false, nil
+		}
+	}
+	defer func() { <-slot }()
+
+	// A try that finds every session in use reports the lock as busy rather
+	// than waiting, so a scheduled sync moves on to its next connection.
+	sessions := lock.sessionLimit(r.pool)
+	if wait {
+		select {
+		case sessions <- struct{}{}:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	} else {
+		select {
+		case sessions <- struct{}{}:
+		default:
+			return false, nil
+		}
+	}
+	defer func() { <-sessions }()
+
+	session, err := pgx.ConnectConfig(ctx, r.pool.Config().ConnConfig)
+	if err != nil {
+		return false, fmt.Errorf("open %s lock session: %w", lock.name, err)
+	}
+	// Closing the session releases the lock, whatever state a canceled
+	// lock call left it in.
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = session.Close(closeCtx)
+	}()
+	if wait {
+		if _, err := session.Exec(ctx, `SELECT pg_advisory_lock($1, hashtext($2))`, lock.class, connectionID); err != nil {
+			return false, fmt.Errorf("wait for %s lock: %w", lock.name, err)
+		}
+	} else {
+		var locked bool
+		if err := session.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, hashtext($2))`, lock.class, connectionID).Scan(&locked); err != nil {
+			return false, fmt.Errorf("try %s lock: %w", lock.name, err)
+		}
+		if !locked {
+			return false, nil
+		}
+	}
+	return true, fn(ctx)
+}
+
+// ClearRatingSyncStates forgets a connection's agreed ratings with every
+// provider account other than keepAccountID, used after the connection is
+// re-bound to that account.
+func (r *PostgresRepository) ClearRatingSyncStates(ctx context.Context, connectionID, keepAccountID string) error {
+	_, err := r.pool.Exec(ctx, `
+		DELETE FROM watch_provider_rating_items
+		WHERE connection_id = $1::uuid AND provider_account_id <> $2
+	`, connectionID, keepAccountID)
+	if err != nil {
+		return fmt.Errorf("clear rating sync states: %w", err)
+	}
+	return nil
+}
+
+// UpdateRatingCursors removes and sets sync cursor keys in place, only while the
+// connection is still bound to providerAccountID. Other cursor keys and every
+// other column are left alone, so a concurrent rebind or sync flow is never
+// overwritten.
+func (r *PostgresRepository) UpdateRatingCursors(ctx context.Context, connectionID, providerAccountID string, remove []string, set map[string]string) error {
+	if len(remove) == 0 && len(set) == 0 {
+		return nil
+	}
+	if remove == nil {
+		remove = []string{}
+	}
+	_, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_connections
+		SET sync_cursors = (COALESCE(sync_cursors, '{}'::jsonb) - $3::text[]) || $4::jsonb
+		WHERE id = $1::uuid AND provider_account_id = $2
+	`, connectionID, providerAccountID, remove, encodeSyncCursors(set))
+	if err != nil {
+		return fmt.Errorf("update rating cursors: %w", err)
+	}
+	return nil
+}
+
+// ListDroppedEventConnections returns the profile's connections that sync
+// dropped shows, i.e. should mirror a local drop or undrop to the provider.
+func (r *PostgresRepository) ListDroppedEventConnections(ctx context.Context, userID int, profileID string) ([]Connection, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+connectionColumns+`
+		FROM watch_provider_connections
+		WHERE user_id = $1 AND profile_id = $2 AND sync_dropped_enabled = true
+			AND (rate_limited_until IS NULL OR rate_limited_until <= now())
+		ORDER BY provider
+	`, userID, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("list dropped event connections: %w", err)
+	}
+	defer rows.Close()
+
+	var conns []Connection
+	for rows.Next() {
+		conn, scanErr := r.scanConnection(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan dropped event connection: %w", scanErr)
+		}
+		conns = append(conns, conn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dropped event connections: %w", err)
+	}
+	return conns, nil
+}
+
+// ListDroppedSyncStates returns a connection's agreed drops with the given
+// provider account, like ListRatingSyncStates. A nil seriesIDs returns every
+// state; otherwise only the listed series.
+func (r *PostgresRepository) ListDroppedSyncStates(ctx context.Context, connectionID, providerAccountID string, seriesIDs []string) ([]DroppedSyncState, error) {
+	query := `
+		SELECT connection_id::text, provider_account_id, series_id, provider_item_key, remote_seen, updated_at
+		FROM watch_provider_dropped_items
+		WHERE connection_id = $1::uuid AND provider_account_id = $2`
+	args := []any{connectionID, providerAccountID}
+	if seriesIDs != nil {
+		query += ` AND series_id = ANY($3)`
+		args = append(args, seriesIDs)
+	}
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list dropped sync states: %w", err)
+	}
+	defer rows.Close()
+	var states []DroppedSyncState
+	for rows.Next() {
+		var state DroppedSyncState
+		if err := rows.Scan(&state.ConnectionID, &state.ProviderAccountID, &state.SeriesID, &state.ProviderItemKey, &state.RemoteSeen, &state.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan dropped sync state: %w", err)
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dropped sync states: %w", err)
+	}
+	return states, nil
+}
+
+// UpsertDroppedSyncStates records agreed drops, only while each row's
+// connection is still bound to the row's provider account (see
+// UpsertRatingSyncStates).
+func (r *PostgresRepository) UpsertDroppedSyncStates(ctx context.Context, states []DroppedSyncState) error {
+	if len(states) == 0 {
+		return nil
+	}
+	return pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		pairs := make([]ratingBinding, len(states))
+		for i, state := range states {
+			pairs[i] = ratingBinding{state.ConnectionID, state.ProviderAccountID}
+		}
+		bound, err := lockBoundRatingAccounts(ctx, tx, pairs)
+		if err != nil {
+			return err
+		}
+		var connectionIDs, accountIDs, seriesIDs, keys []string
+		var seen []bool
+		for _, state := range states {
+			if !bound[ratingBinding{state.ConnectionID, state.ProviderAccountID}] {
+				continue
+			}
+			connectionIDs = append(connectionIDs, state.ConnectionID)
+			accountIDs = append(accountIDs, state.ProviderAccountID)
+			seriesIDs = append(seriesIDs, state.SeriesID)
+			keys = append(keys, state.ProviderItemKey)
+			seen = append(seen, state.RemoteSeen)
+		}
+		if len(seriesIDs) == 0 {
+			return nil
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO watch_provider_dropped_items (
+				connection_id, provider_account_id, series_id, provider_item_key, remote_seen
+			)
+			SELECT input.connection_id::uuid, input.provider_account_id, input.series_id,
+				input.provider_item_key, input.remote_seen
+			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::boolean[])
+				AS input(connection_id, provider_account_id, series_id, provider_item_key, remote_seen)
+			ON CONFLICT (connection_id, series_id) DO UPDATE SET
+				provider_account_id = EXCLUDED.provider_account_id,
+				provider_item_key = CASE
+					WHEN EXCLUDED.provider_item_key <> '' THEN EXCLUDED.provider_item_key
+					ELSE watch_provider_dropped_items.provider_item_key
+				END,
+				remote_seen = EXCLUDED.remote_seen,
+				updated_at = now()
+		`, connectionIDs, accountIDs, seriesIDs, keys, seen)
+		if err != nil {
+			return fmt.Errorf("upsert dropped sync states: %w", err)
+		}
+		return nil
+	})
+}
+
+// DeleteDroppedSyncStates forgets agreed drops recorded for one provider
+// account, leaving rows another account has since agreed on.
+func (r *PostgresRepository) DeleteDroppedSyncStates(ctx context.Context, connectionID, providerAccountID string, seriesIDs []string) error {
+	if len(seriesIDs) == 0 {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `
+		DELETE FROM watch_provider_dropped_items
+		WHERE connection_id = $1::uuid AND provider_account_id = $2 AND series_id = ANY($3)
+	`, connectionID, providerAccountID, seriesIDs)
+	if err != nil {
+		return fmt.Errorf("delete dropped sync states: %w", err)
+	}
+	return nil
+}
+
+// ClearDroppedSyncStates forgets a connection's agreed drops with every
+// provider account other than keepAccountID, used after a rebind.
+func (r *PostgresRepository) ClearDroppedSyncStates(ctx context.Context, connectionID, keepAccountID string) error {
+	_, err := r.pool.Exec(ctx, `
+		DELETE FROM watch_provider_dropped_items
+		WHERE connection_id = $1::uuid AND provider_account_id <> $2
+	`, connectionID, keepAccountID)
+	if err != nil {
+		return fmt.Errorf("clear dropped sync states: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) GetMediaDuration(ctx context.Context, mediaItemID string) (float64, error) {
+	var duration float64
+	err := r.pool.QueryRow(ctx, mediaDurationQuery, mediaItemID).Scan(&duration)
+	if err != nil {
+		return 0, fmt.Errorf("get media duration: %w", err)
+	}
+	return duration, nil
+}
+
+func (r *PostgresRepository) GetListMediaItems(ctx context.Context, mediaItemIDs []string) (map[string]LocalFavorite, error) {
+	result := make(map[string]LocalFavorite, len(mediaItemIDs))
+	if len(mediaItemIDs) == 0 {
+		return result, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT content_id, type, title, COALESCE(year, 0), COALESCE(imdb_id, ''), COALESCE(tmdb_id, ''), COALESCE(tvdb_id, '')
+		FROM media_items
+		WHERE content_id = ANY($1)
+	`, mediaItemIDs)
+	if err != nil {
+		return nil, fmt.Errorf("get list media items: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var fav LocalFavorite
+		if err := rows.Scan(&fav.MediaItemID, &fav.Kind, &fav.Title, &fav.Year, &fav.IMDbID, &fav.TMDBID, &fav.TVDBID); err != nil {
+			return nil, fmt.Errorf("scan list media item: %w", err)
+		}
+		fav.ProviderItemKey = providerItemKeyForLocalFavorite(fav)
+		result[fav.MediaItemID] = fav
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate list media items: %w", err)
+	}
+	return result, nil
+}
+
+// GetMediaTitles loads the display titles of movies, series and episodes by
+// media item id; see MediaTitles. Unknown ids are absent from the result.
+func (r *PostgresRepository) GetMediaTitles(ctx context.Context, mediaItemIDs []string) (map[string]MediaTitles, error) {
+	result := make(map[string]MediaTitles, len(mediaItemIDs))
+	if len(mediaItemIDs) == 0 {
+		return result, nil
+	}
+	// An id in both tables is read as the episode, so one row comes back per id.
+	rows, err := r.pool.Query(ctx, `
+		SELECT m.content_id, m.type, m.title, COALESCE(m.year, 0), '', 0
+		FROM media_items m
+		WHERE m.content_id = ANY($1)
+			AND NOT EXISTS (SELECT 1 FROM episodes e WHERE e.content_id = m.content_id)
+		UNION ALL
+		SELECT e.content_id, 'episode', COALESCE(e.title, ''), COALESCE(s.year, 0),
+			COALESCE(s.title, ''), COALESCE(s.year, 0)
+		FROM episodes e
+		LEFT JOIN media_items s ON s.content_id = e.series_id
+		WHERE e.content_id = ANY($1)
+	`, mediaItemIDs)
+	if err != nil {
+		return nil, fmt.Errorf("get media titles: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var titles MediaTitles
+		if err := rows.Scan(&id, &titles.Kind, &titles.Title, &titles.Year, &titles.SeriesTitle, &titles.SeriesYear); err != nil {
+			return nil, fmt.Errorf("scan media titles: %w", err)
+		}
+		result[id] = titles
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate media titles: %w", err)
+	}
+	return result, nil
+}
+
+const mediaDurationQuery = `
+		SELECT COALESCE(MAX(duration), 0)
+		FROM media_files
+		WHERE content_id = $1 AND missing_since IS NULL
+	`
+
+func (r *PostgresRepository) UpsertHistoryExports(ctx context.Context, exports []HistoryExport) error {
+	for _, export := range exports {
+		_, err := r.pool.Exec(ctx, `
+			INSERT INTO watch_provider_history_exports (
+				connection_id, history_id, media_item_id, watched_at, provider_item_key, status,
+				attempt_count, last_attempt_at, last_error
+			)
+			VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (connection_id, history_id) DO UPDATE SET
+				provider_item_key = EXCLUDED.provider_item_key,
+				status = CASE
+					WHEN watch_provider_history_exports.status IN ('sent', 'satisfied_by_scrobble', 'not_found')
+						OR watch_provider_history_exports.attempt_count >= 5
+					THEN watch_provider_history_exports.status
+					ELSE EXCLUDED.status
+				END,
+				updated_at = now()
+		`, export.ConnectionID, export.HistoryID, export.MediaItemID, export.WatchedAt, export.ProviderItemKey,
+			export.Status, export.AttemptCount, export.LastAttemptAt, export.LastError)
+		if err != nil {
+			return fmt.Errorf("upsert history export: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *PostgresRepository) ListPendingHistoryExports(
+	ctx context.Context,
+	connectionID string,
+	after HistoryExportCursor,
+	limit int,
+) ([]HistoryExport, error) {
+	if limit <= 0 || limit > maxHistoryExportPage {
+		limit = maxHistoryExportPage
+	}
+	var afterID any
+	if after.ID != "" {
+		afterID = after.ID
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT id::text, connection_id::text, history_id, media_item_id, watched_at,
+			provider_item_key, status, attempt_count, last_attempt_at, last_error, created_at, updated_at
+		FROM watch_provider_history_exports
+		WHERE connection_id = $1::uuid
+		  AND status IN ('pending', 'failed')
+		  AND attempt_count < 5
+		  AND ($3::uuid IS NULL OR (watched_at, id) > ($4::timestamptz, $3::uuid))
+		-- Qualified: a bare "id" would sort by the id::text output column,
+		-- not the uuid the cursor compares.
+		ORDER BY watched_at ASC, watch_provider_history_exports.id ASC
+		LIMIT $2
+	`, connectionID, limit, afterID, after.WatchedAt)
+	if err != nil {
+		return nil, fmt.Errorf("list pending history exports: %w", err)
+	}
+	defer rows.Close()
+	var exports []HistoryExport
+	for rows.Next() {
+		var export HistoryExport
+		if err := rows.Scan(
+			&export.ID,
+			&export.ConnectionID,
+			&export.HistoryID,
+			&export.MediaItemID,
+			&export.WatchedAt,
+			&export.ProviderItemKey,
+			&export.Status,
+			&export.AttemptCount,
+			&export.LastAttemptAt,
+			&export.LastError,
+			&export.CreatedAt,
+			&export.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan pending history export: %w", err)
+		}
+		exports = append(exports, export)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending history exports: %w", err)
+	}
+	return exports, nil
+}
+
+func (r *PostgresRepository) ListPendingHistoryExportsByHistoryIDs(
+	ctx context.Context,
+	connectionID string,
+	historyIDs []string,
+	limit int,
+) ([]HistoryExport, error) {
+	if len(historyIDs) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > len(historyIDs) {
+		limit = len(historyIDs)
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT id::text, connection_id::text, history_id, media_item_id, watched_at,
+			provider_item_key, status, attempt_count, last_attempt_at, last_error, created_at, updated_at
+		FROM watch_provider_history_exports
+		WHERE connection_id = $1::uuid
+		  AND history_id = ANY($2::text[])
+		  AND status IN ('pending', 'failed')
+		  AND attempt_count < 5
+		ORDER BY watched_at ASC
+		LIMIT $3
+	`, connectionID, historyIDs, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending history exports by history ids: %w", err)
+	}
+	defer rows.Close()
+	var exports []HistoryExport
+	for rows.Next() {
+		var export HistoryExport
+		if err := rows.Scan(
+			&export.ID,
+			&export.ConnectionID,
+			&export.HistoryID,
+			&export.MediaItemID,
+			&export.WatchedAt,
+			&export.ProviderItemKey,
+			&export.Status,
+			&export.AttemptCount,
+			&export.LastAttemptAt,
+			&export.LastError,
+			&export.CreatedAt,
+			&export.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan pending history export by history ids: %w", err)
+		}
+		exports = append(exports, export)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending history exports by history ids: %w", err)
+	}
+	return exports, nil
+}
+
+func (r *PostgresRepository) MarkHistoryExportStatus(ctx context.Context, id string, status string, lastError string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_history_exports
+		SET status = $2,
+			attempt_count = attempt_count + 1,
+			last_attempt_at = now(),
+			last_error = $3,
+			updated_at = now()
+		WHERE id = $1::uuid
+		  AND status NOT IN ('sent', 'satisfied_by_scrobble', 'not_found')
+	`, id, status, lastError)
+	if err != nil {
+		return fmt.Errorf("mark history export status: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) MarkHistoryExportSatisfiedByScrobble(ctx context.Context, connectionID string, historyID string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_history_exports
+		SET status = 'satisfied_by_scrobble',
+			last_attempt_at = now(),
+			last_error = '',
+			updated_at = now()
+		WHERE connection_id = $1::uuid AND history_id = $2
+		  AND status NOT IN ('sent', 'not_found')
+	`, connectionID, historyID)
+	if err != nil {
+		return fmt.Errorf("mark history export satisfied by scrobble: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) UpsertListItemStates(ctx context.Context, states []ListItemState) error {
+	for _, state := range states {
+		kind := state.ListKind
+		if kind == "" {
+			kind = ListKindFavorites
+		}
+		_, err := r.pool.Exec(ctx, `
+			INSERT INTO watch_provider_list_items (
+				connection_id, list_kind, media_item_id, provider_item_key, kind, title, year,
+				remote_present, local_present, last_seen_remote_at, last_seen_local_at,
+				last_exported_at, last_removed_remote_at, last_removed_local_at, last_error, title_ids
+			)
+			VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, COALESCE($16::text[], '{}'))
+			ON CONFLICT (connection_id, list_kind, media_item_id) DO UPDATE SET
+				provider_item_key = CASE
+					WHEN EXCLUDED.provider_item_key <> '' THEN EXCLUDED.provider_item_key
+					ELSE watch_provider_list_items.provider_item_key
+				END,
+				kind = CASE WHEN EXCLUDED.kind <> '' THEN EXCLUDED.kind ELSE watch_provider_list_items.kind END,
+				title = CASE WHEN EXCLUDED.title <> '' THEN EXCLUDED.title ELSE watch_provider_list_items.title END,
+				year = CASE WHEN EXCLUDED.year <> 0 THEN EXCLUDED.year ELSE watch_provider_list_items.year END,
+				remote_present = watch_provider_list_items.remote_present OR EXCLUDED.remote_present,
+				local_present = EXCLUDED.local_present,
+				last_seen_remote_at = COALESCE(EXCLUDED.last_seen_remote_at, watch_provider_list_items.last_seen_remote_at),
+				last_seen_local_at = COALESCE(EXCLUDED.last_seen_local_at, watch_provider_list_items.last_seen_local_at),
+				last_exported_at = COALESCE(EXCLUDED.last_exported_at, watch_provider_list_items.last_exported_at),
+				last_removed_remote_at = COALESCE(EXCLUDED.last_removed_remote_at, watch_provider_list_items.last_removed_remote_at),
+				last_removed_local_at = COALESCE(EXCLUDED.last_removed_local_at, watch_provider_list_items.last_removed_local_at),
+				last_error = EXCLUDED.last_error,
+				title_ids = `+mergeTitleIDsSQL("watch_provider_list_items.title_ids", "EXCLUDED.title_ids")+`,
+				updated_at = now()
+		`, state.ConnectionID, string(kind), state.MediaItemID, state.ProviderItemKey, state.Kind, state.Title, state.Year,
+			state.RemotePresent, state.LocalPresent, state.LastSeenRemoteAt, state.LastSeenLocalAt,
+			state.LastExportedAt, state.LastRemovedRemoteAt, state.LastRemovedLocalAt, state.LastError, state.TitleIDs)
+		if err != nil {
+			return fmt.Errorf("upsert list item state: %w", err)
+		}
+	}
+	return nil
+}
+
+// mergeTitleIDsSQL is the union of two title ID arrays, sorted: a title keeps
+// every ID it has held, so a write that knows fewer of them loses none.
+func mergeTitleIDsSQL(stored, added string) string {
+	return `ARRAY(SELECT DISTINCT id FROM unnest(` + stored + ` || ` + added + `) AS ids(id) ORDER BY id)`
+}
+
+// AddListItemTitleIDs adds IDs to a title row's title IDs.
+func (r *PostgresRepository) AddListItemTitleIDs(ctx context.Context, connectionID string, kind ListKind, mediaItemID string, ids []string) error {
+	if _, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_list_items
+		SET title_ids = `+mergeTitleIDsSQL("title_ids", "$4::text[]")+`,
+			updated_at = now()
+		WHERE connection_id = $1::uuid AND list_kind = $2 AND media_item_id = $3
+		  AND NOT (title_ids @> $4::text[])
+	`, connectionID, string(kind), mediaItemID, ids); err != nil {
+		return fmt.Errorf("add list item title ids: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) WatchlistTitlesSince(ctx context.Context, connectionID string) (*time.Time, error) {
+	var since *time.Time
+	err := r.pool.QueryRow(ctx, `
+		SELECT watchlist_titles_since FROM watch_provider_connections WHERE id = $1::uuid
+	`, connectionID).Scan(&since)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read watchlist titles since: %w", err)
+	}
+	return since, nil
+}
+
+func (r *PostgresRepository) MarkWatchlistTitlesSince(ctx context.Context, connectionID string) error {
+	if _, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_connections SET watchlist_titles_since = now()
+		WHERE id = $1::uuid AND watchlist_titles_since IS NULL
+	`, connectionID); err != nil {
+		return fmt.Errorf("mark watchlist titles since: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) ListListItemStates(ctx context.Context, connectionID string, kind ListKind) ([]ListItemState, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+listItemStateColumns+`
+		FROM watch_provider_list_items
+		WHERE connection_id = $1::uuid AND list_kind = $2
+	`, connectionID, string(kind))
+	if err != nil {
+		return nil, fmt.Errorf("list list item states: %w", err)
+	}
+	defer rows.Close()
+	return scanListItemStates(rows)
+}
+
+func (r *PostgresRepository) ListPendingListItemExports(ctx context.Context, connectionID string, kind ListKind, limit int) ([]ListItemState, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+listItemStateColumns+`
+		FROM watch_provider_list_items
+		WHERE connection_id = $1::uuid
+		  AND list_kind = $2
+		  AND local_present = true
+		  AND remote_present = false
+		  AND last_error = ''
+		ORDER BY last_seen_local_at ASC NULLS LAST, created_at ASC
+		LIMIT $3
+	`, connectionID, string(kind), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending list item exports: %w", err)
+	}
+	defer rows.Close()
+	return scanListItemStates(rows)
+}
+
+func (r *PostgresRepository) ListPendingListItemRemovals(ctx context.Context, connectionID string, kind ListKind, limit int) ([]ListItemState, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+listItemStateColumns+`
+		FROM watch_provider_list_items item
+		WHERE connection_id = $1::uuid
+		  AND list_kind = $2
+		  AND local_present = false
+		  AND remote_present = true
+		  AND last_error = ''
+		  AND NOT `+listItemKeyHeldElsewhere+`
+		ORDER BY last_removed_local_at ASC NULLS LAST, updated_at ASC
+		LIMIT $3
+	`, connectionID, string(kind), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending list item removals: %w", err)
+	}
+	defer rows.Close()
+	return scanListItemStates(rows)
+}
+
+// ListListItemsWithSharedKeyHeld reports which of the media items' rows share
+// their provider key with another library item of the same kind still on the
+// local list.
+func (r *PostgresRepository) ListListItemsWithSharedKeyHeld(ctx context.Context, connectionID string, kind ListKind, mediaItemIDs []string) (map[string]bool, error) {
+	held := make(map[string]bool)
+	if len(mediaItemIDs) == 0 {
+		return held, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT item.media_item_id
+		FROM watch_provider_list_items item
+		WHERE item.connection_id = $1::uuid
+		  AND item.list_kind = $2
+		  AND item.media_item_id = ANY($3)
+		  AND `+listItemKeyHeldElsewhere+`
+	`, connectionID, string(kind), mediaItemIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list list items with shared key held: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan list item with shared key held: %w", err)
+		}
+		held[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate list items with shared key held: %w", err)
+	}
+	return held, nil
+}
+
+func (r *PostgresRepository) MarkListItemExported(ctx context.Context, connectionID string, kind ListKind, mediaItemID string, exportedAt time.Time) error {
+	return r.updateListItemState(ctx, connectionID, kind, mediaItemID, `
+		remote_present = true,
+		local_present = true,
+		last_exported_at = $4,
+		last_seen_remote_at = COALESCE(last_seen_remote_at, $4),
+		last_error = ''
+	`, exportedAt)
+}
+
+func (r *PostgresRepository) MarkListItemRemoteRemoved(ctx context.Context, connectionID string, kind ListKind, mediaItemID string, removedAt time.Time) error {
+	return r.updateListItemState(ctx, connectionID, kind, mediaItemID, `
+		remote_present = false,
+		last_removed_remote_at = $4,
+		last_error = ''
+	`, removedAt)
+}
+
+func (r *PostgresRepository) MarkListItemLocalRemoved(ctx context.Context, connectionID string, kind ListKind, mediaItemID string, removedAt time.Time) error {
+	return r.updateListItemState(ctx, connectionID, kind, mediaItemID, `
+		local_present = false,
+		last_removed_local_at = $4,
+		last_error = ''
+	`, removedAt)
+}
+
+func (r *PostgresRepository) MarkListItemError(ctx context.Context, connectionID string, kind ListKind, mediaItemID, lastError string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_list_items
+		SET last_error = $4, updated_at = now()
+		WHERE connection_id = $1::uuid AND list_kind = $2 AND media_item_id = $3
+	`, connectionID, string(kind), mediaItemID, lastError)
+	if err != nil {
+		return fmt.Errorf("mark list item error: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) SetListItemProviderKey(ctx context.Context, connectionID string, kind ListKind, mediaItemID, key string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_list_items
+		SET provider_item_key = $4, updated_at = now()
+		WHERE connection_id = $1::uuid AND list_kind = $2 AND media_item_id = $3
+	`, connectionID, string(kind), mediaItemID, key)
+	if err != nil {
+		return fmt.Errorf("set list item provider key: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) updateListItemState(ctx context.Context, connectionID string, kind ListKind, mediaItemID, setClause string, at time.Time) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_list_items
+		SET `+setClause+`,
+			updated_at = now()
+		WHERE connection_id = $1::uuid AND list_kind = $2 AND media_item_id = $3
+	`, connectionID, string(kind), mediaItemID, at)
+	if err != nil {
+		return fmt.Errorf("update list item state: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) ListScrobbleConnections(ctx context.Context, userID int, profileID string) ([]Connection, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+connectionColumns+`
+		FROM watch_provider_connections
+		WHERE user_id = $1 AND profile_id = $2 AND scrobble_enabled = true
+			AND (rate_limited_until IS NULL OR rate_limited_until <= now())
+		ORDER BY provider
+	`, userID, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("list scrobble connections: %w", err)
+	}
+	defer rows.Close()
+	var conns []Connection
+	for rows.Next() {
+		conn, err := r.scanConnection(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan scrobble connection: %w", err)
+		}
+		conns = append(conns, conn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate scrobble connections: %w", err)
+	}
+	return conns, nil
+}
+
+func (r *PostgresRepository) UpsertScrobbleSession(ctx context.Context, event ScrobbleEvent, connectionID string, action string) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO watch_provider_scrobble_sessions (
+			playback_session_id, connection_id, media_item_id, provider_item_key, kind,
+			imdb_id, tmdb_id, tvdb_id, series_imdb_id, series_tmdb_id, series_tvdb_id,
+			season_number, episode_number, history_id, started_at, last_progress,
+			duration_seconds, completed, last_action, last_error
+		)
+		VALUES (
+			$1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10,
+			$11, $12, $13, $14, $15, $16, $17, $18, $19, ''
+		)
+		ON CONFLICT (playback_session_id, connection_id) DO UPDATE SET
+			media_item_id = EXCLUDED.media_item_id,
+			provider_item_key = EXCLUDED.provider_item_key,
+			kind = EXCLUDED.kind,
+			imdb_id = EXCLUDED.imdb_id,
+			tmdb_id = EXCLUDED.tmdb_id,
+			tvdb_id = EXCLUDED.tvdb_id,
+			series_imdb_id = EXCLUDED.series_imdb_id,
+			series_tmdb_id = EXCLUDED.series_tmdb_id,
+			series_tvdb_id = EXCLUDED.series_tvdb_id,
+			season_number = EXCLUDED.season_number,
+			episode_number = EXCLUDED.episode_number,
+			history_id = COALESCE(NULLIF(EXCLUDED.history_id, ''), watch_provider_scrobble_sessions.history_id),
+			last_progress = EXCLUDED.last_progress,
+			duration_seconds = EXCLUDED.duration_seconds,
+			completed = EXCLUDED.completed,
+			last_action = EXCLUDED.last_action,
+			last_error = '',
+			updated_at = now()
+	`, event.PlaybackSessionID, connectionID, event.MediaItemID, event.ProviderItemKey, event.Kind,
+		event.IMDbID, event.TMDBID, event.TVDBID, event.SeriesIMDbID, event.SeriesTMDBID,
+		event.SeriesTVDBID, event.SeasonNumber, event.EpisodeNumber, event.HistoryID,
+		event.OccurredAt, event.PositionSeconds, event.DurationSeconds, event.Completed, action)
+	if err != nil {
+		return fmt.Errorf("upsert scrobble session: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) UpdateScrobbleSession(ctx context.Context, playbackSessionID string, connectionID string, action string, progress float64, historyID string, lastError string, stopSentAt *time.Time) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_scrobble_sessions
+		SET last_action = $3,
+			last_progress = $4,
+			history_id = COALESCE(NULLIF($5, ''), history_id),
+			last_error = $6,
+			stop_sent_at = COALESCE($7, stop_sent_at),
+			updated_at = now()
+		WHERE playback_session_id = $1 AND connection_id = $2::uuid
+	`, playbackSessionID, connectionID, action, progress, historyID, lastError, stopSentAt)
+	if err != nil {
+		return fmt.Errorf("update scrobble session: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) PrepareConfirmedScrobbleStop(ctx context.Context, event ScrobbleEvent, connectionID string, staleBefore time.Time) (confirmedStopPreparation, time.Time, error) {
+	var claimVersion time.Time
+	err := r.pool.QueryRow(ctx, `
+		INSERT INTO watch_provider_scrobble_sessions (
+			playback_session_id, connection_id, media_item_id, provider_item_key, kind,
+			imdb_id, tmdb_id, tvdb_id, series_imdb_id, series_tmdb_id, series_tvdb_id,
+			season_number, episode_number, history_id, started_at, last_progress,
+			duration_seconds, completed, last_action, last_error, stop_sent_at
+		)
+		VALUES (
+			$1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10,
+			$11, $12, $13, $14, $15, $16, $17, $18, 'stop_confirming', '', NULL
+		)
+		ON CONFLICT (playback_session_id, connection_id) DO NOTHING
+		RETURNING updated_at
+	`, event.PlaybackSessionID, connectionID, event.MediaItemID, event.ProviderItemKey, event.Kind,
+		event.IMDbID, event.TMDBID, event.TVDBID, event.SeriesIMDbID, event.SeriesTMDBID,
+		event.SeriesTVDBID, event.SeasonNumber, event.EpisodeNumber, event.HistoryID,
+		event.OccurredAt, event.PositionSeconds, event.DurationSeconds, event.Completed).Scan(&claimVersion)
+	if err == nil {
+		return confirmedStopPrepared, claimVersion, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return confirmedStopInProgress, time.Time{}, fmt.Errorf("insert confirmed scrobble stop: %w", err)
+	}
+
+	err = r.pool.QueryRow(ctx, `
+		UPDATE watch_provider_scrobble_sessions
+		SET last_action = 'stop_confirming',
+			last_progress = $3,
+			history_id = COALESCE(NULLIF($4, ''), history_id),
+			duration_seconds = $5,
+			completed = $6,
+			last_error = '',
+			stop_sent_at = NULL,
+			updated_at = now()
+		WHERE playback_session_id = $1 AND connection_id = $2::uuid
+			-- A non-null stop_sent_at can be the provisional ActiveEncodings
+			-- fallback. Confirmed delivery must replace it with the later
+			-- authoritative Stopped position, so last_action owns deduplication.
+			AND last_action IS DISTINCT FROM 'stop_confirmed'
+			AND (last_action IS DISTINCT FROM 'stop_confirming' OR updated_at <= $7)
+		RETURNING updated_at
+	`, event.PlaybackSessionID, connectionID, event.PositionSeconds, event.HistoryID,
+		event.DurationSeconds, event.Completed, staleBefore).Scan(&claimVersion)
+	if err == nil {
+		return confirmedStopPrepared, claimVersion, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return confirmedStopInProgress, time.Time{}, fmt.Errorf("prepare confirmed scrobble stop: %w", err)
+	}
+
+	var lastAction string
+	if err := r.pool.QueryRow(ctx, `
+		SELECT last_action
+		FROM watch_provider_scrobble_sessions
+		WHERE playback_session_id = $1 AND connection_id = $2::uuid
+	`, event.PlaybackSessionID, connectionID).Scan(&lastAction); err != nil {
+		return confirmedStopInProgress, time.Time{}, fmt.Errorf("read confirmed scrobble stop state: %w", err)
+	}
+	if lastAction == "stop_confirmed" {
+		return confirmedStopAlreadySent, time.Time{}, nil
+	}
+	return confirmedStopInProgress, time.Time{}, nil
+}
+
+func (r *PostgresRepository) CompleteConfirmedScrobbleStop(ctx context.Context, playbackSessionID string, connectionID string, progress float64, historyID string, claimVersion time.Time, stopSentAt time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_scrobble_sessions
+		SET last_action = 'stop_confirmed',
+			last_progress = $3,
+			history_id = COALESCE(NULLIF($4, ''), history_id),
+			last_error = '',
+			stop_sent_at = $5,
+			updated_at = now()
+		WHERE playback_session_id = $1 AND connection_id = $2::uuid
+			AND last_action = 'stop_confirming' AND updated_at = $6
+	`, playbackSessionID, connectionID, progress, historyID, stopSentAt, claimVersion)
+	if err != nil {
+		return fmt.Errorf("complete confirmed scrobble stop: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errConfirmedStopClaimLost
+	}
+	return nil
+}
+
+func (r *PostgresRepository) FailConfirmedScrobbleStop(ctx context.Context, playbackSessionID string, connectionID string, progress float64, historyID string, claimVersion time.Time, lastError string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_scrobble_sessions
+		SET last_action = 'stop_retry',
+			last_progress = $3,
+			history_id = COALESCE(NULLIF($4, ''), history_id),
+			last_error = $6,
+			updated_at = now()
+		WHERE playback_session_id = $1 AND connection_id = $2::uuid
+			AND last_action = 'stop_confirming' AND updated_at = $5
+	`, playbackSessionID, connectionID, progress, historyID, claimVersion, lastError)
+	if err != nil {
+		return fmt.Errorf("fail confirmed scrobble stop: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errConfirmedStopClaimLost
+	}
+	return nil
+}
+
+func (r *PostgresRepository) ListOpenScrobbleSessions(ctx context.Context) ([]ScrobbleSession, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT playback_session_id, connection_id::text, media_item_id, provider_item_key, kind,
+			imdb_id, tmdb_id, tvdb_id, series_imdb_id, series_tmdb_id, series_tvdb_id,
+			season_number, episode_number, history_id, started_at, last_progress,
+			duration_seconds, completed, last_action, stop_sent_at, last_error
+		FROM watch_provider_scrobble_sessions
+		WHERE stop_sent_at IS NULL
+			AND last_action NOT IN ('stop_confirming', 'stop_retry')
+		ORDER BY started_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list open scrobble sessions: %w", err)
+	}
+	defer rows.Close()
+	var sessions []ScrobbleSession
+	for rows.Next() {
+		var session ScrobbleSession
+		if err := rows.Scan(
+			&session.PlaybackSessionID,
+			&session.ConnectionID,
+			&session.MediaItemID,
+			&session.ProviderItemKey,
+			&session.Kind,
+			&session.IMDbID,
+			&session.TMDBID,
+			&session.TVDBID,
+			&session.SeriesIMDbID,
+			&session.SeriesTMDBID,
+			&session.SeriesTVDBID,
+			&session.SeasonNumber,
+			&session.EpisodeNumber,
+			&session.HistoryID,
+			&session.StartedAt,
+			&session.LastProgress,
+			&session.DurationSeconds,
+			&session.Completed,
+			&session.LastAction,
+			&session.StopSentAt,
+			&session.LastError,
+		); err != nil {
+			return nil, fmt.Errorf("scan open scrobble session: %w", err)
+		}
+		sessions = append(sessions, session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate open scrobble sessions: %w", err)
+	}
+	return sessions, nil
+}
+
+func (r *PostgresRepository) ListPendingScrobbleReconciliations(ctx context.Context) ([]ScrobbleSession, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT playback_session_id, connection_id::text, media_item_id, provider_item_key, kind,
+			imdb_id, tmdb_id, tvdb_id, series_imdb_id, series_tmdb_id, series_tvdb_id,
+			season_number, episode_number, history_id, started_at, last_progress,
+			duration_seconds, completed, last_action, stop_sent_at, history_reconciled_at, last_error
+		FROM watch_provider_scrobble_sessions
+		WHERE stop_sent_at IS NOT NULL AND completed = true AND history_id <> ''
+			AND history_reconciled_at IS NULL
+		ORDER BY stop_sent_at ASC
+		LIMIT 100
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending scrobble reconciliations: %w", err)
+	}
+	defer rows.Close()
+	var sessions []ScrobbleSession
+	for rows.Next() {
+		var session ScrobbleSession
+		if err := rows.Scan(
+			&session.PlaybackSessionID, &session.ConnectionID, &session.MediaItemID,
+			&session.ProviderItemKey, &session.Kind, &session.IMDbID, &session.TMDBID,
+			&session.TVDBID, &session.SeriesIMDbID, &session.SeriesTMDBID,
+			&session.SeriesTVDBID, &session.SeasonNumber, &session.EpisodeNumber,
+			&session.HistoryID, &session.StartedAt, &session.LastProgress,
+			&session.DurationSeconds, &session.Completed, &session.LastAction,
+			&session.StopSentAt, &session.HistoryReconciledAt, &session.LastError,
+		); err != nil {
+			return nil, fmt.Errorf("scan pending scrobble reconciliation: %w", err)
+		}
+		sessions = append(sessions, session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending scrobble reconciliations: %w", err)
+	}
+	return sessions, nil
+}
+
+// ListScrobbleStops returns when the connection sent, or last tried to send, a
+// scrobble stop for a play Silo recorded, for each of mediaItemIDs that has
+// one. A stop still in flight counts at its attempt: the provider may already
+// hold its copy before stop_sent_at is written, and a stop it never received
+// left no copy to match.
+func (r *PostgresRepository) ListScrobbleStops(ctx context.Context, connectionID string, mediaItemIDs []string) (map[string][]time.Time, error) {
+	stops := make(map[string][]time.Time)
+	if len(mediaItemIDs) == 0 {
+		return stops, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT media_item_id, COALESCE(stop_sent_at, updated_at)
+		FROM watch_provider_scrobble_sessions
+		WHERE connection_id = $1::uuid AND media_item_id = ANY($2)
+			AND history_id <> '' AND last_action LIKE 'stop%'
+	`, connectionID, mediaItemIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list scrobble stops: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var mediaItemID string
+		var stopSentAt time.Time
+		if err := rows.Scan(&mediaItemID, &stopSentAt); err != nil {
+			return nil, fmt.Errorf("scan scrobble stop: %w", err)
+		}
+		stops[mediaItemID] = append(stops[mediaItemID], stopSentAt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate scrobble stops: %w", err)
+	}
+	return stops, nil
+}
+
+func (r *PostgresRepository) MarkScrobbleHistoryReconciled(
+	ctx context.Context,
+	playbackSessionID string,
+	connectionID string,
+	reconciledAt time.Time,
+) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE watch_provider_scrobble_sessions
+		SET history_reconciled_at = $3, last_error = '', updated_at = now()
+		WHERE playback_session_id = $1 AND connection_id = $2::uuid
+	`, playbackSessionID, connectionID, reconciledAt)
+	if err != nil {
+		return fmt.Errorf("mark scrobble history reconciled: %w", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) scanDeviceAuthSession(row pgx.Row) (DeviceAuthSession, error) {
+	var session DeviceAuthSession
+	err := row.Scan(
+		&session.ID,
+		&session.Provider,
+		&session.UserID,
+		&session.ProfileID,
+		&session.DeviceCode,
+		&session.UserCode,
+		&session.VerificationURL,
+		&session.IntervalSeconds,
+		&session.ExpiresAt,
+		&session.CompletedAt,
+	)
+	if err != nil {
+		return DeviceAuthSession{}, err
+	}
+	decrypted, err := r.cipher.DecryptIfEncrypted(
+		session.DeviceCode,
+		authStateAAD(session.Provider, session.UserID, session.ProfileID),
+	)
+	if err != nil {
+		return DeviceAuthSession{}, fmt.Errorf("decrypt watch provider authorization state: %w", err)
+	}
+	session.DeviceCode = decrypted
+	return session, nil
+}
+
+func scanSyncRun(row pgx.Row) (SyncRun, error) {
+	var run SyncRun
+	err := row.Scan(
+		&run.ID,
+		&run.ConnectionID,
+		&run.Trigger,
+		&run.Status,
+		&run.Provider,
+		&run.InboundWatchedFound,
+		&run.InboundWatchedImported,
+		&run.InboundProgressFound,
+		&run.InboundProgressImported,
+		&run.OutboundFound,
+		&run.OutboundSent,
+		&run.InboundFavoritesFound,
+		&run.InboundFavoritesImported,
+		&run.OutboundFavoritesFound,
+		&run.OutboundFavoritesSent,
+		&run.FavoriteRemovalsSent,
+		&run.InboundWatchlistFound,
+		&run.InboundWatchlistImported,
+		&run.OutboundWatchlistFound,
+		&run.OutboundWatchlistSent,
+		&run.WatchlistRemovalsSent,
+		&run.InboundRatingsFound,
+		&run.InboundRatingsImported,
+		&run.OutboundRatingsFound,
+		&run.OutboundRatingsSent,
+		&run.Warning,
+		&run.Error,
+		&run.StartedAt,
+		&run.CompletedAt,
+		&run.CreatedAt,
+	)
+	if err != nil {
+		return SyncRun{}, err
+	}
+	return run, nil
+}
+
+func (r *PostgresRepository) scanConnection(row pgx.Row) (Connection, error) {
+	var conn Connection
+	var rawSyncCursors []byte
+	var rawConnectionSettings []byte
+	var rawPluginCredentials string
+	err := row.Scan(
+		&conn.ID,
+		&conn.Provider,
+		&conn.UserID,
+		&conn.ProfileID,
+		&conn.ProviderAccountID,
+		&conn.ProviderUsername,
+		&conn.AccessToken,
+		&conn.RefreshToken,
+		&conn.TokenExpiresAt,
+		&rawPluginCredentials,
+		&conn.ImportWatchedEnabled,
+		&conn.ImportProgressEnabled,
+		&conn.ExportWatchedEnabled,
+		&conn.ExportUnwatchedEnabled,
+		&conn.ImportFavoritesEnabled,
+		&conn.ExportFavoritesEnabled,
+		&conn.SyncFavoriteRemovalsEnabled,
+		&conn.ImportWatchlistEnabled,
+		&conn.ExportWatchlistEnabled,
+		&conn.SyncWatchlistRemovalsEnabled,
+		&conn.SyncWatchlistOrderEnabled,
+		&conn.ScrobbleEnabled,
+		&conn.ImportRatingsEnabled,
+		&conn.ExportRatingsEnabled,
+		&conn.SyncDroppedEnabled,
+		&conn.LastInboundSyncAt,
+		&conn.LastProgressSyncAt,
+		&conn.LastOutboundSyncAt,
+		&conn.LastFavoritesSyncAt,
+		&conn.LastWatchlistSyncAt,
+		&conn.LastScrobbleErrorAt,
+		&conn.LastError,
+		&conn.RateLimitedUntil,
+		&rawSyncCursors,
+		&rawConnectionSettings,
+		&conn.CreatedAt,
+		&conn.UpdatedAt,
+	)
+	if err != nil {
+		return Connection{}, err
+	}
+	// Decrypt the tokens (read-path contract), bound to the connection's stable
+	// business key — matching TokenAAD on the write path.
+	if conn.AccessToken, err = r.cipher.DecryptIfEncrypted(conn.AccessToken, TokenAAD("access_token", conn.Provider, conn.UserID, conn.ProfileID)); err != nil {
+		return Connection{}, fmt.Errorf("decrypt watch access token: %w", err)
+	}
+	if conn.RefreshToken, err = r.cipher.DecryptIfEncrypted(conn.RefreshToken, TokenAAD("refresh_token", conn.Provider, conn.UserID, conn.ProfileID)); err != nil {
+		return Connection{}, fmt.Errorf("decrypt watch refresh token: %w", err)
+	}
+	if err := r.decodePluginCredentials(&conn, rawPluginCredentials); err != nil {
+		return Connection{}, err
+	}
+	conn.SyncCursors = decodeSyncCursors(rawSyncCursors)
+	conn.ConnectionSettings = decodeStoredConnectionSettings(rawConnectionSettings)
+	return conn, nil
+}
+
+type storedPluginCredentials struct {
+	AccessToken      string            `json:"access_token"`
+	RefreshToken     string            `json:"refresh_token,omitempty"`
+	TokenExpiresAt   *time.Time        `json:"expires_at,omitempty"`
+	TokenType        string            `json:"token_type,omitempty"`
+	Scopes           []string          `json:"scopes,omitempty"`
+	SecretAttributes map[string]string `json:"secret_attributes,omitempty"`
+}
+
+// encodePluginCredentials encodes the authoritative credential bundle every
+// connection stores next to the dedicated token columns. A row written by a
+// former built-in provider has only the columns; decodePluginCredentials leaves
+// them in place when the bundle is empty, and the next write adds the bundle.
+func (r *PostgresRepository) encodePluginCredentials(conn Connection) (string, error) {
+	payload, err := json.Marshal(storedPluginCredentials{
+		AccessToken:      conn.AccessToken,
+		RefreshToken:     conn.RefreshToken,
+		TokenExpiresAt:   conn.TokenExpiresAt,
+		TokenType:        conn.TokenType,
+		Scopes:           conn.Scopes,
+		SecretAttributes: conn.SecretAttributes,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode watch provider credentials: %w", err)
+	}
+	encoded, err := r.cipher.Encrypt(
+		string(payload),
+		TokenAAD("plugin_credentials", conn.Provider, conn.UserID, conn.ProfileID),
+	)
+	if err != nil {
+		return "", fmt.Errorf("encrypt watch provider credentials: %w", err)
+	}
+	return encoded, nil
+}
+
+func (r *PostgresRepository) decodePluginCredentials(conn *Connection, encoded string) error {
+	if conn == nil || strings.TrimSpace(encoded) == "" {
+		return nil
+	}
+	plaintext, err := r.cipher.DecryptIfEncrypted(
+		encoded,
+		TokenAAD("plugin_credentials", conn.Provider, conn.UserID, conn.ProfileID),
+	)
+	if err != nil {
+		return fmt.Errorf("decrypt watch provider credentials: %w", err)
+	}
+	var credentials storedPluginCredentials
+	if err := json.Unmarshal([]byte(plaintext), &credentials); err != nil {
+		return fmt.Errorf("decode watch provider credentials: %w", err)
+	}
+	conn.AccessToken = credentials.AccessToken
+	conn.RefreshToken = credentials.RefreshToken
+	conn.TokenExpiresAt = credentials.TokenExpiresAt
+	conn.TokenType = credentials.TokenType
+	conn.Scopes = append([]string(nil), credentials.Scopes...)
+	conn.SecretAttributes = cloneStringMap(credentials.SecretAttributes)
+	return nil
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	result := make(map[string]string, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func scanListItemStates(rows pgx.Rows) ([]ListItemState, error) {
+	var states []ListItemState
+	for rows.Next() {
+		var state ListItemState
+		if err := rows.Scan(
+			&state.ID,
+			&state.ConnectionID,
+			&state.ListKind,
+			&state.MediaItemID,
+			&state.ProviderItemKey,
+			&state.Kind,
+			&state.Title,
+			&state.Year,
+			&state.RemotePresent,
+			&state.LocalPresent,
+			&state.LastSeenRemoteAt,
+			&state.LastSeenLocalAt,
+			&state.LastExportedAt,
+			&state.LastRemovedRemoteAt,
+			&state.LastRemovedLocalAt,
+			&state.LastError,
+			&state.CreatedAt,
+			&state.UpdatedAt,
+			&state.TitleIDs,
+		); err != nil {
+			return nil, fmt.Errorf("scan list item state: %w", err)
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate list item states: %w", err)
+	}
+	return states, nil
+}
+
+func encodeSyncCursors(cursors map[string]string) []byte {
+	if len(cursors) == 0 {
+		return []byte(`{}`)
+	}
+	data, err := json.Marshal(cursors)
+	if err != nil {
+		return []byte(`{}`)
+	}
+	return data
+}
+
+func decodeSyncCursors(data []byte) map[string]string {
+	if len(data) == 0 {
+		return map[string]string{}
+	}
+	var cursors map[string]string
+	if err := json.Unmarshal(data, &cursors); err != nil || cursors == nil {
+		return map[string]string{}
+	}
+	return cursors
+}

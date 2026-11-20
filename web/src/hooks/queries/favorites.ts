@@ -1,0 +1,99 @@
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import type { BrowseItem } from "@/api/types";
+import { catalogItemFromV2 } from "@/api/v2/catalog";
+import { v2 } from "@/api/v2/request";
+import { favoriteKeys } from "./keys";
+import { toast } from "sonner";
+import { t } from "@/i18n";
+import {
+  cancelItemDetailQueries,
+  scheduleMediaSurfaceInvalidation,
+  updateCatalogItemDetail,
+} from "./mediaSurfaceRefresh";
+import {
+  PERSONAL_STATE_WRITE_TIMEOUT_MS,
+  personalStateMutationOptions,
+} from "./personalStateWrites";
+
+export function useFavorites() {
+  return useQuery({
+    queryKey: favoriteKeys.list(),
+    queryFn: ({ signal }): Promise<BrowseItem[]> =>
+      v2("GET /api/v2/favorites", { signal }).then((data) => data.items.map(catalogItemFromV2)),
+  });
+}
+
+/**
+ * Whether the acting profile has any favorite, for surfaces that only need
+ * that bit (the taste-seed gate and banner). It asks for a one-card page
+ * rather than the full list. An empty page that still carries a cursor means
+ * the newest favorite is one the viewer may not see and more follow; the
+ * profile has favorited something, so it counts as having favorites.
+ */
+export function useHasFavorites() {
+  return useQuery({
+    queryKey: favoriteKeys.exists(),
+    queryFn: ({ signal }): Promise<boolean> =>
+      v2("GET /api/v2/favorites", { query: { limit: 1 }, signal }).then(
+        (data) => data.items.length > 0 || data.page?.has_more === true,
+      ),
+  });
+}
+
+export function useToggleFavorite(itemId: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    ...personalStateMutationOptions,
+    mutationFn: (currentlyFavorite: boolean) =>
+      currentlyFavorite
+        ? v2("DELETE /api/v2/favorites/{item_id}", {
+            path: { item_id: itemId },
+            timeoutMs: PERSONAL_STATE_WRITE_TIMEOUT_MS,
+          })
+        : v2("PUT /api/v2/favorites/{item_id}", {
+            path: { item_id: itemId },
+            timeoutMs: PERSONAL_STATE_WRITE_TIMEOUT_MS,
+          }),
+    onMutate: async (currentlyFavorite: boolean) => {
+      await cancelItemDetailQueries(queryClient, itemId);
+      updateCatalogItemDetail(queryClient, itemId, (detail) => ({
+        ...detail,
+        user_state: {
+          ...detail.user_state,
+          played: detail.user_state?.played ?? detail.user_data?.played ?? false,
+          is_favorite: !currentlyFavorite,
+          in_watchlist: detail.user_state?.in_watchlist ?? false,
+        },
+      }));
+    },
+    // Revert only this mutation's own field. Restoring a whole snapshot would
+    // discard a concurrent watchlist/watched toggle's optimistic state.
+    onError: (_err, currentlyFavorite) => {
+      updateCatalogItemDetail(queryClient, itemId, (detail) => ({
+        ...detail,
+        user_state: {
+          ...detail.user_state,
+          played: detail.user_state?.played ?? detail.user_data?.played ?? false,
+          is_favorite: currentlyFavorite,
+          in_watchlist: detail.user_state?.in_watchlist ?? false,
+        },
+      }));
+      toast.error(t("web.common.toast.favorites.updateFailed"));
+    },
+    onSuccess: (_data, currentlyFavorite) => {
+      toast.success(
+        currentlyFavorite
+          ? t("web.common.toast.favorites.removed")
+          : t("web.common.toast.favorites.added"),
+      );
+    },
+    onSettled: () => {
+      scheduleMediaSurfaceInvalidation(queryClient, {
+        itemId,
+        skipItemDetail: true,
+        skipSimilarItems: true,
+      });
+    },
+  });
+}

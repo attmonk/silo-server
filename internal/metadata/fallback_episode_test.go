@@ -1,0 +1,1115 @@
+package metadata
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"sort"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+// ---------------------------------------------------------------------------
+// Fake repositories for episode/season testing
+// ---------------------------------------------------------------------------
+
+// fakeEpisodeRepo implements metadataEpisodeRepo with an in-memory store keyed
+// by (series_id, season_number, episode_number).
+type fakeEpisodeRepo struct {
+	mu                 sync.Mutex
+	episodes           map[string]*models.Episode // key: "seriesID:season:episode"
+	listByNumbersErr   error
+	bulkUpsertErr      error
+	upsertErrors       map[string]error
+	getByNumberCalls   int
+	listByNumbersCalls int
+	upserts            int
+	bulkUpserts        int
+}
+
+func newFakeEpisodeRepo() *fakeEpisodeRepo {
+	return &fakeEpisodeRepo{
+		episodes:     make(map[string]*models.Episode),
+		upsertErrors: make(map[string]error),
+	}
+}
+
+func episodeKey(seriesID string, season, episode int) string {
+	return fmt.Sprintf("%s:%d:%d", seriesID, season, episode)
+}
+
+func (r *fakeEpisodeRepo) GetBySeriesAndNumber(_ context.Context, seriesID string, season, episode int) (*models.Episode, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.getByNumberCalls++
+	key := episodeKey(seriesID, season, episode)
+	if ep, ok := r.episodes[key]; ok {
+		cp := *ep
+		return &cp, nil
+	}
+	return nil, catalog.ErrEpisodeNotFound
+}
+
+func (r *fakeEpisodeRepo) GetByID(_ context.Context, contentID string) (*models.Episode, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, ep := range r.episodes {
+		if ep.ContentID == contentID {
+			cp := *ep
+			return &cp, nil
+		}
+	}
+	return nil, catalog.ErrEpisodeNotFound
+}
+
+func (r *fakeEpisodeRepo) ListBySeriesAndAirDates(_ context.Context, seriesID string, airDates []string) (map[string][]*models.Episode, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	dateSet := make(map[string]struct{}, len(airDates))
+	for _, airDate := range airDates {
+		dateSet[airDate] = struct{}{}
+	}
+	result := make(map[string][]*models.Episode, len(dateSet))
+	for _, ep := range r.episodes {
+		if ep.SeriesID != seriesID || ep.AirDate == nil {
+			continue
+		}
+		key := ep.AirDate.Format("2006-01-02")
+		if _, ok := dateSet[key]; !ok {
+			continue
+		}
+		cp := *ep
+		result[key] = append(result[key], &cp)
+	}
+	for key := range result {
+		sort.Slice(result[key], func(i, j int) bool {
+			left := result[key][i]
+			right := result[key][j]
+			if left.SeasonNumber != right.SeasonNumber {
+				return left.SeasonNumber < right.SeasonNumber
+			}
+			return left.EpisodeNumber < right.EpisodeNumber
+		})
+	}
+	return result, nil
+}
+
+func (r *fakeEpisodeRepo) ListBySeries(_ context.Context, seriesID string) ([]*models.Episode, error) {
+	return r.listBySeries(seriesID), nil
+}
+
+func (r *fakeEpisodeRepo) ListBySeriesAndNumbers(
+	_ context.Context,
+	seriesID string,
+	seasonNumbers []int32,
+	episodeNumbers []int32,
+) ([]*models.Episode, error) {
+	r.mu.Lock()
+	r.listByNumbersCalls++
+	err := r.listByNumbersErr
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	requested := make(map[string]struct{}, len(seasonNumbers))
+	for i := range seasonNumbers {
+		requested[episodeKey(seriesID, int(seasonNumbers[i]), int(episodeNumbers[i]))] = struct{}{}
+	}
+	all := r.listBySeries(seriesID)
+	result := make([]*models.Episode, 0, len(all))
+	for _, episode := range all {
+		if _, ok := requested[episodeKey(seriesID, episode.SeasonNumber, episode.EpisodeNumber)]; ok {
+			result = append(result, episode)
+		}
+	}
+	return result, nil
+}
+
+func (r *fakeEpisodeRepo) ListBySeasonID(_ context.Context, seasonID string) ([]*models.Episode, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var result []*models.Episode
+	for _, ep := range r.episodes {
+		if ep.SeasonID == seasonID {
+			cp := *ep
+			result = append(result, &cp)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		left := result[i]
+		right := result[j]
+		if left.SeasonNumber != right.SeasonNumber {
+			return left.SeasonNumber < right.SeasonNumber
+		}
+		return left.EpisodeNumber < right.EpisodeNumber
+	})
+	return result, nil
+}
+
+func (r *fakeEpisodeRepo) Upsert(_ context.Context, ep *models.Episode) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.upserts++
+	if err := r.upsertErrors[episodeKey(ep.SeriesID, ep.SeasonNumber, ep.EpisodeNumber)]; err != nil {
+		return err
+	}
+	r.applyUpsertLocked(ep)
+	return nil
+}
+
+func (r *fakeEpisodeRepo) applyUpsertLocked(ep *models.Episode) {
+	key := episodeKey(ep.SeriesID, ep.SeasonNumber, ep.EpisodeNumber)
+	if existing, ok := r.episodes[key]; ok {
+		// Preserve the existing content_id (mirrors the ON CONFLICT behavior).
+		ep.ContentID = existing.ContentID
+		// Update fields in place.
+		cp := *ep
+		r.episodes[key] = &cp
+	} else {
+		cp := *ep
+		r.episodes[key] = &cp
+	}
+}
+
+func (r *fakeEpisodeRepo) BulkUpsert(_ context.Context, seriesID string, episodes []*models.Episode) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bulkUpserts++
+	for i, ep := range episodes {
+		if ep == nil {
+			return fmt.Errorf("episode %d is nil", i)
+		}
+		if ep.SeriesID != seriesID {
+			return fmt.Errorf("episode %d belongs to series %q, want %q", i, ep.SeriesID, seriesID)
+		}
+		if !catalog.FitsPostgresInteger(ep.SeasonNumber) || !catalog.FitsPostgresInteger(ep.EpisodeNumber) || !catalog.FitsPostgresInteger(ep.Runtime) {
+			return fmt.Errorf("episode %d has a value outside the PostgreSQL integer range", i)
+		}
+	}
+	if r.bulkUpsertErr != nil {
+		return r.bulkUpsertErr
+	}
+	for _, ep := range episodes {
+		r.applyUpsertLocked(ep)
+	}
+	return nil
+}
+
+func (r *fakeEpisodeRepo) UpsertCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.upserts
+}
+
+func (r *fakeEpisodeRepo) BulkUpsertCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bulkUpserts
+}
+
+func (r *fakeEpisodeRepo) GetByNumberCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.getByNumberCalls
+}
+
+func (r *fakeEpisodeRepo) ListByNumbersCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.listByNumbersCalls
+}
+
+// listBySeries returns all episodes for a series, for test assertions.
+func (r *fakeEpisodeRepo) listBySeries(seriesID string) []*models.Episode {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var result []*models.Episode
+	for _, ep := range r.episodes {
+		if ep.SeriesID == seriesID {
+			cp := *ep
+			result = append(result, &cp)
+		}
+	}
+	return result
+}
+
+// fakeSeasonRepo implements metadataSeasonRepo with an in-memory store keyed
+// by (series_id, season_number).
+type fakeSeasonRepo struct {
+	mu               sync.Mutex
+	seasons          map[string]*models.Season // key: "seriesID:seasonNum"
+	listErr          error
+	bulkUpsertErr    error
+	upsertErrors     map[string]error
+	getByNumberCalls int
+	listCalls        int
+	upserts          int
+	bulkUpserts      int
+}
+
+func newFakeSeasonRepo() *fakeSeasonRepo {
+	return &fakeSeasonRepo{
+		seasons:      make(map[string]*models.Season),
+		upsertErrors: make(map[string]error),
+	}
+}
+
+func seasonKey(seriesID string, seasonNum int) string {
+	return fmt.Sprintf("%s:%d", seriesID, seasonNum)
+}
+
+func (r *fakeSeasonRepo) GetBySeriesAndNumber(_ context.Context, seriesID string, seasonNum int) (*models.Season, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.getByNumberCalls++
+	key := seasonKey(seriesID, seasonNum)
+	if s, ok := r.seasons[key]; ok {
+		cp := *s
+		return &cp, nil
+	}
+	return nil, catalog.ErrSeasonNotFound
+}
+
+func (r *fakeSeasonRepo) GetByID(_ context.Context, contentID string) (*models.Season, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, season := range r.seasons {
+		if season.ContentID == contentID {
+			cp := *season
+			return &cp, nil
+		}
+	}
+	return nil, catalog.ErrSeasonNotFound
+}
+
+func (r *fakeSeasonRepo) Upsert(_ context.Context, s *models.Season) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.upserts++
+	if err := r.upsertErrors[seasonKey(s.SeriesID, s.SeasonNumber)]; err != nil {
+		return err
+	}
+	r.applyUpsertLocked(s)
+	return nil
+}
+
+func (r *fakeSeasonRepo) applyUpsertLocked(s *models.Season) {
+	key := seasonKey(s.SeriesID, s.SeasonNumber)
+	existing, ok := r.seasons[key]
+	if ok {
+		// Preserve existing content_id (mirrors ON CONFLICT behavior).
+		s.ContentID = existing.ContentID
+	}
+	cp := *s
+	cp.WriteBackdrop, cp.BackdropFillOnly = false, false
+	// Like SeasonRepository, only a write marked WriteBackdrop changes the
+	// stored backdrop.
+	if !s.WriteBackdrop || (s.BackdropFillOnly && ok && existing.BackdropPath != "") {
+		cp.BackdropPath, cp.BackdropSourcePath, cp.BackdropThumbhash = "", "", ""
+		if ok {
+			cp.BackdropPath, cp.BackdropSourcePath, cp.BackdropThumbhash = existing.BackdropPath, existing.BackdropSourcePath, existing.BackdropThumbhash
+		}
+	}
+	r.seasons[key] = &cp
+}
+
+func (r *fakeSeasonRepo) BulkUpsert(_ context.Context, seasons []*models.Season) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bulkUpserts++
+	if r.bulkUpsertErr != nil {
+		return r.bulkUpsertErr
+	}
+	for _, s := range seasons {
+		r.applyUpsertLocked(s)
+	}
+	return nil
+}
+
+func (r *fakeSeasonRepo) ClearBackdropsExcept(_ context.Context, seriesID string, keep []int32) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.seasons {
+		if s.SeriesID == seriesID && !slices.Contains(keep, int32(s.SeasonNumber)) {
+			s.BackdropPath, s.BackdropSourcePath, s.BackdropThumbhash = "", "", ""
+		}
+	}
+	return nil
+}
+
+func (r *fakeSeasonRepo) ListBySeriesAndNumbers(_ context.Context, seriesID string, seasonNumbers []int32) ([]*models.Season, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.listCalls++
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	requested := make(map[int]struct{}, len(seasonNumbers))
+	for _, seasonNumber := range seasonNumbers {
+		requested[int(seasonNumber)] = struct{}{}
+	}
+	var result []*models.Season
+	for _, season := range r.seasons {
+		if season.SeriesID == seriesID {
+			if _, ok := requested[season.SeasonNumber]; !ok {
+				continue
+			}
+			cp := *season
+			result = append(result, &cp)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].SeasonNumber < result[j].SeasonNumber
+	})
+	return result, nil
+}
+
+func (r *fakeSeasonRepo) UpsertCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.upserts
+}
+
+func (r *fakeSeasonRepo) BulkUpsertCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bulkUpserts
+}
+
+func (r *fakeSeasonRepo) GetByNumberCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.getByNumberCalls
+}
+
+func (r *fakeSeasonRepo) ListCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.listCalls
+}
+
+// fakeLocalizationRepo stores localization rows of one kind in memory, keyed
+// by content ID and language, and counts each call.
+type fakeLocalizationRepo[T any] struct {
+	localizations   map[string]*T
+	keyOf           func(*T) string
+	bulkGetErr      error
+	bulkUpsertErr   error
+	upsertErrors    map[string]error
+	getCalls        int
+	bulkGetCalls    int
+	upsertCalls     int
+	bulkUpsertCalls int
+}
+
+func newFakeLocalizationRepo[T any](keyOf func(*T) string) fakeLocalizationRepo[T] {
+	return fakeLocalizationRepo[T]{
+		localizations: make(map[string]*T),
+		keyOf:         keyOf,
+		upsertErrors:  make(map[string]error),
+	}
+}
+
+// seasonLocalizationKey keys every localization row, episode rows included.
+func seasonLocalizationKey(contentID, language string) string {
+	return contentID + ":" + language
+}
+
+func (r *fakeLocalizationRepo[T]) Get(_ context.Context, contentID, language string) (*T, error) {
+	r.getCalls++
+	loc := r.localizations[seasonLocalizationKey(contentID, language)]
+	if loc == nil {
+		return nil, nil
+	}
+	cp := *loc
+	return &cp, nil
+}
+
+func (r *fakeLocalizationRepo[T]) getByIDs(contentIDs []string, language string) (map[string]*T, error) {
+	r.bulkGetCalls++
+	if r.bulkGetErr != nil {
+		return nil, r.bulkGetErr
+	}
+	result := make(map[string]*T, len(contentIDs))
+	for _, contentID := range contentIDs {
+		if loc := r.localizations[seasonLocalizationKey(contentID, language)]; loc != nil {
+			cp := *loc
+			result[contentID] = &cp
+		}
+	}
+	return result, nil
+}
+
+func (r *fakeLocalizationRepo[T]) Upsert(_ context.Context, loc *T) error {
+	r.upsertCalls++
+	if err := r.upsertErrors[r.keyOf(loc)]; err != nil {
+		return err
+	}
+	r.store(loc)
+	return nil
+}
+
+func (r *fakeLocalizationRepo[T]) BulkUpsert(_ context.Context, localizations []*T) error {
+	r.bulkUpsertCalls++
+	if r.bulkUpsertErr != nil {
+		return r.bulkUpsertErr
+	}
+	for _, loc := range localizations {
+		r.store(loc)
+	}
+	return nil
+}
+
+func (r *fakeLocalizationRepo[T]) store(loc *T) {
+	cp := *loc
+	r.localizations[r.keyOf(loc)] = &cp
+}
+
+type fakeSeasonLocalizationRepo struct {
+	fakeLocalizationRepo[models.SeasonLocalization]
+}
+
+func newFakeSeasonLocalizationRepo() *fakeSeasonLocalizationRepo {
+	return &fakeSeasonLocalizationRepo{newFakeLocalizationRepo(func(loc *models.SeasonLocalization) string {
+		return seasonLocalizationKey(loc.SeasonContentID, loc.Language)
+	})}
+}
+
+func (r *fakeSeasonLocalizationRepo) GetBySeasonIDs(_ context.Context, contentIDs []string, language string) (map[string]*models.SeasonLocalization, error) {
+	return r.getByIDs(contentIDs, language)
+}
+
+type fakeEpisodeLocalizationRepo struct {
+	fakeLocalizationRepo[models.EpisodeLocalization]
+}
+
+func newFakeEpisodeLocalizationRepo() *fakeEpisodeLocalizationRepo {
+	return &fakeEpisodeLocalizationRepo{newFakeLocalizationRepo(func(loc *models.EpisodeLocalization) string {
+		return seasonLocalizationKey(loc.EpisodeContentID, loc.Language)
+	})}
+}
+
+func (r *fakeEpisodeLocalizationRepo) GetByEpisodeIDs(_ context.Context, contentIDs []string, language string) (map[string]*models.EpisodeLocalization, error) {
+	return r.getByIDs(contentIDs, language)
+}
+
+// fakeEpisodeLinkerFileRepo extends fakeFileRepo with EpisodeLinker methods,
+// allowing the fallback synthesis to list unlinked files and link them.
+type fakeEpisodeLinkerFileRepo struct {
+	fakeFileRepo
+	files        map[int]*models.MediaFile // fileID -> file
+	episodeLinks map[int]string            // fileID -> episodeID
+}
+
+func newFakeEpisodeLinkerFileRepo() *fakeEpisodeLinkerFileRepo {
+	return &fakeEpisodeLinkerFileRepo{
+		fakeFileRepo: *newFakeFileRepo(),
+		files:        make(map[int]*models.MediaFile),
+		episodeLinks: make(map[int]string),
+	}
+}
+
+func (r *fakeEpisodeLinkerFileRepo) addFile(file *models.MediaFile) {
+	r.fakeFileRepo.mu.Lock()
+	defer r.fakeFileRepo.mu.Unlock()
+	cp := *file
+	r.files[file.ID] = &cp
+}
+
+func (r *fakeEpisodeLinkerFileRepo) UpdateEpisodeLink(_ context.Context, fileID int, _ string, episodeID string, seasonNum, episodeNum int) error {
+	r.fakeFileRepo.mu.Lock()
+	defer r.fakeFileRepo.mu.Unlock()
+	r.episodeLinks[fileID] = episodeID
+	if file, ok := r.files[fileID]; ok {
+		file.EpisodeID = episodeID
+		file.SeasonNumber = seasonNum
+		file.EpisodeNumber = episodeNum
+	}
+	return nil
+}
+
+func (r *fakeEpisodeLinkerFileRepo) ListBySeriesUnlinked(_ context.Context, seriesContentID string) ([]*models.MediaFile, error) {
+	r.fakeFileRepo.mu.Lock()
+	defer r.fakeFileRepo.mu.Unlock()
+	var result []*models.MediaFile
+	for _, file := range r.files {
+		cid := r.fakeFileRepo.contentIDs[file.ID]
+		if cid != seriesContentID {
+			continue
+		}
+		if _, linked := r.episodeLinks[file.ID]; linked {
+			continue
+		}
+		cp := *file
+		result = append(result, &cp)
+	}
+	return result, nil
+}
+
+type blockingEpisodeLinkerFileRepo struct {
+	*fakeEpisodeLinkerFileRepo
+	mu        sync.Mutex
+	listCalls int
+	entered   chan struct{}
+	release   chan struct{}
+	enterOnce sync.Once
+}
+
+func newBlockingEpisodeLinkerFileRepo() *blockingEpisodeLinkerFileRepo {
+	return &blockingEpisodeLinkerFileRepo{
+		fakeEpisodeLinkerFileRepo: newFakeEpisodeLinkerFileRepo(),
+		entered:                   make(chan struct{}),
+		release:                   make(chan struct{}),
+	}
+}
+
+func (r *blockingEpisodeLinkerFileRepo) ListBySeriesUnlinked(ctx context.Context, seriesContentID string) ([]*models.MediaFile, error) {
+	r.mu.Lock()
+	r.listCalls++
+	callNum := r.listCalls
+	r.mu.Unlock()
+
+	if callNum == 1 {
+		r.enterOnce.Do(func() { close(r.entered) })
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	return r.fakeEpisodeLinkerFileRepo.ListBySeriesUnlinked(ctx, seriesContentID)
+}
+
+func (r *blockingEpisodeLinkerFileRepo) ListCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.listCalls
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+type fallbackTestHarness struct {
+	service     *MetadataService
+	itemRepo    *fakeItemRepo
+	fileRepo    *fakeEpisodeLinkerFileRepo
+	episodeRepo *fakeEpisodeRepo
+	seasonRepo  *fakeSeasonRepo
+	libraryRepo *fakeLibraryRepo
+}
+
+func newFallbackTestHarness() *fallbackTestHarness {
+	h := &fallbackTestHarness{
+		itemRepo:    newFakeItemRepo(),
+		fileRepo:    newFakeEpisodeLinkerFileRepo(),
+		episodeRepo: newFakeEpisodeRepo(),
+		seasonRepo:  newFakeSeasonRepo(),
+		libraryRepo: newFakeLibraryRepo(),
+	}
+	h.service = &MetadataService{
+		itemRepo:    h.itemRepo,
+		fileRepo:    h.fileRepo,
+		episodeRepo: h.episodeRepo,
+		seasonRepo:  h.seasonRepo,
+		libraryRepo: h.libraryRepo,
+	}
+	return h
+}
+
+func mustDate(t *testing.T, value string) *time.Time {
+	t.Helper()
+	parsed, err := time.Parse("2006-01-02", value)
+	if err != nil {
+		t.Fatalf("parse date %q: %v", value, err)
+	}
+	return &parsed
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+func TestEnsureSeriesEpisodeLinks_SkipsAmbiguousAirDateMatch(t *testing.T) {
+	h := newFallbackTestHarness()
+	ctx := context.Background()
+
+	seriesID := "series-daily-ambiguous"
+	h.itemRepo.Upsert(ctx, &models.MediaItem{
+		ContentID: seriesID,
+		Title:     "Two A Day",
+		Type:      "series",
+		Status:    "matched",
+		Studios:   []string{},
+		Networks:  []string{},
+		Countries: []string{},
+		Genres:    []string{},
+	})
+	h.episodeRepo.Upsert(ctx, &models.Episode{
+		ContentID:      "ep-one",
+		SeriesID:       seriesID,
+		SeasonID:       "season-1",
+		SeasonNumber:   1,
+		EpisodeNumber:  10,
+		AirDate:        mustDate(t, "2026-04-24"),
+		MetadataSource: "provider",
+	})
+	h.episodeRepo.Upsert(ctx, &models.Episode{
+		ContentID:      "ep-two",
+		SeriesID:       seriesID,
+		SeasonID:       "season-1",
+		SeasonNumber:   1,
+		EpisodeNumber:  11,
+		AirDate:        mustDate(t, "2026-04-24"),
+		MetadataSource: "provider",
+	})
+	file := &models.MediaFile{
+		ID:            102,
+		MediaFolderID: 10,
+		FilePath:      "/media/tv/Two A Day/Season 01/Two A Day - 2026.04.24.mkv",
+	}
+	h.fileRepo.addFile(file)
+	h.fileRepo.contentIDs[file.ID] = seriesID
+
+	if err := h.service.ensureSeriesEpisodeLinks(ctx, seriesID); err != nil {
+		t.Fatalf("ensureSeriesEpisodeLinks failed: %v", err)
+	}
+
+	if got := h.fileRepo.episodeLinks[file.ID]; got != "" {
+		t.Fatalf("ambiguous date linked to %q, want no link", got)
+	}
+}
+
+func seedAirDateSeries(ctx context.Context, t *testing.T, h *fallbackTestHarness, seriesID string, episodes ...*models.Episode) {
+	t.Helper()
+	if err := h.itemRepo.Upsert(ctx, &models.MediaItem{
+		ContentID: seriesID,
+		Title:     "Daily Show",
+		Type:      "series",
+		Status:    "matched",
+		TvdbID:    "77075",
+		Studios:   []string{},
+		Networks:  []string{},
+		Countries: []string{},
+		Genres:    []string{},
+	}); err != nil {
+		t.Fatalf("seed series: %v", err)
+	}
+	for _, episode := range episodes {
+		episode.SeriesID = seriesID
+		episode.SeasonID = fmt.Sprintf("season-%d", episode.SeasonNumber)
+		episode.MetadataSource = "provider"
+		if err := h.episodeRepo.Upsert(ctx, episode); err != nil {
+			t.Fatalf("seed episode %s: %v", episode.ContentID, err)
+		}
+	}
+}
+
+func addAirDateFile(h *fallbackTestHarness, seriesID string, id int, path string) {
+	h.fileRepo.addFile(&models.MediaFile{ID: id, MediaFolderID: 10, FilePath: path})
+	h.fileRepo.contentIDs[id] = seriesID
+}
+
+type airDateCandidateFile struct {
+	id   int
+	path string
+	want string
+}
+
+type ensureSeriesEpisodeLinksAirDateCandidatesCase struct {
+	name     string
+	episodes []*models.Episode
+	files    []airDateCandidateFile
+}
+
+var ensureSeriesEpisodeLinksAirDateCandidatesCases = func() []ensureSeriesEpisodeLinksAirDateCandidatesCase {
+	airDate := func(value string) *time.Time {
+		parsed, err := time.Parse("2006-01-02", value)
+		if err != nil {
+			panic(err)
+		}
+		return &parsed
+	}
+
+	return []ensureSeriesEpisodeLinksAirDateCandidatesCase{
+		{
+			// A daily show matched on TVDB: a same-day special and the
+			// year-season episode both carry TVDB IDs, and a TMDB-numbered row
+			// carries only its own.
+			name: "narrows past a provider tie",
+			episodes: []*models.Episode{
+				{ContentID: "ep-special", SeasonNumber: 0, EpisodeNumber: 5, Title: "Tournament Preview", AirDate: airDate("2026-04-24"), TvdbID: "11733001"},
+				{ContentID: "ep-tmdb-42-165", SeasonNumber: 42, EpisodeNumber: 165, Title: "Show #9550", AirDate: airDate("2026-04-24"), TmdbID: "7178079"},
+				{ContentID: "ep-tvdb-2026-82", SeasonNumber: 2026, EpisodeNumber: 82, Title: "Fri, Apr 24, 2026", AirDate: airDate("2026-04-24"), TvdbID: "11733849"},
+			},
+			files: []airDateCandidateFile{{110, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-24.mkv", "ep-tvdb-2026-82"}},
+		},
+		{
+			name: "folder season picks between numberings",
+			episodes: []*models.Episode{
+				{ContentID: "ep-42-165", SeasonNumber: 42, EpisodeNumber: 165, Title: "Show #9550", AirDate: airDate("2026-04-24"), TvdbID: "11733001"},
+				{ContentID: "ep-2026-82", SeasonNumber: 2026, EpisodeNumber: 82, Title: "Fri, Apr 24, 2026", AirDate: airDate("2026-04-24"), TvdbID: "11733849"},
+			},
+			files: []airDateCandidateFile{
+				{120, "/media/tv/Daily Show/Season 42/Daily Show - 2026-04-24.mkv", "ep-42-165"},
+				{121, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-24.mkv", "ep-2026-82"},
+				// A folder season no candidate has decides nothing.
+				{122, "/media/tv/Daily Show/Season 01/Daily Show - 2026-04-24.mkv", ""},
+			},
+		},
+		{
+			name: "filename title outranks folder season",
+			episodes: []*models.Episode{
+				{ContentID: "ep-special", SeasonNumber: 0, EpisodeNumber: 5, Title: "Tournament Preview", AirDate: airDate("2026-04-24"), TvdbID: "11733001"},
+				{ContentID: "ep-regular", SeasonNumber: 2026, EpisodeNumber: 82, Title: "Fri, Apr 24, 2026", AirDate: airDate("2026-04-24"), TvdbID: "11733849"},
+			},
+			files: []airDateCandidateFile{{123, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-24 - Tournament Preview.mkv", "ep-special"}},
+		},
+		{
+			name: "unmatched title does not default to the regular episode",
+			episodes: []*models.Episode{
+				{ContentID: "ep-special", SeasonNumber: 0, EpisodeNumber: 5, Title: "Tournament Preview", AirDate: airDate("2026-04-24"), TvdbID: "11733001"},
+				{ContentID: "ep-regular", SeasonNumber: 2026, EpisodeNumber: 82, Title: "Fri, Apr 24, 2026", AirDate: airDate("2026-04-24"), TvdbID: "11733849"},
+			},
+			files: []airDateCandidateFile{{124, "/media/tv/Daily Show/Daily Show - 2026-04-24 - Tournament Preview Show.mkv", ""}},
+		},
+		{
+			name: "prefers the regular episode over a same-day special",
+			episodes: []*models.Episode{
+				{ContentID: "ep-special", SeasonNumber: 0, EpisodeNumber: 5, Title: "Tournament Preview", AirDate: airDate("2026-04-24"), TvdbID: "11733001"},
+				{ContentID: "ep-regular", SeasonNumber: 2026, EpisodeNumber: 82, Title: "Fri, Apr 24, 2026", AirDate: airDate("2026-04-24"), TvdbID: "11733849"},
+			},
+			files: []airDateCandidateFile{{111, "/media/tv/Daily Show/Daily Show - 2026-04-24.mkv", "ep-regular"}},
+		},
+		{
+			name: "Specials folder keeps the special",
+			episodes: []*models.Episode{
+				{ContentID: "ep-special", SeasonNumber: 0, EpisodeNumber: 5, Title: "Tournament Preview", AirDate: airDate("2026-04-24"), TvdbID: "11733001"},
+				{ContentID: "ep-regular", SeasonNumber: 2026, EpisodeNumber: 82, Title: "Fri, Apr 24, 2026", AirDate: airDate("2026-04-24"), TvdbID: "11733849"},
+			},
+			files: []airDateCandidateFile{{112, "/media/tv/Daily Show/Specials/Daily Show - 2026-04-24.mkv", "ep-special"}},
+		},
+		{
+			name: "filename title picks the same-day episode",
+			episodes: []*models.Episode{
+				{ContentID: "ep-early", SeasonNumber: 2026, EpisodeNumber: 81, Title: "Morning Edition", AirDate: airDate("2026-04-24"), TvdbID: "11733848"},
+				{ContentID: "ep-late", SeasonNumber: 2026, EpisodeNumber: 82, Title: "Jamie Ding, Zach Pollock, Nicco Martinez", AirDate: airDate("2026-04-24"), TvdbID: "11733849"},
+			},
+			files: []airDateCandidateFile{
+				{113, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-24 - Jamie Ding Zach Pollock Nicco Martinez.mkv", "ep-late"},
+				{114, "/media/tv/Daily Show/Season 2026/Daily.Show.2026.04.24.Morning.Edition.1080p.WEB.h264-GROUP.mkv", "ep-early"},
+			},
+		},
+		{
+			// "Unknown" is a placeholder, not evidence for the episode titled
+			// Unknown, and a generic title cannot pick between generic episode
+			// titles.
+			name: "ambiguous air dates link nothing",
+			episodes: []*models.Episode{
+				{ContentID: "ep-a", SeasonNumber: 2026, EpisodeNumber: 81, Title: "Unknown", AirDate: airDate("2026-04-24"), TvdbID: "11733848"},
+				{ContentID: "ep-b", SeasonNumber: 2026, EpisodeNumber: 82, Title: "Second Show", AirDate: airDate("2026-04-24"), TvdbID: "11733849"},
+				{ContentID: "ep-c", SeasonNumber: 2026, EpisodeNumber: 83, Title: "Episode 83", AirDate: airDate("2026-04-25"), TvdbID: "11733850"},
+				{ContentID: "ep-d", SeasonNumber: 2026, EpisodeNumber: 84, Title: "Episode 84", AirDate: airDate("2026-04-25"), TvdbID: "11733851"},
+			},
+			files: []airDateCandidateFile{
+				{115, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-24 - Unknown.mkv", ""},
+				{116, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-25 - Episode 83.mkv", ""},
+				{117, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-25.mkv", ""},
+			},
+		},
+		{
+			// Generic titles that only read as generic once normalized.
+			name: "generic title spellings decide nothing",
+			episodes: []*models.Episode{
+				{ContentID: "ep-83", SeasonNumber: 2026, EpisodeNumber: 83, Title: "Episode 83", AirDate: airDate("2026-04-24"), TvdbID: "11733850"},
+				{ContentID: "ep-84", SeasonNumber: 2026, EpisodeNumber: 84, Title: "Episode 84", AirDate: airDate("2026-04-24"), TvdbID: "11733851"},
+				{ContentID: "ep-tba", SeasonNumber: 2026, EpisodeNumber: 85, Title: "TBA", AirDate: airDate("2026-04-25"), TvdbID: "11733852"},
+				{ContentID: "ep-86", SeasonNumber: 2026, EpisodeNumber: 86, Title: "Second Show", AirDate: airDate("2026-04-25"), TvdbID: "11733853"},
+				{ContentID: "ep-one", SeasonNumber: 2026, EpisodeNumber: 87, Title: "Episode One", AirDate: airDate("2026-04-26"), TvdbID: "11733854"},
+				{ContentID: "ep-two", SeasonNumber: 2026, EpisodeNumber: 88, Title: "Episode Two", AirDate: airDate("2026-04-26"), TvdbID: "11733855"},
+			},
+			files: []airDateCandidateFile{
+				{130, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-24 - Episode-83.mkv", ""},
+				{131, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-25 - (TBA).mkv", ""},
+				{132, "/media/tv/Daily Show/Season 2026/Daily Show - 2026-04-26 - Episode One.mkv", ""},
+			},
+		},
+	}
+}()
+
+// TestFallbackEpisode_PartialProviderCoverageKeepsScannerEpisodes verifies that
+// when a provider supplies metadata for some episodes but not all, the
+// scanner-derived fallback rows are preserved for the missing episodes.
+func TestFallbackEpisode_PartialProviderCoverageKeepsScannerEpisodes(t *testing.T) {
+	h := newFallbackTestHarness()
+	ctx := context.Background()
+
+	seriesID := "series-partial-1"
+
+	// Create the series item (already matched).
+	h.itemRepo.Upsert(ctx, &models.MediaItem{
+		ContentID: seriesID,
+		Title:     "Partial Show",
+		Type:      "series",
+		Status:    "matched",
+		Studios:   []string{},
+		Networks:  []string{},
+		Countries: []string{},
+		Genres:    []string{},
+	})
+
+	// Provider supplied S01E01 only.
+	h.seasonRepo.Upsert(ctx, &models.Season{
+		ContentID:      "season-provider-1",
+		SeriesID:       seriesID,
+		SeasonNumber:   1,
+		Title:          "Season 1",
+		MetadataSource: "provider",
+	})
+	h.episodeRepo.Upsert(ctx, &models.Episode{
+		ContentID:      "ep-provider-s01e01",
+		SeriesID:       seriesID,
+		SeasonID:       "season-provider-1",
+		SeasonNumber:   1,
+		EpisodeNumber:  1,
+		Title:          "Pilot",
+		MetadataSource: "provider",
+	})
+
+	// But there are also files for S01E02 and S01E03 that the provider didn't
+	// know about.
+	files := []*models.MediaFile{
+		{ID: 10, MediaFolderID: 10, FilePath: "/media/tv/Partial Show/Season 01/Partial.Show.S01E02.mkv", SeasonNumber: 1, EpisodeNumber: 2},
+		{ID: 11, MediaFolderID: 10, FilePath: "/media/tv/Partial Show/Season 01/Partial.Show.S01E03.mkv", SeasonNumber: 1, EpisodeNumber: 3},
+	}
+	for _, f := range files {
+		h.fileRepo.addFile(f)
+		h.fileRepo.contentIDs[f.ID] = seriesID
+	}
+
+	// Synthesize fallback episodes for the gaps.
+	if err := h.service.SynthesizeFallbackEpisodes(ctx, seriesID); err != nil {
+		t.Fatalf("SynthesizeFallbackEpisodes failed: %v", err)
+	}
+
+	// Provider episode S01E01 should be untouched.
+	ep1, err := h.episodeRepo.GetBySeriesAndNumber(ctx, seriesID, 1, 1)
+	if err != nil {
+		t.Fatalf("S01E01 missing: %v", err)
+	}
+	if ep1.ContentID != "ep-provider-s01e01" {
+		t.Errorf("S01E01 content_id changed: want ep-provider-s01e01, got %q", ep1.ContentID)
+	}
+	if ep1.Title != "Pilot" {
+		t.Errorf("S01E01 title changed: want Pilot, got %q", ep1.Title)
+	}
+	if ep1.MetadataSource != "provider" {
+		t.Errorf("S01E01 metadata_source changed: want provider, got %q", ep1.MetadataSource)
+	}
+
+	// Scanner-derived episodes should exist for the gaps.
+	ep2, err := h.episodeRepo.GetBySeriesAndNumber(ctx, seriesID, 1, 2)
+	if err != nil {
+		t.Fatalf("S01E02 not created: %v", err)
+	}
+	if ep2.MetadataSource != "scanner_fallback" {
+		t.Errorf("S01E02 metadata_source: want scanner_fallback, got %q", ep2.MetadataSource)
+	}
+
+	ep3, err := h.episodeRepo.GetBySeriesAndNumber(ctx, seriesID, 1, 3)
+	if err != nil {
+		t.Fatalf("S01E03 not created: %v", err)
+	}
+	if ep3.MetadataSource != "scanner_fallback" {
+		t.Errorf("S01E03 metadata_source: want scanner_fallback, got %q", ep3.MetadataSource)
+	}
+
+	// Total episodes should be 3.
+	allEpisodes := h.episodeRepo.listBySeries(seriesID)
+	if len(allEpisodes) != 3 {
+		t.Errorf("expected 3 total episodes, got %d", len(allEpisodes))
+	}
+}
+
+func TestEnsureSeriesEpisodeLinks_CoalescesConcurrentFallbackWork(t *testing.T) {
+	ctx := context.Background()
+
+	itemRepo := newFakeItemRepo()
+	fileRepo := newBlockingEpisodeLinkerFileRepo()
+	episodeRepo := newFakeEpisodeRepo()
+	seasonRepo := newFakeSeasonRepo()
+	libraryRepo := newFakeLibraryRepo()
+
+	service := &MetadataService{
+		itemRepo:    itemRepo,
+		fileRepo:    fileRepo,
+		episodeRepo: episodeRepo,
+		seasonRepo:  seasonRepo,
+		libraryRepo: libraryRepo,
+	}
+
+	seriesID := "series-coalesced-1"
+	if err := itemRepo.Upsert(ctx, &models.MediaItem{
+		ContentID:                 seriesID,
+		Title:                     "EastEnders",
+		Type:                      "series",
+		Status:                    "unmatched",
+		EpisodeMetadataIncomplete: true,
+		Studios:                   []string{},
+		Networks:                  []string{},
+		Countries:                 []string{},
+		Genres:                    []string{},
+	}); err != nil {
+		t.Fatalf("upserting series item: %v", err)
+	}
+
+	file := &models.MediaFile{
+		ID:            1,
+		MediaFolderID: 10,
+		FilePath:      "/media/tv/EastEnders/Season 01/EastEnders.S01E01.mkv",
+		SeasonNumber:  1,
+		EpisodeNumber: 1,
+	}
+	fileRepo.addFile(file)
+	fileRepo.contentIDs[file.ID] = seriesID
+
+	const concurrentCalls = 16
+	errCh := make(chan error, concurrentCalls)
+
+	go func() {
+		errCh <- service.ensureSeriesEpisodeLinks(ctx, seriesID)
+	}()
+
+	<-fileRepo.entered
+
+	var wg sync.WaitGroup
+	for i := 1; i < concurrentCalls; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- service.ensureSeriesEpisodeLinks(ctx, seriesID)
+		}()
+	}
+
+	close(fileRepo.release)
+	wg.Wait()
+
+	for i := 0; i < concurrentCalls; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("ensureSeriesEpisodeLinks returned error: %v", err)
+		}
+	}
+
+	if got := seasonRepo.UpsertCalls(); got != 1 {
+		t.Fatalf("expected 1 fallback season upsert, got %d", got)
+	}
+	if got := episodeRepo.UpsertCalls(); got != 1 {
+		t.Fatalf("expected 1 fallback episode upsert, got %d", got)
+	}
+
+	ep, err := episodeRepo.GetBySeriesAndNumber(ctx, seriesID, 1, 1)
+	if err != nil {
+		t.Fatalf("expected synthesized episode to exist: %v", err)
+	}
+	if ep.MetadataSource != "scanner_fallback" {
+		t.Fatalf("expected synthesized episode metadata source scanner_fallback, got %q", ep.MetadataSource)
+	}
+}
+
+// failingAirDateEpisodeRepo fails the air-date lookup the completeness sweep
+// runs for a series' unlinked by-date files.
+type failingAirDateEpisodeRepo struct {
+	*fakeEpisodeRepo
+}
+
+func (failingAirDateEpisodeRepo) ListBySeriesAndAirDates(context.Context, string, []string) (map[string][]*models.Episode, error) {
+	return nil, errors.New("air-date lookup failed")
+}
+
+// TestRefreshSeriesEpisodeMetadataState_KeepsSeriesDebtWhenByDateCheckFails
+// covers a failed by-date check: clearing the flag would let the refresh's
+// settle drop the series debt, the only trigger left for the unlinked file.
+func TestRefreshSeriesEpisodeMetadataState_KeepsSeriesDebtWhenByDateCheckFails(t *testing.T) {
+	h := newFallbackTestHarness()
+	debts := newFakeRefreshDebtRepo()
+	h.service.refreshDebtRepo = debts
+	ctx := context.Background()
+	const seriesID = "series-daily-check-fails"
+	seedAirDateSeries(ctx, t, h, seriesID,
+		&models.Episode{ContentID: "ep-1", SeasonNumber: 1, EpisodeNumber: 1, Title: "Friday", TvdbID: "1001", AirDate: mustDate(t, "2024-05-03")},
+	)
+	item, err := h.itemRepo.GetByID(ctx, seriesID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.EpisodeMetadataIncomplete = true
+	if err := h.itemRepo.Upsert(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	queued := &models.MetadataRefreshDebt{
+		TargetType:    RefreshTargetItem,
+		ContentID:     seriesID,
+		ReasonMask:    RefreshDebtReasonEpisodeIncomplete,
+		Priority:      refreshDebtPriority(RefreshDebtReasonEpisodeIncomplete),
+		AttemptCount:  1,
+		NextRefreshAt: time.Now().Add(24 * time.Hour).Truncate(time.Second),
+	}
+	debts.debts[fakeRefreshDebtKey(RefreshTargetItem, seriesID)] = queued
+	addAirDateFile(h, seriesID, 301, "/media/tv/Daily Show (2024)/Season 01/Daily Show (2024) - 2024-05-06 - Episode.mkv")
+	h.service.episodeRepo = failingAirDateEpisodeRepo{fakeEpisodeRepo: h.episodeRepo}
+
+	if h.service.refreshSeriesEpisodeMetadataState(ctx, seriesID, time.Now()) {
+		t.Error("sweep reported success after the by-date check failed")
+	}
+	item, err = h.itemRepo.GetByID(ctx, seriesID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !item.EpisodeMetadataIncomplete {
+		t.Error("EpisodeMetadataIncomplete cleared after the by-date check failed")
+	}
+	if debt := debts.debts[fakeRefreshDebtKey(RefreshTargetItem, seriesID)]; debt == nil || debt.AttemptCount != 1 ||
+		!debt.NextRefreshAt.Equal(queued.NextRefreshAt) {
+		t.Errorf("series debt = %+v, want it kept as queued", debt)
+	}
+}
+
+// ResetEdits empties a stored season's lockable fields and locks, as
+// catalog.SeasonRepository.ResetEdits does.
+func (r *fakeSeasonRepo) ResetEdits(_ context.Context, contentID string, keepText bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.seasons {
+		if s.ContentID == contentID {
+			if !keepText {
+				s.Title, s.Overview = "", ""
+			}
+			s.AirDate, s.LockedFields = nil, []int{}
+			return nil
+		}
+	}
+	return fmt.Errorf("season %s not found", contentID)
+}
+
+// ResetEdits empties a stored episode's lockable fields and locks, as
+// catalog.EpisodeRepository.ResetEdits does.
+func (r *fakeEpisodeRepo) ResetEdits(_ context.Context, contentID string, keepText bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, ep := range r.episodes {
+		if ep.ContentID == contentID {
+			if !keepText {
+				ep.Title, ep.Overview = "", ""
+			}
+			ep.AirDate, ep.Runtime, ep.LockedFields = nil, 0, []int{}
+			return nil
+		}
+	}
+	return fmt.Errorf("episode %s not found", contentID)
+}

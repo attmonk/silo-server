@@ -1,0 +1,546 @@
+package pluginhost
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/hashicorp/go-hclog"
+	"golang.org/x/time/rate"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/Silo-Server/silo-server/internal/events"
+)
+
+// EventPublisher is the subset of *events.Hub required by RuntimeHostServer.
+// Defined as an interface so tests can supply a fake.
+type EventPublisher interface {
+	Publish(ctx context.Context, env events.Envelope) error
+}
+
+// pluginEventGate is implemented by an EventPublisher that knows whether a
+// plugin event has subscribers (*events.Hub does), so an event nobody
+// subscribes to is not built or published.
+type pluginEventGate interface {
+	PluginEventWanted(event string) bool
+}
+
+// wantsEvent reports whether the publisher could deliver eventName to a
+// subscriber.
+func (s *RuntimeHostServer) wantsEvent(eventName string) bool {
+	gate, ok := s.publisher.(pluginEventGate)
+	return !ok || gate.PluginEventWanted(eventName)
+}
+
+// LibraryRecord is the wire shape for libraries returned to plugins. Mirrors
+// the proto Library message.
+type LibraryRecord struct {
+	ID        string
+	Name      string
+	MediaType string // movie | tv | mixed
+}
+
+// LibraryLister returns libraries visible to a user (or all when userID is "").
+type LibraryLister interface {
+	ListLibraries(ctx context.Context, userID string) ([]LibraryRecord, error)
+}
+
+// LibraryPresenceRecord is a single host catalog match returned by a
+// CatalogPresenceLookup. The plugin sees it as proto MediaPresence.
+type LibraryPresenceRecord struct {
+	ExternalID string
+	MediaID    string
+	LibraryID  string
+	Title      string
+}
+
+// CatalogPresenceLookup answers "which of these external IDs do we already
+// have?" for a batch of IDs. v1 supports provider "tmdb" only; other values
+// should return the empty result without error.
+type CatalogPresenceLookup interface {
+	LookupByExternalIDs(ctx context.Context, provider, mediaType string, ids []string) ([]LibraryPresenceRecord, error)
+}
+
+// InstalledPluginRecord is the host-side shape returned to plugins for peer
+// discovery.
+type InstalledPluginRecord struct {
+	InstallationID int
+	PluginID       string
+	Version        string
+	Enabled        bool
+	Capabilities   []*pluginv1.CapabilityDescriptor
+}
+
+// InstalledPluginLister returns installed plugins and their capability
+// descriptors for RuntimeHost.ListInstalledPlugins.
+type InstalledPluginLister interface {
+	ListInstalledPlugins(ctx context.Context) ([]InstalledPluginRecord, error)
+}
+
+// InstalledPluginListerFunc adapts a plain function to InstalledPluginLister.
+type InstalledPluginListerFunc func(ctx context.Context) ([]InstalledPluginRecord, error)
+
+func (f InstalledPluginListerFunc) ListInstalledPlugins(ctx context.Context) ([]InstalledPluginRecord, error) {
+	return f(ctx)
+}
+
+// GlobalConfigSetter persists a global config entry for a plugin installation.
+type GlobalConfigSetter interface {
+	SetGlobalConfigEntry(ctx context.Context, installationID int, key string, value map[string]any) error
+}
+
+// GlobalConfigSetterFunc adapts a plain function to GlobalConfigSetter.
+type GlobalConfigSetterFunc func(ctx context.Context, installationID int, key string, value map[string]any) error
+
+func (f GlobalConfigSetterFunc) SetGlobalConfigEntry(ctx context.Context, installationID int, key string, value map[string]any) error {
+	return f(ctx, installationID, key, value)
+}
+
+// DefaultPublishEventRatePerSec is the default maximum number of events a
+// plugin may publish per second. It also serves as the burst size so a plugin
+// can fire a short burst at a higher rate before being throttled.
+const DefaultPublishEventRatePerSec = 100
+
+// RuntimeHostServer is the gRPC server that plugins call back into via the
+// go-plugin broker. Each plugin instance gets its own RuntimeHostServer so
+// the pluginID is fixed at construction.
+type RuntimeHostServer struct {
+	pluginv1.UnimplementedRuntimeHostServer
+	publisher EventPublisher
+	libs      LibraryLister
+	catalog   CatalogPresenceLookup
+	pluginID  string
+	limiter   *rate.Limiter
+
+	installedPlugins InstalledPluginLister
+	configSetter     GlobalConfigSetter
+	installationID   int
+
+	hostInfo      HostInfoFunc
+	instanceState InstanceStateStore
+	networkAccess NetworkAccessBroker
+	// ingressToken is the token issued to this process instance; pushes are
+	// accepted only while it is current.
+	ingressToken string
+	// provider is the network_access_provider.v1 slug from the plugin's
+	// manifest; empty for plugins that are not providers.
+	provider string
+	logger   hclog.Logger
+}
+
+// RuntimeHostOptions configures a RuntimeHostServer for one plugin instance.
+type RuntimeHostOptions struct {
+	Publisher          EventPublisher
+	Libraries          LibraryLister
+	Catalog            CatalogPresenceLookup
+	InstalledPlugins   InstalledPluginLister
+	GlobalConfigSetter GlobalConfigSetter
+	HostInfo           HostInfoFunc
+	InstanceState      InstanceStateStore
+	NetworkAccess      NetworkAccessBroker
+	Logger             hclog.Logger
+	// EventRatePerSec caps PublishEvent; <= 0 takes DefaultPublishEventRatePerSec.
+	EventRatePerSec int
+
+	PluginID       string
+	InstallationID int
+	// NetworkAccessProvider is the provider slug the manifest declares, or
+	// empty. Only providers may push network access status.
+	NetworkAccessProvider string
+	// IngressToken is the token issued to this process instance. Status
+	// pushes are accepted only while it is still the installation's current
+	// token.
+	IngressToken string
+}
+
+// NewRuntimeHostServerWithOptions builds the server the host binds for one
+// plugin instance.
+func NewRuntimeHostServerWithOptions(opts RuntimeHostOptions) *RuntimeHostServer {
+	s := NewRuntimeHostServerWithRate(opts.Publisher, opts.Libraries, opts.PluginID, opts.EventRatePerSec)
+	s.catalog = opts.Catalog
+	s.installedPlugins = opts.InstalledPlugins
+	s.configSetter = opts.GlobalConfigSetter
+	s.installationID = opts.InstallationID
+	s.hostInfo = opts.HostInfo
+	s.instanceState = opts.InstanceState
+	s.networkAccess = opts.NetworkAccess
+	s.provider = opts.NetworkAccessProvider
+	s.ingressToken = opts.IngressToken
+	s.logger = opts.Logger
+	if s.logger == nil {
+		s.logger = hclog.NewNullLogger()
+	}
+	return s
+}
+
+// NewRuntimeHostServer constructs a RuntimeHostServer bound to the given
+// pluginID. The pluginID is server-stamped on all published events so plugins
+// cannot forge core event names.
+func NewRuntimeHostServer(publisher EventPublisher, libs LibraryLister, pluginID string) *RuntimeHostServer {
+	return &RuntimeHostServer{
+		publisher: publisher,
+		libs:      libs,
+		pluginID:  pluginID,
+		limiter:   rate.NewLimiter(rate.Limit(DefaultPublishEventRatePerSec), DefaultPublishEventRatePerSec),
+	}
+}
+
+// NewRuntimeHostServerWithRate is like NewRuntimeHostServer but installs a
+// caller-specified rate limit (events/sec, also used as burst). Pass perSec<=0
+// to fall back to DefaultPublishEventRatePerSec.
+func NewRuntimeHostServerWithRate(publisher EventPublisher, libs LibraryLister, pluginID string, perSec int) *RuntimeHostServer {
+	if perSec <= 0 {
+		perSec = DefaultPublishEventRatePerSec
+	}
+	return &RuntimeHostServer{
+		publisher: publisher,
+		libs:      libs,
+		pluginID:  pluginID,
+		limiter:   rate.NewLimiter(rate.Limit(perSec), perSec),
+	}
+}
+
+// NewRuntimeHostServerWithCatalog is like NewRuntimeHostServer but also
+// accepts a CatalogPresenceLookup. Use this when the host can answer
+// CheckMediaPresence; passing nil makes presence queries return empty.
+func NewRuntimeHostServerWithCatalog(publisher EventPublisher, libs LibraryLister, catalog CatalogPresenceLookup, pluginID string) *RuntimeHostServer {
+	s := NewRuntimeHostServer(publisher, libs, pluginID)
+	s.catalog = catalog
+	return s
+}
+
+// NewRuntimeHostServerWithServices is like NewRuntimeHostServerWithCatalog but
+// also enables peer discovery and plugin-owned config persistence.
+func NewRuntimeHostServerWithServices(
+	publisher EventPublisher,
+	libs LibraryLister,
+	catalog CatalogPresenceLookup,
+	installedPlugins InstalledPluginLister,
+	configSetter GlobalConfigSetter,
+	pluginID string,
+	installationID int,
+) *RuntimeHostServer {
+	s := NewRuntimeHostServerWithCatalog(publisher, libs, catalog, pluginID)
+	s.installedPlugins = installedPlugins
+	s.configSetter = configSetter
+	s.installationID = installationID
+	return s
+}
+
+// PublishEvent auto-prefixes the plugin's event name with "plugin.<plugin_id>."
+// and forwards to the EventPublisher on events.ChannelPlugins. The plugin ID
+// is server-stamped (not taken from the request) so plugins cannot forge
+// core event names by crafting a malicious event_name.
+func (s *RuntimeHostServer) PublishEvent(ctx context.Context, req *pluginv1.PublishEventRequest) (*pluginv1.PublishEventResponse, error) {
+	if s.limiter != nil && !s.limiter.Allow() {
+		return nil, fmt.Errorf("rate limit exceeded for plugin %q", s.pluginID)
+	}
+	name := strings.TrimSpace(req.GetEventName())
+	if name == "" {
+		return nil, fmt.Errorf("event_name is required")
+	}
+	if s.pluginID == "" {
+		return nil, fmt.Errorf("server: plugin id not bound")
+	}
+	if s.publisher == nil {
+		return nil, fmt.Errorf("server: event publisher not configured")
+	}
+
+	prefixed := "plugin." + s.pluginID + "." + name
+	if !s.wantsEvent(prefixed) {
+		return &pluginv1.PublishEventResponse{}, nil
+	}
+	var payload json.RawMessage
+	if p := req.GetPayload(); p != nil {
+		raw, err := p.MarshalJSON()
+		if err != nil {
+			return nil, fmt.Errorf("encode payload: %w", err)
+		}
+		payload = raw
+	}
+
+	env := events.Envelope{
+		Channel: events.ChannelPlugins,
+		Event:   prefixed,
+		Data:    payload,
+	}
+	if err := s.publisher.Publish(ctx, env); err != nil {
+		return nil, fmt.Errorf("publish: %w", err)
+	}
+	return &pluginv1.PublishEventResponse{}, nil
+}
+
+// PublishEventTo is like PublishEvent but restricts delivery to subscribers
+// belonging to the target plugin_id.
+func (s *RuntimeHostServer) PublishEventTo(ctx context.Context, req *pluginv1.PublishEventToRequest) (*pluginv1.PublishEventToResponse, error) {
+	if s.limiter != nil && !s.limiter.Allow() {
+		return nil, fmt.Errorf("rate limit exceeded for plugin %q", s.pluginID)
+	}
+	name := strings.TrimSpace(req.GetEventName())
+	if name == "" {
+		return nil, fmt.Errorf("event_name is required")
+	}
+	targetPluginID := strings.TrimSpace(req.GetTargetPluginId())
+	if targetPluginID == "" {
+		return nil, fmt.Errorf("target_plugin_id is required")
+	}
+	if s.pluginID == "" {
+		return nil, fmt.Errorf("server: plugin id not bound")
+	}
+	if s.publisher == nil {
+		return nil, fmt.Errorf("server: event publisher not configured")
+	}
+
+	prefixed := "plugin." + s.pluginID + "." + name
+	if !s.wantsEvent(prefixed) {
+		return &pluginv1.PublishEventToResponse{}, nil
+	}
+	var payload json.RawMessage
+	if p := req.GetPayload(); p != nil {
+		raw, err := p.MarshalJSON()
+		if err != nil {
+			return nil, fmt.Errorf("encode payload: %w", err)
+		}
+		payload = raw
+	}
+
+	env := events.Envelope{
+		Channel:        events.ChannelPlugins,
+		Event:          prefixed,
+		Data:           payload,
+		TargetPluginID: targetPluginID,
+	}
+	if err := s.publisher.Publish(ctx, env); err != nil {
+		return nil, fmt.Errorf("publish: %w", err)
+	}
+	return &pluginv1.PublishEventToResponse{}, nil
+}
+
+// ListLibraries delegates to the LibraryLister, mapping the userID from the
+// request through to the underlying data source.
+func (s *RuntimeHostServer) ListLibraries(ctx context.Context, req *pluginv1.ListLibrariesRequest) (*pluginv1.ListLibrariesResponse, error) {
+	if s.libs == nil {
+		return &pluginv1.ListLibrariesResponse{}, nil
+	}
+	rows, err := s.libs.ListLibraries(ctx, req.GetUserId())
+	if err != nil {
+		return nil, fmt.Errorf("list libraries: %w", err)
+	}
+	resp := &pluginv1.ListLibrariesResponse{Libraries: make([]*pluginv1.Library, 0, len(rows))}
+	for _, r := range rows {
+		resp.Libraries = append(resp.Libraries, &pluginv1.Library{
+			Id:        r.ID,
+			Name:      r.Name,
+			MediaType: r.MediaType,
+		})
+	}
+	return resp, nil
+}
+
+// ListInstalledPlugins returns installed plugins and their advertised
+// capabilities for peer discovery.
+func (s *RuntimeHostServer) ListInstalledPlugins(ctx context.Context, _ *pluginv1.ListInstalledPluginsRequest) (*pluginv1.ListInstalledPluginsResponse, error) {
+	if s.installedPlugins == nil {
+		return &pluginv1.ListInstalledPluginsResponse{}, nil
+	}
+	rows, err := s.installedPlugins.ListInstalledPlugins(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list installed plugins: %w", err)
+	}
+	resp := &pluginv1.ListInstalledPluginsResponse{Plugins: make([]*pluginv1.InstalledPlugin, 0, len(rows))}
+	for _, row := range rows {
+		resp.Plugins = append(resp.Plugins, &pluginv1.InstalledPlugin{
+			InstallationId: int64(row.InstallationID),
+			PluginId:       row.PluginID,
+			Version:        row.Version,
+			Enabled:        row.Enabled,
+			Capabilities:   row.Capabilities,
+		})
+	}
+	return resp, nil
+}
+
+// SetGlobalConfigEntry persists a plugin-owned global config entry for this
+// plugin installation.
+func (s *RuntimeHostServer) SetGlobalConfigEntry(ctx context.Context, req *pluginv1.SetGlobalConfigEntryRequest) (*pluginv1.SetGlobalConfigEntryResponse, error) {
+	key := strings.TrimSpace(req.GetKey())
+	if key == "" {
+		return nil, fmt.Errorf("key is required")
+	}
+	if s.installationID == 0 {
+		return nil, fmt.Errorf("server: installation id not bound")
+	}
+	if s.configSetter == nil {
+		return nil, fmt.Errorf("server: config setter not configured")
+	}
+	value := map[string]any{}
+	if req.GetValue() != nil {
+		value = req.GetValue().AsMap()
+	}
+	if err := s.configSetter.SetGlobalConfigEntry(ctx, s.installationID, key, value); err != nil {
+		return nil, fmt.Errorf("set global config entry: %w", err)
+	}
+	return &pluginv1.SetGlobalConfigEntryResponse{}, nil
+}
+
+// CheckMediaPresence delegates to the configured CatalogPresenceLookup.
+// Returns the empty list when no catalog is configured.
+func (s *RuntimeHostServer) CheckMediaPresence(ctx context.Context, req *pluginv1.CheckMediaPresenceRequest) (*pluginv1.CheckMediaPresenceResponse, error) {
+	if len(req.GetIds()) > 100 {
+		return nil, fmt.Errorf("ids: too many (%d), max 100", len(req.GetIds()))
+	}
+	if s.catalog == nil {
+		return &pluginv1.CheckMediaPresenceResponse{}, nil
+	}
+	rows, err := s.catalog.LookupByExternalIDs(ctx, req.GetProvider(), req.GetMediaType(), req.GetIds())
+	if err != nil {
+		return nil, fmt.Errorf("lookup: %w", err)
+	}
+	resp := &pluginv1.CheckMediaPresenceResponse{
+		Present: make([]*pluginv1.MediaPresence, 0, len(rows)),
+	}
+	for _, r := range rows {
+		resp.Present = append(resp.Present, &pluginv1.MediaPresence{
+			ExternalId: r.ExternalID,
+			MediaId:    r.MediaID,
+			LibraryId:  r.LibraryID,
+			Title:      r.Title,
+		})
+	}
+	return resp, nil
+}
+
+// GetHostInfo reports the hosting process: public and loopback base URLs,
+// role, name, node id, the listeners a network access provider should expose
+// and, for providers, the ingress token issued for this process instance.
+func (s *RuntimeHostServer) GetHostInfo(ctx context.Context, _ *pluginv1.GetHostInfoRequest) (*pluginv1.GetHostInfoResponse, error) {
+	if s.hostInfo == nil {
+		return nil, status.Error(codes.Unimplemented, "host info is not configured")
+	}
+	info, err := s.hostInfo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("host info: %w", err)
+	}
+	resp := &pluginv1.GetHostInfoResponse{
+		PublicBaseUrl: strings.TrimRight(info.PublicBaseURL, "/"),
+		HostRole:      info.Role,
+		HostName:      info.Name,
+		NodeId:        info.NodeID,
+	}
+	if resp.PublicBaseUrl != "" && info.PluginContentPrefix != "" && s.installationID > 0 {
+		resp.PluginProxyBaseUrl = resp.PublicBaseUrl + info.PluginContentPrefix + "/plugins/" + strconv.Itoa(s.installationID)
+	}
+	for _, listener := range info.Listeners {
+		if listener.Name == ListenerAPI && listener.Address != "" {
+			resp.InternalBaseUrl = "http://" + listener.Address
+		}
+		resp.Listeners = append(resp.Listeners, &pluginv1.HostListener{
+			Name:        listener.Name,
+			Address:     listener.Address,
+			DefaultPort: int32(listener.DefaultPort),
+		})
+	}
+	if s.provider != "" && s.networkAccess != nil && s.installationID > 0 {
+		if token, ok := s.networkAccess.IngressToken(s.installationID); ok {
+			resp.IngressToken = token
+		}
+	}
+	return resp, nil
+}
+
+// ReadInstanceState returns one key of the instance's private state with its
+// version. The scope is fixed by the store the host configured for this
+// process. Versioned is always set: this host honors expected_version.
+func (s *RuntimeHostServer) ReadInstanceState(ctx context.Context, req *pluginv1.ReadInstanceStateRequest) (*pluginv1.ReadInstanceStateResponse, error) {
+	if err := ValidateInstanceStateKey(req.GetKey()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if s.instanceState == nil || s.installationID <= 0 {
+		return nil, status.Error(codes.FailedPrecondition, ErrInstanceStateUnavailable.Error())
+	}
+	value, version, err := s.instanceState.ReadInstanceState(ctx, s.installationID, req.GetKey())
+	if err != nil {
+		return nil, instanceStateError(err)
+	}
+	if version == 0 {
+		return &pluginv1.ReadInstanceStateResponse{Versioned: true}, nil
+	}
+	return &pluginv1.ReadInstanceStateResponse{Value: value, Found: true, Version: version, Versioned: true}, nil
+}
+
+// WriteInstanceState stores one key of the instance's private state. With
+// expected_version set it writes only while the key is at that version and
+// answers Aborted otherwise.
+func (s *RuntimeHostServer) WriteInstanceState(ctx context.Context, req *pluginv1.WriteInstanceStateRequest) (*pluginv1.WriteInstanceStateResponse, error) {
+	if err := ValidateInstanceStateKey(req.GetKey()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if len(req.GetValue()) > InstanceStateMaxValueBytes {
+		return nil, status.Error(codes.InvalidArgument, ErrInstanceStateValueTooLarge.Error())
+	}
+	if s.instanceState == nil || s.installationID <= 0 {
+		return nil, status.Error(codes.FailedPrecondition, ErrInstanceStateUnavailable.Error())
+	}
+	version, err := s.instanceState.WriteInstanceState(ctx, s.installationID, req.GetKey(), req.GetValue(), req.ExpectedVersion)
+	if err != nil {
+		return nil, instanceStateError(err)
+	}
+	return &pluginv1.WriteInstanceStateResponse{Version: version}, nil
+}
+
+func instanceStateError(err error) error {
+	switch {
+	case errors.Is(err, ErrInstanceStateKeyTooLong), errors.Is(err, ErrInstanceStateValueTooLarge):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, ErrInstanceStateTooManyKeys):
+		return status.Error(codes.ResourceExhausted, err.Error())
+	case errors.Is(err, ErrInstanceStateVersionConflict):
+		return status.Error(codes.Aborted, err.Error())
+	case errors.Is(err, ErrInstanceStateUnavailable):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	return fmt.Errorf("instance state: %w", err)
+}
+
+// ReportNetworkAccessStatus records a provider's status push in the host's
+// status cache. Only state transitions are logged; auth_url never is.
+func (s *RuntimeHostServer) ReportNetworkAccessStatus(_ context.Context, req *pluginv1.ReportNetworkAccessStatusRequest) (*pluginv1.ReportNetworkAccessStatusResponse, error) {
+	if s.provider == "" {
+		return nil, status.Error(codes.PermissionDenied, "plugin does not declare network_access_provider.v1")
+	}
+	if req.GetStatus() == nil {
+		return nil, status.Error(codes.InvalidArgument, "status is required")
+	}
+	if s.networkAccess == nil || s.installationID <= 0 {
+		// Config test-runs and hosts without netaccess wiring accept and drop
+		// the push so a provider does not fail on it.
+		return &pluginv1.ReportNetworkAccessStatusResponse{}, nil
+	}
+	entry := NetworkAccessStatusFromProto(s.installationID, s.provider, req.GetStatus())
+	previous, changed, accepted := s.networkAccess.ReportFor(s.installationID, s.ingressToken, entry)
+	if !accepted {
+		// This process's token was revoked while the push was in flight:
+		// the host already stopped or replaced it. Its status must not
+		// overwrite whatever the replacement reports.
+		s.logger.Debug("network access status from a revoked process instance dropped",
+			"plugin_id", s.pluginID, "installation_id", s.installationID, "provider", s.provider)
+		return &pluginv1.ReportNetworkAccessStatusResponse{}, nil
+	}
+	if changed {
+		s.logger.Info("network access provider state changed",
+			"plugin_id", s.pluginID,
+			"installation_id", s.installationID,
+			"provider", s.provider,
+			"from", previous.State,
+			"to", entry.State,
+			"origin", entry.Origin,
+			"error", entry.Error,
+		)
+	}
+	return &pluginv1.ReportNetworkAccessStatusResponse{}, nil
+}

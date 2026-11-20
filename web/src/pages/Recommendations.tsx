@@ -1,0 +1,219 @@
+import { useDiscover, useTasteProfile } from "@/hooks/queries/recommendations";
+import type { DiscoverRow } from "@/api/v2/recommendations";
+import MediaCarousel from "@/components/MediaCarousel";
+import SectionItemCard from "@/components/SectionItemCard";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Sparkles, RefreshCw } from "lucide-react";
+import { useUICustomization } from "@/hooks/useUICustomization";
+import { useSectionTitle } from "@/lib/sectionTitle";
+import { carouselCardWidthClasses } from "@/lib/uiCustomization";
+import { useT, type MessageKey } from "@/i18n";
+
+/** Rows built from the profile's own history; the others are shared rows. */
+const PERSONAL_ROW_TYPES = new Set(["cluster", "similar_users_liked"]);
+
+/**
+ * The page's subtitle. A profile with no personal row yet sees the default
+ * rows, so it is not told they come from its history.
+ */
+function pageSubtitle(rows: DiscoverRow[]): MessageKey {
+  return rows.some((row) => PERSONAL_ROW_TYPES.has(row.type))
+    ? "web.recommendations.subtitlePersonal"
+    : "web.recommendations.subtitleDefault";
+}
+
+function buildSectionHref(row: DiscoverRow): string | undefined {
+  if (!row.section_kind) return undefined;
+  const base = `/recommendations/section/${encodeURIComponent(row.section_kind)}`;
+  return row.section_key ? `${base}/${encodeURIComponent(row.section_key)}` : base;
+}
+
+function TasteProfileCard({
+  profile,
+  isLoading,
+}: {
+  profile:
+    | {
+        top_genres: string[];
+        favorite_directors: string[];
+      }
+    | undefined;
+  isLoading: boolean;
+}) {
+  const t = useT();
+  if (isLoading) {
+    return (
+      <div className="glass-subtle space-y-3 rounded-xl p-5">
+        <Skeleton className="h-5 w-32 rounded" />
+        <Skeleton className="h-4 w-48 rounded" />
+      </div>
+    );
+  }
+
+  if (!profile || (profile.top_genres.length === 0 && profile.favorite_directors.length === 0)) {
+    return null;
+  }
+
+  return (
+    <div className="glass-subtle space-y-4 rounded-xl p-5">
+      <h2 className="text-base font-semibold">{t("web.recommendations.tasteProfile")}</h2>
+
+      {profile.top_genres.length > 0 && (
+        <div className="space-y-1.5">
+          <p className="text-muted-foreground text-xs font-medium tracking-wide uppercase">
+            {t("web.recommendations.topGenres")}
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {profile.top_genres.map((genre) => (
+              <span
+                key={genre}
+                className="bg-accent text-foreground rounded-full px-2.5 py-0.5 text-xs font-medium"
+              >
+                {genre}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {profile.favorite_directors.length > 0 && (
+        <div className="space-y-1.5">
+          <p className="text-muted-foreground text-xs font-medium tracking-wide uppercase">
+            {t("web.recommendations.favoriteDirectors")}
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {profile.favorite_directors.map((director) => (
+              <span
+                key={director}
+                className="border-border text-foreground rounded-full border px-2.5 py-0.5 text-xs"
+              >
+                {director}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DiscoverEmptyState() {
+  const t = useT();
+  return (
+    <div className="flex flex-col items-center justify-center gap-3 py-24 text-center">
+      <Sparkles className="text-muted-foreground/50 h-10 w-10" />
+      <div className="space-y-1">
+        <p className="text-sm font-medium">{t("web.recommendations.emptyTitle")}</p>
+        <p className="text-muted-foreground max-w-sm text-xs">
+          {t("web.recommendations.emptyBody")}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function DiscoverErrorState({ onRetry }: { onRetry: () => void }) {
+  const t = useT();
+  return (
+    <div className="flex flex-col items-center justify-center gap-4 py-24 text-center">
+      <p className="text-muted-foreground text-sm">{t("web.recommendations.loadFailed")}</p>
+      <button
+        onClick={onRetry}
+        className="text-primary hover:text-primary/80 inline-flex items-center gap-2 text-sm font-medium"
+      >
+        <RefreshCw className="h-4 w-4" />
+        {t("common.retry")}
+      </button>
+    </div>
+  );
+}
+
+function DiscoverSkeletons({ posterWidthClasses }: { posterWidthClasses: string }) {
+  return (
+    <div className="space-y-10 pt-2">
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div key={i} className="space-y-5">
+          <div className="px-4 sm:px-6 lg:px-10 xl:px-12">
+            <Skeleton className="h-6 w-48 rounded" />
+          </div>
+          <div className="flex gap-4 overflow-hidden px-4 sm:px-6 lg:gap-5 lg:px-10 xl:px-12">
+            {Array.from({ length: 12 }).map((_, j) => (
+              <div key={j} className={posterWidthClasses}>
+                <Skeleton className="aspect-[2/3] w-full rounded-xl" />
+                <Skeleton className="mt-3 h-4 w-3/4 rounded" />
+                <Skeleton className="mt-1.5 h-3 w-1/2 rounded" />
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export default function Recommendations() {
+  // The viewer-facing name, as on the native apps; admin and setup screens
+  // keep "Recommendations" for the server feature.
+  const t = useT();
+  const sectionTitle = useSectionTitle();
+  useDocumentTitle(t("web.recommendations.title"));
+
+  const tasteProfileQuery = useTasteProfile();
+  const { data, isLoading, isError, refetch } = useDiscover();
+  const { prefs: overlayPrefs, quickActionMode } = useOverlayPrefs();
+  const { cardPresentation } = useUICustomization();
+  const posterWidthClasses = carouselCardWidthClasses(cardPresentation.poster_size);
+
+  const rows = data?.rows ?? [];
+
+  return (
+    <div className="space-y-2 pb-10">
+      {/* Header */}
+      <div className="px-4 pt-6 pb-4 sm:px-6 lg:px-10 xl:px-12">
+        <div className="flex flex-col gap-6 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h1 className="text-foreground text-2xl font-bold tracking-tight sm:text-3xl">
+              {t("web.recommendations.title")}
+            </h1>
+            {rows.length > 0 && (
+              <p className="text-muted-foreground mt-1 text-sm">{t(pageSubtitle(rows))}</p>
+            )}
+          </div>
+          <TasteProfileCard
+            profile={tasteProfileQuery.data}
+            isLoading={tasteProfileQuery.isLoading}
+          />
+        </div>
+      </div>
+
+      {/* Content */}
+      {isLoading ? (
+        <DiscoverSkeletons posterWidthClasses={posterWidthClasses} />
+      ) : isError ? (
+        <DiscoverErrorState onRetry={() => refetch()} />
+      ) : rows.length === 0 ? (
+        <DiscoverEmptyState />
+      ) : (
+        rows.map((row, i) => (
+          <MediaCarousel
+            key={`${row.type}-${i}`}
+            title={sectionTitle({ ...row, title: row.label })}
+            titleHref={buildSectionHref(row)}
+          >
+            {row.items.map((item) => (
+              <div key={item.content_id} className={posterWidthClasses} role="listitem">
+                <SectionItemCard
+                  item={item}
+                  overlayPrefs={overlayPrefs}
+                  quickActionMode={quickActionMode}
+                />
+              </div>
+            ))}
+          </MediaCarousel>
+        ))
+      )}
+    </div>
+  );
+}

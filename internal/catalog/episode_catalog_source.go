@@ -1,0 +1,211 @@
+package catalog
+
+import (
+	"fmt"
+	"strings"
+)
+
+// episodeCatalogSelectBody is the hand-written subquery that hydrates episode
+// rows for the "episode" media scope, aliased "mi" so the shared catalog
+// projection can read it. The `si.type = 'series'` predicate is load-bearing,
+// not cosmetic: episode_libraries (and thus episode_catalog_entries) is
+// populated from every media_files row with a non-null episode_id, including
+// podcast episodes (media_items.type = 'podcast'). Without this guard those
+// non-TV episodes would hydrate into episode-scoped results, e.g. when a
+// library-scoped episode query happens to resolve a podcast/audiobook folder.
+// Restricting hydration to series-parented episodes keeps the episode catalog
+// to genuine TV episodes on every surface (native and Jellyfin-compat). Real
+// TV episodes always hang off a type='series' parent, so this never
+// over-filters legitimate episode sections.
+const episodeCatalogSelectBody = `(
+	SELECT
+		e.content_id,
+		e.air_date AS episode_air_date,
+		e.series_id AS episode_series_id,
+		LOWER(COALESCE(NULLIF(BTRIM(si.sort_title), ''), si.title)) AS episode_series_sort_key,
+		e.season_number AS episode_season_number,
+		e.episode_number,
+		'episode'::text AS type,
+		COALESCE(NULLIF(BTRIM(e.title), ''), 'Episode ' || e.episode_number::text) AS title,
+		COALESCE(NULLIF(BTRIM(e.sort_title), ''), NULLIF(BTRIM(e.title), ''), 'Episode ' || e.episode_number::text) AS sort_title,
+		LOWER(COALESCE(NULLIF(BTRIM(e.sort_title), ''), NULLIF(BTRIM(e.title), ''), 'Episode ' || e.episode_number::text)) AS sort_key,
+		COALESCE(NULLIF(BTRIM(e.default_metadata_language), ''), COALESCE(si.default_metadata_language, '')) AS default_metadata_language,
+		''::text AS original_title,
+		COALESCE(si.year, EXTRACT(YEAR FROM e.air_date)::integer, 0) AS year,
+		COALESCE(si.genres, '{}'::text[]) AS genres,
+		COALESCE(si.content_rating, '') AS content_rating,
+		si.content_rating_age,
+		si.advisory_age,
+		COALESCE(si.advisory_source, '') AS advisory_source,
+		COALESCE(NULLIF(e.runtime, 0), COALESCE(si.runtime, 0)) AS runtime,
+		COALESCE(e.overview, '') AS overview,
+		''::text AS tagline,
+		e.rating_imdb,
+		e.rating_tmdb,
+		NULL::integer AS rating_rt_critic,
+		NULL::integer AS rating_rt_audience,
+		COALESCE(e.imdb_id, '') AS imdb_id,
+		COALESCE(e.tmdb_id, '') AS tmdb_id,
+		COALESCE(e.tvdb_id, '') AS tvdb_id,
+		COALESCE(NULLIF(s.poster_path, ''), NULLIF(si.poster_path, ''), NULLIF(e.still_path, ''), '') AS poster_path,
+		''::text AS poster_source_path,
+		COALESCE(NULLIF(s.poster_thumbhash, ''), NULLIF(si.poster_thumbhash, ''), NULLIF(e.still_thumbhash, ''), '') AS poster_thumbhash,
+		COALESCE(si.backdrop_path, '') AS backdrop_path,
+		COALESCE(si.backdrop_source_path, '') AS backdrop_source_path,
+		COALESCE(si.backdrop_thumbhash, '') AS backdrop_thumbhash,
+		COALESCE(si.logo_path, '') AS logo_path,
+		COALESCE(si.logo_source_path, '') AS logo_source_path,
+		''::text AS banner_path,
+		''::text AS banner_source_path,
+		''::text AS banner_thumbhash,
+		''::text AS thumb_path,
+		''::text AS thumb_source_path,
+		''::text AS thumb_thumbhash,
+		''::text AS clearart_path,
+		''::text AS clearart_source_path,
+		''::text AS disc_path,
+		''::text AS disc_source_path,
+		COALESCE(e.metadata_s3_path, '') AS metadata_s3_path,
+		COALESCE(e.metadata_etag, '') AS metadata_etag,
+		NULL::integer AS season_count,
+		COALESCE(si.studios, '{}'::text[]) AS studios,
+		COALESCE(si.networks, '{}'::text[]) AS networks,
+		COALESCE(si.countries, '{}'::text[]) AS countries,
+		COALESCE(si.keywords, '{}'::text[]) AS keywords,
+		COALESCE(si.original_language, '') AS original_language,
+		CASE WHEN e.air_date IS NULL THEN NULL ELSE e.air_date::text END AS release_date,
+		NULL::date AS digital_release_date,
+		NULL::date AS physical_release_date,
+		NULL::text AS first_air_date,
+		NULL::text AS last_air_date,
+		e.air_date AS last_air_date_at,
+		e.air_date AS latest_available_episode_air_date_at,
+		NULL::timestamptz AS latest_episode_added_at,
+		si.air_time,
+		si.air_timezone,
+		COALESCE(si.show_status, '') AS show_status,
+		si.matched_at,
+		si.last_refreshed,
+		si.refresh_failures,
+		si.episode_metadata_incomplete,
+		si.episode_metadata_last_checked_at,
+		COALESCE(si.locked_fields, '{}'::integer[]) AS locked_fields,
+		COALESCE(NULLIF(BTRIM(si.status), ''), 'matched') AS status,
+		e.created_at,
+		e.updated_at
+	FROM episodes e
+	JOIN media_items si ON si.content_id = e.series_id
+	LEFT JOIN seasons s ON s.content_id = e.season_id
+	WHERE (%s)
+	  AND si.type = 'series'
+) mi`
+
+// episodeCatalogSeriesParentGuard keeps entry pages and totals restricted to
+// TV episodes, matching the hydration query. Membership and episode triggers
+// maintain ece.series_id in the same transaction, including reparenting, so
+// checking the parent directly avoids another episode lookup for every entry.
+const episodeCatalogSeriesParentGuard = `EXISTS (
+		SELECT 1
+		FROM media_items si
+		WHERE si.content_id = ece.series_id
+		  AND si.type = 'series'
+	)`
+
+const episodeCatalogActiveLibraryExists = `EXISTS (
+		SELECT 1
+		FROM episode_libraries el
+		WHERE el.episode_id = e.content_id
+	)`
+
+var episodeCatalogBaseRelation = fmt.Sprintf(episodeCatalogSelectBody, episodeCatalogActiveLibraryExists)
+
+func isEpisodeCatalogScope(scope string) bool {
+	return scope == "episode"
+}
+
+// mediaItemsBaseRelation is the catalog's default base relation.
+const mediaItemsBaseRelation = "media_items mi"
+
+func catalogBaseRelationForScope(scope string) string {
+	if isEpisodeCatalogScope(scope) {
+		return episodeCatalogBaseRelation
+	}
+	return mediaItemsBaseRelation
+}
+
+func episodeCatalogBaseRelationForLibraries(
+	allowedLibraryIDs []int,
+	disabledLibraryIDs []int,
+	argIdx int,
+) (string, []any, bool) {
+	if len(allowedLibraryIDs) == 0 && len(disabledLibraryIDs) == 0 {
+		return episodeCatalogBaseRelation, nil, false
+	}
+
+	var libraryPredicates []string
+	args := make([]any, 0, len(allowedLibraryIDs)+len(disabledLibraryIDs))
+
+	if len(allowedLibraryIDs) > 0 {
+		libraryPredicates = append(libraryPredicates, fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM episode_libraries el_scope_in
+		WHERE el_scope_in.episode_id = e.content_id
+		  AND el_scope_in.media_folder_id = ANY($%d)
+	)`, argIdx))
+		args = append(args, allowedLibraryIDs)
+		argIdx++
+	} else if len(disabledLibraryIDs) > 0 {
+		libraryPredicates = append(libraryPredicates, episodeCatalogActiveLibraryExists)
+	}
+
+	if len(disabledLibraryIDs) > 0 {
+		libraryPredicates = append(libraryPredicates, fmt.Sprintf(`NOT EXISTS (
+		SELECT 1
+		FROM episode_libraries el_scope_out
+		WHERE el_scope_out.episode_id = e.content_id
+		  AND el_scope_out.media_folder_id = ANY($%d)
+	)`, argIdx))
+		args = append(args, disabledLibraryIDs)
+		argIdx++
+	}
+
+	parentAccess := AccessFilter{DisabledLibraryIDs: disabledLibraryIDs}
+	if len(allowedLibraryIDs) > 0 {
+		parentAccess.AllowedLibraryIDs = allowedLibraryIDs
+	}
+	appendLibraryAccessConditions("e.series_id", parentAccess, &libraryPredicates, &args, &argIdx)
+
+	relation := fmt.Sprintf(
+		episodeCatalogSelectBody,
+		strings.Join(libraryPredicates, "\n\tAND "),
+	)
+	return relation, args, true
+}
+
+func catalogLibraryContentExprForScope(scope, alias string) string {
+	if isEpisodeCatalogScope(scope) {
+		return alias + ".content_id"
+	}
+	return alias + ".content_id"
+}
+
+func catalogLibraryMembershipTableAndKeyForScope(scope string) (string, string) {
+	if isEpisodeCatalogScope(scope) {
+		return "episode_libraries", "episode_id"
+	}
+	return "media_item_libraries", "content_id"
+}
+
+func catalogMediaFileJoinConditionForScope(scope, mediaFileAlias, itemAlias string) string {
+	if isEpisodeCatalogScope(scope) {
+		return mediaFileAlias + ".episode_id = " + itemAlias + ".content_id"
+	}
+	return mediaFileAlias + ".content_id = " + itemAlias + ".content_id"
+}
+
+func catalogMediaFileGroupExprForScope(scope, mediaFileAlias string) string {
+	if isEpisodeCatalogScope(scope) {
+		return mediaFileAlias + ".episode_id"
+	}
+	return mediaFileAlias + ".content_id"
+}

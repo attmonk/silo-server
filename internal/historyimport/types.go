@@ -1,0 +1,401 @@
+package historyimport
+
+import "time"
+
+const (
+	SourceTypeEmby     = "emby"
+	SourceTypeJellyfin = "jellyfin"
+	SourceTypePlex     = "plex"
+
+	ConnectionModeConnect    = "connect"
+	ConnectionModeCustom     = "custom"
+	ConnectionModePredefined = "predefined"
+	ConnectionModePlexOAuth  = "plex_oauth"
+	ConnectionModeAdminToken = "admin_token"
+
+	RunStatusQueued    = "queued"
+	RunStatusRunning   = "running"
+	RunStatusCompleted = "completed"
+	RunStatusFailed    = "failed"
+	RunStatusCancelled = "cancelled"
+
+	KindMovie   = "movie"
+	KindSeries  = "series"
+	KindSeason  = "season"
+	KindEpisode = "episode"
+)
+
+const (
+	connectSessionTTL      = 30 * time.Minute
+	maxStoredWarnings      = 20
+	maxUnmatchedSamples    = 10
+	maxUnmatchedLogSamples = 40
+	connectApplicationName = "Silo/1.0.0"
+)
+
+// Source is an admin-configured external media server used as an import source.
+type Source struct {
+	Revision      int64     `json:"-"`
+	ID            int       `json:"id"`
+	Name          string    `json:"name"`
+	SourceType    string    `json:"source_type"`
+	BaseURL       string    `json:"base_url,omitempty"`
+	SystemID      string    `json:"system_id,omitempty"`
+	Enabled       bool      `json:"enabled"`
+	SortOrder     int       `json:"sort_order"`
+	HasAdminToken bool      `json:"has_admin_token"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type ConnectServer struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	SystemID     string `json:"system_id,omitempty"`
+	URL          string `json:"url,omitempty"`
+	LocalAddress string `json:"local_address,omitempty"`
+	AccessKey    string `json:"access_key,omitempty"`
+	HasRemoteURL bool   `json:"has_remote_url"`
+	HasLocalURL  bool   `json:"has_local_address"`
+}
+
+type ConnectServerResponse struct {
+	ServerID        string `json:"server_id"`
+	Name            string `json:"name"`
+	SystemID        string `json:"system_id,omitempty"`
+	HasRemoteURL    bool   `json:"has_remote_url"`
+	HasLocalAddress bool   `json:"has_local_address"`
+}
+
+type ConnectSession struct {
+	ID                 string          `json:"connect_session_id"`
+	UserID             int             `json:"-"`
+	ConnectUserID      string          `json:"-"`
+	ConnectAccessToken string          `json:"-"`
+	Servers            []ConnectServer `json:"servers"`
+	ExpiresAt          time.Time       `json:"expires_at"`
+	ConsumedAt         *time.Time      `json:"consumed_at,omitempty"`
+	CreatedAt          time.Time       `json:"created_at"`
+	UpdatedAt          time.Time       `json:"updated_at"`
+}
+
+type ConnectSessionLoginResult struct {
+	ConnectSessionID string                  `json:"connect_session_id"`
+	Servers          []ConnectServerResponse `json:"servers"`
+	ExpiresAt        time.Time               `json:"expires_at"`
+}
+
+type PlexServer struct {
+	Name             string `json:"name"`
+	ClientIdentifier string `json:"client_identifier"`
+	AccessToken      string `json:"access_token"`
+	RemoteURL        string `json:"remote_url"`
+	LocalURL         string `json:"local_url"`
+	// ConnectionURLs is every address plex.tv advertised for this server, in
+	// the order it advertised them. RemoteURL and LocalURL are picked out of
+	// this same list. Sessions persisted before this field existed decode with
+	// it empty, so those two remain the fallback.
+	ConnectionURLs []string `json:"connection_urls,omitempty"`
+	Owned          bool     `json:"owned"`
+	HasRemoteURL   bool     `json:"has_remote_url"`
+	HasLocalURL    bool     `json:"has_local_url"`
+}
+
+type PlexSession struct {
+	ID         string       `json:"plex_session_id"`
+	UserID     int          `json:"-"`
+	PinID      string       `json:"-"`
+	PinCode    string       `json:"-"`
+	AuthToken  string       `json:"-"`
+	Servers    []PlexServer `json:"servers,omitempty"`
+	ExpiresAt  time.Time    `json:"expires_at"`
+	ConsumedAt *time.Time   `json:"consumed_at,omitempty"`
+	CreatedAt  time.Time    `json:"created_at"`
+	UpdatedAt  time.Time    `json:"updated_at"`
+}
+
+type PlexPinResponse struct {
+	SessionID string    `json:"session_id"`
+	PinCode   string    `json:"pin_code"`
+	AuthURL   string    `json:"auth_url"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type PlexCheckRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+type PlexCheckResponse struct {
+	Authenticated bool               `json:"authenticated"`
+	Servers       []PlexServerPublic `json:"servers,omitempty"`
+}
+
+type PlexServerPublic struct {
+	Name             string `json:"name"`
+	ClientIdentifier string `json:"client_identifier"`
+	Owned            bool   `json:"owned"`
+	HasRemoteURL     bool   `json:"has_remote_url"`
+	HasLocalURL      bool   `json:"has_local_url"`
+}
+
+// Run represents one history import execution.
+type Run struct {
+	CancelRequested   bool              `json:"-"`
+	ID                string            `json:"id"`
+	UserID            int               `json:"user_id"`
+	ProfileID         string            `json:"profile_id"`
+	SourceType        string            `json:"source_type"`
+	ConnectionMode    string            `json:"connection_mode"`
+	Status            string            `json:"status"`
+	MappingID         *int              `json:"mapping_id,omitempty"`
+	Fetched           int               `json:"fetched"`
+	Matched           int               `json:"matched"`
+	Unmatched         int               `json:"unmatched"`
+	ProgressUpdated   int               `json:"progress_updated"`
+	HistoryCreated    int               `json:"history_created"`
+	WatchlistAdded    int               `json:"watchlist_added"`
+	FavoritesImported int               `json:"favorites_imported"`
+	Skipped           int               `json:"skipped"`
+	Warnings          []string          `json:"warnings"`
+	UnmatchedSamples  []UnmatchedSample `json:"unmatched_samples"`
+	ErrorMessage      string            `json:"error_message,omitempty"`
+	CreatedAt         time.Time         `json:"created_at"`
+	StartedAt         *time.Time        `json:"started_at,omitempty"`
+	CompletedAt       *time.Time        `json:"completed_at,omitempty"`
+	// PlayedSince is the lookback cutoff an admin run was queued with; nil
+	// reads the full history. The runner reads it and /api/v2 admin run
+	// responses show it; v1 does not.
+	PlayedSince *time.Time `json:"-"`
+}
+
+// AdminRunOptions shapes an admin-queued run. The zero value is a full import.
+type AdminRunOptions struct {
+	// PlayedSince limits the played-history read to items last played at or
+	// after it. Only Jellyfin sources support it.
+	PlayedSince *time.Time
+}
+
+type UnmatchedSample struct {
+	Kind   string `json:"kind"`
+	Title  string `json:"title"`
+	Year   int    `json:"year,omitempty"`
+	Reason string `json:"reason"`
+}
+
+type Record struct {
+	ExternalID      string
+	Kind            string
+	Title           string
+	Year            int
+	IMDbID          string
+	TMDBID          string
+	TVDBID          string
+	SeriesTitle     string
+	SeriesYear      int
+	SeriesIMDbID    string
+	SeriesTMDBID    string
+	SeriesTVDBID    string
+	SeasonNumber    int
+	EpisodeNumber   int
+	Played          bool
+	PlayCount       int
+	LastPlayedAt    *time.Time
+	PositionSeconds float64
+	DurationSeconds float64
+	// AllowedLibraryIDs limits which episodes a whole-series or whole-season
+	// marker expands to (MatchLeaves): those in these libraries, with their
+	// series in one too. Nil means every library; empty means none.
+	AllowedLibraryIDs []int
+	// Watchlisted marks an entry from the source account's watchlist: the
+	// matched item is added to the importing profile's watchlist instead of
+	// receiving watch state.
+	Watchlisted bool
+	// FavoriteOnly prevents a favorite with no played/resumable counterpart
+	// from creating an empty progress row. PreferTMDB avoids stale secondary
+	// TVDB IDs winning over Emby's primary TMDB identity for favorite series.
+	Favorite     bool
+	FavoriteOnly bool
+	PreferTMDB   bool
+	// HiddenFromResume marks an in-progress item the user hid from the
+	// source's Continue Watching. Its progress is still imported, and the
+	// profile gets a matching Continue Watching dismissal. A show between
+	// episodes has no such item; see ContinueWatchingRow.
+	HiddenFromResume bool
+	// RepeatOfWatch marks a favorite whose item was already delivered as a
+	// watch record, so one item counts once in the run's totals.
+	RepeatOfWatch bool
+	// SourceSeriesID is the source's own ID of an episode's series, which
+	// ties the episode to the source's Continue Watching row.
+	SourceSeriesID string
+	UpdatedAt      time.Time
+}
+
+// ContinueWatchingRow is the shows a source's own Continue Watching row lists.
+// A show the import brought into the profile's Continue Watching or Next Up
+// that the row leaves out was hidden at the source, and is dropped (see
+// Service.reconcileContinueWatching).
+type ContinueWatchingRow struct {
+	// SourceSeriesIDs are the source's IDs of the listed shows.
+	SourceSeriesIDs map[string]bool
+	// Series identifies the listed shows by provider ID (Kind KindSeries),
+	// so a show the source holds under several IDs, such as one per library,
+	// counts as listed whichever copy the user watched.
+	Series []Record
+	// IncludesNextUp reports that the row lists at least one unstarted
+	// episode, so it shows shows between episodes. Without it only shows
+	// with an episode in progress can be judged from the row.
+	IncludesNextUp bool
+	// UnfinishedSourceSeries are the source's IDs of shows it counts as
+	// having episodes left to watch. A finished show is missing from the row
+	// without having been hidden.
+	UnfinishedSourceSeries map[string]bool
+}
+
+// ContinueWatchingRowReporter is a Provider that can report its source's
+// Continue Watching row after Fetch. ok is false when the row was not read
+// reliably; nothing is hidden then.
+type ContinueWatchingRowReporter interface {
+	ContinueWatchingRow() (row ContinueWatchingRow, ok bool)
+}
+
+type Match struct {
+	MediaItemID string
+	Kind        string
+	Title       string
+	Year        int
+}
+
+type CreateRunInput struct {
+	ProfileID        string `json:"profile_id"`
+	Source           string `json:"source"`
+	ConnectSessionID string `json:"connect_session_id,omitempty"`
+	ServerID         string `json:"server_id,omitempty"`
+	SourceID         int    `json:"source_id,omitempty"`
+	ServerURL        string `json:"server_url,omitempty"`
+	Username         string `json:"username,omitempty"`
+	Password         string `json:"password,omitempty"`
+	JellyfinBaseURL  string `json:"jellyfin_base_url,omitempty"`
+	JellyfinUsername string `json:"jellyfin_username,omitempty"`
+	JellyfinPassword string `json:"jellyfin_password,omitempty"`
+	PlexSessionID    string `json:"plex_session_id,omitempty"`
+	PlexServerID     string `json:"plex_server_id,omitempty"`
+	PlexBaseURL      string `json:"plex_base_url,omitempty"`
+	// PlexBaseURLs carries the other addresses advertised for the same server.
+	// PlexBaseURL stays the preferred one, for clients that send only it.
+	PlexBaseURLs []string `json:"plex_base_urls,omitempty"`
+	PlexToken    string   `json:"plex_token,omitempty"`
+	// PlexAccountToken is the plex.tv account token from a browser-side
+	// PIN/OAuth flow. PlexToken is a PMS access token in that flow and is
+	// rejected by account-level APIs (the watchlist), so clients that hold
+	// both must send both.
+	PlexAccountToken string `json:"plex_account_token,omitempty"`
+}
+
+type LoginConnectInput struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type CreateSourceInput struct {
+	Name       string `json:"name"`
+	SourceType string `json:"source_type"`
+	BaseURL    string `json:"base_url"`
+	SystemID   string `json:"system_id,omitempty"`
+	Enabled    bool   `json:"enabled"`
+	SortOrder  int    `json:"sort_order"`
+	AdminToken string `json:"admin_token,omitempty"`
+}
+
+type UpdateSourceInput struct {
+	Name       *string `json:"name,omitempty"`
+	BaseURL    *string `json:"base_url,omitempty"`
+	SystemID   *string `json:"system_id,omitempty"`
+	Enabled    *bool   `json:"enabled,omitempty"`
+	SortOrder  *int    `json:"sort_order,omitempty"`
+	AdminToken *string `json:"admin_token,omitempty"`
+}
+
+type ExecutionSummary struct {
+	Fetched               int
+	Matched               int
+	Unmatched             int
+	ProgressUpdated       int
+	HistoryCreated        int
+	WatchlistAdded        int
+	FavoritesImported     int
+	Skipped               int
+	Warnings              []string
+	UnmatchedSamples      []UnmatchedSample
+	UnmatchedReasonCounts map[string]int
+	// HiddenSuppressed counts records refused because the profile removed
+	// them from its history.
+	HiddenSuppressed int
+}
+
+// --- Admin types ---
+
+// ExternalUser is a user account on an external media server.
+type ExternalUser struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Home       bool   `json:"home,omitempty"`
+	Guest      bool   `json:"guest,omitempty"`
+	Restricted bool   `json:"restricted,omitempty"`
+}
+
+// UserMapping persists the link from one external server user to a Silo user + profile.
+type UserMapping struct {
+	Revision         int64      `json:"-"`
+	ID               int        `json:"id"`
+	SourceID         int        `json:"source_id"`
+	ExternalUserID   string     `json:"external_user_id"`
+	ExternalUserName string     `json:"external_user_name"`
+	SiloUserID       int        `json:"silo_user_id"`
+	SiloProfileID    string     `json:"silo_profile_id"`
+	SiloUsername     string     `json:"silo_username,omitempty"`
+	SiloProfileName  string     `json:"silo_profile_name,omitempty"`
+	LastImportedAt   *time.Time `json:"last_imported_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+type CreateMappingInput struct {
+	SourceID         int    `json:"source_id"`
+	ExternalUserID   string `json:"external_user_id"`
+	ExternalUserName string `json:"external_user_name"`
+	SiloUserID       int    `json:"silo_user_id"`
+	SiloProfileID    string `json:"silo_profile_id"`
+}
+
+type UpdateMappingInput struct {
+	SiloUserID    *int    `json:"silo_user_id,omitempty"`
+	SiloProfileID *string `json:"silo_profile_id,omitempty"`
+}
+
+type SetAdminTokenInput struct {
+	Token string `json:"token"`
+}
+
+// BulkRunResult is the response from a bulk admin run request.
+type BulkRunOutcome struct {
+	MappingID int    `json:"mapping_id"`
+	Status    string `json:"status"`
+	Run       *Run   `json:"run,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+type BulkRunResult struct {
+	Outcomes []BulkRunOutcome `json:"outcomes"`
+	Runs     []*Run           `json:"runs"`
+	Skipped  int              `json:"skipped"`
+	Errors   int              `json:"errors"`
+}
+
+type PlexLoginInput struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type PlexLoginResult struct {
+	Token string `json:"token"`
+}

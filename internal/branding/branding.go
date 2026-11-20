@@ -1,0 +1,98 @@
+// Package branding is the single source of truth for server white-labeling:
+// server name, custom logos (wordmark + mark), favicon, login background, and
+// the derived browser tab title, web app manifest, and theme color.
+//
+// It is intentionally a leaf package (it depends only on imageutil and the
+// s3client value type via small interfaces) so that both internal/server (which
+// templates index.html and serves the manifest/favicon) and
+// internal/api/handlers (which exposes the public read + admin upload endpoints)
+// can depend on it without an import cycle.
+package branding
+
+import "errors"
+
+// AssetKind identifies an uploadable branding image.
+type AssetKind string
+
+const (
+	// KindWordmark is the wide logo shown in the expanded sidebar.
+	KindWordmark AssetKind = "wordmark"
+	// KindWordmarkLight was the wide logo for light themes. The web client has
+	// one dark theme and no longer shows it, and /api/v2 does not accept it; it
+	// stays a valid kind only so the frozen /api/v1 upload, delete and serve
+	// routes keep their behavior until v1 retires.
+	KindWordmarkLight AssetKind = "wordmark_light"
+	// KindMark is the square icon shown in the collapsed sidebar and PWA install.
+	KindMark AssetKind = "mark"
+	// KindMarkLight was the square icon for light themes; kept for /api/v1 only,
+	// like KindWordmarkLight.
+	KindMarkLight AssetKind = "mark_light"
+	// KindFavicon is the browser tab icon. Served as-is (no WebP re-encode) so
+	// Safari and mobile browsers keep working.
+	KindFavicon AssetKind = "favicon"
+	// KindLoginBg is the background image for the auth pages.
+	KindLoginBg AssetKind = "login_bg"
+)
+
+// Scalar branding settings keys (stored in the server_settings table). Asset
+// keys live on each assetSpec.
+const (
+	KeyServerName    = "branding.server_name"
+	KeyLoginSubtitle = "branding.login_subtitle"
+	KeyAccentColor   = "branding.accent_color"
+	// KeyDefaultTheme is the retired admin default theme. The web client has
+	// one theme and ignores it; only the frozen /api/v1 branding response still
+	// reports it, until v1 retires.
+	KeyDefaultTheme = "branding.default_theme"
+)
+
+// Defaults applied when a branding setting is unset. ServerName/LoginSubtitle
+// mirror the frontend's hardcoded fallbacks so behavior is unchanged out of the
+// box.
+const (
+	DefaultServerName    = "Silo"
+	DefaultLoginSubtitle = "Sign in with an existing account."
+	// DefaultThemeColor is used for the PWA manifest theme/background color when
+	// no accent color is configured.
+	DefaultThemeColor = "#0b0b0f"
+)
+
+// assetURLBase is the public, stable path prefix for serving branding assets.
+// Assets are addressed by content ref (?v=<hash><ext>) for immutable caching.
+//
+// Minted in the v2 namespace: these URLs are baked into the SPA index.html
+// favicon link and the PWA manifest, which nothing rewrites, so a v1-shaped
+// path would 404 once the /api/v1 tombstone lands. The bridge release serves
+// both namespaces, so the v1 branding JSON carrying this URL keeps working.
+const assetURLBase = "/api/v2/branding/assets/"
+
+// AssetContentSecurityPolicy hardens every served branding asset response.
+//
+// SECURITY: the favicon accepts SVG, a valid favicon format that can embed
+// <script> and on* handlers. Served on the app origin and navigated to
+// directly, such an SVG would otherwise execute in the viewer's session
+// (stored XSS) — X-Content-Type-Options alone does not stop a correctly-typed
+// SVG document from running scripts. `sandbox` (no allow-tokens) forces an
+// opaque origin with scripting disabled, and `default-src 'none'` blocks all
+// fetches; the asset still renders fine as an <img>/<link rel="icon">
+// subresource (where this policy does not apply). Harmless for raster images.
+const AssetContentSecurityPolicy = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+
+// Errors returned by Service. Handlers map these to HTTP status codes.
+var (
+	// ErrAssetNotConfigured indicates no custom asset of the requested kind is set.
+	ErrAssetNotConfigured = errors.New("branding: asset not configured")
+	// ErrInvalidKind indicates an unknown asset kind.
+	ErrInvalidKind = errors.New("branding: invalid asset kind")
+	// ErrUnsupportedImage indicates the uploaded file is not an accepted image type.
+	ErrUnsupportedImage = errors.New("branding: unsupported image type")
+)
+
+// IsValidKind reports whether s names a known asset kind.
+func IsValidKind(s string) bool {
+	_, ok := assetSpecs[AssetKind(s)]
+	return ok
+}
+
+// ErrStorageUnavailable indicates that branding asset storage is not configured.
+var ErrStorageUnavailable = errors.New("branding asset storage is not configured")

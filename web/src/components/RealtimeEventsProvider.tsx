@@ -1,0 +1,1285 @@
+import { jellyfinCompatStatusKey } from "@/api/v2/jellyfinStatusCache";
+import { fetchAdminTaskJob } from "@/api/v2/adminTasks";
+import type { QueryClient, QueryFilters } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
+import type {
+  AdminJob,
+  AppNotification,
+  EventChannel,
+  EventsEventMessage,
+  EventsSnapshotMessage,
+  EventsStreamMessage,
+  HistoryImportRun,
+  JellyfinCompatOperationStatus,
+  JellyfinCompatStatus,
+  NotificationReadEventPayload,
+  ScanRun,
+  TaskInfo,
+} from "@/api/types";
+import {
+  captureSessionIdentity,
+  isCapturedProfileAuthorityActive,
+  isSessionIdentityCurrent,
+  StaleApiRequestContextError,
+  type ProfileRequestContextSnapshot,
+  type SessionIdentitySnapshot,
+} from "@/api/client";
+import { isTransientV2Error, v2RetryDelayMs } from "@/api/v2/request";
+import {
+  mintEventsSocketTicket,
+  captureEventsAuthority,
+  isEventsAuthorityActive,
+} from "@/api/v2/eventsSocket";
+import {
+  applyNotificationCreated,
+  applyNotificationRead,
+  applyNotificationsSnapshot,
+  notificationToast,
+} from "@/hooks/queries/notifications";
+import { toast } from "sonner";
+import {
+  RealtimeEventsContext,
+  type EventChannelHandlers,
+  type RealtimeConnectionState,
+  type RealtimeEventsContextValue,
+} from "@/components/realtimeEventsContext";
+import {
+  createCatalogInvalidationScheduler,
+  invalidateAccessDependentState,
+  invalidateCatalogState,
+  scheduleProgressHomeRefresh,
+  userStateChangeAffectsSectionMembership,
+} from "@/components/realtimeCatalogInvalidation";
+import { jobCancelledError, jobFailedError } from "@/lib/adminJobErrors";
+import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
+import { createRealtimeQueryRefreshScheduler } from "@/components/realtimeQueryRefresh";
+import { adminSessionsKey } from "@/api/v2/adminSessionsCache";
+import {
+  adminDownloadPreparationsKey,
+  applyDownloadPreparationProgress,
+  isDownloadPreparationProgressEvent,
+  type AdminDownloadPreparationList,
+} from "@/api/v2/adminDownloadPreparations";
+import { adminDownloadStorageRootKey } from "@/api/v2/adminDownloadStorageCache";
+import { adminStatsKey } from "@/hooks/queries/admin/stats";
+import { useAuth } from "@/hooks/useAuth";
+import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
+import { usePageActivity } from "@/hooks/usePageActivity";
+import {
+  adminKeys,
+  historyImportKeys,
+  libraryKeys,
+  notInterestedKeys,
+  requestKeys,
+  sectionKeys,
+} from "@/hooks/queries/keys";
+import {
+  dropInactiveWatchDetail,
+  scheduleMediaSurfaceInvalidation,
+  updateCatalogItemDetail,
+} from "@/hooks/queries/mediaSurfaceRefresh";
+import type { ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "react-router";
+
+interface JobWaiter {
+  timeoutId: number;
+  resolve: (job: AdminJob) => void;
+  reject: (error: Error) => void;
+  /** Stops waiting on a socket event and polls the job instead. */
+  poll: () => void;
+}
+
+interface UserStatePayload {
+  profile_id: string;
+  content_id?: string;
+  series_id?: string;
+  change:
+    | "progress"
+    | "favorite"
+    | "watchlist"
+    | "history"
+    | "watched"
+    | "home_dismissal"
+    | "not_interested";
+  played?: boolean;
+  is_favorite?: boolean;
+  in_watchlist?: boolean;
+  not_interested?: boolean;
+}
+
+const CATALOG_ITEM_CHANGED_EVENTS = new Set([
+  "catalog.item.changed",
+  "library.item_added",
+  "metadata.updated",
+]);
+
+// Everything that shows a title's request state: the request list, title
+// pages, Discover, and request search results. The feature status and brand
+// lists don't depend on it.
+const REQUEST_STATE_QUERIES: QueryFilters[] = [
+  { queryKey: requestKeys.mineAll() },
+  { queryKey: requestKeys.detailAll() },
+  { queryKey: requestKeys.discovery() },
+  { queryKey: requestKeys.discoverBrowseAll() },
+  { queryKey: requestKeys.searchAll() },
+];
+
+function isRequestNotification(notification: Pick<AppNotification, "type">) {
+  return notification.type?.startsWith("request.") ?? false;
+}
+
+/**
+ * Close code the server ends the events socket with after an access_changed
+ * frame. The client refetches access-dependent data and reconnects at once.
+ */
+export const EVENTS_ACCESS_CHANGED_CLOSE_CODE = 4001;
+
+/**
+ * How long the events socket stays open after the page is hidden. Its frames
+ * keep the cache current meanwhile, so a quick tab switch costs no requests. A
+ * longer absence closes the socket, and the return refetches active queries
+ * once to cover the frames it missed.
+ */
+export const HIDDEN_EVENTS_SOCKET_GRACE_MS = 60_000;
+
+function buildEventsUrl(location: Pick<Location, "protocol" | "host">) {
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${location.host}/api/v2/events/ws`;
+}
+
+function parseEventsMessage(value: unknown): EventsStreamMessage | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as EventsStreamMessage;
+    if (!parsed || typeof parsed.type !== "string") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function isTerminalJob(job: AdminJob) {
+  return job.status === "completed" || job.status === "failed" || job.status === "cancelled";
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+/** The longest a job wait backs off after failed reads; a longer Retry-After still holds. */
+const JOB_POLL_MAX_BACKOFF_MS = 30_000;
+/** setTimeout's limit; a longer delay would fire at once. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Reads the job until it finishes. A read that may succeed later does not end
+ * the wait, since the job is still running on the server; it backs off while
+ * reads keep failing. Signing out or switching account or server ends it.
+ */
+async function pollAdminJobUntilTerminal(
+  jobId: string,
+  session: SessionIdentitySnapshot,
+): Promise<AdminJob> {
+  let failures = 0;
+  for (;;) {
+    if (!isSessionIdentityCurrent(session)) {
+      throw new StaleApiRequestContextError();
+    }
+    const read = await fetchAdminTaskJob(jobId).then(
+      (job) => ({ job }),
+      (error: unknown) => ({ error }),
+    );
+    // A read that finished after a sign-out or account switch, either way, is the old session's.
+    if (!isSessionIdentityCurrent(session)) {
+      throw new StaleApiRequestContextError();
+    }
+    if ("error" in read) {
+      if (!isTransientV2Error(read.error)) {
+        throw read.error;
+      }
+      failures += 1;
+      const backoff = Math.min(1_000 * 2 ** failures, JOB_POLL_MAX_BACKOFF_MS);
+      await delay(Math.min(v2RetryDelayMs(read.error, backoff), MAX_TIMEOUT_MS));
+      continue;
+    }
+    failures = 0;
+    const { job } = read;
+    if (job.status === "completed") {
+      return job;
+    }
+    if (job.status === "failed") {
+      throw jobFailedError(job);
+    }
+    if (job.status === "cancelled") {
+      throw jobCancelledError(job);
+    }
+    await delay(1_000);
+  }
+}
+
+function sortJobs(jobs: AdminJob[]) {
+  return [...jobs].sort((left, right) => {
+    const leftTime = Date.parse(left.requested_at);
+    const rightTime = Date.parse(right.requested_at);
+    if (Number.isNaN(leftTime) || Number.isNaN(rightTime)) {
+      const leftID = left.id ?? "";
+      const rightID = right.id ?? "";
+      return rightID.localeCompare(leftID);
+    }
+    return rightTime - leftTime;
+  });
+}
+
+function upsertJob(existing: AdminJob[] | undefined, nextJob: AdminJob, limit = 50) {
+  if (!nextJob || !nextJob.id) {
+    return existing ?? [];
+  }
+  const jobs = existing ? [...existing] : [];
+  const index = jobs.findIndex((job) => job.id === nextJob.id);
+  if (index >= 0) {
+    jobs[index] = nextJob;
+  } else {
+    jobs.push(nextJob);
+  }
+  return sortJobs(jobs).slice(0, limit);
+}
+
+function applyJellyfinCompatOperationUpdate(
+  queryClient: QueryClient,
+  operation: JellyfinCompatOperationStatus,
+  authority: ProfileRequestContextSnapshot | null,
+) {
+  if (!authority || !isCapturedProfileAuthorityActive(authority)) return;
+  const key = jellyfinCompatStatusKey(authority);
+  if (!operation?.id) {
+    void queryClient.invalidateQueries({ queryKey: key, exact: true });
+    return;
+  }
+
+  queryClient.setQueryData<JellyfinCompatStatus>(key, (existing) => {
+    if (!existing) {
+      return existing;
+    }
+    return {
+      ...existing,
+      web_state: jellyfinCompatOperationWebState(operation),
+      operation,
+    };
+  });
+
+  if (operation.state !== "running") {
+    void queryClient.invalidateQueries({ queryKey: key, exact: true });
+  }
+}
+
+function jellyfinCompatOperationWebState(
+  operation: JellyfinCompatOperationStatus,
+): JellyfinCompatStatus["web_state"] {
+  if (operation.state === "running") {
+    return operation.kind === "remove" ? "removing" : "installing";
+  }
+  if (operation.state === "failed") {
+    return "failed";
+  }
+  if (operation.kind === "remove") {
+    return "missing";
+  }
+  return "installed";
+}
+
+function hydrateAdminJobSnapshot(queryClient: QueryClient, jobs: AdminJob[]) {
+  void queryClient.invalidateQueries({ queryKey: adminKeys.jobs("__all") });
+  const sorted = sortJobs(jobs);
+  queryClient.setQueryData<AdminJob[]>(adminKeys.jobs("__all"), sorted);
+
+  const jobsByType = new Map<string, AdminJob[]>();
+  for (const job of sorted) {
+    const list = jobsByType.get(job.job_type) ?? [];
+    list.push(job);
+    jobsByType.set(job.job_type, list);
+  }
+  for (const [jobType, entries] of jobsByType) {
+    void queryClient.invalidateQueries({ queryKey: adminKeys.jobs(jobType) });
+    queryClient.setQueryData<AdminJob[]>(adminKeys.jobs(jobType), entries);
+  }
+}
+
+function applyAdminJobUpdate(queryClient: QueryClient, job: AdminJob) {
+  void queryClient.invalidateQueries({ queryKey: adminKeys.jobs(job.job_type) });
+  void queryClient.invalidateQueries({ queryKey: adminKeys.jobs("__all") });
+  queryClient.setQueryData<AdminJob[]>(adminKeys.jobs(job.job_type), (existing) =>
+    upsertJob(existing, job, 50),
+  );
+  queryClient.setQueryData<AdminJob[]>(adminKeys.jobs("__all"), (existing) =>
+    upsertJob(existing, job, 50),
+  );
+}
+
+function findCachedAdminJob(queryClient: QueryClient, jobId: string) {
+  const matches = queryClient.getQueryCache().findAll({
+    predicate: (query) =>
+      Array.isArray(query.queryKey) &&
+      query.queryKey[0] === "admin" &&
+      query.queryKey[1] === "jobs",
+  });
+
+  for (const query of matches) {
+    const jobs = query.state.data as AdminJob[] | undefined;
+    if (!Array.isArray(jobs)) continue;
+    const job = jobs?.find((entry) => entry.id === jobId);
+    if (job) {
+      return job;
+    }
+  }
+
+  return null;
+}
+
+function catalogEventLibraryID(data: unknown) {
+  if (!data || typeof data !== "object" || !("library_id" in data)) {
+    return undefined;
+  }
+  const value = (data as { library_id?: unknown }).library_id;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function catalogEventContentID(data: unknown) {
+  if (!data || typeof data !== "object" || !("content_id" in data)) {
+    return undefined;
+  }
+  const value = (data as { content_id?: unknown }).content_id;
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function handleJobSideEffects(
+  queryClient: QueryClient,
+  job: AdminJob,
+  eventName: string,
+  allowDashboardRefetch: boolean,
+) {
+  if (job.job_type === "delete_library") {
+    void queryClient.invalidateQueries({
+      queryKey: adminKeys.libraries(),
+      refetchType: allowDashboardRefetch ? "active" : "none",
+    });
+    void queryClient.invalidateQueries({ queryKey: libraryKeys.all });
+  }
+
+  if (eventName === "job.completed" && job.job_type === "catalog_import") {
+    invalidateCatalogState(queryClient, { allowDashboardRefetch });
+  }
+
+  if (eventName === "job.completed" && job.job_type === "delete_library") {
+    invalidateCatalogState(queryClient, { allowDashboardRefetch });
+  }
+}
+
+function hydrateScans(queryClient: QueryClient, scans: ScanRun[]) {
+  queryClient.setQueryData(adminKeys.activeScans(), scans);
+}
+
+function applyScanUpdate(queryClient: QueryClient, scan: ScanRun, eventName: string) {
+  queryClient.setQueryData<ScanRun[]>(adminKeys.activeScans(), (existing) => {
+    const scans = existing ? [...existing] : [];
+    const index = scans.findIndex((entry) => entry.id === scan.id);
+    const active = scan.status === "accepted" || scan.status === "running";
+    if (index >= 0 && !active) {
+      scans.splice(index, 1);
+    } else if (index >= 0) {
+      scans[index] = scan;
+    } else if (active) {
+      scans.push(scan);
+    }
+    return scans;
+  });
+
+  if (
+    eventName === "scan.completed" ||
+    eventName === "scan.failed" ||
+    eventName === "scan.cancelled"
+  ) {
+    void queryClient.invalidateQueries({ queryKey: adminKeys.libraries() });
+    void queryClient.invalidateQueries({ queryKey: adminKeys.libraryMatchQueueStatuses() });
+  }
+}
+
+function updateHistoryImportCaches(queryClient: QueryClient, run?: HistoryImportRun) {
+  if (run) {
+    queryClient.setQueryData(historyImportKeys.run(run.id), run);
+    queryClient.setQueryData(adminKeys.historyImportAdminRun(run.id), run);
+  }
+
+  void queryClient.invalidateQueries({
+    predicate: (query) =>
+      Array.isArray(query.queryKey) &&
+      query.queryKey[0] === historyImportKeys.all[0] &&
+      query.queryKey[1] === "runs",
+  });
+  void queryClient.invalidateQueries({
+    predicate: (query) =>
+      Array.isArray(query.queryKey) &&
+      query.queryKey[0] === adminKeys.historyImportAdminRuns({})[0] &&
+      query.queryKey[1] === adminKeys.historyImportAdminRuns({})[1],
+  });
+  void queryClient.invalidateQueries({
+    predicate: (query) =>
+      Array.isArray(query.queryKey) &&
+      query.queryKey[0] === adminKeys.historyImportMappings(undefined)[0] &&
+      query.queryKey[1] === adminKeys.historyImportMappings(undefined)[1],
+  });
+}
+
+function handleUserStateEvent(
+  queryClient: QueryClient,
+  payload: UserStatePayload,
+  activeProfileID: string | null | undefined,
+  allowDashboardRefetch: boolean,
+) {
+  if (payload.profile_id && activeProfileID && payload.profile_id !== activeProfileID) {
+    return;
+  }
+
+  if (payload.content_id) {
+    updateCatalogItemDetail(queryClient, payload.content_id, (detail) => {
+      const played =
+        payload.played ?? detail.user_state?.played ?? detail.user_data?.played ?? false;
+      const isFavorite = payload.is_favorite ?? detail.user_state?.is_favorite ?? false;
+      const inWatchlist = payload.in_watchlist ?? detail.user_state?.in_watchlist ?? false;
+      const notInterested = payload.not_interested ?? detail.user_state?.not_interested ?? false;
+      if (
+        played === (detail.user_data?.played ?? false) &&
+        played === (detail.user_state?.played ?? false) &&
+        isFavorite === (detail.user_state?.is_favorite ?? false) &&
+        inWatchlist === (detail.user_state?.in_watchlist ?? false) &&
+        notInterested === (detail.user_state?.not_interested ?? false)
+      ) {
+        return detail;
+      }
+      return {
+        ...detail,
+        user_data:
+          payload.played == null
+            ? detail.user_data
+            : { ...detail.user_data, played: payload.played },
+        user_state: {
+          played,
+          is_favorite: isFavorite,
+          in_watchlist: inWatchlist,
+          not_interested: notInterested,
+        },
+      };
+    });
+  }
+
+  // The patch above only carries played/favourite/watchlist/not-interested,
+  // which is the whole of what a favorite, watchlist or not-interested event
+  // changes. Every other change — progress
+  // above all, which arrives with no state at all — also moves fields the patch
+  // cannot reconstruct (position_seconds, is_in_progress, season counts), so the
+  // detail query still has to be refreshed for those.
+  const detailFullyPatched =
+    payload.change === "favorite" ||
+    payload.change === "watchlist" ||
+    payload.change === "not_interested";
+  if (payload.change === "not_interested") {
+    void queryClient.invalidateQueries({ queryKey: notInterestedKeys.all });
+  }
+  // A closed player would start from its cached watch detail's resume
+  // position, so drop it now rather than after the coalesced refresh; the
+  // refresh still reaches the series it led to.
+  const knownRelatedIds =
+    payload.content_id && (payload.change === "progress" || payload.change === "watched")
+      ? dropInactiveWatchDetail(queryClient, payload.content_id)
+      : undefined;
+  scheduleMediaSurfaceInvalidation(
+    queryClient,
+    payload.content_id
+      ? {
+          itemId: payload.content_id,
+          seriesId: payload.series_id,
+          skipItemDetail: detailFullyPatched,
+          // A mark changes which titles More like this lists.
+          skipSimilarItems: payload.change !== "not_interested",
+          knownRelatedIds,
+        }
+      : { skipSimilarItems: true },
+  );
+  // Resetting home's load queue re-runs every section fetch. Membership
+  // changes do it immediately; progress ticks coalesce into one trailing
+  // refresh per window so an open home still catches another client's
+  // playback without a per-tick storm. Mark the home sections stale before
+  // an immediate reset because the surface invalidation above is debounced.
+  if (userStateChangeAffectsSectionMembership(payload.change)) {
+    void queryClient
+      .invalidateQueries({ queryKey: sectionKeys.home(), refetchType: "none" })
+      .then(() => bumpHomeRefreshSignal(queryClient));
+  } else {
+    scheduleProgressHomeRefresh(queryClient);
+  }
+  void queryClient.invalidateQueries({
+    queryKey: adminKeys.stats(),
+    refetchType: allowDashboardRefetch ? "active" : "none",
+  });
+}
+
+export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
+  const queryClient = useQueryClient();
+  const { user, profile, refreshAccount } = useAuth();
+  const actingAdmin = useIsActingAdmin();
+  const pageActivity = usePageActivity();
+  const location = useLocation();
+  const authenticatedUserID = user?.id ?? null;
+  const renderedAuthority = captureEventsAuthority();
+  const isForegroundPlaybackRoute = location.pathname.startsWith("/watch/");
+  const isDashboardRoute = location.pathname === "/admin" || location.pathname === "/admin/";
+  const allowDashboardRealtimeUpdates = !isDashboardRoute || pageActivity.canPollDashboard;
+  const [connectionState, setConnectionState] = useState<RealtimeConnectionState>("connecting");
+  const catalogInvalidation = useMemo(
+    () => createCatalogInvalidationScheduler(queryClient),
+    [queryClient],
+  );
+  const reconnectTimerRef = useRef<number | undefined>(undefined);
+  const profileRebindAttemptsRef = useRef(0);
+  const nextReconnectDelayRef = useRef<number | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const helloReceivedRef = useRef(false);
+  const requestCounterRef = useRef(0);
+  const channelRefsRef = useRef(new Map<EventChannel, number>());
+  const channelHandlersRef = useRef(new Map<EventChannel, Map<number, EventChannelHandlers>>());
+  const nextHandlerIDRef = useRef(1);
+  const waitersRef = useRef(new Map<string, JobWaiter>());
+  const activeProfileIDRef = useRef<string | null | undefined>(profile?.id);
+  const allowDashboardRealtimeUpdatesRef = useRef(allowDashboardRealtimeUpdates);
+  const shouldCatchUpOnFocusRef = useRef(false);
+  const hiddenAtRef = useRef<number | null>(null);
+  const hideCountRef = useRef(0);
+  // An unexpected drop on a visible page is not caught up at once, but the
+  // next return from a hide catches up the frames it lost.
+  const droppedSinceCatchUpRef = useRef(false);
+  const [hiddenGraceExpired, setHiddenGraceExpired] = useState(false);
+  // Bumping these replaces the socket, or runs a catch-up while the page is visible.
+  const [socketGeneration, setSocketGeneration] = useState(0);
+  const [catchUpSignal, setCatchUpSignal] = useState(0);
+  // A frozen page runs no timers or socket handlers, so it gets no grace.
+  const keepSocketOpen =
+    pageActivity.canApplyRealtimeUpdates || (!pageActivity.isFrozen && !hiddenGraceExpired);
+
+  activeProfileIDRef.current = profile?.id;
+  allowDashboardRealtimeUpdatesRef.current = allowDashboardRealtimeUpdates;
+
+  useEffect(() => () => catalogInvalidation.cancel(), [catalogInvalidation]);
+
+  const settleWaiterRef = useRef<(job: AdminJob) => void>(() => {});
+  settleWaiterRef.current = (job: AdminJob) => {
+    const waiter = waitersRef.current.get(job.id);
+    if (!waiter || !isTerminalJob(job)) {
+      return;
+    }
+    waitersRef.current.delete(job.id);
+    window.clearTimeout(waiter.timeoutId);
+    if (job.status === "completed") {
+      waiter.resolve(job);
+      return;
+    }
+    if (job.status === "cancelled") {
+      waiter.reject(jobCancelledError(job));
+      return;
+    }
+    waiter.reject(jobFailedError(job));
+  };
+
+  const currentChannels = useCallback(() => {
+    return Array.from(channelRefsRef.current.entries())
+      .filter(([, count]) => count > 0)
+      .map(([channel]) => channel);
+  }, []);
+
+  const sendSubscribe = useCallback(() => {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN || !helloReceivedRef.current) {
+      return;
+    }
+    requestCounterRef.current += 1;
+    socket.send(
+      JSON.stringify({
+        type: "subscribe",
+        request_id: `req-${requestCounterRef.current}`,
+        channels: currentChannels(),
+      }),
+    );
+  }, [currentChannels]);
+
+  const subscribeChannel = useCallback(
+    (channel: EventChannel, handlers?: EventChannelHandlers) => {
+      channelRefsRef.current.set(channel, (channelRefsRef.current.get(channel) ?? 0) + 1);
+
+      let handlerID: number | null = null;
+      if (handlers) {
+        handlerID = nextHandlerIDRef.current++;
+        const channelHandlers =
+          channelHandlersRef.current.get(channel) ?? new Map<number, EventChannelHandlers>();
+        channelHandlers.set(handlerID, handlers);
+        channelHandlersRef.current.set(channel, channelHandlers);
+      }
+
+      sendSubscribe();
+
+      return () => {
+        const current = channelRefsRef.current.get(channel) ?? 0;
+        if (current <= 1) {
+          channelRefsRef.current.delete(channel);
+        } else {
+          channelRefsRef.current.set(channel, current - 1);
+        }
+
+        if (handlerID != null) {
+          const channelHandlers = channelHandlersRef.current.get(channel);
+          channelHandlers?.delete(handlerID);
+          if (channelHandlers && channelHandlers.size === 0) {
+            channelHandlersRef.current.delete(channel);
+          }
+        }
+
+        sendSubscribe();
+      };
+    },
+    [sendSubscribe],
+  );
+
+  function dispatchChannelMessage(
+    channel: EventChannel,
+    kind: "snapshot" | "event",
+    message: EventsSnapshotMessage | EventsEventMessage,
+  ) {
+    const handlers = channelHandlersRef.current.get(channel);
+    if (!handlers) {
+      return;
+    }
+    for (const entry of handlers.values()) {
+      if (kind === "snapshot") {
+        entry.onSnapshot?.(message);
+      } else {
+        entry.onEvent?.(message);
+      }
+    }
+  }
+
+  /** Patches a progress reading into the cached list; false when a re-read is needed. */
+  function applyDownloadPreparationProgressToCache(
+    authority: ProfileRequestContextSnapshot | null,
+    event: Parameters<typeof applyDownloadPreparationProgress>[1],
+  ) {
+    const key = adminDownloadPreparationsKey(authority);
+    const cached = queryClient.getQueryData<AdminDownloadPreparationList>(key);
+    if (!cached) return true; // nothing is showing the list; nothing to refresh
+    const next = applyDownloadPreparationProgress(cached, event);
+    if (!next) return false;
+    queryClient.setQueryData(key, next);
+    return true;
+  }
+
+  function handleSnapshot(
+    message: EventsSnapshotMessage,
+    refreshSessions: () => void,
+    refreshQueries: (...filters: QueryFilters[]) => void,
+    refreshDownloadPreparations: () => void,
+    refreshDownloadStorage: () => void,
+  ) {
+    switch (message.channel) {
+      case "download_preparations":
+        // The channel sends no snapshot body; a (re)subscription means events
+        // may have been missed, so re-read the list and the storage views.
+        refreshDownloadPreparations();
+        refreshDownloadStorage();
+        break;
+      case "jobs":
+        if (Array.isArray(message.data)) {
+          hydrateAdminJobSnapshot(queryClient, message.data as AdminJob[]);
+          for (const job of message.data as AdminJob[]) {
+            settleWaiterRef.current(job);
+          }
+        }
+        break;
+      case "sessions":
+        refreshSessions();
+        break;
+      case "tasks":
+        // Reconnect must also catch up history/metrics for tasks that finished
+        // while disconnected. One sweep avoids refetching each detail twice.
+        // A plugin update check that finished meanwhile may have changed the
+        // installations too.
+        refreshQueries(
+          { queryKey: adminKeys.tasks() },
+          { queryKey: adminKeys.pluginInstallations() },
+        );
+        break;
+      case "scans":
+        hydrateScans(queryClient, (message.data as ScanRun[]) ?? []);
+        break;
+      case "history_import":
+        updateHistoryImportCaches(queryClient);
+        break;
+      case "notifications":
+        if (Array.isArray(message.data)) {
+          const rows = message.data as AppNotification[];
+          applyNotificationsSnapshot(queryClient, rows);
+          // A reconnect sends request changes made while the socket was down
+          // as unread rows here, not as notification.created events.
+          if (rows.some(isRequestNotification)) {
+            refreshQueries(...REQUEST_STATE_QUERIES);
+          }
+        }
+        break;
+      default:
+        break;
+    }
+    dispatchChannelMessage(message.channel, "snapshot", message);
+  }
+
+  function handleNotificationEvent(
+    message: EventsEventMessage,
+    refreshQueries: (...filters: QueryFilters[]) => void,
+  ) {
+    if (message.event === "notification.created") {
+      const notification = message.data as AppNotification;
+      // A request changed state (approved, declined, arrived). The scheduler
+      // batches a burst (a scan fulfilling many requests) into one refetch.
+      if (isRequestNotification(notification)) {
+        refreshQueries(...REQUEST_STATE_QUERIES);
+      }
+      if (
+        notification.profile_id &&
+        activeProfileIDRef.current &&
+        notification.profile_id !== activeProfileIDRef.current
+      ) {
+        return;
+      }
+      applyNotificationCreated(queryClient, notification);
+      const content = notificationToast(notification);
+      if (content) toast(content.title, { description: content.description });
+      return;
+    }
+    if (message.event === "notification.read") {
+      applyNotificationRead(queryClient, message.data as NotificationReadEventPayload);
+    }
+  }
+
+  function handleEvent(
+    message: EventsEventMessage,
+    realtimeAuthority: ProfileRequestContextSnapshot | null,
+    refreshSessions: () => void,
+    refreshQueries: (...filters: QueryFilters[]) => void,
+    refreshDownloadPreparations: () => void,
+    refreshDownloadStorage: () => void,
+  ) {
+    switch (message.channel) {
+      case "download_preparations":
+        if (message.event === "download_storage.changed") {
+          // Clean-up or a revoke changed what the storage views show.
+          refreshDownloadStorage();
+          break;
+        }
+        if (
+          message.event === "download_preparation.progress" &&
+          isDownloadPreparationProgressEvent(message.data) &&
+          applyDownloadPreparationProgressToCache(realtimeAuthority, message.data)
+        ) {
+          break;
+        }
+        refreshDownloadPreparations();
+        break;
+      case "catalog":
+        {
+          const isItemChange = CATALOG_ITEM_CHANGED_EVENTS.has(message.event);
+          catalogInvalidation.schedule({
+            itemId: isItemChange ? catalogEventContentID(message.data) : undefined,
+            libraryId: catalogEventLibraryID(message.data),
+            allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
+            // An item changing inside a library does not change the set of
+            // libraries, so the admin library lists stay untouched.
+            includeLibraryLists: !isItemChange,
+          });
+        }
+        break;
+      case "jobs":
+        applyAdminJobUpdate(queryClient, message.data as AdminJob);
+        handleJobSideEffects(
+          queryClient,
+          message.data as AdminJob,
+          message.event,
+          allowDashboardRealtimeUpdatesRef.current,
+        );
+        settleWaiterRef.current(message.data as AdminJob);
+        break;
+      case "sessions":
+        if (message.event === "sessions.replaced") {
+          refreshSessions();
+        }
+        break;
+      case "tasks":
+        if (message.event === "task.updated") {
+          // Task frames fan out across nodes without source identity, while HTTP
+          // task execution state belongs to the serving process.
+          const task = message.data as Pick<TaskInfo, "key" | "state">;
+          const filters: QueryFilters[] = [
+            { queryKey: adminKeys.tasks(), exact: true },
+            { queryKey: adminKeys.tasksIncludingHidden(), exact: true },
+            { queryKey: adminKeys.task(task.key), exact: true },
+          ];
+          if (task.state === "idle") {
+            filters.push(
+              { queryKey: adminKeys.taskHistory(task.key) },
+              { queryKey: adminKeys.taskMetrics(task.key) },
+            );
+            // A finished plugin update check may have updated plugins or
+            // recorded a refused update on them.
+            if (task.key === "check_plugin_updates") {
+              filters.push({ queryKey: adminKeys.pluginInstallations() });
+            }
+          }
+          refreshQueries(...filters);
+        }
+        break;
+      case "scans":
+        applyScanUpdate(queryClient, message.data as ScanRun, message.event);
+        break;
+      case "history_import":
+        updateHistoryImportCaches(queryClient, message.data as HistoryImportRun);
+        break;
+      case "settings":
+        if (message.event === "jellyfin_compat.web_operation.updated") {
+          applyJellyfinCompatOperationUpdate(
+            queryClient,
+            message.data as JellyfinCompatOperationStatus,
+            realtimeAuthority,
+          );
+        }
+        break;
+      case "user_state":
+        handleUserStateEvent(
+          queryClient,
+          message.data as UserStatePayload,
+          activeProfileIDRef.current,
+          allowDashboardRealtimeUpdatesRef.current,
+        );
+        break;
+      case "notifications":
+        handleNotificationEvent(message, refreshQueries);
+        break;
+      default:
+        break;
+    }
+    dispatchChannelMessage(message.channel, "event", message);
+  }
+
+  useEffect(() => {
+    if (pageActivity.canApplyRealtimeUpdates) {
+      setHiddenGraceExpired(false);
+      return;
+    }
+    const timer = window.setTimeout(
+      () => setHiddenGraceExpired(true),
+      HIDDEN_EVENTS_SOCKET_GRACE_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [pageActivity.canApplyRealtimeUpdates]);
+
+  useEffect(() => {
+    if (!pageActivity.canApplyRealtimeUpdates) {
+      if (hiddenAtRef.current === null) {
+        hiddenAtRef.current = Date.now();
+        hideCountRef.current += 1;
+      }
+      return;
+    }
+    const hiddenAt = hiddenAtRef.current;
+    hiddenAtRef.current = null;
+    if (!authenticatedUserID) {
+      shouldCatchUpOnFocusRef.current = false;
+      return;
+    }
+    // A suspended page (a phone browser in the background) runs no timers, so
+    // the grace timer may not have closed the socket. Frames were probably
+    // missed, and the socket may have died without a close event: replace it.
+    if (hiddenAt !== null && Date.now() - hiddenAt >= HIDDEN_EVENTS_SOCKET_GRACE_MS) {
+      shouldCatchUpOnFocusRef.current = true;
+      if (socketRef.current) {
+        setSocketGeneration((generation) => generation + 1);
+      }
+    }
+    if (hiddenAt !== null && droppedSinceCatchUpRef.current) {
+      shouldCatchUpOnFocusRef.current = true;
+    }
+    if (!shouldCatchUpOnFocusRef.current) {
+      return;
+    }
+    // The foreground player covers the routed app and owns everything it
+    // needs for uninterrupted playback. Refetching every active query here
+    // used to reload profiles, capabilities, theme/settings, branding, and
+    // watch detail together whenever a hidden playback tab became visible.
+    // Keep the catch-up pending until the watch route exits; the underlying
+    // screen will then refresh before it becomes useful again.
+    if (isForegroundPlaybackRoute) {
+      return;
+    }
+
+    shouldCatchUpOnFocusRef.current = false;
+    droppedSinceCatchUpRef.current = false;
+    void queryClient.refetchQueries({
+      type: "active",
+      predicate: (query) => !isDashboardQueryKey(query.queryKey),
+    });
+    // The account record is not a query. An access change made while the
+    // socket was down never sends access_changed: the reconnect's ticket
+    // already carries the new access.
+    void refreshAccount().catch(() => {});
+  }, [
+    authenticatedUserID,
+    catchUpSignal,
+    isForegroundPlaybackRoute,
+    pageActivity.canApplyRealtimeUpdates,
+    queryClient,
+    refreshAccount,
+  ]);
+
+  useEffect(() => {
+    if (!authenticatedUserID) {
+      setConnectionState("disconnected");
+      return;
+    }
+    if (!keepSocketOpen) {
+      // Frames sent from now on are missed; catch up when the page returns.
+      shouldCatchUpOnFocusRef.current = true;
+      setConnectionState("disconnected");
+      return;
+    }
+
+    const authority = captureEventsAuthority();
+    if (!authority) {
+      setConnectionState("disconnected");
+      return;
+    }
+    const authorityActive = () => isEventsAuthorityActive(authority);
+    const adminRefresh = createRealtimeQueryRefreshScheduler(
+      queryClient,
+      authorityActive,
+      (queryKey) => !isDashboardQueryKey(queryKey) || allowDashboardRealtimeUpdatesRef.current,
+    );
+    const refreshSessions = () => {
+      if (!authority.profileId) return;
+      adminRefresh.schedule(
+        { queryKey: adminSessionsKey(authority), exact: true },
+        { queryKey: adminStatsKey(authority), exact: true },
+      );
+    };
+    const refreshDownloadPreparations = () => {
+      if (!authority.profileId) return;
+      adminRefresh.schedule({ queryKey: adminDownloadPreparationsKey(authority), exact: true });
+    };
+    const refreshDownloadStorage = () => {
+      if (!authority.profileId) return;
+      adminRefresh.schedule({ queryKey: adminDownloadStorageRootKey(authority) });
+    };
+    let closedByEffect = false;
+    let activeSocket: WebSocket | null = null;
+
+    const clearReconnect = () => {
+      if (reconnectTimerRef.current !== undefined) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = undefined;
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (closedByEffect || reconnectTimerRef.current !== undefined) {
+        return;
+      }
+      // The profile-rebind path stretches the delay so a persistently failing
+      // ticket mint cannot turn into a tight reconnect loop.
+      const delay = nextReconnectDelayRef.current ?? 1_000;
+      nextReconnectDelayRef.current = null;
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = undefined;
+        if (closedByEffect) {
+          return;
+        }
+        connect();
+      }, delay);
+    };
+
+    const connect = () => {
+      if (closedByEffect) {
+        return;
+      }
+      setConnectionState("connecting");
+      helloReceivedRef.current = false;
+
+      void mintEventsSocketTicket(authority)
+        .then((ticket) => {
+          if (closedByEffect || !authorityActive()) return;
+          openSocket(ticket.ticket);
+        })
+        .catch(() => {
+          if (closedByEffect || !authorityActive()) return;
+          setConnectionState("disconnected");
+          scheduleReconnect();
+        });
+    };
+
+    const openSocket = (ticket: string) => {
+      let socket: WebSocket;
+      try {
+        if (!authorityActive()) return;
+        socket = new WebSocket(buildEventsUrl(window.location), [
+          "silo.events.v2",
+          `silo.ticket.${ticket}`,
+        ]);
+      } catch {
+        setConnectionState("disconnected");
+        scheduleReconnect();
+        return;
+      }
+
+      activeSocket = socket;
+      socketRef.current = socket;
+      const hideCountAtOpen = hideCountRef.current;
+      // The server sends access_changed and then closes with
+      // EVENTS_ACCESS_CHANGED_CLOSE_CODE; whichever arrives first refreshes.
+      let accessChangeHandled = false;
+      const handleAccessChanged = () => {
+        if (accessChangeHandled) return;
+        accessChangeHandled = true;
+        invalidateAccessDependentState(queryClient, {
+          allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
+        });
+        void refreshAccount().catch(() => {});
+        // The new access applies to the next ticket, so reconnect at once.
+        nextReconnectDelayRef.current = 0;
+      };
+
+      socket.onopen = () => {
+        if (closedByEffect || socketRef.current !== socket || !authorityActive()) {
+          return;
+        }
+        setConnectionState("live");
+      };
+
+      socket.onmessage = (event) => {
+        if (closedByEffect || socketRef.current !== socket || !authorityActive()) {
+          return;
+        }
+        const message = parseEventsMessage(event.data);
+        if (!message) {
+          return;
+        }
+
+        switch (message.type) {
+          case "hello":
+            helloReceivedRef.current = true;
+            sendSubscribe();
+            return;
+          case "subscribed": {
+            // A profile_required rejection means the profile binding was lost
+            // (the ticket mint failed or the ticket was not honored). Left
+            // alone, this socket would stay healthy for hours while silently
+            // delivering no notifications — reconnect with backoff to re-mint.
+            const profileRequired = (message.rejected ?? []).some(
+              (entry) => entry.channel === "notifications" && entry.code === "profile_required",
+            );
+            if (profileRequired && activeProfileIDRef.current) {
+              // Rebinding requires a fresh handshake (tickets are consumed at
+              // upgrade time), so the shared socket must close. The backoff
+              // grows to 5 minutes so a persistent notifications-only outage
+              // costs the catalog/user_state channels one brief flap per
+              // cycle instead of a permanent fast reconnect loop.
+              profileRebindAttemptsRef.current += 1;
+              nextReconnectDelayRef.current = Math.min(
+                300_000,
+                1_000 * 2 ** Math.min(profileRebindAttemptsRef.current, 9),
+              );
+              socket.close();
+            } else {
+              profileRebindAttemptsRef.current = 0;
+            }
+            return;
+          }
+          case "snapshot":
+            handleSnapshot(
+              message,
+              refreshSessions,
+              adminRefresh.schedule,
+              refreshDownloadPreparations,
+              refreshDownloadStorage,
+            );
+            return;
+          case "event":
+            handleEvent(
+              message,
+              authority,
+              refreshSessions,
+              adminRefresh.schedule,
+              refreshDownloadPreparations,
+              refreshDownloadStorage,
+            );
+            return;
+          case "access_changed":
+            handleAccessChanged();
+            return;
+          case "error":
+            return;
+        }
+      };
+
+      socket.onerror = () => {
+        if (closedByEffect || socketRef.current !== socket || !authorityActive()) {
+          return;
+        }
+        setConnectionState("disconnected");
+      };
+
+      socket.onclose = (event: CloseEvent) => {
+        if (socketRef.current !== socket) {
+          return;
+        }
+        if (
+          event.code === EVENTS_ACCESS_CHANGED_CLOSE_CODE &&
+          !closedByEffect &&
+          authorityActive()
+        ) {
+          handleAccessChanged();
+        } else if (!closedByEffect) {
+          droppedSinceCatchUpRef.current = true;
+        }
+        if (
+          event.code !== EVENTS_ACCESS_CHANGED_CLOSE_CODE &&
+          !closedByEffect &&
+          (hiddenAtRef.current !== null || hideCountRef.current !== hideCountAtOpen)
+        ) {
+          // The socket was up while the page was hidden, and a phone browser
+          // may have been suspended then, so frames could have been lost
+          // without notice. Catalog and user-state channels send no snapshot
+          // on reconnect: catch up now, or when the page returns.
+          shouldCatchUpOnFocusRef.current = true;
+          setCatchUpSignal((signal) => signal + 1);
+        }
+        socketRef.current = null;
+        activeSocket = null;
+        helloReceivedRef.current = false;
+        setConnectionState("disconnected");
+        if (!closedByEffect) {
+          scheduleReconnect();
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      closedByEffect = true;
+      adminRefresh.cancel();
+      clearReconnect();
+      // The server job outlives this socket: keep waiting on it by polling.
+      for (const waiter of waitersRef.current.values()) {
+        window.clearTimeout(waiter.timeoutId);
+        waiter.poll();
+      }
+      waitersRef.current.clear();
+      const socket = activeSocket;
+      if (socket && socketRef.current === socket) {
+        socketRef.current = null;
+      }
+      activeSocket = null;
+      if (
+        socket &&
+        (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
+      ) {
+        socket.close();
+      }
+    };
+    // Rebind on authority changes, including a replacement PIN proof for the
+    // same profile. Ordinary access-token refresh preserves this authority.
+  }, [
+    authenticatedUserID,
+    profile?.id,
+    renderedAuthority?.authContextVersion,
+    renderedAuthority?.serverOrigin,
+    renderedAuthority?.profileId,
+    renderedAuthority?.profileToken,
+    keepSocketOpen,
+    socketGeneration,
+    queryClient,
+    refreshAccount,
+    sendSubscribe,
+  ]);
+
+  const awaitAdminJob = useCallback(
+    (jobId: string) => {
+      const session = captureSessionIdentity();
+      const cachedJob = findCachedAdminJob(queryClient, jobId);
+      if (cachedJob) {
+        if (cachedJob.status === "completed") {
+          return Promise.resolve(cachedJob);
+        }
+        if (cachedJob.status === "failed") {
+          return Promise.reject(jobFailedError(cachedJob));
+        }
+        if (cachedJob.status === "cancelled") {
+          return Promise.reject(jobCancelledError(cachedJob));
+        }
+      }
+
+      // Must match the gate on AdminRealtimeEventChannels: when the jobs
+      // channel isn't subscribed (not acting as admin), waiting on a live
+      // event would hang until the fallback timeout — poll instead.
+      if (!actingAdmin || connectionState !== "live") {
+        return pollAdminJobUntilTerminal(jobId, session);
+      }
+
+      return new Promise<AdminJob>((resolve, reject) => {
+        const existing = waitersRef.current.get(jobId);
+        if (existing) {
+          window.clearTimeout(existing.timeoutId);
+        }
+
+        const poll = () => void pollAdminJobUntilTerminal(jobId, session).then(resolve, reject);
+        const timeoutId = window.setTimeout(() => {
+          waitersRef.current.delete(jobId);
+          poll();
+        }, 60_000);
+
+        waitersRef.current.set(jobId, { timeoutId, resolve, reject, poll });
+      });
+    },
+    [actingAdmin, connectionState, queryClient],
+  );
+
+  const value = useMemo<RealtimeEventsContextValue>(
+    () => ({
+      connectionState,
+      awaitAdminJob,
+      subscribeChannel,
+    }),
+    [awaitAdminJob, connectionState, subscribeChannel],
+  );
+
+  return <RealtimeEventsContext.Provider value={value}>{children}</RealtimeEventsContext.Provider>;
+}
+
+export { buildEventsUrl };
+
+function isDashboardQueryKey(queryKey: unknown) {
+  return (
+    Array.isArray(queryKey) &&
+    queryKey[0] === "admin" &&
+    (queryKey[1] === "stats" ||
+      queryKey[1] === "sessions" ||
+      queryKey[1] === "libraries" ||
+      queryKey[1] === "users")
+  );
+}

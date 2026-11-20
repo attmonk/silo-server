@@ -1,0 +1,122 @@
+import type { ReactNode } from "react";
+
+import { useT } from "@/i18n";
+import { cn } from "@/lib/utils";
+
+/**
+ * A selectable card used by the Add-source flow. Cards rather than a dropdown
+ * because each option needs a sentence explaining what it does — the choice
+ * between "Sonarr pushes to Silo" and "Silo polls Sonarr" is meaningless
+ * without it, and a <select> has nowhere to put that.
+ */
+export function ChoiceCard({
+  title,
+  description,
+  icon,
+  badge,
+  selected,
+  onSelect,
+  disabled,
+  describedBy,
+}: {
+  title: string;
+  description?: string;
+  icon?: ReactNode;
+  /** Short qualifier shown beside the title, e.g. "Recommended". */
+  badge?: string;
+  selected: boolean;
+  onSelect: () => void;
+  /**
+   * Unavailable: stays focusable, so a screen reader still reaches it and the
+   * reason `describedBy` names, but does nothing.
+   */
+  disabled?: boolean;
+  describedBy?: string;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={selected}
+      aria-disabled={disabled || undefined}
+      aria-describedby={describedBy}
+      onClick={disabled ? undefined : onSelect}
+      className={cn(
+        "rounded-lg border p-3 text-start transition-colors aria-disabled:cursor-not-allowed aria-disabled:opacity-60",
+        selected
+          ? "border-primary bg-accent"
+          : "border-border [&:not([aria-disabled])]:hover:bg-accent/50",
+      )}
+    >
+      <span className="flex flex-wrap items-center gap-1.5 text-sm font-medium">
+        {icon}
+        {title}
+        {badge && (
+          <span className="bg-success/15 text-success rounded-full px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase">
+            {badge}
+          </span>
+        )}
+      </span>
+      {description && (
+        <span className="text-muted-foreground mt-1 block text-xs leading-relaxed">
+          {description}
+        </span>
+      )}
+    </button>
+  );
+}
+
+/** Marks a completed step; a symbol, not text. */
+const DONE_MARK = "✓";
+
+export interface Step {
+  label: string;
+  /** Answered: the operator has filled it in, or moved on past an optional one. */
+  done: boolean;
+}
+
+/**
+ * Numbered progress indicator for the Add-source flow. Steps are supplied by
+ * the caller because their number varies per source: a webhook-only watcher
+ * needing no credentials genuinely has fewer questions than a pollable arr.
+ * The first unanswered step is the current one.
+ */
+export function StepTrail({ steps }: { steps: Step[] }) {
+  const t = useT();
+  if (steps.length < 2) return null;
+  const currentIndex = steps.findIndex((step) => !step.done);
+
+  return (
+    <ol className="flex flex-wrap items-center gap-x-2 gap-y-1">
+      {steps.map((step, index) => {
+        const done = step.done;
+        const active = index === currentIndex;
+        return (
+          <li key={step.label} className="flex items-center gap-2">
+            {index > 0 && <span className="bg-border hidden h-px w-6 sm:block" aria-hidden />}
+            <span
+              className={cn(
+                "flex items-center gap-1.5 text-xs",
+                active ? "text-foreground font-medium" : "text-muted-foreground",
+              )}
+              aria-current={active ? "step" : undefined}
+            >
+              <span
+                className={cn(
+                  "grid size-5 shrink-0 place-items-center rounded-full border text-[10px] font-semibold",
+                  active && "bg-foreground text-background border-transparent",
+                  done && "border-success/40 bg-success/15 text-success",
+                )}
+              >
+                {done ? DONE_MARK : index + 1}
+              </span>
+              {step.label}
+              {done && (
+                <span className="sr-only">{t("web.admin.autoscan.sourceDialog.stepDone")}</span>
+              )}
+            </span>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}

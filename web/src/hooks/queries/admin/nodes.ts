@@ -1,0 +1,470 @@
+import { useEffect, useRef, useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  captureProfileRequestContext,
+  captureSessionIdentity,
+  getAccessToken,
+  getProfileToken,
+  getProfileTokenGeneration,
+  isProfileRequestContextCurrent,
+  isCapturedProfileAuthorityActive,
+  StaleApiRequestContextError,
+  type ProfileRequestContextSnapshot,
+} from "@/api/client";
+import { v2, type V2Result } from "@/api/v2/request";
+import type {
+  StreamNode,
+  NodeCapabilities,
+  NodeLastStats,
+  CreateNodeRequest,
+  UpdateNodeRequest,
+  ReprobeNodeResult,
+} from "@/api/types";
+import { adminKeys } from "../keys";
+import { usePageActivity } from "@/hooks/usePageActivity";
+import { describeReprobeOutcome } from "@/pages/adminNodesPresentation";
+import { toast } from "sonner";
+import { t } from "@/i18n";
+
+const ADMIN_STALE_TIME = 30_000;
+
+export async function fetchAdminNodes(
+  profileContext = captureProfileRequestContext(),
+): Promise<StreamNode[]> {
+  if (!profileContext) throw new StaleApiRequestContextError();
+  const nodes: StreamNode[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await v2("GET /api/v2/admin/nodes", {
+      profileContext,
+      query: { limit: 200, cursor },
+    });
+    if (!isCapturedProfileAuthorityActive(profileContext)) throw new StaleApiRequestContextError();
+    nodes.push(
+      ...page.items.map((row) => ({
+        ...row,
+        capabilities: row.capabilities as NodeCapabilities | undefined,
+        last_stats: row.last_stats as NodeLastStats | undefined,
+      })),
+    );
+    cursor = page.page?.next_cursor;
+  } while (cursor);
+  return nodes;
+}
+
+/**
+ * Polled on the node health cadence, because this row now carries live
+ * readings rather than configuration.
+ *
+ * `staleTime` alone marks data old; it does not schedule anything. Without an
+ * interval the GPU, disk and health columns froze at whatever they were when
+ * the page mounted, refreshing only on focus, reconnect or a mutation — so an
+ * operator watching a node saturate, a scratch volume fill, or a health check
+ * start failing would see none of it. The server persists a fresh sample every
+ * 30 seconds, so asking more often only costs requests.
+ *
+ * Gated on page activity: a backgrounded or frozen tab has nobody reading it,
+ * and polling every admin tab a browser has open is how a small deployment
+ * ends up serving its own dashboard.
+ */
+export function useAdminNodes() {
+  const pageActivity = usePageActivity();
+  const profileContext = captureProfileRequestContext();
+  return useQuery({
+    queryKey: [
+      ...adminKeys.nodes(),
+      profileContext?.serverOrigin,
+      profileContext?.authContextVersion,
+      profileContext?.profileId,
+      profileContext?.profileTokenGeneration,
+    ],
+    enabled: profileContext !== null,
+    queryFn: () => fetchAdminNodes(profileContext),
+    staleTime: ADMIN_STALE_TIME,
+    refetchInterval: pageActivity.canApplyRealtimeUpdates ? ADMIN_STALE_TIME : false,
+  });
+}
+
+// Setup may have an administrator account before selecting a profile. An
+// empty captured profile header represents that absence; no profile is chosen
+// on the caller's behalf. The shared request still fences account/server changes.
+function captureNodeWriteAuthority(): ProfileRequestContextSnapshot | null {
+  const profile = captureProfileRequestContext();
+  if (profile) return profile;
+  const accessToken = getAccessToken();
+  if (!accessToken) return null;
+  return {
+    ...captureSessionIdentity(),
+    accessToken,
+    profileId: "",
+    profileToken: getProfileToken(),
+    profileTokenGeneration: getProfileTokenGeneration(),
+  };
+}
+export function isNodeWriteAuthorityActive(authority: ProfileRequestContextSnapshot): boolean {
+  if (
+    !isProfileRequestContextCurrent(authority) ||
+    authority.profileTokenGeneration !== getProfileTokenGeneration()
+  )
+    return false;
+  if (authority.profileId !== "") return isCapturedProfileAuthorityActive(authority);
+  return (
+    getAccessToken() !== null &&
+    captureProfileRequestContext() === null &&
+    getProfileToken() === authority.profileToken
+  );
+}
+
+type NodeWriteIntent = {
+  action: "create" | "update" | "delete";
+  authority: ProfileRequestContextSnapshot | null;
+  node?: StreamNode;
+  body?: CreateNodeRequest | UpdateNodeRequest;
+  /** Gets the stored node a create or update acknowledged; nothing on delete. */
+  onSuccess?: (saved?: { id: string; name: string; type: string }) => void;
+};
+function useNodeWrite() {
+  const client = useQueryClient();
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const mutation = useMutation({
+    retry: false,
+    mutationFn: async (intent: NodeWriteIntent) => {
+      if (!mounted.current || !intent.authority || !isNodeWriteAuthorityActive(intent.authority))
+        throw new StaleApiRequestContextError();
+      const common = { profileContext: intent.authority, retryAuthentication: false };
+      let result;
+      let etag: string | null = null;
+      const onResponse = (response: Response) => {
+        etag = response.headers.get("ETag");
+      };
+      if (intent.action === "create") {
+        result = await v2("POST /api/v2/admin/nodes", {
+          ...common,
+          body: intent.body as CreateNodeRequest,
+          onResponse,
+        });
+      } else {
+        if (!intent.node?.config_etag) throw new Error(t("web.admin.errors.nodesReloadReopen"));
+        const options = {
+          ...common,
+          path: { id: String(intent.node.id) },
+          headers: { "If-Match": intent.node.config_etag },
+        };
+        if (intent.action === "delete") {
+          await v2("DELETE /api/v2/admin/nodes/{id}", options);
+        } else {
+          result = await v2("PUT /api/v2/admin/nodes/{id}", {
+            ...options,
+            body: intent.body as UpdateNodeRequest,
+            onResponse,
+          });
+          if (result.id !== String(intent.node.id))
+            throw new Error("Unexpected node write acknowledgement.");
+        }
+      }
+      if (!mounted.current || !isNodeWriteAuthorityActive(intent.authority))
+        throw new StaleApiRequestContextError();
+      if (result && (!etag || result.config_etag !== etag))
+        throw new Error(t("web.admin.errors.nodeWriteAckMissing"));
+      return result;
+    },
+    onSuccess: (result, intent) => {
+      if (!mounted.current || !intent.authority || !isNodeWriteAuthorityActive(intent.authority))
+        return;
+      toast.success(
+        intent.action === "delete"
+          ? t("web.admin.nodes.hooks.nodes.deleted")
+          : t("web.admin.nodes.hooks.nodes.saved"),
+      );
+      intent.onSuccess?.(result);
+      // A new node has never been checked, so it lists as unhealthy and takes
+      // no work until the next health sweep, up to 30 seconds later. Check it
+      // now; the check stores its result for every server.
+      if (intent.action === "create" && result) {
+        const authority = intent.authority;
+        void v2("POST /api/v2/admin/nodes/{id}/check", {
+          path: { id: String(result.id) },
+          profileContext: authority,
+          retryAuthentication: false,
+        })
+          .catch(() => {
+            // The sweep checks the node anyway.
+          })
+          .finally(() => {
+            if (isNodeWriteAuthorityActive(authority))
+              client.invalidateQueries({ queryKey: adminKeys.nodes() });
+          });
+      }
+    },
+    onError: (_error, intent) => {
+      if (mounted.current && intent.authority && isNodeWriteAuthorityActive(intent.authority))
+        toast.error(t("web.admin.nodes.hooks.nodes.changeUnconfirmed"));
+    },
+    onSettled: (_result, _error, intent) => {
+      if (intent.authority && isNodeWriteAuthorityActive(intent.authority))
+        client.invalidateQueries({ queryKey: adminKeys.nodes() });
+    },
+  });
+  return { ...mutation, isMounted: () => mounted.current };
+}
+export function useCreateNode() {
+  const [authority] = useState(captureNodeWriteAuthority);
+  const mutation = useNodeWrite();
+  const intent = (
+    body: CreateNodeRequest,
+    options?: { onSuccess?: NodeWriteIntent["onSuccess"] },
+  ): NodeWriteIntent => ({
+    action: "create",
+    authority,
+    body: structuredClone(body),
+    onSuccess: options?.onSuccess,
+  });
+  return {
+    ...mutation,
+    isAuthorityActive: () =>
+      mutation.isMounted() && authority !== null && isNodeWriteAuthorityActive(authority),
+    mutate: (body: CreateNodeRequest, options?: { onSuccess?: NodeWriteIntent["onSuccess"] }) =>
+      mutation.mutate(intent(body, options)),
+    mutateAsync: (body: CreateNodeRequest) => mutation.mutateAsync(intent(body)),
+  };
+}
+export function useUpdateNode() {
+  const [authority] = useState(captureNodeWriteAuthority);
+  const mutation = useNodeWrite();
+  return {
+    ...mutation,
+    mutate: (
+      { node, body }: { node: StreamNode; body: UpdateNodeRequest },
+      options?: { onSuccess?: () => void },
+    ) =>
+      mutation.mutate({
+        action: "update",
+        authority,
+        node: structuredClone(node),
+        body: structuredClone(body),
+        onSuccess: options?.onSuccess,
+      }),
+  };
+}
+export type NodeDeleteIntent = {
+  node: StreamNode;
+  authority: ProfileRequestContextSnapshot | null;
+};
+export function useDeleteNode() {
+  const mutation = useNodeWrite();
+  return {
+    ...mutation,
+    mutate: (intent: NodeDeleteIntent) =>
+      mutation.mutate({ action: "delete", ...structuredClone(intent) }),
+  };
+}
+
+type NodeCommandIntent<A> = {
+  node: StreamNode;
+  authority: ProfileRequestContextSnapshot;
+  action: A;
+};
+type NodeCommandRequest = {
+  path: { id: string };
+  profileContext: ProfileRequestContextSnapshot;
+  retryAuthentication: false;
+};
+
+/**
+ * A POST command on one node row. The selected node and the rendered authority
+ * are captured before the request queues, nothing is replayed automatically,
+ * and a result or invalidation that arrives under a changed authority is
+ * dropped. `send` issues the request for the intent's action.
+ */
+function useNodeCommand<A, R extends object>(command: {
+  send: (action: A, request: NodeCommandRequest) => Promise<R>;
+  onResult: (result: R, intent: NodeCommandIntent<A>) => void;
+  errorMessage: (intent: NodeCommandIntent<A>) => string;
+}) {
+  const queryClient = useQueryClient();
+  const renderedAuthority = captureProfileRequestContext();
+  const mutation = useMutation({
+    retry: false,
+    mutationFn: async (intent: NodeCommandIntent<A>) => {
+      if (!isCapturedProfileAuthorityActive(intent.authority))
+        throw new StaleApiRequestContextError();
+      const result = await command.send(intent.action, {
+        path: { id: String(intent.node.id) },
+        profileContext: intent.authority,
+        retryAuthentication: false,
+      });
+      if (!isCapturedProfileAuthorityActive(intent.authority))
+        throw new StaleApiRequestContextError();
+      if ("node_id" in result && result.node_id !== String(intent.node.id))
+        throw new Error("Unexpected node command result");
+      return result;
+    },
+    onSuccess: (result, intent) => {
+      if (isCapturedProfileAuthorityActive(intent.authority)) command.onResult(result, intent);
+    },
+    onError: (_error, intent) => {
+      if (isCapturedProfileAuthorityActive(intent.authority))
+        toast.error(command.errorMessage(intent));
+    },
+    onSettled: (_result, _error, intent) => {
+      if (isCapturedProfileAuthorityActive(intent.authority))
+        queryClient.invalidateQueries({ queryKey: adminKeys.nodes() });
+    },
+  });
+  return {
+    ...mutation,
+    variables: mutation.variables?.node,
+    mutate: (node: StreamNode, action: A) => {
+      if (!renderedAuthority || !isCapturedProfileAuthorityActive(renderedAuthority)) return;
+      mutation.mutate({ node: structuredClone(node), authority: renderedAuthority, action });
+    },
+  };
+}
+
+type NodeObservation =
+  | V2Result<"POST /api/v2/admin/nodes/{id}/check">
+  | V2Result<"POST /api/v2/admin/nodes/{id}/reprobe">;
+
+function useNodeObservationCommand(action: "check" | "reprobe") {
+  const command = useNodeCommand<"check" | "reprobe", NodeObservation>({
+    send: (kind, request) =>
+      kind === "check"
+        ? v2("POST /api/v2/admin/nodes/{id}/check", request)
+        : v2("POST /api/v2/admin/nodes/{id}/reprobe", request),
+    onResult: (result, intent) => {
+      if ("healthy" in result) {
+        toast.success(
+          result.healthy
+            ? t("web.admin.nodes.hooks.nodes.health.healthy", { name: intent.node.name })
+            : t("web.admin.nodes.hooks.nodes.health.unhealthy", { name: intent.node.name }),
+        );
+        if (!result.health_persisted)
+          toast.error(t("web.admin.nodes.hooks.nodes.health.notStored"));
+      } else {
+        const outcome = describeReprobeOutcome(intent.node, {
+          ...result,
+          node_id: Number(result.node_id),
+        } as ReprobeNodeResult);
+        if (outcome.ok) toast.success(outcome.message);
+        else toast.error(outcome.message);
+      }
+    },
+    errorMessage: () => t("web.admin.nodes.hooks.nodes.commandUnconfirmed"),
+  });
+  return { ...command, mutate: (node: StreamNode) => command.mutate(node, action) };
+}
+export function useCheckNodeHealth() {
+  return useNodeObservationCommand("check");
+}
+export function useReprobeNode() {
+  return useNodeObservationCommand("reprobe");
+}
+
+/**
+ * Drains a transcode node (requested: true) or lifts the drain (false). The
+ * node stays listed and health-checked; the list refetches so the status line
+ * moves from "Draining" to "Drained" as the node reports it.
+ */
+export function useSetNodeDrain() {
+  return useNodeCommand({
+    send: (requested: boolean, request) =>
+      requested
+        ? v2("POST /api/v2/admin/nodes/{id}/drain", request)
+        : v2("POST /api/v2/admin/nodes/{id}/resume", request),
+    onResult: (result, intent) =>
+      toast.success(
+        result.drain_requested
+          ? t("web.admin.nodes.hooks.nodes.drain.draining", { name: intent.node.name })
+          : t("web.admin.nodes.hooks.nodes.drain.resumed", { name: intent.node.name }),
+      ),
+    errorMessage: (intent) =>
+      intent.action
+        ? t("web.admin.nodes.hooks.nodes.drain.drainFailed", { name: intent.node.name })
+        : t("web.admin.nodes.hooks.nodes.drain.resumeFailed", { name: intent.node.name }),
+  });
+}
+
+/**
+ * What node administration this API build supports. During a rolling deploy
+ * the web bundle can be newer than the server answering, so newer node actions
+ * are gated on it, and a failed read counts as "not supported".
+ */
+export function useAdminNodeCapabilities() {
+  return useQuery({
+    queryKey: adminKeys.nodeCapabilities(),
+    queryFn: ({ signal }) => v2("GET /api/v2/admin/nodes/capabilities", { signal }),
+    staleTime: ADMIN_STALE_TIME,
+    retry: false,
+  });
+}
+
+type IssueNodeKeyIntent = {
+  node: Pick<StreamNode, "id" | "name">;
+  authority: ProfileRequestContextSnapshot;
+  reveal: (key: string) => void;
+};
+
+/**
+ * Issues a transcode node's key, or rotates it when one exists; the previous
+ * key stops working at once. The key is in this one response only: it goes to
+ * `reveal` and the mutation resolves with nothing, so neither the query cache
+ * nor the mutation cache ever holds it. Never retried, because every call
+ * rotates. Failures stay on `error` for the caller to show; nothing is toasted.
+ */
+export function useIssueNodeKey() {
+  const queryClient = useQueryClient();
+  const renderedAuthority = captureProfileRequestContext();
+  const mutation = useMutation({
+    retry: false,
+    mutationFn: async ({ node, authority, reveal }: IssueNodeKeyIntent): Promise<void> => {
+      if (!isCapturedProfileAuthorityActive(authority)) throw new StaleApiRequestContextError();
+      const result = await v2("POST /api/v2/admin/nodes/{id}/key", {
+        path: { id: String(node.id) },
+        profileContext: authority,
+        retryAuthentication: false,
+      });
+      if (!isCapturedProfileAuthorityActive(authority)) throw new StaleApiRequestContextError();
+      reveal(result.node_key);
+    },
+    onSettled: (_result, _error, intent) => {
+      // key_issued changes on the row.
+      if (isCapturedProfileAuthorityActive(intent.authority))
+        queryClient.invalidateQueries({ queryKey: adminKeys.nodes() });
+    },
+  });
+  return {
+    isPending: mutation.isPending,
+    error: mutation.error,
+    reset: mutation.reset,
+    mutate: (node: Pick<StreamNode, "id" | "name">, reveal: (key: string) => void) => {
+      if (!renderedAuthority || !isCapturedProfileAuthorityActive(renderedAuthority)) return;
+      mutation.mutate({
+        node: { id: node.id, name: node.name },
+        authority: renderedAuthority,
+        reveal,
+      });
+    },
+  };
+}
+
+export function useToggleNode() {
+  const mutation = useNodeWrite();
+  const authority = captureProfileRequestContext();
+  return {
+    ...mutation,
+    variables: mutation.variables?.node,
+    mutate: (node: StreamNode) =>
+      mutation.mutate({
+        action: "update",
+        authority,
+        node: structuredClone(node),
+        body: { enabled: !node.enabled },
+      }),
+  };
+}

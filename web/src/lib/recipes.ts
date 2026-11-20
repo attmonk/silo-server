@@ -1,0 +1,180 @@
+import { v2 } from "../api/v2/request";
+import type { components } from "../api/v2/schema";
+import { serverText } from "../i18n";
+
+export type Category =
+  | "library_staples"
+  | "personalized"
+  | "discovery"
+  | "editorial"
+  | "seasonal"
+  | "mood"
+  | "hand_picked"
+  | "social"
+  | "custom";
+
+export interface GalleryPreset {
+  key: string;
+  display_name: string;
+  icon: string;
+  description_short: string;
+  description_long?: string;
+  /** Catalog keys for the three texts above, present when the server sent them. */
+  display_name_key?: string;
+  description_short_key?: string;
+  description_long_key?: string;
+  default_params: Record<string, unknown>;
+}
+
+/**
+ * A preset's name for display, in the interface language. `display_name`
+ * itself stays English: a row created from a preset is saved under it.
+ */
+export function presetLabel(preset: GalleryPreset): string {
+  return serverText(preset.display_name_key, undefined, preset.display_name);
+}
+
+/** A preset's one-line description for display, in the interface language. */
+export function presetShortText(preset: GalleryPreset): string {
+  return serverText(preset.description_short_key, undefined, preset.description_short);
+}
+
+export interface RecipeDefinition {
+  type: string;
+  category: Category;
+  presets: GalleryPreset[];
+  avoid_duplicates: boolean;
+  supports_rotation: boolean;
+  admin_only: boolean;
+}
+
+export interface RecipeCatalogResponse {
+  categories: Partial<Record<Category, RecipeDefinition[]>>;
+}
+
+// matchRecipePreset returns the preset a section's config came from.
+// Several presets can share one recipe type and differ only in their params
+// (TMDB Trending Today vs This Week), so the type alone cannot name the
+// section. The preset whose default params the config matches on the most
+// keys wins; a config that matches none falls back to the first preset.
+export function matchRecipePreset(
+  def: RecipeDefinition,
+  config: Record<string, unknown> | undefined,
+): GalleryPreset | undefined {
+  return findMatchingPreset(def, config) ?? def.presets[0];
+}
+
+/** The preset a config came from, or undefined when it matches none. */
+export function findMatchingPreset(
+  def: RecipeDefinition,
+  config: Record<string, unknown> | undefined,
+): GalleryPreset | undefined {
+  let best: GalleryPreset | undefined;
+  let bestScore = -1;
+  for (const preset of def.presets) {
+    const entries = Object.entries(preset.default_params ?? {});
+    const matches = entries.every(
+      ([key, value]) => JSON.stringify(config?.[key]) === JSON.stringify(value),
+    );
+    if (matches && entries.length > bestScore) {
+      best = preset;
+      bestScore = entries.length;
+    }
+  }
+  return best;
+}
+
+export interface PreviewRequest {
+  section_type: string;
+  config: Record<string, unknown>;
+  item_limit?: number;
+  library_id?: number;
+  library_ids?: number[];
+}
+
+export interface PreviewResponse {
+  items: Array<{
+    content_id: string;
+    title?: string;
+    /** The presigned v2 `poster_url`, ready to load; absent when the item has no poster. */
+    poster_path?: string;
+    poster_thumbhash?: string;
+  }>;
+  total_count: number;
+  /** A row of collections' cards, in order; it then has no items. */
+  collections?: Array<{
+    id: string;
+    source: "library" | "user";
+    title: string;
+    poster_url: string;
+    poster_thumbhash?: string;
+  }>;
+}
+
+export async function fetchRecipeCatalog(): Promise<RecipeCatalogResponse> {
+  return recipeCatalogFromV2(await v2("GET /api/v2/sections/recipes"));
+}
+
+/** The GET /api/v2/sections/recipes body keyed by category, as the web reads it. */
+export function recipeCatalogFromV2(
+  catalog: components["schemas"]["RecipeCatalog"],
+): RecipeCatalogResponse {
+  const categories: Partial<Record<Category, RecipeDefinition[]>> = {};
+  for (const group of catalog.categories) {
+    categories[group.category as Category] = group.recipes.map((def) => ({
+      type: def.type,
+      category: def.category as Category,
+      presets: def.presets.map((preset) => ({
+        key: preset.key,
+        display_name: preset.display_name,
+        icon: preset.icon,
+        description_short: preset.description_short,
+        ...(preset.description_long ? { description_long: preset.description_long } : {}),
+        ...(preset.display_name_key ? { display_name_key: preset.display_name_key } : {}),
+        ...(preset.description_short_key
+          ? { description_short_key: preset.description_short_key }
+          : {}),
+        ...(preset.description_long_key
+          ? { description_long_key: preset.description_long_key }
+          : {}),
+        default_params: preset.default_params,
+      })),
+      avoid_duplicates: def.avoid_duplicates,
+      supports_rotation: def.supports_rotation,
+      admin_only: def.admin_only,
+    }));
+  }
+  return { categories };
+}
+
+export async function previewSection(
+  req: PreviewRequest,
+  signal?: AbortSignal,
+): Promise<PreviewResponse> {
+  const result = await v2("POST /api/v2/admin/sections/preview", {
+    signal,
+    body: {
+      ...req,
+      library_id: req.library_id === undefined ? undefined : String(req.library_id),
+      library_ids: req.library_ids?.map(String),
+    },
+  });
+  return {
+    items: result.items.map((item) => ({
+      content_id: item.content_id,
+      title: item.title,
+      poster_path: item.poster_url,
+      poster_thumbhash: item.poster_thumbhash,
+    })),
+    total_count: result.total_count,
+    ...(result.collections?.length && {
+      collections: result.collections.map((card) => ({
+        id: card.id,
+        source: card.source,
+        title: card.title,
+        poster_url: card.poster_url,
+        poster_thumbhash: card.poster_thumbhash,
+      })),
+    }),
+  };
+}

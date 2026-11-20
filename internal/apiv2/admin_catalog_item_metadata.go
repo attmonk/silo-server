@@ -1,0 +1,190 @@
+package apiv2
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/adminjob"
+	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	catalogsvc "github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/policy"
+	"github.com/Silo-Server/silo-server/internal/providerid"
+)
+
+type AdminItemMetadataService interface {
+	CreateItemMetadataRefresh(context.Context, string, adminjob.ItemRefreshMode, int) (*models.AdminJob, error)
+	UpdateCatalogItemMetadata(context.Context, string, handlers.UpdateItemMetadataRequest, []string) (*catalogsvc.ItemDetail, error)
+}
+type AdminItemMetadataUpdate struct {
+	Title            *string   `json:"title,omitempty" nullable:"true"`
+	SortTitle        *string   `json:"sort_title,omitempty" nullable:"true"`
+	OriginalTitle    *string   `json:"original_title,omitempty" nullable:"true"`
+	Overview         *string   `json:"overview,omitempty" nullable:"true"`
+	Tagline          *string   `json:"tagline,omitempty" nullable:"true"`
+	ContentRating    *string   `json:"content_rating,omitempty" nullable:"true"`
+	Year             *int      `json:"year,omitempty" nullable:"true"`
+	Runtime          *int      `json:"runtime,omitempty" nullable:"true"`
+	Genres           *[]string `json:"genres,omitempty" nullable:"true"`
+	Studios          *[]string `json:"studios,omitempty" nullable:"true"`
+	Networks         *[]string `json:"networks,omitempty" nullable:"true"`
+	Countries        *[]string `json:"countries,omitempty" nullable:"true" doc:"Country codes, ISO 3166-1 alpha-2 by convention (US); stored as sent; null clears"`
+	ReleaseDate      *string   `json:"release_date,omitempty" nullable:"true" doc:"Null clears the stored date"`
+	FirstAirDate     *string   `json:"first_air_date,omitempty" nullable:"true" doc:"Null clears the stored date"`
+	LastAirDate      *string   `json:"last_air_date,omitempty" nullable:"true" doc:"Null clears the stored date"`
+	AirTime          *string   `json:"air_time,omitempty" nullable:"true" doc:"Null clears the stored time"`
+	AirTimezone      *string   `json:"air_timezone,omitempty" nullable:"true" doc:"IANA time zone; null clears it"`
+	AirDate          *string   `json:"air_date,omitempty" nullable:"true" doc:"Season or episode air date; null clears it"`
+	Status           *string   `json:"status,omitempty" nullable:"true" enum:"pending,matched,unmatched" doc:"Match status; null leaves it unchanged"`
+	RatingIMDB       *float64  `json:"rating_imdb,omitempty" nullable:"true" doc:"Null clears it, along with any IMDb score a metadata plugin stored"`
+	RatingTMDB       *float64  `json:"rating_tmdb,omitempty" nullable:"true" doc:"Null clears it, along with any TMDB score a metadata plugin stored"`
+	RatingRTCritic   *int      `json:"rating_rt_critic,omitempty" nullable:"true" doc:"Null clears it, along with any Rotten Tomatoes critic score a metadata plugin stored"`
+	RatingRTAudience *int      `json:"rating_rt_audience,omitempty" nullable:"true" doc:"Null clears it, along with any Rotten Tomatoes audience score a metadata plugin stored"`
+	ImdbID           *string   `json:"imdb_id,omitempty" nullable:"true" doc:"IMDb title ID, stored trimmed and in lowercase; an empty string clears it"`
+	TmdbID           *string   `json:"tmdb_id,omitempty" nullable:"true" doc:"TMDB ID, stored trimmed and without a TMDB URL slug (550-fight-club saves as 550); an empty string clears it"`
+	TvdbID           *string   `json:"tvdb_id,omitempty" nullable:"true" doc:"TheTVDB ID, stored trimmed; an empty string clears it"`
+	SeasonNumber     *int      `json:"season_number,omitempty" nullable:"true"`
+	EpisodeNumber    *int      `json:"episode_number,omitempty" nullable:"true"`
+	LockedFields     *[]int    `json:"locked_fields,omitempty" nullable:"true"`
+}
+type AdminItemMetadataUpdateInput struct {
+	ID   string `path:"id" minLength:"1" maxLength:"512"`
+	Body AdminItemMetadataUpdate
+	// RawBody tells an explicit null from an omitted member, which Body
+	// cannot: Huma decodes both to nil.
+	RawBody []byte
+}
+type AdminItemMetadataRefreshInput struct {
+	ID   string `path:"id" minLength:"1" maxLength:"512"`
+	Body struct {
+		Mode string `json:"mode,omitempty" enum:"quick,complete,reset" default:"quick" doc:"quick rescans the item's folder and refreshes its metadata; complete rebuilds the item from its files first; reset is a quick refresh that also clears the item's field locks and every field its providers have no value for, and fails without changing the item when a provider lookup, search or fallback-language lookup fails for any reason other than a not-found answer or an enrichment provider whose key is missing or rejected, or when the item is pinned unmatched; through a library whose metadata language is not the item's own, it keeps the item's own-language title, overview and tagline. getAdminCatalogCapabilities reports item_metadata_reset when reset is accepted; a server without it rejects reset with 422"`
+	}
+}
+
+func registerAdminCatalogItemMetadata(reg *Registry) {
+	op := func(method, suffix, id, summary string) Operation {
+		return Operation{Operation: humaOp(method, Prefix+"/admin/items/{id}"+suffix, id, "admin-catalog", summary), Class: ClassPermissionGated, Permission: policy.PermissionMetadataCuration, ServiceBacked: true, DemoRestricted: isMutatingMethod(method), RetrySafety: RetrySafetyNonRetryable}
+	}
+	refresh := op(http.MethodPost, "/refresh-metadata", "refreshAdminItemMetadata", "Persist an item metadata refresh job for an authorized item.")
+	refresh.DefaultStatus = http.StatusAccepted
+	Register(reg, refresh, reg.refreshAdminItemMetadata)
+	Register(reg, op(http.MethodPatch, "/metadata", "updateAdminItemMetadata", "Apply partial metadata edits and return refreshed catalog detail."), reg.updateAdminItemMetadata)
+}
+func (reg *Registry) refreshAdminItemMetadata(ctx context.Context, in *AdminItemMetadataRefreshInput) (*AdminCatalogJobAcceptedOutput, error) {
+	if reg.deps.AdminItemMetadata == nil {
+		return nil, unavailable("item metadata")
+	}
+	claims := claimsFrom(ctx)
+	job, err := reg.deps.AdminItemMetadata.CreateItemMetadataRefresh(ctx, in.ID, adminjob.ItemRefreshMode(in.Body.Mode), claims.UserID)
+	if err != nil {
+		return nil, collectionProblem(err)
+	}
+	// The job already exists; a failed acting-admin lookup only narrows what
+	// the response shows.
+	actingAdmin, _ := apimw.ActingAdmin(ctx)
+	return &AdminCatalogJobAcceptedOutput{Location: Prefix + "/admin/jobs/" + job.ID, RetryAfter: "5", Body: reg.adminTaskJobOf(ctx, job, actingAdmin)}, nil
+}
+func (reg *Registry) updateAdminItemMetadata(ctx context.Context, in *AdminItemMetadataUpdateInput) (*CatalogItemDetailOutput, error) {
+	if reg.deps.AdminItemMetadata == nil {
+		return nil, unavailable("item metadata")
+	}
+	if problem := rejectMalformedMetadata(&in.Body); problem != nil {
+		return nil, problem
+	}
+	detail, err := reg.deps.AdminItemMetadata.UpdateCatalogItemMetadata(ctx, in.ID, handlers.UpdateItemMetadataRequest(in.Body), clearedItemMetadataFields(in.RawBody))
+	if err != nil {
+		return nil, collectionProblem(err)
+	}
+	// The operation is gated on metadata curation, so the editor gets every
+	// stored rating back.
+	detail.ViewerCurates = true
+	return &CatalogItemDetailOutput{Body: catalogItemDetailOf(detail, reg.ratingSelection(ctx))}, nil
+}
+
+// The item metadata members that hold a calendar date.
+const (
+	memberReleaseDate  = "release_date"
+	memberFirstAirDate = "first_air_date"
+	memberLastAirDate  = "last_air_date"
+	memberAirDate      = "air_date"
+)
+
+// rejectMalformedMetadata refuses a date member that is not a YYYY-MM-DD
+// calendar date, and a provider ID member that is not an ID of its provider.
+// The repositories write these members as text, so PostgreSQL would otherwise
+// fail the write (release_date and air_date, a 500) or store the value as
+// given. Null decodes to nil and clears the date.
+//
+// It first normalizes each provider ID in the body: trimmed, an IMDb ID in
+// lowercase, and a TMDB ID without the slug a TMDB URL carries. Lookups
+// compare these IDs exactly, so a padded or slugged value would miss the item,
+// and a refresh drops a value that fails these checks and restores the
+// item's previous ID. An empty ID stays an edit that clears it.
+func rejectMalformedMetadata(body *AdminItemMetadataUpdate) *Problem {
+	var errs []ProblemError
+	for _, date := range []struct {
+		member string
+		value  *string
+	}{
+		{memberReleaseDate, body.ReleaseDate},
+		{memberFirstAirDate, body.FirstAirDate},
+		{memberLastAirDate, body.LastAirDate},
+		{memberAirDate, body.AirDate},
+	} {
+		if date.value == nil {
+			continue
+		}
+		// PostgreSQL's date type has no year 0.
+		if parsed, err := time.Parse(time.DateOnly, *date.value); err != nil || parsed.Year() < 1 {
+			errs = append(errs, ProblemError{Location: locationBody + "." + date.member, Code: codeInvalid, Detail: "expected a calendar date, YYYY-MM-DD"})
+		}
+	}
+	for _, id := range []struct {
+		member    string
+		value     **string
+		normalize func(string) string
+		valid     func(string) bool
+		detail    string
+	}{
+		{"imdb_id", &body.ImdbID, strings.ToLower, providerid.IsIMDbID, "expected an IMDb ID, such as tt0137523"},
+		{"tmdb_id", &body.TmdbID, catalogsvc.NormalizeTMDBID, providerid.IsPositiveDecimal, "expected a TMDB ID, such as 550"},
+		{"tvdb_id", &body.TvdbID, nil, providerid.IsPositiveDecimal, "expected a TheTVDB ID, such as 81189"},
+	} {
+		if *id.value == nil {
+			continue
+		}
+		value := strings.TrimSpace(**id.value)
+		if id.normalize != nil {
+			value = id.normalize(value)
+		}
+		*id.value = &value
+		if value != "" && !id.valid(value) {
+			errs = append(errs, ProblemError{Location: locationBody + "." + id.member, Code: codeInvalid, Detail: id.detail})
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return NewProblem(TypeValidationFailed, "The request did not pass validation; see errors.").WithErrors(errs...)
+}
+
+// clearedItemMetadataFields lists the clearable members the body sets to
+// null. A null on any other member leaves it unchanged, like omission.
+func clearedItemMetadataFields(raw []byte) []string {
+	// Huma already validated the body; one that does not decode here has no
+	// members to clear.
+	var members map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &members)
+	var cleared []string
+	for _, field := range catalogsvc.ClearableMetadataFields {
+		if value, ok := members[field]; ok && bytes.Equal(bytes.TrimSpace(value), jsonNull) {
+			cleared = append(cleared, field)
+		}
+	}
+	return cleared
+}

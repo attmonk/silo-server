@@ -1,0 +1,967 @@
+package playback
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/embeddedsub"
+	"github.com/Silo-Server/silo-server/internal/fspath"
+	"github.com/Silo-Server/silo-server/internal/httpstream"
+)
+
+// SubtitleCache stores complete SUP, VTT, and ASS subtitle extracts on disk
+// so repeat selections don't re-run a whole-file ffmpeg demux. Even a small
+// text subtitle track can require reading a multi-GB source to completion.
+//
+// Entries are keyed by the source path, subtitle ordinal, source mtime+size,
+// and output format. When the source changes, the lookup key changes and the
+// old entry becomes garbage that eviction reclaims. Entry recency for LRU is
+// tracked by bumping the cache file's mtime on every hit (portable, unlike
+// atime which is often disabled via noatime/relatime mounts).
+//
+// Concurrency: the first requester of an uncached track starts a fill: one
+// extract writing into a temp file that is atomically renamed into the cache
+// on clean ffmpeg exit (and discarded on any error, so a partial entry is
+// never served). Every request for the track while the fill runs, the first
+// included, streams that temp file as it grows, so concurrent requests share
+// one whole-file demux and no viewer's connection can hold up another's.
+// Fills are per process and the cache is on local disk, so requests on other
+// nodes extract for themselves.
+type SubtitleCache struct {
+	// transcodeDir returns the current transcode directory; the cache lives
+	// in a subtitle-cache subdirectory beneath it, created lazily. An empty
+	// return disables the cache for that call.
+	transcodeDir func() string
+	// maxBytes is the total-size eviction budget for committed entries.
+	maxBytes int64
+
+	mu sync.Mutex
+	// inflight maps a cache key to the fill running for it, so another
+	// request can watch it or wait for it.
+	inflight map[string]*SubtitleCacheFill
+
+	// warmSem bounds concurrent background warms server-wide (each warm
+	// demuxes an entire source file — heavy sequential IO). Acquisition is
+	// non-blocking: warms beyond the budget are dropped, not queued; the
+	// next windowed miss for that track re-attempts the warm.
+	warmSem chan struct{}
+
+	// source, when set, reads embedded tracks from kept copies or through
+	// the source's index before the cache demuxes the source
+	// (SetEmbeddedSource). Requests whose options name no track
+	// (StreamExtractOpts.Embedded) skip it.
+	source EmbeddedSubtitleSource
+}
+
+const (
+	subtitleFormatSRT    = "srt"
+	subtitleCodecSubRip  = "subrip"
+	subtitleCodecSSA     = "ssa"
+	subtitleFormatSUP    = "sup"
+	subtitleFormatASS    = "ass"
+	subtitleMuxerWebVTT  = "webvtt"
+	subtitleCacheDirName = "subtitle-cache"
+	// defaultSubtitleCacheMaxBytes caps the cache at 2 GiB — PGS tracks run
+	// 15-80 MB, so this holds a few dozen tracks.
+	// TODO: expose as a config knob following the download.artifact_max_bytes
+	// pattern (internal/config/config.go DownloadConfig.ArtifactMaxBytes).
+	defaultSubtitleCacheMaxBytes = 2 << 30
+	// stalePartMaxAge is how long an orphaned .part temp file (leftover from
+	// a crash mid-fill) survives before eviction sweeps remove it.
+	stalePartMaxAge = time.Hour
+	// subtitleCacheWarmSlots caps concurrent background warms server-wide.
+	// Two lets a second household stream warm while the first is still
+	// demuxing, without letting a burst of playbacks saturate disk IO.
+	subtitleCacheWarmSlots = 2
+	// subtitleCacheWarmTimeout bounds a single background warm. A full-file
+	// demux of a large remux on network storage can take minutes; anything
+	// beyond this is stuck and should release its slot.
+	subtitleCacheWarmTimeout = 30 * time.Minute
+)
+
+// SUPExtractFunc runs one ffmpeg subtitle extract described by opts, writing
+// output to opts.Writer. Production callers pass StreamExtractSubtitle;
+// tests substitute fakes. The cache invokes it with the caller's options
+// rewritten as needed (tee writer for fills, cached-.sup input for windowed
+// serves, cleared window for background warms).
+type SUPExtractFunc func(ctx context.Context, opts StreamExtractOpts) error
+
+// NewSubtitleCache builds a cache rooted under the transcode directory
+// returned by transcodeDir at call time (so runtime config changes are
+// honored). Pass nil to disable caching entirely.
+func NewSubtitleCache(transcodeDir func() string) *SubtitleCache {
+	return &SubtitleCache{
+		transcodeDir: transcodeDir,
+		maxBytes:     defaultSubtitleCacheMaxBytes,
+		inflight:     make(map[string]*SubtitleCacheFill),
+		warmSem:      make(chan struct{}, subtitleCacheWarmSlots),
+	}
+}
+
+// ServeExtract serves an embedded subtitle using the cache for complete
+// tracks. Explicit text windows stream without caching; SUP retains its
+// progressive window and background-warming behavior in ServeSUPExtract.
+// Only one request fills the cache; other viewers stream independently.
+//
+// A complete track comes from, in order: the cache; a fill that converts
+// the track kept in blob storage or read through the source's index (the
+// EmbeddedSubtitleSource, when set and opts.Embedded names the track); a
+// fill that demuxes the source, which also keeps the track. A window comes
+// from the kept track or the source's index, else from a demux of the
+// source.
+func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, extract SUPExtractFunc) error {
+	if err := r.Context().Err(); err != nil {
+		return err
+	}
+	// Full demuxes can outlive the API listener's absolute write timeout.
+	// Reuse the media-stream deadline so progress continues while stalled
+	// connections still have a bounded write lifetime.
+	w = httpstream.NewRollingDeadlineWriter(w)
+	_, format := streamExtractOutput(opts.SourceCodec, opts.TargetFormat)
+	if format == subtitleFormatSUP {
+		return c.ServeSUPExtract(w, r, opts, extract)
+	}
+	if format == subtitleMuxerWebVTT {
+		format = SubtitleFormatVTTV3
+	}
+	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
+	if format == subtitleFormatASS {
+		w.Header().Set("Content-Type", "text/x-ssa; charset=utf-8")
+	}
+	full := opts.SeekSeconds == 0 && opts.DurationSeconds == 0
+	if full && c.serveCached(w, r, opts, format) {
+		return nil
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	if full {
+		return c.streamFullTrack(r.Context(), w, opts, format, c.sourced(extract))
+	}
+	if served, err := c.serveWindowFromSource(r.Context(), w, opts, extract); served {
+		return err
+	}
+	opts.Writer = w
+	return admitted(extract)(r.Context(), opts)
+}
+
+func (c *SubtitleCache) serveCached(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, format string) bool {
+	cached, modTime, ok := c.lookup(opts.InputPath, opts.TrackIndex, format)
+	if !ok {
+		return false
+	}
+	defer func() { _ = cached.Close() }()
+	w.Header().Set("Cache-Control", "private, no-cache")
+	http.ServeContent(w, r, "", modTime, cached)
+	return true
+}
+
+// ServeSUPExtract serves the .sup extract for one source+track described by
+// opts (opts.Writer is ignored; the cache supplies it). Full-track requests
+// (no AllowWindow): a cache hit is served with http.ServeContent (Range
+// support, Content-Length, Last-Modified from the source file's mtime,
+// revalidatable instead of no-store); a miss streams the track through a
+// fill shared with concurrent requests (streamFullTrack), published as the
+// cache entry on clean extract exit and discarded on any error — a partial
+// entry is never served. Windowed requests (opts.AllowWindow): the output
+// covers only a slice of the track, so it is never cached; but when the
+// full-track entry already exists, the windowed extract runs against the
+// small cached .sup instead of re-demuxing the original file, and when it
+// doesn't, a detached background warm is kicked off so subsequent windows
+// get that fast path. A nil receiver disables caching and just streams.
+//
+// The caller sets any extra response headers (e.g. CORS) before calling.
+// The returned error is the extract error; cache hits return nil.
+func (c *SubtitleCache) ServeSUPExtract(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, extract SUPExtractFunc) error {
+	if opts.AllowWindow {
+		return c.serveWindowedSUP(w, r, opts, extract)
+	}
+
+	if cached, modTime, ok := c.Lookup(opts.InputPath, opts.TrackIndex); ok {
+		defer func() { _ = cached.Close() }()
+		slog.DebugContext(r.Context(), "subtitle stream served from cache",
+			"input", opts.InputPath, "track", opts.TrackIndex)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "private, no-cache")
+		http.ServeContent(w, r, "", modTime, cached)
+		return nil
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	return c.streamFullTrack(r.Context(), w, opts, subtitleFormatSUP, c.sourced(extract))
+}
+
+// streamFullTrack streams a complete track that was not cached when the
+// request arrived. The first request starts a fill and every request that
+// arrives while it runs watches it, so the track is demuxed once however many
+// requests ask for it (a player opening a sidecar can send several). When
+// the fill commits, a watcher finishes from the cache entry. When the fill
+// fails, the watcher reports its error. When the fill cannot serve the rest
+// (its temp file failed, or its entry could not be published), the watcher
+// runs its own extract and skips the bytes it already sent; an extract of the
+// same source writes the same bytes. A request with no usable fill (caching off,
+// or a text batch that writes its file only at the end) extracts for itself.
+func (c *SubtitleCache) streamFullTrack(ctx context.Context, w io.Writer, opts StreamExtractOpts, format string, extract SUPExtractFunc) error {
+	fill, inflight := c.reserveFill(opts.InputPath, opts.TrackIndex, format, true)
+	switch {
+	case fill != nil:
+		// A fill that committed after the caller's lookup already holds the track.
+		if served, err := c.copyCachedFrom(w, opts, format, 0); served {
+			fill.Discard()
+			return err
+		}
+		fill.join()
+		c.startFill(ctx, opts, extract, fill)
+	case inflight != nil && inflight.join():
+		fill = inflight
+	default:
+		opts.Writer = w
+		return extract(ctx, opts)
+	}
+	sent, err := fill.watch(ctx, w)
+	fill.leave()
+	if err != nil {
+		return err
+	}
+	if served, err := c.copyCachedFrom(w, opts, format, sent); served {
+		return err
+	}
+	if err := fill.extractError(); err != nil {
+		return err
+	}
+	opts.Writer = &skipWriter{w: w, n: sent}
+	return extract(ctx, opts)
+}
+
+// startFill runs extract into fill in the background. The extract writes
+// only to the fill's temp file, which its viewers read. When the last viewer
+// leaves before the end (a start that gave up, a replan or seek that reloads
+// the item) the extract carries on in a warm slot, since the same track is
+// usually asked for again seconds later and the demux behind it can take
+// minutes on a large remux; with every slot busy it stops and the fill is
+// discarded.
+func (c *SubtitleCache) startFill(ctx context.Context, opts StreamExtractOpts, extract SUPExtractFunc, fill *SubtitleCacheFill) {
+	extractCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subtitleCacheWarmTimeout)
+	// holdsSlot is guarded by fill.mu, under which orphaned runs.
+	var holdsSlot bool
+	fill.mu.Lock()
+	fill.orphaned = func() bool {
+		select {
+		case c.warmSem <- struct{}{}:
+			holdsSlot = true
+			return true
+		default:
+			cancel()
+			return false
+		}
+	}
+	fill.mu.Unlock()
+	opts.Writer = fill.Tee(io.Discard)
+	go func() {
+		defer cancel()
+		start := time.Now()
+		err := extract(extractCtx, opts)
+		// With the extract over, a viewer leaving has nothing to keep running.
+		fill.mu.Lock()
+		fill.orphaned = nil
+		viewersLeft := holdsSlot
+		fill.mu.Unlock()
+		if viewersLeft {
+			<-c.warmSem
+		}
+		if err != nil {
+			fill.fail(err)
+		} else if err := fill.Commit(); err != nil {
+			slog.WarnContext(ctx, "subtitle cache commit failed",
+				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
+		} else if viewersLeft {
+			slog.InfoContext(ctx, "subtitle cache fill finished after its viewers left",
+				"input", opts.InputPath, "track", opts.TrackIndex,
+				"elapsed_ms", time.Since(start).Milliseconds())
+		}
+	}()
+}
+
+// copyCachedFrom writes the committed entry for opts' track from byte off.
+// It reports false when there is no entry at least off bytes long.
+func (c *SubtitleCache) copyCachedFrom(w io.Writer, opts StreamExtractOpts, format string, off int64) (bool, error) {
+	f, _, ok := c.lookup(opts.InputPath, opts.TrackIndex, format)
+	if !ok {
+		return false, nil
+	}
+	defer func() { _ = f.Close() }()
+	if info, err := f.Stat(); err != nil || info.Size() < off {
+		return false, nil
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return false, nil
+	}
+	return true, copyAndFlush(w, f)
+}
+
+// skipWriter drops the first n bytes written to it: a viewer that falls back
+// to its own extract already received them from a fill.
+type skipWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (s *skipWriter) Write(p []byte) (int, error) {
+	if s.n >= int64(len(p)) {
+		s.n -= int64(len(p))
+		return len(p), nil
+	}
+	skipped := int(s.n)
+	s.n = 0
+	n, err := s.w.Write(p[skipped:])
+	return skipped + n, err
+}
+
+func (s *skipWriter) Flush() {
+	if f, ok := s.w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// serveWindowedSUP streams a windowed slice of the track. The output is a
+// position-dependent slice so it is never cached itself, but the cache still
+// speeds it up: with a committed full-track entry the extract's input is
+// rewritten to the cached .sup (15-80 MB, so the -ss scan is near-instant
+// versus re-demuxing a multi-GB source); without one, a background warm is
+// started so later windows — the client re-fetches on every seek — hit the
+// fast path.
+func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, extract SUPExtractFunc) error {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	cachedPath, _, cached := c.cachedEntryPath(opts.InputPath, opts.TrackIndex)
+	warm := c.readSourced(extract, false)
+	// A window open to the end is most of the track: the cached .sup answers
+	// it at once, where the source would be read whole first.
+	if !cached || opts.DurationSeconds > 0 {
+		served, err := c.serveWindowFromSource(r.Context(), w, opts, extract)
+		if served {
+			if !cached {
+				// As after a demuxed window: keep the track and cache its .sup
+				// for the windows to come.
+				c.WarmInBackground(opts, warm)
+			}
+			return err
+		}
+		if errors.Is(err, errSlowWindowRead) || errors.Is(err, embeddedsub.ErrSlowReads) {
+			// Reading every cue of the track the same way would take far
+			// longer, or already gave way to slow reads, and its random
+			// reads would starve the playback stream reading the same
+			// file; the demux reads it in order. A kept track whose local
+			// copy was slow to fetch is kept again this way, as every warm
+			// did before the index.
+			warm = func(ctx context.Context, opts StreamExtractOpts) error {
+				return c.demuxAndKeep(ctx, opts, extract)
+			}
+		}
+	}
+	if cached {
+		slog.DebugContext(r.Context(), "windowed subtitle extract using cached full track",
+			"input", opts.InputPath, "track", opts.TrackIndex, "cache_entry", cachedPath)
+		opts.InputPath = cachedPath
+		opts.InputIsExtractedSup = true
+		if firstCue, err := readSupFirstCue(cachedPath); err == nil {
+			opts = windowFromCachedSup(opts, firstCue)
+		}
+	} else {
+		c.WarmInBackground(opts, warm)
+		// The window demuxes the source; a refusal must come before the
+		// status goes out to answer busy. The warm, in its own warm slot,
+		// goes on either way, so the next window can read the cached .sup.
+		release, err := admitDemux()
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	opts.Writer = w
+	return extract(r.Context(), opts)
+}
+
+// WarmInBackground starts a detached full-track extract that fills the cache
+// entry for opts' source+track, so future windowed requests can extract from
+// the small cached .sup instead of the original file. The warm runs on a
+// background context with a generous timeout — it must survive the request
+// that triggered it. BeginFill's in-flight coalescing guarantees at most one
+// fill per track (a concurrent client-driven fill wins and the warm is
+// skipped), and warmSem bounds warms server-wide: beyond the budget the warm
+// is dropped, not queued — the next windowed miss re-attempts it. A nil
+// receiver is a no-op.
+func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtractFunc) {
+	if c == nil || extract == nil {
+		return
+	}
+	select {
+	case c.warmSem <- struct{}{}:
+	default:
+		slog.Debug("subtitle cache warm skipped: all warm slots busy",
+			"input", opts.InputPath, "track", opts.TrackIndex)
+		return
+	}
+	fill, _ := c.reserveFill(opts.InputPath, opts.TrackIndex, subtitleFormatSUP, true)
+	if fill == nil {
+		// Another fill (client-driven or a previous warm) is already in
+		// flight, or the cache is unusable — either way, nothing to do.
+		<-c.warmSem
+		return
+	}
+
+	// Full-track options: the warm ignores the triggering request's window
+	// and writes only to the cache temp file (no response writer).
+	opts.SeekSeconds = 0
+	opts.DurationSeconds = 0
+	opts.AllowWindow = false
+	opts.InputIsExtractedSup = false
+	opts.Writer = fill.Tee(io.Discard)
+
+	go func() {
+		defer func() { <-c.warmSem }()
+		ctx, cancel := context.WithTimeout(context.Background(), subtitleCacheWarmTimeout)
+		defer cancel()
+
+		start := time.Now()
+		slog.Info("subtitle cache warm started",
+			"input", opts.InputPath, "track", opts.TrackIndex)
+		if err := extract(ctx, opts); err != nil {
+			fill.fail(err)
+			slog.Warn("subtitle cache warm failed",
+				"input", opts.InputPath, "track", opts.TrackIndex,
+				"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+			return
+		}
+		if err := fill.Commit(); err != nil {
+			slog.Warn("subtitle cache warm commit failed",
+				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
+			return
+		}
+		slog.Info("subtitle cache warm finished",
+			"input", opts.InputPath, "track", opts.TrackIndex,
+			"elapsed_ms", time.Since(start).Milliseconds())
+	}()
+}
+
+// dir resolves the cache directory, or "" when caching is disabled.
+func (c *SubtitleCache) dir() string {
+	if c == nil || c.transcodeDir == nil {
+		return ""
+	}
+	base := c.transcodeDir()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, subtitleCacheDirName)
+}
+
+// subtitleCacheKeyPrefix identifies a source file + track ordinal regardless
+// of source version; the full key appends mtime+size so a changed source
+// yields a different filename.
+func subtitleCacheKeyPrefix(inputPath string, trackIndex int) string {
+	sum := sha256.Sum256([]byte(inputPath))
+	return fmt.Sprintf("%x-s%d-", sum[:12], trackIndex)
+}
+
+func subtitleCacheFormatKey(inputPath string, trackIndex int, mtime time.Time, size int64, format string) string {
+	return fmt.Sprintf("%s%d-%d.%s", subtitleCacheKeyPrefix(inputPath, trackIndex), mtime.UnixNano(), size, format)
+}
+
+// Lookup opens the cached full-track .sup extract for the given source file
+// and subtitle stream ordinal. The source is stat'ed on every lookup: an
+// mtime or size mismatch means the entry (if any) is stale and reads as a
+// miss. On a hit the returned modTime is the *source* file's mtime — stable
+// across hits, suitable for Last-Modified — while the cache file's own mtime
+// is bumped to record recency for LRU eviction. The caller owns closing the
+// returned file.
+func (c *SubtitleCache) Lookup(inputPath string, trackIndex int) (f *os.File, modTime time.Time, ok bool) {
+	return c.lookup(inputPath, trackIndex, subtitleFormatSUP)
+}
+
+func (c *SubtitleCache) lookup(inputPath string, trackIndex int, format string) (f *os.File, modTime time.Time, ok bool) {
+	path, modTime, ok := c.cachedFormatEntryPath(inputPath, trackIndex, format)
+	if !ok {
+		return nil, time.Time{}, false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, time.Time{}, false
+	}
+	return f, modTime, true
+}
+
+// LookupText returns a complete cached text subtitle artifact. The cache key
+// includes the source path, mtime, size, stream ordinal, and output format.
+func (c *SubtitleCache) LookupText(inputPath string, trackIndex int, format string) ([]byte, bool) {
+	format = normalizeCachedTextSubtitleFormat(format)
+	if format == "" {
+		return nil, false
+	}
+	f, _, ok := c.lookup(inputPath, trackIndex, format)
+	if !ok {
+		return nil, false
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(f)
+	return data, err == nil
+}
+
+// LookupWebVTT returns the complete WebVTT rendition native playback cached
+// for a text track (ServeExtract stores SubRip and forced-VTT extracts under
+// the vtt key), so another reader can reuse it instead of demuxing the source.
+func (c *SubtitleCache) LookupWebVTT(inputPath string, trackIndex int) ([]byte, bool) {
+	f, _, ok := c.lookup(inputPath, trackIndex, SubtitleFormatVTTV3)
+	if !ok {
+		return nil, false
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(f)
+	return data, err == nil
+}
+
+// ExtractText reuses a complete cached text track or extracts it once for this
+// request. The fill captures source identity before extraction, so a replaced
+// source cannot publish an old extract under the new file's cache key.
+func (c *SubtitleCache) ExtractText(ctx context.Context, inputPath string, trackIndex int, format string, extract func(context.Context) ([]byte, error)) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	format = normalizeCachedTextSubtitleFormat(format)
+	if format == "" {
+		return nil, fmt.Errorf("unsupported cached subtitle format")
+	}
+	// Share another request's extraction rather than demuxing the source a
+	// second time: look the track up, else reserve the fill, else wait for
+	// whoever holds it and look again. A fill that commits between a busy
+	// reservation and the wait is found by the next lookup, and one that
+	// commits during the last wait by the lookup after the loop. The rounds
+	// are bounded, so a cache that can't take a fill (disabled, unwritable)
+	// falls through to extracting without one.
+	var fill *SubtitleCacheFill
+	for round := 0; round < textFillRounds && fill == nil; round++ {
+		if data, ok := c.LookupText(inputPath, trackIndex, format); ok {
+			return data, nil
+		}
+		if fill = c.beginFill(inputPath, trackIndex, format); fill != nil {
+			break
+		}
+		if afterBusyTextFill != nil {
+			afterBusyTextFill()
+		}
+		c.waitForTextFill(ctx, inputPath, TextSubtitleTrack{Ordinal: trackIndex, Format: format})
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	// Another filler may have committed since the last lookup: between it
+	// and this reservation, or during the last round's wait. Reuse its entry
+	// rather than extracting again.
+	if data, ok := c.LookupText(inputPath, trackIndex, format); ok {
+		if fill != nil {
+			fill.Discard()
+		}
+		return data, nil
+	}
+	data, err := extract(ctx)
+	if err != nil {
+		if fill != nil {
+			fill.Discard()
+		}
+		return nil, err
+	}
+	if fill != nil {
+		// Tee records cache write failures; its destination io.Discard cannot fail.
+		_, _ = fill.Tee(io.Discard).Write(data)
+		if err := fill.Commit(); err != nil {
+			slog.WarnContext(ctx, "subtitle cache commit failed", "error", err)
+		}
+	}
+	return data, nil
+}
+
+// textFillRounds bounds ExtractText's lookup, reserve and wait rounds.
+const textFillRounds = 3
+
+// afterBusyTextFill runs when ExtractText finds another fill in progress,
+// before it waits; tests use it to finish that fill in between.
+var afterBusyTextFill func()
+
+// afterTextFillWaitCapture runs once waitForTextFill holds an in-flight
+// fill's done channel, before it blocks on it; tests use it to act while a
+// request is waiting.
+var afterTextFillWaitCapture func()
+
+func normalizeCachedTextSubtitleFormat(format string) string {
+	switch strings.ToLower(strings.TrimPrefix(strings.TrimSpace(format), ".")) {
+	case subtitleFormatSRT, subtitleCodecSubRip:
+		return subtitleFormatSRT
+	case subtitleFormatASS, subtitleCodecSSA:
+		return subtitleFormatASS
+	default:
+		return ""
+	}
+}
+
+// cachedEntryPath reports whether a committed entry exists for the given
+// source+track and returns its path plus the source file's mtime. Like
+// Lookup it stats the source on every call (a changed source reads as a
+// miss) and bumps the entry's mtime to record recency for LRU eviction.
+// Callers that hand the path to an external reader (ffmpeg) rather than
+// opening it themselves use this instead of Lookup.
+func (c *SubtitleCache) cachedEntryPath(inputPath string, trackIndex int) (path string, srcModTime time.Time, ok bool) {
+	return c.cachedFormatEntryPath(inputPath, trackIndex, subtitleFormatSUP)
+}
+
+func (c *SubtitleCache) cachedFormatEntryPath(inputPath string, trackIndex int, format string) (path string, srcModTime time.Time, ok bool) {
+	dir := c.dir()
+	if dir == "" {
+		return "", time.Time{}, false
+	}
+	src, err := fspath.Stat(inputPath)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+	path = filepath.Join(dir, subtitleCacheFormatKey(inputPath, trackIndex, src.ModTime(), src.Size(), format))
+	if _, err := os.Stat(path); err != nil {
+		return "", time.Time{}, false
+	}
+	// Recency bump for LRU. Best-effort: a failure (e.g. read-only remount)
+	// only degrades eviction ordering, not correctness.
+	now := time.Now()
+	if err := os.Chtimes(path, now, now); err != nil {
+		slog.Debug("subtitle cache recency bump failed", "path", path, "error", err)
+	}
+	return path, src.ModTime(), true
+}
+
+// SubtitleCacheFill is an in-progress cache population for one track. Bytes
+// are written to a temp file via the writer returned by Tee; Commit renames
+// it into place atomically, Discard throws it away. Exactly one of Commit or
+// Discard must be called.
+type SubtitleCacheFill struct {
+	c          *SubtitleCache
+	key        string
+	inputPath  string
+	trackIndex int
+	srcMtime   time.Time
+	srcSize    int64
+	tmp        *os.File
+	// progressive marks a fill whose extract streams through Tee, so its
+	// temp file grows as the extract runs and requests can watch it. A text
+	// batch writes its files directly and only at the end.
+	progressive bool
+	// done is closed when the fill commits or is discarded.
+	done chan struct{}
+
+	// mu guards the fields below and the temp file: watchers read it under
+	// mu, and Commit and Discard close it under mu.
+	mu sync.Mutex
+	// failed flips when a temp-file write errors (e.g. disk full); the tee
+	// keeps serving its writer and Commit refuses to publish the entry.
+	failed bool
+	// written counts the bytes in the temp file.
+	written int64
+	// grew is closed and replaced whenever written grows or failed flips,
+	// and closed for good when the fill ends.
+	grew  chan struct{}
+	ended bool
+	// err is why a fill was discarded, for the requests watching it.
+	err error
+	// viewers counts the requests watching the fill.
+	viewers int
+	// orphaned runs under mu when the last viewer leaves before the fill
+	// ends; it reports whether the extract carries on without viewers.
+	orphaned  func() bool
+	abandoned bool
+}
+
+// errSubtitleSourceChanged discards a fill whose source changed during the
+// extract: its bytes belong to neither version of the file.
+var errSubtitleSourceChanged = errors.New("source file changed during extract; cache fill discarded")
+
+// BeginFill reserves the in-flight slot for the given track and creates the
+// temp file the tee will write into. Returns nil — meaning "stream without
+// caching" — when caching is disabled, the source can't be stat'ed, the
+// cache directory can't be created, or another fill for the same track is
+// already in flight.
+func (c *SubtitleCache) BeginFill(inputPath string, trackIndex int) *SubtitleCacheFill {
+	return c.beginFill(inputPath, trackIndex, subtitleFormatSUP)
+}
+
+func (c *SubtitleCache) beginFill(inputPath string, trackIndex int, format string) *SubtitleCacheFill {
+	fill, _ := c.reserveFill(inputPath, trackIndex, format, false)
+	return fill
+}
+
+// reserveFill reserves the in-flight slot for a track and creates the fill's
+// temp file. When another fill already holds the slot it returns that fill
+// as inflight instead. Both are nil when caching is unavailable.
+func (c *SubtitleCache) reserveFill(inputPath string, trackIndex int, format string, progressive bool) (fill, inflight *SubtitleCacheFill) {
+	dir := c.dir()
+	if dir == "" {
+		return nil, nil
+	}
+	src, err := fspath.Stat(inputPath)
+	if err != nil {
+		return nil, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.Warn("subtitle cache dir create failed", "dir", dir, "error", err)
+		return nil, nil
+	}
+	fill = &SubtitleCacheFill{
+		c:           c,
+		key:         subtitleCacheFormatKey(inputPath, trackIndex, src.ModTime(), src.Size(), format),
+		inputPath:   inputPath,
+		trackIndex:  trackIndex,
+		srcMtime:    src.ModTime(),
+		srcSize:     src.Size(),
+		progressive: progressive,
+		done:        make(chan struct{}),
+		grew:        make(chan struct{}),
+	}
+	// Held until the temp file exists, so a request that finds the fill
+	// cannot watch it before then.
+	fill.mu.Lock()
+	defer fill.mu.Unlock()
+	c.mu.Lock()
+	if busy := c.inflight[fill.key]; busy != nil {
+		c.mu.Unlock()
+		return nil, busy
+	}
+	c.inflight[fill.key] = fill
+	c.mu.Unlock()
+
+	tmp, err := os.CreateTemp(dir, fill.key+".part-*")
+	if err != nil {
+		fill.endLocked()
+		c.release(fill)
+		slog.Warn("subtitle cache temp create failed", "dir", dir, "error", err)
+		return nil, nil
+	}
+	fill.tmp = tmp
+	return fill, nil
+}
+
+func (c *SubtitleCache) release(fill *SubtitleCacheFill) {
+	c.mu.Lock()
+	if c.inflight[fill.key] == fill {
+		close(fill.done)
+		delete(c.inflight, fill.key)
+	}
+	c.mu.Unlock()
+}
+
+// join adds a viewer to a progressive fill that is still running. It
+// reports false when the fill cannot be watched.
+func (f *SubtitleCacheFill) join() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.progressive || f.ended || f.abandoned {
+		return false
+	}
+	f.viewers++
+	return true
+}
+
+// leave removes a viewer. The last one to leave a running fill orphans it.
+func (f *SubtitleCacheFill) leave() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.viewers--
+	if f.viewers == 0 && !f.ended && f.orphaned != nil {
+		orphaned := f.orphaned
+		f.orphaned = nil
+		f.abandoned = !orphaned()
+	}
+}
+
+// watch writes the fill's output to w as the extract produces it, reading
+// the temp file, so a slow or stalled client holds up only itself. It
+// returns the bytes written once the fill ends or its temp file fails, or
+// with the error that ended ctx or a write.
+func (f *SubtitleCacheFill) watch(ctx context.Context, w io.Writer) (int64, error) {
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	var sent int64
+	for {
+		f.mu.Lock()
+		if f.ended || f.failed {
+			f.mu.Unlock()
+			return sent, nil
+		}
+		if sent == f.written {
+			grew := f.grew
+			f.mu.Unlock()
+			select {
+			case <-grew:
+				continue
+			case <-ctx.Done():
+				return sent, ctx.Err()
+			}
+		}
+		n, _ := f.tmp.ReadAt(buf[:min(int64(len(buf)), f.written-sent)], sent)
+		f.mu.Unlock()
+		if n == 0 {
+			// An unreadable temp file: the caller extracts the rest itself.
+			return sent, nil
+		}
+		if _, err := w.Write(buf[:n]); err != nil {
+			return sent, err
+		}
+		sent += int64(n)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+}
+
+// fail discards the fill, recording err for the requests watching it.
+func (f *SubtitleCacheFill) fail(err error) {
+	f.mu.Lock()
+	f.err = err
+	f.mu.Unlock()
+	f.Discard()
+}
+
+func (f *SubtitleCacheFill) extractError() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.err
+}
+
+// endLocked marks the fill ended and wakes its watchers.
+func (f *SubtitleCacheFill) endLocked() {
+	if !f.ended {
+		f.ended = true
+		close(f.grew)
+	}
+}
+
+// Tee wraps the response writer so every chunk also lands in the fill's temp
+// file. The returned writer implements http.Flusher (delegating to w when w
+// does), so copyAndFlush keeps flushing cues to the client in real time. A
+// temp-file write failure never fails the response — the fill is marked
+// failed and the client keeps streaming.
+func (f *SubtitleCacheFill) Tee(w io.Writer) io.Writer {
+	flusher, _ := w.(http.Flusher)
+	return &subtitleTeeWriter{w: w, flusher: flusher, fill: f}
+}
+
+type subtitleTeeWriter struct {
+	w       io.Writer
+	flusher http.Flusher
+	fill    *SubtitleCacheFill
+}
+
+func (t *subtitleTeeWriter) Write(p []byte) (int, error) {
+	t.fill.record(p)
+	return t.w.Write(p)
+}
+
+func (t *subtitleTeeWriter) Flush() {
+	if t.flusher != nil {
+		t.flusher.Flush()
+	}
+}
+
+// record appends p to the temp file and wakes the fill's watchers.
+func (f *SubtitleCacheFill) record(p []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failed || f.ended {
+		return
+	}
+	if _, err := f.tmp.Write(p); err != nil {
+		f.failed = true
+		slog.Warn("subtitle cache tee write failed; continuing uncached",
+			"track", f.trackIndex, "error", err)
+	} else {
+		f.written += int64(len(p))
+	}
+	close(f.grew)
+	f.grew = make(chan struct{})
+}
+
+// Commit publishes the temp file as the cache entry: fsync, atomic rename,
+// stale-sibling cleanup, then size-cap eviction. It refuses to publish (and
+// discards instead) when a tee write failed or when the source file changed
+// while the extract ran — a partial or mismatched entry must never be served.
+func (f *SubtitleCacheFill) Commit() error {
+	f.mu.Lock()
+	failed := f.failed
+	f.mu.Unlock()
+	if failed {
+		f.Discard()
+		return errors.New("subtitle cache fill had write errors; discarded")
+	}
+	if src, err := fspath.Stat(f.inputPath); err != nil ||
+		!src.ModTime().Equal(f.srcMtime) || src.Size() != f.srcSize {
+		f.fail(errSubtitleSourceChanged)
+		return errSubtitleSourceChanged
+	}
+	defer f.c.release(f)
+
+	f.mu.Lock()
+	err := f.publishLocked()
+	f.endLocked()
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(f.tmp.Name())
+	f.c.removeStaleSiblings(dir, f.inputPath, f.trackIndex, f.key)
+	f.c.evict(dir)
+	return nil
+}
+
+// publishLocked syncs, closes, and renames the temp file into place.
+func (f *SubtitleCacheFill) publishLocked() error {
+	tmpPath := f.tmp.Name()
+	if err := f.tmp.Sync(); err != nil {
+		f.closeAndRemoveTmp()
+		return fmt.Errorf("sync subtitle cache temp: %w", err)
+	}
+	if err := f.tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close subtitle cache temp: %w", err)
+	}
+	if err := os.Rename(tmpPath, filepath.Join(filepath.Dir(tmpPath), f.key)); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("publish subtitle cache entry: %w", err)
+	}
+	return nil
+}
+
+// Discard abandons the fill: the temp file is removed and the in-flight slot
+// released. Safe to call after a failed Commit (idempotent enough — the temp
+// file is already gone and re-removal is a no-op).
+func (f *SubtitleCacheFill) Discard() {
+	f.mu.Lock()
+	f.closeAndRemoveTmp()
+	f.endLocked()
+	f.mu.Unlock()
+	f.c.release(f)
+}
+
+func (f *SubtitleCacheFill) closeAndRemoveTmp() {
+	_ = f.tmp.Close()
+	if err := os.Remove(f.tmp.Name()); err != nil && !os.IsNotExist(err) {
+		slog.Warn("subtitle cache temp remove failed", "path", f.tmp.Name(), "error", err)
+	}
+}

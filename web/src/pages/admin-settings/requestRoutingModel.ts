@@ -1,0 +1,1220 @@
+import type { PluginAdminForm, PluginAdminFormField, RequestIntegration } from "@/api/types";
+import { joinList } from "@/lib/appLocale";
+import type {
+  RequestRoute,
+  RequestRouteBody,
+  RequestRouteConditions,
+  RequestRouteDestination,
+  RequestRouteFacts,
+  RequestRouteMediaType,
+  RequestRoutePreviewRule,
+} from "@/api/v2/adminRequests";
+import { evaluateShowWhen } from "@/components/admin/plugins/schemaFormUtils";
+import { numberText, t, type MessageKey, type TextValues } from "@/i18n";
+import { routingCountryName, routingLanguageName } from "@/lib/requestRoutingOptions";
+import { tmdbGenreName } from "@/lib/tmdbGenres";
+
+import {
+  ROUTING_OWNED_CONFIG_KEYS,
+  SERVICE_KIND_KEY,
+  serverConfigSchema,
+  serverInstallation,
+  type RequestRouterInstallation,
+} from "./requestServerModel";
+
+/* ------------------------------------------------------------------------ */
+/* Drafts and wire bodies                                                    */
+/* ------------------------------------------------------------------------ */
+
+/** One tier's destination while it is being edited. */
+export interface RouteDestinationDraft {
+  integration_id: string;
+  overrides: Record<string, unknown>;
+}
+
+export function destinationDraft(dest: RequestRouteDestination | undefined): RouteDestinationDraft {
+  return { integration_id: dest?.integration_id ?? "", overrides: { ...(dest?.overrides ?? {}) } };
+}
+
+/** The wire form of a destination: nothing at all when no server is chosen. */
+export function destinationBody(draft: RouteDestinationDraft): RequestRouteDestination {
+  if (!draft.integration_id) return {};
+  const overrides = Object.fromEntries(
+    Object.entries(draft.overrides).filter(([, value]) => value !== undefined),
+  );
+  return Object.keys(overrides).length > 0
+    ? { integration_id: draft.integration_id, overrides }
+    : { integration_id: draft.integration_id };
+}
+
+/** A media type's Everything else while it is being edited. */
+export interface FallbackDraft {
+  hd: RouteDestinationDraft;
+  uhd: RouteDestinationDraft;
+}
+
+/** Everything else's body: no conditions, always on, and no 4K server means no 4K copy. */
+export function fallbackBody(route: RequestRoute, draft: FallbackDraft): RequestRouteBody {
+  return {
+    name: route.name,
+    enabled: true,
+    conditions: {},
+    hd: destinationBody(draft.hd),
+    uhd: destinationBody(draft.uhd),
+    skip_uhd: false,
+  };
+}
+
+/** A tier's destination as an editor holds it: a server, or (4K) no copy. */
+export interface DestinationChoice {
+  dest: RouteDestinationDraft;
+  skip: boolean;
+}
+
+/** A rule's two destinations as its editor starts them. */
+export function initialChoices(source: RequestRoute | null): {
+  hd: DestinationChoice;
+  uhd: DestinationChoice;
+} {
+  return {
+    hd: { dest: destinationDraft(source?.hd), skip: false },
+    uhd: { dest: destinationDraft(source?.uhd), skip: source?.skip_uhd ?? false },
+  };
+}
+
+/** The caption under the 4K version. */
+export function fourKCaption(forceDual: boolean): string {
+  return forceDual
+    ? t("web.admin.settings.requests.destination.fourKCaptionForceDual")
+    : t("web.admin.settings.requests.destination.fourKCaption");
+}
+
+/** A routing rule while it is being edited. */
+export interface RouteRuleDraft {
+  name: string;
+  enabled: boolean;
+  conditions: RequestRouteConditions;
+  hd: RouteDestinationDraft;
+  uhd: RouteDestinationDraft;
+  skipUhd: boolean;
+}
+
+export function ruleDraft(route: RequestRoute | null): RouteRuleDraft {
+  return {
+    name: route?.name ?? "",
+    enabled: route?.enabled ?? true,
+    conditions: { ...(route?.conditions ?? {}) },
+    hd: destinationDraft(route?.hd),
+    uhd: destinationDraft(route?.uhd),
+    skipUhd: route?.skip_uhd ?? false,
+  };
+}
+
+/** The list conditions, each an include field and its exclude twin. */
+export const LIST_CONDITION_FIELDS = {
+  genre: ["genre_ids", "exclude_genre_ids"],
+  language: ["original_languages", "exclude_original_languages"],
+  country: ["origin_countries", "exclude_origin_countries"],
+  network: ["network_ids", "exclude_network_ids"],
+  studio: ["company_ids", "exclude_company_ids"],
+  requester: ["requester_user_ids", "exclude_requester_user_ids"],
+  keyword: ["keyword_ids", "exclude_keyword_ids"],
+  status: ["series_statuses", "exclude_series_statuses"],
+} as const satisfies Record<
+  string,
+  readonly [keyof RequestRouteConditions, keyof RequestRouteConditions]
+>;
+
+export type ListConditionKind = keyof typeof LIST_CONDITION_FIELDS;
+type ListField = (typeof LIST_CONDITION_FIELDS)[ListConditionKind][number];
+
+const STRING_LISTS: ReadonlySet<ListField> = new Set([
+  "original_languages",
+  "exclude_original_languages",
+  "origin_countries",
+  "exclude_origin_countries",
+  "series_statuses",
+  "exclude_series_statuses",
+]);
+
+const LIST_FIELDS: readonly ListField[] = Object.values(LIST_CONDITION_FIELDS).flat();
+
+/** Drops unset conditions so the body carries only the ones that narrow. */
+export function cleanConditions(conditions: RequestRouteConditions): RequestRouteConditions {
+  const out: RequestRouteConditions = {};
+  if (conditions.anime !== undefined) out.anime = conditions.anime;
+  for (const key of LIST_FIELDS) {
+    const values = conditions[key] as readonly (string | number)[] | undefined;
+    if (values && values.length > 0) (out as Record<string, unknown>)[key] = [...values];
+  }
+  if (conditions.year_from) out.year_from = conditions.year_from;
+  if (conditions.year_to) out.year_to = conditions.year_to;
+  if (conditions.max_content_rating) out.max_content_rating = conditions.max_content_rating;
+  return out;
+}
+
+export function ruleBody(
+  draft: RouteRuleDraft,
+  mediaType?: RequestRouteMediaType,
+): RequestRouteBody {
+  return {
+    ...(mediaType ? { media_type: mediaType } : {}),
+    name: draft.name.trim(),
+    enabled: draft.enabled,
+    conditions: cleanConditions(draft.conditions),
+    hd: destinationBody(draft.hd),
+    uhd: draft.skipUhd ? {} : destinationBody(draft.uhd),
+    skip_uhd: draft.skipUhd,
+  };
+}
+
+/** A saved rule's body, e.g. to flip its switch without opening it. */
+export function routeBody(route: RequestRoute): RequestRouteBody {
+  return ruleBody(ruleDraft(route));
+}
+
+/* ------------------------------------------------------------------------ */
+/* Condition rows: what the rule editor shows                                */
+/* ------------------------------------------------------------------------ */
+
+export type ConditionKind = "anime" | "year" | "rating" | ListConditionKind;
+
+/**
+ * One line of "Which requests". A list line holds its values as strings (IDs
+ * too) and says whether a title must have any of them or none of them.
+ */
+export type ConditionRow =
+  | { kind: "anime"; anime: boolean }
+  | { kind: "year"; from?: number; to?: number }
+  | { kind: "rating"; max: string }
+  | { kind: ListConditionKind; mode: "any" | "none"; values: string[] };
+
+export type ListConditionRow = Extract<ConditionRow, { mode: "any" | "none" }>;
+
+/** The order conditions are listed and read in. */
+const ROW_ORDER: readonly ConditionKind[] = [
+  "anime",
+  "genre",
+  "language",
+  "country",
+  "year",
+  "status",
+  "rating",
+  "network",
+  "studio",
+  "requester",
+  "keyword",
+];
+
+export function isListRow(row: ConditionRow): row is ListConditionRow {
+  return "mode" in row;
+}
+
+/** The rows a rule's saved conditions read as, one per set field. */
+export function conditionRows(conditions: RequestRouteConditions): ConditionRow[] {
+  const rows: ConditionRow[] = [];
+  for (const kind of ROW_ORDER) {
+    if (kind === "anime") {
+      if (conditions.anime !== undefined) rows.push({ kind, anime: conditions.anime });
+    } else if (kind === "year") {
+      if (conditions.year_from || conditions.year_to) {
+        rows.push({
+          kind,
+          from: conditions.year_from || undefined,
+          to: conditions.year_to || undefined,
+        });
+      }
+    } else if (kind === "rating") {
+      if (conditions.max_content_rating) rows.push({ kind, max: conditions.max_content_rating });
+    } else {
+      const [include, exclude] = LIST_CONDITION_FIELDS[kind];
+      for (const [field, mode] of [
+        [include, "any"],
+        [exclude, "none"],
+      ] as const) {
+        const values = conditions[field] as readonly (string | number)[] | undefined;
+        if (values?.length) rows.push({ kind, mode, values: values.map(String) });
+      }
+    }
+  }
+  return rows;
+}
+
+/** A row's wire field, e.g. `exclude_genre_ids`, for its inline error. */
+export function rowField(row: ConditionRow): string {
+  if (row.kind === "anime") return "anime";
+  if (row.kind === "year") return "year_from";
+  if (row.kind === "rating") return "max_content_rating";
+  const [include, exclude] = LIST_CONDITION_FIELDS[row.kind];
+  return row.mode === "any" ? include : exclude;
+}
+
+/**
+ * The conditions a set of rows saves as. Rows left empty save nothing, and two
+ * rows naming the same field save the values of both.
+ */
+export function rowsToConditions(rows: readonly ConditionRow[]): RequestRouteConditions {
+  const out: Record<string, unknown> = {};
+  for (const row of rows) {
+    if (row.kind === "anime") out.anime = row.anime;
+    else if (row.kind === "year") {
+      if (row.from) out.year_from = row.from;
+      if (row.to) out.year_to = row.to;
+    } else if (row.kind === "rating") {
+      if (row.max) out.max_content_rating = row.max;
+    } else if (row.values.length > 0) {
+      const field = rowField(row) as ListField;
+      const values = STRING_LISTS.has(field) ? row.values : row.values.map(Number);
+      const current = (out[field] as (string | number)[] | undefined) ?? [];
+      out[field] = [...new Set([...current, ...values])];
+    }
+  }
+  return out as RequestRouteConditions;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Sentences                                                                 */
+/* ------------------------------------------------------------------------ */
+
+export interface RoutingNames {
+  users?: ReadonlyMap<number, string>;
+  /** TMDB network names, for series. Network and studio IDs overlap, so each has its own map. */
+  networks?: ReadonlyMap<number, string>;
+  /** TMDB studio (company) names, for movies. */
+  studios?: ReadonlyMap<number, string>;
+}
+
+/**
+ * Formats a catalog message: `t` for text shown in the interface language,
+ * `englishText` for text the client saves (a rule's automatic name).
+ */
+type Text = (id: MessageKey, values?: TextValues) => string;
+
+/** "A", "A or B", "A, B or C". */
+function orList(values: readonly string[], tx: Text = t): string {
+  if (values.length <= 1) return values[0] ?? "";
+  return tx("web.admin.settings.requests.model.orList", {
+    // Not joinList: a language's list format can add its own "and" (German
+    // "A, B und C"), which would contradict the "or" this message adds.
+    items: values.slice(0, -1).join(", "),
+    last: values.at(-1)!,
+  });
+}
+
+/** "A", "A and B", "A, B and C". */
+function andList(values: readonly string[]): string {
+  if (values.length <= 1) return values[0] ?? "";
+  return t("web.admin.settings.requests.model.andList", {
+    items: values.slice(0, -1).join(", "),
+    last: values.at(-1)!,
+  });
+}
+
+/** "isn't Horror", "is neither Horror nor War", "is none of A, B or C". */
+function notOneOf(values: readonly string[]): string {
+  if (values.length === 1)
+    return t("web.admin.settings.requests.model.clause.isNot", { value: values[0]! });
+  if (values.length === 2) {
+    return t("web.admin.settings.requests.model.clause.isNeither", {
+      first: values[0]!,
+      second: values[1]!,
+    });
+  }
+  return t("web.admin.settings.requests.model.clause.isNoneOf", { values: orList(values) });
+}
+
+function yearRangeLabel(from?: number, to?: number, tx: Text = t): string {
+  if (from && to) {
+    // A single year has no message; it takes the screen's digits only when
+    // shown, never in a name saved through `englishText`.
+    if (from === to) return tx === t ? numberText(from) : String(from);
+    return tx("web.admin.settings.requests.model.years.range", { from, to });
+  }
+  if (from) return tx("web.admin.settings.requests.model.years.from", { from });
+  if (to) return tx("web.admin.settings.requests.model.years.to", { to });
+  return "";
+}
+
+function genreNames(
+  ids: readonly number[],
+  mediaType: RequestRouteMediaType,
+  tx: Text = t,
+): string[] {
+  return ids.map((id) => tmdbGenreName(id, mediaType, tx));
+}
+
+/** The name of a brand with no known name, in a sentence or (`title`) a rule name. */
+const BRAND_FALLBACK: Record<"network" | "studio", { sentence: MessageKey; title: MessageKey }> = {
+  network: {
+    sentence: "web.admin.settings.requests.model.networkFallback",
+    title: "web.admin.settings.requests.model.networkFallbackTitle",
+  },
+  studio: {
+    sentence: "web.admin.settings.requests.model.studioFallback",
+    title: "web.admin.settings.requests.model.studioFallbackTitle",
+  },
+};
+
+function brandNames(
+  ids: readonly number[],
+  kind: "network" | "studio",
+  names: RoutingNames,
+  form: "sentence" | "title" = "sentence",
+  tx: Text = t,
+): string[] {
+  const map = kind === "network" ? names.networks : names.studios;
+  return ids.map((id) => map?.get(id) ?? tx(BRAND_FALLBACK[kind][form], { id: String(id) }));
+}
+
+function userNames(ids: readonly number[], names: RoutingNames, tx: Text = t): string[] {
+  return ids.map(
+    (id) =>
+      names.users?.get(id) ??
+      tx("web.admin.settings.requests.model.accountFallback", { id: String(id) }),
+  );
+}
+
+type SeriesStatus = NonNullable<RequestRouteConditions["series_statuses"]>[number];
+
+/** Each status's name; the schema's statuses must all be here. */
+const SERIES_STATUS_LABELS = {
+  returning: "web.admin.settings.requests.model.status.returning",
+  in_production: "web.admin.settings.requests.model.status.inProduction",
+  upcoming: "web.admin.settings.requests.model.status.upcoming",
+  ended: "web.admin.settings.requests.model.status.ended",
+  cancelled: "web.admin.settings.requests.model.status.cancelled",
+} satisfies Record<SeriesStatus, MessageKey>;
+
+/**
+ * A series' statuses as the server stores them, in the order the editor
+ * offers them. Each `label` is read in the interface language when used.
+ */
+export const SERIES_STATUSES: readonly { value: string; readonly label: string }[] = Object.entries(
+  SERIES_STATUS_LABELS,
+).map(([value, key]) => ({
+  value,
+  get label() {
+    return t(key);
+  },
+}));
+
+/**
+ * One-click status sets. A rule stores the statuses, not the set, so
+ * changing a set never changes a saved rule. Each `label` is read in the
+ * interface language when used.
+ */
+export const SERIES_STATUS_PRESETS: readonly {
+  readonly label: string;
+  labelKey: MessageKey;
+  values: readonly string[];
+}[] = [
+  {
+    labelKey: "web.admin.settings.requests.model.statusPreset.continuing",
+    get label() {
+      return t(this.labelKey);
+    },
+    values: ["returning", "in_production", "upcoming"],
+  },
+  {
+    labelKey: "web.admin.settings.requests.model.statusPreset.ended",
+    get label() {
+      return t(this.labelKey);
+    },
+    values: ["ended", "cancelled"],
+  },
+];
+
+/** "Ended"; a status newer than the editor reads as the server sent it. */
+export function seriesStatusLabel(status: string, tx: Text = t): string {
+  const key = (SERIES_STATUS_LABELS as Record<string, MessageKey>)[status];
+  return key ? tx(key) : status;
+}
+
+/** The preset a set of statuses is exactly, if any. */
+export function seriesStatusPreset(values: readonly string[]) {
+  return SERIES_STATUS_PRESETS.find(
+    (preset) =>
+      preset.values.length === values.length && preset.values.every((v) => values.includes(v)),
+  );
+}
+
+function statusNames(values: readonly string[], tx: Text = t): string[] {
+  return values.map((value) => seriesStatusLabel(value, tx));
+}
+
+function lowerStatusNames(values: readonly string[]): string[] {
+  return statusNames(values).map((name) => name.toLowerCase());
+}
+
+/** The clauses of a rule's conditions, in reading order: "is anime", "is rated PG or lower". */
+function conditionClauses(
+  conditions: RequestRouteConditions,
+  mediaType: RequestRouteMediaType,
+  names: RoutingNames = {},
+): string[] {
+  const c = conditions;
+  const out: string[] = [];
+  const clause = (key: MessageKey, list: readonly string[]) => t(key, { values: orList(list) });
+  if (c.anime === true) out.push(t("web.admin.settings.requests.model.clause.anime"));
+  if (c.anime === false) out.push(t("web.admin.settings.requests.model.clause.notAnime"));
+  if (c.genre_ids?.length)
+    out.push(
+      clause("web.admin.settings.requests.model.clause.genre", genreNames(c.genre_ids, mediaType)),
+    );
+  if (c.exclude_genre_ids?.length) out.push(notOneOf(genreNames(c.exclude_genre_ids, mediaType)));
+  if (c.original_languages?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.language",
+        c.original_languages.map((code) => routingLanguageName(code)),
+      ),
+    );
+  }
+  if (c.exclude_original_languages?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.notLanguage",
+        c.exclude_original_languages.map((code) => routingLanguageName(code)),
+      ),
+    );
+  }
+  if (c.origin_countries?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.country",
+        c.origin_countries.map((code) => routingCountryName(code)),
+      ),
+    );
+  }
+  if (c.exclude_origin_countries?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.notCountry",
+        c.exclude_origin_countries.map((code) => routingCountryName(code)),
+      ),
+    );
+  }
+  const years = yearRangeLabel(c.year_from, c.year_to);
+  if (years)
+    out.push(t("web.admin.settings.requests.model.clause.years", { media_type: mediaType, years }));
+  if (c.series_statuses?.length)
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.status",
+        lowerStatusNames(c.series_statuses),
+      ),
+    );
+  if (c.exclude_series_statuses?.length) {
+    out.push(notOneOf(lowerStatusNames(c.exclude_series_statuses)));
+  }
+  if (c.max_content_rating) {
+    out.push(
+      t("web.admin.settings.requests.model.clause.rating", { rating: c.max_content_rating }),
+    );
+  }
+  if (c.network_ids?.length)
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.network",
+        brandNames(c.network_ids, "network", names),
+      ),
+    );
+  if (c.exclude_network_ids?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.notNetwork",
+        brandNames(c.exclude_network_ids, "network", names),
+      ),
+    );
+  }
+  if (c.company_ids?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.studio",
+        brandNames(c.company_ids, "studio", names),
+      ),
+    );
+  }
+  if (c.exclude_company_ids?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.notStudio",
+        brandNames(c.exclude_company_ids, "studio", names),
+      ),
+    );
+  }
+  if (c.requester_user_ids?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.requester",
+        userNames(c.requester_user_ids, names),
+      ),
+    );
+  }
+  if (c.exclude_requester_user_ids?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.notRequester",
+        userNames(c.exclude_requester_user_ids, names),
+      ),
+    );
+  }
+  if (c.keyword_ids?.length) {
+    out.push(clause("web.admin.settings.requests.model.clause.keyword", c.keyword_ids.map(String)));
+  }
+  if (c.exclude_keyword_ids?.length) {
+    out.push(
+      clause(
+        "web.admin.settings.requests.model.clause.notKeyword",
+        c.exclude_keyword_ids.map(String),
+      ),
+    );
+  }
+  return out;
+}
+
+/** "When a series is Family or Kids and is rated PG or lower". */
+export function ruleSentence(
+  conditions: RequestRouteConditions,
+  mediaType: RequestRouteMediaType,
+  names: RoutingNames = {},
+): string {
+  const clauses = conditionClauses(conditions, mediaType, names);
+  if (clauses.length === 0)
+    return t("web.admin.settings.requests.model.ruleSentenceEvery", { media_type: mediaType });
+  return t("web.admin.settings.requests.model.ruleSentenceWhen", {
+    media_type: mediaType,
+    conditions: andList(clauses),
+  });
+}
+
+/**
+ * A short name for a rule, from its conditions: "Anime", "Not English",
+ * "Family or Kids, PG or lower". Pass `englishText` for a name the client saves.
+ */
+export function autoRuleName(
+  conditions: RequestRouteConditions,
+  mediaType: RequestRouteMediaType,
+  names: RoutingNames = {},
+  tx: Text = t,
+): string {
+  const c = conditions;
+  const orListTx = (list: readonly string[]) => orList(list, tx);
+  const parts: string[] = [];
+  const not = (list: readonly string[]) =>
+    tx("web.admin.settings.requests.model.autoName.not", { values: orListTx(list) });
+  const named = (key: MessageKey, list: readonly string[]) => tx(key, { values: orListTx(list) });
+  if (c.anime === true) parts.push(tx("web.admin.settings.requests.model.autoName.anime"));
+  if (c.anime === false) parts.push(tx("web.admin.settings.requests.model.autoName.notAnime"));
+  if (c.genre_ids?.length) parts.push(orListTx(genreNames(c.genre_ids, mediaType, tx)));
+  if (c.exclude_genre_ids?.length) parts.push(not(genreNames(c.exclude_genre_ids, mediaType, tx)));
+  if (c.original_languages?.length)
+    parts.push(orListTx(c.original_languages.map((code) => routingLanguageName(code, tx))));
+  if (c.exclude_original_languages?.length) {
+    parts.push(not(c.exclude_original_languages.map((code) => routingLanguageName(code, tx))));
+  }
+  if (c.origin_countries?.length)
+    parts.push(orListTx(c.origin_countries.map((code) => routingCountryName(code, tx))));
+  if (c.exclude_origin_countries?.length) {
+    parts.push(
+      named(
+        "web.admin.settings.requests.model.autoName.notCountry",
+        c.exclude_origin_countries.map((code) => routingCountryName(code, tx)),
+      ),
+    );
+  }
+  const years = yearRangeLabel(c.year_from, c.year_to, tx);
+  if (years) parts.push(years);
+  if (c.series_statuses?.length) {
+    const preset = seriesStatusPreset(c.series_statuses);
+    parts.push(preset ? tx(preset.labelKey) : orListTx(statusNames(c.series_statuses, tx)));
+  }
+  if (c.exclude_series_statuses?.length) {
+    parts.push(not(statusNames(c.exclude_series_statuses, tx)));
+  }
+  if (c.max_content_rating) {
+    parts.push(
+      tx("web.admin.settings.requests.model.autoName.rating", { rating: c.max_content_rating }),
+    );
+  }
+  if (c.network_ids?.length) {
+    parts.push(orListTx(brandNames(c.network_ids, "network", names, "title", tx)));
+  }
+  if (c.exclude_network_ids?.length) {
+    parts.push(
+      named(
+        "web.admin.settings.requests.model.autoName.notNetwork",
+        brandNames(c.exclude_network_ids, "network", names, "title", tx),
+      ),
+    );
+  }
+  if (c.company_ids?.length) {
+    parts.push(orListTx(brandNames(c.company_ids, "studio", names, "title", tx)));
+  }
+  if (c.exclude_company_ids?.length) {
+    parts.push(
+      named(
+        "web.admin.settings.requests.model.autoName.notStudio",
+        brandNames(c.exclude_company_ids, "studio", names, "title", tx),
+      ),
+    );
+  }
+  if (c.requester_user_ids?.length) {
+    parts.push(
+      named(
+        "web.admin.settings.requests.model.autoName.requester",
+        userNames(c.requester_user_ids, names, tx),
+      ),
+    );
+  }
+  if (c.exclude_requester_user_ids?.length) {
+    parts.push(
+      named(
+        "web.admin.settings.requests.model.autoName.notRequester",
+        userNames(c.exclude_requester_user_ids, names, tx),
+      ),
+    );
+  }
+  if (c.keyword_ids?.length)
+    parts.push(
+      named("web.admin.settings.requests.model.autoName.keyword", c.keyword_ids.map(String)),
+    );
+  if (c.exclude_keyword_ids?.length) {
+    parts.push(
+      named(
+        "web.admin.settings.requests.model.autoName.notKeyword",
+        c.exclude_keyword_ids.map(String),
+      ),
+    );
+  }
+  const name = parts.join(", ") || tx("web.admin.settings.requests.model.autoName.newRule");
+  return name.length > 100 ? `${name.slice(0, 99)}…` : name;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Destinations                                                              */
+/* ------------------------------------------------------------------------ */
+
+const OVERRIDE_LABELS: Record<string, MessageKey> = {
+  root_folder: "web.admin.settings.requests.model.override.rootFolder",
+  quality_profile_id: "web.admin.settings.requests.model.override.qualityProfile",
+  tags: "web.admin.settings.requests.model.override.tags",
+  series_type: "web.admin.settings.requests.model.override.seriesType",
+  minimum_availability: "web.admin.settings.requests.model.override.minimumAvailability",
+  search_on_add: "web.admin.settings.requests.model.override.searchOnAdd",
+  season_folder: "web.admin.settings.requests.model.override.seasonFolder",
+};
+
+/** The overrides shown on a destination's own rows; the rest go under More settings. */
+const INLINE_OVERRIDES: readonly string[] = ["root_folder", "quality_profile_id", "tags"];
+
+/**
+ * Overrides whose value already reads as a name. A root folder's option label
+ * adds the free space to the path, which is noise in a summary.
+ */
+const SELF_NAMED_OVERRIDES = new Set(["root_folder"]);
+
+/**
+ * Override keys whose values are IDs on the server (a quality profile, tags, a
+ * Sonarr metadata language), so naming them takes the server's options.
+ */
+export const SERVER_NAMED_OVERRIDES: ReadonlySet<string> = new Set([
+  "quality_profile_id",
+  "tags",
+  "metadata_language",
+]);
+
+export interface OverrideNames {
+  /** The server's loaded options (root folders, quality profiles, tags), by field key. */
+  options?: Readonly<Record<string, readonly { value: string; label: string }[]>>;
+  /** The server's plugin form, for field labels and fixed choices. */
+  fields?: readonly PluginAdminFormField[];
+}
+
+function overrideValueLabel(key: string, value: unknown, names: OverrideNames): string {
+  if (Array.isArray(value)) return joinList(value.map((v) => overrideValueLabel(key, v, names)));
+  if (typeof value === "boolean") {
+    return t(
+      value
+        ? "web.admin.settings.requests.model.override.on"
+        : "web.admin.settings.requests.model.override.off",
+    );
+  }
+  const raw = String(value);
+  if (SELF_NAMED_OVERRIDES.has(key)) return raw;
+  const choices = names.options?.[key] ?? names.fields?.find((f) => f.key === key)?.options;
+  return choices?.find((choice) => choice.value === raw)?.label ?? raw;
+}
+
+export function overrideLabel(key: string, names: OverrideNames = {}): string {
+  const own = OVERRIDE_LABELS[key];
+  if (own) return t(own);
+  return names.fields?.find((field) => field.key === key)?.label ?? key;
+}
+
+function presentOverrides(overrides: Record<string, unknown> | undefined): [string, unknown][] {
+  const entries = Object.entries(overrides ?? {}).filter(
+    ([, value]) =>
+      value !== undefined && value !== null && !(Array.isArray(value) && value.length === 0),
+  );
+  const rank = (key: string) => {
+    const i = INLINE_OVERRIDES.indexOf(key);
+    return i === -1 ? INLINE_OVERRIDES.length : i;
+  };
+  return entries.sort(([a], [b]) => rank(a) - rank(b));
+}
+
+/**
+ * "Folder /anime · Quality HD-1080p · Tags anime". Values are named from the
+ * server's options when they are loaded, and shown as the stored IDs when not.
+ */
+export function overridesSummary(
+  overrides: Record<string, unknown> | undefined,
+  names: OverrideNames = {},
+): string {
+  return presentOverrides(overrides)
+    .map(([key, value]) =>
+      t("web.admin.settings.requests.model.overrideSummaryItem", {
+        setting: overrideLabel(key, names),
+        value: overrideValueLabel(key, value, names),
+      }),
+    )
+    .join(" · ");
+}
+
+/**
+ * Where a destination sends a copy, naming only what it overrides:
+ * "Sonarr Anime · /tv/anime · Anime 1080p · anime · Series type: Anime".
+ */
+export function destinationSentence(
+  dest: RequestRouteDestination,
+  servers: readonly Pick<RequestIntegration, "id" | "name">[],
+  names: OverrideNames = {},
+): string {
+  const server = servers.find((candidate) => candidate.id === dest.integration_id);
+  const parts = [server?.name ?? t("web.admin.settings.requests.model.missingServer")];
+  for (const [key, value] of presentOverrides(dest.overrides)) {
+    const label = overrideValueLabel(key, value, names);
+    parts.push(
+      INLINE_OVERRIDES.includes(key)
+        ? label
+        : t("web.admin.settings.requests.model.overrideSetting", {
+            setting: overrideLabel(key, names),
+            value: label,
+          }),
+    );
+  }
+  return parts.join(" · ");
+}
+
+/** Whether two destinations send a copy to the same place with the same settings. */
+export function sameDestination(a: RequestRouteDestination, b: RequestRouteDestination): boolean {
+  return (
+    (a.integration_id ?? "") === (b.integration_id ?? "") &&
+    stableJSON(a.overrides ?? {}) === stableJSON(b.overrides ?? {})
+  );
+}
+
+function stableJSON(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJSON).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJSON(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+export type Tier = "hd" | "uhd";
+
+/** Whether a rule decides a tier for the titles it matches: sends it, or (4K) makes none. */
+export function decidesTier(route: Pick<RequestRoute, "hd" | "uhd" | "skip_uhd">, tier: Tier) {
+  return tier === "hd"
+    ? Boolean(route.hd.integration_id)
+    : Boolean(route.uhd.integration_id) || route.skip_uhd;
+}
+
+/**
+ * What a rule's "pass it on" choice means for a tier: Everything else's
+ * destination when no enabled rule below decides that copy, and the rules
+ * below otherwise. `below` is every rule after this one.
+ */
+export function passThroughLabel(
+  tier: Tier,
+  below: readonly RequestRoute[],
+  fallback: Pick<RequestRoute, "hd" | "uhd"> | undefined,
+  servers: readonly Pick<RequestIntegration, "id" | "name">[],
+): string {
+  if (below.some((rule) => rule.enabled && decidesTier(rule, tier))) {
+    return t("web.admin.settings.requests.model.passThrough.rulesBelow");
+  }
+  const dest = tier === "hd" ? fallback?.hd : fallback?.uhd;
+  const server = servers.find((candidate) => candidate.id === dest?.integration_id);
+  if (server)
+    return t("web.admin.settings.requests.model.passThrough.fallback", { server: server.name });
+  return t(
+    tier === "hd"
+      ? "web.admin.settings.requests.model.passThrough.fallbackNone"
+      : "web.admin.settings.requests.model.passThrough.fallbackNo4K",
+  );
+}
+
+const OVERRIDABLE_CONTROLS = new Set(["SELECT", "MULTI_SELECT", "SWITCH"]);
+
+/**
+ * The plugin fields a route can override on this server: the server's own
+ * form minus the keys routing sets and the service kind, and minus fields the
+ * form would not show for this server (Radarr's minimum availability on a
+ * Sonarr server).
+ */
+export function overrideFields(
+  descriptor: PluginAdminForm | undefined,
+  serverConfig: Record<string, unknown>,
+): PluginAdminFormField[] {
+  if (!descriptor) return [];
+  return descriptor.fields.filter(
+    (field) =>
+      OVERRIDABLE_CONTROLS.has(field.control) &&
+      field.key !== SERVICE_KIND_KEY &&
+      !ROUTING_OWNED_CONFIG_KEYS.includes(field.key) &&
+      evaluateShowWhen(field.show_when, serverConfig, descriptor.fields),
+  );
+}
+
+/** The fields a route can override on a server, from its plugin's form. */
+export function serverOverrideFields(
+  server: RequestIntegration,
+  installations: RequestRouterInstallation[],
+): PluginAdminFormField[] {
+  const entry = serverInstallation(installations, server.installation_id, server.capability_id);
+  return overrideFields(serverConfigSchema(entry).descriptor, server.plugin_config ?? {});
+}
+
+/** A destination's fields: Folder, Quality and Tags on their own rows, the rest under More settings. */
+export function splitOverrideFields(fields: readonly PluginAdminFormField[]): {
+  inline: PluginAdminFormField[];
+  more: PluginAdminFormField[];
+} {
+  const inline = INLINE_OVERRIDES.flatMap((key) => fields.filter((field) => field.key === key));
+  const more = fields.filter((field) => !INLINE_OVERRIDES.includes(field.key));
+  return { inline, more };
+}
+
+/** Whether a server's form offers Sonarr's Anime series type. */
+export function offersAnimeSeriesType(fields: readonly PluginAdminFormField[]): boolean {
+  return fields.some(
+    (field) =>
+      field.key === "series_type" && (field.options ?? []).some((opt) => opt.value === "anime"),
+  );
+}
+
+/* ------------------------------------------------------------------------ */
+/* Content ratings                                                           */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Each US rating's own minimum age, as the server's `access.Normalize` gives
+ * it. A rule's "rated X or lower" compares these ages, not the parental
+ * tiers, so "TV-Y7 or lower" does not take TV-PG and "PG-13 or lower" does
+ * not take TV-14. Keyed by the canonical token (letters, digits and "+").
+ */
+const RATING_AGES: Readonly<Record<string, number>> = {
+  G: 0,
+  TVY: 0,
+  TVG: 0,
+  TVY7: 7,
+  TVY7FV: 7,
+  PG: 8,
+  TVPG: 8,
+  PG13: 13,
+  TV14: 14,
+  R: 17,
+  TVMA: 17,
+  NC17: 18,
+};
+
+/** The minimum age a US rating stands for; undefined for one the server would not read. */
+export function ratingAge(rating: string | undefined): number | undefined {
+  const canon = (rating ?? "")
+    .trim()
+    .replace(/^rated\s+/i, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9+]/g, "");
+  return RATING_AGES[canon];
+}
+
+/** The US ratings a rule can cap at, youngest first. */
+export const ROUTING_RATINGS: readonly string[] = [
+  "G",
+  "TV-Y",
+  "TV-G",
+  "TV-Y7",
+  "PG",
+  "TV-PG",
+  "PG-13",
+  "TV-14",
+  "R",
+].sort((a, b) => ratingAge(a)! - ratingAge(b)!);
+
+/* ------------------------------------------------------------------------ */
+/* Try a title: facts and the trace                                          */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * A routing rating in words: "PG-13", or "PG12 (JP)" for a title's own
+ * country's rating, which the server prefixes with the country code.
+ */
+export function ratingLabel(rating: string): string {
+  const match = /^([A-Za-z]{2,3}):(.+)$/.exec(rating);
+  return match
+    ? t("web.admin.settings.requests.model.countryRating", {
+        rating: match[2]!,
+        country: match[1]!.toUpperCase(),
+      })
+    : rating;
+}
+
+/** "anime · Japanese · Japan · 2001 · Ended · Rated PG · Animation, Fantasy". */
+export function factsSentence(facts: RequestRouteFacts, mediaType: RequestRouteMediaType): string {
+  return [
+    facts.anime ? t("web.admin.settings.requests.model.facts.anime") : null,
+    facts.original_language ? routingLanguageName(facts.original_language) : null,
+    facts.origin_countries.length > 0
+      ? joinList(facts.origin_countries.map((code) => routingCountryName(code)))
+      : null,
+    facts.year ? String(facts.year) : null,
+    mediaType === "series"
+      ? facts.series_status
+        ? seriesStatusLabel(facts.series_status)
+        : t("web.admin.settings.requests.model.facts.statusUnknown")
+      : null,
+    facts.content_rating
+      ? t("web.admin.settings.requests.model.facts.rated", {
+          rating: ratingLabel(facts.content_rating),
+        })
+      : t("web.admin.settings.requests.model.facts.noRating"),
+    facts.genre_ids.length > 0 ? joinList(genreNames(facts.genre_ids, mediaType)) : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+export interface TraceContext {
+  facts: RequestRouteFacts;
+  mediaType: RequestRouteMediaType;
+  names: RoutingNames;
+  /** The account the preview routed as; undefined for anyone. */
+  requesterUserId?: number;
+}
+
+/** A title's fact as a trace reads it: "genre is Animation, Family", or "no genres". */
+function has(values: readonly string[], none: MessageKey, label: MessageKey): string {
+  return values.length > 0 ? t(label, { values: joinList([...values]) }) : t(none);
+}
+
+/** "<fact> (wants <wanted>)", or (`except`) "<fact> (wants anything but <wanted>)". */
+function miss(fact: string, wanted: string, except = false): string {
+  return t(
+    except
+      ? "web.admin.settings.requests.model.trace.missExcept"
+      : "web.admin.settings.requests.model.trace.miss",
+    { fact, wanted },
+  );
+}
+
+/**
+ * Why a title fails one condition of a rule, from the preview's facts:
+ * "genre is Animation (wants Family or Kids)", "no rating (wants PG or lower)".
+ * Year bounds are reported once, as `year_from`, for both keys.
+ */
+function traceMissSentence(
+  key: string,
+  conditions: RequestRouteConditions,
+  ctx: TraceContext,
+): string {
+  const { facts, mediaType, names } = ctx;
+  const c = conditions;
+  const genres = has(
+    genreNames(facts.genre_ids, mediaType),
+    "web.admin.settings.requests.model.trace.noGenres",
+    "web.admin.settings.requests.model.trace.genreIs",
+  );
+  const language = has(
+    facts.original_language ? [routingLanguageName(facts.original_language)] : [],
+    "web.admin.settings.requests.model.trace.noLanguage",
+    "web.admin.settings.requests.model.trace.languageIs",
+  );
+  const countries = has(
+    facts.origin_countries.map((code) => routingCountryName(code)),
+    "web.admin.settings.requests.model.trace.noCountry",
+    "web.admin.settings.requests.model.trace.countryIs",
+  );
+  const requester =
+    ctx.requesterUserId === undefined ? undefined : userNames([ctx.requesterUserId], names)[0];
+  const requestedBy = requester
+    ? t("web.admin.settings.requests.model.trace.requestedBy", { user: requester })
+    : t("web.admin.settings.requests.model.trace.requestedByAnyone");
+  switch (key) {
+    case "anime":
+      return t(
+        c.anime
+          ? "web.admin.settings.requests.model.trace.notAnime"
+          : "web.admin.settings.requests.model.trace.anime",
+      );
+    case "genre_ids":
+      return miss(genres, orList(genreNames(c.genre_ids ?? [], mediaType)));
+    case "exclude_genre_ids":
+      return miss(genres, orList(genreNames(c.exclude_genre_ids ?? [], mediaType)), true);
+    case "original_languages":
+      return miss(
+        language,
+        orList((c.original_languages ?? []).map((code) => routingLanguageName(code))),
+      );
+    case "exclude_original_languages":
+      return miss(
+        language,
+        orList((c.exclude_original_languages ?? []).map((code) => routingLanguageName(code))),
+        true,
+      );
+    case "origin_countries":
+      return miss(
+        countries,
+        orList((c.origin_countries ?? []).map((code) => routingCountryName(code))),
+      );
+    case "exclude_origin_countries":
+      return miss(
+        countries,
+        orList((c.exclude_origin_countries ?? []).map((code) => routingCountryName(code))),
+        true,
+      );
+    case "year_from":
+    case "year_to":
+      return miss(
+        facts.year
+          ? t("web.admin.settings.requests.model.trace.yearIs", { year: facts.year })
+          : t("web.admin.settings.requests.model.trace.noYear"),
+        yearRangeLabel(c.year_from, c.year_to),
+      );
+    case "series_statuses":
+    case "exclude_series_statuses": {
+      const is = facts.series_status
+        ? t("web.admin.settings.requests.model.trace.statusIs", {
+            status: seriesStatusLabel(facts.series_status),
+          })
+        : t("web.admin.settings.requests.model.trace.noStatus");
+      return miss(is, orList(statusNames(c[key] ?? [])), key !== "series_statuses");
+    }
+    case "max_content_rating":
+      return t("web.admin.settings.requests.model.trace.missRating", {
+        fact: facts.content_rating
+          ? t("web.admin.settings.requests.model.trace.ratedAs", {
+              rating: ratingLabel(facts.content_rating),
+            })
+          : t("web.admin.settings.requests.model.trace.noRating"),
+        rating: c.max_content_rating ?? "",
+      });
+    case "network_ids":
+    case "exclude_network_ids": {
+      const on = has(
+        brandNames(facts.network_ids, "network", names),
+        "web.admin.settings.requests.model.trace.noNetwork",
+        "web.admin.settings.requests.model.trace.networkIs",
+      );
+      return miss(on, orList(brandNames(c[key] ?? [], "network", names)), key !== "network_ids");
+    }
+    case "company_ids":
+    case "exclude_company_ids": {
+      const by = has(
+        brandNames(facts.company_ids, "studio", names),
+        "web.admin.settings.requests.model.trace.noStudio",
+        "web.admin.settings.requests.model.trace.studioIs",
+      );
+      return miss(by, orList(brandNames(c[key] ?? [], "studio", names)), key !== "company_ids");
+    }
+    case "requester_user_ids":
+      return miss(requestedBy, orList(userNames(c.requester_user_ids ?? [], names)));
+    case "exclude_requester_user_ids":
+      return t("web.admin.settings.requests.model.trace.missRequesterExcept", {
+        fact: requestedBy,
+        users: orList(userNames(c.exclude_requester_user_ids ?? [], names)),
+      });
+    case "keyword_ids":
+      return t("web.admin.settings.requests.model.trace.missKeyword", {
+        wanted: orList((c.keyword_ids ?? []).map(String)),
+      });
+    case "exclude_keyword_ids": {
+      const excluded = c.exclude_keyword_ids ?? [];
+      const found = excluded.filter((id) => facts.keyword_ids.includes(id)).map(String);
+      return t("web.admin.settings.requests.model.trace.missExcludedKeyword", {
+        found: orList(found),
+        wanted: orList(excluded.map(String)),
+      });
+    }
+    default:
+      return t("web.admin.settings.requests.model.trace.fails", { condition: key });
+  }
+}
+
+/** Every miss of a rule, year bounds once. */
+function traceMisses(
+  unmet: readonly string[],
+  conditions: RequestRouteConditions,
+  ctx: TraceContext,
+): string[] {
+  const keys = unmet.filter(
+    (key, i) => key !== "year_to" || !unmet.slice(0, i).includes("year_from"),
+  );
+  return keys.map((key) => traceMissSentence(key, conditions, ctx));
+}
+
+/** What a matching rule did: "decides HD", "decides HD and 4K", "decides HD: none", "decides 4K: none". */
+function traceDecision(rule: Pick<RequestRoutePreviewRule, "hd" | "uhd">): string {
+  const parts: string[] = [];
+  if (rule.hd === "sends" && rule.uhd === "sends")
+    return t("web.admin.settings.requests.model.trace.decidesBoth");
+  if (rule.hd === "sends") parts.push(t("web.admin.settings.requests.model.trace.decidesHd"));
+  if (rule.hd === "skips") parts.push(t("web.admin.settings.requests.model.trace.decidesHdNone"));
+  if (rule.uhd === "sends") parts.push(t("web.admin.settings.requests.model.trace.decidesUhd"));
+  if (rule.uhd === "skips") parts.push(t("web.admin.settings.requests.model.trace.decidesUhdNone"));
+  if (parts.length > 0) return parts.join(" · ");
+  const passed = rule.hd === "passes" || rule.uhd === "passes";
+  return t(
+    passed
+      ? "web.admin.settings.requests.model.trace.passesOn"
+      : "web.admin.settings.requests.model.trace.alreadyDecided",
+  );
+}
+
+/**
+ * One line of "How it was decided" for a rule of the preview:
+ * "1. Anime — matches · decides HD", "Off: Old anime",
+ * "3. Kids & family — doesn't match: genre is Animation (wants Family or Kids)".
+ */
+export function traceLine(
+  rule: RequestRoutePreviewRule,
+  number: number,
+  conditions: RequestRouteConditions | undefined,
+  ctx: TraceContext,
+): string {
+  if (rule.is_fallback)
+    return t("web.admin.settings.requests.model.trace.fallbackLine", {
+      decision: traceDecision(rule),
+    });
+  if (!rule.enabled)
+    return t("web.admin.settings.requests.model.trace.offLine", { rule: rule.route_name });
+  const head = { number: String(number), rule: rule.route_name };
+  if (rule.unmet_conditions.length === 0) {
+    return t("web.admin.settings.requests.model.trace.matchLine", {
+      ...head,
+      decision: traceDecision(rule),
+    });
+  }
+  const misses = conditions
+    ? traceMisses(rule.unmet_conditions, conditions, ctx)
+    : rule.unmet_conditions;
+  return t("web.admin.settings.requests.model.trace.missLine", {
+    ...head,
+    misses: misses.join("; "),
+  });
+}

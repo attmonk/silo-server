@@ -1,0 +1,144 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/Silo-Server/silo-server/internal/playback"
+)
+
+var ErrServerRestartAlreadyRequested = errors.New("server restart already requested")
+
+type ServerControlHandler struct {
+	requestRestart func(ctx context.Context) error
+	commands       *playback.CommandDispatcher
+	restartStatus  *ServerRestartStatusTracker
+}
+
+type serverRestartRequest struct {
+	Reason  string `json:"reason"`
+	Title   string `json:"title"`
+	Message string `json:"message"`
+}
+
+type serverRestartResponse struct {
+	Status           string `json:"status"`
+	Message          string `json:"message"`
+	NotifiedSessions int    `json:"notified_sessions"`
+}
+
+func NewServerControlHandler(
+	requestRestart func(ctx context.Context) error,
+	commands *playback.CommandDispatcher,
+	restartStatus *ServerRestartStatusTracker,
+) *ServerControlHandler {
+	return &ServerControlHandler{
+		requestRestart: requestRestart,
+		commands:       commands,
+		restartStatus:  restartStatus,
+	}
+}
+
+// AdminServerRestartRequest carries the optional notice shown to playback
+// sessions before this process shuts down.
+type AdminServerRestartRequest = serverRestartRequest
+
+// AdminServerRestartResult is the accepted restart request. Status is
+// restart_requested on the first accepted request and already_requested when
+// this process is already shutting down; both are 202.
+type AdminServerRestartResult = serverRestartResponse
+
+// RequestAdminServerRestart notifies playback sessions, then asks THIS process
+// to shut down gracefully. It is process-local: a cluster peer is not
+// restarted, and a repeat while the shutdown is pending converges on
+// already_requested rather than starting anything new (coalescing).
+func (h *ServerControlHandler) RequestAdminServerRestart(ctx context.Context, req AdminServerRestartRequest) (AdminServerRestartResult, error) {
+	if h == nil || h.requestRestart == nil {
+		return AdminServerRestartResult{}, apiError(http.StatusServiceUnavailable, "service_unavailable", "Server restart is unavailable")
+	}
+	notifiedSessions := h.notifyPlaybackSessions(req)
+	if err := h.requestRestart(context.Background()); err != nil {
+		if errors.Is(err, ErrServerRestartAlreadyRequested) {
+			h.restartStatus.MarkRestartRequested()
+			return AdminServerRestartResult{
+				Status:           "already_requested",
+				Message:          "Server restart is already in progress.",
+				NotifiedSessions: notifiedSessions,
+			}, nil
+		}
+		slog.ErrorContext(ctx, "server restart request failed", "component", "api", "error", err)
+		return AdminServerRestartResult{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to request server restart")
+	}
+	h.restartStatus.MarkRestartRequested()
+	return AdminServerRestartResult{
+		Status:           "restart_requested",
+		Message:          "Server restart requested. The process will shut down gracefully.",
+		NotifiedSessions: notifiedSessions,
+	}, nil
+}
+
+func (h *ServerControlHandler) notifyPlaybackSessions(req serverRestartRequest) int {
+	if h == nil || h.commands == nil {
+		return 0
+	}
+
+	title := req.Title
+	if title == "" {
+		title = "Server restarting"
+	}
+	message := req.Message
+	if message == "" {
+		message = "The server is restarting now. Playback may reconnect shortly."
+	}
+
+	payload, err := json.Marshal(map[string]string{
+		"title":   title,
+		"message": message,
+	})
+	if err != nil {
+		slog.Warn("server restart: failed to build realtime payload", "error", err)
+		return 0
+	}
+
+	results := h.commands.DispatchToAll(func(session *playback.Session) (playback.CommandEnvelope, time.Duration, func(), error) {
+		if session == nil {
+			return playback.CommandEnvelope{}, 0, nil, playback.ErrCommandDispatchUnavailable
+		}
+		command, err := playback.NewCommandEnvelope(
+			session.ID,
+			uuid.NewString(),
+			playback.CommandServerRestarting,
+			payload,
+		)
+		if err != nil {
+			return playback.CommandEnvelope{}, 0, nil, err
+		}
+		command.Reason = req.Reason
+		if command.Reason == "" {
+			command.Reason = "server_restart_requested"
+		}
+		command.IssuedBy = &playback.CommandIssuedBy{Kind: "admin"}
+		return command, 0, nil, nil
+	})
+
+	delivered := 0
+	for _, result := range results {
+		if result.Delivered {
+			delivered++
+			continue
+		}
+		if result.DispatchErr != nil && !errors.Is(result.DispatchErr, playback.ErrRealtimeConnectionNotFound) {
+			slog.Warn("server restart: failed to notify playback session",
+				"session_id", result.SessionID,
+				"error", result.DispatchErr,
+			)
+		}
+	}
+	return delivered
+}

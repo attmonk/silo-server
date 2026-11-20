@@ -1,0 +1,354 @@
+import { type ReactNode } from "react";
+import { decodeThumbhash } from "@/lib/thumbhash";
+import { imageIdentity, useImageLoaded } from "@/hooks/useImageLoaded";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
+import { useShowTitleArt } from "@/hooks/useTitleArt";
+import { HeroBackdropArtwork } from "@/components/HeroBackdropArtwork";
+import { useT } from "@/i18n";
+
+import "./detailLayout.css";
+import DetailOverview from "./components/DetailOverview";
+import DetailTitle from "./DetailTitle";
+import MachineTranslatedLabel from "./components/MachineTranslatedLabel";
+
+interface DetailHeroProps {
+  title: string;
+  subtitle?: ReactNode;
+  context?: ReactNode;
+  backdropUrl?: string;
+  backdropThumbhash?: string;
+  posterUrl?: string;
+  posterThumbhash?: string;
+  posterOrientation?: "portrait" | "landscape" | "square";
+  hidePoster?: boolean;
+  logoUrl?: string;
+  metadata?: ReactNode;
+  genres?: string[];
+  /**
+   * Optional URL builder that turns each genre into a router path. When
+   * provided, genre badges render as <a> links to the filtered library
+   * view. When omitted, badges render as plain text (default).
+   */
+  genreHref?: (genre: string) => string;
+  overview?: string;
+  /** Pulses the overview while an on-view AI translation is in flight. */
+  overviewTranslating?: boolean;
+  /** When set, renders a small "Translate" chip under the overview. */
+  onTranslateOverview?: () => void;
+  /** Labels the overview as machine-translated by AI. */
+  overviewMachineTranslated?: boolean;
+  /** Marks the tagline as machine-translated by AI. */
+  taglineMachineTranslated?: boolean;
+  /** Spoiler protection: keep the overview behind a reveal button. */
+  overviewHidden?: boolean;
+  onRevealOverview?: () => void;
+  actions?: ReactNode;
+  aside?: ReactNode;
+  studioLabel?: string;
+  tagline?: string;
+  scoreRow?: ReactNode;
+  crewLine?: ReactNode;
+  variant?: "full" | "compact" | "episode" | "series" | "season";
+  /**
+   * Shortens the full hero so the first row of the content below it starts
+   * inside the viewport, for pages whose hero leads into a grid of titles.
+   */
+  shortHero?: boolean;
+  topNav?: ReactNode;
+}
+
+export default function DetailHero({
+  title,
+  subtitle,
+  context,
+  backdropUrl,
+  backdropThumbhash,
+  posterUrl,
+  posterThumbhash,
+  posterOrientation = "portrait",
+  hidePoster = false,
+  logoUrl,
+  metadata,
+  genres,
+  genreHref,
+  overview,
+  overviewTranslating = false,
+  onTranslateOverview,
+  overviewMachineTranslated = false,
+  taglineMachineTranslated = false,
+  overviewHidden = false,
+  onRevealOverview,
+  actions,
+  aside,
+  studioLabel,
+  tagline,
+  scoreRow,
+  crewLine,
+  variant = "full",
+  shortHero = false,
+  topNav,
+}: DetailHeroProps) {
+  const t = useT();
+  const {
+    loaded: posterLoaded,
+    onLoad: onPosterLoad,
+    onError: onPosterError,
+  } = useImageLoaded(posterUrl);
+  const showTitleArt = useShowTitleArt();
+  const titleLogoUrl = showTitleArt ? logoUrl : undefined;
+  // Until the profile's choice is known, a title with a logo reserves the logo
+  // box without fetching the art or drawing the text.
+  const holdTitle = showTitleArt === undefined && Boolean(logoUrl);
+  // A plain-text context is the title's type; it shares one eyebrow line with
+  // the studio or network. Richer context (an episode breadcrumb) keeps its own row.
+  const eyebrowType = typeof context === "string" ? context : undefined;
+  const posterPlaceholder = posterThumbhash ? decodeThumbhash(posterThumbhash) : "";
+  const isCompact = variant === "compact";
+  const isViewportBounded = variant === "episode" || variant === "series" || variant === "season";
+  // Below lg a viewport-bounded hero hides its poster (detailLayout.css), so
+  // it is not rendered there and its image is never downloaded.
+  const wideViewport = useMediaQuery("(min-width: 64rem)", true);
+  const showPoster = !hidePoster && (!isViewportBounded || wideViewport);
+
+  const posterSizeClass = (() => {
+    switch (posterOrientation) {
+      case "portrait":
+        return isCompact ? "w-[140px] sm:w-[160px]" : "w-[170px] sm:w-[220px]";
+      case "square":
+        // Bigger than portrait — square posters are visually smaller per
+        // pixel than 2:3 ones at the same width, so bump dimensions to
+        // keep them feeling like a comparable hero focal element.
+        return isCompact ? "w-[180px] sm:w-[200px]" : "w-[200px] sm:w-[260px]";
+      case "landscape":
+      default:
+        return isCompact ? "w-[200px] sm:w-[260px]" : "w-[240px] sm:w-[320px]";
+    }
+  })();
+
+  const posterAspect = (() => {
+    switch (posterOrientation) {
+      case "portrait":
+        return "aspect-[2/3]";
+      case "square":
+        return "aspect-square";
+      case "landscape":
+      default:
+        return "aspect-video";
+    }
+  })();
+
+  return (
+    <section
+      className="item-detail-hero border-border/10 relative isolate overflow-hidden border-b"
+      data-variant={variant}
+      data-viewport-bounded={isViewportBounded || undefined}
+    >
+      {topNav}
+      {/* The artwork stops 1px short of the bottom edge, which the fade below
+          covers solidly anyway. At a fractional hero height the edge pixel is
+          only partly covered by the fade, and the artwork bled through as a line. */}
+      <HeroBackdropArtwork
+        backdropUrl={backdropUrl}
+        backdropThumbhash={backdropThumbhash}
+        className="absolute inset-x-0 top-0 bottom-px"
+      />
+
+      {/* Keep the detail treatment on three contained paint surfaces while
+          preserving its original stacking: tint/left fade, ambient artwork
+          glow, then the bottom fades and vignette. Previously five full-hero
+          elements were independently invalidated during browser-chrome resize. */}
+      <div className="detail-hero-scrim detail-hero-scrim-under" />
+      <div className="ambient-glow detail-hero-ambient" />
+      <div className="detail-hero-scrim detail-hero-scrim-over" />
+
+      <div
+        className={`detail-hero-layout page-shell-wide relative flex flex-col justify-end pb-8 ${
+          isCompact
+            ? // min-height (not fixed height) below lg: bottom-justified content
+              // taller than the hero would otherwise overflow out the top, under
+              // the floating back button.
+              "min-h-[max(35vh,300px)] pt-20 lg:min-h-[42vh]"
+            : shortHero
+              ? "min-h-[50dvh] pt-24 lg:min-h-[54dvh]"
+              : "min-h-[60dvh] pt-28 lg:min-h-[72dvh]"
+        }`}
+      >
+        <div
+          className={`grid gap-8 ${
+            !isCompact && aside ? "lg:grid-cols-[minmax(0,1fr)_280px] lg:items-end" : ""
+          }`}
+        >
+          <div
+            className={`detail-hero-primary-content flex min-w-0 flex-col gap-6 ${!hidePoster ? "lg:flex-row lg:items-end" : ""}`}
+          >
+            {/* Poster */}
+            {showPoster && (
+              <div
+                className={`media-card-image border-border/20 relative border shadow-[var(--shadow-md)] ${posterSizeClass}`}
+              >
+                {posterUrl ? (
+                  <>
+                    <img
+                      key={imageIdentity(posterUrl)}
+                      src={posterUrl}
+                      alt={title}
+                      decoding="async"
+                      className={`w-full object-cover ${posterAspect} ${posterLoaded ? "opacity-100" : "opacity-0"}`}
+                      onLoad={onPosterLoad}
+                      onError={onPosterError}
+                    />
+                    <span
+                      key={`placeholder-${imageIdentity(posterUrl)}`}
+                      aria-hidden="true"
+                      data-testid="detail-hero-poster-placeholder"
+                      className={`bg-surface pointer-events-none absolute inset-0 bg-cover bg-center transition-opacity duration-300 ${
+                        posterLoaded ? "opacity-0" : "opacity-100"
+                      }`}
+                      style={
+                        posterPlaceholder
+                          ? { backgroundImage: `url(${posterPlaceholder})` }
+                          : undefined
+                      }
+                    />
+                  </>
+                ) : (
+                  <div
+                    className={`text-muted-foreground bg-surface flex items-center justify-center p-6 text-center text-sm ${posterAspect}`}
+                  >
+                    {title}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Info column */}
+            <div
+              key={isViewportBounded ? title : undefined}
+              className="detail-hero-copy max-w-3xl"
+              style={{ textShadow: "var(--hero-text-shadow, 0 1px 3px rgb(0 0 0 / 40%))" }}
+            >
+              <div
+                className={isViewportBounded ? "detail-hero-information" : "contents"}
+                tabIndex={isViewportBounded ? 0 : undefined}
+                role={isViewportBounded ? "region" : undefined}
+                aria-label={isViewportBounded ? t("web.detail.hero.mediaDetailsRegion") : undefined}
+              >
+                {context && !eyebrowType && (
+                  <div className="detail-hero-context text-muted-foreground mb-4 text-sm font-medium">
+                    {context}
+                  </div>
+                )}
+
+                {(eyebrowType || studioLabel) && (
+                  <p className="detail-hero-context text-muted-foreground mb-3 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs font-semibold tracking-[0.16em] uppercase">
+                    {eyebrowType && <span>{eyebrowType}</span>}
+                    {eyebrowType && studioLabel && (
+                      <span aria-hidden="true" className="size-[3px] rounded-full bg-current" />
+                    )}
+                    {studioLabel && <span className="text-foreground/85">{studioLabel}</span>}
+                  </p>
+                )}
+
+                {titleLogoUrl ? (
+                  <>
+                    <h1 className="sr-only">{title}</h1>
+                    <img
+                      src={titleLogoUrl}
+                      alt=""
+                      decoding="async"
+                      className="mb-4 h-20 w-full max-w-[420px] object-contain object-left lg:h-28 lg:max-w-[480px]"
+                    />
+                  </>
+                ) : holdTitle ? (
+                  <>
+                    <h1 className="sr-only">{title}</h1>
+                    <div
+                      aria-hidden="true"
+                      data-testid="detail-hero-title-pending"
+                      className="mb-4 h-20 w-full max-w-[420px] lg:h-28 lg:max-w-[480px]"
+                    />
+                  </>
+                ) : (
+                  <DetailTitle
+                    title={title}
+                    bounded={isViewportBounded}
+                    className={`bidi-text text-foreground mb-3 font-extrabold tracking-tight ${
+                      isCompact
+                        ? "font-display text-3xl leading-[1.1] sm:text-4xl"
+                        : "font-display text-4xl leading-[0.98] tracking-[-0.05em] sm:text-5xl lg:text-7xl"
+                    }`}
+                  />
+                )}
+
+                {/* Tagline (italic) — falls back to subtitle */}
+                {(tagline || subtitle) && (
+                  <div
+                    className={`bidi-text text-muted-foreground mb-4 text-[0.8125rem] ${
+                      tagline
+                        ? "text-foreground/72 italic"
+                        : "text-muted-foreground text-base font-medium not-italic"
+                    }`}
+                  >
+                    {tagline || subtitle}
+                    {tagline && taglineMachineTranslated && (
+                      <MachineTranslatedLabel compact className="ms-1.5 align-middle not-italic" />
+                    )}
+                  </div>
+                )}
+
+                <div className="detail-hero-facts">
+                  {metadata && <div className="mb-4">{metadata}</div>}
+                  {scoreRow && <div className="mb-4">{scoreRow}</div>}
+                </div>
+
+                {overview && (
+                  <DetailOverview
+                    overview={overview}
+                    compact={isCompact}
+                    clamp={isViewportBounded}
+                    translating={overviewTranslating}
+                    onTranslate={onTranslateOverview}
+                    machineTranslated={overviewMachineTranslated}
+                    hidden={overviewHidden}
+                    onReveal={onRevealOverview}
+                  />
+                )}
+
+                {/* Crew line and genre chips render independently: pages that
+                  fold genres into their crew line simply omit the genres prop. */}
+                {crewLine && <div className="mt-3">{crewLine}</div>}
+                {genres && genres.length > 0 && (
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    {genres.map((genre) =>
+                      genreHref ? (
+                        <a
+                          key={genre}
+                          href={genreHref(genre)}
+                          className="metadata-badge hover:bg-foreground/10 transition-colors"
+                        >
+                          {genre}
+                        </a>
+                      ) : (
+                        <span key={genre} className="metadata-badge">
+                          {genre}
+                        </span>
+                      ),
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {actions && (
+                <div className="detail-action-bar mt-6" style={{ textShadow: "none" }}>
+                  {actions}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {!isCompact && aside && <div className="lg:justify-self-end">{aside}</div>}
+        </div>
+      </div>
+    </section>
+  );
+}

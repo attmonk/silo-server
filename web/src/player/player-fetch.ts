@@ -1,0 +1,190 @@
+/**
+ * Minimal fetch wrapper for the player module.
+ * Uses PlayerConfig for API base URL and auth — never imports app-specific code.
+ */
+
+import { V2_CLIENT_HEADERS } from "@/api/v2/request";
+import { t } from "@/i18n";
+import type { PlayerConfig } from "./context/PlayerConfigContext";
+
+interface PlayerErrorEnvelope {
+  error?: string;
+  message?: string;
+}
+
+export class PlayerFetchError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+    public code?: string,
+    public rawBody?: string,
+  ) {
+    super(message);
+    this.name = "PlayerFetchError";
+  }
+}
+
+/**
+ * Whether the server answered that this playback session was ended for good
+ * (410 `playback_session_ended`), as it does after an administrator stops a
+ * player that did not confirm the command. The player exits instead of
+ * starting a fresh session.
+ */
+export function isPlaybackSessionEndedError(error: unknown): boolean {
+  if (!(error instanceof PlayerFetchError) || error.status !== 410) return false;
+  if (error.code === "playback_session_ended") return true;
+  return /\/problems\/playback_session_ended"/.test(error.rawBody ?? "");
+}
+
+/**
+ * Whether a failed player request may succeed if it is sent again later: the
+ * server answered 5xx, or never answered at all (network failure, timeout,
+ * abort). A 4xx is the server's considered answer and is final.
+ */
+export function isTransientPlayerRequestError(error: unknown): boolean {
+  if (error instanceof PlayerFetchError) return error.status >= 500;
+  return error instanceof TypeError || error instanceof DOMException;
+}
+
+/**
+ * The client, auth, profile and device headers every player request carries.
+ * Credentials come from PlayerConfig so a host that embeds the player
+ * elsewhere keeps control of them. The client identity is the one every web
+ * v2 request sends; the server labels playback metrics with it.
+ * `hasJsonBody` adds the JSON content type for a non-FormData body.
+ */
+export function playerRequestHeaders(
+  config: PlayerConfig,
+  base: HeadersInit | undefined,
+  hasJsonBody: boolean,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    ...V2_CLIENT_HEADERS,
+    ...(base as Record<string, string>),
+  };
+  if (hasJsonBody) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  const token = config.getAccessToken();
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const profileId = config.getProfileId();
+  if (profileId) {
+    headers["X-Profile-Id"] = profileId;
+  }
+
+  const profileToken = config.getProfileToken?.();
+  if (profileToken) {
+    headers["X-Profile-Token"] = profileToken;
+  }
+
+  headers["X-Silo-Device-Id"] = config.getDeviceId();
+  return headers;
+}
+
+/**
+ * Performs one authenticated request and retries a late 401 after rotating the
+ * access token for the same account. Callers that need to decode a typed
+ * response can share this boundary without reimplementing auth recovery.
+ */
+export async function playerFetchResponse(
+  config: PlayerConfig,
+  url: string,
+  options: RequestInit = {},
+): Promise<Response> {
+  // Capture the auth context and token the headers are built from so a late
+  // 401 can tell same-account token rotation apart from a changed viewer.
+  const authContext = config.getAuthContext?.();
+  const token = config.getAccessToken();
+  const headers = playerRequestHeaders(
+    config,
+    options.headers,
+    options.body != null && !(options.body instanceof FormData),
+  );
+
+  let res = await fetch(url, {
+    ...options,
+    headers,
+  });
+
+  if (
+    res.status === 401 &&
+    config.refreshToken &&
+    config.getAuthContext?.() === authContext &&
+    !options.signal?.aborted
+  ) {
+    // A late 401 may arrive after another request already rotated the token.
+    const alreadyRefreshed = config.getAccessToken() !== token && config.getAccessToken() !== null;
+    const refreshed = alreadyRefreshed || (await config.refreshToken());
+    const refreshedToken = config.getAccessToken();
+    if (
+      refreshed &&
+      refreshedToken &&
+      config.getAuthContext?.() === authContext &&
+      !options.signal?.aborted
+    ) {
+      // Keep the original profile/PIN, device, body, and abort signal. Only
+      // same-account token rotation may change authority during this retry.
+      res = await fetch(url, {
+        ...options,
+        headers: { ...headers, Authorization: `Bearer ${refreshedToken}` },
+      });
+    }
+  }
+
+  return res;
+}
+
+/**
+ * Performs an authenticated fetch against the configured API.
+ * Returns the parsed JSON body for 2xx responses, undefined when the response
+ * carries no body.
+ * Throws PlayerFetchError for non-2xx responses.
+ */
+export async function playerFetch<T>(
+  config: PlayerConfig,
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  const res = await playerFetchResponse(config, `${config.apiBaseUrl}${path}`, options);
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    let message = res.statusText || t("web.player.error.requestFailed");
+    let code: string | undefined;
+
+    if (text) {
+      try {
+        const parsed = JSON.parse(text) as PlayerErrorEnvelope;
+        if (typeof parsed.message === "string" && parsed.message.trim().length > 0) {
+          message = parsed.message.trim();
+        } else if (text.trim().length > 0) {
+          message = text.trim();
+        }
+        if (typeof parsed.error === "string" && parsed.error.trim().length > 0) {
+          code = parsed.error.trim();
+        }
+      } catch {
+        if (text.trim().length > 0) {
+          message = text.trim();
+        }
+      }
+    }
+
+    throw new PlayerFetchError(res.status, message, code, text);
+  }
+
+  if (res.status === 204) {
+    return undefined as T;
+  }
+
+  // Accepted operations may return either a JSON status object (for example
+  // subtitle translation) or an empty acknowledgement (route diagnostics).
+  // Inspect the payload rather than assigning body semantics to status 202.
+  const text = await res.text();
+  if (text.trim() === "") return undefined as T;
+  return JSON.parse(text) as T;
+}

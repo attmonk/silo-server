@@ -1,0 +1,146 @@
+package handlers
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/nodeauth"
+
+	"github.com/Silo-Server/silo-server/internal/logredact"
+	"github.com/Silo-Server/silo-server/internal/nodepool"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
+	"github.com/Silo-Server/silo-server/internal/transcodenode"
+	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
+)
+
+// startLocalPlaybackTransport is the shared local ffmpeg launch primitive for
+// legacy and protocol-v3 orchestration. Callers retain ownership of lifecycle
+// locking and decide whether registration is immediate or transactionally
+// staged.
+func (h *PlaybackHandler) startLocalPlaybackTransport(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+	return playback.StartTranscode(ctx, opts)
+}
+
+// startRemotePlaybackTransport is the shared remote-node launch primitive.
+// It returns the node's HTTP status separately so legacy and v3 can preserve
+// their existing public error envelopes while executing identical transport
+// startup and response parsing.
+func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, nodeURL string, request transcodenode.TranscodeStartRequest) (transcodenode.TranscodeStartResponse, int, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return transcodenode.TranscodeStartResponse{}, 0, err
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, h.remotePlaybackTransportTimeout(nodeURL, request))
+	defer cancel()
+	httpRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPost, nodepool.NodeEndpoint(nodeURL, "/transcode/start"), bytes.NewReader(body))
+	if err != nil {
+		return transcodenode.TranscodeStartResponse{}, 0, logredact.SanitizeURLError(err)
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	if err := nodeauth.SignTranscode(httpRequest, nodeURL, h.NodeKeys); err != nil {
+		return transcodenode.TranscodeStartResponse{}, 0, err
+	}
+	response, err := transcodeproxy.DoNode(transcodeproxy.NodeClient(), httpRequest, nodeURL, "transcode_start")
+	if err != nil {
+		nodepool.ReportConnectFailure(h.NodePlanner, nodeURL, err)
+		return transcodenode.TranscodeStartResponse{}, 0, logredact.SanitizeURLError(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		// Drain the (small) error body so the transport can reuse the
+		// connection instead of tearing it down on every failed start.
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		// A node at its own job cap takes no new work from here until its
+		// next health check; the caller tries another executor, as it does
+		// after any refused start.
+		if nodepool.RefusedAtCapacity(response) {
+			nodepool.ReportAtCapacity(h.NodePlanner, nodeURL)
+		}
+		if request.ToneMapMode != "" {
+			if validationErr := transcodenode.ToneMapExecutionErrorForResponse(
+				response.StatusCode,
+				response.Header.Get(transcodenode.ToneMapExecutionErrorHeader),
+			); validationErr != nil {
+				return transcodenode.TranscodeStartResponse{}, response.StatusCode, validationErr
+			}
+		}
+		return transcodenode.TranscodeStartResponse{}, response.StatusCode, nil
+	}
+	var result transcodenode.TranscodeStartResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		// Older nodes returned an empty 202 response; accept that for ordinary
+		// transcodes while treating any other malformed 202 body as a failed
+		// start instead of fabricating a success from a zero-value response.
+		if errors.Is(err, io.EOF) && request.ToneMapMode == "" {
+			return transcodenode.TranscodeStartResponse{}, response.StatusCode, nil
+		}
+		slog.WarnContext(ctx, "remote transcode start response decode failed", "component", "api", "node", logredact.SanitizeURL(nodeURL), "error", err)
+		return transcodenode.TranscodeStartResponse{}, response.StatusCode, fmt.Errorf("decode remote transcode start response: %w", err)
+	}
+	return result, response.StatusCode, nil
+}
+
+func (h *PlaybackHandler) remotePlaybackTransportTimeout(nodeURL string, request transcodenode.TranscodeStartRequest) time.Duration {
+	if request.ToneMapMode == "" {
+		if request.RequireReady && (remoteAutoFallbackPossibleV3(request) || remoteHardwareRetryPossibleV3(request)) {
+			// The node answers only after its first manifest, which can
+			// follow an early exit on each safer path: hw_accel=auto's
+			// fallback, or under an explicit hardware backend the CPU-decode
+			// and software retries after a decoder rejection. Each attempt
+			// may use its whole readiness wait before it exits.
+			return transcodenode.TranscodeStartReadyMaxDuration + 5*time.Second
+		}
+		return playback.ManifestStartupTimeout + 5*time.Second
+	}
+	timeout := h.remoteToneMapProbeTimeoutV3(nodeURL) + playback.ManifestStartupTimeout
+	if request.ToneMapPreflightRequired {
+		timeout += tonemap.SourcePreflightTimeout(request.TotalDuration)
+	}
+	if request.RequireReady {
+		timeout += transcodenode.TranscodeStartReadinessTimeout
+	}
+	return timeout
+}
+
+// remoteAutoFallbackPossibleV3 reports whether a node may walk the hw_accel=auto
+// fallback for this start: a video transcode dispatched as auto. The node
+// resolves auto against its live hardware, so the budget follows the request
+// rather than a stored capability report that may be missing or stale.
+func remoteAutoFallbackPossibleV3(request transcodenode.TranscodeStartRequest) bool {
+	return strings.EqualFold(strings.TrimSpace(request.HWAccel), "auto") &&
+		!strings.EqualFold(strings.TrimSpace(request.TargetCodecVideo), "copy")
+}
+
+// remoteHardwareRetryPossibleV3 reports whether a node start under an explicit
+// hardware backend may retry after an early exit: a video transcode whose
+// configured acceleration is neither auto nor none.
+func remoteHardwareRetryPossibleV3(request transcodenode.TranscodeStartRequest) bool {
+	hwAccel := strings.ToLower(strings.TrimSpace(request.HWAccel))
+	return hwAccel != "" && hwAccel != playback.HWAccelAuto && hwAccel != playback.HWAccelNone &&
+		!strings.EqualFold(strings.TrimSpace(request.TargetCodecVideo), "copy")
+}
+
+// fetchRemoteNodeCapabilities reads the capability report of the worker of
+// kind target at nodeURL. Proxies serve the same route as transcode nodes, so
+// the caller names the kind it holds the URL as, never inferred from the URL.
+func fetchRemoteNodeCapabilities(ctx context.Context, target nodeauth.Target, nodeURL string, nodeKeys nodeauth.Keyring) (playback.HWAccelInfo, error) {
+	info, status, err := transcodenode.FetchHWCapabilities(ctx, transcodeproxy.NodeClient(), nodeURL, target, nodeKeys)
+	if err != nil {
+		return playback.HWAccelInfo{}, err
+	}
+	if status != http.StatusOK {
+		return playback.HWAccelInfo{}, fmt.Errorf("node returned %d", status)
+	}
+	info.Source = "transcode_node"
+	info.NodeURL = nodeURL
+	return info, nil
+}

@@ -1,0 +1,35 @@
+package playback
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestCleanupOrphanedTranscodeDirsRequiresSeparatorBoundary(t *testing.T) {
+	root := t.TempDir()
+	keep := []string{"session-1", "session-1-plan-abc-generation"}
+	reap := []string{"session-10", "session-10-plan-def", "session-2-plan-def-generation", "session-1extra"}
+	for _, name := range append(append([]string{}, keep...), reap...) {
+		if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := CleanupOrphanedTranscodeDirs(root, map[string]struct{}{"session-1": {}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != len(reap) {
+		t.Fatalf("removed = %d, want %d", removed, len(reap))
+	}
+	for _, name := range keep {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("active session directory %q was removed: %v", name, err)
+		}
+	}
+	for _, name := range reap {
+		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+			t.Fatalf("foreign directory %q still exists: %v", name, err)
+		}
+	}
+}

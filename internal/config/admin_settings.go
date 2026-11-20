@@ -1,0 +1,1563 @@
+package config
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net"
+	"net/mail"
+	"net/url"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/ai/reasoning"
+	"github.com/Silo-Server/silo-server/internal/lang"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	redisv9 "github.com/redis/go-redis/v9"
+	"github.com/robfig/cron/v3"
+)
+
+const (
+	cloudflareURLMode                  = "cloudflare_token"
+	playbackSegmentRetentionSettingKey = "playback.segment_retention_seconds"
+)
+
+// ChapterThumbnailSoftwareToneMapSettingKey lets chapter thumbnail extraction
+// tone-map HDR frames on the CPU when no hardware tone mapper is available.
+const ChapterThumbnailSoftwareToneMapSettingKey = "playback.chapter_thumbnail_software_tone_map_enabled"
+
+// PlaybackTranscodeHardwareToneMapSettingKey and
+// PlaybackTranscodeSoftwareToneMapSettingKey are server-wide execution policy
+// knobs. They live in the admin settings registry (not the generated
+// per-profile settings contract) because they govern which FFmpeg recipes the
+// deployment may execute.
+const (
+	PlaybackTranscodeHardwareToneMapSettingKey = "playback.transcode_hardware_tone_map_enabled"
+	PlaybackTranscodeSoftwareToneMapSettingKey = "playback.transcode_software_tone_map_enabled"
+)
+
+// SetupCompletedSettingKey records that the first-run setup wizard reached its
+// final screen. The public setup-status endpoint reports it so the web client
+// can refuse to reopen the wizard once an install has been through it; it says
+// nothing about whether any optional step was configured.
+const SetupCompletedSettingKey = "setup.completed"
+
+// DashboardHiddenAttentionSettingKey lists the setup notices (by health item
+// id, such as "email") an admin hid from the Dashboard's Needs attention
+// panel, as a JSON array of strings. It is server-wide, so a server that
+// deliberately runs without mail stops asking every admin. Only the web
+// client reads it; empty hides nothing.
+const DashboardHiddenAttentionSettingKey = "ui.dashboard.hidden_attention"
+
+const (
+	maxDashboardHiddenAttentionIDs   = 32
+	maxDashboardHiddenAttentionIDLen = 64
+)
+
+// CatalogScopeVersionsToLibrarySettingKey makes a library-scoped catalog read
+// (library_id on the v2 item, versions, and episode operations) return only
+// the files stored in that library. Off, the default, keeps every accessible
+// version of an item visible no matter which library it was opened from.
+const CatalogScopeVersionsToLibrarySettingKey = "catalog.scope_versions_to_library"
+
+// AccessUnratedContentSettingKey decides what a profile with a content-rating
+// ceiling sees for a title with no rating: an empty rating, or an explicit
+// "not rated" marker. "hide", the default, keeps such a title out of every
+// ceilinged viewer's catalog; "allow" shows it. A rating the server cannot
+// read is hidden from ceilinged profiles either way (see
+// access.UnrecognizedRatingAge). Profiles without a ceiling are unaffected.
+const AccessUnratedContentSettingKey = "access.unrated_content"
+
+// Values for AccessUnratedContentSettingKey.
+const (
+	AccessUnratedContentHide  = "hide"
+	AccessUnratedContentAllow = "allow"
+)
+
+// PlaybackKeyframePlaylistSettingKey serves copy-remux HLS as one complete
+// playlist planned from the source's keyframes, instead of FFmpeg's growing
+// one (#1466). It is off by default until it has been tried across players.
+const PlaybackKeyframePlaylistSettingKey = "playback.copy_keyframe_playlist"
+
+// The connection speed test's schedule, delivered to clients with the probe
+// URL. Automatic tests run only when this is true; Test speed always works.
+// A reading lasts the max age, in days, before an automatic test is due again.
+const (
+	PlaybackBandwidthProbeAutomaticSettingKey  = "playback.bandwidth_probe_automatic"
+	PlaybackBandwidthProbeMaxAgeDaysSettingKey = "playback.bandwidth_probe_max_age_days"
+	// DefaultBandwidthProbeMaxAgeDays matches the lifetime of a learned limit.
+	DefaultBandwidthProbeMaxAgeDays = 7
+	maxBandwidthProbeMaxAgeDays     = 30
+)
+
+// CatalogExtraRatingSourcesSettingKey lists, comma-separated, the rating
+// sources clients show in addition to IMDb and TMDB, which are always shown:
+// sources metadata plugins declare, such as rt_critic. Empty, the
+// default, shows only IMDb and TMDB, because the owners of the other scores
+// restrict how others may display them. See internal/ratingsources.
+const CatalogExtraRatingSourcesSettingKey = "catalog.extra_rating_sources"
+
+// ParseRatingSourceList splits a CatalogExtraRatingSourcesSettingKey value
+// into source names, dropping blanks, duplicates, and malformed names.
+func ParseRatingSourceList(raw string) []string {
+	sources, _ := splitRatingSourceList(raw)
+	return sources
+}
+
+// splitRatingSourceList splits a comma-separated list of rating source names
+// into trimmed, lowercased, deduplicated names, skipping blanks. Malformed
+// names are left out; the first one is returned so a save can refuse it.
+func splitRatingSourceList(raw string) (sources []string, malformed string) {
+	seen := map[string]struct{}{}
+	for _, entry := range strings.Split(raw, ",") {
+		source := strings.ToLower(strings.TrimSpace(entry))
+		if source == "" {
+			continue
+		}
+		if !models.ValidRatingSourceID(source) {
+			if malformed == "" {
+				malformed = source
+			}
+			continue
+		}
+		if _, dup := seen[source]; dup {
+			continue
+		}
+		seen[source] = struct{}{}
+		sources = append(sources, source)
+	}
+	return sources, malformed
+}
+
+// Shared server-setting keys used by playback and prepared-download policy
+// readers. Keep them here with the effective admin-setting defaults.
+const (
+	Allow4KTranscodeSettingKey                    = "allow_4k_transcode"
+	PlaybackAllowHEVCEncodingSettingKey           = "playback.allow_hevc_encoding"
+	PlaybackPreferLowerVersionTranscodeSettingKey = "playback.prefer_lower_version_transcode"
+	DownloadLocalTranscodeFallbackSettingKey      = "download.local_transcode_fallback"
+)
+
+// JellyfinCompatAddressStreamGrantSettingKey turns on the Jellyfin API's
+// address-only stream grant: a static video stream that carries no credential
+// is served as the owner of a live PlaybackInfo negotiation made from the same
+// client address. Anyone sharing that address (household or carrier NAT, a VPN
+// exit, a proxy that collapses clients to one address) who knows the item and
+// source IDs can then stream the file. The Jellyfin API reads it live on each
+// request that reaches that grant.
+const JellyfinCompatAddressStreamGrantSettingKey = "jellyfin_compat.address_stream_grant_enabled"
+
+// DefaultJellyfinCompatAddressStreamGrantEnabled is the address-only stream
+// grant's value while the setting is unset. Every default of that setting
+// derives from this constant.
+const DefaultJellyfinCompatAddressStreamGrantEnabled = false
+
+// ArtworkStorageReconcileCheckpointKey is machine-managed task state. It is
+// stored alongside server settings for durability but must not be exposed or
+// edited through the administrator settings API.
+const ArtworkStorageReconcileCheckpointKey = "s3.public_storage_reconcile_checkpoint"
+
+// StorageTransitionTargetKey holds the machine-managed staged transition and
+// its post-restart recovery status.
+const StorageTransitionTargetKey = "storage.transition.target"
+
+// ArtworkStorageSweepCheckpointKey is the machine-managed cursor for the
+// artwork storage sweep, kept out of the administrator settings API for the
+// same reason as the reconcile checkpoint.
+const ArtworkStorageSweepCheckpointKey = "artwork.storage_sweep_checkpoint"
+
+// MediaImageSweepCheckpointKey stores durable per-namespace listing progress.
+const MediaImageSweepCheckpointKey = "media_images.sweep_checkpoint"
+
+// ChapterThumbnailOriginalsCleanupKey is the machine-managed checkpoint for the
+// one-time cleanup of full-size chapter thumbnail originals, kept out of the
+// administrator settings API like the other storage checkpoints.
+const ChapterThumbnailOriginalsCleanupKey = "chapter_thumbnails.originals_cleanup_checkpoint"
+
+// MetadataImageWorkersSettingKey sizes the artwork encode pool. 0 means one
+// worker per CPU core, resolved when the task runs.
+const MetadataImageWorkersSettingKey = "metadata.image_workers"
+
+// MetadataPersonRefreshPerMinuteSettingKey caps how many background person
+// metadata lookups each API node makes per minute. Every lookup asks each
+// person-capable provider once, so it bounds each provider, and it leaves room
+// on provider limits a scan shares. On-demand lookups (a person page) aren't
+// counted.
+const MetadataPersonRefreshPerMinuteSettingKey = "metadata.person_refresh_per_minute"
+
+// MetadataFallbackLanguageSettingKey is the ISO 639-1 language metadata
+// refreshes fall back to when providers have no title or description in a
+// library's metadata language, before the original language.
+// MetadataFallbackOriginal turns the fallback off: the original language is
+// used, as before the setting existed.
+const (
+	MetadataFallbackLanguageSettingKey = "metadata.fallback_language"
+	MetadataFallbackOriginal           = "original"
+)
+
+// PreviewImageWidthSettingKey is the width of the preview images the server
+// makes from video: chapter thumbnails and the thumbnails of seek-preview
+// sheets. Changing it makes both again.
+const PreviewImageWidthSettingKey = "playback.preview_image_width"
+
+// Bounds of PreviewImageWidthSettingKey, in pixels. Widths are even.
+const (
+	DefaultPreviewImageWidth = 300
+	MinPreviewImageWidth     = 160
+	MaxPreviewImageWidth     = 640
+)
+
+// PreviewImageWidth reads a stored PreviewImageWidthSettingKey value: an
+// unset or unparsable value is the default, and any other is brought within
+// bounds and made even, as validation would have required.
+func PreviewImageWidth(value string) int {
+	width, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return DefaultPreviewImageWidth
+	}
+	return min(max(width, MinPreviewImageWidth), MaxPreviewImageWidth) &^ 1
+}
+
+// MarkersDetectionWorkersSettingKey sizes local intro detection: how many
+// seasons are analyzed at once and how many ffmpeg processes read audio.
+const MarkersDetectionWorkersSettingKey = "markers.detection_workers"
+
+// ServerLANDiscoverySettingKey advertises the API server on the local network
+// (DNS-SD service _silo._tcp, internal/landiscovery) so clients can find it
+// without an address. The responder starts with the API listener, so a change
+// takes effect on restart.
+const ServerLANDiscoverySettingKey = "server.lan_discovery"
+
+// serverLogFormatSettingKey selects text or JSON console logs.
+const serverLogFormatSettingKey = "server.log_format"
+
+// Backup settings (docs/architecture/backups.md). internal/backup reads them
+// live at each run, so none needs a restart.
+const (
+	// BackupEnabledSettingKey turns the nightly backup on. "Back up now" works
+	// either way.
+	BackupEnabledSettingKey = "backup.enabled"
+	// BackupTimeSettingKey is the server-local HH:MM the nightly backup starts.
+	BackupTimeSettingKey = "backup.time"
+	// BackupKeepSettingKey is how many nightly and manual backups rotation
+	// keeps, from MinBackupKeep to MaxBackupKeep.
+	BackupKeepSettingKey = "backup.keep"
+	// BackupIncludeIntroFingerprintsSettingKey keeps intro fingerprint data in
+	// the dump. Without it, intro detection analyzes a season again when its
+	// next episode arrives.
+	BackupIncludeIntroFingerprintsSettingKey = "backup.include_intro_fingerprints"
+	// BackupIncludeSubtitlesSettingKey copies downloaded subtitles into the
+	// backup's blobs.
+	BackupIncludeSubtitlesSettingKey = "backup.include_subtitles"
+	// BackupDestinationSettingKey names where backups are written:
+	// BackupDestinationDefault, the operational blob store, or
+	// BackupDestinationS3, the dedicated bucket the backup.s3.* keys name.
+	BackupDestinationSettingKey = "backup.destination"
+	BackupDestinationDefault    = "default"
+	BackupDestinationS3         = "s3"
+	// The dedicated backup bucket. The secret key is encrypted at rest.
+	BackupS3EndpointSettingKey  = "backup.s3.endpoint"
+	BackupS3RegionSettingKey    = "backup.s3.region"
+	BackupS3PathStyleSettingKey = "backup.s3.path_style"
+	BackupS3BucketSettingKey    = "backup.s3.bucket"
+	BackupS3KeyPrefixSettingKey = "backup.s3.key_prefix"
+	BackupS3AccessKeySettingKey = "backup.s3.access_key"
+	BackupS3SecretKeySettingKey = "backup.s3.secret_key"
+	// BackupS3KeyAcknowledgedSettingKey is the SECRET_KEY check value the
+	// admin confirmed keeping a copy of. S3 backups run only while it equals
+	// this server's; only the acknowledge-key endpoint writes it.
+	BackupS3KeyAcknowledgedSettingKey = "backup.s3.key_acknowledged"
+	MinBackupKeep                     = 1
+	MaxBackupKeep                     = 60
+	DefaultBackupTime                 = "04:00"
+	DefaultBackupKeep                 = 7
+)
+
+// ParseBackupTime reads a backup.time value, "H:MM" or "HH:MM" on a 24-hour
+// clock.
+func ParseBackupTime(value string) (hour, minute int, ok bool) {
+	h, m, found := strings.Cut(strings.TrimSpace(value), ":")
+	if !found || len(h) < 1 || len(h) > 2 || len(m) != 2 {
+		return 0, 0, false
+	}
+	hour, errH := strconv.Atoi(h)
+	minute, errM := strconv.Atoi(m)
+	if errH != nil || errM != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return 0, 0, false
+	}
+	return hour, minute, true
+}
+
+// ServerLocalURLSettingKey is the API server's address on the local network,
+// for a deployment whose LAN advertisement cannot reach the network or names
+// the wrong port (Docker bridge networking). Signed-in clients read it from the
+// connections document and use it, over TLS pinned to the deployment key, while
+// they can reach it (docs/architecture/server-identity.md, "Local network TLS").
+// Read per request, so a change applies without restart.
+const ServerLocalURLSettingKey = "server.local_url"
+
+// External sign-in settings (docs/architecture/external-sign-in.md).
+const (
+	// AuthLocalPasswordLoginSettingKey turns local password sign-in on or off
+	// server-wide. Off, only break-glass admin accounts may sign in with a
+	// local password; turning it off requires at least one of them. The
+	// "silo auth local-login enable" command turns it back on.
+	AuthLocalPasswordLoginSettingKey = "auth.local_password_login"
+	// AuthEmailAutoMatchSettingKey links a first external sign-in to the
+	// unlinked account holding the same email, but only when the provider
+	// says the email is verified. Off by default: an email match lets whoever
+	// controls the address at the provider take the account over. Silo does
+	// not verify account emails either, so whoever registers or sets that
+	// address on a Silo account first is the one matched; the match ends the
+	// account's existing sessions, device approvals and API keys.
+	AuthEmailAutoMatchSettingKey = "auth.email_auto_match"
+	// AuthUserAPIKeysSettingKey lets accounts that are not admins, and
+	// profiles other than the primary one, create API keys for themselves.
+	// Those keys carry user scopes only. Off by default: only a server admin
+	// creates keys. Turning it off stops new keys and leaves existing ones
+	// working until they are revoked.
+	AuthUserAPIKeysSettingKey = "auth.user_api_keys" //nolint:gosec // A setting name, not a credential.
+	// AuthProviderRecheckIntervalSettingKey is how old an identity's last
+	// provider check may be before a session refresh asks the provider again.
+	AuthProviderRecheckIntervalSettingKey = "auth.provider_recheck_interval"
+	// AuthProviderRecheckOutagePolicySettingKey decides what a refresh does
+	// when the provider cannot be reached for a due re-check.
+	AuthProviderRecheckOutagePolicySettingKey = "auth.provider_recheck_outage_policy"
+	// AuthRefreshTokenExpirySettingKey is the login-session lifetime. It is
+	// also the absolute age a provider that cannot re-check an account
+	// allows: such a session ends that long after the provider last vouched
+	// for it, and the account's API keys and Audiobookshelf sessions are
+	// revoked once the person has not signed in through the provider for
+	// that long.
+	AuthRefreshTokenExpirySettingKey = "auth.refresh_token_expiry"
+)
+
+// Values for AuthProviderRecheckOutagePolicySettingKey: keep the session and
+// retry at the next refresh, or refuse the refresh until the provider answers.
+const (
+	AuthRecheckFailOpen   = "fail_open"
+	AuthRecheckFailClosed = "fail_closed"
+)
+
+// DefaultAuthProviderRecheckInterval is AuthProviderRecheckIntervalSettingKey
+// when no valid value is stored.
+const DefaultAuthProviderRecheckInterval = 12 * time.Hour
+
+// AuthProviderRecheckInterval parses a stored
+// AuthProviderRecheckIntervalSettingKey value. An empty or invalid value is
+// the default.
+func AuthProviderRecheckInterval(raw string) time.Duration {
+	parsed, err := parseDuration(strings.TrimSpace(raw))
+	if err != nil || parsed <= 0 {
+		return DefaultAuthProviderRecheckInterval
+	}
+	return parsed
+}
+
+// DefaultAuthRefreshTokenExpiry is AuthRefreshTokenExpirySettingKey when no
+// valid value is stored.
+const DefaultAuthRefreshTokenExpiry = 30 * 24 * time.Hour
+
+// AuthRefreshTokenExpiry parses a stored AuthRefreshTokenExpirySettingKey
+// value. An empty or invalid value is the default.
+func AuthRefreshTokenExpiry(raw string) time.Duration {
+	parsed, err := parseDuration(strings.TrimSpace(raw))
+	if err != nil || parsed <= 0 {
+		return DefaultAuthRefreshTokenExpiry
+	}
+	return parsed
+}
+
+// ServerSettingsMutationLock names the advisory lock general settings
+// mutations hold for their transaction. Machine-managed credential values,
+// excluded from configuration validation, use their own key-specific lock.
+// Writers of state that a setting's
+// validation reads (such as the break-glass accounts that
+// AuthLocalPasswordLoginSettingKey requires) take it too, so the check and
+// the write cannot interleave.
+const ServerSettingsMutationLock = "silo:server_settings:mutation"
+
+// adminSettingDefaults is the effective value shown by the Admin UI when no
+// row exists in server_settings. Keep these values aligned with the runtime
+// readers that own each setting. The UI must never invent a second set of
+// defaults: an untouched form should describe the behavior the server is
+// actually running.
+// Setting keys and default values are a data table; naming each repeated
+// literal would bury what the table says.
+//
+//nolint:goconst
+var adminSettingDefaults = map[string]string{
+	"auth.access_token_expiry":  "8h",
+	"auth.refresh_token_expiry": "30d",
+	"server.log_level":          "info",
+	"server.log_quiet":          "",
+	"server.public_url":         "",
+	"branding.server_name":      "Silo",
+	"branding.login_subtitle":   "Sign in with an existing account.",
+	"clientip.trusted_proxies":  "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1/128",
+	"theme.catalog_url":         DefaultThemeCatalogURL,
+
+	ServerLANDiscoverySettingKey:              "true",
+	ServerLocalURLSettingKey:                  "",
+	AuthLocalPasswordLoginSettingKey:          "true",
+	AuthEmailAutoMatchSettingKey:              "false",
+	AuthUserAPIKeysSettingKey:                 "false",
+	AuthProviderRecheckIntervalSettingKey:     "12h",
+	AuthProviderRecheckOutagePolicySettingKey: AuthRecheckFailOpen,
+
+	"database.max_connections":   "20",
+	"s3.public_path_style":       "true",
+	"s3.public_url_auth":         "presigned",
+	"s3.public_token_param":      "verify",
+	"s3.public_token_ttl":        "10800",
+	"s3.private_path_style":      "true",
+	"s3.metadata_presign_expiry": "4h",
+	"s3.user_db_path_style":      "true",
+	"userdb.backend":             "postgres",
+	"userdb.pool_max_open":       "500",
+	"userdb.idle_timeout":        "12h",
+
+	"scanner.workers":                      "8",
+	MetadataImageWorkersSettingKey:         "0",
+	"scanner.max_concurrent_libraries":     "1",
+	"scanner.max_concurrent_scoped":        "2",
+	"scanner.file_removal_grace":           "24h",
+	"scanner.empty_trash_after_scan":       "true",
+	"scanner.realtime_monitoring":          "true",
+	"matcher.workers":                      "8",
+	"matcher.batch_size":                   "500",
+	"matcher.enable_tv_series_root_queue":  "true",
+	"matcher.enable_tv_series_group_queue": "false",
+	"metadata.cache_images":                "true",
+	"artwork.storage_backend":              "auto",
+	"artwork.local_path":                   "/var/lib/silo/artwork",
+	"markers.mode":                         "both",
+	"markers.lazy_playback":                "true",
+	MarkersDetectionWorkersSettingKey:      "1",
+	"markers.online_storage":               "stored",
+	"markers.detect_intros":                "true",
+	"markers.detect_credits":               "true",
+	// Unset until the admin saves the setup wizard's sharing choice; a
+	// migration stored true on servers set up before the wizard saved it.
+	"markers.share_by_default": "",
+
+	// Background person metadata lookups per API node per minute.
+	MetadataPersonRefreshPerMinuteSettingKey: "120",
+	MetadataFallbackLanguageSettingKey:       "en",
+
+	"playback.ffmpeg_path":                           "",
+	playbackTranscodeDirSettingKey:                   DefaultTranscodeDir,
+	playbackSegmentRetentionSettingKey:               "600",
+	"playback.hw_accel":                              "auto",
+	"playback.transcode_enabled":                     "true",
+	PlaybackAllowHEVCEncodingSettingKey:              "false",
+	PlaybackPreferLowerVersionTranscodeSettingKey:    "true",
+	PlaybackRoutingDirectPlayEgressSettingKey:        string(PlaybackEgressPreferProxy),
+	PlaybackRoutingRemuxExecutionSettingKey:          string(PlaybackExecutionPreferTranscode),
+	PlaybackRoutingRemuxEgressSettingKey:             string(PlaybackEgressPreferProxy),
+	PlaybackRoutingVideoTranscodeExecutionSettingKey: string(PlaybackExecutionPreferTranscode),
+	PlaybackRoutingVideoTranscodeEgressSettingKey:    string(PlaybackEgressPreferProxy),
+	"playback.chapter_thumbnail_workers":             "1",
+	"playback.chapter_thumbnail_execution":           "local",
+	"playback.chapter_thumbnail_node_capacity":       "1",
+	"playback.chapter_thumbnail_hdr_policy":          "best_effort",
+	"playback.preview_image_width":                   "300",
+	"playback.trickplay_interval_seconds":            "10",
+	"playback.trickplay_workers":                     "1",
+	"playback.trickplay_node_capacity":               "1",
+	"playback.trickplay_execution":                   "local",
+	ChapterThumbnailSoftwareToneMapSettingKey:        "true",
+	PlaybackTranscodeHardwareToneMapSettingKey:       "true",
+	PlaybackTranscodeSoftwareToneMapSettingKey:       "true",
+	CatalogScopeVersionsToLibrarySettingKey:          "false",
+	AccessUnratedContentSettingKey:                   AccessUnratedContentHide,
+	CatalogExtraRatingSourcesSettingKey:              "",
+	"playback.watched_threshold":                     "90",
+	"playback.min_resume_threshold":                  "5",
+	Allow4KTranscodeSettingKey:                       "true",
+	playback.TranscodeThrottleEnabledSettingKey:      strconv.FormatBool(playback.DefaultTranscodeThrottleEnabled),
+	playback.TranscodeThrottleSecondsSettingKey:      strconv.Itoa(playback.DefaultTranscodeThrottleSeconds),
+
+	"audiobookshelf_compat.enabled":            "true",
+	"jellyfin_compat.enabled":                  "true",
+	"jellyfin_compat.public_url":               "http://127.0.0.1:8096",
+	"jellyfin_compat.emulated_server_version":  DefaultJellyfinCompatEmulatedServerVersion,
+	"jellyfin_compat.server_name":              "Silo",
+	"jellyfin_compat.web_enabled":              "true",
+	"jellyfin_compat.web_version":              DefaultJellyfinWebVersion,
+	"jellyfin_compat.web_install_dir":          DefaultJellyfinWebInstallDir,
+	"jellyfin_compat.session_ttl":              "87600h",
+	"jellyfin_compat.playback_session_ttl":     defaultJellyfinCompatPlaybackSessionTTL,
+	JellyfinCompatAddressStreamGrantSettingKey: strconv.FormatBool(DefaultJellyfinCompatAddressStreamGrantEnabled),
+
+	"recommendations.enabled":                    "false",
+	"recommendations.embeddings_job_timeout":     "24h",
+	"recommendations.embeddings_cron":            "0 3 * * *",
+	"recommendations.taste_profiles_cron":        "0 4 * * *",
+	"recommendations.cowatch_cron":               "30 4 * * *",
+	"recommendations.recommendations_cron":       "0 5 * * *",
+	"recommendations.taste_decay_half_life_days": "180",
+	"recommendations.diversity_lambda":           "0.7",
+
+	"ai.auth_mode":                        "api_key",
+	"ai.reasoning_effort":                 "",
+	AIServiceTierSettingKey:               "",
+	"ai.chat_model":                       "gpt-6-luna",
+	"ai.asr_model":                        "whisper-1",
+	"ai.max_concurrent_jobs":              "2",
+	"subtitle_ai.enabled":                 "false",
+	"subtitle_ai.transcribe_enabled":      "false",
+	"subtitle_ai.batch_size":              "40",
+	"subtitle_ai.context_neighbors":       "2",
+	"subtitle_ai.asr_chunk_seconds":       "600",
+	"subtitle_ai.live_asr_chunk_seconds":  "30",
+	"subtitle_ai.transcribe_quota_jobs":   "0",
+	"subtitle_ai.transcribe_quota_period": "day",
+	"subtitles.auto_sync":                 "true",
+	"subtitles.sync_execution":            "prefer_transcode_nodes",
+	"subtitles.sync_node_capacity":        "1",
+	"metadata_ai.enabled":                 "false",
+	"metadata_ai.on_view":                 "off",
+
+	"download.enabled":                       "false",
+	"download.server_bandwidth_mbps":         "0",
+	"download.user_bandwidth_mbps":           "0",
+	"download.max_concurrent_per_user":       "3",
+	"download.max_per_period":                "0",
+	"download.period_duration":               "24h",
+	"download.transcode_enabled":             "false",
+	DownloadLocalTranscodeFallbackSettingKey: "true",
+	"download.max_concurrent_prepares":       "2",
+	"download.artifact_max_bytes":            "0",
+	DownloadArtifactCacheHoursSettingKey:     "72",
+	DownloadArtifactDiskCeilingSettingKey:    "85",
+
+	"policy.editor_enabled":                 "false",
+	"policy.eval_timeout_ms":                "100",
+	"policy.decision_log_verbosity":         "digest",
+	"policy.decision_log_scope_sample_rate": "50",
+	"policy.decision_log_retention_days":    "14",
+
+	"email.enabled":       "false",
+	"email.smtp_port":     "587",
+	"email.smtp_security": "starttls",
+	"email.from_name":     "Silo",
+
+	"notifications.release_events_enabled":                     "true",
+	"notifications.fanout_enabled":                             "true",
+	"notifications.ui_enabled":                                 "true",
+	"notifications.fanout.settle_seconds":                      "30",
+	"notifications.fanout.max_event_age_hours":                 "72",
+	"notifications.retention.read_days":                        "90",
+	"notifications.retention.unread_days":                      "180",
+	"notifications.retention.event_days":                       "30",
+	"notifications.webhooks_enabled":                           "false",
+	"notifications.webhooks.max_per_profile":                   "10",
+	"notifications.webhooks.allow_private_destinations":        "false",
+	"notifications.webhooks.deliveries_per_minute_per_profile": "60",
+	"notifications.email_enabled":                              "true",
+	"notifications.email.allow_per_episode":                    "true",
+	"notifications.email.digest_hour":                          "8",
+	"notifications.discord_enabled":                            "false",
+	"notifications.discord.allow_per_episode":                  "true",
+	"notifications.discord.digest_hour":                        "8",
+	"notifications.discord.poster_mode":                        "provider",
+	"notifications.server_channels_enabled":                    "true",
+	"notifications.server_channels.batch_seconds":              "300",
+	"notifications.server_channels.mention_requesters":         "false",
+	"notifications.web_push_enabled":                           "true",
+	"notifications.apple_push_delivery_enabled":                "true",
+	"notifications.android_push_delivery_enabled":              "true",
+
+	"taskmanager.history_retention_days": "30",
+	"taskmanager.history_keep_per_task":  "1000",
+
+	"autoscan.events_retention_days": "30",
+
+	// Off: server addresses non-admin users supply for history import and
+	// webhook sync must be on the public internet (historyimport).
+	"media_servers.allow_private_destinations": "false",
+
+	"opslog.capture_level":            "info",
+	"opslog.retention_days":           "7",
+	"opslog.cleanup_interval_minutes": "15",
+	"opslog.max_rows":                 "1000000",
+	"opslog.max_size_mb":              "1024",
+	"overlays.enabled":                "true",
+	"signup.enabled":                  "false",
+	SetupCompletedSettingKey:          "false",
+
+	// Self-service password reset from the sign-in page; an administrator
+	// opts in.
+	"password_reset.self_service_enabled": "false",
+
+	"catalog.search.provider":                             "postgres",
+	"catalog.search.meilisearch.index":                    "silo_media_items",
+	"catalog.search.meilisearch.timeout_ms":               "800",
+	"catalog.search.meilisearch.matching_strategy":        "last",
+	"catalog.search.meilisearch.sync_batch_size":          "500",
+	"catalog.search.meilisearch.rebuild_batch_size":       "5000",
+	"catalog.search.meilisearch.rebuild_task_queue_depth": "16",
+	"catalog.search.meilisearch.semantic_enabled":         "false",
+	"catalog.search.meilisearch.semantic_ratio":           "0.5",
+	"catalog.search.meilisearch.embedder":                 "silo_recommendations",
+	"catalog.search.meilisearch.binary_quantized":         "false",
+
+	PlaybackKeyframePlaylistSettingKey: "false",
+
+	PlaybackBandwidthProbeAutomaticSettingKey:  "true",
+	PlaybackBandwidthProbeMaxAgeDaysSettingKey: strconv.Itoa(DefaultBandwidthProbeMaxAgeDays),
+
+	BackupEnabledSettingKey:                  "true",
+	BackupTimeSettingKey:                     DefaultBackupTime,
+	BackupKeepSettingKey:                     strconv.Itoa(DefaultBackupKeep),
+	BackupIncludeIntroFingerprintsSettingKey: "false",
+	BackupIncludeSubtitlesSettingKey:         "true",
+	BackupDestinationSettingKey:              BackupDestinationDefault,
+	BackupS3EndpointSettingKey:               "",
+	BackupS3RegionSettingKey:                 "",
+	BackupS3PathStyleSettingKey:              "false",
+	BackupS3BucketSettingKey:                 "",
+	BackupS3KeyPrefixSettingKey:              "",
+	BackupS3AccessKeySettingKey:              "",
+}
+
+var legacyAdminSettingFallbacks = []struct {
+	canonical string
+	legacy    string
+}{
+	{"s3.public_endpoint", "s3.operational_endpoint"},             //nolint:goconst // Explicit compatibility pair.
+	{"s3.public_read_endpoint", "s3.operational_public_endpoint"}, //nolint:goconst // Explicit compatibility pair.
+	{"s3.public_region", "s3.operational_region"},                 //nolint:goconst // Explicit compatibility pair.
+	{"s3.public_path_style", "s3.operational_path_style"},         //nolint:goconst // Explicit compatibility pair.
+	{"s3.public_bucket", "s3.operational_bucket"},                 //nolint:goconst // Explicit compatibility pair.
+	{"s3.public_key_prefix", "s3.operational_key_prefix"},         //nolint:goconst // Explicit compatibility pair.
+	{"s3.public_access_key", "s3.operational_access_key"},         //nolint:goconst // Explicit compatibility pair.
+	{"s3.public_secret_key", "s3.operational_secret_key"},         //nolint:goconst // Explicit compatibility pair.
+	{"s3.public_url_auth", "s3.operational_url_auth"},
+	{"s3.public_token_secret", "s3.operational_token_secret"},
+	{"s3.public_token_param", "s3.operational_token_param"},
+	{"s3.public_token_ttl", "s3.operational_token_ttl"}, //nolint:goconst // Explicit compatibility pair.
+	{"s3.private_endpoint", "s3.operational_endpoint"},  //nolint:goconst // Explicit compatibility pair.
+	{"s3.private_region", "s3.operational_region"},
+	{"s3.private_path_style", "s3.operational_path_style"},
+	{"s3.private_bucket", "s3.operational_bucket"},
+	{"s3.private_key_prefix", "s3.operational_key_prefix"},
+	{"s3.private_access_key", "s3.operational_access_key"},
+	{"s3.private_secret_key", "s3.operational_secret_key"},
+	{"ai.chat_model", "subtitle_ai.chat_model"},
+}
+
+// AdminSettingDefaultKeys lists every key with an admin default, sorted. The
+// backup restore table must classify each one.
+func AdminSettingDefaultKeys() []string {
+	keys := make([]string, 0, len(adminSettingDefaults))
+	for key := range adminSettingDefaults {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// EffectiveAdminSettings overlays persisted values onto the runtime defaults
+// used by the Admin UI. An empty persisted value means "use the default" for
+// keys that have one, matching stringOr/boolOr/intOr in LoadFromDB.
+func EffectiveAdminSettings(stored map[string]string) map[string]string {
+	effective := make(map[string]string, len(adminSettingDefaults)+len(stored))
+	for key, value := range adminSettingDefaults {
+		effective[key] = value
+	}
+	for key, value := range stored {
+		if value == "" {
+			if _, hasDefault := adminSettingDefaults[key]; hasDefault {
+				continue
+			}
+		}
+		effective[key] = value
+	}
+	// Preserve the canonical-then-legacy precedence used by LoadFromDB. Apply
+	// aliases after the stored overlay so an explicitly empty canonical key
+	// cannot erase a configured legacy fallback.
+	for _, fallback := range legacyAdminSettingFallbacks {
+		applyLegacyAdminSettingFallback(
+			effective,
+			stored,
+			fallback.canonical,
+			fallback.legacy,
+		)
+	}
+	applyLegacyPositiveIntAdminSettingFallback(
+		effective,
+		stored,
+		"ai.max_concurrent_jobs",
+		"subtitle_ai.max_concurrent_jobs",
+	)
+	return effective
+}
+
+// AdminSettingEnabled reads a stored boolean setting as the Admin UI shows
+// it: an absent or empty value is the setting's default, so a runtime reader
+// and an untouched settings form cannot disagree.
+func AdminSettingEnabled(key, stored string) bool {
+	value := strings.TrimSpace(stored)
+	if value == "" {
+		value = adminSettingDefaults[key]
+	}
+	return strings.EqualFold(value, "true")
+}
+
+func applyLegacyAdminSettingFallback(effective, stored map[string]string, canonical, legacy string) {
+	if stored[canonical] != "" {
+		return
+	}
+	if value := stored[legacy]; value != "" {
+		effective[canonical] = value
+	}
+}
+
+func applyLegacyPositiveIntAdminSettingFallback(
+	effective,
+	stored map[string]string,
+	canonical,
+	legacy string,
+) {
+	value := stored[canonical]
+	if value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed > 0 {
+			return
+		}
+	}
+	if fallback := stored[legacy]; fallback != "" {
+		effective[canonical] = fallback
+		return
+	}
+	if fallback, ok := adminSettingDefaults[canonical]; ok {
+		effective[canonical] = fallback
+	}
+}
+
+// NormalizeAdminSetting validates and canonicalizes settings shared by the
+// generic single and batch Admin endpoints. Domain-specific validators may
+// layer stricter checks on top of this function.
+func NormalizeAdminSetting(key, raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+
+	switch key {
+	case "metadata.cache_images", "playback.transcode_enabled", PlaybackAllowHEVCEncodingSettingKey, PlaybackPreferLowerVersionTranscodeSettingKey,
+		PlaybackKeyframePlaylistSettingKey, PlaybackBandwidthProbeAutomaticSettingKey,
+		ChapterThumbnailSoftwareToneMapSettingKey, PlaybackTranscodeHardwareToneMapSettingKey,
+		PlaybackTranscodeSoftwareToneMapSettingKey, CatalogScopeVersionsToLibrarySettingKey,
+		Allow4KTranscodeSettingKey, playback.TranscodeThrottleEnabledSettingKey, "audiobookshelf_compat.enabled",
+		"jellyfin_compat.enabled", "jellyfin_compat.web_enabled", JellyfinCompatAddressStreamGrantSettingKey, "recommendations.enabled",
+		"subtitle_ai.enabled", "subtitle_ai.transcribe_enabled", "metadata_ai.enabled", "subtitles.auto_sync",
+		"download.enabled", "download.transcode_enabled", DownloadLocalTranscodeFallbackSettingKey,
+		"email.enabled", "signup.enabled", "password_reset.self_service_enabled", SetupCompletedSettingKey,
+		"scanner.empty_trash_after_scan", "scanner.realtime_monitoring", "matcher.enable_tv_series_root_queue",
+		"matcher.enable_tv_series_group_queue", "policy.editor_enabled",
+		"overlays.enabled", "notifications.release_events_enabled", "notifications.fanout_enabled",
+		"notifications.ui_enabled", "notifications.webhooks_enabled",
+		"notifications.webhooks.allow_private_destinations", "media_servers.allow_private_destinations",
+		"notifications.email_enabled",
+		"notifications.email.allow_per_episode", "notifications.discord_enabled",
+		"notifications.discord.allow_per_episode", "notifications.server_channels_enabled",
+		"notifications.server_channels.mention_requesters", "notifications.web_push_enabled",
+		"notifications.apple_push_delivery_enabled", "notifications.android_push_delivery_enabled",
+		"catalog.search.meilisearch.semantic_enabled", "catalog.search.meilisearch.binary_quantized",
+		"s3.public_path_style", "s3.private_path_style", "s3.user_db_path_style",
+		AuthLocalPasswordLoginSettingKey, AuthEmailAutoMatchSettingKey, AuthUserAPIKeysSettingKey, ServerLANDiscoverySettingKey,
+		BackupEnabledSettingKey, BackupIncludeIntroFingerprintsSettingKey, BackupIncludeSubtitlesSettingKey,
+		BackupS3PathStyleSettingKey:
+		return normalizeAdminBool(key, value)
+
+	case BackupTimeSettingKey:
+		hour, minute, ok := ParseBackupTime(value)
+		if !ok {
+			return "", fmt.Errorf("%s must be a 24-hour time such as 04:00", key)
+		}
+		return fmt.Sprintf("%02d:%02d", hour, minute), nil
+	case BackupKeepSettingKey:
+		return normalizeAdminInt(key, value, MinBackupKeep, MaxBackupKeep)
+	case BackupDestinationSettingKey:
+		return normalizeAdminEnum(key, value, BackupDestinationDefault, BackupDestinationS3)
+	case BackupS3EndpointSettingKey:
+		return normalizeAdminURL(key, value)
+	case BackupS3KeyPrefixSettingKey:
+		return strings.Trim(value, "/"), nil
+
+	case AuthProviderRecheckIntervalSettingKey:
+		parsed, err := parseDuration(value)
+		if err != nil || parsed < 5*time.Minute || parsed > 30*24*time.Hour {
+			return "", fmt.Errorf("%s must be a duration between 5m and 30d", key)
+		}
+		return value, nil
+	case AuthProviderRecheckOutagePolicySettingKey:
+		return normalizeAdminEnum(key, value, AuthRecheckFailOpen, AuthRecheckFailClosed)
+
+	case AccessUnratedContentSettingKey:
+		return normalizeAdminEnum(key, value, AccessUnratedContentHide, AccessUnratedContentAllow)
+
+	case CatalogExtraRatingSourcesSettingKey:
+		return normalizeRatingSourceList(key, value)
+
+	case "artwork.storage_backend":
+		return normalizeAdminEnum(key, value, "auto", "local", "s3")
+	case "artwork.local_path":
+		if value == "" || !filepath.IsAbs(value) {
+			return "", fmt.Errorf("%s must be an absolute path", key)
+		}
+		return filepath.Clean(value), nil
+
+	case "database.max_connections":
+		return normalizeAdminInt(key, value, 1, 10000)
+	case "userdb.pool_max_open":
+		return normalizeAdminInt(key, value, 1, 100000)
+	case "scanner.workers", "matcher.workers",
+		"scanner.max_concurrent_libraries", "scanner.max_concurrent_scoped":
+		return normalizeAdminInt(key, value, 1, 1024)
+	case "matcher.batch_size":
+		return normalizeAdminInt(key, value, 1, 100000)
+	case MetadataImageWorkersSettingKey:
+		return normalizeAdminInt(key, value, 0, 256)
+	case MetadataPersonRefreshPerMinuteSettingKey:
+		return normalizeAdminInt(key, value, 1, 6000)
+	case MarkersDetectionWorkersSettingKey:
+		return normalizeAdminInt(key, value, 1, 64)
+	case "playback.chapter_thumbnail_workers", "playback.chapter_thumbnail_node_capacity", "subtitles.sync_node_capacity":
+		return normalizeAdminInt(key, value, 1, 1024)
+	case PreviewImageWidthSettingKey:
+		normalized, err := normalizeAdminInt(key, value, MinPreviewImageWidth, MaxPreviewImageWidth)
+		if err != nil {
+			return "", err
+		}
+		if width, _ := strconv.Atoi(normalized); width%2 != 0 {
+			return "", fmt.Errorf("%s must be an even number of pixels", key)
+		}
+		return normalized, nil
+	case "playback.trickplay_interval_seconds":
+		return normalizeAdminInt(key, value, 5, 60)
+	case PlaybackBandwidthProbeMaxAgeDaysSettingKey:
+		// Rows are retained 30 days after their last update, so a longer
+		// lifetime would outlive the reading it describes.
+		return normalizeAdminInt(key, value, 1, maxBandwidthProbeMaxAgeDays)
+	// A node takes no more runs than API servers send it, so its capacity
+	// shares the per-server worker range.
+	case "playback.trickplay_workers", "playback.trickplay_node_capacity":
+		return normalizeAdminInt(key, value, 1, 64)
+	case "playback.watched_threshold":
+		return normalizeAdminInt(key, value, 1, 100)
+	case "playback.min_resume_threshold":
+		return normalizeAdminInt(key, value, 1, 99)
+	case playback.TranscodeThrottleSecondsSettingKey:
+		return normalizeAdminInt(key, value, 60, 86400)
+	case playbackSegmentRetentionSettingKey:
+		normalized, err := normalizeAdminInt(key, value, 0, 86400)
+		if err != nil {
+			return "", err
+		}
+		seconds, _ := strconv.Atoi(normalized)
+		if seconds != 0 && seconds < 120 {
+			return "", fmt.Errorf("%s must be 0 or between 120 and 86400", key)
+		}
+		return normalized, nil
+	case "ai.max_concurrent_jobs", "subtitle_ai.max_concurrent_jobs":
+		return normalizeAdminInt(key, value, 1, 1024)
+	case "subtitle_ai.batch_size":
+		return normalizeAdminInt(key, value, 1, 1000)
+	case "subtitle_ai.context_neighbors":
+		return normalizeAdminInt(key, value, 0, 100)
+	case "subtitle_ai.asr_chunk_seconds":
+		return normalizeAdminInt(key, value, 60, 600)
+	case "subtitle_ai.live_asr_chunk_seconds":
+		// 15s is the transcriber's hard floor (clampASRChunkSeconds); accepting
+		// less would store a value the runtime silently raises.
+		return normalizeAdminInt(key, value, 15, 600)
+	case "subtitle_ai.transcribe_quota_jobs":
+		return normalizeAdminInt(key, value, 0, math.MaxInt32)
+	case "download.server_bandwidth_mbps", "download.user_bandwidth_mbps":
+		return normalizeAdminInt64(key, value, 0, 73_786_976_294_838)
+	case "download.max_concurrent_per_user", "download.max_per_period",
+		"download.max_concurrent_prepares", "download.artifact_max_bytes":
+		return normalizeAdminInt64(key, value, 0, math.MaxInt64)
+	case DownloadArtifactCacheHoursSettingKey:
+		return normalizeAdminInt(key, value, 0, MaxDownloadArtifactCacheHours)
+	case DownloadArtifactDiskCeilingSettingKey:
+		return normalizeAdminInt(key, value, MinDownloadArtifactDiskCeilingPercent, MaxDownloadArtifactDiskCeilingPercent)
+	case "policy.decision_log_scope_sample_rate", "policy.decision_log_retention_days":
+		return normalizeAdminInt(key, value, 1, math.MaxInt32)
+	case "policy.eval_timeout_ms":
+		return normalizeAdminInt(key, value, 1, 60000)
+	case "email.smtp_port":
+		return normalizeAdminInt(key, value, 1, 65535)
+	case "notifications.fanout.settle_seconds":
+		return normalizeAdminInt(key, value, 0, 3600)
+	case "notifications.fanout.max_event_age_hours":
+		return normalizeAdminInt(key, value, 1, 24*365)
+	case "notifications.retention.read_days", "notifications.retention.unread_days",
+		"notifications.retention.event_days":
+		return normalizeAdminInt(key, value, 1, 3650)
+	case "notifications.webhooks.max_per_profile":
+		return normalizeAdminInt(key, value, 1, 100)
+	case "notifications.webhooks.deliveries_per_minute_per_profile":
+		return normalizeAdminInt(key, value, 1, 10000)
+	case "notifications.email.digest_hour", "notifications.discord.digest_hour":
+		return normalizeAdminInt(key, value, 0, 23)
+	case "notifications.server_channels.batch_seconds":
+		return normalizeAdminInt(key, value, 120, 3600)
+	case "catalog.search.meilisearch.timeout_ms":
+		return normalizeAdminInt(key, value, 1, math.MaxInt32)
+	case "catalog.search.meilisearch.sync_batch_size":
+		return normalizeAdminInt(key, value, 1, 10000)
+	case "catalog.search.meilisearch.rebuild_batch_size":
+		return normalizeAdminInt(key, value, 1, 25000)
+	case "catalog.search.meilisearch.rebuild_task_queue_depth":
+		return normalizeAdminInt(key, value, 1, 16)
+	case "taskmanager.history_retention_days", "autoscan.events_retention_days":
+		return normalizeAdminInt(key, value, 1, 3650)
+	case "taskmanager.history_keep_per_task":
+		return normalizeAdminInt(key, value, 1, math.MaxInt32)
+	case "opslog.retention_days", "opslog.cleanup_interval_minutes":
+		return normalizeAdminInt(key, value, 1, math.MaxInt32)
+	case "opslog.max_rows", "opslog.max_size_mb":
+		return normalizeAdminInt64(key, value, 1, math.MaxInt64)
+	case "s3.public_token_ttl":
+		return normalizeAdminInt(key, value, 1, math.MaxInt32)
+
+	case "recommendations.taste_decay_half_life_days":
+		return normalizeAdminFloat(key, value, math.SmallestNonzeroFloat64, math.MaxFloat64)
+	case "recommendations.diversity_lambda", "catalog.search.meilisearch.semantic_ratio":
+		return normalizeAdminFloat(key, value, 0, 1)
+
+	case "auth.access_token_expiry", "auth.refresh_token_expiry", "userdb.idle_timeout",
+		"download.period_duration", "jellyfin_compat.session_ttl",
+		"jellyfin_compat.playback_session_ttl", "s3.metadata_presign_expiry",
+		"recommendations.embeddings_job_timeout":
+		return normalizeAdminDuration(key, value)
+	case "scanner.file_removal_grace":
+		// The scanner deliberately tolerates a zero or negative grace as
+		// "remove missing files immediately" (LoadFromDB warns and clamps to
+		// zero), so only require a parseable duration here.
+		if _, err := parseDuration(value); err != nil {
+			return "", fmt.Errorf("%s must be a duration", key)
+		}
+		return value, nil
+
+	case "server.log_level":
+		return normalizeAdminEnum(key, value, "debug", "info", "warn", "error")
+	case serverLogFormatSettingKey:
+		// Empty keeps the text default, as an unset row does.
+		if value == "" {
+			return "", nil
+		}
+		return normalizeAdminEnum(key, value, "text", "json")
+	case "opslog.capture_level":
+		// "warning" is accepted because the startup reader in cmd/silo treats
+		// it as an alias for "warn".
+		return normalizeAdminEnum(key, value, "debug", "info", "warn", "warning", "error")
+	case "userdb.backend":
+		return normalizeAdminEnum(key, value, "postgres", "sqlite")
+	case "playback.hw_accel":
+		return normalizeAdminEnum(key, value, "auto", "qsv", "vaapi", "nvenc", "videotoolbox", "none")
+	case PlaybackRoutingRemuxExecutionSettingKey, PlaybackRoutingVideoTranscodeExecutionSettingKey:
+		return normalizeAdminEnum(key, value,
+			string(PlaybackExecutionPreferWorker), string(PlaybackExecutionPreferTranscode),
+			string(PlaybackExecutionWorkerOnly),
+			string(PlaybackExecutionPreferAPI), string(PlaybackExecutionAPIOnly))
+	case PlaybackRoutingDirectPlayEgressSettingKey, PlaybackRoutingRemuxEgressSettingKey,
+		PlaybackRoutingVideoTranscodeEgressSettingKey:
+		return normalizeAdminEnum(key, value,
+			string(PlaybackEgressPreferProxy), string(PlaybackEgressProxyOnly),
+			string(PlaybackEgressPreferAPI), string(PlaybackEgressAPIOnly))
+	case "playback.chapter_thumbnail_execution", "playback.trickplay_execution", "subtitles.sync_execution":
+		return normalizeAdminEnum(key, value, "local", "prefer_transcode_nodes", "transcode_nodes_only")
+	case "playback.chapter_thumbnail_hdr_policy":
+		return normalizeAdminEnum(key, value, "disabled", "best_effort")
+	case "metadata_ai.on_view":
+		return normalizeAdminEnum(key, value, "off", "button", "auto")
+	case MetadataFallbackLanguageSettingKey:
+		value = strings.ToLower(value)
+		if value == "" || value == MetadataFallbackOriginal || (len(value) == 2 && lang.RegisteredTag(value) == value) {
+			return value, nil
+		}
+		return "", fmt.Errorf("%s must be a two-letter ISO 639-1 code or %q", key, MetadataFallbackOriginal)
+	case "ai.auth_mode":
+		return normalizeAdminEnum(key, value, "api_key", aiAuthModeChatGPT)
+	case "ai.reasoning_effort":
+		return normalizeAdminEnum(key, value, "", "none", "minimal", "low", "medium", "high", "xhigh", "max")
+	case AIServiceTierSettingKey:
+		return normalizeAdminEnum(key, value, "", "priority", "ultrafast")
+	case "subtitle_ai.transcribe_quota_period":
+		return normalizeAdminEnum(key, value, "day", "week", "month")
+	case "policy.decision_log_verbosity":
+		return normalizeAdminEnum(key, value, "digest", "verbose")
+	case "email.smtp_security":
+		return normalizeAdminEnum(key, value, "starttls", "tls", "none")
+	case "notifications.discord.poster_mode":
+		return normalizeAdminEnum(key, value, "off", "provider", "server")
+	case "catalog.search.provider":
+		return normalizeAdminEnum(key, value, "postgres", "meilisearch")
+	case "catalog.search.meilisearch.matching_strategy":
+		return normalizeAdminEnum(key, value, "last", "all")
+	case "s3.public_url_auth":
+		return normalizeAdminEnum(key, value, "", "presigned", "public", "cloudflare_token")
+
+	case "recommendations.embeddings_cron", "recommendations.taste_profiles_cron",
+		"recommendations.cowatch_cron", "recommendations.recommendations_cron":
+		if _, err := cron.ParseStandard(value); err != nil {
+			return "", fmt.Errorf("%s must be a valid five-field cron expression: %w", key, err)
+		}
+		return value, nil
+
+	case legacyAITextURLSetting, legacyAITextKeySetting, legacyAISpeechURLSetting, legacyAISpeechKeySetting,
+		legacySubtitleURLSetting, legacySubtitleKeySetting:
+		return "", fmt.Errorf("%s was replaced by AI providers; connect the provider in AI Services", key)
+	case legacyEmbeddingURLSetting, legacyEmbeddingTokenSetting, legacyOpenAIEmbeddingModel,
+		legacyOpenAIEmbeddingToken, legacyEmbeddingProviderSetting:
+		return "", fmt.Errorf("%s was replaced by AI providers; choose the embedding provider on Recommendations", key)
+	case AITextProviderSettingKey, AISpeechProviderSettingKey, EmbeddingProviderSettingKey:
+		return value, nil
+
+	case "server.public_url", "jellyfin_compat.public_url",
+		"s3.public_endpoint", "s3.public_read_endpoint", "s3.private_endpoint",
+		"s3.user_db_endpoint", "catalog.search.meilisearch.url":
+		return normalizeAdminURL(key, value)
+	case ServerLocalURLSettingKey:
+		return normalizeLocalURL(value)
+	case "redis.url":
+		return NormalizeRedisURL(value)
+	case RedisDBSettingKey:
+		return NormalizeRedisDB(value)
+	case "theme.catalog_url":
+		return normalizeAdminThemeURL(key, value)
+
+	case "email.from_address":
+		if value == "" {
+			return "", nil
+		}
+		address, err := mail.ParseAddress(value)
+		if err != nil || address.Address != value {
+			return "", fmt.Errorf("%s must be a valid email address", key)
+		}
+		return value, nil
+
+	case DashboardHiddenAttentionSettingKey:
+		return normalizeDashboardHiddenAttention(value)
+
+	case "defaults.card_overlays", "opslog.bucket_policies", "ui.admin_theme_vars":
+		if value == "" {
+			return "", nil
+		}
+		var decoded any
+		if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+			return "", fmt.Errorf("%s must be valid JSON: %w", key, err)
+		}
+		return value, nil
+	}
+
+	if def, ok := adminDefaultDefinition(key); ok {
+		return normalizeAdminDefault(def, value)
+	}
+
+	return raw, nil
+}
+
+// adminDefaultDefinition returns the settings-contract definition whose
+// server-wide default the key holds. A contract that fails to load leaves the
+// key unrecognized; the server refuses to start in that state anyway.
+func adminDefaultDefinition(key string) (*settingscontract.Definition, bool) {
+	contract, err := settingscontract.Load()
+	if err != nil {
+		return nil, false
+	}
+	return contract.AdminDefaultFor(key)
+}
+
+// normalizeAdminDefault validates an administrator default against the value
+// schema of the setting it stands in for. Empty clears it, so viewers inherit
+// the contract default again.
+func normalizeAdminDefault(def *settingscontract.Definition, value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	normalized, err := def.ValueSchema.NormalizeValue(json.RawMessage(value), settingscontract.ObjectSchemas())
+	if err != nil {
+		return "", fmt.Errorf("%s must be a valid %s value: %w",
+			settingscontract.AdminDefaultSettingKey(def.Key), def.Key, err)
+	}
+	return string(normalized), nil
+}
+
+// AdminSettingsCapabilities describes durable bootstrap configuration that is
+// intentionally absent from the flat server_settings map.
+type AdminSettingsCapabilities struct {
+	RedisBootstrapAvailable bool
+}
+
+// ValidateAdminSettings validates a stored settings snapshot without external
+// bootstrap capabilities.
+func ValidateAdminSettings(values map[string]string) error {
+	return ValidateAdminSettingsWithCapabilities(values, AdminSettingsCapabilities{})
+}
+
+// ValidateAdminSettingsWithCapabilities validates the complete prospective
+// settings snapshot against durable bootstrap configuration. It catches
+// combinations that only become invalid once independently editable fields are
+// considered together.
+func ValidateAdminSettingsWithCapabilities(values map[string]string, capabilities AdminSettingsCapabilities) error {
+	if _, err := LoadFromDB(values); err != nil {
+		return err
+	}
+
+	access, err := parseDuration(EffectiveAdminSettings(values)["auth.access_token_expiry"])
+	if err != nil || access <= 0 {
+		return fmt.Errorf("auth.access_token_expiry must be a positive duration")
+	}
+	refresh, err := parseDuration(EffectiveAdminSettings(values)["auth.refresh_token_expiry"])
+	if err != nil || refresh <= 0 {
+		return fmt.Errorf("auth.refresh_token_expiry must be a positive duration")
+	}
+	if refresh < access {
+		return fmt.Errorf("auth.refresh_token_expiry must be greater than or equal to auth.access_token_expiry")
+	}
+
+	if watched, _ := strconv.Atoi(EffectiveAdminSettings(values)["playback.watched_threshold"]); watched > 0 {
+		if resume, _ := strconv.Atoi(EffectiveAdminSettings(values)["playback.min_resume_threshold"]); resume >= watched {
+			return fmt.Errorf("playback.min_resume_threshold must be less than playback.watched_threshold")
+		}
+	}
+
+	effective := EffectiveAdminSettings(values)
+	if err := reasoning.Validate(effective["ai.chat_model"], effective["ai.reasoning_effort"]); err != nil {
+		return err
+	}
+	if err := ValidateAIProviderBindings(effective); err != nil {
+		return err
+	}
+	for _, prefix := range []string{"s3.public", "s3.private"} {
+		endpoint := strings.TrimSpace(effective[prefix+"_endpoint"])
+		bucket := strings.TrimSpace(effective[prefix+"_bucket"])
+		if (endpoint == "") != (bucket == "") {
+			return fmt.Errorf("%s endpoint and bucket must be configured together", strings.ReplaceAll(prefix, ".", " "))
+		}
+		accessKey := strings.TrimSpace(effective[prefix+"_access_key"])
+		secretKey := strings.TrimSpace(effective[prefix+"_secret_key"])
+		if (accessKey == "") != (secretKey == "") {
+			return fmt.Errorf("%s access key and secret key must be configured together", strings.ReplaceAll(prefix, ".", " "))
+		}
+	}
+
+	if err := ValidateArtworkStorageSettings(effective); err != nil {
+		return err
+	}
+
+	switch effective["s3.public_url_auth"] {
+	case "", "presigned":
+	case "public", cloudflareURLMode:
+		if strings.TrimSpace(effective["s3.public_read_endpoint"]) == "" {
+			return fmt.Errorf("s3.public_read_endpoint is required for %s URL authentication", effective["s3.public_url_auth"])
+		}
+		if effective["s3.public_url_auth"] == cloudflareURLMode && strings.TrimSpace(effective["s3.public_token_secret"]) == "" {
+			return fmt.Errorf("s3.public_token_secret is required for Cloudflare Token URL authentication")
+		}
+	default:
+		return fmt.Errorf("s3.public_url_auth must be presigned, public, or cloudflare_token")
+	}
+	if effective["email.enabled"] == "true" {
+		if strings.TrimSpace(effective["email.smtp_host"]) == "" {
+			return fmt.Errorf("email.smtp_host is required when email is enabled")
+		}
+		if strings.TrimSpace(effective["email.from_address"]) == "" {
+			return fmt.Errorf("email.from_address is required when email is enabled")
+		}
+	}
+	if (strings.TrimSpace(effective["watchsync.simkl.client_id"]) == "") != (strings.TrimSpace(effective["watchsync.simkl.client_secret"]) == "") {
+		return errors.New("watchsync.simkl client ID and client secret must be configured together")
+	}
+	if err := ValidateRedisRateLimitTransport(effective, capabilities.RedisBootstrapAvailable); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ValidateRedisRateLimitTransport ensures a persisted Redis limiter selection
+// will still have a usable transport after restart. Active process state is not
+// sufficient: it may be using a URL that this same update clears.
+func ValidateRedisRateLimitTransport(values map[string]string, redisBootstrapAvailable bool) error {
+	effective := EffectiveAdminSettings(values)
+	redisURL, err := NormalizeRedisURL(effective["redis.url"])
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(effective["ratelimit.backend"]), "redis") &&
+		redisURL == "" &&
+		!redisBootstrapAvailable {
+		return fmt.Errorf("redis.url or a bootstrap REDIS_URL is required when ratelimit.backend is redis")
+	}
+	return nil
+}
+
+// NormalizeRedisURL applies the same parser used by the runtime Redis client.
+func NormalizeRedisURL(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	if _, _, err := ParseRedisURL(value); err != nil {
+		return "", fmt.Errorf("redis.url must be a valid redis://, rediss://, or unix:// URL: %w", err)
+	}
+	return value, nil
+}
+
+// RedisDBSettingKey is the setting that replaces the database number in
+// redis.url.
+const RedisDBSettingKey = "redis.db"
+
+// NormalizeRedisDB accepts an empty value, which leaves the database number
+// to redis.url, or a whole number of 0 or more.
+func NormalizeRedisDB(raw string) (string, error) {
+	db, set, err := parseRedisDB(raw)
+	if err != nil || !set {
+		return "", err
+	}
+	return strconv.Itoa(db), nil
+}
+
+// parseRedisDB reads a redis.db value and reports whether it names a number.
+func parseRedisDB(raw string) (db int, set bool, err error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, false, nil
+	}
+	db, err = strconv.Atoi(value)
+	if err != nil || db < 0 {
+		return 0, false, fmt.Errorf("%s must be a whole number, 0 or more", RedisDBSettingKey)
+	}
+	return db, true, nil
+}
+
+// Options returns the options every Redis client is built from: what
+// ParseRedisURL reads from URL, on database DB when DB is set. The error says
+// which of the two cannot be read.
+func (c RedisConfig) Options() (*redisv9.Options, *redisv9.FailoverOptions, error) {
+	options, failover, err := ParseRedisURL(c.URL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid redis URL: %w", err)
+	}
+	db, set, err := parseRedisDB(c.DB)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch {
+	case !set:
+	case failover != nil:
+		failover.DB = db
+	default:
+		options.DB = db
+	}
+	return options, failover, nil
+}
+
+// Database returns the database number the config's clients are on. It
+// reports false when there is no URL or the config cannot be parsed.
+func (c RedisConfig) Database() (int, bool) {
+	if strings.TrimSpace(c.URL) == "" {
+		return 0, false
+	}
+	options, failover, err := c.Options()
+	if err != nil {
+		return 0, false
+	}
+	var db int
+	if failover != nil {
+		db = failover.DB
+	} else {
+		db = options.DB
+	}
+	// go-redis accepts a negative number in a URL and leaves the connection
+	// on database 0.
+	return max(db, 0), true
+}
+
+// WithBootstrapURL returns the config of a process started with REDIS_URL.
+// The environment names the whole connection, database number included, so
+// the saved redis.db is not applied to it. An empty bootstrapURL changes
+// nothing.
+func (c RedisConfig) WithBootstrapURL(bootstrapURL string) RedisConfig {
+	if bootstrapURL == "" {
+		return c
+	}
+	return RedisConfig{URL: bootstrapURL}
+}
+
+// redisSentinelMasterParam is the query parameter that makes a redis.url name
+// a Sentinel deployment instead of one Redis server.
+const redisSentinelMasterParam = "master_name"
+
+// ParseRedisURL parses a redis.url value and returns exactly one set of
+// options. A URL with a master_name parameter names a Sentinel deployment:
+// its host and any addr parameters are Sentinel addresses, its user info
+// authenticates to Sentinel, and the username and password parameters
+// authenticate to the Redis servers. Any other URL names one Redis server.
+// The URL path is the database number, unless a db parameter overrides it.
+//
+// The URL can carry passwords and the errors are logged, so an error says
+// what is wrong without quoting any part of the URL.
+func ParseRedisURL(raw string) (*redisv9.Options, *redisv9.FailoverOptions, error) {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, nil, errors.New("redis: the URL is malformed" + redisURLEncodingHint)
+	}
+	query, queryErr := url.ParseQuery(u.RawQuery)
+	sentinel := query.Has(redisSentinelMasterParam)
+	mentioned := strings.Contains(percentDecoded(u.RawQuery), redisSentinelMasterParam) || strings.Contains(u.Fragment, redisSentinelMasterParam)
+	if mentioned && (queryErr != nil || strings.Contains(raw, "#")) {
+		// go-redis drops a pair it cannot parse and everything after a #. A
+		// dropped master_name would turn the URL into a single-server URL for
+		// the Sentinel port, and a dropped addr or password is just as silent.
+		return nil, nil, errors.New("redis: a parameter of the URL cannot be read" + redisURLEncodingHint)
+	}
+	if !sentinel {
+		options, err := redisv9.ParseURL(raw)
+		if err != nil {
+			return nil, nil, redisURLError(err)
+		}
+		if options.PoolSize < 0 {
+			return nil, nil, errRedisNegativePoolSize
+		}
+		return options, nil, nil
+	}
+
+	if strings.Contains(u.RawQuery, "+") {
+		// A + in a query string is a space, so a password with a + in it
+		// would reach Redis changed.
+		return nil, nil, errors.New("redis: a + in a Sentinel URL parameter means a space; write %2B for a plus sign")
+	}
+	failover, err := redisv9.ParseFailoverURL(raw)
+	if err != nil {
+		return nil, nil, redisURLError(err)
+	}
+	if strings.TrimSpace(failover.MasterName) == "" {
+		return nil, nil, fmt.Errorf("redis: %s must name the Sentinel master", redisSentinelMasterParam)
+	}
+	if failover.PoolSize < 0 {
+		return nil, nil, errRedisNegativePoolSize
+	}
+	if host, port, err := net.SplitHostPort(u.Host); err != nil || host == "" || port == "" {
+		// go-redis would fall back to port 6379, the Redis port.
+		return nil, nil, errors.New("redis: the Sentinel address needs a host and a port, for example sentinel-1:26379; name further Sentinels with addr parameters")
+	}
+	if failover.RouteByLatency || failover.RouteRandomly || failover.ReplicaOnly || failover.UseDisconnectedReplicas {
+		// These options are for reading from replicas. Silo's clients write,
+		// and go-redis panics when a single client is built with a routing
+		// option.
+		return nil, nil, errors.New("redis: route_by_latency, route_randomly, replica_only and use_disconnected_replicas are not supported; Silo reads and writes on the master")
+	}
+	if failover.DialTimeout < 0 || failover.ReadTimeout < 0 {
+		// go-redis reads a read timeout of 0 or less as no timeout. A
+		// subscription that redials into a frozen master would then wait for
+		// its answer for ever, and never move to the master Sentinel promotes.
+		// With a dial timeout of 0 or less every dial fails at once.
+		return nil, nil, errors.New("redis: dial_timeout and read_timeout must be more than 0 in a Sentinel URL; leave them out for the defaults")
+	}
+	if failover.DialTimeout == 0 {
+		// go-redis's Sentinel dialer reads the timeout from these options,
+		// where its 5 second default is not filled in, and a subscription's
+		// dial has no other limit. A dial to a master that is gone would wait
+		// until the kernel gives up.
+		failover.DialTimeout = 5 * time.Second
+	}
+	return nil, failover, nil
+}
+
+// errRedisNegativePoolSize refuses a negative pool_size. go-redis replaces
+// only 0 with its default and panics building a client from a negative size,
+// which the connection check and every start would then do.
+var errRedisNegativePoolSize = errors.New("redis: pool_size must be 0 or more; leave it out for the default")
+
+// percentDecoded decodes the escapes in s that are valid and keeps the rest as
+// they are. url.QueryUnescape gives up at the first invalid one.
+func percentDecoded(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			if value, err := strconv.ParseUint(s[i+1:i+3], 16, 8); err == nil {
+				b.WriteByte(byte(value))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+const redisURLEncodingHint = "; percent-encode reserved characters in user names and passwords"
+
+// redisURLError keeps what is wrong with a URL and drops the value go-redis
+// quotes after it, which can be part of a password that was not
+// percent-encoded.
+func redisURLError(err error) error {
+	problem, _, _ := strings.Cut(strings.TrimPrefix(err.Error(), "redis: "), ": ")
+	switch problem {
+	case "unexpected option", "invalid database number", "invalid URL path":
+		// What a reserved character in a password turns into.
+		problem += redisURLEncodingHint
+	}
+	return errors.New("redis: " + problem)
+}
+
+func normalizeAdminBool(key, value string) (string, error) {
+	parsed, err := strconv.ParseBool(strings.ToLower(value))
+	if err != nil {
+		return "", fmt.Errorf("%s must be true or false", key)
+	}
+	return strconv.FormatBool(parsed), nil
+}
+
+func normalizeAdminInt(key, value string, minValue, maxValue int) (string, error) {
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < minValue || parsed > maxValue {
+		return "", fmt.Errorf("%s must be an integer between %d and %d", key, minValue, maxValue)
+	}
+	return strconv.Itoa(parsed), nil
+}
+
+func normalizeAdminInt64(key, value string, minValue, maxValue int64) (string, error) {
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < minValue || parsed > maxValue {
+		return "", fmt.Errorf("%s must be an integer between %d and %d", key, minValue, maxValue)
+	}
+	return strconv.FormatInt(parsed, 10), nil
+}
+
+func normalizeAdminFloat(key, value string, minValue, maxValue float64) (string, error) {
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < minValue || parsed > maxValue {
+		return "", fmt.Errorf("%s must be a number between %g and %g", key, minValue, maxValue)
+	}
+	return strconv.FormatFloat(parsed, 'f', -1, 64), nil
+}
+
+func normalizeAdminDuration(key, value string) (string, error) {
+	parsed, err := parseDuration(value)
+	if err != nil || parsed <= 0 {
+		return "", fmt.Errorf("%s must be a positive duration", key)
+	}
+	return value, nil
+}
+
+// ValidateArtworkStorageSettings rejects an explicit S3 artwork backend with
+// no public bucket to back it. blobstore.Open fails on that combination, so
+// accepting it here would only surface as a fatal restart.
+func ValidateArtworkStorageSettings(effective map[string]string) error {
+	if strings.ToLower(strings.TrimSpace(effective["artwork.storage_backend"])) != "s3" {
+		return nil
+	}
+	if strings.TrimSpace(effective["s3.public_bucket"]) == "" {
+		return fmt.Errorf("artwork.storage_backend s3 requires s3.public_bucket")
+	}
+	return nil
+}
+
+// normalizeRatingSourceList canonicalizes a comma-separated list of rating
+// source names: trimmed, lowercased, and deduplicated. A name that is not a
+// well-formed source name is an error rather than silently dropped. A
+// well-formed name no enabled plugin declares is kept but shows nothing (see
+// ratingsources.Build).
+func normalizeRatingSourceList(key, value string) (string, error) {
+	sources, malformed := splitRatingSourceList(value)
+	if malformed != "" {
+		return "", fmt.Errorf("%s: %q is not a rating source name", key, malformed)
+	}
+	return strings.Join(sources, ","), nil
+}
+
+// normalizeDashboardHiddenAttention canonicalizes the hidden notice list:
+// trimmed, unique, non-empty ids in their original order. An empty list
+// stores as empty.
+func normalizeDashboardHiddenAttention(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	// Decode loosely and check each element: a []string target would take
+	// JSON null, at the top or as an element, without an error.
+	notStrings := fmt.Errorf("%s must be a JSON array of strings", DashboardHiddenAttentionSettingKey)
+	var ids []any
+	if err := json.Unmarshal([]byte(value), &ids); err != nil || ids == nil {
+		return "", notStrings
+	}
+	kept := make([]string, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, element := range ids {
+		id, ok := element.(string)
+		if !ok {
+			return "", notStrings
+		}
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		if len(id) > maxDashboardHiddenAttentionIDLen {
+			return "", fmt.Errorf("%s ids must be at most %d characters", DashboardHiddenAttentionSettingKey, maxDashboardHiddenAttentionIDLen)
+		}
+		seen[id] = true
+		kept = append(kept, id)
+	}
+	if len(kept) > maxDashboardHiddenAttentionIDs {
+		return "", fmt.Errorf("%s may list at most %d ids", DashboardHiddenAttentionSettingKey, maxDashboardHiddenAttentionIDs)
+	}
+	if len(kept) == 0 {
+		return "", nil
+	}
+	encoded, _ := json.Marshal(kept)
+	return string(encoded), nil
+}
+
+func normalizeAdminEnum(key, value string, allowed ...string) (string, error) {
+	normalized := strings.ToLower(value)
+	for _, candidate := range allowed {
+		if normalized == candidate {
+			return normalized, nil
+		}
+	}
+	return "", fmt.Errorf("%s must be one of: %s", key, strings.Join(allowed, ", "))
+}
+
+// normalizeLocalURL accepts an http(s) origin: clients reach the API at its
+// root, and the connections document publishes origins only.
+func normalizeLocalURL(value string) (string, error) {
+	normalized, err := normalizeAdminURL(ServerLocalURLSettingKey, value)
+	if err != nil || normalized == "" {
+		return normalized, err
+	}
+	parsed, err := url.Parse(normalized)
+	if err != nil {
+		return "", fmt.Errorf("%s must include a URL scheme and host", ServerLocalURLSettingKey)
+	}
+	if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		return "", fmt.Errorf("%s must be a scheme, host and optional port, such as http://192.168.1.20:8080", ServerLocalURLSettingKey)
+	}
+	return normalized, nil
+}
+
+func normalizeAdminURL(key, value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("%s must include a URL scheme and host", key)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("%s must use http or https", key)
+	}
+	return strings.TrimRight(value, "/"), nil
+}

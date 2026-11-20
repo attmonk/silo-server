@@ -1,0 +1,522 @@
+package metadata
+
+import (
+	"context"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+func TestIsLocalImageSourcePath(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"file:///media/movies/Film/poster.jpg", true},
+		{"FILE:///media/movies/Film/poster.jpg", true},
+		{"  file:///media/poster.jpg  ", true},
+		{"https://image.tmdb.org/t/p/original/a.jpg", false},
+		{"tvdb://banners/a.jpg", false},
+		{"local/movies/abc/poster/original.webp", false},
+		{"tmdb/movies/550/poster/original.webp", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isLocalImageSourcePath(tc.path); got != tc.want {
+			t.Errorf("isLocalImageSourcePath(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestApplyBestImagesLocalCandidateAlwaysApplies(t *testing.T) {
+	item := &models.MediaItem{PosterPath: "tmdb/movies/550/poster/original.webp"}
+	applyBestImages(item, []RemoteImage{
+		{ProviderID: "nfo", URL: "file:///media/movies/Film/poster.jpg", Type: ImagePoster, Rating: 0},
+		{ProviderID: "tmdb", URL: "https://image.tmdb.org/text.jpg", Type: ImagePoster, Language: "en", Rating: 10},
+	}, MergeFillEmpty, "en", "")
+	if item.PosterPath != "file:///media/movies/Film/poster.jpg" {
+		t.Fatalf("PosterPath = %q, want local candidate to apply over existing art", item.PosterPath)
+	}
+}
+
+func TestApplyBestImagesRemoteSelectionUnchanged(t *testing.T) {
+	// Regression pins: a rating-0 remote candidate still cannot displace
+	// existing art in fill mode, while a rated one still can.
+	item := &models.MediaItem{PosterPath: "tmdb/movies/550/poster/original.webp"}
+	applyBestImages(item, []RemoteImage{
+		{ProviderID: "tmdb", URL: "https://image.tmdb.org/zero.jpg", Type: ImagePoster, Rating: 0},
+	}, MergeFillEmpty, "en", "")
+	if item.PosterPath != "tmdb/movies/550/poster/original.webp" {
+		t.Fatalf("PosterPath = %q, rating-0 remote must not displace existing art", item.PosterPath)
+	}
+
+	applyBestImages(item, []RemoteImage{
+		{ProviderID: "tmdb", URL: "https://image.tmdb.org/rated.jpg", Type: ImagePoster, Rating: 7.5},
+	}, MergeFillEmpty, "en", "")
+	if item.PosterPath != "https://image.tmdb.org/rated.jpg" {
+		t.Fatalf("PosterPath = %q, rated remote candidate must still apply", item.PosterPath)
+	}
+
+	empty := &models.MediaItem{}
+	applyBestImages(empty, []RemoteImage{
+		{ProviderID: "tmdb", URL: "https://image.tmdb.org/zero.jpg", Type: ImagePoster, Rating: 0},
+	}, MergeFillEmpty, "en", "")
+	if empty.PosterPath != "https://image.tmdb.org/zero.jpg" {
+		t.Fatalf("PosterPath = %q, rating-0 remote must still fill empty art", empty.PosterPath)
+	}
+}
+
+func TestApplyBestImagesPrefersTextPostersByLanguage(t *testing.T) {
+	includesText := true
+	textless := false
+	tests := []struct {
+		name          string
+		preferredLang string
+		fallbackLang  string
+		images        []RemoteImage
+		wantPoster    string
+	}{
+		{
+			name:          "with a fallback language, textless beats a poster in another language",
+			preferredLang: "sv",
+			fallbackLang:  "en",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "japanese", Type: ImagePoster, Rating: 10, IncludesText: &includesText},
+				{ProviderID: "tmdb", URL: "textless", Type: ImagePoster, Rating: 5},
+			},
+			wantPoster: "textless",
+		},
+		{
+			name:          "the fallback language beats English",
+			preferredLang: "sv",
+			fallbackLang:  "fr",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "english", Type: ImagePoster, Language: "en", Rating: 9},
+				{ProviderID: "tmdb", URL: "french", Type: ImagePoster, Language: "fr", Rating: 6},
+			},
+			wantPoster: "french",
+		},
+		{
+			name:          "English still beats textless with another fallback language",
+			preferredLang: "sv",
+			fallbackLang:  "fr",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "textless", Type: ImagePoster, Rating: 10},
+				{ProviderID: "tmdb", URL: "english", Type: ImagePoster, Language: "en", Rating: 6},
+			},
+			wantPoster: "english",
+		},
+		{
+			name:          "explicit text flag beats a higher rated English-tagged textless poster",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tvdb", URL: "textless-english", Type: ImagePoster, Language: "en", Rating: 10, IncludesText: &textless},
+				{ProviderID: "tvdb", URL: "english-with-text", Type: ImagePoster, Language: "en", Rating: 6, IncludesText: &includesText},
+			},
+			wantPoster: "english-with-text",
+		},
+		{
+			name:          "explicit textless poster remains the final fallback",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tvdb", URL: "textless-english", Type: ImagePoster, Language: "en", Rating: 10, IncludesText: &textless},
+			},
+			wantPoster: "textless-english",
+		},
+		{
+			name:          "preferred language beats higher rated textless poster",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "textless", Type: ImagePoster, Rating: 10},
+				{ProviderID: "tmdb", URL: "english", Type: ImagePoster, Language: "en", Rating: 7},
+			},
+			wantPoster: "english",
+		},
+		{
+			name:          "preferred language beats higher rated English poster",
+			preferredLang: "fr",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "french", Type: ImagePoster, Language: "fr", Rating: 6},
+				{ProviderID: "tmdb", URL: "english", Type: ImagePoster, Language: "en", Rating: 9},
+			},
+			wantPoster: "french",
+		},
+		{
+			name:          "English beats higher rated other language when preferred is unavailable",
+			preferredLang: "fr",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "english", Type: ImagePoster, Language: "en", Rating: 6},
+				{ProviderID: "tmdb", URL: "german", Type: ImagePoster, Language: "de", Rating: 9},
+			},
+			wantPoster: "english",
+		},
+		{
+			name:          "highest rated other language beats textless fallback",
+			preferredLang: "fr",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "textless", Type: ImagePoster, Rating: 10},
+				{ProviderID: "tmdb", URL: "spanish", Type: ImagePoster, Language: "es", Rating: 6},
+				{ProviderID: "tmdb", URL: "german", Type: ImagePoster, Language: "de", Rating: 8},
+			},
+			wantPoster: "german",
+		},
+		{
+			name:          "textless remains the final fallback",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "textless-low", Type: ImagePoster, Rating: 4},
+				{ProviderID: "tmdb", URL: "textless-high", Type: ImagePoster, Rating: 8},
+			},
+			wantPoster: "textless-high",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &models.MediaItem{}
+			applyBestImages(item, tt.images, MergeFillEmpty, tt.preferredLang, tt.fallbackLang)
+			if item.PosterPath != tt.wantPoster {
+				t.Fatalf("PosterPath = %q, want %q", item.PosterPath, tt.wantPoster)
+			}
+		})
+	}
+}
+
+func TestApplyBestImagesUsesLibraryLanguageForArtwork(t *testing.T) {
+	item := &models.MediaItem{}
+	applyBestImages(item, []RemoteImage{
+		{ProviderID: "tmdb", URL: "poster-textless", Type: ImagePoster, Rating: 10},
+		{ProviderID: "tmdb", URL: "poster-english", Type: ImagePoster, Language: "en", Rating: 7},
+		{ProviderID: "tmdb", URL: "backdrop-textless", Type: ImageBackdrop, Rating: 10},
+		{ProviderID: "tmdb", URL: "backdrop-english", Type: ImageBackdrop, Language: "en", Rating: 7},
+		{ProviderID: "tmdb", URL: "logo-textless", Type: ImageLogo, Rating: 10},
+		{ProviderID: "tmdb", URL: "logo-english", Type: ImageLogo, Language: "en", Rating: 7},
+	}, MergeFillEmpty, "en", "")
+
+	if item.PosterPath != "poster-english" {
+		t.Fatalf("PosterPath = %q, want text poster", item.PosterPath)
+	}
+	if item.BackdropPath != "backdrop-textless" {
+		t.Fatalf("BackdropPath = %q, want language-neutral background", item.BackdropPath)
+	}
+	if item.LogoPath != "logo-english" {
+		t.Fatalf("LogoPath = %q, want English logo", item.LogoPath)
+	}
+}
+
+func TestApplyBestImagesLogoCandidates(t *testing.T) {
+	tests := []struct {
+		name          string
+		preferredLang string
+		images        []RemoteImage
+		wantLogo      string
+	}{
+		{
+			name:          "preferred language beats higher rated English logo",
+			preferredLang: "fr",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "french", Type: ImageLogo, Language: "fr", Rating: 6},
+				{ProviderID: "tmdb", URL: "english", Type: ImageLogo, Language: "en", Rating: 9},
+			},
+			wantLogo: "french",
+		},
+		{
+			name:          "English is the cross-language fallback",
+			preferredLang: "fr",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "english", Type: ImageLogo, Language: "en", Rating: 6},
+				{ProviderID: "tmdb", URL: "neutral", Type: ImageLogo, Rating: 10},
+			},
+			wantLogo: "english",
+		},
+		{
+			name:          "language-neutral beats unrelated language",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "german", Type: ImageLogo, Language: "de", Rating: 10},
+				{ProviderID: "tmdb", URL: "neutral", Type: ImageLogo, Rating: 6},
+			},
+			wantLogo: "neutral",
+		},
+		{
+			name:          "TVDB clear art cannot beat a lower-priority TMDB wordmark",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tvdb", URL: tvdbClearArtURL, Type: ImageLogo, Language: "en", Rating: 10},
+				{ProviderID: "tmdb", URL: "tmdb://wordmark.png", Type: ImageLogo, Language: "en", Rating: 6},
+			},
+			wantLogo: "tmdb://wordmark.png",
+		},
+		{
+			name:          "TVDB clear art alone leaves the logo empty",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tvdb", URL: tvdbClearArtURL, Type: ImageLogo, Language: "en", Rating: 10},
+			},
+		},
+		{
+			name:          "clear art served over HTTPS is rejected",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tvdb", URL: "https://artworks.thetvdb.com/banners/v4/series/81189/clearart/611b4e0dd75a6.png", Type: ImageLogo, Language: "en", Rating: 10},
+			},
+		},
+		{
+			name:          "TVDB ClearLogo is a wordmark and keeps provider-chain priority",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tvdb", URL: tvdbClearLogoURL, Type: ImageLogo, Language: "en", Rating: 10},
+				{ProviderID: "tmdb", URL: "tmdb://wordmark.png", Type: ImageLogo, Language: "en", Rating: 6},
+			},
+			wantLogo: tvdbClearLogoURL,
+		},
+		{
+			name:          "local sidecar remains authoritative",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "nfo", URL: "file:///media/shows/Example/logo.png", Type: ImageLogo},
+				{ProviderID: "tmdb", URL: "tmdb://wordmark.png", Type: ImageLogo, Language: "en", Rating: 10},
+			},
+			wantLogo: "file:///media/shows/Example/logo.png",
+		},
+		{
+			name:          "highest-rated TMDB wordmark wins within the language tier",
+			preferredLang: "en",
+			images: []RemoteImage{
+				{ProviderID: "tmdb", URL: "tmdb://lower-rated.png", Type: ImageLogo, Language: "en", Rating: 6},
+				{ProviderID: "tmdb", URL: "tmdb://top-rated.png", Type: ImageLogo, Language: "en", Rating: 9},
+			},
+			wantLogo: "tmdb://top-rated.png",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &models.MediaItem{}
+			applyBestImages(item, tt.images, MergeFillEmpty, tt.preferredLang, "")
+			if item.LogoPath != tt.wantLogo {
+				t.Fatalf("LogoPath = %q, want %q", item.LogoPath, tt.wantLogo)
+			}
+		})
+	}
+}
+
+// TVDB serves series ClearArt and ClearLogo from these path shapes. TVDB
+// plugins before v1.4.0 reported the ClearArt as ImageLogo.
+const (
+	tvdbClearArtURL  = "tvdb://banners/v4/series/81189/clearart/611b4e0dd75a6.png"
+	tvdbClearLogoURL = "tvdb://banners/v4/series/81189/clearlogo/611b4df33bac5.png"
+)
+
+func TestApplyBestImagesFallsBackToLanguageTaggedBackgrounds(t *testing.T) {
+	// Language-neutral backgrounds are preferred, but an item whose backdrops
+	// are all language-tagged must still get one rather than none.
+	item := &models.MediaItem{}
+	applyBestImages(item, []RemoteImage{
+		{ProviderID: "tmdb", URL: "english", Type: ImageBackdrop, Language: "en", Rating: 10},
+		{ProviderID: "tmdb", URL: "german", Type: ImageBackdrop, Language: "de", Rating: 9},
+	}, MergeFillEmpty, "en", "")
+	if item.BackdropPath != "english" {
+		t.Fatalf("BackdropPath = %q, want a language-tagged fallback background", item.BackdropPath)
+	}
+}
+
+func TestBuildItemLocalizationRecordSkipsLocalCandidates(t *testing.T) {
+	// Language-neutral local files must not duplicate into per-language rows.
+	loc := buildItemLocalizationRecord(
+		nil,
+		"movie-1",
+		"de",
+		"movie",
+		&MetadataResult{},
+		&MetadataResult{},
+		[]RemoteImage{
+			{ProviderID: "nfo", URL: "file:///media/movies/Film/poster.jpg", Type: ImagePoster},
+		},
+		MergeFillEmpty,
+		"de", "",
+		false, true, false)
+
+	if loc.PosterPath != "" || loc.PosterSourcePath != "" {
+		t.Fatalf("localization picked up local candidate: path=%q source=%q", loc.PosterPath, loc.PosterSourcePath)
+	}
+}
+
+func TestEnqueueItemImagesAcceptsLocalSource(t *testing.T) {
+	service := &MetadataService{}
+	enqueuer := &recordingImageCacheJobEnqueuer{}
+	service.SetAutoCacheImages(true)
+	service.SetImageCacheJobEnqueuer(enqueuer)
+
+	item := &models.MediaItem{
+		ContentID:        "movie-1",
+		Type:             "movie",
+		PosterSourcePath: "file:///media/movies/Film/poster.jpg",
+	}
+	service.enqueueItemImages(context.Background(), item, nil, nil)
+	if len(enqueuer.inputs) != 1 {
+		t.Fatalf("enqueued %d jobs, want 1", len(enqueuer.inputs))
+	}
+	in := enqueuer.inputs[0]
+	if in.SourcePath != "file:///media/movies/Film/poster.jpg" {
+		t.Fatalf("SourcePath = %q", in.SourcePath)
+	}
+	if in.ProviderID != "local" {
+		t.Fatalf("ProviderID = %q, want local", in.ProviderID)
+	}
+	if in.ProviderContentID != "movie-1" {
+		t.Fatalf("ProviderContentID = %q", in.ProviderContentID)
+	}
+}
+
+func TestNormalizeImageCacheJobInputAcceptsLocalSource(t *testing.T) {
+	in, ok := normalizeImageCacheJobInput(EnqueueImageCacheJobInput{
+		TargetType:      ImageCacheTargetItem,
+		TargetContentID: "movie-1",
+		SourcePath:      "file:///media/movies/Film/poster.jpg",
+		ContentType:     "movies",
+	})
+	if !ok {
+		t.Fatal("local file:// source must be accepted")
+	}
+	if in.ProviderID != "local" {
+		t.Fatalf("ProviderID = %q, want local", in.ProviderID)
+	}
+}
+
+func TestIsStableProviderImageFailureLocalClasses(t *testing.T) {
+	for _, text := range []string{
+		"local image missing: /media/movies/Film/poster.jpg",
+		"local image forbidden: /media/movies/Film/poster.jpg",
+		"local image path outside library roots: /etc/passwd",
+		"unexpected status 404",
+	} {
+		if !isStableProviderImageFailure(text) {
+			t.Errorf("expected stable failure classification for %q", text)
+		}
+	}
+	if isStableProviderImageFailure("local image read failed: io timeout") {
+		t.Error("transient local read errors must keep the normal backoff")
+	}
+}
+
+func TestMergeAndPersistLockedImagesKeepPendingArtworkSources(t *testing.T) {
+	h := newTestHarness()
+	ctx := context.Background()
+	const posterSource = "file:///media/tv/Show/poster.jpg"
+
+	if err := h.itemRepo.Upsert(ctx, &models.MediaItem{
+		ContentID:               "series-locked-art",
+		Type:                    "series",
+		Title:                   "Example Show",
+		Year:                    2024,
+		Status:                  "matched",
+		DefaultMetadataLanguage: "en",
+		PosterSourcePath:        posterSource,
+		LogoPath:                "artwork/series-locked-art/logo.png",
+		LogoSourcePath:          "tmdb://logo.png",
+		LockedFields:            []int{int(FieldImages)},
+		Studios:                 []string{},
+		Networks:                []string{},
+		Countries:               []string{},
+		Genres:                  []string{},
+	}); err != nil {
+		t.Fatalf("upsert existing item: %v", err)
+	}
+	providerRepo := newFakeProviderIDRepo()
+	providerRepo.set("series-locked-art", &models.MediaItemProviderID{
+		ContentID:  "series-locked-art",
+		ItemType:   "series",
+		Provider:   "custom",
+		ProviderID: "series-123",
+	})
+	h.service.providerIDRepo = providerRepo
+
+	_, err := h.service.mergeAndPersist(ctx, ProcessRequest{
+		ContentID: "series-locked-art",
+		Mode:      ModeManualRefresh,
+		Language:  "en",
+	}, &MetadataResult{
+		HasMetadata: true,
+		Title:       "Example Show",
+		Year:        2024,
+		ProviderIDs: map[string]string{"custom": "series-123"},
+	}, []RemoteImage{
+		{URL: posterSource, Type: ImagePoster},
+		{URL: "https://images.example/other-poster.jpg", Type: ImagePoster, Rating: 9},
+	}, nil, nil, "series")
+	if err != nil {
+		t.Fatalf("mergeAndPersist: %v", err)
+	}
+
+	got, err := h.itemRepo.GetByID(ctx, "series-locked-art")
+	if err != nil {
+		t.Fatalf("load item: %v", err)
+	}
+	if got.PosterPath != "" || got.PosterSourcePath != posterSource {
+		t.Fatalf("poster = path %q source %q, want pending local source preserved", got.PosterPath, got.PosterSourcePath)
+	}
+	if got.LogoPath != "artwork/series-locked-art/logo.png" || got.LogoSourcePath != "tmdb://logo.png" {
+		t.Fatalf("logo = path %q source %q, want cached logo unchanged", got.LogoPath, got.LogoSourcePath)
+	}
+}
+
+// A refresh replaces a cached TVDB clear-art logo only with a wordmark: on a
+// manual refresh clear art alone clears it, a TVDB ClearLogo is queued over it
+// in either mode, and a cached ClearLogo or an admin-locked choice stays.
+func TestApplyBestImagesStoredClearArtLogo(t *testing.T) {
+	const cachedLogo = "tvdb/series/123/logo/original.webp"
+	newerClearArt := "tvdb://banners/v4/series/81189/clearart/611b4e1126ff1.png"
+	for _, tc := range []struct {
+		name                 string
+		existing             models.MediaItem
+		images               []RemoteImage
+		mode                 MergeMode
+		wantPath, wantSource string
+	}{
+		{
+			name:     "clear art cleared on manual refresh",
+			existing: models.MediaItem{LogoPath: cachedLogo, LogoSourcePath: tvdbClearArtURL},
+			images:   []RemoteImage{{ProviderID: "tvdb", URL: newerClearArt, Type: ImageLogo, Language: "en", Rating: 10}},
+			mode:     MergeReplaceUnlocked,
+		},
+		{
+			// The cached path stays served until the cache job publishes the new source.
+			name:     "TVDB ClearLogo queued over clear art, fill-empty",
+			existing: models.MediaItem{LogoPath: cachedLogo, LogoSourcePath: tvdbClearArtURL},
+			images:   []RemoteImage{{ProviderID: "tvdb", URL: tvdbClearLogoURL, Type: ImageLogo, Language: "en", Rating: 10}},
+			mode:     MergeFillEmpty, wantPath: cachedLogo, wantSource: tvdbClearLogoURL,
+		},
+		{
+			name:     "TVDB ClearLogo queued over clear art, replace",
+			existing: models.MediaItem{LogoPath: cachedLogo, LogoSourcePath: tvdbClearArtURL},
+			images:   []RemoteImage{{ProviderID: "tvdb", URL: tvdbClearLogoURL, Type: ImageLogo, Language: "en", Rating: 10}},
+			mode:     MergeReplaceUnlocked, wantPath: cachedLogo, wantSource: tvdbClearLogoURL,
+		},
+		{
+			name:     "cached TVDB ClearLogo kept when the refresh offers no logo",
+			existing: models.MediaItem{LogoPath: cachedLogo, LogoSourcePath: tvdbClearLogoURL},
+			mode:     MergeReplaceUnlocked, wantPath: cachedLogo, wantSource: tvdbClearLogoURL,
+		},
+		{
+			name: "locked clear art kept on manual refresh",
+			existing: models.MediaItem{
+				LogoPath: "tvdb/series/123/logo/admin-choice.webp", LogoSourcePath: tvdbClearArtURL,
+				LockedFields: []int{int(FieldImages)},
+			},
+			images:   []RemoteImage{{ProviderID: "tvdb", URL: newerClearArt, Type: ImageLogo, Rating: 9}},
+			mode:     MergeReplaceUnlocked,
+			wantPath: "tvdb/series/123/logo/admin-choice.webp", wantSource: tvdbClearArtURL,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			existing := tc.existing
+			item := existing
+			applyBestImages(&item, tc.images, tc.mode, "en", "")
+			prepareItemImagesForQueue(&item, &existing, true, false)
+			if item.LogoPath != tc.wantPath || item.LogoSourcePath != tc.wantSource {
+				t.Fatalf("logo = path %q source %q, want path %q source %q", item.LogoPath, item.LogoSourcePath, tc.wantPath, tc.wantSource)
+			}
+		})
+	}
+}

@@ -1,0 +1,675 @@
+package jellycompat
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+func TestDecodeDeviceProfileKeepsCodecProfiles(t *testing.T) {
+	profile, err := decodeDeviceProfile(strings.NewReader(`{
+		"DeviceProfile": {
+			"CodecProfiles": [{
+				"Type": "Video",
+				"Codec": "hevc",
+				"Conditions": [{
+					"Condition": "LessThanEqual",
+					"Property": "VideoLevel",
+					"Value": 153,
+					"IsRequired": false
+				}],
+				"ApplyConditions": [{
+					"Condition": "EqualsAny",
+					"Property": "VideoProfile",
+					"Value": "main 10"
+				}]
+			}]
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("decodeDeviceProfile: %v", err)
+	}
+	if !profile.HasData() {
+		t.Fatal("HasData = false, want true for CodecProfiles-only payload")
+	}
+	if len(profile.CodecProfiles) != 1 {
+		t.Fatalf("CodecProfiles length = %d, want 1", len(profile.CodecProfiles))
+	}
+	condition := profile.CodecProfiles[0].Conditions[0]
+	if condition.Value != "153" {
+		t.Fatalf("condition Value = %q, want numeric value stringified", condition.Value)
+	}
+}
+
+func TestMatchesCodecProfileContainerUsesJellyfinLiteralTokens(t *testing.T) {
+	tests := []struct {
+		name              string
+		profileContainers string
+		inputContainers   string
+		want              bool
+	}{
+		{name: "asterisk is a literal", profileContainers: "*", inputContainers: "mkv", want: false},
+		{name: "ts does not alias mpegts", profileContainers: "ts", inputContainers: "mpegts", want: false},
+		{name: "negative ts allows mpegts", profileContainers: "-ts", inputContainers: "mpegts", want: true},
+		{name: "case insensitive literal", profileContainers: "MKV", inputContainers: "mkv", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := matchesCodecProfileContainer(tt.profileContainers, tt.inputContainers); got != tt.want {
+				t.Fatalf("matchesCodecProfileContainer(%q, %q) = %v, want %v",
+					tt.profileContainers, tt.inputContainers, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHLSRemuxDV8HDR10BaseLayerMatchesExplicitDOVIAndHDR10Declaration(t *testing.T) {
+	version := hlsRemuxDV8HDR10BaseLayerTestVersion()
+	profile := hlsRemuxDV8HDR10BaseLayerTestProfile([]ProfileCondition{
+		{Condition: "EqualsAny", Property: "VideoRangeType", Value: "SDR|HDR10|HDR10Plus|HLG|DOVI", IsRequired: true},
+		{Condition: "EqualsAny", Property: "VideoCodecTag", Value: "hvc1|dvh1", IsRequired: true},
+	})
+	if !profile.SupportsHLSRemuxForAudioStream(version, defaultAudioStreamIndex(version)) {
+		t.Fatal("proven single-layer DV8.1 HDR10-base source did not match the client's explicit DOVI+HDR10 HLS declaration")
+	}
+}
+
+// A DV 8.1 file whose HDR10 base layer also carries HDR10+ keeps the remux it
+// had before the scanner detected HDR10+.
+func TestHLSRemuxDV8HDR10BaseLayerAcceptsHDR10PlusBase(t *testing.T) {
+	version := hlsRemuxDV8HDR10BaseLayerTestVersion()
+	version.VideoTracks[0].HDR10Plus = true
+	version.VideoTracks[0].VideoRangeType = "DOVIWithHDR10Plus"
+	profile := hlsRemuxDV8HDR10BaseLayerTestProfile([]ProfileCondition{
+		{Condition: "EqualsAny", Property: "VideoRangeType", Value: "SDR|HDR10|HDR10Plus|HLG|DOVI", IsRequired: true},
+		{Condition: "EqualsAny", Property: "VideoCodecTag", Value: "hvc1|dvh1", IsRequired: true},
+	})
+	if !profile.SupportsHLSRemuxForAudioStream(version, defaultAudioStreamIndex(version)) {
+		t.Fatal("DV8.1 source with HDR10+ in its base layer lost the explicit DOVI+HDR10 HLS remux")
+	}
+}
+
+func TestDV8HDR10BaseLayerDoesNotWidenOriginalMKVDirectPlay(t *testing.T) {
+	version := hlsRemuxDV8HDR10BaseLayerTestVersion()
+	profile := DeviceProfile{
+		DirectPlayProfiles: []DirectPlayProfile{{Type: "Video", Container: "mkv", VideoCodec: "hevc", AudioCodec: "eac3"}},
+		CodecProfiles: []CodecProfile{{
+			Type: "Video", Container: "mkv", Codec: "hevc",
+			Conditions: []ProfileCondition{{
+				Condition: "EqualsAny", Property: "VideoRangeType", Value: "HDR10|DOVI", IsRequired: true,
+			}},
+		}},
+	}
+	if profile.SupportsDirectPlay(version) {
+		t.Fatal("original MKV direct play unexpectedly accepted the HLS-only DV8 range exception")
+	}
+}
+
+func TestHLSRemuxDV8HDR10BaseLayerKeepsAllOtherConditionsExact(t *testing.T) {
+	version := hlsRemuxDV8HDR10BaseLayerTestVersion()
+	tests := []struct {
+		name       string
+		conditions []ProfileCondition
+	}{
+		{
+			name: "sample entry",
+			conditions: []ProfileCondition{
+				{Condition: "EqualsAny", Property: "VideoRangeType", Value: "HDR10|DOVI", IsRequired: true},
+				{Condition: "Equals", Property: "VideoCodecTag", Value: "hvc1", IsRequired: true},
+			},
+		},
+		{
+			name: "explicit actual range exclusion",
+			conditions: []ProfileCondition{
+				{Condition: "NotEquals", Property: "VideoRangeType", Value: "DOVIWithHDR10", IsRequired: true},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profile := hlsRemuxDV8HDR10BaseLayerTestProfile(tt.conditions)
+			if profile.SupportsHLSRemuxForAudioStream(version, defaultAudioStreamIndex(version)) {
+				t.Fatal("HLS remux was accepted despite an unsatisfied exact condition")
+			}
+		})
+	}
+}
+
+func TestHLSRemuxDV8HDR10BaseLayerDoesNotWidenAudioProfiles(t *testing.T) {
+	version := hlsRemuxDV8HDR10BaseLayerTestVersion()
+	for _, profileType := range []string{"Audio", "VideoAudio"} {
+		t.Run(profileType, func(t *testing.T) {
+			profile := DeviceProfile{
+				TranscodingProfiles: []TranscodingProfile{{Type: "Video", Protocol: "hls", Container: "mp4", VideoCodec: "hevc", AudioCodec: "eac3"}},
+				CodecProfiles: []CodecProfile{{
+					Type: profileType, Codec: "eac3",
+					Conditions: []ProfileCondition{{
+						Condition: "EqualsAny", Property: "VideoRangeType", Value: "HDR10|DOVI", IsRequired: true,
+					}},
+				}},
+			}
+			if profile.SupportsHLSRemuxForAudioStream(version, defaultAudioStreamIndex(version)) {
+				t.Fatal("audio profile unexpectedly accepted the DV8 video-range exception")
+			}
+		})
+	}
+}
+
+func TestHLSRemuxDV8HDR10BaseLayerFailsClosedWithoutProvenSingleLayerMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*models.VideoTrack)
+	}{
+		{name: "missing base layer", mutate: func(video *models.VideoTrack) { video.DVBLPresent = false }},
+		{name: "profile 5", mutate: func(video *models.VideoTrack) { video.DVProfile = 5 }},
+		{name: "enhancement layer", mutate: func(video *models.VideoTrack) { video.DVELPresent = true }},
+		{name: "unknown enhancement layer", mutate: func(video *models.VideoTrack) { video.DVEnhancementLayer = "unknown" }},
+		{name: "HDR10 only declaration", mutate: func(video *models.VideoTrack) {}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			version := hlsRemuxDV8HDR10BaseLayerTestVersion()
+			tt.mutate(&version.VideoTracks[0])
+			conditions := []ProfileCondition{{Condition: "EqualsAny", Property: "VideoRangeType", Value: "HDR10|DOVI", IsRequired: true}}
+			if tt.name == "HDR10 only declaration" {
+				conditions[0].Value = "HDR10"
+			}
+			profile := hlsRemuxDV8HDR10BaseLayerTestProfile(conditions)
+			if profile.SupportsHLSRemuxForAudioStream(version, defaultAudioStreamIndex(version)) {
+				t.Fatal("unproven or non-DV declaration unexpectedly gained an HLS remux route")
+			}
+		})
+	}
+}
+
+func hlsRemuxDV8HDR10BaseLayerTestVersion() catalog.FileVersion {
+	return catalog.FileVersion{
+		FileID: 1, Container: "mkv", CodecVideo: "hevc", CodecAudio: "eac3", HDR: true,
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", Profile: "Main 10", Level: 153, Width: 3840, Height: 2160, BitDepth: 10,
+			DVProfile: 8, DVBLCompatID: 1, DVConfigPresent: true, DVBLCompatIDPresent: true,
+			DVBLPresent: true, DVRPUPresent: true, DVEnhancementLayer: "none", VideoRangeType: "DOVIWithHDR10",
+		}},
+		AudioTracks: []models.AudioTrack{{Codec: "eac3", Channels: 6, Default: true}},
+	}
+}
+
+func hlsRemuxDV8HDR10BaseLayerTestProfile(conditions []ProfileCondition) DeviceProfile {
+	return DeviceProfile{
+		TranscodingProfiles: []TranscodingProfile{{Type: "Video", Protocol: "hls", Container: "mp4", VideoCodec: "hevc", AudioCodec: "eac3"}},
+		CodecProfiles:       []CodecProfile{{Type: "Video", Container: "hls", SubContainer: "mp4", Codec: "hevc", Conditions: conditions}},
+	}
+}
+
+func TestHDR10PlusSatisfiesHDR10RangeConditions(t *testing.T) {
+	const (
+		hdr10Display = "DOVIInvalid|DOVIWithEL|DOVIWithELHDR10Plus|DOVI|DOVIWithHDR10|DOVIWithHDR10Plus|HDR10Plus"
+		sdrDisplay   = hdr10Display + "|HDR10"
+	)
+	supportedRanges := func(ranges string) CodecProfile {
+		return CodecProfile{Type: "Video", Codec: "hevc", Conditions: []ProfileCondition{{
+			Condition: "EqualsAny", Property: "VideoRangeType", Value: ranges, IsRequired: true,
+		}}}
+	}
+	tests := []struct {
+		name           string
+		rangeType      string
+		rangeProfile   CodecProfile
+		wantDirectPlay bool
+		wantHLSRemux   bool
+	}{
+		{
+			name: "HDR10+ meets a positive list naming HDR10", rangeType: "HDR10Plus",
+			rangeProfile: supportedRanges("SDR|HDR10|HLG"), wantDirectPlay: true, wantHLSRemux: true,
+		},
+		{
+			name: "HDR10+ fails a positive list without HDR10", rangeType: "HDR10Plus",
+			rangeProfile: supportedRanges("SDR|HLG"),
+		},
+		{
+			name: "HDR10+ exclusion blocks direct play but not the copy", rangeType: "HDR10Plus",
+			rangeProfile: unsupportedRangeProfile("hevc", hdr10Display), wantHLSRemux: true,
+		},
+		{
+			name: "HDR10 exclusion blocks the HDR10+ copy", rangeType: "HDR10Plus",
+			rangeProfile: unsupportedRangeProfile("hevc", sdrDisplay),
+		},
+		{
+			name: "HDR10 meets a positive list naming HDR10", rangeType: "HDR10",
+			rangeProfile: supportedRanges("SDR|HDR10|HLG"), wantDirectPlay: true, wantHLSRemux: true,
+		},
+		{
+			name: "HDR10 is not satisfied by HDR10Plus", rangeType: "HDR10",
+			rangeProfile: supportedRanges("SDR|HDR10Plus|HLG"),
+		},
+		{
+			name: "HDR10 passes an HDR10+ exclusion", rangeType: "HDR10",
+			rangeProfile: unsupportedRangeProfile("hevc", hdr10Display), wantDirectPlay: true, wantHLSRemux: true,
+		},
+		{
+			name: "HDR10 fails an HDR10 exclusion", rangeType: "HDR10",
+			rangeProfile: unsupportedRangeProfile("hevc", sdrDisplay),
+		},
+		{
+			name: "DV 8.1 with HDR10+ meets a positive list naming DOVIWithHDR10", rangeType: "DOVIWithHDR10Plus",
+			rangeProfile: supportedRanges("SDR|HDR10|DOVIWithHDR10"), wantDirectPlay: true, wantHLSRemux: true,
+		},
+		{
+			name: "DV 8.1 with HDR10+ fails a positive list without DOVIWithHDR10", rangeType: "DOVIWithHDR10Plus",
+			rangeProfile: supportedRanges("SDR|HDR10|HLG"),
+		},
+		{
+			name: "DV 7 with HDR10+ meets a positive list naming DOVIWithEL", rangeType: "DOVIWithELHDR10Plus",
+			rangeProfile: supportedRanges("SDR|HDR10|DOVIWithEL"), wantDirectPlay: true, wantHLSRemux: true,
+		},
+		// A profile from before the HDR10+ range types excludes HDR10 alone.
+		{
+			name: "HDR10+ stays excluded by an exclusion naming only HDR10", rangeType: "HDR10Plus",
+			rangeProfile: unsupportedRangeProfile("hevc", "DOVI|DOVIWithHDR10|HDR10"),
+		},
+		{
+			name: "DV 8.1 with HDR10+ stays excluded by an exclusion naming only DOVIWithHDR10", rangeType: "DOVIWithHDR10Plus",
+			rangeProfile: unsupportedRangeProfile("hevc", "DOVI|DOVIWithHDR10"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			version := hdr10PlusRangeTestVersion(tt.rangeType)
+			profile := DeviceProfile{
+				DirectPlayProfiles:  []DirectPlayProfile{{Type: "Video", Container: "mkv", VideoCodec: "hevc", AudioCodec: "eac3"}},
+				TranscodingProfiles: []TranscodingProfile{{Type: "Video", Protocol: "hls", Container: "mp4", VideoCodec: "hevc", AudioCodec: "eac3"}},
+				CodecProfiles:       []CodecProfile{tt.rangeProfile},
+			}
+			if got := profile.SupportsDirectPlay(version); got != tt.wantDirectPlay {
+				t.Fatalf("SupportsDirectPlay = %v, want %v", got, tt.wantDirectPlay)
+			}
+			if got := profile.SupportsHLSRemuxForAudioStream(version, defaultAudioStreamIndex(version)); got != tt.wantHLSRemux {
+				t.Fatalf("SupportsHLSRemuxForAudioStream = %v, want %v", got, tt.wantHLSRemux)
+			}
+		})
+	}
+}
+
+// hdr10PlusRangeTestVersion is a 4K HEVC MKV without Dolby Vision whose
+// primary video reports rangeType.
+func hdr10PlusRangeTestVersion(rangeType string) catalog.FileVersion {
+	return catalog.FileVersion{
+		FileID: 1, Container: "mkv", CodecVideo: "hevc", CodecAudio: "eac3", HDR: true,
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", Profile: "Main 10", Level: 153, Width: 3840, Height: 2160, BitDepth: 10,
+			HDR10Plus: rangeType == "HDR10Plus", VideoRangeType: rangeType,
+		}},
+		AudioTracks: []models.AudioTrack{{Codec: "eac3", Channels: 6, Default: true}},
+	}
+}
+
+func TestBuildMediaStreamsPreservesColorRange(t *testing.T) {
+	tests := []struct {
+		name           string
+		colorRange     string
+		wantColorRange string
+		wantJSONField  bool
+	}{
+		{name: "limited", colorRange: "tv", wantColorRange: "tv", wantJSONField: true},
+		{name: "internal unknown sentinel", colorRange: "unknown"},
+		{name: "missing"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			version := catalog.FileVersion{
+				VideoTracks: []models.VideoTrack{{
+					Codec:      "h264",
+					ColorRange: tt.colorRange,
+				}},
+			}
+
+			streams := buildMediaStreams("item", "source", version)
+			if len(streams) != 1 {
+				t.Fatalf("streams length = %d, want 1", len(streams))
+			}
+			if got := streams[0].ColorRange; got != tt.wantColorRange {
+				t.Fatalf("ColorRange = %q, want %q", got, tt.wantColorRange)
+			}
+
+			payload, err := json.Marshal(streams[0])
+			if err != nil {
+				t.Fatalf("marshal media stream: %v", err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(payload, &decoded); err != nil {
+				t.Fatalf("unmarshal media stream: %v", err)
+			}
+			got, present := decoded["ColorRange"]
+			if present != tt.wantJSONField {
+				t.Fatalf("JSON ColorRange present = %v, want %v (value %#v)", present, tt.wantJSONField, got)
+			}
+			if tt.wantJSONField && got != tt.wantColorRange {
+				t.Fatalf("JSON ColorRange = %#v, want %q", got, tt.wantColorRange)
+			}
+		})
+	}
+}
+
+func TestConditionMatchesUnknownPropertyHonorsIsRequired(t *testing.T) {
+	tests := []struct {
+		name       string
+		isRequired bool
+		want       bool
+	}{
+		{name: "optional unknown property is satisfied", want: true},
+		{name: "required unknown property fails", isRequired: true, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			condition := ProfileCondition{
+				Condition:  "Equals",
+				Property:   "UnsupportedProperty",
+				Value:      "value",
+				IsRequired: tt.isRequired,
+			}
+			if got := conditionMatches(condition, conditionValues{}); got != tt.want {
+				t.Fatalf("conditionMatches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConditionMatchesUsesRealTrackValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		version   catalog.FileVersion
+		condition ProfileCondition
+		want      bool
+	}{
+		{
+			name:      "interlaced track fails an optional IsInterlaced NotEquals true",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 720, Height: 576, Interlaced: true}}},
+			condition: ProfileCondition{Condition: "NotEquals", Property: "IsInterlaced", Value: "true"},
+			want:      false,
+		},
+		{
+			name:      "60fps track fails a 30fps framerate cap",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "60/1"}}},
+			condition: ProfileCondition{Condition: "LessThanOrEqual", Property: "VideoFramerate", Value: "30"},
+			want:      false,
+		},
+		{
+			name:      "23.976fps track passes a 30fps framerate cap",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24000/1001"}}},
+			condition: ProfileCondition{Condition: "LessThanOrEqual", Property: "VideoFramerate", Value: "30"},
+			want:      true,
+		},
+		{
+			name:      "missing framerate leaves an optional cap satisfied",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}},
+			condition: ProfileCondition{Condition: "LessThanOrEqual", Property: "VideoFramerate", Value: "30"},
+			want:      true,
+		},
+		{
+			name:      "track bitrate fails a video bitrate cap",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, Bitrate: 20_000}}},
+			condition: ProfileCondition{Condition: "LessThanEqual", Property: "VideoBitrate", Value: "10000000"},
+			want:      false,
+		},
+		{
+			name: "version bitrate is the video bitrate fallback",
+			version: catalog.FileVersion{
+				Bitrate:     20_000,
+				VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}},
+			},
+			condition: ProfileCondition{Condition: "LessThanEqual", Property: "VideoBitrate", Value: "10000000"},
+			want:      false,
+		},
+		{
+			name: "96kHz audio fails a 48kHz sample rate cap",
+			version: catalog.FileVersion{
+				CodecAudio:  "flac",
+				AudioTracks: []models.AudioTrack{{Codec: "flac", Channels: 2, SampleRate: 96_000, Default: true}},
+			},
+			condition: ProfileCondition{Condition: "LessThanEqual", Property: "AudioSampleRate", Value: "48000"},
+			want:      false,
+		},
+		{
+			name: "audio bitrate cap is enforced",
+			version: catalog.FileVersion{
+				CodecAudio:  "truehd",
+				AudioTracks: []models.AudioTrack{{Codec: "truehd", Channels: 8, Bitrate: 4_000, Default: true}},
+			},
+			condition: ProfileCondition{Condition: "LessThanEqual", Property: "AudioBitrate", Value: "640000"},
+			want:      false,
+		},
+		{
+			// Track bitrates are kbps and caps are bits per second: 448 kbps
+			// must not slip under a 320000 cap as the number 448.
+			name: "kbps track bitrate is compared in bits per second",
+			version: catalog.FileVersion{
+				CodecAudio:  "ac3",
+				AudioTracks: []models.AudioTrack{{Codec: "ac3", Channels: 6, Bitrate: 448, Default: true}},
+			},
+			condition: ProfileCondition{Condition: "LessThanEqual", Property: "AudioBitrate", Value: "320000"},
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := buildConditionValues(tt.version, nil)
+			if got := conditionMatches(tt.condition, values); got != tt.want {
+				t.Fatalf("conditionMatches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// jellyfin-web sends "AudioProfile NotEquals HE-AAC" without an IsRequired key,
+// which Jellyfin treats as required.
+func TestConditionMatchesAudioProfileWithOmittedIsRequired(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile string
+		want    bool
+	}{
+		{name: "he-aac track fails", profile: "HE-AAC", want: false},
+		{name: "lc track passes", profile: "LC", want: true},
+		{name: "unknown profile fails because the condition is required", profile: "", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var condition ProfileCondition
+			payload := `{"Condition":"NotEquals","Property":"AudioProfile","Value":"HE-AAC"}`
+			if err := json.Unmarshal([]byte(payload), &condition); err != nil {
+				t.Fatalf("unmarshal ProfileCondition: %v", err)
+			}
+			if !condition.IsRequired {
+				t.Fatal("IsRequired = false, want true for an omitted key")
+			}
+
+			values := buildConditionValues(catalog.FileVersion{
+				CodecAudio:  "aac",
+				AudioTracks: []models.AudioTrack{{Codec: "aac", Profile: tt.profile, Channels: 2, Default: true}},
+			}, nil)
+			if got := conditionMatches(condition, values); got != tt.want {
+				t.Fatalf("conditionMatches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConditionMatchesLegacyValuesOnlyWhenKnown(t *testing.T) {
+	tests := []struct {
+		name      string
+		version   catalog.FileVersion
+		condition ProfileCondition
+		want      bool
+	}{
+		{
+			name:      "level 0 satisfies an optional level cap",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "hevc", Width: 1920, Height: 1080, Level: 0}}},
+			condition: ProfileCondition{Condition: "LessThanOrEqual", Property: "VideoLevel", Value: "183"},
+			want:      true,
+		},
+		{
+			name:      "level 0 fails a required level cap",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "hevc", Width: 1920, Height: 1080, Level: 0}}},
+			condition: ProfileCondition{Condition: "LessThanOrEqual", Property: "VideoLevel", Value: "183", IsRequired: true},
+			want:      false,
+		},
+		{
+			name:      "level -99 sentinel satisfies an optional level cap",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "hevc", Width: 1920, Height: 1080, Level: -99}}},
+			condition: ProfileCondition{Condition: "LessThanOrEqual", Property: "VideoLevel", Value: "183"},
+			want:      true,
+		},
+		{
+			name:      "known level 120 fails a tighter cap",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "hevc", Width: 1920, Height: 1080, Level: 120}}},
+			condition: ProfileCondition{Condition: "LessThanOrEqual", Property: "VideoLevel", Value: "100"},
+			want:      false,
+		},
+		{
+			name: "channels 0 satisfies an optional channel cap",
+			version: catalog.FileVersion{
+				CodecAudio:  "aac",
+				AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 0, Default: true}},
+			},
+			condition: ProfileCondition{Condition: "LessThanEqual", Property: "AudioChannels", Value: "2"},
+			want:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := buildConditionValues(tt.version, nil)
+			if got := conditionMatches(tt.condition, values); got != tt.want {
+				t.Fatalf("conditionMatches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConditionMatchesIsAVC(t *testing.T) {
+	tests := []struct {
+		name      string
+		version   catalog.FileVersion
+		condition ProfileCondition
+		want      bool
+	}{
+		{
+			name:      "h264 track passes Equals true",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}},
+			condition: ProfileCondition{Condition: "Equals", Property: "IsAVC", Value: "true"},
+			want:      true,
+		},
+		{
+			name:      "hevc track fails Equals true",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Codec: "hevc", Width: 1920, Height: 1080}}},
+			condition: ProfileCondition{Condition: "Equals", Property: "IsAVC", Value: "true"},
+			want:      false,
+		},
+		{
+			name:      "empty codec satisfies an optional IsAVC condition",
+			version:   catalog.FileVersion{VideoTracks: []models.VideoTrack{{Width: 1920, Height: 1080}}},
+			condition: ProfileCondition{Condition: "Equals", Property: "IsAVC", Value: "true"},
+			want:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := buildConditionValues(tt.version, nil)
+			if got := conditionMatches(tt.condition, values); got != tt.want {
+				t.Fatalf("conditionMatches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func unsupportedRangeProfile(codec, ranges string) CodecProfile {
+	return CodecProfile{
+		Type:  "Video",
+		Codec: codec,
+		Conditions: []ProfileCondition{{
+			Condition: "NotEquals",
+			Property:  "VideoRangeType",
+			Value:     ranges,
+		}},
+		ApplyConditions: []ProfileCondition{{
+			Condition: "EqualsAny",
+			Property:  "VideoRangeType",
+			Value:     ranges,
+		}},
+	}
+}
+
+func TestAudioTranscodeRemuxTriesLaterProfileConditions(t *testing.T) {
+	version := catalog.FileVersion{CodecVideo: "h264", CodecAudio: "dts", VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}, AudioTracks: []models.AudioTrack{{Codec: "dts", Channels: 6}}}
+	rejected := TranscodingProfile{Type: "Video", Protocol: "hls", Container: "mp4", VideoCodec: "h264", AudioCodec: "aac", Conditions: []ProfileCondition{{Condition: "Equals", Property: "AudioChannels", Value: "6", IsRequired: true}}}
+	accepted := rejected
+	accepted.Conditions = []ProfileCondition{{Condition: "Equals", Property: "AudioChannels", Value: "2", IsRequired: true}}
+	for _, tc := range []struct {
+		name     string
+		profiles []TranscodingProfile
+		want     bool
+	}{{"later stereo output matches", []TranscodingProfile{rejected, accepted}, true}, {"only incompatible output", []TranscodingProfile{rejected}, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := DeviceProfile{TranscodingProfiles: tc.profiles}
+			if got := profile.supportsHLSRemuxWithAudioTranscodeForAudioStream(version, nil, 2); got != tc.want {
+				t.Fatalf("supports remux=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeviceProfileDeclaresVideoRangeType(t *testing.T) {
+	declared := DeviceProfile{CodecProfiles: []CodecProfile{{
+		Type:  "Video",
+		Codec: "hevc,h265",
+		Conditions: []ProfileCondition{{
+			Condition: "EqualsAny", Property: "VideoRangeType", Value: "SDR|HDR10|DOVI|DOVIWithHDR10",
+		}},
+	}}}
+	if !declared.declaresVideoRangeType("hevc", compatRangeDOVI) {
+		t.Fatal("an explicit DOVI range type must be detected")
+	}
+	if declared.declaresVideoRangeType("av1", compatRangeDOVI) {
+		t.Fatal("a declaration for hevc must not apply to av1")
+	}
+	if (DeviceProfile{}).declaresVideoRangeType("hevc", compatRangeDOVI) {
+		t.Fatal("a profile without range conditions does not declare DOVI")
+	}
+	notEquals := DeviceProfile{CodecProfiles: []CodecProfile{{Type: "Video", Conditions: []ProfileCondition{{Condition: "NotEquals", Property: "VideoRangeType", Value: "DOVI"}}}}}
+	if notEquals.declaresVideoRangeType("hevc", compatRangeDOVI) {
+		t.Fatal("NotEquals DOVI is not a declaration of support")
+	}
+}
+
+// Only HEVC profile 5 and AV1 profile 10 have a dvh1/dav1 stream to offer; an
+// AVC Dolby Vision track must not be advertised as dvh1.
+func TestCompatDOVIVariantEligibleCodecProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		codec   string
+		profile int
+		want    bool
+	}{
+		{"hevc", 5, true},
+		{"h265", 5, true},
+		{"av1", 10, true},
+		{"h264", 9, false},
+		{"hevc", 10, false},
+		{"av1", 5, false},
+	} {
+		version := catalog.FileVersion{HDR: true, VideoTracks: []models.VideoTrack{{
+			Codec: tc.codec, DVProfile: tc.profile, DVLevel: 6, VideoRangeType: compatRangeDOVI,
+		}}}
+		if got := compatDOVIVariantEligible(version); got != tc.want {
+			t.Errorf("%s profile %d eligible = %v, want %v", tc.codec, tc.profile, got, tc.want)
+		}
+	}
+}

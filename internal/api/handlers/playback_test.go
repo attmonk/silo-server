@@ -1,0 +1,1323 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/mediaprobe"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
+	"github.com/Silo-Server/silo-server/internal/noderouting"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	"github.com/Silo-Server/silo-server/internal/settingskeys"
+	"github.com/Silo-Server/silo-server/internal/streamtoken"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
+	"github.com/Silo-Server/silo-server/internal/transcodenode"
+	"github.com/Silo-Server/silo-server/internal/userdb"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/watchsync"
+)
+
+func TestWritePlaybackToneMapExecutionError(t *testing.T) {
+	for _, tt := range []struct {
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{tonemap.ErrSourceRevisionChanged, http.StatusUnprocessableEntity, transcodenode.ToneMapSourceRevisionChangedCode},
+		{tonemap.ErrSourcePreflightRejected, http.StatusUnprocessableEntity, transcodenode.ToneMapSourcePreflightRejectedCode},
+		{playback.ErrToneMapSourceValidationUnavailable, http.StatusServiceUnavailable, transcodenode.ToneMapSourceValidationUnavailableCode},
+	} {
+		rr := httptest.NewRecorder()
+		if !writePlaybackToneMapExecutionError(rr, tt.err) {
+			t.Fatalf("error %v was not handled", tt.err)
+		}
+		if rr.Code != tt.wantStatus || rr.Header().Get(transcodenode.ToneMapExecutionErrorHeader) != tt.wantCode {
+			t.Fatalf("response = %d/%q, want %d/%q", rr.Code, rr.Header().Get(transcodenode.ToneMapExecutionErrorHeader), tt.wantStatus, tt.wantCode)
+		}
+	}
+}
+
+func TestNativeTranscodeHandlersRejectProxyRecipeBeforeReconstruction(t *testing.T) {
+	const secret = "test-secret"
+	for _, test := range []struct {
+		name   string
+		path   string
+		params map[string]string
+		handle func(*PlaybackHandler, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name: "manifest", path: "/api/v1/playback/transcode/lost-proxy-hls/master.m3u8",
+			params: map[string]string{"session_id": "lost-proxy-hls"},
+			handle: func(handler *PlaybackHandler, w http.ResponseWriter, r *http.Request) {
+				handler.HandleGetTranscodeManifest(w, r)
+			},
+		},
+		{
+			name: "segment", path: "/api/v1/playback/transcode/lost-proxy-hls/segment/seg_00001.m4s",
+			params: map[string]string{"session_id": "lost-proxy-hls", "name": "seg_00001.m4s"},
+			handle: func(handler *PlaybackHandler, w http.ResponseWriter, r *http.Request) {
+				handler.HandleGetTranscodeSegment(w, r)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			card := playback.RecipeCard{
+				SessionID: "lost-proxy-hls", UserID: 1, MediaFileID: 42, PlayMethod: playback.PlayTranscode,
+				RoutingWorkload: string(noderouting.WorkloadVideoTranscode), RoutingExecution: string(noderouting.ExecutionTranscode),
+				RoutingEgress: string(noderouting.EgressProxy),
+			}
+			token, err := streamtoken.Sign(card.ToClaims(), secret, time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manager := playback.NewSessionManager(0, 0)
+			handler := newKeyedPlaybackHandler(manager)
+			handler.JWTSecret = secret
+			handler.NodeKeys = nodeauthtest.SameKey(secret)
+			recorder := httptest.NewRecorder()
+			test.handle(handler, recorder, playbackTestRequest(http.MethodGet, test.path+"?st="+token, nil, test.params))
+
+			if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"error":"routing_policy_unsatisfied"`) {
+				t.Fatalf("response = %d %s, want proxy-egress refusal", recorder.Code, recorder.Body.String())
+			}
+			if _, err := manager.GetSession(card.SessionID); !errors.Is(err, playback.ErrSessionNotFound) {
+				t.Fatalf("proxy recipe reconstructed a native session: %v", err)
+			}
+		})
+	}
+}
+
+type testUserStoreProvider struct {
+	store userstore.UserStore
+}
+
+func (p testUserStoreProvider) ForUser(context.Context, int) (userstore.UserStore, error) {
+	return p.store, nil
+}
+
+func (p testUserStoreProvider) Close() error { return nil }
+
+type testPlaybackFileResolver struct {
+	file *models.MediaFile
+}
+
+func (r testPlaybackFileResolver) GetByID(context.Context, int) (*models.MediaFile, error) {
+	return r.file, nil
+}
+
+type mapPlaybackFileResolver struct {
+	files map[int]*models.MediaFile
+}
+
+func (r mapPlaybackFileResolver) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	return r.files[id], nil
+}
+
+type testPlaybackFileVersionFetcher struct {
+	byContent map[string][]*models.MediaFile
+	byEpisode map[string][]*models.MediaFile
+}
+
+func (f testPlaybackFileVersionFetcher) GetByContentID(_ context.Context, id string) ([]*models.MediaFile, error) {
+	return f.byContent[id], nil
+}
+
+func (f testPlaybackFileVersionFetcher) GetByEpisodeID(_ context.Context, id string) ([]*models.MediaFile, error) {
+	return f.byEpisode[id], nil
+}
+
+type testPlaybackSettingsRepo struct {
+	values map[string]string
+}
+
+func (r testPlaybackSettingsRepo) Get(_ context.Context, key string) (string, error) {
+	return r.values[key], nil
+}
+
+func (r testPlaybackSettingsRepo) GetMany(_ context.Context, keys ...string) (map[string]string, error) {
+	out := make(map[string]string, len(keys))
+	for _, key := range keys {
+		if value, ok := r.values[key]; ok {
+			out[key] = value
+		}
+	}
+	return out, nil
+}
+
+type allowAllPlaybackItemAccess struct{}
+
+func (allowAllPlaybackItemAccess) EnsureAccessible(
+	context.Context,
+	string,
+	catalog.AccessFilter,
+) error {
+	return nil
+}
+
+type noopPlaybackAdminStore struct{}
+
+func (noopPlaybackAdminStore) RecordHistory(context.Context, AdminPlaybackHistoryEntry) error {
+	return nil
+}
+
+func (noopPlaybackAdminStore) DeleteSession(context.Context, string) error { return nil }
+
+type recordingPlaybackWatchScrobbler struct {
+	starts []watchsync.ScrobbleEvent
+	pauses []watchsync.ScrobbleEvent
+	stops  []watchsync.ScrobbleEvent
+}
+
+func (s *recordingPlaybackWatchScrobbler) ScrobbleStart(_ context.Context, event watchsync.ScrobbleEvent) error {
+	s.starts = append(s.starts, event)
+	return nil
+}
+
+func (s *recordingPlaybackWatchScrobbler) ScrobblePause(_ context.Context, event watchsync.ScrobbleEvent) error {
+	s.pauses = append(s.pauses, event)
+	return nil
+}
+
+func (s *recordingPlaybackWatchScrobbler) ScrobbleStop(_ context.Context, event watchsync.ScrobbleEvent) error {
+	s.stops = append(s.stops, event)
+	return nil
+}
+
+type testEpisodeLookup struct {
+	episode *models.Episode
+}
+
+func (l testEpisodeLookup) GetByID(context.Context, string) (*models.Episode, error) {
+	return l.episode, nil
+}
+
+type failingSessionManager struct{}
+
+func (failingSessionManager) StartSession(int, string, int, playback.PlayMethod, bool) (*playback.Session, error) {
+	return nil, errors.New("boom")
+}
+
+func (failingSessionManager) StartSessionWithFiles(int, string, int, int, playback.PlayMethod, bool) (*playback.Session, error) {
+	return nil, errors.New("boom")
+}
+
+func (failingSessionManager) StartSessionWithFilesContext(context.Context, int, string, int, int, playback.PlayMethod, bool) (*playback.Session, error) {
+	return nil, errors.New("boom")
+}
+
+func (failingSessionManager) UpdateProgress(string, float64, bool) error { return nil }
+
+func (failingSessionManager) UpdateAudioTrack(string, int, playback.PlayMethod) error { return nil }
+
+func (failingSessionManager) UpdateStreamState(string, playback.SessionStreamState) error {
+	return nil
+}
+
+func (failingSessionManager) MarkPlanCommitted(string) error { return nil }
+
+func (failingSessionManager) TouchActivity(string) error { return nil }
+
+func (failingSessionManager) BeginTransport(string) error { return nil }
+
+func (failingSessionManager) EndTransport(string) error { return nil }
+
+func (failingSessionManager) WatchTransportStop(string) (<-chan struct{}, func()) {
+	return nil, func() {}
+}
+
+func (failingSessionManager) SetRemoteTransport(string, bool) error { return nil }
+
+func (failingSessionManager) SetTranscodeNodeURL(string, string) error { return nil }
+func (failingSessionManager) SetTranscodeRoute(string, playback.TranscodeRoute) error {
+	return nil
+}
+func (failingSessionManager) ApplyReplacement(string, playback.SessionReplacement) (playback.SessionReplacementRollback, error) {
+	return playback.SessionReplacementRollback{}, nil
+}
+func (failingSessionManager) ApplyReplacementIfRoute(string, playback.TranscodeRoute, playback.SessionReplacement) (playback.SessionReplacementRollback, bool, error) {
+	return playback.SessionReplacementRollback{}, true, nil
+}
+func (failingSessionManager) RollbackReplacement(string, playback.SessionReplacementRollback) error {
+	return nil
+}
+
+func (failingSessionManager) SetRealtimeConnection(string, bool) error { return nil }
+
+func (failingSessionManager) SetProgressPersistenceDisabled(string, bool) error { return nil }
+
+func (failingSessionManager) StopSession(string) error { return nil }
+
+func (failingSessionManager) GetSession(string) (*playback.Session, error) { return nil, nil }
+
+func newPlaybackTestStore(t *testing.T) userstore.UserStore {
+	t.Helper()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	// Every connection to ":memory:" opens its own empty database, so a second
+	// pooled connection (playback start writes preferences concurrently) would
+	// see no tables.
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	if err := userdb.InitSchema(db); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+
+	store := userdb.NewSQLiteUserStore(db)
+	if err := store.CreateProfile(context.Background(), userstore.Profile{ID: "profile-1", Name: "Main"}); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+
+	return store
+}
+
+func newAuthorizedPlaybackContext() context.Context {
+	ctx := context.Background()
+	ctx = apimw.SetClaims(ctx, &auth.Claims{UserID: 1, Role: "user", TokenType: auth.TokenTypeAccess})
+	return apimw.SetProfileID(ctx, "profile-1")
+}
+
+func TestHeaderAuthenticatedMediaEnforcesHLSOwnerOnEveryRequest(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	manager.RegisterReconstructed(&playback.Session{
+		ID:                        "secure-hls-session",
+		UserID:                    1,
+		PlayMethod:                playback.PlayTranscode,
+		RequireMediaAuthorization: true,
+	})
+	manager.RegisterReconstructed(&playback.Session{
+		ID:         "legacy-hls-session",
+		UserID:     1,
+		PlayMethod: playback.PlayTranscode,
+	})
+	handler := newKeyedPlaybackHandler(manager)
+
+	type endpoint struct {
+		name   string
+		handle func(http.ResponseWriter, *http.Request)
+		path   func(string) string
+		params func(string) map[string]string
+	}
+	endpoints := []endpoint{
+		{
+			name:   "manifest",
+			handle: handler.HandleGetTranscodeManifest,
+			path: func(id string) string {
+				return "/api/v1/playback/transcode/" + id + "/master.m3u8"
+			},
+			params: func(id string) map[string]string { return map[string]string{"session_id": id} },
+		},
+		{
+			name:   "segment",
+			handle: handler.HandleGetTranscodeSegment,
+			path: func(id string) string {
+				return "/api/v1/playback/transcode/" + id + "/segment/seg_00001.m4s"
+			},
+			params: func(id string) map[string]string {
+				return map[string]string{"session_id": id, "name": "seg_00001.m4s"}
+			},
+		},
+	}
+
+	request := func(endpoint endpoint, sessionID string, userID int) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, endpoint.path(sessionID), nil)
+		if userID != 0 {
+			ctx := apimw.SetClaims(req.Context(), &auth.Claims{
+				UserID: userID, Role: "user", TokenType: auth.TokenTypeAccess,
+			})
+			req = req.WithContext(ctx)
+		}
+		routeCtx := chi.NewRouteContext()
+		for key, value := range endpoint.params(sessionID) {
+			routeCtx.URLParams.Add(key, value)
+		}
+		return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+	}
+
+	for _, endpoint := range endpoints {
+		t.Run(endpoint.name, func(t *testing.T) {
+			for _, test := range []struct {
+				name      string
+				sessionID string
+				userID    int
+				want      int
+			}{
+				{name: "secure missing auth", sessionID: "secure-hls-session", want: http.StatusUnauthorized},
+				{name: "secure wrong owner", sessionID: "secure-hls-session", userID: 2, want: http.StatusForbidden},
+				// The media process is intentionally absent in this unit fixture;
+				// reaching 404 proves the authenticated owner passed the gate.
+				{name: "secure owner accepted", sessionID: "secure-hls-session", userID: 1, want: http.StatusNotFound},
+				// Legacy UUID-bearer behavior remains unchanged.
+				{name: "legacy missing auth accepted", sessionID: "legacy-hls-session", want: http.StatusNotFound},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					rr := httptest.NewRecorder()
+					endpoint.handle(rr, request(endpoint, test.sessionID, test.userID))
+					if rr.Code != test.want {
+						t.Fatalf("status = %d body=%s, want %d", rr.Code, rr.Body.String(), test.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// A segment request whose context ends while it waits for FFmpeg stops waiting
+// at once, instead of holding the request until the wait times out. It still
+// answers 404: net/http also ends the context of a client that only
+// half-closed, and writing nothing would reach it as an empty 200.
+func TestGetTranscodeSegment_StopsWaitingWhenRequestEnds(t *testing.T) {
+	const sessionID = "departed-segment"
+	transcodeSession, err := playback.StartTranscode(context.Background(), playback.TranscodeOpts{
+		SessionID:          sessionID,
+		InputPath:          "/media/slow.mkv",
+		OutputDir:          t.TempDir(),
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		FFmpegPath:         writePlaybackTestFFmpegNeverReady(t),
+		HWAccel:            "none",
+		AudioTrackIndex:    -1,
+		SubtitleTrackIndex: -1,
+	})
+	if err != nil {
+		t.Fatalf("StartTranscode: %v", err)
+	}
+	t.Cleanup(func() { _ = transcodeSession.Close() })
+
+	sessions := playback.NewSessionManager(0, 0)
+	sessions.RegisterReconstructed(&playback.Session{ID: sessionID, UserID: 1, PlayMethod: playback.PlayTranscode})
+	handler := newKeyedPlaybackHandler(sessions)
+	handler.TranscodeManager().RegisterTranscodeSession(sessionID, transcodeSession)
+
+	// No playlist yet, so the first segment would wait for FFmpeg's startup.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/api/v2/playback/transcode/"+sessionID+"/segment/seg_00000.ts", nil)
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("session_id", sessionID)
+	routeCtx.URLParams.Add("name", "seg_00000.ts")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+	rr := httptest.NewRecorder()
+
+	started := time.Now()
+	handler.HandleGetTranscodeSegment(rr, req)
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("segment request waited %v after it ended", elapsed)
+	}
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d %q, want 404", rr.Code, rr.Body.String())
+	}
+}
+
+func withPlaybackRouteParam(req *http.Request, key, value string) *http.Request {
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add(key, value)
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+}
+
+func writePlaybackTestFFmpeg(t *testing.T) string {
+	return writePlaybackTestFFmpegSleep(t, "30")
+}
+
+func writePlaybackToneMapFFprobe(t *testing.T, ffmpegPath string, track models.VideoTrack) {
+	t.Helper()
+	stream := map[string]any{
+		"index": 0, "codec_name": track.Codec, "codec_type": "video", "profile": track.Profile,
+		"level": track.Level, "width": track.Width, "height": track.Height, "avg_frame_rate": track.FrameRate,
+		"pix_fmt": track.PixelFormat, "bits_per_raw_sample": track.BitDepth, "color_range": track.ColorRange,
+		"color_primaries": track.ColorPrimaries, "color_transfer": track.ColorTransfer, "color_space": track.ColorSpace,
+	}
+	if track.DVConfigPresent {
+		sideData := map[string]any{
+			"side_data_type": "DOVI configuration record", "dv_profile": track.DVProfile, "dv_level": track.DVLevel,
+			"bl_present_flag": playbackTestBoolInt(track.DVBLPresent), "rpu_present_flag": playbackTestBoolInt(track.DVRPUPresent),
+			"el_present_flag": playbackTestBoolInt(track.DVELPresent),
+		}
+		if track.DVBLCompatIDPresent {
+			sideData["dv_bl_signal_compatibility_id"] = track.DVBLCompatID
+		}
+		stream["side_data_list"] = []any{sideData}
+	}
+	output, err := json.Marshal(map[string]any{"streams": []any{stream}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := mediaprobe.FFprobePathFromFFmpeg(ffmpegPath)
+	script := "#!/bin/sh\nprintf '%s' '" + strings.ReplaceAll(string(output), "'", "'\\''") + "'\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func playbackTestBoolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func writePlaybackTestFFmpegSleep(t *testing.T, sleepSeconds string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "fake-ffmpeg.sh")
+	// Discovery and one-frame smoke commands finish immediately. Only a
+	// transport stays alive; exec keeps it one process so cancellation closes
+	// its pipes without waiting for an orphaned shell child.
+	// The playlist is the HLS output's, which a subtitle rendition's outputs
+	// may follow.
+	script := "#!/bin/sh\n" +
+		"last=\"\"\n" +
+		"for arg in \"$@\"; do case \"$arg\" in *.m3u8) last=\"$arg\" ;; esac; done\n" +
+		"case \" $* \" in *\" -bsfs \"*|*\" -encoders \"*|*\" -filters \"*|*\" -f null - \"*) exit 0 ;; esac\n" +
+		"case \"$last\" in\n" +
+		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
+		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
+		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
+		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
+		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
+		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
+		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
+		"esac\n" +
+		"exec sleep " + sleepSeconds + "\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return path
+}
+
+func writePlaybackTestFFmpegAlwaysFailing(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "failing-ffmpeg.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho 'intentional startup failure' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write failing fake ffmpeg: %v", err)
+	}
+	return path
+}
+
+func writePlaybackTestFFmpegNeverReady(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "not-ready-ffmpeg.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write not-ready fake ffmpeg: %v", err)
+	}
+	return path
+}
+
+func playbackTestConfig(ffmpegPath, transcodeDir string) func() config.PlaybackConfig {
+	return func() config.PlaybackConfig {
+		return config.PlaybackConfig{
+			FFmpegPath:       ffmpegPath,
+			TranscodeDir:     transcodeDir,
+			TranscodeEnabled: true,
+		}
+	}
+}
+
+func requireWorkerRoutingV3(handler *PlaybackHandler) {
+	previous := handler.PlaybackConfig
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		var cfg config.PlaybackConfig
+		if previous != nil {
+			cfg = previous()
+		}
+		cfg.Routing = config.DefaultPlaybackRoutingPolicy()
+		cfg.Routing.RemuxExecution = config.PlaybackExecutionWorkerOnly
+		cfg.Routing.VideoTranscodeExecution = config.PlaybackExecutionWorkerOnly
+		return cfg
+	}
+}
+
+func useDefaultRoutingV3(handler *PlaybackHandler) {
+	previous := handler.PlaybackConfig
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		var cfg config.PlaybackConfig
+		if previous != nil {
+			cfg = previous()
+		}
+		cfg.Routing = config.DefaultPlaybackRoutingPolicy()
+		return cfg
+	}
+}
+
+func writePlaybackTestMediaFile(t *testing.T, name string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir media path: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("video"), 0o644); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+	return path
+}
+
+type recordingMissingMarker struct {
+	ids []int
+}
+
+func (m *recordingMissingMarker) MarkMissing(_ context.Context, id int, _ string, _ time.Time) error {
+	m.ids = append(m.ids, id)
+	return nil
+}
+
+type recordingSessionSyncer struct {
+	calls int
+}
+
+func (s *recordingSessionSyncer) SyncNow(context.Context) error {
+	s.calls++
+	return nil
+}
+
+type recordingPlaybackAdminStore struct {
+	history []AdminPlaybackHistoryEntry
+	deleted []string
+}
+
+func (s *recordingPlaybackAdminStore) RecordHistory(_ context.Context, entry AdminPlaybackHistoryEntry) error {
+	s.history = append(s.history, entry)
+	return nil
+}
+
+func (s *recordingPlaybackAdminStore) DeleteSession(_ context.Context, sessionID string) error {
+	s.deleted = append(s.deleted, sessionID)
+	return nil
+}
+
+func TestFinalizeSessionStop_UsesProviderLifecycleSemantics(t *testing.T) {
+	tests := []struct {
+		name               string
+		position           float64
+		reason             PlaybackEndReason
+		disablePersistence bool
+		wantPauseCalls     int
+		wantStopCalls      int
+		wantEventPosition  float64
+	}{
+		{
+			name:              "user exit stops below-resume-threshold scrobble",
+			position:          120,
+			reason:            PlaybackEndStopped,
+			wantStopCalls:     1,
+			wantEventPosition: 120,
+		},
+		{
+			name:              "system teardown pauses reconstructable scrobble",
+			position:          120,
+			wantPauseCalls:    1,
+			wantEventPosition: 120,
+		},
+		{
+			name:              "completed system teardown stops scrobble",
+			position:          3500,
+			wantStopCalls:     1,
+			wantEventPosition: 3500,
+		},
+		{
+			name:              "user exit at zero still stops scrobble",
+			reason:            PlaybackEndStopped,
+			wantStopCalls:     1,
+			wantEventPosition: 0,
+		},
+		{
+			name:               "disabled persistence does not scrobble",
+			position:           120,
+			reason:             PlaybackEndStopped,
+			disablePersistence: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newPlaybackTestStore(t)
+			file := &models.MediaFile{
+				ID:        42,
+				ContentID: "movie-1",
+				Duration:  3600,
+			}
+			scrobbler := &recordingPlaybackWatchScrobbler{}
+			handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+			handler.StoreProvider = testUserStoreProvider{store: store}
+			handler.WatchScrobbler = scrobbler
+
+			session := &playback.Session{
+				ID:                         "session-1",
+				UserID:                     1,
+				ProfileID:                  "profile-1",
+				MediaFileID:                file.ID,
+				Position:                   tt.position,
+				DisableProgressPersistence: tt.disablePersistence,
+				StartedAt:                  time.Now().Add(-time.Minute),
+			}
+			handler.finalizeSessionStopWithResult(context.Background(), session, false, "", tt.reason)
+
+			if got := len(scrobbler.pauses); got != tt.wantPauseCalls {
+				t.Fatalf("pause calls = %d, want %d", got, tt.wantPauseCalls)
+			}
+			if got := len(scrobbler.stops); got != tt.wantStopCalls {
+				t.Fatalf("stop calls = %d, want %d", got, tt.wantStopCalls)
+			}
+			if len(scrobbler.pauses)+len(scrobbler.stops) == 1 {
+				event := scrobbler.pauses
+				if len(event) == 0 {
+					event = scrobbler.stops
+				}
+				if event[0].MediaItemID != file.ContentID {
+					t.Fatalf("media item ID = %q, want %q", event[0].MediaItemID, file.ContentID)
+				}
+				if event[0].PositionSeconds != tt.wantEventPosition {
+					t.Fatalf("position = %v, want %v", event[0].PositionSeconds, tt.wantEventPosition)
+				}
+				if event[0].SessionEnded {
+					t.Fatal("a teardown the client can rebuild was reported as an ended session")
+				}
+			}
+		})
+	}
+}
+
+// Expiry and abort retire the session id, so their pause tells providers the
+// session ended. A session that keeps no progress is not scrobbled on abort.
+// A Jellyfin play's own stop still reaches providers from its client's
+// Stopped report after the expiry, so its expiry stays a plain pause.
+func TestRetiredSessionsReportEndedPause(t *testing.T) {
+	expire := func(h *PlaybackHandler, s *playback.Session) {
+		h.finalizeSessionStopWithResult(context.Background(), s, false, "", PlaybackEndExpired)
+	}
+	abort := func(h *PlaybackHandler, s *playback.Session) {
+		h.finalizeSessionAbort(context.Background(), s, false, "", nativeEndClaim{owned: true})
+	}
+	tests := []struct {
+		name               string
+		finalize           func(*PlaybackHandler, *playback.Session)
+		disablePersistence bool
+		jellyfinCompat     bool
+		wantPauses         int
+		wantEnded          bool
+	}{
+		{"expiry", expire, false, false, 1, true},
+		{"abort", abort, false, false, 1, true},
+		{"abort without progress", abort, true, false, 0, false},
+		{"jellyfin expiry", expire, false, true, 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := &models.MediaFile{ID: 42, ContentID: "movie-1", Duration: 3600}
+			scrobbler := &recordingPlaybackWatchScrobbler{}
+			handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+			handler.StoreProvider = testUserStoreProvider{store: newPlaybackTestStore(t)}
+			handler.WatchScrobbler = scrobbler
+
+			tt.finalize(handler, &playback.Session{
+				ID:                         "session-1",
+				UserID:                     1,
+				ProfileID:                  "profile-1",
+				MediaFileID:                file.ID,
+				Position:                   600,
+				DisableProgressPersistence: tt.disablePersistence,
+				IsJellyfinCompat:           tt.jellyfinCompat,
+				StartedAt:                  time.Now().Add(-time.Minute),
+			})
+
+			if len(scrobbler.stops) != 0 || len(scrobbler.pauses) != tt.wantPauses {
+				t.Fatalf("pauses = %d, stops = %d, want %d pauses", len(scrobbler.pauses), len(scrobbler.stops), tt.wantPauses)
+			}
+			for _, event := range scrobbler.pauses {
+				if event.SessionEnded != tt.wantEnded {
+					t.Fatalf("pause SessionEnded = %v, want %v", event.SessionEnded, tt.wantEnded)
+				}
+			}
+		})
+	}
+}
+
+// The finalizing request is not the viewer's: an admin terminate carries the
+// admin's address and an expiry carries none. History keeps the viewer's.
+func TestBuildAdminHistoryEntry_RecordsViewerIP(t *testing.T) {
+	for name, ctx := range map[string]context.Context{
+		"admin terminate": clientip.SetContext(context.Background(), "198.51.100.7"),
+		"expiry":          context.Background(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{
+				file: &models.MediaFile{ID: 42, ContentID: "movie-1", Duration: 3600},
+			})
+			handler.AdminStore = noopPlaybackAdminStore{}
+
+			entry, err := handler.buildAdminHistoryEntry(ctx, &playback.Session{
+				ID:          "session-1",
+				UserID:      1,
+				ProfileID:   "profile-1",
+				MediaFileID: 42,
+				ClientIP:    "203.0.113.20",
+				StartedAt:   time.Now().Add(-time.Minute),
+			})
+			if err != nil {
+				t.Fatalf("buildAdminHistoryEntry: %v", err)
+			}
+			if entry == nil || entry.ClientIP != "203.0.113.20" {
+				t.Fatalf("entry = %+v, want ClientIP 203.0.113.20", entry)
+			}
+		})
+	}
+}
+
+func TestPersistStopAndHistory_SkipsZeroProgressStops(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	if err := store.SetProgress(context.Background(), "profile-1", "movie-1", 900, 3600, userstore.ProgressThresholds{}); err != nil {
+		t.Fatalf("seed progress: %v", err)
+	}
+
+	file := &models.MediaFile{
+		ID:         42,
+		ContentID:  "movie-1",
+		FilePath:   "/media/movie.mkv",
+		Resolution: "1080p",
+		Duration:   3600,
+	}
+	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+
+	handler.persistStopAndHistory(context.Background(), &playback.Session{
+		ID:          "session-1",
+		UserID:      1,
+		ProfileID:   "profile-1",
+		MediaFileID: 42,
+		Position:    0,
+	})
+
+	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
+	if err != nil {
+		t.Fatalf("get progress: %v", err)
+	}
+	if progress == nil || progress.PositionSeconds != 900 {
+		t.Fatalf("position after zero stop = %v, want 900", progress)
+	}
+
+	history, err := store.ListHistory(context.Background(), "profile-1", 10, 0)
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("history len = %d, want 0", len(history))
+	}
+}
+
+func TestFindAlternateFile_DoesNotCrossEdition(t *testing.T) {
+	source := &models.MediaFile{
+		ID:         1,
+		ContentID:  "movie-1",
+		Resolution: "2160p",
+		HDR:        true,
+		Bitrate:    30_000_000,
+		EditionKey: "final_cut",
+	}
+
+	handler := &PlaybackHandler{
+		FileVersionFetcher: testPlaybackFileVersionFetcher{
+			byContent: map[string][]*models.MediaFile{
+				"movie-1": {
+					source,
+					{
+						ID:         2,
+						ContentID:  "movie-1",
+						Resolution: "1080p",
+						HDR:        false,
+						Bitrate:    12_000_000,
+						EditionKey: "theatrical",
+					},
+					{
+						ID:         3,
+						ContentID:  "movie-1",
+						Resolution: "1080p",
+						HDR:        false,
+						Bitrate:    10_000_000,
+						EditionKey: "final_cut",
+					},
+				},
+			},
+		},
+	}
+
+	alternates, err := handler.findAlternateFiles(context.Background(), source, catalog.AccessFilter{})
+	if err != nil {
+		t.Fatalf("findAlternateFiles: %v", err)
+	}
+	if len(alternates) == 0 {
+		t.Fatal("expected alternate file")
+	}
+	alternate := alternates[0]
+	if alternate.ID != 3 {
+		t.Fatalf("alternate.ID = %d, want 3", alternate.ID)
+	}
+}
+
+func TestNativeTranscodeHandlersRejectCommittedProxyEgress(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	manager.RegisterReconstructed(&playback.Session{
+		ID: "proxy-hls", UserID: 1, PlayMethod: playback.PlayTranscode,
+		RoutingWorkload: string(noderouting.WorkloadVideoTranscode), RoutingExecution: string(noderouting.ExecutionTranscode),
+		RoutingEgress: string(noderouting.EgressProxy), TranscodeNodeURL: "http://worker.invalid",
+	})
+	handler := newKeyedPlaybackHandler(manager)
+	for _, test := range []struct {
+		name   string
+		path   string
+		params map[string]string
+		handle func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "manifest", path: "/api/v1/playback/transcode/proxy-hls/master.m3u8", params: map[string]string{"session_id": "proxy-hls"}, handle: handler.HandleGetTranscodeManifest},
+		{name: "segment", path: "/api/v1/playback/transcode/proxy-hls/segment/seg_0.m4s", params: map[string]string{"session_id": "proxy-hls", "name": "seg_0.m4s"}, handle: handler.HandleGetTranscodeSegment},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			test.handle(recorder, playbackTestRequest(http.MethodGet, test.path, nil, test.params))
+			if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"error":"routing_policy_unsatisfied"`) {
+				t.Fatalf("response = %d %s, want proxy-egress refusal", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+// A start remembers the version it played: under the series for an episode,
+// so the next episode opens on the same traits, and under the movie itself,
+// naming the exact file, so a play too short to leave progress still keeps
+// the viewer's choice. On /api/v2 it never saves the audio track: a start
+// cannot tell a pick from Auto, a Next Up carry, or a fallback, and a saved
+// track would outrank the profile's language for the rest of the series, so
+// picks reach the audio preference through PUT /audio-prefs.
+func TestStartPlaybackV2RemembersVersionButNotAudioTrack(t *testing.T) {
+	tests := []struct {
+		name       string
+		episodeID  string
+		key        string
+		wantFileID int
+	}{
+		{name: "episode", episodeID: "episode-1", key: "series-1", wantFileID: 0},
+		{name: "movie", key: "movie-1", wantFileID: 42},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newPlaybackTestStore(t)
+			file := v3HandlerFixtureFile(t)
+			file.EpisodeID = tt.episodeID
+			file.EditionKey = "directors-cut"
+			file.AudioTracks = []models.AudioTrack{
+				{Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+				{Language: "eng", Codec: "aac", Channels: 6, Layout: "5.1"},
+			}
+
+			handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+			handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+			handler.StoreProvider = testUserStoreProvider{store: store}
+			handler.ItemAccess = allowAllPlaybackItemAccess{}
+			handler.EpisodeLookup = testEpisodeLookup{episode: &models.Episode{ContentID: "episode-1", SeriesID: "series-1"}}
+
+			request := v3HandlerStartRequest()
+			request.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{Enabled: true, SupportedOnDevice: true}
+			audioTrack := 1
+			request.AudioTrackIndex = &audioTrack
+			response := startPlaybackDecisionV2(t, handler, marshalV3StartRequest(t, request))
+			handler.waitForPlaybackStartSideEffectsV3(context.Background(), response.SessionID)
+
+			pref, err := store.GetSeriesPlaybackPreference(context.Background(), "profile-1", tt.key)
+			if err != nil || pref == nil {
+				t.Fatalf("GetSeriesPlaybackPreference(%q) = %+v, %v", tt.key, pref, err)
+			}
+			if pref.Resolution != "1080p" || pref.CodecVideo != "h264" || pref.HDR {
+				t.Fatalf("stored pref = %+v, want 1080p/h264/false", pref)
+			}
+			wantEdition := ""
+			if tt.wantFileID != 0 {
+				wantEdition = "directors-cut"
+			}
+			if pref.FileID != tt.wantFileID || pref.EditionKey != wantEdition {
+				t.Fatalf("stored file/edition = %d/%q, want %d/%q", pref.FileID, pref.EditionKey, tt.wantFileID, wantEdition)
+			}
+
+			audio, err := store.GetAudioPreference(context.Background(), "profile-1", tt.key)
+			switch {
+			case err != nil:
+				t.Fatalf("GetAudioPreference(%q): %v", tt.key, err)
+			case audio != nil:
+				t.Fatalf("GetAudioPreference(%q) = %+v; want no saved audio preference", tt.key, audio)
+			}
+		})
+	}
+}
+
+// A start that never produced a session played nothing, so it must not teach
+// the series what the viewer prefers.
+func TestStartPlaybackV2DoesNotPersistSeriesPlaybackPreferenceOnFailure(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	file := v3HandlerFixtureFile(t)
+	file.EpisodeID = "episode-1"
+
+	handler := newKeyedPlaybackHandler(failingSessionManager{}, testPlaybackFileResolver{file: file})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.EpisodeLookup = testEpisodeLookup{episode: &models.Episode{ContentID: "episode-1", SeriesID: "series-1"}}
+
+	// v3 reports playback outcomes in the body; the request itself was fine.
+	response := startPlaybackDecisionV2(t, handler, marshalV3StartRequest(t, v3HandlerStartRequest()))
+	if response.Terminal == nil || response.PlaybackPlan != nil {
+		t.Fatalf("expected a terminal with no plan, got %#v", response)
+	}
+
+	pref, err := store.GetSeriesPlaybackPreference(context.Background(), "profile-1", "series-1")
+	if err != nil {
+		t.Fatalf("GetSeriesPlaybackPreference: %v", err)
+	}
+	if pref != nil {
+		t.Fatalf("expected no persisted preference on failure, got %+v", pref)
+	}
+}
+
+// A v3 client sends a track identity only when the viewer picked one. With none
+// sent, the server resolves this profile's audio language through the settings
+// contract — the same resolution the catalog publishes as
+// effective_audio_track_index — instead of falling to ordinal zero.
+//
+// The legacy user_profiles.language column always carries a different track's
+// language than the canonical answer, so a regression to reading it flips the
+// selected index.
+func TestStartPlaybackV2AudioLanguageResolvesCanonically(t *testing.T) { //nolint:funlen // ported unchanged from the retired v1 handler test
+	newFile := func(t *testing.T) *models.MediaFile {
+		file := v3HandlerFixtureFile(t)
+		file.AudioTracks = []models.AudioTrack{
+			{Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+			{Language: "jpn", Codec: "aac", Channels: 2, Layout: "stereo"},
+			{Language: "spa", Codec: "aac", Channels: 2, Layout: "stereo"},
+			{Language: "fra", Codec: "aac", Channels: 2, Layout: "stereo"},
+		}
+		return file
+	}
+
+	setLegacyLanguage := func(t *testing.T, store userstore.UserStore, language string) {
+		t.Helper()
+		if err := store.UpdateProfile(context.Background(), "profile-1", userstore.UpdateProfileInput{
+			Language: &language,
+		}); err != nil {
+			t.Fatalf("seed legacy language column: %v", err)
+		}
+	}
+
+	setCanonicalLanguage := func(t *testing.T, store userstore.UserStore, identity userstore.SettingIdentity, language string) {
+		t.Helper()
+		identity.Key = settingskeys.PlaybackAudioLanguage
+		identity.ProfileID = "profile-1"
+		encoded, err := json.Marshal(language)
+		if err != nil {
+			t.Fatalf("encode canonical audio language: %v", err)
+		}
+		if _, err := store.UpsertSettingValue(context.Background(), identity, encoded); err != nil {
+			t.Fatalf("seed canonical audio language: %v", err)
+		}
+	}
+
+	startPlayback := func(
+		t *testing.T,
+		store userstore.UserStore,
+		file *models.MediaFile,
+		deviceID string,
+		mutate func(*playback.StartRequestV3),
+	) int {
+		t.Helper()
+		manager := playback.NewSessionManager(0, 0)
+		handler := newKeyedPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+		handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+		handler.StoreProvider = testUserStoreProvider{store: store}
+		handler.ItemAccess = allowAllPlaybackItemAccess{}
+		if file.EpisodeID != "" {
+			handler.EpisodeLookup = testEpisodeLookup{episode: &models.Episode{ContentID: file.EpisodeID, SeriesID: "series-1"}}
+		}
+
+		startRequest := v3HandlerStartRequest()
+		startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{Enabled: true, SupportedOnDevice: true}
+		if mutate != nil {
+			mutate(&startRequest)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start",
+			strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext())
+		// A client name or user agent is not a stable settings identity. Only
+		// the explicit device header may select a profile_device row.
+		req.Header.Set("User-Agent", "SiloTV/apple-tv")
+		if deviceID != "" {
+			req.Header.Set(deviceIDHeader, deviceID)
+		}
+		rr := httptest.NewRecorder()
+		serveStartPlaybackV2(t, handler, rr, req)
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var response playback.DecisionResponseV3
+		if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if response.PlaybackPlan == nil {
+			t.Fatalf("response = %#v", response)
+		}
+		session, err := manager.GetSession(response.PlaybackPlan.SessionID)
+		if err != nil {
+			t.Fatalf("GetSession: %v", err)
+		}
+		handler.waitForPlaybackStartSideEffectsV3(context.Background(), session.ID)
+		return session.AudioTrackIndex
+	}
+
+	t.Run("canonical value wins over legacy column", func(t *testing.T) {
+		store := newPlaybackTestStore(t)
+		setLegacyLanguage(t, store, "eng")
+		setCanonicalLanguage(t, store, userstore.SettingIdentity{
+			Scope: settingscontract.ScopeProfile,
+		}, "ja")
+
+		if index := startPlayback(t, store, newFile(t), "", nil); index != 1 {
+			t.Fatalf("AudioTrackIndex = %d, want 1 (canonical \"ja\" track)", index)
+		}
+	})
+
+	t.Run("device value applies only to the identified device", func(t *testing.T) {
+		store := newPlaybackTestStore(t)
+		setCanonicalLanguage(t, store, userstore.SettingIdentity{Scope: settingscontract.ScopeProfile}, "en")
+		setCanonicalLanguage(t, store, userstore.SettingIdentity{
+			Scope:    settingscontract.ScopeProfileDevice,
+			DeviceID: "apple-tv",
+		}, "ja")
+
+		if index := startPlayback(t, store, newFile(t), "apple-tv", nil); index != 1 {
+			t.Fatalf("AudioTrackIndex = %d, want 1 (device \"ja\" track)", index)
+		}
+		// The start above remembered its track for this movie; clear it so
+		// the next start shows only the scope resolution.
+		if err := store.DeleteAudioPreference(context.Background(), "profile-1", "movie-1"); err != nil {
+			t.Fatalf("DeleteAudioPreference: %v", err)
+		}
+		if index := startPlayback(t, store, newFile(t), "", nil); index != 0 {
+			t.Fatalf("AudioTrackIndex = %d, want 0 (profile \"en\" track without device identity)", index)
+		}
+	})
+
+	t.Run("series and library values outrank device value", func(t *testing.T) {
+		store := newPlaybackTestStore(t)
+		setCanonicalLanguage(t, store, userstore.SettingIdentity{Scope: settingscontract.ScopeProfile}, "en")
+		setCanonicalLanguage(t, store, userstore.SettingIdentity{
+			Scope:    settingscontract.ScopeProfileDevice,
+			DeviceID: "apple-tv",
+		}, "ja")
+		setCanonicalLanguage(t, store, userstore.SettingIdentity{
+			Scope:     settingscontract.ScopeProfileLibrary,
+			LibraryID: 12,
+		}, "es")
+		setCanonicalLanguage(t, store, userstore.SettingIdentity{
+			Scope:    settingscontract.ScopeProfileSeries,
+			SeriesID: "series-1",
+		}, "fr")
+
+		movie := newFile(t)
+		movie.MediaFolderID = 12
+		if index := startPlayback(t, store, movie, "apple-tv", nil); index != 2 {
+			t.Fatalf("AudioTrackIndex = %d, want 2 (library \"es\" track)", index)
+		}
+
+		episode := newFile(t)
+		episode.MediaFolderID = 12
+		episode.EpisodeID = "episode-1"
+		if index := startPlayback(t, store, episode, "apple-tv", nil); index != 3 {
+			t.Fatalf("AudioTrackIndex = %d, want 3 (series \"fr\" track)", index)
+		}
+	})
+
+	t.Run("explicit track selection outranks saved settings", func(t *testing.T) {
+		store := newPlaybackTestStore(t)
+		setCanonicalLanguage(t, store, userstore.SettingIdentity{
+			Scope:    settingscontract.ScopeProfileDevice,
+			DeviceID: "apple-tv",
+		}, "ja")
+		file := newFile(t)
+		if index := startPlayback(t, store, file, "apple-tv", func(request *playback.StartRequestV3) {
+			explicit := 0
+			request.AudioTrackIndex = &explicit
+			request.AudioTrackID = playback.TrackIDV3(file.ID, "audio", explicit)
+		}); index != 0 {
+			t.Fatalf("AudioTrackIndex = %d, want 0 (explicit \"en\" track)", index)
+		}
+	})
+}
+
+// An omitted start_position asks the server for its resume policy; an explicit
+// zero means "start over". The distinction is settled before planning, because
+// the plan's timeline is cut at the start position — a route chosen for zero
+// and then seeked to the resume point is a different route.
+func TestStartPlaybackV2ResumePolicyAppliesOnlyToAnOmittedStartPosition(t *testing.T) {
+	zero := 0.0
+	multipart := func(file *models.MediaFile) {
+		file.PresentationKind = "multipart"
+		file.PresentationGroupKey = file.ContentID
+		file.PresentationPartIndex = 4
+		file.PresentationPartTotal = 6
+	}
+
+	for _, tc := range []struct {
+		name          string
+		startPosition *float64
+		mutate        func(*models.MediaFile)
+		wantPosition  float64
+	}{
+		{name: "omitted start position restores the saved resume point", wantPosition: 900},
+		{name: "explicit zero starts over", startPosition: &zero, wantPosition: 0},
+		// Every part of a multipart item shares one resume point with the item,
+		// so a part-local seek to it would land somewhere arbitrary.
+		{name: "a multipart part does not resume into itself", mutate: multipart, wantPosition: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newPlaybackTestStore(t)
+			if err := store.SetProgress(context.Background(), "profile-1", "movie-1", 900, 3600, userstore.ProgressThresholds{}); err != nil {
+				t.Fatalf("seed progress: %v", err)
+			}
+			file := v3HandlerFixtureFile(t)
+			if tc.mutate != nil {
+				tc.mutate(file)
+			}
+
+			manager := playback.NewSessionManager(0, 0)
+			handler := newKeyedPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+			handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+			handler.StoreProvider = testUserStoreProvider{store: store}
+			handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+			request := v3HandlerStartRequest()
+			request.StartPosition = tc.startPosition
+			response := startPlaybackDecisionV2(t, handler, marshalV3StartRequest(t, request))
+			if response.PlaybackPlan == nil {
+				t.Fatalf("response = %#v", response)
+			}
+			// The plan and the session have to agree on where playback begins.
+			if got := response.PlaybackPlan.Timeline.SourceStartSeconds; got != tc.wantPosition {
+				t.Fatalf("plan source start = %v, want %v", got, tc.wantPosition)
+			}
+			session, err := manager.GetSession(response.PlaybackPlan.SessionID)
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if session.Position != tc.wantPosition {
+				t.Fatalf("session position = %v, want %v", session.Position, tc.wantPosition)
+			}
+		})
+	}
+}
+
+// A missing backing file is not something a client can be handed a plan for,
+// and it must not leave a session behind that nothing will ever stop.
+func TestStartPlaybackV2MarksMissingFileAndSkipsSessionCreation(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	marker := &recordingMissingMarker{}
+	file := v3HandlerFixtureFile(t)
+	file.FilePath = filepath.Join(t.TempDir(), "missing.mkv")
+
+	handler := newKeyedPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.MissingMarker = marker
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start",
+		strings.NewReader(marshalV3StartRequest(t, v3HandlerStartRequest()))).WithContext(newAuthorizedPlaybackContext())
+	rr := httptest.NewRecorder()
+	serveStartPlaybackV2(t, handler, rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if got := len(sessionMgr.AllSessions()); got != 0 {
+		t.Fatalf("session count = %d, want 0", got)
+	}
+	if len(marker.ids) != 1 || marker.ids[0] != 42 {
+		t.Fatalf("marked ids = %v, want [42]", marker.ids)
+	}
+}
+
+type testSeasonEpisodeLookup struct {
+	testEpisodeLookup
+	season []*models.Episode
+}
+
+func (l testSeasonEpisodeLookup) ListBySeason(context.Context, string, int) ([]*models.Episode, error) {
+	return l.season, nil
+}
+
+// A completed multi-episode file marks the episodes of its range it serves
+// watched, so the next episode offered is not the same file again (issue
+// #739). Episodes past the lookup bound don't resolve to the file and stay
+// unwatched.
+func TestPersistStopAndHistory_MarksSpannedEpisodesWatched(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	file := &models.MediaFile{
+		ID:                42,
+		ContentID:         "series-1",
+		EpisodeID:         "episode-1",
+		FilePath:          "/media/Show/Season 01/Show - S01E01-E12.mkv",
+		Duration:          3600,
+		MultiEpisodeStart: 1,
+		MultiEpisodeEnd:   12,
+	}
+	episode := func(number int) *models.Episode {
+		return &models.Episode{ContentID: "episode-" + strconv.Itoa(number), SeriesID: "series-1", SeasonNumber: 1, EpisodeNumber: number}
+	}
+	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	season := make([]*models.Episode, 0, 12)
+	for number := 1; number <= 12; number++ {
+		season = append(season, episode(number))
+	}
+	handler.EpisodeLookup = testSeasonEpisodeLookup{
+		testEpisodeLookup: testEpisodeLookup{episode: episode(1)},
+		season:            season,
+	}
+
+	handler.persistStopAndHistory(context.Background(), &playback.Session{
+		ID:          "session-1",
+		UserID:      1,
+		ProfileID:   "profile-1",
+		MediaFileID: 42,
+		Position:    3590,
+	})
+
+	progress, err := store.ListProgressByMediaItems(context.Background(), "profile-1", []string{"episode-1", "episode-2", "episode-11", "episode-12"})
+	if err != nil {
+		t.Fatalf("list progress: %v", err)
+	}
+	for id, want := range map[string]bool{"episode-1": true, "episode-2": true, "episode-11": true, "episode-12": false} {
+		if got := progress[id].Completed; got != want {
+			t.Errorf("%s completed = %v, want %v", id, got, want)
+		}
+	}
+}

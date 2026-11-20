@@ -1,0 +1,290 @@
+package nodepool
+
+import (
+	"encoding/json"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/netaccess"
+)
+
+// TranscodePool manages transcode nodes with least-connections selection.
+// Thread-safe for concurrent use.
+type TranscodePool struct {
+	nodes []*Node
+	mu    sync.RWMutex
+	// unreachable holds the normalized URLs of nodes marked unreachable by
+	// MarkUnreachable. The mark has to outlive SetNodes, which the node
+	// configuration reconciliation calls every few seconds with the database
+	// rows, and those still carry the last sweep's verdict. A successful
+	// health result for the node, or the node leaving the pool, clears it.
+	unreachable map[string]struct{}
+	// keyCheck, when set, reports whether a node id has a usable key (the
+	// credential registry's HasKey). Without it each node's KeyIssued stands
+	// in, which only a pool reload updates.
+	keyCheck atomic.Pointer[func(nodeID int) bool]
+}
+
+// NewTranscodePool creates an empty transcode pool.
+func NewTranscodePool() *TranscodePool {
+	return &TranscodePool{}
+}
+
+// SetNodes replaces the node list. Node URLs are normalized (trailing slashes
+// trimmed) at the storage boundary so every consumer compares them
+// consistently, including TranscodeNodeHealthy and remote-start adoption.
+// Physical GPU identities are derived here too, so the planner's shared-GPU
+// accounting works from the stored capability report immediately after a
+// restart, before any node has advertised a changed hash.
+func (p *TranscodePool) SetNodes(nodes []*Node) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	present := make(map[string]struct{}, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			n.URL = normalizeNodeURL(n.URL)
+			applyPhysicalGPUKeys(n)
+			present[n.URL] = struct{}{}
+			if _, marked := p.unreachable[n.URL]; marked {
+				n.Healthy = false
+			}
+		}
+	}
+	for url := range p.unreachable {
+		if _, ok := present[url]; !ok {
+			delete(p.unreachable, url)
+		}
+	}
+	p.nodes = nodes
+}
+
+// SetKeyCheck makes the pool ask hasKey whether a node can be signed for.
+// Wire it to the credential registry's HasKey, which a missed
+// node_pool_changed event delays by one registry refresh at most.
+func (p *TranscodePool) SetKeyCheck(hasKey func(nodeID int) bool) {
+	p.keyCheck.Store(&hasKey)
+}
+
+// HasKey reports whether a request to n can be signed. A transcode node
+// without a key cannot be, so it takes no new work: it would only fail every
+// job sent to it, and as the node that never has a job it would otherwise win
+// least-loaded selection. It stays pooled, listed, and health-checked.
+func (p *TranscodePool) HasKey(n *Node) bool {
+	if n == nil {
+		return false
+	}
+	if p == nil {
+		return n.KeyIssued
+	}
+	if check := p.keyCheck.Load(); check != nil && *check != nil {
+		return (*check)(n.ID)
+	}
+	return n.KeyIssued
+}
+
+// KeyedNodes returns the pooled nodes a request can be signed for: the only
+// ones new work may go to.
+func (p *TranscodePool) KeyedNodes() []*Node {
+	nodes := p.Nodes()
+	keyed := nodes[:0]
+	for _, n := range nodes {
+		if p.HasKey(n) {
+			keyed = append(keyed, n)
+		}
+	}
+	return keyed
+}
+
+// Acquire returns the healthy node with the fewest active jobs that a request
+// can be signed for. Returns nil if no such node is available.
+func (p *TranscodePool) Acquire() *Node {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	var best *Node
+	for _, n := range p.nodes {
+		if !n.Healthy || !n.Enabled || !p.HasKey(n) {
+			continue
+		}
+		if best == nil || n.ActiveJobs < best.ActiveJobs {
+			best = n
+		}
+	}
+	return best
+}
+
+// FindByURL returns the node with the given URL, or nil if not found.
+// Used for soft-affinity during quality switches.
+func (p *TranscodePool) FindByURL(url string) *Node {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, n := range p.nodes {
+		if n.URL == url {
+			return n
+		}
+	}
+	return nil
+}
+
+// normalizeNodeURL trims trailing slashes so a node URL stored with a
+// trailing slash (e.g. an admin-entered base URL) compares equal to a lookup
+// without one. Applied where URLs enter the pool and where lookups are made.
+func normalizeNodeURL(url string) string {
+	return strings.TrimRight(url, "/")
+}
+
+// Nodes returns a copy of the current node list.
+func (p *TranscodePool) Nodes() []*Node {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	cp := make([]*Node, len(p.nodes))
+	copy(cp, p.nodes)
+	return cp
+}
+
+// ApplyHealth records a health check result by swapping the node for an
+// updated copy, keeping published *Node values immutable.
+func (p *TranscodePool) ApplyHealth(id int, checkedURL string, healthy bool, activeJobs, egressKbps int, advertisedHash string, lastStats []byte, networkAccess netaccess.NodeNetworkAccess, checkedAt time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	applyNodeHealth(p.nodes, id, checkedURL, healthy, activeJobs, egressKbps, advertisedHash, lastStats, networkAccess, nil, checkedAt)
+	p.clearUnreachableLocked(id, checkedURL, healthy)
+}
+
+// ApplyHealthReport is ApplyHealth for a whole report, drain state included.
+func (p *TranscodePool) ApplyHealthReport(id int, checkedURL string, report HealthReport, checkedAt time.Time) {
+	drainState := report.DrainState.normalized()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	applyNodeHealth(p.nodes, id, checkedURL, report.Healthy, report.ActiveJobs, report.EgressKbps, report.CapabilitiesHash, report.LastStats, report.NetworkAccess, &drainState, checkedAt)
+	p.clearUnreachableLocked(id, checkedURL, report.Healthy)
+}
+
+// clearUnreachableLocked lifts the unreachable mark on checkedURL after a
+// healthy result. Cleared only by a result about the node now at that URL: a
+// late result for a removed or repointed node says nothing about its
+// replacement. The caller holds p.mu.
+func (p *TranscodePool) clearUnreachableLocked(id int, checkedURL string, healthy bool) {
+	if !healthy {
+		return
+	}
+	for _, n := range p.nodes {
+		if n != nil && n.ID == id && sameNodeURL(n.URL, checkedURL) {
+			delete(p.unreachable, normalizeNodeURL(checkedURL))
+			return
+		}
+	}
+}
+
+// ApplyCapabilities records a freshly fetched capability report by swapping the
+// node for an updated copy, keeping published *Node values immutable.
+func (p *TranscodePool) ApplyCapabilities(id int, fetchedFrom string, capabilities []byte, hash string, refreshedAt time.Time, drift *string, driftBaseline []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	applyNodeCapabilities(p.nodes, id, fetchedFrom, capabilities, hash, refreshedAt, drift, driftBaseline)
+}
+
+// NormalizeNodeURL is how a node's address is written wherever it is used as an
+// identity: a map key, a comparison, or the base of a request.
+//
+// A stored URL may carry a trailing slash and mean the same worker, so anything
+// that keys by the raw value ends up with two entries for one node — and the
+// one an invalidation deletes is not the one a lookup finds.
+func NormalizeNodeURL(nodeURL string) string {
+	return normalizeNodeURL(nodeURL)
+}
+
+// NodeEndpoint joins a stored node URL with one of the node's own routes.
+//
+// A stored URL may carry a trailing slash — an operator pasting a base URL is
+// the usual way, and everything here already treats the two forms as the same
+// worker. Concatenating a route onto it produces "//admin/…", which the node's
+// router does not have: the request 404s, and the operator's action fails
+// against a node that is running and reachable. The normalization that makes
+// the two forms equal for comparison has to make them equal for addressing too.
+func NodeEndpoint(nodeURL, path string) string {
+	return normalizeNodeURL(nodeURL) + path
+}
+
+// sameNodeURL compares two node addresses the way the pools store them, so a
+// trailing slash on one side is not a different worker.
+func sameNodeURL(a, b string) bool {
+	return normalizeNodeURL(a) == normalizeNodeURL(b)
+}
+
+// applyNodeHealth replaces the slice entry for id with an updated copy.
+//
+// checkedURL fences the write the same way the database update does, and for
+// the same reason: a health request is bounded at five seconds, which is ample
+// time for an administrator to repoint the row and reload the pools. Publishing
+// by id alone would then write one worker's health — and the scratch fill
+// transcode admission reads — onto the replacement, and the database fence
+// downstream cannot undo that. The pool would stay wrong until a later sweep.
+//
+// A nil drainState leaves the node's drain state as it was.
+func applyNodeHealth(nodes []*Node, id int, checkedURL string, healthy bool, activeJobs, egressKbps int, advertisedHash string, lastStats []byte, networkAccess netaccess.NodeNetworkAccess, drainState *DrainState, checkedAt time.Time) {
+	for i, n := range nodes {
+		if n.ID != id || !sameNodeURL(n.URL, checkedURL) {
+			continue
+		}
+		clone := *n
+		clone.Healthy = healthy
+		clone.ActiveJobs = activeJobs
+		clone.EgressKbps = egressKbps
+		clone.LastHealthCheck = &checkedAt
+		// Always a pointer once a check has happened, empty string included: the
+		// distinction between "this node reports no hash" and "no one has asked"
+		// is the whole reason the field is one.
+		clone.AdvertisedCapabilitiesHash = &advertisedHash
+		// A check that carried no stats clears them rather than keeping the
+		// previous sample: an unreachable node's five-minute-old CPU number
+		// looks live on a dashboard, which is worse than no number at all. The
+		// payload is cloned because the caller's buffer is a decoded HTTP body.
+		if len(lastStats) > 0 {
+			clone.LastStats = append(json.RawMessage(nil), lastStats...)
+		} else {
+			clone.LastStats = nil
+		}
+		// Same rule for the network access report: a check that carried none
+		// clears it, so ClientURLFor never hands out an origin the node has
+		// stopped confirming. Cloned so the published copy is immutable.
+		clone.NetworkAccess = networkAccess.Normalized().Clone()
+		if drainState != nil {
+			clone.DrainState = *drainState
+		}
+		nodes[i] = &clone
+		return
+	}
+}
+
+// applyNodeCapabilities replaces the slice entry for id with a copy carrying
+// the new capability report. The payload is cloned because the caller's buffer
+// (a decoded HTTP response) is not ours to publish.
+//
+// drift is set verbatim, nil included: the note describes the comparison that
+// produced this payload, so a node whose hardware recovered must lose the note
+// at the same moment it gains the clean report.
+func applyNodeCapabilities(nodes []*Node, id int, fetchedFrom string, capabilities []byte, hash string, refreshedAt time.Time, drift *string, driftBaseline []byte) {
+	for i, n := range nodes {
+		if n.ID != id || !sameNodeURL(n.URL, fetchedFrom) {
+			continue
+		}
+		clone := *n
+		clone.Capabilities = append(json.RawMessage(nil), capabilities...)
+		clone.CapabilitiesHash = &hash
+		clone.CapabilitiesRefreshedAt = &refreshedAt
+		clone.CapabilityDrift = drift
+		if len(driftBaseline) > 0 {
+			clone.CapabilityDriftBaseline = append(json.RawMessage(nil), driftBaseline...)
+		} else {
+			clone.CapabilityDriftBaseline = nil
+		}
+		// The GPU identities belong to the payload being replaced, so they are
+		// re-derived rather than carried over from the previous report.
+		applyPhysicalGPUKeys(&clone)
+		nodes[i] = &clone
+		return
+	}
+}

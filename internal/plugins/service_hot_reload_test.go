@@ -1,0 +1,475 @@
+package plugins
+
+import (
+	"archive/zip"
+	"cmp"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+	"testing"
+
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-server/internal/pluginhost"
+)
+
+// A plugin built on a newer SDK may use an enum value this server doesn't
+// know; its installed manifest.json keeps it as a number, while the running
+// client's copy dropped it at start. That is not drift, so the client stays.
+func TestServiceEnsureClientIgnoresEnumValuesTheServerDoesNotKnow(t *testing.T) {
+	ctx := context.Background()
+	installed := testPluginManifest(t, "silo.metadb", "0.0.36")
+	installed.Capabilities[0].ConfigSchema = []*pluginv1.ConfigSchema{{
+		Key:        "connection",
+		JsonSchema: `{"type":"object","properties":{"accent":{"type":"string"}}}`,
+		AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{
+			{Key: "accent", Control: pluginv1.AdminFormControl(99)},
+		}},
+	}}
+	installPath := writeInstalledPluginManifest(t, installed)
+
+	store := newFakeServiceInstallationStore(&Installation{
+		ID:          3,
+		PluginID:    installed.GetPluginId(),
+		Version:     installed.GetVersion(),
+		InstallPath: installPath,
+		Enabled:     true,
+	})
+	host := &fakeServiceHost{clientResult: &fakePluginClient{manifest: pluginhost.KnownManifest(installed)}}
+	service := &Service{installations: store, host: host}
+
+	if _, err := service.MetadataProviderClient(ctx, 3, "metadb"); err != nil {
+		t.Fatalf("MetadataProviderClient() returned error: %v", err)
+	}
+	if len(host.stopped) != 0 || len(host.started) != 0 {
+		t.Fatalf("stopped = %v, started %d times; want the running client kept", host.stopped, len(host.started))
+	}
+}
+
+func TestServiceEnsureClientKeepsHealthyClientWhenInstalledManifestUnavailable(t *testing.T) {
+	ctx := context.Background()
+
+	installDir := t.TempDir()
+	installPath := filepath.Join(installDir, "plugin")
+	if err := os.WriteFile(installPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("WriteFile(%q) returned error: %v", installPath, err)
+	}
+
+	runningClient := &fakePluginClient{manifest: testPluginManifest(t, "silo.metadb", "0.0.36")}
+	store := newFakeServiceInstallationStore(&Installation{
+		ID:          3,
+		PluginID:    "silo.metadb",
+		Version:     "0.0.36",
+		InstallPath: installPath,
+		Enabled:     true,
+	})
+	host := &fakeServiceHost{clientResult: runningClient}
+	service := &Service{
+		installations: store,
+		host:          host,
+	}
+
+	got, err := service.ensureClient(ctx, 3)
+	if err != nil {
+		t.Fatalf("ensureClient() returned error: %v", err)
+	}
+	if got != runningClient {
+		t.Fatalf("ensureClient() returned %#v, want existing running client %#v", got, runningClient)
+	}
+	if len(host.started) != 0 {
+		t.Fatalf("start calls = %d, want 0", len(host.started))
+	}
+	if len(host.stopped) != 0 {
+		t.Fatalf("stop calls = %d, want 0", len(host.stopped))
+	}
+}
+
+type fakeServiceHost struct {
+	clientResult pluginClient
+	clientErr    error
+	startResult  pluginClient
+	startErr     error
+	started      []pluginhost.StartRequest
+	stopped      []int
+	events       *[]string
+}
+
+func (f *fakeServiceHost) Start(_ context.Context, req pluginhost.StartRequest) (pluginClient, error) {
+	recordTestEvent(f.events, "start")
+	f.started = append(f.started, req)
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
+	if f.startResult != nil {
+		return f.startResult, nil
+	}
+	return &fakePluginClient{manifest: req.Manifest}, nil
+}
+
+func (f *fakeServiceHost) Client(int) (pluginClient, error) {
+	if f.clientErr != nil {
+		return nil, f.clientErr
+	}
+	return f.clientResult, nil
+}
+
+func (f *fakeServiceHost) Stop(installationID int) error {
+	recordTestEvent(f.events, "stop")
+	f.stopped = append(f.stopped, installationID)
+	return nil
+}
+
+func (f *fakeServiceHost) NextStartSeq() uint64 { return 0 }
+
+func (f *fakeServiceHost) Shutdown(context.Context) error {
+	return nil
+}
+
+type fakePluginClient struct {
+	manifest              *pluginv1.PluginManifest
+	metadataProviderCalls int
+	markerProvider        *pluginhost.MarkerProviderClient
+}
+
+func (f *fakePluginClient) Manifest() *pluginv1.PluginManifest {
+	return f.manifest
+}
+
+func (f *fakePluginClient) TestConfiguration(context.Context, *pluginv1.TestConfigurationRequest) (*pluginv1.TestConfigurationResponse, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) MetadataProvider(string) (*pluginhost.MetadataProviderClient, error) {
+	f.metadataProviderCalls++
+	return nil, nil
+}
+
+func (f *fakePluginClient) ImageResolver(string) (*pluginhost.ImageResolverClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) MarkerProvider(string) (*pluginhost.MarkerProviderClient, error) {
+	return f.markerProvider, nil
+}
+
+func (f *fakePluginClient) MediaAnalyzer(string) (*pluginhost.MediaAnalyzerClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) ScheduledTask(string) (*pluginhost.ScheduledTaskClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) ScanSource(string) (*pluginhost.ScanSourceClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) RequestRouter(string) (*pluginhost.RequestRouterClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) EventConsumer(string) (*pluginhost.EventConsumerClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) AuthProvider(string) (*pluginhost.AuthProviderClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) HTTPRoutes(string) (*pluginhost.HTTPRoutesClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) WatchSyncProvider(string) (*pluginhost.WatchSyncProviderClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) NetworkAccessProvider(string) (*pluginhost.NetworkAccessProviderClient, error) {
+	return nil, nil
+}
+
+func (f *fakePluginClient) NotificationChannel(string) (*pluginhost.NotificationChannelClient, error) {
+	return nil, nil
+}
+
+type fakeServiceInstallationStore struct {
+	byID map[int]*Installation
+	// mu guards every field: the resident supervisor reads the store from
+	// several goroutines while a test mutates it.
+	mu               sync.Mutex
+	byPluginID       map[string][]*Installation
+	createInputs     []CreateInstallationInput
+	updateIDs        []int
+	updateInputs     []UpdateInstallationInput
+	deleteIDs        []int
+	saveArchiveIDs   []int
+	saveArchiveErr   error
+	listCapabilities []*Capability
+	// capabilitiesByID, when set, gives each installation its own
+	// capabilities in place of listCapabilities.
+	capabilitiesByID map[int][]*Capability
+	events           *[]string
+	// archives, when set, backs GetArchive for the archive cache; unset ids
+	// report ErrArchiveNotFound.
+	archives map[int]*InstallationArchive
+}
+
+func newFakeServiceInstallationStore(installations ...*Installation) *fakeServiceInstallationStore {
+	store := &fakeServiceInstallationStore{
+		byID:       make(map[int]*Installation, len(installations)),
+		byPluginID: make(map[string][]*Installation),
+	}
+	for _, installation := range installations {
+		if installation == nil {
+			continue
+		}
+		cloned := *installation
+		store.byID[cloned.ID] = &cloned
+		store.byPluginID[cloned.PluginID] = append(store.byPluginID[cloned.PluginID], &cloned)
+	}
+	return store
+}
+
+// installedPluginStore holds manifest, written to disk, as enabled installation id.
+func installedPluginStore(t *testing.T, id int, manifest *pluginv1.PluginManifest) *fakeServiceInstallationStore {
+	t.Helper()
+	return newFakeServiceInstallationStore(&Installation{
+		ID: id, PluginID: manifest.GetPluginId(), Version: manifest.GetVersion(),
+		InstallPath: writeInstalledPluginManifest(t, manifest), Enabled: true,
+	})
+}
+
+func (s *fakeServiceInstallationStore) Create(_ context.Context, input CreateInstallationInput) (*Installation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recordTestEvent(s.events, "create")
+	s.createInputs = append(s.createInputs, input)
+	id := len(s.byID) + 1
+	installation := &Installation{
+		ID:          id,
+		PluginID:    input.PluginID,
+		Version:     input.Version,
+		InstallPath: input.InstallPath,
+		Enabled:     input.Enabled,
+	}
+	s.byID[id] = installation
+	s.byPluginID[input.PluginID] = append(s.byPluginID[input.PluginID], installation)
+	return installation, nil
+}
+
+func (s *fakeServiceInstallationStore) SaveArchive(_ context.Context, installationID int, _ []byte, _ string, _ []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recordTestEvent(s.events, "save_archive")
+	s.saveArchiveIDs = append(s.saveArchiveIDs, installationID)
+	return s.saveArchiveErr
+}
+
+func (s *fakeServiceInstallationStore) Update(_ context.Context, id int, input UpdateInstallationInput) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recordTestEvent(s.events, "update")
+	s.updateIDs = append(s.updateIDs, id)
+	s.updateInputs = append(s.updateInputs, input)
+
+	installation, ok := s.byID[id]
+	if !ok {
+		return nil
+	}
+	if input.Version != nil {
+		installation.Version = *input.Version
+	}
+	if input.InstallPath != nil {
+		installation.InstallPath = *input.InstallPath
+	}
+	if input.Enabled != nil {
+		installation.Enabled = *input.Enabled
+	}
+	if input.Restart {
+		installation.RuntimeGeneration++
+	}
+	return nil
+}
+
+func (s *fakeServiceInstallationStore) Delete(_ context.Context, id int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recordTestEvent(s.events, "delete")
+	s.deleteIDs = append(s.deleteIDs, id)
+	delete(s.byID, id)
+	return nil
+}
+
+func (s *fakeServiceInstallationStore) GetByID(_ context.Context, id int) (*Installation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	installation, ok := s.byID[id]
+	if !ok {
+		return nil, ErrInstallationNotFound
+	}
+	cloned := *installation
+	return &cloned, nil
+}
+
+func (s *fakeServiceInstallationStore) List(context.Context) ([]*Installation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]*Installation, 0, len(s.byID))
+	for _, installation := range s.byID {
+		cloned := *installation
+		result = append(result, &cloned)
+	}
+	return result, nil
+}
+
+func (s *fakeServiceInstallationStore) ListEnabled(_ context.Context) ([]*Installation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result []*Installation
+	for _, installation := range s.byID {
+		if !installation.Enabled {
+			continue
+		}
+		cloned := *installation
+		result = append(result, &cloned)
+	}
+	slices.SortFunc(result, func(a, b *Installation) int { return cmp.Compare(a.ID, b.ID) })
+	return result, nil
+}
+
+func (s *fakeServiceInstallationStore) ListByPluginID(_ context.Context, pluginID string) ([]*Installation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list := s.byPluginID[pluginID]
+	result := make([]*Installation, 0, len(list))
+	for _, installation := range list {
+		cloned := *installation
+		result = append(result, &cloned)
+	}
+	return result, nil
+}
+
+func (s *fakeServiceInstallationStore) ListCapabilities(_ context.Context, id int) ([]*Capability, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.capabilitiesByID != nil {
+		return s.capabilitiesByID[id], nil
+	}
+	return s.listCapabilities, nil
+}
+
+// ListEnabledWithCapabilityTypes mirrors ListCapabilities, whose fixed
+// capability list applies to every installation in the fake.
+func (s *fakeServiceInstallationStore) ListEnabledWithCapabilityTypes(ctx context.Context, capabilityTypes []string) ([]*Installation, error) {
+	if s.capabilitiesByID != nil {
+		enabled, err := s.ListEnabled(ctx)
+		return slices.DeleteFunc(enabled, func(installation *Installation) bool {
+			return !slices.ContainsFunc(s.capabilitiesByID[installation.ID], func(record *Capability) bool {
+				return slices.Contains(capabilityTypes, record.Type)
+			})
+		}), err
+	}
+	matches := false
+	for _, record := range s.listCapabilities {
+		if record == nil {
+			continue
+		}
+		for _, capabilityType := range capabilityTypes {
+			if record.Type == capabilityType {
+				matches = true
+			}
+		}
+	}
+	if !matches {
+		return nil, nil
+	}
+	return s.ListEnabled(ctx)
+}
+
+func (s *fakeServiceInstallationStore) GetArchive(_ context.Context, installationID int) (*InstallationArchive, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if archive, ok := s.archives[installationID]; ok && archive != nil {
+		return archive, nil
+	}
+	return nil, ErrArchiveNotFound
+}
+
+func writeInstalledPluginManifest(t *testing.T, manifest *pluginv1.PluginManifest) string {
+	t.Helper()
+
+	installDir := t.TempDir()
+	installPath := filepath.Join(installDir, "plugin")
+	if err := os.WriteFile(installPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("WriteFile(%q) returned error: %v", installPath, err)
+	}
+
+	manifestBytes, err := protojson.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("protojson.Marshal() returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(installDir, "manifest.json"), manifestBytes, 0644); err != nil {
+		t.Fatalf("WriteFile(manifest.json) returned error: %v", err)
+	}
+
+	return installPath
+}
+
+func writePluginArchive(t *testing.T, path string, manifest *pluginv1.PluginManifest) {
+	t.Helper()
+
+	binaryBytes := []byte("#!/bin/sh\nexit 0\n")
+	manifestCopy := proto.Clone(manifest).(*pluginv1.PluginManifest)
+	checksum := sha256.Sum256(binaryBytes)
+	manifestCopy.Checksum = hex.EncodeToString(checksum[:])
+
+	manifestBytes, err := protojson.Marshal(manifestCopy)
+	if err != nil {
+		t.Fatalf("protojson.Marshal() returned error: %v", err)
+	}
+
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("Create(%q) returned error: %v", path, err)
+	}
+	defer file.Close()
+
+	writer := zip.NewWriter(file)
+	manifestEntry, err := writer.Create("manifest.json")
+	if err != nil {
+		t.Fatalf("Create(manifest.json) returned error: %v", err)
+	}
+	if _, err := manifestEntry.Write(manifestBytes); err != nil {
+		t.Fatalf("Write(manifest.json) returned error: %v", err)
+	}
+
+	binaryEntry, err := writer.Create("plugin")
+	if err != nil {
+		t.Fatalf("Create(plugin) returned error: %v", err)
+	}
+	if _, err := binaryEntry.Write(binaryBytes); err != nil {
+		t.Fatalf("Write(plugin) returned error: %v", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+}
+
+func recordTestEvent(events *[]string, event string) {
+	if events == nil {
+		return
+	}
+	*events = append(*events, event)
+}
+
+func (f *fakeServiceHost) Running(_ int) bool {
+	_, err := f.Client(0)
+	return err == nil
+}

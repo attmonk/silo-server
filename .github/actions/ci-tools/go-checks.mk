@@ -1,0 +1,60 @@
+# The Go jobs' lanes. CI runs this file from the trusted CI tools checkout in
+# the repository root: Go lint runs lint, Go vet runs vet and then contracts,
+# and Go test runs tests, each job on its own runner.
+# LINT_BASE_REF, LINT_BASE_MODE, CONTRACT_BASE_REF, and TEST_GOFLAGS come from
+# the workflow.
+.PHONY: lint vet contracts tests test-dependencies
+
+# Router recovery must hold over the whole tree, including inherited lines.
+lint:
+	@unformatted="$$(gofmt -l .)"; if [ -n "$$unformatted" ]; then echo "::error::gofmt is required on:"; echo "$$unformatted"; exit 1; fi
+	BASE_REF="$${LINT_BASE_REF}" LINT_CHANGED_CI=1 LINT_CHANGED_BASE_MODE="$${LINT_BASE_MODE}" CI_OPERATION=lint bash .ci-tools/scripts/lint-changed.sh
+	$(MAKE) -f Makefile lint-router-recovery
+
+# The whole tree, so a change that breaks vet in a package it did not touch
+# still fails; lint-changed reports only changed lines.
+vet:
+	go vet ./...
+
+# Package assertions belong to the tests lane; these check generated artifacts.
+contracts:
+	$(MAKE) -j1 -f Makefile verify-settings-bindings verify-playback-fixtures verify-route-inventory
+	$(MAKE) -j1 -f Makefile verify-apiv2-openapi CONTRACT_GO_TESTS=0
+	git fetch --no-tags origin "+refs/heads/$${CONTRACT_BASE_REF}:refs/remotes/origin/$${CONTRACT_BASE_REF}"
+	$(MAKE) -j1 -f Makefile verify-apiv2-contract CONTRACT_GO_TESTS=0 BASE_REF="origin/$${CONTRACT_BASE_REF}"
+
+# Go's test cache cannot see files a test's child process reads, so these
+# packages always rerun; the grep fails when a new test starts go, git, or node
+# outside them or the packages whose subprocess inputs are immutable.
+UNCACHED := cmd/silo internal/jellycompat internal/pluginhost internal/plugins scripts/ci/sizeratchet scripts/ci/migrationcheck
+# subprocess-manifest: scripts/ci/subprocess-tests.json
+# deferred: no recorded occurrence; retain UNCACHED and the subprocess guard.
+IMMUTABLE := internal/contractspec internal/debugserver
+test-dependencies:
+	@variants="$$(go list -deps -test -f '{{.ImportPath}}|{{.ForTest}}' ./internal/auth/ ./internal/api/handlers/)" || exit $$?; \
+	[ -n "$$variants" ] || { echo "::error::test dependency metadata is empty"; exit 1; }; \
+	printf '%s\n' "$$variants" | awk -F '|' '\
+	  $$2 != "" { split($$1, name, " "); \
+	    if ((name[1] == "github.com/Silo-Server/silo-server/internal/api/handlers" || \
+	         name[1] == "github.com/Silo-Server/silo-server/internal/apiv2") && name[1] != $$2) { \
+	      print "::error::lower-layer external test recompiles " $$0; bad=1 \
+	    } \
+	  } END { exit bad }'
+
+tests: test-dependencies
+	@want="$$(printf '%s\n' $(wildcard $(UNCACHED) $(IMMUTABLE)) | sort -u)"; \
+	got="$$(git grep -l -E '(exec\.Command(Context)?\(([^,]+, )?"(go|git|node)"|LookPath\("(go|git|node)"\))' -- '*_test.go' | sed 's@/[^/]*$$@@' | sort -u)"; \
+	if [ "$$want" != "$$got" ]; then echo "::error::packages whose tests start go, git, or node changed"; echo "want: $$want"; echo "got: $$got"; exit 1; fi
+	$(MAKE) -f Makefile embed-stub
+	@if [ "$${GITHUB_EVENT_NAME}" = schedule ]; then \
+		GOFLAGS="$${TEST_GOFLAGS}" $(MAKE) -f Makefile test-go; \
+	else \
+		listed="$$(go list -f '{{.ImportPath}} {{.Module.Path}}' ./...)" || exit $$?; \
+		packages="$$(printf '%s\n' "$$listed" | awk -v excluded="$(UNCACHED)" '\
+			BEGIN { n = split(excluded, paths, " "); for (i = 1; i <= n; i++) uncached[paths[i]] = 1 } \
+		NF == 2 && !(substr($$1, length($$2) + 2) in uncached) { printf "%s ", $$1 } \
+		')" || exit $$?; \
+		if [ -z "$$packages" ]; then echo "::error::ordinary Go test package list is empty"; exit 1; fi; \
+		GOFLAGS="$${TEST_GOFLAGS}" $(MAKE) -f Makefile test-go GO_TEST_PACKAGES="$$packages" && \
+			go test -count=1 $(addprefix ./,$(UNCACHED)); \
+	fi

@@ -1,0 +1,176 @@
+import type { ReactNode } from "react";
+import { Check, ChevronLeft, ChevronRight } from "lucide-react";
+import type { Season } from "@/api/types";
+import { usePrefetchCatalogSeason } from "@/hooks/queries/catalogRead";
+import { useCarouselEmbla } from "@/hooks/useCarouselEmbla";
+import { buildItemHref } from "@/lib/mediaNavigation";
+import { formatSeasonMeta, formatSeasonProgress, getSeasonDisplayTitle } from "./itemDetailLayout";
+import CardPlayOverlay from "@/components/CardPlayOverlay";
+import CardOverlays from "@/components/overlays/CardOverlays";
+import ViewTransitionLink from "@/components/ViewTransitionLink";
+import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import { useAppLanguage, useT } from "@/i18n";
+import { overlayDataFromSeason } from "@/lib/overlays";
+import WatchProgressBar from "@/components/WatchProgressBar";
+
+interface SeasonCarouselProps {
+  seasons: Season[];
+  /** The series page's library scope, kept on each season link. */
+  libraryId?: number;
+}
+
+export default function SeasonCarousel({ seasons, libraryId }: SeasonCarouselProps) {
+  useAppLanguage();
+  const sorted = seasons.slice().sort((a, b) => a.season_number - b.season_number);
+  const prefetchSeason = usePrefetchCatalogSeason(libraryId);
+  const { prefs: overlayPrefs } = useOverlayPrefs();
+
+  if (sorted.length === 0) {
+    return null;
+  }
+
+  return (
+    <SeasonRail count={sorted.length}>
+      {sorted.map((season) => {
+        const userData = season.user_data;
+        const isCompleted = userData?.played === true;
+        const hasProgress =
+          !isCompleted &&
+          userData != null &&
+          (userData.watched_count > 0 || userData.in_progress_count > 0);
+        const progressPercent =
+          hasProgress && season.episode_count > 0
+            ? Math.round((userData.watched_count / season.episode_count) * 100)
+            : 0;
+        const seasonHref = buildItemHref({ contentId: season.content_id, libraryId });
+
+        return (
+          <li key={season.content_id} className="embla__slide shrink-0">
+            <div className="group/season w-[160px] sm:w-[170px]">
+              {/* Poster */}
+              <div className="group/media relative">
+                <ViewTransitionLink
+                  to={seasonHref}
+                  prefetchOn="intent"
+                  onPrefetch={() => prefetchSeason(season.content_id)}
+                  className="media-card-image relative block aspect-[2/3] overflow-hidden rounded-xl"
+                >
+                  {season.poster_url ? (
+                    <img
+                      src={season.poster_url}
+                      alt={getSeasonDisplayTitle(season)}
+                      className="h-full w-full object-cover transition-transform duration-300 group-hover/season:scale-105"
+                      loading="lazy"
+                      decoding="async"
+                    />
+                  ) : (
+                    <div className="text-muted-foreground bg-surface flex h-full items-center justify-center p-4 text-center text-sm font-medium">
+                      {getSeasonDisplayTitle(season)}
+                    </div>
+                  )}
+
+                  {overlayPrefs && (
+                    <CardOverlays
+                      data={overlayDataFromSeason(season)}
+                      prefs={overlayPrefs}
+                      hasProgressBar={isCompleted || hasProgress}
+                    />
+                  )}
+
+                  {/* Completed checkmark */}
+                  {isCompleted && (
+                    // eslint-disable-next-line silo/no-physical-direction -- on the poster artwork, which doesn't mirror; matches CardOverlays and CardWatchStatus
+                    <div className="absolute top-2.5 right-2.5 z-20 rounded-full bg-green-500/90 p-1 text-white shadow-sm">
+                      <Check className="size-3.5" strokeWidth={3} />
+                    </div>
+                  )}
+
+                  {(isCompleted || hasProgress) && (
+                    <WatchProgressBar
+                      percent={isCompleted ? 100 : progressPercent}
+                      fillColor={isCompleted ? "#4caf50" : undefined}
+                      animate
+                    />
+                  )}
+                </ViewTransitionLink>
+                {season.play_content_id ? (
+                  <CardPlayOverlay
+                    contentId={season.play_content_id}
+                    title={getSeasonDisplayTitle(season)}
+                    type="episode"
+                  />
+                ) : null}
+              </div>
+
+              {/* Info — always the same height */}
+              <ViewTransitionLink
+                to={seasonHref}
+                onPrefetch={() => prefetchSeason(season.content_id)}
+                className="block px-0.5 pt-2.5"
+              >
+                <div className="truncate text-[0.8125rem] font-semibold">
+                  {getSeasonDisplayTitle(season)}
+                </div>
+                <div className="text-muted-foreground text-xs">
+                  {hasProgress
+                    ? formatSeasonProgress(season, userData.watched_count)
+                    : formatSeasonMeta(season)}
+                </div>
+              </ViewTransitionLink>
+            </div>
+          </li>
+        );
+      })}
+    </SeasonRail>
+  );
+}
+
+/**
+ * The drag-scrollable season row with hover arrows. Children are the season
+ * slides, each an `<li className="embla__slide shrink-0">`.
+ */
+export function SeasonRail({ count, children }: { count: number; children: ReactNode }) {
+  const t = useT();
+  const { emblaRef, canScrollPrev, canScrollNext, scrollPrev, scrollNext } = useCarouselEmbla();
+
+  return (
+    <section className="group/carousel">
+      <div className="mb-5 flex items-end justify-between gap-4">
+        <h2 className="text-xl font-semibold">{t("web.detail.seasons.heading")}</h2>
+        <span className="text-muted-foreground text-sm">
+          {t("web.detail.seasons.totalCount", { count: count })}
+        </span>
+      </div>
+
+      <div className="relative">
+        {canScrollPrev && (
+          <button
+            type="button"
+            onClick={scrollPrev}
+            className="from-background/90 absolute start-0 top-0 bottom-0 z-10 flex h-11 w-11 items-center justify-center self-center bg-gradient-to-r to-transparent opacity-0 transition-opacity duration-200 group-hover/carousel:opacity-100 focus-visible:opacity-100 rtl:bg-gradient-to-l"
+            aria-label={t("web.detail.carousel.scrollLeft")}
+          >
+            <ChevronLeft className="text-foreground h-6 w-6" />
+          </button>
+        )}
+
+        <div ref={emblaRef} className="embla__viewport -mt-1 overflow-hidden pt-1 pb-5">
+          <ul role="list" className="embla__container flex cursor-grab list-none gap-4">
+            {children}
+          </ul>
+        </div>
+
+        {canScrollNext && (
+          <button
+            type="button"
+            onClick={scrollNext}
+            className="from-background/90 absolute end-0 top-0 bottom-0 z-10 flex h-11 w-11 items-center justify-center self-center bg-gradient-to-l to-transparent opacity-0 transition-opacity duration-200 group-hover/carousel:opacity-100 focus-visible:opacity-100 rtl:bg-gradient-to-r"
+            aria-label={t("web.detail.carousel.scrollRight")}
+          >
+            <ChevronRight className="text-foreground h-6 w-6" />
+          </button>
+        )}
+      </div>
+    </section>
+  );
+}

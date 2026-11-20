@@ -1,0 +1,390 @@
+package database
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"os"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
+)
+
+const (
+	schemaMigrationsLockID int64 = 8_034_219_741
+	gooseVersionTable            = "public.goose_db_version"
+
+	// migrationTimeoutEnv configures how long a migration run may take.
+	migrationTimeoutEnv     = "SILO_MIGRATE_TIMEOUT"
+	defaultMigrationTimeout = 20 * time.Minute
+)
+
+// MigrationTimeout returns the deadline budget for a migration run. It is
+// configurable via SILO_MIGRATE_TIMEOUT (a Go duration such as "60m"). A value
+// of 0 or negative disables the deadline entirely — appropriate for a one-off
+// heavy data migration (e.g. a full-table COLLATE rewrite + value remap) that
+// legitimately runs longer than any fixed cap and must not be abandoned
+// mid-flight, since an abandoned run leaves an orphaned backend holding
+// AccessExclusive locks while the next boot retries. Unset or unparseable falls
+// back to defaultMigrationTimeout, preserving prior behavior.
+func MigrationTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(migrationTimeoutEnv))
+	if raw == "" {
+		return defaultMigrationTimeout
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("invalid migration timeout; using default",
+			"env", migrationTimeoutEnv, "value", raw,
+			"default", defaultMigrationTimeout.String(), "error", err)
+		return defaultMigrationTimeout
+	}
+	return d
+}
+
+// MigrationContext derives the context for a migration run, honoring
+// MigrationTimeout. A non-positive timeout yields a cancelable context with no
+// deadline. The caller must always invoke the returned CancelFunc.
+func MigrationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if d := MigrationTimeout(); d > 0 {
+		return context.WithTimeout(ctx, d)
+	}
+	return context.WithCancel(ctx)
+}
+
+// RunMigrations applies all pending Goose migrations from fsys/dir, one at a
+// time, logging each migration's start and finish and a heartbeat while a long
+// one runs, so a slow startup is visibly working rather than silent.
+func RunMigrations(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, dir string) error {
+	provider, err := newMigrationProvider(pool, fsys, dir)
+	if err != nil {
+		return err
+	}
+	defer provider.Close()
+
+	if err := applyMigrationsLogged(ctx, provider, slog.Default(), migrationHeartbeatInterval); err != nil {
+		return err
+	}
+	// Connections look up the vector types when they open. On a new database
+	// the migrations create them, so reconnect for the binary codecs.
+	pool.Reset()
+	return nil
+}
+
+// MigrateDownTo rolls back every migration newer than version, newest first.
+//
+// It exists because several migrations are Go rather than SQL — the settings
+// backfill and the jellycompat DisplayPreferences move — and those are
+// registered on this provider, so the standalone goose CLI cannot see them.
+// Without this, their down functions are written but unreachable, and the only
+// rollback for a deploy that moved data out of a table the previous binary
+// reads is restoring a backup.
+//
+// version is the last migration to KEEP: passing the version before a release
+// undoes exactly that release.
+func MigrateDownTo(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, dir string, version int64) error {
+	provider, err := newMigrationProvider(pool, fsys, dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = provider.Close() }()
+
+	logger := slog.Default()
+	// Log and start the heartbeat before Status: it takes the migration lock,
+	// and waiting on another primary's lock must not be silent.
+	logger.InfoContext(ctx, "rolling back database migrations", "to_version", version)
+	started := time.Now()
+	stop := startMigrationHeartbeat(migrationHeartbeatInterval, func(elapsed string) {
+		logger.InfoContext(ctx, "database migration rollback still running",
+			"to_version", version, "elapsed", elapsed)
+	})
+	defer stop()
+	// goose's DownTo rolls every migration back before it returns, so progress
+	// can't name the migration running at the moment. Log the applied
+	// migrations newer than the target instead, so a long rollback shows what
+	// it may cover.
+	if statuses, statusErr := provider.Status(ctx); statusErr != nil {
+		logger.WarnContext(ctx, "could not list the migrations to roll back", "to_version", version, "error", statusErr)
+	} else {
+		candidates := migrationRollbackCandidates(statuses, version)
+		logger.InfoContext(ctx, "database migration rollback candidates",
+			"to_version", version,
+			"count", len(candidates),
+			"candidates", migrationNames(candidates))
+	}
+	results, err := provider.DownTo(ctx, version)
+	stop()
+	rolledBack := logMigrationRollbackResults(ctx, logger, version, results, err)
+	if err != nil {
+		return fmt.Errorf("rolling back goose migrations to %d: %w", version, err)
+	}
+	logger.InfoContext(ctx, "database migration rollback finished",
+		"to_version", version,
+		"rolled_back", rolledBack,
+		"duration", roundMigrationDuration(time.Since(started)))
+	return nil
+}
+
+// MigrationStatus describes a migration source and whether Goose has applied it.
+type MigrationStatus struct {
+	Version   int64
+	Source    string
+	State     string
+	AppliedAt time.Time
+}
+
+// MigrationStatuses returns Goose status using the same legacy bootstrap and locking path as RunMigrations.
+func MigrationStatuses(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, dir string) ([]MigrationStatus, error) {
+	provider, err := newMigrationProvider(pool, fsys, dir)
+	if err != nil {
+		return nil, err
+	}
+	defer provider.Close()
+
+	gooseStatuses, err := provider.Status(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading goose migration status: %w", err)
+	}
+
+	statuses := make([]MigrationStatus, 0, len(gooseStatuses))
+	for _, status := range gooseStatuses {
+		var version int64
+		var source string
+		if status.Source != nil {
+			version = status.Source.Version
+			source = status.Source.Path
+		}
+		statuses = append(statuses, MigrationStatus{
+			Version:   version,
+			Source:    source,
+			State:     string(status.State),
+			AppliedAt: status.AppliedAt,
+		})
+	}
+	return statuses, nil
+}
+
+func newMigrationProvider(pool *pgxpool.Pool, fsys fs.FS, dir string) (*goose.Provider, error) {
+	p, err := openMigrationProvider(pool, fsys, dir, goMigrations())
+	if err != nil {
+		return nil, err
+	}
+	return p.Provider, nil
+}
+
+func newGooseProvider(sqlDB *sql.DB, migrationFS fs.FS, locker lock.SessionLocker, goMigs []*goose.Migration) (*goose.Provider, error) {
+	provider, err := goose.NewProvider(
+		goose.DialectPostgres,
+		sqlDB,
+		migrationFS,
+		goose.WithTableName(gooseVersionTable),
+		goose.WithAllowOutofOrder(true),
+		goose.WithSessionLocker(locker),
+		// These are Go rather than SQL because their conversion rules live
+		// in Go packages shared with other write paths: the settings backfill
+		// validates every value against the contract and re-encodes it as
+		// typed JSON, the displayprefs move parses the legacy jellycompat
+		// keys, the subtitle language backfill applies the scanner's
+		// lang.CompatibleTag, and the sidecar subtitle name backfill applies
+		// the scanner's naming.SidecarSubtitleTags. None of these can be
+		// expressed in SQL without duplicating those rules. The invalid index rebuild and the
+		// push attempt key scope decide per index whether to drop and build it
+		// concurrently, which SQL cannot do outside a transaction.
+		goose.WithGoMigrations(goMigs...),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating goose migration provider: %w", err)
+	}
+	return provider, nil
+}
+
+func goMigrations() []*goose.Migration {
+	return []*goose.Migration{
+		settingsBackfillMigration(),
+		displayPrefsMoveMigration(),
+		subtitleLanguageBackfillMigration(),
+		invalidIndexRebuildMigration(),
+		pushAttemptKeyScopeMigration(),
+		externalSubtitleNameBackfillMigration(),
+		blobGCQueueChapterFileIndexMigration(),
+	}
+}
+
+// MigrationVersions lists every migration version this binary carries, SQL
+// and Go, in ascending order. A restore refuses a backup whose schema is
+// newer than the last of them, or that has applied a version not among them:
+// migrations run out of order, so a database can hold a version older than
+// the newest one here that this binary does not carry.
+func MigrationVersions(fsys fs.FS, dir string) ([]int64, error) {
+	migrationFS, err := migrationSubFS(fsys, dir)
+	if err != nil {
+		return nil, err
+	}
+	names, err := fs.Glob(migrationFS, "*.sql")
+	if err != nil {
+		return nil, err
+	}
+	versions := make([]int64, 0, len(names)+len(goMigrations()))
+	for _, name := range names {
+		version, err := goose.NumericComponent(name)
+		if err != nil {
+			return nil, fmt.Errorf("migration %s: %w", name, err)
+		}
+		versions = append(versions, version)
+	}
+	for _, m := range goMigrations() {
+		versions = append(versions, m.Version)
+	}
+	slices.Sort(versions)
+	return slices.Compact(versions), nil
+}
+
+func migrationSubFS(fsys fs.FS, dir string) (fs.FS, error) {
+	if dir == "" || dir == "." {
+		return fsys, nil
+	}
+
+	sub, err := fs.Sub(fsys, dir)
+	if err != nil {
+		return nil, fmt.Errorf("opening migration directory %q: %w", dir, err)
+	}
+	return sub, nil
+}
+
+type legacyBootstrapLocker struct {
+	delegate lock.SessionLocker
+}
+
+func (l *legacyBootstrapLocker) SessionLock(ctx context.Context, conn *sql.Conn) error {
+	if err := l.delegate.SessionLock(ctx, conn); err != nil {
+		return err
+	}
+	if err := bootstrapLegacyGooseVersions(ctx, conn); err != nil {
+		_ = l.delegate.SessionUnlock(context.WithoutCancel(ctx), conn)
+		return fmt.Errorf("bootstrapping goose migration versions: %w", err)
+	}
+	return nil
+}
+
+func (l *legacyBootstrapLocker) SessionUnlock(ctx context.Context, conn *sql.Conn) error {
+	return l.delegate.SessionUnlock(ctx, conn)
+}
+
+func bootstrapLegacyGooseVersions(ctx context.Context, conn *sql.Conn) error {
+	if err := ensureGooseVersionTable(ctx, conn); err != nil {
+		return err
+	}
+	if err := ensureGooseZeroVersion(ctx, conn); err != nil {
+		return err
+	}
+
+	hasLegacyVersions, err := tableExists(ctx, conn, "public.schema_versions")
+	if err != nil {
+		return fmt.Errorf("checking legacy schema_versions table: %w", err)
+	}
+	if !hasLegacyVersions {
+		return nil
+	}
+
+	if err := copyLegacyVersions(ctx, conn); err != nil {
+		return err
+	}
+	return verifyLegacyVersions(ctx, conn)
+}
+
+func ensureGooseVersionTable(ctx context.Context, conn *sql.Conn) error {
+	_, err := conn.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS public.goose_db_version (
+			id integer PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
+			version_id bigint NOT NULL,
+			is_applied boolean NOT NULL,
+			tstamp timestamp NOT NULL DEFAULT now()
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("ensuring goose version table: %w", err)
+	}
+	return nil
+}
+
+func ensureGooseZeroVersion(ctx context.Context, conn *sql.Conn) error {
+	_, err := conn.ExecContext(ctx, `
+		INSERT INTO public.goose_db_version (version_id, is_applied)
+		SELECT 0, true
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM public.goose_db_version
+			WHERE version_id = 0 AND is_applied
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("ensuring goose zero version: %w", err)
+	}
+	return nil
+}
+
+func copyLegacyVersions(ctx context.Context, conn *sql.Conn) error {
+	_, err := conn.ExecContext(ctx, `
+		INSERT INTO public.goose_db_version (version_id, is_applied, tstamp)
+		SELECT sv.version, true, sv.applied_at::timestamp
+		FROM public.schema_versions sv
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM public.goose_db_version gv
+			WHERE gv.version_id = sv.version AND gv.is_applied
+		)
+		ORDER BY sv.version
+	`)
+	if err != nil {
+		return fmt.Errorf("copying legacy schema_versions rows: %w", err)
+	}
+	return nil
+}
+
+func verifyLegacyVersions(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `
+		SELECT sv.version
+		FROM public.schema_versions sv
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM public.goose_db_version gv
+			WHERE gv.version_id = sv.version AND gv.is_applied
+		)
+		ORDER BY sv.version
+		LIMIT 10
+	`)
+	if err != nil {
+		return fmt.Errorf("verifying legacy schema_versions rows: %w", err)
+	}
+	defer rows.Close()
+
+	var missing []int
+	for rows.Next() {
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			return fmt.Errorf("scanning missing legacy version: %w", err)
+		}
+		missing = append(missing, version)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("reading missing legacy versions: %w", err)
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("legacy schema_versions rows missing from goose_db_version: %v", missing)
+	}
+	return nil
+}
+
+func tableExists(ctx context.Context, conn *sql.Conn, qualifiedName string) (bool, error) {
+	var exists bool
+	if err := conn.QueryRowContext(ctx, "SELECT to_regclass($1) IS NOT NULL", qualifiedName).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}

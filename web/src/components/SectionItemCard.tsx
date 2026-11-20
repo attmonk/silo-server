@@ -1,0 +1,178 @@
+import { memo, useRef } from "react";
+import ViewTransitionLink from "@/components/ViewTransitionLink";
+import MediaCardArtwork, {
+  MEDIA_CARD_CAPTION_CLASS,
+  MEDIA_CARD_META_CLASS,
+  MEDIA_CARD_TITLE_CLASS,
+} from "@/components/MediaCardArtwork";
+import MediaItemMenu from "@/components/MediaItemMenu";
+import CardOverlays from "@/components/overlays/CardOverlays";
+import CardWatchStatus from "@/components/overlays/CardWatchStatus";
+import { overlayDataFromSectionItem, type CardOverlayPrefs } from "@/lib/overlays";
+import type { CardQuickActionMode } from "@/lib/cardQuickActions";
+import { buildEpisodeCardLabels } from "@/lib/episodeCardLabels";
+import {
+  formatUpcomingDate,
+  formatUpcomingSubtitle,
+  formatUpcomingTime,
+  upcomingBadgeClass,
+  upcomingBadgeLabel,
+} from "@/lib/upcomingEventPresentation";
+import type { SectionItem } from "@/api/types";
+import { buildItemHref } from "@/lib/mediaNavigation";
+import CardPlayOverlay from "@/components/CardPlayOverlay";
+import { numberText, useAppLanguage, useT, type Translate } from "@/i18n";
+
+/**
+ * A "next in series" card's book number. The server sends it as the English
+ * badge "Book 3"; the number is read back out and shown in the app language.
+ */
+function bookBadgeLabel(t: Translate, badges: string[] | undefined): string | undefined {
+  const badge = badges?.find((value) => value.startsWith("Book "));
+  if (!badge) return undefined;
+  const number = /^Book (\d+)$/.exec(badge)?.[1];
+  return number ? t("web.detail.books.bookNumber", { number: Number(number) }) : badge;
+}
+
+interface SectionItemCardProps {
+  item: SectionItem;
+  libraryId?: number;
+  overlayPrefs?: CardOverlayPrefs | null;
+  quickActionMode?: CardQuickActionMode;
+  /** On screen in the first row at first paint: load the poster eagerly. */
+  priority?: boolean;
+}
+
+export default memo(function SectionItemCard({
+  item,
+  libraryId,
+  overlayPrefs = null,
+  quickActionMode = "none",
+  priority = false,
+}: SectionItemCardProps) {
+  const t = useT();
+  // The upcoming and episode lines come from plain helpers; follow language changes.
+  useAppLanguage();
+  const itemHref = buildItemHref({ contentId: item.content_id, libraryId });
+  const upcomingEvent = item.upcoming_event;
+  const subtitle = upcomingEvent ? formatUpcomingSubtitle(upcomingEvent) : "";
+  const airDateLabel = upcomingEvent ? formatUpcomingDate(upcomingEvent.air_date) : "";
+  const airTimeLabel = upcomingEvent ? formatUpcomingTime(upcomingEvent.air_time) : null;
+  const episodeLabels = !upcomingEvent ? buildEpisodeCardLabels(item) : null;
+  const headingHref =
+    item.type === "episode" && item.series_id
+      ? buildItemHref({ contentId: item.series_id, libraryId })
+      : itemHref;
+  const cardRef = useRef<HTMLDivElement>(null);
+  const displayTitle = episodeLabels ? episodeLabels.seriesTitle : item.title;
+
+  return (
+    <div ref={cardRef} className="media-card media-card-longpress group/card">
+      <div className="group/media relative">
+        <ViewTransitionLink
+          to={itemHref}
+          prefetchOn="intent"
+          aria-label={displayTitle}
+          className="block overflow-hidden rounded-xl"
+        >
+          <MediaCardArtwork
+            src={item.poster_url}
+            alt={item.title}
+            mediaType={item.type}
+            thumbhash={item.poster_thumbhash}
+            square={item.type === "audiobook"}
+            lazy
+            priority={priority}
+          >
+            {item.status === "ambiguous" && (
+              // eslint-disable-next-line silo/no-physical-direction -- on the poster artwork, which doesn't mirror; matches CardOverlays and CardWatchStatus
+              <span className="absolute top-2.5 left-2.5 rounded-full border border-amber-500/25 bg-black/40 px-2 py-0.5 text-[0.625rem] leading-none font-semibold tracking-wide text-amber-200 uppercase backdrop-blur-sm">
+                {t("web.home.sectionRow.ambiguous")}
+              </span>
+            )}
+            {item.status === "matched" && overlayPrefs && (
+              <CardOverlays data={overlayDataFromSectionItem(item)} prefs={overlayPrefs} />
+            )}
+            {item.status === "matched" && !upcomingEvent && (
+              <CardWatchStatus userState={item.user_state} />
+            )}
+            {upcomingEvent && upcomingEvent.badges.length > 0 && (
+              // eslint-disable-next-line silo/no-physical-direction -- on the poster artwork, which doesn't mirror; matches CardOverlays and CardWatchStatus
+              <div className="absolute top-2.5 left-2.5 flex max-w-[calc(100%-2.5rem)] flex-wrap gap-1">
+                {upcomingEvent.badges.map((badge) => (
+                  <span
+                    key={badge}
+                    className={`rounded-full border px-2 py-0.5 text-[0.625rem] leading-none font-semibold tracking-wide uppercase backdrop-blur-sm ${upcomingBadgeClass(
+                      badge,
+                    )}`}
+                  >
+                    {upcomingBadgeLabel(badge)}
+                  </span>
+                ))}
+              </div>
+            )}
+          </MediaCardArtwork>
+        </ViewTransitionLink>
+        {item.play_content_id ? (
+          <CardPlayOverlay
+            contentId={item.play_content_id}
+            title={episodeLabels ? episodeLabels.seriesTitle : item.title}
+            type={item.type === "movie" ? "movie" : "episode"}
+            libraryId={libraryId}
+          />
+        ) : null}
+        <MediaItemMenu
+          contentId={item.content_id}
+          mediaType={item.type}
+          libraryId={libraryId}
+          userState={item.user_state}
+          variant="poster"
+          quickActionMode={quickActionMode}
+          longPressRef={cardRef}
+          itemTitle={displayTitle}
+        />
+      </div>
+      <div className={MEDIA_CARD_CAPTION_CLASS}>
+        <ViewTransitionLink to={headingHref} className={MEDIA_CARD_TITLE_CLASS}>
+          {displayTitle}
+        </ViewTransitionLink>
+        {upcomingEvent ? (
+          <ViewTransitionLink to={itemHref} className="block hover:underline">
+            {subtitle && (
+              <div className="text-muted-foreground mt-1 truncate text-[0.6875rem] font-medium tracking-[0.14em] uppercase">
+                {subtitle}
+              </div>
+            )}
+            <div className="mt-1.5 flex min-w-0 items-center gap-1.5 text-[0.6875rem] font-medium">
+              <span className="text-foreground shrink-0">{airDateLabel}</span>
+              {airTimeLabel && (
+                <span className="text-muted-foreground min-w-0 truncate">{airTimeLabel}</span>
+              )}
+            </div>
+          </ViewTransitionLink>
+        ) : episodeLabels ? (
+          <ViewTransitionLink to={itemHref} className="block hover:underline">
+            {episodeLabels.episodeTitle ? (
+              <div className="bidi-text text-muted-foreground mt-1 truncate text-[0.75rem] font-medium">
+                {episodeLabels.episodeTitle}
+              </div>
+            ) : null}
+            <div className="text-muted-foreground mt-1 text-[0.6875rem] font-medium tracking-[0.14em] uppercase">
+              {episodeLabels.episodeCode}
+            </div>
+          </ViewTransitionLink>
+        ) : item.item_source === "next_in_series" && item.series_title ? (
+          <ViewTransitionLink to={itemHref} className={MEDIA_CARD_META_CLASS}>
+            {[bookBadgeLabel(t, item.badges), item.series_title].filter(Boolean).join(" · ")}
+          </ViewTransitionLink>
+        ) : (
+          <ViewTransitionLink to={itemHref} className={MEDIA_CARD_META_CLASS}>
+            {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- a space, not text */}
+            {item.year ? numberText(item.year) : null}{" "}
+            {item.type === "series" ? t("web.home.sectionRow.seriesType") : null}
+          </ViewTransitionLink>
+        )}
+      </div>
+    </div>
+  );
+});

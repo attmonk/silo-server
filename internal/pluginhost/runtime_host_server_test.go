@@ -1,0 +1,143 @@
+package pluginhost_test
+
+import (
+	"context"
+	"testing"
+
+	"google.golang.org/protobuf/types/known/structpb"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+
+	"github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/pluginhost"
+)
+
+type fakeHub struct {
+	calls []events.Envelope
+}
+
+func (f *fakeHub) Publish(_ context.Context, env events.Envelope) error {
+	f.calls = append(f.calls, env)
+	return nil
+}
+
+type fakeLibLister struct{ libs []pluginhost.LibraryRecord }
+
+func (f *fakeLibLister) ListLibraries(_ context.Context, _ string) ([]pluginhost.LibraryRecord, error) {
+	return f.libs, nil
+}
+
+func TestRuntimeHostServer_PublishEvent_AutoPrefixesAndPublishes(t *testing.T) {
+	hub := &fakeHub{}
+	srv := pluginhost.NewRuntimeHostServer(hub, &fakeLibLister{}, "silo.example")
+
+	payload, _ := structpb.NewStruct(map[string]any{"foo": "bar"})
+	_, err := srv.PublishEvent(context.Background(), &pluginv1.PublishEventRequest{
+		EventName: "approved",
+		Payload:   payload,
+	})
+	if err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	if len(hub.calls) != 1 {
+		t.Fatalf("hub calls = %d, want 1", len(hub.calls))
+	}
+	got := hub.calls[0]
+	if got.Channel != events.ChannelPlugins {
+		t.Errorf("channel = %q, want %q", got.Channel, events.ChannelPlugins)
+	}
+	if got.Event != "plugin.silo.example.approved" {
+		t.Errorf("event = %q, want %q", got.Event, "plugin.silo.example.approved")
+	}
+}
+
+func TestRuntimeHostServer_ListLibraries_PassesUserID(t *testing.T) {
+	for _, userID := range []string{"", "u1"} {
+		t.Run("user="+userID, func(t *testing.T) {
+			source := pluginhost.LibraryDataSourceFunc(func(_ context.Context, gotUserID string) ([]pluginhost.LibraryRecord, error) {
+				if gotUserID != userID {
+					t.Errorf("data source userID = %q, want %q", gotUserID, userID)
+				}
+				return []pluginhost.LibraryRecord{
+					{ID: "lib-1", Name: "Movies", MediaType: "movie"},
+					{ID: "lib-2", Name: "Shows", MediaType: "tv"},
+				}, nil
+			})
+			srv := pluginhost.NewRuntimeHostServer(&fakeHub{}, pluginhost.NewLibraryLister(source), "silo.example")
+			resp, err := srv.ListLibraries(context.Background(), &pluginv1.ListLibrariesRequest{UserId: userID})
+			if err != nil {
+				t.Fatalf("ListLibraries: %v", err)
+			}
+			if len(resp.GetLibraries()) != 2 {
+				t.Fatalf("got %d libraries, want 2", len(resp.GetLibraries()))
+			}
+			if resp.GetLibraries()[0].GetId() != "lib-1" {
+				t.Errorf("first lib id = %q", resp.GetLibraries()[0].GetId())
+			}
+		})
+	}
+}
+
+func TestRuntimeHostServer_PublishEvent_RateLimited(t *testing.T) {
+	hub := &fakeHub{}
+	srv := pluginhost.NewRuntimeHostServerWithRate(hub, &fakeLibLister{}, "silo.example", 2)
+
+	payload, _ := structpb.NewStruct(map[string]any{"i": float64(1)})
+	for i := 0; i < 5; i++ {
+		_, _ = srv.PublishEvent(context.Background(), &pluginv1.PublishEventRequest{
+			EventName: "ping",
+			Payload:   payload,
+		})
+	}
+	// rate.NewLimiter(2, 2) → burst=2 + ~0 tokens replenished within
+	// microsecond test runtime → 2-3 calls succeed, rest are rate-limited.
+	if got := len(hub.calls); got > 3 {
+		t.Errorf("hub.calls = %d, expected at most 3 with rate=2", got)
+	}
+	if len(hub.calls) == 0 {
+		t.Errorf("expected at least the burst to succeed")
+	}
+}
+
+type fakeCatalog struct {
+	matches []pluginhost.LibraryPresenceRecord
+	gotIDs  []string
+	gotType string
+	gotProv string
+}
+
+func (f *fakeCatalog) LookupByExternalIDs(_ context.Context, provider, mediaType string, ids []string) ([]pluginhost.LibraryPresenceRecord, error) {
+	f.gotProv = provider
+	f.gotType = mediaType
+	f.gotIDs = append(f.gotIDs, ids...)
+	return f.matches, nil
+}
+
+func TestRuntimeHostServer_CheckMediaPresence_RejectsTooMany(t *testing.T) {
+	srv := pluginhost.NewRuntimeHostServerWithCatalog(&fakeHub{}, &fakeLibLister{}, &fakeCatalog{}, "p")
+	ids := make([]string, 101)
+	for i := range ids {
+		ids[i] = "x"
+	}
+	_, err := srv.CheckMediaPresence(context.Background(), &pluginv1.CheckMediaPresenceRequest{
+		Provider:  "tmdb",
+		MediaType: "movie",
+		Ids:       ids,
+	})
+	if err == nil {
+		t.Error("expected error for >100 ids")
+	}
+}
+
+func TestRuntimeHostServer_PublishEventTo_RejectsEmptyTarget(t *testing.T) {
+	hub := &fakeHub{}
+	srv := pluginhost.NewRuntimeHostServer(hub, &fakeLibLister{}, "silo.example")
+
+	_, err := srv.PublishEventTo(context.Background(), &pluginv1.PublishEventToRequest{EventName: "approved"})
+	if err == nil {
+		t.Fatal("expected error for empty target_plugin_id")
+	}
+	if len(hub.calls) != 0 {
+		t.Errorf("hub.calls = %d, want 0", len(hub.calls))
+	}
+}

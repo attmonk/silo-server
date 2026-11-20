@@ -1,0 +1,271 @@
+package apiv2
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"sort"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// fakePersonalLists keeps one profile's favorites in order, newest first,
+// and resolves a card for every entry the catalog "has" (the entries whose
+// id is not in missing).
+type fakePersonalLists struct {
+	favorites []userstore.Favorite
+	watchlist []userstore.WatchlistEntry
+	missing   map[string]bool
+	err       error
+	viewers   []handlers.PersonalListViewer
+	limits    []int
+}
+
+// listKeyAfter reports whether the row's key sorts strictly after the
+// cursor key in (added_at DESC, media_item_id DESC) order, i.e. is smaller.
+func listKeyAfter(row, after userstore.ListKey) bool {
+	if row.AddedAt != after.AddedAt {
+		return row.AddedAt < after.AddedAt
+	}
+	return row.MediaItemID < after.MediaItemID
+}
+
+// keysetPage models the store's ORDER BY added_at DESC, media_item_id DESC
+// LIMIT over rows of one profile, resuming strictly after the key.
+func keysetPage[E any](rows []E, profileID string, keyOf func(E) userstore.ListKey, rowProfile func(E) string, after *userstore.ListKey, limit int) []E {
+	var matches []E
+	for _, e := range rows {
+		if rowProfile(e) != profileID {
+			continue
+		}
+		if after != nil && !listKeyAfter(keyOf(e), *after) {
+			continue
+		}
+		matches = append(matches, e)
+	}
+	sort.SliceStable(matches, func(i, j int) bool {
+		return listKeyAfter(keyOf(matches[j]), keyOf(matches[i]))
+	})
+	if len(matches) > limit {
+		matches = matches[:limit]
+	}
+	return matches
+}
+
+func (f *fakePersonalLists) ListFavoritesPage(_ context.Context, viewer handlers.PersonalListViewer, after *userstore.ListKey, limit int) ([]userstore.Favorite, []handlers.CollectionItemView, error) {
+	f.viewers = append(f.viewers, viewer)
+	f.limits = append(f.limits, limit)
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	page := keysetPage(f.favorites, viewer.ProfileID,
+		func(e userstore.Favorite) userstore.ListKey {
+			return userstore.ListKey{AddedAt: e.AddedAt, MediaItemID: e.MediaItemID}
+		},
+		func(e userstore.Favorite) string { return e.ProfileID }, after, limit)
+	cards := make([]handlers.CollectionItemView, 0, len(page))
+	for _, e := range page {
+		if f.missing[e.MediaItemID] {
+			continue
+		}
+		cards = append(cards, handlers.CollectionItemView{ContentID: e.MediaItemID, Type: "movie", Title: "Title " + e.MediaItemID, Status: "matched"})
+	}
+	return page, cards, nil
+}
+
+// VisibleItemIDs reports every id the catalog "has" as visible.
+func (f *fakePersonalLists) VisibleItemIDs(_ context.Context, _ handlers.PersonalListViewer, ids []string) (map[string]bool, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	visible := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		visible[id] = !f.missing[id]
+	}
+	return visible, nil
+}
+
+// ResolveCards resolves a series card for every id the catalog "has".
+func (f *fakePersonalLists) ResolveCards(_ context.Context, viewer handlers.PersonalListViewer, ids []string) ([]handlers.CollectionItemView, error) {
+	f.viewers = append(f.viewers, viewer)
+	if f.err != nil {
+		return nil, f.err
+	}
+	cards := make([]handlers.CollectionItemView, 0, len(ids))
+	for _, id := range ids {
+		if f.missing[id] {
+			continue
+		}
+		cards = append(cards, handlers.CollectionItemView{ContentID: id, Type: "series", Title: "Title " + id, Status: "matched"})
+	}
+	return cards, nil
+}
+
+func (f *fakePersonalLists) GetFavorite(_ context.Context, viewer handlers.PersonalListViewer, itemID string) (userstore.Favorite, bool, error) {
+	if f.err != nil {
+		return userstore.Favorite{}, false, f.err
+	}
+	if f.missing[itemID] {
+		return userstore.Favorite{}, false, &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Item not found"}
+	}
+	for _, e := range f.favorites {
+		if e.ProfileID == viewer.ProfileID && e.MediaItemID == itemID {
+			return e, true, nil
+		}
+	}
+	return userstore.Favorite{}, false, nil
+}
+
+func (f *fakePersonalLists) AddFavorite(_ context.Context, viewer handlers.PersonalListViewer, itemID string) error {
+	if f.err != nil {
+		return f.err
+	}
+	if f.missing[itemID] {
+		return &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Item not found"}
+	}
+	for _, e := range f.favorites {
+		if e.ProfileID == viewer.ProfileID && e.MediaItemID == itemID {
+			return nil
+		}
+	}
+	f.favorites = append([]userstore.Favorite{{ProfileID: viewer.ProfileID, MediaItemID: itemID, AddedAt: "2026-01-03T00:00:00Z"}}, f.favorites...)
+	return nil
+}
+
+func (f *fakePersonalLists) RemoveFavorite(_ context.Context, viewer handlers.PersonalListViewer, itemID string) error {
+	if f.err != nil {
+		return f.err
+	}
+	kept := f.favorites[:0]
+	for _, e := range f.favorites {
+		if e.ProfileID != viewer.ProfileID || e.MediaItemID != itemID {
+			kept = append(kept, e)
+		}
+	}
+	f.favorites = kept
+	return nil
+}
+
+func (f *fakePersonalLists) ListWatchlistPage(_ context.Context, viewer handlers.PersonalListViewer, after *userstore.ListKey, limit int) ([]userstore.WatchlistEntry, []handlers.CollectionItemView, error) {
+	f.viewers = append(f.viewers, viewer)
+	f.limits = append(f.limits, limit)
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	page := keysetPage(f.watchlist, viewer.ProfileID,
+		func(e userstore.WatchlistEntry) userstore.ListKey {
+			return userstore.ListKey{AddedAt: e.AddedAt, MediaItemID: e.MediaItemID}
+		},
+		func(e userstore.WatchlistEntry) string { return e.ProfileID }, after, limit)
+	cards := make([]handlers.CollectionItemView, 0, len(page))
+	for _, e := range page {
+		if f.missing[e.MediaItemID] {
+			continue
+		}
+		cards = append(cards, handlers.CollectionItemView{ContentID: e.MediaItemID, Type: "series", Title: "Title " + e.MediaItemID, Status: "matched"})
+	}
+	return page, cards, nil
+}
+
+func (f *fakePersonalLists) GetWatchlistEntry(_ context.Context, viewer handlers.PersonalListViewer, itemID string) (userstore.WatchlistEntry, bool, error) {
+	if f.err != nil {
+		return userstore.WatchlistEntry{}, false, f.err
+	}
+	if f.missing[itemID] {
+		return userstore.WatchlistEntry{}, false, &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Item not found"}
+	}
+	for _, e := range f.watchlist {
+		if e.ProfileID == viewer.ProfileID && e.MediaItemID == itemID {
+			return e, true, nil
+		}
+	}
+	return userstore.WatchlistEntry{}, false, nil
+}
+
+func (f *fakePersonalLists) AddToWatchlist(_ context.Context, viewer handlers.PersonalListViewer, itemID string) error {
+	if f.err != nil {
+		return f.err
+	}
+	if f.missing[itemID] {
+		return &handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Item not found"}
+	}
+	for _, e := range f.watchlist {
+		if e.ProfileID == viewer.ProfileID && e.MediaItemID == itemID {
+			return nil
+		}
+	}
+	f.watchlist = append([]userstore.WatchlistEntry{{ProfileID: viewer.ProfileID, MediaItemID: itemID, AddedAt: "2026-01-03T00:00:00Z"}}, f.watchlist...)
+	return nil
+}
+
+func (f *fakePersonalLists) RemoveFromWatchlist(_ context.Context, viewer handlers.PersonalListViewer, itemID string) error {
+	if f.err != nil {
+		return f.err
+	}
+	kept := f.watchlist[:0]
+	for _, e := range f.watchlist {
+		if e.ProfileID != viewer.ProfileID || e.MediaItemID != itemID {
+			kept = append(kept, e)
+		}
+	}
+	f.watchlist = kept
+	return nil
+}
+
+func favoriteRows() []userstore.Favorite {
+	return []userstore.Favorite{
+		{ProfileID: "p-owner", MediaItemID: "movie:c", AddedAt: "2026-01-02T03:04:05Z"},
+		{ProfileID: "p-owner", MediaItemID: "movie:b", AddedAt: "2026-01-01T00:00:00Z"},
+		{ProfileID: "p-owner", MediaItemID: "movie:a", AddedAt: "2025-12-31T00:00:00Z"},
+		{ProfileID: "p-other", MediaItemID: "movie:z", AddedAt: "2025-12-30T00:00:00Z"},
+	}
+}
+
+type cardPage struct {
+	Items []struct {
+		ContentID string `json:"content_id"`
+	} `json:"items"`
+	Page struct {
+		NextCursor string `json:"next_cursor"`
+		HasMore    bool   `json:"has_more"`
+	} `json:"page"`
+}
+
+func decodeCards(t *testing.T, body string) cardPage {
+	t.Helper()
+	var page cardPage
+	if err := json.Unmarshal([]byte(body), &page); err != nil {
+		t.Fatalf("decode: %v: %s", err, body)
+	}
+	return page
+}
+
+func favoritesDeps(lists *fakePersonalLists) Dependencies {
+	deps := pilotDeps(nil, nil)
+	deps.PersonalLists = lists
+	return deps
+}
+
+func TestFavoritesDenied(t *testing.T) {
+	h := newTestHandler(t, favoritesDeps(&fakePersonalLists{err: errStore}))
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/api/v2/favorites"}, {http.MethodGet, "/api/v2/favorites/movie:c"},
+		{http.MethodGet, "/api/v2/favorites/movie:c/membership"}, {http.MethodPut, "/api/v2/favorites/movie:c"}, {http.MethodDelete, "/api/v2/favorites/movie:c"},
+	} {
+		requireProblem(t, do(t, h, tc.method, tc.path, "", nil), TypeAuthenticationRequired)
+		p := requireProblem(t, do(t, h, tc.method, tc.path, "", bearer(memberToken)), TypeValidationFailed)
+		if len(p.Errors) != 1 || p.Errors[0].Location != locationProfileHeader {
+			t.Fatalf("%s %s: errors = %+v", tc.method, tc.path, p.Errors)
+		}
+		requireProblem(t, do(t, h, tc.method, tc.path, "", with(bearer(memberToken), "X-Profile-Id", "p-locked")), TypeProfileVerificationRequired)
+		requireProblem(t, do(t, h, tc.method, tc.path, "", with(bearer(memberToken), "X-Profile-Id", "p-unknown")), TypeNotFound)
+		// A store failure is the v1 decision (500) as a problem.
+		requireProblem(t, do(t, h, tc.method, tc.path, "", viewerHeaders()), TypeInternalError)
+	}
+	// Without the service the operations fail closed.
+	deps := pilotDeps(nil, nil)
+	deps.PersonalLists = nil
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/favorites", "", viewerHeaders()), TypeDependencyUnavailable)
+}

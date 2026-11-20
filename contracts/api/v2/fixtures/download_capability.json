@@ -1,0 +1,47 @@
+{
+  "revision": "320314e115aea81028873c8f40b8929eb63c75e2b740032428b746a34aafa2af",
+  "state": "available",
+  "allowed": true,
+  "bounded_creation": true,
+  "subscription_mutations": true,
+  "bounded_subscription_sync": true,
+  "subscription_reads": true,
+  "bounded_manifests": true,
+  "file_delivery": false,
+  "enabled": true,
+  "download_allowed": true,
+  "proxy_delivery": false,
+  "ordered_status": true,
+  "quality_presets": [
+    "original",
+    "10mbps",
+    "2mbps"
+  ],
+  "quality_options": [
+    {
+      "preset": "original"
+    },
+    {
+      "preset": "10mbps",
+      "bitrate_kbps": 10000,
+      "max_height": 1080
+    },
+    {
+      "preset": "2mbps",
+      "bitrate_kbps": 2000,
+      "max_height": 720
+    }
+  ],
+  "transcode_enabled": true,
+  "transcode_user_allowed": true,
+  "season_download": false,
+  "series_monitoring": false,
+  "monitoring_modes": [],
+  "bulk_quality": true,
+  "monitor_quality": true,
+  "batch_version": true,
+  "preparation_progress": true,
+  "direct_download_links": false,
+  "prepare_again": true,
+  "revoked_removes_local": true
+}

@@ -1,0 +1,767 @@
+package recommendations
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+const signalPageSize = 1000
+
+type signalRepo interface {
+	GetWatchedItemIDSet(ctx context.Context, userID int, profileID string) (map[string]struct{}, error)
+	GetFavoriteItemIDs(ctx context.Context, userID int, profileID string) ([]string, error)
+	GetNotInterestedMarks(ctx context.Context, userID int, profileID string) ([]NotInterestedMark, error)
+	GetWatchProgressForUser(ctx context.Context, userID int, profileID string) ([]WatchProgressRow, error)
+	GetEbookReaderProgressForUser(ctx context.Context, userID int, profileID string) ([]WatchProgressRow, error)
+	GetRecentCompletedItemIDs(ctx context.Context, userID int, profileID string, limit int) ([]string, error)
+	GetRewatchCounts(ctx context.Context, userID int, profileID string) ([]RewatchCount, error)
+	ResolveCanonicalItemIDs(ctx context.Context, contentIDs []string) (map[string]string, error)
+	ResolveCanonicalItemIDSet(ctx context.Context, contentIDs []string) (map[string]struct{}, error)
+	RecommendableItemIDs(ctx context.Context, itemIDs []string) (map[string]struct{}, error)
+	HasSignalRows(ctx context.Context, userID int, profileID string, includeStoreTables bool) (bool, error)
+}
+
+// SignalReader centralizes profile-scoped recommendation signals. userstore is
+// the source of truth when configured; repo SQL is retained for deployments
+// without a store provider, and answers the reads one query can when the
+// store keeps its signals in the Postgres tables (see storeIsSeparate).
+type SignalReader struct {
+	repo          signalRepo
+	storeProvider userstore.UserStoreProvider
+	// storeOutsidePostgres marks a user store that keeps watch progress,
+	// favorites and watchlist outside the Postgres tables (the SQLite
+	// backend), so checks that would query those tables ask the store.
+	storeOutsidePostgres bool
+}
+
+func NewSignalReader(repo signalRepo, storeProvider userstore.UserStoreProvider) *SignalReader {
+	return &SignalReader{
+		repo:          repo,
+		storeProvider: storeProvider,
+	}
+}
+
+// WithUserStoreOutsidePostgres records whether the user store keeps watch
+// progress, favorites and watchlist outside Postgres (the SQLite backend), and
+// returns the reader. Signal checks then read the store instead of the
+// Postgres tables.
+func (s *SignalReader) WithUserStoreOutsidePostgres(outside bool) *SignalReader {
+	if s != nil {
+		s.storeOutsidePostgres = outside
+	}
+	return s
+}
+
+func (s *SignalReader) storeForUser(ctx context.Context, userID int) (userstore.UserStore, bool, error) {
+	if s == nil || s.storeProvider == nil {
+		return nil, false, nil
+	}
+
+	store, err := s.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return nil, false, fmt.Errorf("open user store for user %d: %w", userID, err)
+	}
+	if store == nil {
+		return nil, false, nil
+	}
+	return store, true, nil
+}
+
+// storeIsSeparate reports whether the profile signals the user store holds
+// live outside the Postgres tables.
+func (s *SignalReader) storeIsSeparate() bool {
+	return s != nil && s.storeProvider != nil && s.storeOutsidePostgres
+}
+
+// HasSignals reports whether the profile has anything a taste profile is
+// built from: a rating, favorite, watchlist entry, or watch or reading
+// progress. It checks existence only, so it stays cheap on every read.
+func (s *SignalReader) HasSignals(ctx context.Context, userID int, profileID string) (bool, error) {
+	separate := s.storeIsSeparate()
+	found, err := s.repo.HasSignalRows(ctx, userID, profileID, !separate)
+	if err != nil || found || !separate {
+		return found, err
+	}
+	store, ok, err := s.storeForUser(ctx, userID)
+	if err != nil || !ok {
+		return false, err
+	}
+	favorites, err := store.ListFavorites(ctx, profileID, 1, 0)
+	if err != nil {
+		return false, fmt.Errorf("list favorites from store: %w", err)
+	}
+	if len(favorites) > 0 {
+		return true, nil
+	}
+	watchlist, err := store.ListWatchlist(ctx, profileID, 1, 0)
+	if err != nil {
+		return false, fmt.Errorf("list watchlist from store: %w", err)
+	}
+	if len(watchlist) > 0 {
+		return true, nil
+	}
+	progress, err := store.ListProgress(ctx, profileID, "all", 1, 0)
+	if err != nil {
+		return false, fmt.Errorf("list progress from store: %w", err)
+	}
+	return len(progress) > 0, nil
+}
+
+// watchedSetMemoKey keys the context value WithWatchedSetMemo installs.
+type watchedSetMemoKey struct{}
+
+// watchedSetMemo holds the watched sets read under one context, by account
+// and profile.
+type watchedSetMemo struct {
+	mu   sync.Mutex
+	sets map[watchedSetMemoProfile]map[string]struct{}
+}
+
+type watchedSetMemoProfile struct {
+	userID    int
+	profileID string
+}
+
+// WithWatchedSetMemo returns ctx carrying a memo for WatchedItemIDSet: under
+// it, a profile's watched set is read once however many SignalReaders ask,
+// so one request that filters rows and then blends airings reads it once.
+// A ctx that already carries a memo is returned as it is, so the rows of one
+// Home render share the memo it installed. A set read through the memo is
+// shared and must not be modified.
+func WithWatchedSetMemo(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(watchedSetMemoKey{}).(*watchedSetMemo); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, watchedSetMemoKey{}, &watchedSetMemo{sets: map[watchedSetMemoProfile]map[string]struct{}{}})
+}
+
+// WatchedItemIDSet returns the canonical IDs of the titles the profile has
+// watched: progress completed or at least half way, episodes counting for
+// their series, plus finished ebooks. Under WithWatchedSetMemo it reuses the
+// set read earlier for the profile.
+func (s *SignalReader) WatchedItemIDSet(ctx context.Context, userID int, profileID string) (map[string]struct{}, error) {
+	memo, _ := ctx.Value(watchedSetMemoKey{}).(*watchedSetMemo)
+	if memo == nil {
+		return s.readWatchedItemIDSet(ctx, userID, profileID)
+	}
+	key := watchedSetMemoProfile{userID, profileID}
+	memo.mu.Lock()
+	defer memo.mu.Unlock()
+	if set, ok := memo.sets[key]; ok {
+		return set, nil
+	}
+	set, err := s.readWatchedItemIDSet(ctx, userID, profileID)
+	if err != nil {
+		return nil, err
+	}
+	memo.sets[key] = set
+	return set, nil
+}
+
+// readWatchedItemIDSet reads the watched set with one query when the store
+// keeps progress in the Postgres tables, and walks the store page by page
+// only when it lives outside them. On Postgres the walk is quadratic: no
+// index serves ListProgressPage's date_trunc keyset, so every page sorts the
+// profile's whole history again.
+func (s *SignalReader) readWatchedItemIDSet(ctx context.Context, userID int, profileID string) (map[string]struct{}, error) {
+	if !s.storeIsSeparate() {
+		return s.repo.GetWatchedItemIDSet(ctx, userID, profileID)
+	}
+	store, ok, err := s.storeForUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return s.repo.GetWatchedItemIDSet(ctx, userID, profileID)
+	}
+
+	rawIDs := make([]string, 0, signalPageSize)
+	if err := pageProgress(ctx, store, profileID, "all", func(progress []userstore.WatchProgress) error {
+		for _, wp := range progress {
+			if wp.Completed || watchedProgressThresholdMet(wp.PositionSeconds, wp.DurationSeconds) {
+				rawIDs = append(rawIDs, wp.MediaItemID)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	ebookProgress, err := s.repo.GetEbookReaderProgressForUser(ctx, userID, profileID)
+	if err != nil {
+		return nil, err
+	}
+	for _, wp := range ebookProgress {
+		if wp.Completed || watchedProgressThresholdMet(wp.PositionSeconds, wp.DurationSeconds) {
+			rawIDs = append(rawIDs, wp.MediaItemID)
+		}
+	}
+
+	return s.repo.ResolveCanonicalItemIDSet(ctx, rawIDs)
+}
+
+// RecommendationExclusionSet returns the canonical IDs the profile's
+// recommendations leave out: the watched set, the profile's favorites, which
+// include its taste-seed picks, and the titles it marked Not interested. A
+// favorited episode excludes its series, as a watched one does. Watchlist
+// titles stay recommendable.
+func (s *SignalReader) RecommendationExclusionSet(ctx context.Context, userID int, profileID string) (map[string]struct{}, error) {
+	excluded, err := s.WatchedItemIDSet(ctx, userID, profileID)
+	if err != nil {
+		return nil, err
+	}
+	favoriteIDs, err := s.favoriteItemIDs(ctx, userID, profileID)
+	if err != nil {
+		return nil, err
+	}
+	favorites, err := s.repo.ResolveCanonicalItemIDSet(ctx, favoriteIDs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve favorite item IDs: %w", err)
+	}
+	marks, err := s.NotInterestedMarks(ctx, userID, profileID)
+	if err != nil {
+		return nil, err
+	}
+	merged := make(map[string]struct{}, len(excluded)+len(favorites)+len(marks))
+	for id := range excluded {
+		merged[id] = struct{}{}
+	}
+	for id := range favorites {
+		merged[id] = struct{}{}
+	}
+	// Marks are kept to movies and series, already canonical.
+	for _, mark := range marks {
+		merged[mark.MediaItemID] = struct{}{}
+	}
+	return merged, nil
+}
+
+// NotInterestedMark is a movie or series the profile marked Not interested,
+// and when.
+type NotInterestedMark struct {
+	MediaItemID string
+	MarkedAt    time.Time
+}
+
+// NotInterestedMarks lists every title the profile marked Not interested,
+// newest first.
+func (s *SignalReader) NotInterestedMarks(ctx context.Context, userID int, profileID string) ([]NotInterestedMark, error) {
+	store, ok, err := s.storeForUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return s.repo.GetNotInterestedMarks(ctx, userID, profileID)
+	}
+
+	var marks []NotInterestedMark
+	var after *userstore.ListKey
+	for {
+		page, err := store.ListNotInterestedPage(ctx, profileID, after, signalPageSize)
+		if err != nil {
+			return nil, fmt.Errorf("list not interested marks from store: %w", err)
+		}
+		for _, e := range page {
+			marks = append(marks, NotInterestedMark{MediaItemID: e.MediaItemID, MarkedAt: parseSignalTime(e.AddedAt, time.Time{})})
+		}
+		if len(page) < signalPageSize {
+			return marks, nil
+		}
+		last := page[len(page)-1]
+		after = &userstore.ListKey{AddedAt: last.AddedAt, MediaItemID: last.MediaItemID}
+	}
+}
+
+// ratedItemLister lists every rating of a profile. *catalog.RatingsRepo
+// implements it.
+type ratedItemLister interface {
+	ListAll(ctx context.Context, userID int, profileID string) ([]catalog.UserRating, error)
+}
+
+// BuildExclusionSet returns the canonical IDs the rows built for the profile
+// leave out: RecommendationExclusionSet, every title the profile rated, as
+// SimilarUsersLiked leaves out, and every title it abandoned by now (see
+// AbandonedItemIDs). A title the profile already judged is not news to it,
+// and one it rated well would otherwise lead its own row, being nearest the
+// taste vector it weighs most in. With no ratings lister rated titles stay.
+func (s *SignalReader) BuildExclusionSet(ctx context.Context, ratings ratedItemLister, userID int, profileID string, now time.Time) (map[string]struct{}, error) {
+	excluded, err := s.RecommendationExclusionSet(ctx, userID, profileID)
+	if err != nil {
+		return nil, err
+	}
+	abandoned, err := s.AbandonedItemIDs(ctx, userID, profileID, now)
+	if err != nil {
+		return nil, fmt.Errorf("read abandoned titles: %w", err)
+	}
+	maps.Copy(excluded, abandoned)
+	if ratings == nil {
+		return excluded, nil
+	}
+	rated, err := ratings.ListAll(ctx, userID, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("list rated titles: %w", err)
+	}
+	ratedIDs := make([]string, len(rated))
+	for i, rating := range rated {
+		ratedIDs[i] = rating.MediaItemID
+	}
+	canonical, err := s.canonicalRatedItemIDs(ctx, ratedIDs)
+	if err != nil {
+		return nil, err
+	}
+	maps.Copy(excluded, canonical)
+	return excluded, nil
+}
+
+// canonicalRatedItemIDs resolves the IDs of rated titles to the canonical IDs
+// rows hold: a rated episode stands for its series, as a watched one does.
+func (s *SignalReader) canonicalRatedItemIDs(ctx context.Context, ratedIDs []string) (map[string]struct{}, error) {
+	canonical, err := s.repo.ResolveCanonicalItemIDSet(ctx, ratedIDs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve rated item IDs: %w", err)
+	}
+	return canonical, nil
+}
+
+// AbandonedItemIDs returns the canonical IDs of the titles the profile
+// abandoned by now: progress below lowProgressThreshold left untouched for
+// abandonedProgressAge, which its taste profile counts as a dislike (see
+// implicitWatchWeight). An abandoned episode stands for its series, as a
+// watched one does.
+func (s *SignalReader) AbandonedItemIDs(ctx context.Context, userID int, profileID string, now time.Time) (map[string]struct{}, error) {
+	progress, err := s.WatchProgressForUser(ctx, userID, profileID)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, wp := range progress {
+		if weight, ok := implicitWatchWeight(wp, now); ok && weight == WeightWatchLow {
+			ids = append(ids, wp.MediaItemID)
+		}
+	}
+	if len(ids) == 0 {
+		return map[string]struct{}{}, nil
+	}
+	return s.repo.ResolveCanonicalItemIDSet(ctx, ids)
+}
+
+// favoriteItemIDs lists every content ID the profile has favorited.
+func (s *SignalReader) favoriteItemIDs(ctx context.Context, userID int, profileID string) ([]string, error) {
+	store, ok, err := s.storeForUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return s.repo.GetFavoriteItemIDs(ctx, userID, profileID)
+	}
+
+	var ids []string
+	var after *userstore.ListKey
+	for {
+		page, err := store.ListFavoritesPage(ctx, profileID, after, signalPageSize)
+		if err != nil {
+			return nil, fmt.Errorf("list favorites from store: %w", err)
+		}
+		for _, f := range page {
+			ids = append(ids, f.MediaItemID)
+		}
+		if len(page) < signalPageSize {
+			return ids, nil
+		}
+		last := page[len(page)-1]
+		after = &userstore.ListKey{AddedAt: last.AddedAt, MediaItemID: last.MediaItemID}
+	}
+}
+
+// WatchProgressForUser returns every progress row of the profile, with its
+// ebook reading progress when it has a user store. When the store keeps
+// progress in the Postgres tables the rows are one query, plus one for the
+// ebooks; only a store outside them is walked page by page, since on
+// Postgres the walk is quadratic (see readWatchedItemIDSet).
+func (s *SignalReader) WatchProgressForUser(ctx context.Context, userID int, profileID string) ([]WatchProgressRow, error) {
+	store, ok, err := s.storeForUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return s.repo.GetWatchProgressForUser(ctx, userID, profileID)
+	}
+	if !s.storeIsSeparate() {
+		rows, err := s.repo.GetWatchProgressForUser(ctx, userID, profileID)
+		if err != nil {
+			return nil, err
+		}
+		// The store reports whole seconds; cut the column's microseconds the
+		// same way, so the rows decay and age exactly as the walk's did.
+		for i := range rows {
+			rows[i].UpdatedAt = rows[i].UpdatedAt.UTC().Truncate(time.Second)
+		}
+		ebookProgress, err := s.repo.GetEbookReaderProgressForUser(ctx, userID, profileID)
+		if err != nil {
+			return nil, err
+		}
+		return append(rows, ebookProgress...), nil
+	}
+
+	rows := make([]WatchProgressRow, 0, signalPageSize)
+	if err := pageProgress(ctx, store, profileID, "all", func(progress []userstore.WatchProgress) error {
+		for _, wp := range progress {
+			rows = append(rows, WatchProgressRow{
+				MediaItemID:     wp.MediaItemID,
+				PositionSeconds: wp.PositionSeconds,
+				DurationSeconds: wp.DurationSeconds,
+				Completed:       wp.Completed,
+				UpdatedAt:       parseSignalTime(wp.UpdatedAt, time.Time{}),
+			})
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	ebookProgress, err := s.repo.GetEbookReaderProgressForUser(ctx, userID, profileID)
+	if err != nil {
+		return nil, err
+	}
+	rows = append(rows, ebookProgress...)
+
+	return rows, nil
+}
+
+// RecentCompletedItemIDs returns the canonical IDs of the profile's most
+// recently completed titles that are still in the catalog and of
+// recommendableMediaTypes, newest first. Completions of deleted items and of
+// other types, such as a finished audiobook, are skipped, so they never
+// become anchors.
+//
+// When the store keeps progress in the Postgres tables this is one query,
+// as for readWatchedItemIDSet: walking the store there re-sorts the whole
+// history for every page, and a profile whose latest completions are many
+// episodes of few series reads every page before it finds limit titles.
+// Every caller takes the same path, so the reads and the worker choose
+// anchors from the same list.
+func (s *SignalReader) RecentCompletedItemIDs(ctx context.Context, userID int, profileID string, limit int) ([]string, error) {
+	if limit <= 0 {
+		return []string{}, nil
+	}
+	if !s.storeIsSeparate() {
+		return s.repo.GetRecentCompletedItemIDs(ctx, userID, profileID, limit)
+	}
+
+	store, ok, err := s.storeForUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return s.repo.GetRecentCompletedItemIDs(ctx, userID, profileID, limit)
+	}
+
+	candidates := make([]WatchProgressRow, 0, limit)
+	ebookProgress, err := s.repo.GetEbookReaderProgressForUser(ctx, userID, profileID)
+	if err != nil {
+		return nil, err
+	}
+	for _, wp := range ebookProgress {
+		if wp.Completed {
+			candidates = append(candidates, wp)
+		}
+	}
+	candidates, err = liveCompletedRows(ctx, s.repo, candidates)
+	if err != nil {
+		return nil, fmt.Errorf("resolve recent completed item IDs: %w", err)
+	}
+	candidates = recentDistinctCompletedRows(candidates, limit)
+
+	var after *userstore.ProgressKey
+	for {
+		progress, err := store.ListProgressPage(ctx, profileID, "completed", after, signalPageSize)
+		if err != nil {
+			return nil, fmt.Errorf("list completed progress from store: %w", err)
+		}
+
+		page := make([]WatchProgressRow, 0, len(progress))
+		oldestPageTime := time.Time{}
+		for _, wp := range progress {
+			if !wp.Completed {
+				continue
+			}
+			updatedAt := parseSignalTime(wp.UpdatedAt, time.Time{})
+			page = append(page, WatchProgressRow{
+				MediaItemID: wp.MediaItemID,
+				Completed:   true,
+				UpdatedAt:   updatedAt,
+			})
+			if oldestPageTime.IsZero() || updatedAt.Before(oldestPageTime) {
+				oldestPageTime = updatedAt
+			}
+		}
+		page, err = liveCompletedRows(ctx, s.repo, page)
+		if err != nil {
+			return nil, fmt.Errorf("resolve recent completed item IDs: %w", err)
+		}
+		candidates = recentDistinctCompletedRows(append(candidates, page...), limit)
+
+		if len(progress) < signalPageSize {
+			break
+		}
+		last := progress[len(progress)-1]
+		after = &userstore.ProgressKey{UpdatedAt: last.UpdatedAt, MediaItemID: last.MediaItemID}
+		// Read every page tied at the cutoff: a later leaf can resolve to a
+		// canonical ID that sorts ahead of the current last anchor.
+		if len(candidates) == limit && !oldestPageTime.IsZero() &&
+			oldestPageTime.Before(candidates[len(candidates)-1].UpdatedAt) {
+			break
+		}
+	}
+
+	ids := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		ids = append(ids, candidate.MediaItemID)
+	}
+	return ids, nil
+}
+
+// Because You Watched anchors on the profile's latest completions.
+const (
+	// BecauseYouWatchedAnchors is how many anchors a profile's Because You
+	// Watched rows are read for, and how many each library gets built.
+	BecauseYouWatchedAnchors = 3
+	// recentAnchorLimit is how many of the latest completions the anchors
+	// of a read that limits no library are chosen from, so disliked ones can
+	// be passed over.
+	recentAnchorLimit = 10
+	// anchorCandidateLimit is how many of the latest completions a read
+	// limited to some libraries, and the worker, choose anchors from, so a
+	// library keeps anchors while the profile watches another library.
+	anchorCandidateLimit = 50
+)
+
+// itemRatingReader reads a profile's ratings (scores, 1 to 10) of the given
+// items, keyed by item. *catalog.RatingsRepo implements it.
+type itemRatingReader interface {
+	ListForItems(ctx context.Context, userID int, profileID string, itemIDs []string) (map[string]int, error)
+}
+
+// anchorItemIDs returns up to n Because You Watched anchors for the profile:
+// the first n of its anchorCandidates among the latest recentAnchorLimit
+// completions. They are the first n of the worker's deeper candidates too.
+func anchorItemIDs(ctx context.Context, signals *SignalReader, ratings itemRatingReader, userID int, profileID string, n int) ([]string, error) {
+	if n <= 0 {
+		return []string{}, nil
+	}
+	candidates, err := anchorCandidates(ctx, signals, ratings, userID, profileID, max(n, recentAnchorLimit))
+	if err != nil {
+		return nil, err
+	}
+	return candidates[:min(n, len(candidates))], nil
+}
+
+// anchorCandidates returns the titles Because You Watched rows may anchor on:
+// the profile's most recently completed titles of recommendableMediaTypes
+// still in the catalog, newest first, of the latest limit, leaving out those
+// it marked Not interested or rated DislikedScoreMax or lower. A row headed
+// "Because You Watched" a title the profile disliked contradicts its taste.
+// With no ratings reader rated titles stay. The
+// worker, the Reader and Watch Tonight all choose anchors from these, since a
+// read can only use an anchor whose row the worker cached.
+func anchorCandidates(ctx context.Context, signals *SignalReader, ratings itemRatingReader, userID int, profileID string, limit int) ([]string, error) {
+	recent, err := signals.RecentCompletedItemIDs(ctx, userID, profileID, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(recent) > 0 {
+		marks, err := signals.NotInterestedMarks(ctx, userID, profileID)
+		if err != nil {
+			return nil, fmt.Errorf("read not interested marks: %w", err)
+		}
+		marked := make(map[string]struct{}, len(marks))
+		for _, m := range marks {
+			marked[m.MediaItemID] = struct{}{}
+		}
+		recent = slices.DeleteFunc(slices.Clone(recent), func(id string) bool {
+			_, ok := marked[id]
+			return ok
+		})
+	}
+	if ratings != nil && len(recent) > 0 {
+		rated, err := ratings.ListForItems(ctx, userID, profileID, recent)
+		if err != nil {
+			return nil, fmt.Errorf("read ratings of recent completions: %w", err)
+		}
+		liked := make([]string, 0, len(recent))
+		for _, id := range recent {
+			if rating, ok := rated[id]; ok && rating <= DislikedScoreMax {
+				continue
+			}
+			liked = append(liked, id)
+		}
+		recent = liked
+	}
+	return recent, nil
+}
+
+// libraryAnchorItemIDs returns the candidates, newest first as given, that
+// are among the first n overall or among the first n of a library they are
+// in (libraries maps a candidate to its libraries). A candidate in one of
+// disabled is hidden from every read, so it takes no library's place. The
+// worker builds rows for these, so a section scoped to any set of libraries
+// finds a row for each of its first n anchors: a title among the first n in a
+// scope is among the first n of its own library in that scope.
+func libraryAnchorItemIDs(candidates []string, libraries map[string][]int, disabled []int, n int) []string {
+	perLibrary := make(map[int]int)
+	anchors := make([]string, 0, min(n, len(candidates)))
+	for i, id := range candidates {
+		keep := i < n
+		if slices.ContainsFunc(libraries[id], func(library int) bool { return slices.Contains(disabled, library) }) {
+			if keep {
+				anchors = append(anchors, id)
+			}
+			continue
+		}
+		for _, library := range libraries[id] {
+			if perLibrary[library] < n {
+				keep = true
+			}
+			perLibrary[library]++
+		}
+		if keep {
+			anchors = append(anchors, id)
+		}
+	}
+	return anchors
+}
+
+func canonicalizeCompletedRows(ctx context.Context, repo signalRepo, rows []WatchProgressRow) error {
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.MediaItemID)
+	}
+	resolved, err := repo.ResolveCanonicalItemIDs(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for i := range rows {
+		if canonicalID := resolved[rows[i].MediaItemID]; canonicalID != "" {
+			rows[i].MediaItemID = canonicalID
+		}
+	}
+	return nil
+}
+
+// liveCompletedRows canonicalizes rows and drops those whose canonical ID is
+// no longer in the catalog (a deleted movie, or an episode whose series was
+// deleted and so no longer resolves to it) or is not of
+// recommendableMediaTypes.
+func liveCompletedRows(ctx context.Context, repo signalRepo, rows []WatchProgressRow) ([]WatchProgressRow, error) {
+	if len(rows) == 0 {
+		return rows, nil
+	}
+	if err := canonicalizeCompletedRows(ctx, repo, rows); err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(rows))
+	for i, row := range rows {
+		ids[i] = row.MediaItemID
+	}
+	existing, err := repo.RecommendableItemIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	live := rows[:0]
+	for _, row := range rows {
+		if _, ok := existing[row.MediaItemID]; ok {
+			live = append(live, row)
+		}
+	}
+	return live, nil
+}
+
+func recentDistinctCompletedRows(rows []WatchProgressRow, limit int) []WatchProgressRow {
+	sort.SliceStable(rows, func(i, j int) bool {
+		if !rows[i].UpdatedAt.Equal(rows[j].UpdatedAt) {
+			return rows[i].UpdatedAt.After(rows[j].UpdatedAt)
+		}
+		return rows[i].MediaItemID < rows[j].MediaItemID
+	})
+	seen := make(map[string]struct{}, len(rows))
+	result := make([]WatchProgressRow, 0, min(limit, len(rows)))
+	for _, row := range rows {
+		if _, ok := seen[row.MediaItemID]; ok {
+			continue
+		}
+		seen[row.MediaItemID] = struct{}{}
+		result = append(result, row)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result
+}
+
+// RewatchCounts returns the items the profile completed at least twice, in
+// media item ID order, counting every visible completed play in its history.
+// When the history lives in the Postgres tables, GetRewatchCounts groups and
+// filters the plays in SQL; a separate store groups them in one read and the
+// single plays are dropped here.
+func (s *SignalReader) RewatchCounts(ctx context.Context, userID int, profileID string) ([]RewatchCount, error) {
+	if !s.storeIsSeparate() {
+		return s.repo.GetRewatchCounts(ctx, userID, profileID)
+	}
+
+	store, ok, err := s.storeForUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return s.repo.GetRewatchCounts(ctx, userID, profileID)
+	}
+
+	items, err := store.ListCompletedHistoryItems(ctx, userstore.CompletedHistoryItemQuery{ProfileID: profileID})
+	if err != nil {
+		return nil, fmt.Errorf("list completed history items from store: %w", err)
+	}
+	var result []RewatchCount
+	for _, item := range items {
+		if item.PlayCount < 2 {
+			continue
+		}
+		result = append(result, RewatchCount{
+			MediaItemID:   item.MediaItemID,
+			Count:         item.PlayCount,
+			LastWatchedAt: parseSignalTime(item.WatchedAt, time.Time{}),
+		})
+	}
+	return result, nil
+}
+
+// pageProgress visits the profile's progress rows with the given status a
+// page at a time, newest first. It pages by keyset, so no row is read twice.
+// A row updated while the walk runs moves ahead of the cursor and is not
+// visited; the change that updated it queues a refresh of its own.
+func pageProgress(ctx context.Context, store userstore.UserStore, profileID, status string, visit func([]userstore.WatchProgress) error) error {
+	var after *userstore.ProgressKey
+	for {
+		progress, err := store.ListProgressPage(ctx, profileID, status, after, signalPageSize)
+		if err != nil {
+			return fmt.Errorf("list progress from store: %w", err)
+		}
+		if err := visit(progress); err != nil {
+			return err
+		}
+		if len(progress) < signalPageSize {
+			return nil
+		}
+		last := progress[len(progress)-1]
+		after = &userstore.ProgressKey{UpdatedAt: last.UpdatedAt, MediaItemID: last.MediaItemID}
+	}
+}
+
+func watchedProgressThresholdMet(positionSeconds, durationSeconds float64) bool {
+	return durationSeconds > 0 && positionSeconds/durationSeconds >= 0.5
+}

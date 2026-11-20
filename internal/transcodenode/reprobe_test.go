@@ -1,0 +1,208 @@
+package transcodenode
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
+)
+
+func postReprobe(t *testing.T, server *Server) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/admin/reprobe-capabilities", nil)
+	nodeauthtest.Sign(t, request, testNodeKey)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	return recorder
+}
+
+// An incomplete probe is not evidence the hardware changed, so a degraded
+// re-probe must answer 503 and leave the previously published hash alone —
+// publishing a partial report would announce a hardware change that did not
+// happen and make the API store it.
+func TestReprobeCapabilitiesKeepsHashOnProbeFailure(t *testing.T) {
+	server, _ := newCapabilityTestServer(t)
+	server.storeCapabilityHash("sha256:previous")
+
+	if got := postReprobe(t, server).Code; got != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for a probe that cannot complete", got)
+	}
+	if got := server.storedCapabilityHash(); got != "sha256:previous" {
+		t.Fatalf("stored hash = %q, want the previous hash kept", got)
+	}
+}
+
+// Every hardware probe ends in a real smoke encode that opens an encoder
+// session. On a card at its concurrent session cap that encode fails with an
+// error indistinguishable from a missing device, and the verdict would be
+// published as verified:false — a hardware regression the server then persists
+// and warns on, for a GPU that is fine and is at that moment encoding. So a busy
+// node refuses, and keeps the report it has.
+func TestReprobeCapabilitiesRefusesWhileTranscoding(t *testing.T) {
+	server := newTestServer(t)
+	server.storeCapabilityHash("sha256:previous")
+	server.activeJobs.Store(2)
+	t.Cleanup(func() { server.activeJobs.Store(0) })
+
+	recorder := postReprobe(t, server)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 while the node is transcoding", recorder.Code)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "idle") {
+		t.Fatalf("body = %q, want it to tell the operator when to retry", body)
+	}
+	if got := server.storedCapabilityHash(); got != "sha256:previous" {
+		t.Fatalf("stored hash = %q, want the previous report untouched", got)
+	}
+}
+
+// The re-probe deliberately does not join a capability build already in flight
+// — bumping the invalidation generation is what makes it honest — so without a
+// lock the scheduled snapshot's ffmpeg matrix and the operator's would run at
+// once on the same GPU, which is the collision the 409 exists to prevent.
+//
+// Ordering is asserted from receipts rather than a timeout: the builder reports
+// when it has been admitted, and records on the far side of the lock whether
+// this test had already released it. A sleep here could only ever say "it had
+// not finished yet", which is also true when it never started.
+func TestCapabilityBuildsAreSerialized(t *testing.T) {
+	server, _ := newCapabilityTestServer(t)
+
+	admitted := make(chan struct{}, 1)
+	server.capabilityBuildAdmitted = func() { admitted <- struct{}{} }
+
+	var released, acquiredAfterRelease atomic.Bool
+	server.capabilityBuildMu.Lock()
+
+	building := make(chan struct{})
+	go func() {
+		defer close(building)
+		// Any builder: the scheduled snapshot takes the same lock the endpoint
+		// and the re-probe do.
+		server.refreshCapabilitySnapshot(context.Background())
+		acquiredAfterRelease.Store(released.Load())
+	}()
+
+	select {
+	case <-admitted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the capability build was never admitted")
+	}
+
+	released.Store(true)
+	server.capabilityBuildMu.Unlock()
+	select {
+	case <-building:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the capability build never ran after the lock was released")
+	}
+	if !acquiredAfterRelease.Load() {
+		t.Fatal("a capability build ran while another held the build lock")
+	}
+}
+
+// An ordinary snapshot runs ffmpeg on the GPU whenever the probe caches are
+// cold, so it registers as GPU work and a manual re-probe cannot claim an
+// apparently idle encoder beside it.
+func TestCapabilitySnapshotRegistersAsGPUWork(t *testing.T) {
+	server, _ := newCapabilityTestServer(t)
+
+	// The builder reports the moment it holds the work slot, which is the state
+	// under test — polling the gate on a timer could observe it before or after.
+	admitted := make(chan struct{}, 1)
+	server.capabilityBuildAdmitted = func() { admitted <- struct{}{} }
+
+	server.capabilityBuildMu.Lock()
+	building := make(chan struct{})
+	go func() {
+		defer close(building)
+		server.refreshCapabilitySnapshot(context.Background())
+	}()
+
+	select {
+	case <-admitted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the capability snapshot was never admitted as GPU work")
+	}
+	if _, ok := server.gpu.beginReprobe(otherWork(0)); ok {
+		server.gpu.endReprobe()
+		t.Fatal("a re-probe was admitted while a capability snapshot held the encoder")
+	}
+
+	server.capabilityBuildMu.Unlock()
+	select {
+	case <-building:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the capability snapshot never completed")
+	}
+}
+
+// The other direction: a snapshot refuses rather than running its matrix beside
+// a re-probe's, and the previously published hash stands.
+func TestCapabilitySnapshotRefusedWhileReprobing(t *testing.T) {
+	server := newTestServer(t)
+	server.storeCapabilityHash("sha256:previous")
+	if _, ok := server.gpu.beginReprobe(otherWork(0)); !ok {
+		t.Fatal("re-probe refused on an idle node")
+	}
+	t.Cleanup(server.gpu.endReprobe)
+
+	if _, err := server.buildCapabilitySnapshot(context.Background()); !errors.Is(err, ErrCapabilityBuildBusy) {
+		t.Fatalf("err = %v, want ErrCapabilityBuildBusy", err)
+	}
+	if got := server.storedCapabilityHash(); got != "sha256:previous" {
+		t.Fatalf("stored hash = %q, want the previous report untouched", got)
+	}
+}
+
+// Every teardown path drops activeJobs before closing the session, so a stop is
+// reflected immediately — but Close waits for ffmpeg to exit, so the encoder
+// keeps its GPU session for the whole call. Without the gate holding it, that
+// live encoder is counted by neither activeJobs nor the gate, and a re-probe
+// landing in the gap smoke-encodes beside it and publishes the false hardware
+// failure the gate exists to prevent.
+func TestReprobeCapabilitiesRefusedWhileASessionIsStillClosing(t *testing.T) {
+	server := newTestServer(t)
+	server.storeCapabilityHash("sha256:previous")
+	server.activeJobs.Store(1)
+
+	var (
+		jobsDuringClose int32
+		reprobeAdmitted bool
+		busyDuringClose int
+	)
+	// Observed from inside the teardown, which is the only instant that matters.
+	err := server.retireGPUSession(func() error {
+		jobsDuringClose = server.activeJobs.Load()
+		busyDuringClose, reprobeAdmitted = server.gpu.beginReprobe(otherWork(int(jobsDuringClose)))
+		if reprobeAdmitted {
+			server.gpu.endReprobe()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retireGPUSession: %v", err)
+	}
+
+	if jobsDuringClose != 0 {
+		t.Fatalf("active jobs = %d during Close, want the 0 that made this a gap", jobsDuringClose)
+	}
+	if reprobeAdmitted {
+		t.Fatal("re-probe admitted while a session was still closing its encoder")
+	}
+	if busyDuringClose != 1 {
+		t.Fatalf("busy = %d, want the closing session counted as GPU work", busyDuringClose)
+	}
+
+	// The hold is released with the teardown, so an idle node re-probes again.
+	if _, ok := server.gpu.beginReprobe(otherWork(int(server.activeJobs.Load()))); !ok {
+		t.Fatal("re-probe refused after the teardown completed")
+	}
+	server.gpu.endReprobe()
+}

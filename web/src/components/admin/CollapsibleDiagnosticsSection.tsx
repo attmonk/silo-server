@@ -1,0 +1,106 @@
+import type { ReactNode } from "react";
+import { ChevronDown } from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
+import { useT } from "@/i18n";
+import { cn } from "@/lib/utils";
+
+// Glyphs that stand in for the count; their meaning is in sr-only text.
+const NO_COUNT = "\u2014";
+const ERROR_MARK = "!";
+
+/**
+ * CollapsibleDiagnosticsSection renders an expandable administrative diagnostics panel
+ * displaying a severity icon, title, description, and status count, error indicator, or a
+ * placeholder while the count is not loaded yet.
+ */
+export function CollapsibleDiagnosticsSection({
+  title,
+  description,
+  count,
+  isError,
+  icon,
+  iconClassName,
+  open,
+  onOpenChange,
+  children,
+}: {
+  title: string;
+  description: string;
+  /** Undefined until the count has loaded, so an unknown count never reads as 0. */
+  count: number | undefined;
+  /** The count failed to load; takes precedence over an unknown count. */
+  isError?: boolean;
+  icon: ReactNode;
+  iconClassName?: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  children: ReactNode;
+}) {
+  const t = useT();
+  const countLabel =
+    count === undefined ? (
+      <>
+        <span aria-hidden="true">{NO_COUNT}</span>
+        <span className="sr-only">{t("web.admin.common.diagnosticsSection.countNotLoaded")}</span>
+      </>
+    ) : (
+      count
+    );
+  return (
+    <section className="surface-panel-subtle overflow-hidden rounded-2xl">
+      <button
+        type="button"
+        className="hover:bg-surface-hover/40 flex min-h-11 w-full items-center gap-3 px-4 py-4 text-start transition-colors lg:px-5"
+        aria-expanded={open}
+        onClick={() => onOpenChange(!open)}
+      >
+        <div
+          className={cn(
+            "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+            iconClassName ?? "bg-amber-500/10",
+          )}
+        >
+          {icon}
+        </div>
+        <div className="min-w-0 flex-1 space-y-0.5">
+          <h2 className="text-sm font-semibold tracking-wide break-words">{title}</h2>
+          <p className="text-muted-foreground text-xs leading-relaxed break-words">{description}</p>
+        </div>
+        {isError ? (
+          open ? (
+            <Badge variant="destructive" className="text-[11px] tabular-nums">
+              <span className="sr-only">{t("web.admin.common.diagnosticsSection.countError")}</span>
+              <span aria-hidden="true">{ERROR_MARK}</span>
+            </Badge>
+          ) : (
+            <div className="text-destructive shrink-0 text-2xl leading-none font-bold tabular-nums">
+              <span className="sr-only">{t("web.admin.common.diagnosticsSection.countError")}</span>
+              <span aria-hidden="true">{ERROR_MARK}</span>
+            </div>
+          )
+        ) : open ? (
+          <Badge variant="secondary" className="text-[11px] tabular-nums">
+            {countLabel}
+          </Badge>
+        ) : (
+          <div
+            className={cn(
+              "shrink-0 text-2xl leading-none font-bold tabular-nums",
+              (count === undefined || count === 0) && "text-muted-foreground",
+            )}
+          >
+            {countLabel}
+          </div>
+        )}
+        <ChevronDown
+          className={cn(
+            "text-muted-foreground h-4 w-4 shrink-0 transition-transform",
+            !open && "-rotate-90 rtl:rotate-90",
+          )}
+        />
+      </button>
+      {open ? <div className="min-w-0 px-3 pb-3">{children}</div> : null}
+    </section>
+  );
+}

@@ -1,0 +1,187 @@
+import {
+  SETTING_DEFINITIONS,
+  type SettingDefinition,
+  type SettingKey,
+} from "@/lib/settingsContract";
+import { formatBitrateKbps } from "@/lib/bitrateOptions";
+import { languageOptionsFor, type SettingOption } from "@/lib/languageOptions";
+import { t } from "@/i18n";
+import { settingOptionLabel, settingUnsetLabel } from "@/lib/settingsText";
+
+/**
+ * Display helpers over the generated settings contract.
+ *
+ * Everything a settings control needs to render — label, description, control
+ * shape, option list, bounds, unit — is already in the manifest, so this module
+ * only adapts those fields to what the UI asks for. It deliberately owns no
+ * per-key knowledge: a hand-written table beside the generated one is exactly
+ * the drift the contract exists to remove, and the one that shipped before this
+ * disagreed with the server about the type and range of several keys.
+ */
+
+export type SettingDisplay = SettingDefinition;
+
+/** Control shapes the admin/settings widgets can render. */
+export type SettingControlKind = "switch" | "select" | "slider" | "stepper" | "panel" | "text";
+
+/** The generated definition for a key, or null when this build has no such key. */
+export function getSettingDefinition(key: string): SettingDisplay | null {
+  return SETTING_DEFINITIONS[key as SettingKey] ?? null;
+}
+
+/**
+ * The control to render for a definition.
+ *
+ * A definition with no recommended_control falls back to its value type, which
+ * is what keeps a newly added key renderable without a manifest edit here.
+ */
+export function controlKindFor(definition: SettingDisplay): SettingControlKind {
+  switch (definition.control) {
+    case "switch":
+    case "select":
+    case "slider":
+    case "stepper":
+    case "panel":
+    case "text":
+      return definition.control;
+  }
+  if (definition.type === "boolean") return "switch";
+  if (definition.type === "enum" || definition.type === "language_tag") return "select";
+  if (definition.type === "integer" || definition.type === "number") return "slider";
+  return "text";
+}
+
+/** Whether a definition is edited through a bespoke panel or raw JSON. */
+export function isStructuredSetting(definition: SettingDisplay | null): boolean {
+  if (!definition) return true;
+  return definition.type === "object" || controlKindFor(definition) === "panel";
+}
+
+/**
+ * The option list for a select, in manifest order.
+ *
+ * Enum members come straight from the contract. Open language tags use the
+ * definition's generated advisory option set (the app language uses the
+ * languages this client ships), plus `currentValue` when the set
+ * lacks it, so a stored tag such as `pt-PT` stays selected instead of blank.
+ * A nullable definition gains a leading, context-specific unset entry so a
+ * control can express clearing it. Deprecated members stay valid stored values
+ * but are not offered.
+ */
+export function optionsFor(definition: SettingDisplay, currentValue?: string): SettingOption[] {
+  if (definition.type === "language_tag") {
+    return languageOptionsFor(definition.key, currentValue);
+  }
+  const members = (definition.values ?? [])
+    .filter((member) => !member.deprecated)
+    .map((member) => ({
+      value: String(member.value),
+      label: settingOptionLabel(definition, member),
+    }));
+  if (definition.nullable) {
+    return [{ value: "", label: t("web.settings.value.unset") }, ...members];
+  }
+  return members;
+}
+
+/**
+ * A stored value rendered for display, in the string form the admin surface
+ * edits. Falls back to the raw value for a key this build does not know, which
+ * is the older-client-newer-server case.
+ */
+export function formatSettingValue(key: string, value: string | null | undefined): string {
+  const definition = getSettingDefinition(key);
+  if (!definition) {
+    return value ?? t("web.settings.value.unset");
+  }
+  if (controlKindFor(definition) === "switch") {
+    return value === "true" ? t("web.settings.value.enabled") : t("web.settings.value.disabled");
+  }
+  if (definition.type === "language_tag") {
+    const match = languageOptionsFor(definition.key, value).find(
+      (option) => option.value === (value ?? ""),
+    );
+    return match?.label ?? value ?? settingUnsetLabel(definition);
+  }
+  if (definition.values?.length) {
+    const fallback = value ?? defaultValueToString(definition);
+    const match = definition.values.find((member) => String(member.value) === fallback);
+    return match
+      ? settingOptionLabel(definition, match)
+      : fallback || t("web.settings.value.unset");
+  }
+  if (definition.unit === "kbps") {
+    // A bandwidth cap reads in Mbps like its select; no value means no cap.
+    // A stored null is "No limit" even where the default is a cap.
+    const raw = value === null ? "" : value || defaultValueToString(definition);
+    const kbps = Number(raw);
+    return raw && Number.isFinite(kbps) ? formatBitrateKbps(kbps) : t("web.settings.value.noLimit");
+  }
+  if (definition.unit) {
+    return formatWithUnit(value ?? defaultValueToString(definition) ?? "0", definition.unit);
+  }
+  if (definition.type === "object") {
+    return value ? t("web.settings.value.custom") : t("web.settings.value.usingFallback");
+  }
+  return value || defaultValueToString(definition) || t("web.settings.value.unset");
+}
+
+const UNIT_MESSAGES = {
+  milliseconds: "web.settings.value.milliseconds",
+  seconds: "web.settings.value.seconds",
+  minutes: "web.settings.value.minutes",
+  episodes: "web.settings.value.episodes",
+} as const;
+
+/** "30 seconds": a whole number with the manifest's unit, in the interface language. */
+export function formatWithUnit(value: string, unit: string): string {
+  const key = UNIT_MESSAGES[unit as keyof typeof UNIT_MESSAGES];
+  const count = Number(value);
+  if (!key || value === "" || !Number.isInteger(count)) return `${value} ${unit}`;
+  return t(key, { count, value });
+}
+
+/** The definition's default in the string form the admin controls compare against. */
+export function defaultValueToString(definition: SettingDisplay): string {
+  const value = definition.defaultValue;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "boolean" || typeof value === "number") return String(value);
+  return JSON.stringify(value);
+}
+
+/**
+ * Retired keys the manifest still accepts but no client reads. `ui.theme` stays
+ * so a stale web bundle's write does not fail; Silo paints one theme, so an
+ * override on it would do nothing.
+ */
+const RETIRED_DEVICE_SETTING_KEYS = new Set<string>(["ui.theme"]);
+
+/**
+ * Every remote setting a device can override, in manifest order. The admin
+ * "show all overrides" view iterates this so an admin can create an override on
+ * any device-scoped setting, not only the ones that already have a row.
+ */
+export const ALL_DEVICE_SETTING_KEYS: SettingKey[] = (
+  Object.keys(SETTING_DEFINITIONS) as SettingKey[]
+).filter((key) => {
+  const definition = SETTING_DEFINITIONS[key];
+  return (
+    definition.persistence === "remote" &&
+    definition.scopes.includes("profile_device") &&
+    !RETIRED_DEVICE_SETTING_KEYS.has(key)
+  );
+});
+
+/** Device-setting keys understood by a connected server contract revision. */
+export function deviceSettingKeysForRevision(revision: number | undefined): SettingKey[] {
+  if (revision === undefined) return [];
+  return ALL_DEVICE_SETTING_KEYS.filter((key) => {
+    const definition = SETTING_DEFINITIONS[key];
+    const scopeIndex = definition.scopes.indexOf("profile_device");
+    return (
+      scopeIndex >= 0 &&
+      (definition.scopeIntroducedIn[scopeIndex] ?? Number.POSITIVE_INFINITY) <= revision
+    );
+  });
+}

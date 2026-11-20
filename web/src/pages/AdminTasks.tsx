@@ -1,0 +1,408 @@
+import { useEffect, useRef, useState } from "react";
+import { joinList } from "@/lib/appLocale";
+import { Link } from "react-router";
+import { useEventChannel } from "@/components/realtimeEventsContext";
+import { AlertTriangle, Loader2, Play, Square } from "lucide-react";
+import { PageHeader } from "@/components/page/PageHeader";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { TaskStatusBadge } from "@/components/admin/TaskStatusBadge";
+import {
+  useTasks,
+  useRunTask,
+  useCancelTask,
+  useTaskMetrics,
+  type MetadataRefreshMetrics,
+} from "@/hooks/queries/admin/tasks";
+import { usePageActivity } from "@/hooks/usePageActivity";
+import { cn } from "@/lib/utils";
+import type { TaskCategory, TaskInfo, TriggerConfig } from "@/api/types";
+
+import { describeTrigger } from "@/lib/taskTrigger";
+import { formatRelativeTime } from "@/lib/date";
+import { formatDateTime as formatPreferredDateTime } from "@/lib/datetime";
+import { clampTaskProgress, formatTaskProgress } from "@/lib/taskProgress";
+import { useServerText, useT, type MessageKey, type Translate } from "@/i18n";
+import { taskText } from "@/lib/taskText";
+
+const CATEGORY_ORDER: TaskCategory[] = ["library", "metadata", "system"];
+const RUN_BUTTON_MIN_VISIBLE_MS = 1_000;
+
+const CATEGORY_LABELS: Record<TaskCategory, MessageKey> = {
+  library: "web.admin.tasks.category.library",
+  metadata: "web.admin.tasks.category.metadata",
+  system: "web.admin.tasks.category.system",
+};
+
+const REFRESH_REASON_LABELS: Record<string, MessageKey> = {
+  episode_incomplete: "web.admin.tasks.refreshReason.episodeIncomplete",
+  stale_provider_id: "web.admin.tasks.refreshReason.staleProviderId",
+  provider_id_incomplete: "web.admin.tasks.refreshReason.providerIdIncomplete",
+  refresh_failure: "web.admin.tasks.refreshReason.refreshFailure",
+  core_metadata_incomplete: "web.admin.tasks.refreshReason.coreMetadataIncomplete",
+  trailers_requested: "web.admin.tasks.refreshReason.trailersRequested",
+  provider_artwork: "web.admin.tasks.refreshReason.providerArtwork",
+};
+
+function useTaskClock() {
+  const pageActivity = usePageActivity();
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!pageActivity.canApplyRealtimeUpdates) {
+      return;
+    }
+
+    setNow(Date.now());
+    const id = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, [pageActivity.canApplyRealtimeUpdates]);
+
+  return now;
+}
+
+function formatDuration(t: Translate, ms: number): string {
+  if (ms <= 0) return t("web.admin.tasks.duration.underOneMs");
+  if (ms < 1000) return t("web.admin.tasks.duration.milliseconds", { ms: ms });
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 60) {
+    return t("web.admin.tasks.duration.seconds", { seconds: totalSeconds });
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainSec = totalSeconds - minutes * 60;
+  if (minutes < 60) {
+    return t("web.admin.tasks.duration.minutesSeconds", {
+      minutes: minutes,
+      seconds: remainSec,
+    });
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainMinutes = minutes % 60;
+  return t("web.admin.tasks.duration.hoursMinutes", {
+    hours: hours,
+    minutes: remainMinutes,
+  });
+}
+
+function describeSchedule(triggers: TriggerConfig[]): string | null {
+  if (triggers.length === 0) return null;
+  return joinList(triggers.map((trigger) => describeTrigger(trigger, "short")));
+}
+
+function isOverdue(dateStr: string, now: number): boolean {
+  return new Date(dateStr).getTime() < now;
+}
+
+function formatNextRun(t: Translate, dateStr: string, now: number): string {
+  const diff = new Date(dateStr).getTime() - now;
+  if (diff < 0) return t("web.admin.tasks.nextRun.overdue");
+  const minutes = Math.floor(diff / 60_000);
+  if (minutes < 60) return t("web.admin.tasks.nextRun.inMinutes", { minutes: minutes });
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return t("web.admin.tasks.nextRun.inHours", { hours: hours });
+  const days = Math.floor(hours / 24);
+  return t("web.admin.tasks.nextRun.inDays", { days: days });
+}
+
+const EM_DASH = "—";
+
+function lastRunTime(completedAt: string | undefined): string {
+  return formatRelativeTime(completedAt, { rounding: "floor" }) ?? EM_DASH;
+}
+
+function formatDateTime(dateStr?: string | null): string {
+  if (!dateStr) return EM_DASH;
+  return formatPreferredDateTime(dateStr);
+}
+
+function refreshReasonLabel(t: Translate, reason: string): string {
+  const key = REFRESH_REASON_LABELS[reason] as MessageKey | undefined;
+  return key ? t(key) : reason;
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function RefreshMetadataSummary({ metrics }: { metrics: MetadataRefreshMetrics }) {
+  const t = useT();
+  const topReasons = metrics.reason_counts.filter((entry) => entry.count > 0);
+
+  return (
+    <div className="bg-muted/20 mt-3 rounded-xl p-3">
+      <div className="grid gap-2 text-xs sm:grid-cols-5">
+        <div>
+          <div className="text-muted-foreground">{t("web.admin.tasks.refreshMetrics.backlog")}</div>
+          <div className="text-foreground font-medium">{metrics.total}</div>
+        </div>
+        <div>
+          <div className="text-muted-foreground">{t("web.admin.tasks.refreshMetrics.due")}</div>
+          <div className="text-foreground font-medium">{metrics.due}</div>
+        </div>
+        <div>
+          <div className="text-muted-foreground">
+            {t("web.admin.tasks.refreshMetrics.processing")}
+          </div>
+          <div className="text-foreground font-medium">{metrics.leased}</div>
+        </div>
+        <div>
+          <div className="text-muted-foreground">
+            {t("web.admin.tasks.refreshMetrics.waitingSince")}
+          </div>
+          <div className="text-foreground font-medium">{formatDateTime(metrics.oldest_due_at)}</div>
+        </div>
+        <div>
+          <div className="text-muted-foreground">
+            {t("web.admin.tasks.refreshMetrics.nextClaimTimeout")}
+          </div>
+          <div className="text-foreground font-medium">
+            {formatDateTime(metrics.oldest_lease_expires_at)}
+          </div>
+        </div>
+      </div>
+
+      {topReasons.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {topReasons.map((entry) => (
+            <Badge key={entry.reason} variant="secondary">
+              {t("web.admin.tasks.refreshMetrics.reasonCount", {
+                reason: refreshReasonLabel(t, entry.reason),
+                count: entry.count,
+              })}
+            </Badge>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TaskRow({
+  task,
+  refreshMetrics,
+  now,
+}: {
+  task: TaskInfo;
+  refreshMetrics?: MetadataRefreshMetrics;
+  now: number;
+}) {
+  const t = useT();
+  const serverText = useServerText();
+  const runTask = useRunTask();
+  const cancelTask = useCancelTask();
+  const runFeedbackStartedAtRef = useRef<number | null>(null);
+  const [isRunFeedbackVisible, setIsRunFeedbackVisible] = useState(false);
+
+  const isRunning = task.state === "running" || task.state === "cancelling";
+  const isShowingRunFeedback = isRunning || isRunFeedbackVisible;
+
+  const handleRunTask = async () => {
+    runFeedbackStartedAtRef.current = Date.now();
+    setIsRunFeedbackVisible(true);
+
+    try {
+      await runTask.mutateAsync(task.key);
+    } finally {
+      const startedAt = runFeedbackStartedAtRef.current;
+      if (startedAt !== null) {
+        const remaining = RUN_BUTTON_MIN_VISIBLE_MS - (Date.now() - startedAt);
+        if (remaining > 0) {
+          await delay(remaining);
+        }
+      }
+      runFeedbackStartedAtRef.current = null;
+      setIsRunFeedbackVisible(false);
+    }
+  };
+
+  return (
+    <div className="border-border flex flex-col gap-4 border-b px-4 py-4 last:border-b-0 sm:flex-row sm:items-center">
+      <div className="min-w-0 flex-1">
+        <Link
+          to={`/admin/tasks/${task.key}`}
+          className="text-foreground hover:text-primary text-sm font-medium transition-colors"
+        >
+          {taskText(serverText, task, "name")}
+        </Link>
+
+        <div className="text-muted-foreground mt-0.5 text-xs">
+          {task.state === "idle" && (
+            <>
+              {describeSchedule(task.triggers) && <span>{describeSchedule(task.triggers)}</span>}
+              {!describeSchedule(task.triggers) && (
+                <span>
+                  {task.manual_only
+                    ? t("web.admin.tasks.row.manualOnly")
+                    : t("web.admin.tasks.row.noSchedule")}
+                </span>
+              )}
+              {task.last_execution && (
+                <span className="ms-2">
+                  {typeof task.last_execution.duration_ms === "number"
+                    ? t("web.admin.tasks.row.lastRunWithDuration", {
+                        time: lastRunTime(task.last_execution.completed_at),
+                        duration: formatDuration(t, task.last_execution.duration_ms),
+                      })
+                    : t("web.admin.tasks.row.lastRun", {
+                        time: lastRunTime(task.last_execution.completed_at),
+                      })}
+                </span>
+              )}
+              {!task.last_execution && !describeSchedule(task.triggers) && (
+                <span> {t("web.admin.tasks.row.neverRun")}</span>
+              )}
+              {task.next_run_at &&
+                (isOverdue(task.next_run_at, now) ? (
+                  <span className="text-warning ms-2 inline-flex items-center gap-1 font-medium">
+                    <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+                    {t("web.admin.tasks.row.overdue")}
+                  </span>
+                ) : (
+                  <span className="ms-2">
+                    {t("web.admin.tasks.row.next", {
+                      next: formatNextRun(t, task.next_run_at, now),
+                    })}
+                  </span>
+                ))}
+            </>
+          )}
+        </div>
+
+        {isRunning && (
+          <div className="mt-1.5 space-y-1">
+            <div className="bg-muted h-2 w-full overflow-hidden rounded-full">
+              <div
+                className={`h-full rounded-full transition-all duration-300 ${
+                  task.state === "cancelling" ? "bg-yellow-500" : "bg-primary"
+                }`}
+                style={{ width: `${Math.max(clampTaskProgress(task.progress), 2)}%` }}
+              />
+            </div>
+            <div className="text-muted-foreground flex items-center justify-between gap-3 text-xs">
+              <p className="min-w-0 truncate">
+                {task.state === "cancelling"
+                  ? t("web.admin.tasks.progress.cancelling")
+                  : t("web.admin.tasks.progress.running")}
+              </p>
+              {task.state !== "cancelling" && task.progress > 0 && (
+                <span className="shrink-0 font-medium tabular-nums">
+                  {formatTaskProgress(task.progress)}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {task.key === "refresh_metadata" && refreshMetrics && (
+          <RefreshMetadataSummary metrics={refreshMetrics} />
+        )}
+      </div>
+
+      {task.state === "idle" && task.last_execution && (
+        <TaskStatusBadge result={task.last_execution} className="self-start sm:self-center" />
+      )}
+
+      {isShowingRunFeedback ? (
+        <Button
+          variant="outline"
+          size="sm"
+          className={cn(
+            "w-full min-w-[8.25rem] justify-center sm:w-auto",
+            isRunning &&
+              task.state !== "cancelling" &&
+              "text-destructive hover:border-destructive/60 hover:bg-destructive/10 hover:text-destructive",
+          )}
+          onClick={() => cancelTask.mutate(task.key)}
+          disabled={!isRunning || cancelTask.isPending || task.state === "cancelling"}
+          title={isRunning ? t("web.admin.tasks.row.stopTitle") : undefined}
+          aria-busy={isShowingRunFeedback}
+        >
+          {task.state === "cancelling" ? (
+            <Square className="me-1.5 h-3.5 w-3.5 fill-current" />
+          ) : isRunning ? (
+            <Square className="me-1.5 h-3.5 w-3.5 fill-current" />
+          ) : (
+            <Loader2 className="me-1.5 h-3.5 w-3.5 animate-spin" />
+          )}
+          {task.state === "cancelling"
+            ? t("web.admin.tasks.row.stopping")
+            : isRunning
+              ? t("web.admin.tasks.row.stop")
+              : t("web.admin.tasks.row.starting")}
+        </Button>
+      ) : (
+        <Button
+          variant="outline"
+          size="sm"
+          className="w-full min-w-[8.25rem] justify-center sm:w-auto"
+          onClick={() => {
+            void handleRunTask();
+          }}
+          disabled={runTask.isPending}
+        >
+          <Play className="me-1.5 h-3.5 w-3.5" />
+          {t("web.admin.tasks.actions.runNow")}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+export default function AdminTasks() {
+  const t = useT();
+  useEventChannel("tasks");
+  const now = useTaskClock();
+  const { data: tasks, isLoading } = useTasks();
+  const { data: refreshMetrics } = useTaskMetrics("refresh_metadata");
+
+  const scheduledTasks = (tasks ?? []).filter((task) => !task.manual_only);
+  const grouped: { id: string; label: string; description?: string; tasks: TaskInfo[] }[] = [
+    ...CATEGORY_ORDER.map((cat) => ({
+      id: cat,
+      label: t(CATEGORY_LABELS[cat]),
+      tasks: scheduledTasks.filter((task) => task.category === cat),
+    })),
+    {
+      id: "on-demand",
+      label: t("web.admin.tasks.onDemand.label"),
+      description: t("web.admin.tasks.onDemand.description"),
+      tasks: (tasks ?? []).filter((task) => task.manual_only),
+    },
+  ].filter((g) => g.tasks.length > 0);
+
+  return (
+    <div className="space-y-6 pb-4 sm:pb-6">
+      <PageHeader
+        title={t("web.admin.tasks.page.title")}
+        subtitle={t("web.admin.tasks.page.subtitle")}
+      />
+
+      {isLoading && (
+        <p className="text-muted-foreground text-sm">{t("web.admin.tasks.page.loading")}</p>
+      )}
+
+      {grouped.map((group) => (
+        <div key={group.id} className="space-y-3">
+          <div className="space-y-1">
+            <h2 className="text-muted-foreground text-xs font-medium tracking-[0.24em] uppercase">
+              {group.label}
+            </h2>
+            {group.description && (
+              <p className="text-muted-foreground text-xs">{group.description}</p>
+            )}
+          </div>
+          <div className="surface-panel overflow-hidden rounded-2xl border-0">
+            {group.tasks.map((task) => (
+              <TaskRow
+                key={task.key}
+                task={task}
+                now={now}
+                refreshMetrics={task.key === "refresh_metadata" ? refreshMetrics : undefined}
+              />
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}

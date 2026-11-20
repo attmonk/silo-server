@@ -1,0 +1,973 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/auditmutation"
+	"github.com/Silo-Server/silo-server/internal/auth/passwordhash"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+// Sentinel errors for repository operations.
+var (
+	ErrNotFound  = errors.New("user not found")
+	ErrDuplicate = errors.New("duplicate user")
+)
+
+// IsNotFound returns true if the error is a "not found" error.
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound)
+}
+
+// IsDuplicate returns true if the error is a "duplicate" error.
+func IsDuplicate(err error) bool {
+	return errors.Is(err, ErrDuplicate)
+}
+
+// CheckPassword verifies a plaintext password against the user's bcrypt hash.
+// This is a standalone function, not a repository method. The error is
+// passwordhash.ErrBusy when the server was too busy to check: the password
+// is then neither right nor wrong.
+func CheckPassword(ctx context.Context, user *models.User, password string) (bool, error) {
+	err := comparePasswordHash(ctx, []byte(user.PasswordHash), []byte(password))
+	if errors.Is(err, passwordhash.ErrBusy) {
+		return false, err
+	}
+	return err == nil, nil
+}
+
+// UserRepository provides CRUD operations for the users table.
+type UserRepository struct {
+	pool *pgxpool.Pool
+}
+
+// NewUserRepository creates a new UserRepository backed by the given pool.
+func NewUserRepository(pool *pgxpool.Pool) *UserRepository {
+	return &UserRepository{pool: pool}
+}
+
+// allColumns is the list of columns returned by all SELECT queries.
+// Kept in one place so scanUser stays in sync.
+const allColumns = `id, email, username, password_hash, local_password_login_enabled, password_change_required, role, permissions, enabled,
+	library_ids, max_playback_quality, access_policy_revision,
+	max_streams, max_transcodes, max_remote_stream_bitrate_kbps, max_local_stream_bitrate_kbps, transcode_allowed, audio_transcode_allowed, max_profiles, download_allowed,
+	download_transcode_allowed, requests_allowed, access_group_id, is_owner, break_glass, created_at, updated_at`
+
+// userLogin receives users.email, users.username, and users.password_hash,
+// all nullable: an account can have only one of a username and an email, and
+// no password hash. NULL reads as the model's empty value, which every lookup
+// by username or email ignores and no password matches.
+type userLogin struct{ email, username, passwordHash *string }
+
+func (l *userLogin) apply(u *models.User) {
+	u.Email, u.Username = derefString(l.email), derefString(l.username)
+	u.PasswordHash = derefString(l.passwordHash)
+}
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// nullIfBlank stores an empty username or email as NULL, so accounts
+// without one never share the empty sign-in identifier.
+func nullIfBlank(s string) *string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return &s
+}
+
+// scanUser scans a single row into a *models.User.
+func scanUser(row pgx.Row) (*models.User, error) {
+	var u models.User
+	var login userLogin
+	err := row.Scan(
+		&u.ID,
+		&login.email,
+		&login.username,
+		&login.passwordHash,
+		&u.LocalPasswordLoginEnabled,
+		&u.PasswordChangeRequired,
+		&u.Role,
+		&u.Permissions,
+		&u.Enabled,
+		&u.LibraryIDs,
+		&u.MaxPlaybackQuality,
+		&u.AccessPolicyRevision,
+		&u.MaxStreams,
+		&u.MaxTranscodes,
+		&u.MaxRemoteStreamBitrateKbps,
+		&u.MaxLocalStreamBitrateKbps,
+		&u.TranscodeAllowed,
+		&u.AudioTranscodeAllowed,
+		&u.MaxProfiles,
+		&u.DownloadAllowed,
+		&u.DownloadTranscodeAllowed,
+		&u.RequestsAllowed,
+		&u.AccessGroupID,
+		&u.IsOwner,
+		&u.BreakGlass,
+		&u.CreatedAt,
+		&u.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("scanning user: %w", err)
+	}
+	login.apply(&u)
+	return &u, nil
+}
+
+// scanUsers scans multiple rows into a []*models.User slice.
+func scanUsers(rows pgx.Rows) ([]*models.User, error) {
+	var users []*models.User
+	for rows.Next() {
+		var u models.User
+		var login userLogin
+		err := rows.Scan(
+			&u.ID,
+			&login.email,
+			&login.username,
+			&login.passwordHash,
+			&u.LocalPasswordLoginEnabled,
+			&u.PasswordChangeRequired,
+			&u.Role,
+			&u.Permissions,
+			&u.Enabled,
+			&u.LibraryIDs,
+			&u.MaxPlaybackQuality,
+			&u.AccessPolicyRevision,
+			&u.MaxStreams,
+			&u.MaxTranscodes,
+			&u.MaxRemoteStreamBitrateKbps,
+			&u.MaxLocalStreamBitrateKbps,
+			&u.TranscodeAllowed,
+			&u.AudioTranscodeAllowed,
+			&u.MaxProfiles,
+			&u.DownloadAllowed,
+			&u.DownloadTranscodeAllowed,
+			&u.RequestsAllowed,
+			&u.AccessGroupID,
+			&u.IsOwner,
+			&u.BreakGlass,
+			&u.CreatedAt,
+			&u.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning user row: %w", err)
+		}
+		login.apply(&u)
+		users = append(users, &u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating user rows: %w", err)
+	}
+	return users, nil
+}
+
+// Create inserts a new user with a bcrypt-hashed password and returns the created user.
+func (r *UserRepository) Create(ctx context.Context, input models.CreateUserInput) (*models.User, error) {
+	return createUser(ctx, r.pool, input)
+}
+
+// NewUserPermissions is the permissions a new account created from input
+// stores: the requested ones, or DefaultUserPermissions for a non-admin that
+// requests none, normalized. A check of what an account created later would
+// get (a backup restore comparing invitations) uses it too, so the two
+// cannot drift.
+func NewUserPermissions(input models.CreateUserInput) ([]string, error) {
+	permissions := append([]string(nil), input.Permissions...)
+	if input.Permissions == nil && input.Role != models.RoleAdmin {
+		permissions = DefaultUserPermissions()
+	}
+	return NormalizePermissions(permissions)
+}
+
+func createUser(ctx context.Context, db interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, input models.CreateUserInput) (*models.User, error) {
+	hash, err := passwordhash.Generate(ctx, []byte(input.Password), passwordHashCost)
+	if err != nil {
+		return nil, fmt.Errorf("hashing password: %w", err)
+	}
+
+	// Base columns that are always included.
+	localPasswordLoginEnabled := true
+	if input.LocalPasswordLoginEnabled != nil {
+		localPasswordLoginEnabled = *input.LocalPasswordLoginEnabled
+	}
+
+	permissions, err := NewUserPermissions(input)
+	if err != nil {
+		return nil, err
+	}
+
+	// Policy columns are written explicitly: a nil pointer stores NULL, which
+	// means "inherit from the access group" (the columns carry no defaults).
+	cols := []string{
+		"email", "username", "password_hash", "local_password_login_enabled", "password_change_required", "role", "permissions",
+		"library_ids", "max_playback_quality", "max_streams", "max_transcodes", "max_remote_stream_bitrate_kbps", "max_local_stream_bitrate_kbps",
+		"transcode_allowed", "audio_transcode_allowed", "max_profiles", "download_allowed", "download_transcode_allowed",
+		"requests_allowed",
+	}
+	args := []any{
+		NormalizeEmail(input.Email),
+		NormalizeUsername(input.Username),
+		string(hash),
+		localPasswordLoginEnabled,
+		input.PasswordChangeRequired,
+		input.Role,
+		permissions,
+		input.LibraryIDs,
+		normalizeQualityOverride(input.MaxPlaybackQuality),
+		input.MaxStreams,
+		input.MaxTranscodes,
+		input.MaxRemoteStreamBitrateKbps,
+		input.MaxLocalStreamBitrateKbps,
+		input.TranscodeAllowed,
+		input.AudioTranscodeAllowed,
+		input.MaxProfiles,
+		input.DownloadAllowed,
+		input.DownloadTranscodeAllowed,
+		input.RequestsAllowed,
+	}
+
+	accessGroupID := input.AccessGroupID
+	if input.Role == models.RoleAdmin {
+		accessGroupID = nil
+	}
+	if accessGroupID != nil {
+		cols = append(cols, "access_group_id")
+		args = append(args, *accessGroupID)
+	}
+
+	// Build placeholders: $1, $2, ..., $N
+	placeholders := make([]string, 0, len(args)+1)
+	for i := range args {
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
+	}
+	// Admins stay ungrouped: scope/action decisions are role-blind, so the
+	// default group's ceilings would cap the server owner (mirrors the
+	// exclusion in the assign_default_group_to_existing_users migration).
+	if accessGroupID == nil && input.Role != models.RoleAdmin {
+		cols = append(cols, "access_group_id")
+		placeholders = append(placeholders, "(SELECT id FROM access_groups WHERE is_default)")
+	}
+
+	query := fmt.Sprintf("INSERT INTO users (%s) VALUES (%s) RETURNING %s",
+		strings.Join(cols, ", "),
+		strings.Join(placeholders, ", "),
+		allColumns,
+	)
+
+	row := db.QueryRow(ctx, query, args...)
+
+	user, err := scanUser(row)
+	if err != nil {
+		if isDuplicateKeyError(err) {
+			return nil, fmt.Errorf("%w: %s", ErrDuplicate, extractConstraint(err))
+		}
+		return nil, fmt.Errorf("creating user: %w", err)
+	}
+
+	return user, nil
+}
+
+// GetByID retrieves a user by their numeric ID.
+func (r *UserRepository) GetByID(ctx context.Context, id int) (*models.User, error) {
+	return userByID(ctx, r.pool, id)
+}
+
+// UserInTransaction reads account authority in an owning caller transaction.
+func UserInTransaction(ctx context.Context, tx pgx.Tx, id int) (*models.User, error) {
+	return userByID(ctx, tx, id)
+}
+
+// UserByID reads an account through db, a pool or a transaction.
+func UserByID(ctx context.Context, db interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, id int) (*models.User, error) {
+	return userByID(ctx, db, id)
+}
+
+func userByID(ctx context.Context, db interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, id int) (*models.User, error) {
+	return scanUser(db.QueryRow(ctx, userByIDQuery, id))
+}
+
+// QueueUser queues GetByID's read on batch. The returned function reads the
+// result from the sent batch, in the order the batch's reads were queued, with
+// GetByID's answer: ErrNotFound for a missing account.
+func QueueUser(batch *pgx.Batch, id int) func(pgx.BatchResults) (*models.User, error) {
+	batch.Queue(userByIDQuery, id)
+	return func(results pgx.BatchResults) (*models.User, error) {
+		return scanUser(results.QueryRow())
+	}
+}
+
+const userByIDQuery = `SELECT ` + allColumns + ` FROM users WHERE id=$1`
+
+// GetByUsername retrieves a user by their username (case-insensitive).
+func (r *UserRepository) GetByUsername(ctx context.Context, username string) (*models.User, error) {
+	query := `SELECT ` + allColumns + ` FROM users WHERE username = $1`
+	return scanUser(r.pool.QueryRow(ctx, query, NormalizeUsername(username)))
+}
+
+// GetByEmail retrieves a user by their email address (case-insensitive).
+func (r *UserRepository) GetByEmail(ctx context.Context, email string) (*models.User, error) {
+	query := `SELECT ` + allColumns + ` FROM users WHERE email = $1`
+	return scanUser(r.pool.QueryRow(ctx, query, NormalizeEmail(email)))
+}
+
+// userUpdateColumn is one candidate column of a user update: it is written
+// only when set, and bumpsAccessPolicy marks the columns whose change has to
+// invalidate durable session/profile tokens by bumping
+// access_policy_revision. Values are pre-computed, so every entry is safe to
+// build even when set is false.
+type userUpdateColumn struct {
+	column            string
+	set               bool
+	value             any
+	bumpsAccessPolicy bool
+}
+
+// accessGroupSetClause builds the SET clause and access-policy predicate for
+// access_group_id given the next free placeholder index. access_group_id is
+// handled outside the generic userUpdateColumn machinery because, unlike
+// every other column, what gets written depends on the row's current role:
+//
+//   - Granting admin (input.Role == "admin") clears the group unconditionally.
+//   - Changing role to anything else without naming a group lands the row on
+//     the default group, but only if it was an admin (accounts are never
+//     un-grouped by an unrelated role change).
+//   - Setting a group on its own (input.Role == nil) is guarded by a CASE so
+//     a write that races an admin promotion cannot leave the admin grouped.
+//   - Otherwise (explicit NULL, or a group set alongside a non-admin role
+//     change) the value is bound directly.
+//
+// Admin accounts are never grouped (see Create). Returns an empty setClause
+// if access_group_id is not touched by this update.
+//
+// The default-group branch reads from a CTE (aliased in defaultGroupCTE)
+// instead of inlining the subselect, because the same expression is spliced
+// into both the SET clause and the access_policy_revision predicate — as a
+// literal subselect it would run twice per UPDATE, but a CTE referenced more
+// than once is materialized once by Postgres.
+func accessGroupSetClause(input models.UpdateUserInput, argIndex int) (setClause, predicate, defaultGroupCTE string, args []any, nextArgIndex int) {
+	const isAdmin = "role = '" + models.RoleAdmin + "'"
+	nextArgIndex = argIndex
+	switch {
+	case input.Role != nil && *input.Role == models.RoleAdmin:
+		placeholder := fmt.Sprintf("$%d", argIndex)
+		setClause = "access_group_id = " + placeholder
+		args = []any{(*int64)(nil)}
+		nextArgIndex++
+	case input.Role != nil && !input.AccessGroupID.Set:
+		defaultGroupCTE = "default_group AS (SELECT id FROM access_groups WHERE is_default)"
+		expr := "(CASE WHEN " + isAdmin + " THEN (SELECT id FROM default_group) ELSE access_group_id END)"
+		setClause = "access_group_id = " + expr
+	case input.Role == nil && input.AccessGroupID.Set && input.AccessGroupID.Value != nil:
+		placeholder := fmt.Sprintf("$%d", argIndex)
+		// The cast pins the parameter type; inside a CASE the driver would
+		// otherwise send it as text.
+		expr := "(CASE WHEN " + isAdmin + " THEN NULL ELSE " + placeholder + "::bigint END)"
+		setClause = "access_group_id = " + expr
+		args = []any{input.AccessGroupID.Value}
+		nextArgIndex++
+	default:
+		if !input.AccessGroupID.Set {
+			return "", "", "", nil, argIndex
+		}
+		placeholder := fmt.Sprintf("$%d", argIndex)
+		setClause = "access_group_id = " + placeholder
+		args = []any{input.AccessGroupID.Value}
+		nextArgIndex++
+	}
+	predicate = "access_group_id IS DISTINCT FROM " + strings.TrimPrefix(setClause, "access_group_id = ")
+	return setClause, predicate, defaultGroupCTE, args, nextArgIndex
+}
+
+// Update modifies a user's fields. Only non-nil fields in the input are updated.
+// If the input contains a Password, it is bcrypt-hashed before storage.
+// It runs in its own transaction, so a promotion and the credential cleanup
+// it implies commit together.
+func (r *UserRepository) Update(ctx context.Context, id int, input models.UpdateUserInput) error {
+	passwordHash, err := hashUpdatePassword(ctx, &input)
+	if err != nil {
+		return err
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := updateUser(ctx, tx, id, input, passwordHash); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// hashUpdatePassword hashes the new password an update sets before the
+// caller opens its transaction, so the transaction never waits for a hashing
+// turn while it holds locks; nil when the update sets none.
+func hashUpdatePassword(ctx context.Context, input *models.UpdateUserInput) (*string, error) {
+	if input == nil || input.Password == nil {
+		return nil, nil
+	}
+	hash, err := passwordhash.Generate(ctx, []byte(*input.Password), passwordHashCost)
+	if err != nil {
+		return nil, fmt.Errorf("hashing password: %w", err)
+	}
+	hashed := string(hash)
+	return &hashed, nil
+}
+
+// updateUser writes input's fields. passwordHash is input.Password prepared by
+// hashUpdatePassword before the transaction; input.Password itself is not read.
+func updateUser(ctx context.Context, db interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, id int, input models.UpdateUserInput, passwordHash *string) error {
+	currentRole, err := updateCurrentRole(ctx, db, id, input)
+	if err != nil {
+		return err
+	}
+	roleChanging := input.Role != nil && *input.Role != currentRole
+	promoting := roleChanging && *input.Role == models.RoleAdmin
+	var email *string
+	if input.Email != nil {
+		normalized := NormalizeEmail(*input.Email)
+		email = &normalized
+	}
+	var username *string
+	if input.Username != nil {
+		normalized := NormalizeUsername(*input.Username)
+		username = &normalized
+	}
+	previousUsername, err := updatePreviousUsername(ctx, db, id, username)
+	if err != nil {
+		return err
+	}
+	var permissions []string
+	if input.Permissions != nil {
+		normalized, err := NormalizePermissions(*input.Permissions)
+		if err != nil {
+			return err
+		}
+		permissions = normalized
+	}
+
+	// Library scope is resolved from users.library_ids on each request, so
+	// changing it must not invalidate durable profile/session tokens — hence
+	// no access-policy bump on that column.
+	columns := []userUpdateColumn{
+		{column: "email", set: email != nil, value: email},
+		{column: "username", set: username != nil, value: username},
+		{column: "password_hash", set: passwordHash != nil, value: passwordHash},
+		{column: "password_change_required", set: passwordHash != nil, value: input.PasswordChangeRequired},
+		{column: "local_password_login_enabled", set: input.LocalPasswordLoginEnabled != nil, value: input.LocalPasswordLoginEnabled},
+		{column: "role", set: input.Role != nil, value: input.Role, bumpsAccessPolicy: true},
+		{column: "permissions", set: input.Permissions != nil, value: permissions, bumpsAccessPolicy: true},
+		{column: "enabled", set: input.Enabled != nil, value: input.Enabled, bumpsAccessPolicy: true},
+		{column: "library_ids", set: input.LibraryIDs.Set, value: derefSlice(input.LibraryIDs.Value)},
+		{
+			column:            "max_playback_quality",
+			set:               input.MaxPlaybackQuality.Set,
+			value:             normalizeQualityOverride(input.MaxPlaybackQuality.Value),
+			bumpsAccessPolicy: true,
+		},
+		{column: "max_streams", set: input.MaxStreams.Set, value: input.MaxStreams.Value},
+		{column: "max_transcodes", set: input.MaxTranscodes.Set, value: input.MaxTranscodes.Value},
+		{column: "max_remote_stream_bitrate_kbps", set: input.MaxRemoteStreamBitrateKbps.Set, value: input.MaxRemoteStreamBitrateKbps.Value},
+		{column: "max_local_stream_bitrate_kbps", set: input.MaxLocalStreamBitrateKbps.Set, value: input.MaxLocalStreamBitrateKbps.Value},
+		{column: "transcode_allowed", set: input.TranscodeAllowed.Set, value: input.TranscodeAllowed.Value},
+		{column: "audio_transcode_allowed", set: input.AudioTranscodeAllowed.Set, value: input.AudioTranscodeAllowed.Value},
+		{column: "max_profiles", set: input.MaxProfiles.Set, value: input.MaxProfiles.Value},
+		{column: "download_allowed", set: input.DownloadAllowed.Set, value: input.DownloadAllowed.Value},
+		{column: "download_transcode_allowed", set: input.DownloadTranscodeAllowed.Set, value: input.DownloadTranscodeAllowed.Value},
+		{column: "requests_allowed", set: input.RequestsAllowed.Set, value: input.RequestsAllowed.Value},
+		breakGlassUpdateColumn(input),
+	}
+
+	setClauses := []string{}
+	accessPolicyPredicates := []string{}
+	args := []any{}
+	argIndex := 1
+	for _, col := range columns {
+		if !col.set {
+			continue
+		}
+		placeholder := fmt.Sprintf("$%d", argIndex)
+		setClauses = append(setClauses, fmt.Sprintf("%s = %s", col.column, placeholder))
+		if col.bumpsAccessPolicy {
+			accessPolicyPredicates = append(
+				accessPolicyPredicates,
+				fmt.Sprintf("%s IS DISTINCT FROM %s", col.column, placeholder),
+			)
+		}
+		args = append(args, col.value)
+		argIndex++
+	}
+
+	// access_group_id is not a plain userUpdateColumn: what gets written
+	// depends on the row's current role, so it is assembled directly rather
+	// than through the generic column loop above.
+	var defaultGroupCTE string
+	if setClause, predicate, cte, groupArgs, nextArgIndex := accessGroupSetClause(input, argIndex); setClause != "" {
+		setClauses = append(setClauses, setClause)
+		accessPolicyPredicates = append(accessPolicyPredicates, predicate)
+		defaultGroupCTE = cte
+		args = append(args, groupArgs...)
+		argIndex = nextArgIndex
+	}
+
+	if len(setClauses) == 0 {
+		// Nothing to update; still verify the user exists.
+		_, err := scanUser(db.QueryRow(ctx, `SELECT `+allColumns+` FROM users WHERE id=$1`, id))
+		return err
+	}
+
+	if len(accessPolicyPredicates) > 0 {
+		setClauses = append(setClauses, fmt.Sprintf(
+			"access_policy_revision = CASE WHEN %s THEN access_policy_revision + 1 ELSE access_policy_revision END",
+			strings.Join(accessPolicyPredicates, " OR "),
+		))
+	}
+
+	// Always bump updated_at.
+	setClauses = append(setClauses, "updated_at = NOW()")
+
+	var query string
+	if defaultGroupCTE != "" {
+		query = fmt.Sprintf("WITH %s UPDATE users SET %s WHERE id = $%d",
+			defaultGroupCTE, strings.Join(setClauses, ", "), argIndex)
+	} else {
+		query = fmt.Sprintf("UPDATE users SET %s WHERE id = $%d",
+			strings.Join(setClauses, ", "), argIndex)
+	}
+	args = append(args, id)
+
+	tag, err := db.Exec(ctx, query, args...)
+	if err != nil {
+		if isDuplicateKeyError(err) {
+			return fmt.Errorf("%w: %s", ErrDuplicate, extractConstraint(err))
+		}
+		return fmt.Errorf("updating user: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if username != nil && previousUsername != "" && previousUsername != *username {
+		if err := renamePrimaryProfileWithAccount(ctx, db, id, previousUsername, *username); err != nil {
+			return err
+		}
+	}
+	if roleChanging {
+		if err := endImpersonationsInvolving(ctx, db, id); err != nil {
+			return err
+		}
+	}
+	if promoting {
+		return revokeCredentialsIssuedToNonAdmin(ctx, db, id)
+	}
+	return nil
+}
+
+// breakGlassUpdateColumn writes the break-glass flag when the update names
+// it, and clears it when the update moves the account off the admin role,
+// which users_break_glass_admin would otherwise refuse.
+func breakGlassUpdateColumn(input models.UpdateUserInput) userUpdateColumn {
+	demoting := input.Role != nil && *input.Role != models.RoleAdmin
+	switch {
+	case demoting:
+		return userUpdateColumn{column: columnBreakGlass, set: true, value: false}
+	case input.BreakGlass != nil:
+		return userUpdateColumn{column: columnBreakGlass, set: true, value: *input.BreakGlass}
+	}
+	return userUpdateColumn{column: columnBreakGlass}
+}
+
+const columnBreakGlass = "break_glass"
+
+// updateCurrentRole returns account id's role before an update that sets
+// one, and "" for an update that leaves the role alone.
+func updateCurrentRole(ctx context.Context, db interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, id int, input models.UpdateUserInput) (string, error) {
+	if input.Role == nil {
+		return "", nil
+	}
+	var role string
+	err := db.QueryRow(ctx, `SELECT role FROM users WHERE id=$1`, id).Scan(&role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return role, err
+}
+
+// endImpersonationsInvolving ends the impersonation sessions account id
+// started and those viewing the server as it. A role change keeps the
+// account's own sessions (their access tokens must be refreshed to carry the
+// new role), but a demoted admin may no longer view as anyone, and a promoted
+// account may only be viewed as by the Owner. Refreshing an impersonation
+// session would otherwise carry it across the change.
+func endImpersonationsInvolving(ctx context.Context, db interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, id int) error {
+	if _, err := db.Exec(ctx, `
+		UPDATE auth_sessions SET revoked_at = NOW()
+		WHERE (impersonator_user_id = $1 OR (user_id = $1 AND impersonator_user_id IS NOT NULL))
+		  AND revoked_at IS NULL`, id); err != nil {
+		return fmt.Errorf("ending impersonation sessions after a role change: %w", err)
+	}
+	return nil
+}
+
+// revokeCredentialsIssuedToNonAdmin deletes the API keys and reset links of
+// an account being made an admin or the Owner. Other admins may have minted
+// them and kept them; afterwards they would carry authority that only the
+// Owner grants.
+func revokeCredentialsIssuedToNonAdmin(ctx context.Context, db interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, id int) error {
+	if _, err := db.Exec(ctx, `DELETE FROM api_keys WHERE user_id = $1`, id); err != nil {
+		return fmt.Errorf("revoking the promoted account's API keys: %w", err)
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM password_reset_tokens WHERE user_id = $1`, id); err != nil {
+		return fmt.Errorf("deleting the promoted account's reset links: %w", err)
+	}
+	return nil
+}
+
+// CompareAndSwapPassword replaces the bcrypt hash only if it is still the one
+// the caller verified. Concurrent password changes using the same old password
+// therefore cannot both succeed with different replacements. The account
+// chose this password itself, so it settles any temporary one.
+func (r *UserRepository) CompareAndSwapPassword(ctx context.Context, id int, expectedHash, newPassword string) error {
+	return r.compareAndSwapPassword(ctx, id, expectedHash, newPassword, nil)
+}
+
+// ReplaceTemporaryPassword is CompareAndSwapPassword for an account holding a
+// temporary password. Every other login session was opened with that
+// temporary password, possibly by someone else, and its next refresh would
+// lift the restriction; they are revoked in the same transaction, keeping
+// only keepSessionID, the session that chose the new password.
+func (r *UserRepository) ReplaceTemporaryPassword(ctx context.Context, id int, expectedHash, newPassword, keepSessionID string) error {
+	return r.compareAndSwapPassword(ctx, id, expectedHash, newPassword, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			UPDATE auth_sessions SET revoked_at = NOW()
+			WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`, id, keepSessionID); err != nil {
+			return fmt.Errorf("revoking temporary-password sessions: %w", err)
+		}
+		return nil
+	})
+}
+
+// ReplacePasswordSigningOutOthers is CompareAndSwapPassword that also signs
+// the account out everywhere except keepSessionID, the session that chose
+// the new password, in the same transaction (RevokeOtherSignInsInTransaction).
+// The caller runs the OnUserSessionsRevoked hook after it returns.
+func (r *UserRepository) ReplacePasswordSigningOutOthers(ctx context.Context, id int, expectedHash, newPassword, keepSessionID string) error {
+	return r.compareAndSwapPassword(ctx, id, expectedHash, newPassword, func(tx pgx.Tx) error {
+		return RevokeOtherSignInsInTransaction(ctx, tx, id, keepSessionID)
+	})
+}
+
+// compareAndSwapPassword runs alsoInTx, when set, in the transaction that
+// replaced the hash.
+func (r *UserRepository) compareAndSwapPassword(ctx context.Context, id int, expectedHash, newPassword string, alsoInTx func(pgx.Tx) error) error {
+	hash, err := passwordhash.Generate(ctx, []byte(newPassword), passwordHashCost)
+	if err != nil {
+		return fmt.Errorf("hashing password: %w", err)
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin password update: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // rollback after commit is a no-op
+	// The account is one of the audit row's accounts; an impersonator is
+	// locked with it in id order rather than after the account's update.
+	if err := auditmutation.LockActors(ctx, tx); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE users
+		SET password_hash = $1, password_change_required = false, updated_at = NOW()
+		WHERE id = $2 AND password_hash = $3`, string(hash), id, expectedHash)
+	if err != nil {
+		return fmt.Errorf("updating password: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		if alsoInTx != nil {
+			if err := alsoInTx(tx); err != nil {
+				return err
+			}
+		}
+		audit, err := auditmutation.RecordMutation(ctx, tx, auditmutation.ActionPasswordChanged, auditmutation.TargetUser,
+			strconv.Itoa(id), http.StatusNoContent, auditmutation.SecretChanged(auditmutation.FieldPassword))
+		if err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit password update: %w", err)
+		}
+		auditmutation.CommitMutation(ctx, audit)
+		return nil
+	}
+
+	if _, err := r.GetByID(ctx, id); err != nil {
+		return err
+	}
+	return ErrCurrentPasswordInvalid
+}
+
+// Delete removes a user by their ID.
+func (r *UserRepository) Delete(ctx context.Context, id int) error {
+	tag, err := r.pool.Exec(ctx, "DELETE FROM users WHERE id = $1", id)
+	if err != nil {
+		return fmt.Errorf("deleting user: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+
+	return nil
+}
+
+// List returns all users ordered by ID ascending.
+func (r *UserRepository) List(ctx context.Context) ([]*models.User, error) {
+	query := `SELECT ` + allColumns + ` FROM users ORDER BY id ASC`
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("listing users: %w", err)
+	}
+	defer rows.Close()
+
+	return scanUsers(rows)
+}
+
+// ListPage returns up to limit users whose id is above afterID, in id order.
+// It is the keyset page behind the v2 account listing; List stays the
+// unbounded v1 listing.
+func (r *UserRepository) ListPage(ctx context.Context, afterID, limit int, identity string) ([]*models.User, error) {
+	query := `SELECT ` + allColumns + ` FROM users WHERE id > $1`
+	args := []any{afterID, limit}
+	if identity != "" {
+		query += ` AND (username = $3 OR email = $3)`
+		args = append(args, NormalizeUsername(identity))
+	}
+	query += ` ORDER BY id ASC LIMIT $2`
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing users page: %w", err)
+	}
+	defer rows.Close()
+
+	return scanUsers(rows)
+}
+
+// Count returns the number of users in the database.
+func (r *UserRepository) Count(ctx context.Context) (int, error) {
+	var count int
+	if err := r.pool.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&count); err != nil {
+		return 0, fmt.Errorf("counting users: %w", err)
+	}
+	return count, nil
+}
+
+// isDuplicateKeyError checks if the error is a PostgreSQL unique_violation (code 23505).
+func isDuplicateKeyError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
+}
+
+// extractConstraint extracts the constraint name from a PgError for diagnostic messages.
+func extractConstraint(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.ConstraintName
+	}
+	return "unknown"
+}
+
+// normalizeQualityOverride keeps the stored quality preset canonical while
+// preserving nil (inherit).
+func normalizeQualityOverride(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	normalized := access.NormalizePlaybackQuality(*value)
+	return &normalized
+}
+
+// derefSlice maps a nil pointer to a NULL array and a non-nil pointer to its
+// (possibly empty) slice, so Postgres distinguishes "inherit" from "none".
+func derefSlice(value *[]int) []int {
+	if value == nil {
+		return nil
+	}
+	if *value == nil {
+		return []int{}
+	}
+	return *value
+}
+
+// InitialSetupAdvisoryLock serializes first-administrator setup across every
+// API process sharing the database. It is transaction-scoped, so a crashed
+// caller releases it with its transaction.
+const InitialSetupAdvisoryLock int64 = 0x53494C4F53455455 // "SILOSETU"
+
+// ClaimInitialSetup runs provision inside the database-wide first-setup
+// boundary: one transaction that holds the setup advisory lock, re-checks that
+// no account exists after acquiring it, and commits only when provision
+// succeeds. A caller that finds an account already committed by the winner
+// gets ErrSetupAlreadyComplete with no rows written. The lock, not the
+// process, fences competing replicas.
+func (r *UserRepository) ClaimInitialSetup(ctx context.Context, provision func(tx pgx.Tx) error) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning initial setup: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", InitialSetupAdvisoryLock); err != nil {
+		return fmt.Errorf("acquiring initial setup lock: %w", err)
+	}
+	var count int
+	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&count); err != nil {
+		return fmt.Errorf("counting users: %w", err)
+	}
+	if count > 0 {
+		return ErrSetupAlreadyComplete
+	}
+	if err := provision(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing initial setup: %w", err)
+	}
+	return nil
+}
+
+// CreateInvited commits an invite use only with the account and its optional
+// profile. A failed insert, profile write, or duplicate account rolls it back.
+func (r *UserRepository) CreateInvited(ctx context.Context, input models.CreateUserInput, code string, provision func(*models.User, pgx.Tx) error) (*models.User, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning invited account: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck
+	if err := EnsureLocalPasswordLoginAllowedInTransaction(ctx, tx); err != nil {
+		return nil, err
+	}
+	// The local-login guard holds the settings mutation lock until commit.
+	// Judge signup policy under that same lock before spending the invite.
+	enabled, err := readServerSetting(ctx, tx, "signup.enabled")
+	if err != nil {
+		return nil, err
+	}
+	const signupEnabledValue = "true"
+	if enabled != signupEnabledValue {
+		return nil, ErrSignupDisabled
+	}
+	if err := redeemCode(ctx, tx, code); err != nil {
+		return nil, err
+	}
+	user, err := createUser(ctx, tx, input)
+	if err != nil {
+		return nil, err
+	}
+	if err := provision(user, tx); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing invited account: %w", err)
+	}
+	return user, nil
+}
+
+// RestoredAccount is an account a backup restore creates: its fields as the
+// backup holds them, with library ids already mapped to this server's.
+type RestoredAccount struct {
+	Email, Username           string
+	PasswordHash              string
+	LocalPasswordLoginEnabled bool
+	PasswordChangeRequired    bool
+	Enabled                   bool
+	Role                      string
+	Permissions               []string
+	// LibraryIDs keeps nil (inherit) distinct from empty (no library).
+	LibraryIDs                 []int
+	MaxPlaybackQuality         *string
+	MaxStreams                 *int
+	MaxTranscodes              *int
+	MaxRemoteStreamBitrateKbps *int
+	MaxLocalStreamBitrateKbps  *int
+	TranscodeAllowed           *bool
+	AudioTranscodeAllowed      *bool
+	MaxProfiles                *int
+	DownloadAllowed            *bool
+	DownloadTranscodeAllowed   *bool
+	RequestsAllowed            *bool
+	// AccessGroupID is the group joined; nil leaves the account ungrouped,
+	// with no default group assigned. An admin is always ungrouped.
+	AccessGroupID *int64
+}
+
+// CreateRestoredAccountInTx inserts an account a restore brings back, in the
+// caller's transaction. It keeps the backup's password hash (so the account
+// signs in with its old password) and never sets the owner or break-glass
+// flags. Unlike Create it assigns no default group: the restore decides the
+// group, after checking it grants nothing the backup's policy did not.
+func CreateRestoredAccountInTx(ctx context.Context, tx pgx.Tx, in RestoredAccount) (*models.User, error) {
+	permissions, err := NormalizePermissions(in.Permissions)
+	if err != nil {
+		return nil, err
+	}
+	if in.Role != models.RoleAdmin && in.Role != models.RoleUser {
+		return nil, fmt.Errorf("role %q is not valid", in.Role)
+	}
+	group := in.AccessGroupID
+	if in.Role == models.RoleAdmin {
+		group = nil
+	}
+	row := tx.QueryRow(ctx, `
+		INSERT INTO users (email, username, password_hash, local_password_login_enabled, password_change_required, enabled, role, permissions,
+			library_ids, max_playback_quality, max_streams, max_transcodes, max_remote_stream_bitrate_kbps, max_local_stream_bitrate_kbps,
+			transcode_allowed, audio_transcode_allowed, max_profiles, download_allowed, download_transcode_allowed, requests_allowed, access_group_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+		RETURNING `+allColumns,
+		nullIfBlank(NormalizeEmail(in.Email)), nullIfBlank(NormalizeUsername(in.Username)), in.PasswordHash, in.LocalPasswordLoginEnabled, in.PasswordChangeRequired,
+		in.Enabled, in.Role, permissions, in.LibraryIDs, normalizeQualityOverride(in.MaxPlaybackQuality), in.MaxStreams, in.MaxTranscodes,
+		in.MaxRemoteStreamBitrateKbps, in.MaxLocalStreamBitrateKbps, in.TranscodeAllowed, in.AudioTranscodeAllowed, in.MaxProfiles,
+		in.DownloadAllowed, in.DownloadTranscodeAllowed, in.RequestsAllowed, group)
+	user, err := scanUser(row)
+	if err != nil {
+		if isDuplicateKeyError(err) {
+			return nil, fmt.Errorf("%w: %s", ErrDuplicate, extractConstraint(err))
+		}
+		return nil, fmt.Errorf("creating restored account: %w", err)
+	}
+	return user, nil
+}

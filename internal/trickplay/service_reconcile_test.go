@@ -1,0 +1,40 @@
+package trickplay
+
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+type reconcileQueue struct {
+	*fakeQueue
+	calls     int
+	reconcile func(context.Context, int) (ReconcileStats, error)
+}
+
+func (q *reconcileQueue) Reconcile(ctx context.Context, _ Recipe, _ string, batch int) (ReconcileStats, error) {
+	q.calls++
+	if batch != reconcileBatch {
+		return ReconcileStats{}, errors.New("unexpected batch size")
+	}
+	return q.reconcile(ctx, q.calls)
+}
+
+func TestReconcileDrainsFullBatches(t *testing.T) {
+	q := &reconcileQueue{fakeQueue: newFakeQueue(), reconcile: func(_ context.Context, call int) (ReconcileStats, error) {
+		if call <= 2 {
+			return ReconcileStats{Added: reconcileBatch}, nil
+		}
+		return ReconcileStats{Added: 501}, nil
+	}}
+	s := newService(q, &fakeStore{}, nil, &fakeExtractor{}, "server")
+	stats, more, err := s.reconcileBatches(t.Context(), testRecipe, q.Reconcile)
+	if err != nil || more || q.calls != 3 || stats.Added != 10501 {
+		t.Fatalf("stats=%+v more=%v calls=%d error=%v", stats, more, q.calls, err)
+	}
+	select {
+	case <-s.wake:
+	default:
+		t.Fatal("workers were not woken")
+	}
+}

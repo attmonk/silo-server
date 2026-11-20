@@ -1,0 +1,369 @@
+// Package filesplit moves a subset of a catalog item's files to an existing
+// item while preserving file-attributable user state. It is shared by the
+// admin Split Versions flow and automatic scanner identity repair.
+package filesplit
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"sort"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/catalog/reattribute"
+	"github.com/Silo-Server/silo-server/internal/contentid"
+)
+
+const (
+	itemTypeMovie  = "movie"
+	itemTypeSeries = "series"
+)
+
+// File is the media-file identity needed for a subset move.
+type File struct {
+	ID                int
+	ContentID         string
+	MediaFolderID     int
+	FilePath          string
+	CanonicalRootPath string
+	ObservedRootPath  string
+	GroupKeyVersion   int
+	ContentGroupKey   string
+	BaseType          string
+	SeasonNumber      int
+	EpisodeNumber     int
+	EpisodeID         string
+}
+
+// Options describes one transactional file-subset move.
+type Options struct {
+	FromContentID string
+	ToContentID   string
+	ItemType      string
+	Files         []File
+	HistoryMode   reattribute.HistoryMode
+}
+
+// Result reports the state reattribution performed by Move.
+type Result struct {
+	EpisodePairs  []reattribute.IDPair
+	Reattribution *reattribute.Report
+}
+
+// Move reassigns files and file-attributable user state inside the caller's
+// transaction. The source predicate makes stale/concurrent selections fail
+// closed instead of moving an unexpected row.
+func Move(ctx context.Context, tx pgx.Tx, opts Options) (*Result, error) {
+	if opts.FromContentID == "" || opts.ToContentID == "" || opts.FromContentID == opts.ToContentID {
+		return nil, fmt.Errorf("filesplit: from/to content ids required and must differ")
+	}
+	if opts.ItemType != itemTypeMovie && opts.ItemType != itemTypeSeries {
+		return nil, fmt.Errorf("filesplit: unsupported item type %q", opts.ItemType)
+	}
+	if len(opts.Files) == 0 {
+		return nil, fmt.Errorf("filesplit: at least one file is required")
+	}
+	if opts.HistoryMode == "" {
+		opts.HistoryMode = reattribute.HistoryModeEvidence
+	}
+	if !reattribute.ValidHistoryMode(opts.HistoryMode) {
+		return nil, fmt.Errorf("filesplit: invalid history mode %q", opts.HistoryMode)
+	}
+
+	fileIDs := distinctFileIDs(opts.Files)
+	if len(fileIDs) != len(opts.Files) {
+		return nil, fmt.Errorf("filesplit: file ids must be positive and unique")
+	}
+	// Episode state follows a moved multi-episode file for every episode it
+	// serves, not only the one it links to. Read those before the move unlinks
+	// the files.
+	spannedPairs, err := spannedEpisodePairs(ctx, tx, opts, fileIDs)
+	if err != nil {
+		return nil, err
+	}
+	// The self-join reads each row as it was before the update, so the source
+	// episodes the moved files leave behind come from the database rather than
+	// from the caller's selection.
+	var moved int
+	var sourceEpisodeIDs []string
+	if err := tx.QueryRow(ctx, `
+		WITH moved AS (
+			UPDATE media_files mf
+			SET content_id = $1,
+				episode_id = NULL,
+				match_attempted_at = NULL,
+				updated_at = NOW()
+			FROM media_files previous
+			WHERE previous.id = mf.id
+			  AND mf.content_id = $2
+			  AND mf.id = ANY($3::bigint[])
+			RETURNING previous.episode_id
+		)
+		SELECT COUNT(*)::int,
+		       COALESCE(array_agg(DISTINCT episode_id) FILTER (WHERE episode_id IS NOT NULL), ARRAY[]::text[])
+		FROM moved
+	`, opts.ToContentID, opts.FromContentID, fileIDs).Scan(&moved, &sourceEpisodeIDs); err != nil {
+		return nil, fmt.Errorf("filesplit: moving files: %w", err)
+	}
+	if moved != len(fileIDs) {
+		return nil, fmt.Errorf(
+			"filesplit: moved %d of %d selected files; source ownership changed",
+			moved,
+			len(fileIDs),
+		)
+	}
+
+	for _, folderID := range distinctFolderIDs(opts.Files) {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO media_item_libraries (content_id, media_folder_id)
+			VALUES ($1, $2)
+			ON CONFLICT DO NOTHING
+		`, opts.ToContentID, folderID); err != nil {
+			return nil, fmt.Errorf("filesplit: adding target library membership: %w", err)
+		}
+	}
+	// A folder whose files all moved no longer holds the source. Remove that
+	// membership here: a later subtree scan only reconciles content its files
+	// link to, and none of them link to the source any more.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM media_item_libraries membership
+		WHERE membership.content_id = $1
+		  AND membership.media_folder_id = ANY($2::int[])
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM media_files remaining
+			WHERE remaining.content_id = membership.content_id
+			  AND remaining.media_folder_id = membership.media_folder_id
+			  AND remaining.missing_since IS NULL
+		  )
+	`, opts.FromContentID, distinctFolderIDs(opts.Files)); err != nil {
+		return nil, fmt.Errorf("filesplit: removing stale source library membership: %w", err)
+	}
+	// Root claims keep their first owner, so a root the split emptied would
+	// still resolve new files there to the source. Hand those claims over.
+	if _, err := tx.Exec(ctx, `
+		UPDATE media_item_roots claim
+		SET content_id = $1, last_seen_at = NOW()
+		FROM (
+			SELECT DISTINCT media_folder_id, canonical_root_path
+			FROM media_files
+			WHERE id = ANY($3::bigint[])
+			  AND canonical_root_path <> ''
+		) moved
+		WHERE claim.media_folder_id = moved.media_folder_id
+		  AND claim.canonical_root_path = moved.canonical_root_path
+		  AND claim.content_id = $2
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM media_files remaining
+			WHERE remaining.media_folder_id = claim.media_folder_id
+			  AND remaining.canonical_root_path = claim.canonical_root_path
+			  AND remaining.content_id = $2
+			  AND remaining.missing_since IS NULL
+		  )
+	`, opts.ToContentID, opts.FromContentID, fileIDs); err != nil {
+		return nil, fmt.Errorf("filesplit: moving source root claims: %w", err)
+	}
+
+	derivedEpisodePairs := DeriveEpisodePairs(opts.ItemType, opts.Files, opts.ToContentID)
+	for _, pair := range spannedPairs {
+		if !slices.ContainsFunc(derivedEpisodePairs, func(derived reattribute.IDPair) bool { return derived.From == pair.From }) {
+			derivedEpisodePairs = append(derivedEpisodePairs, pair)
+		}
+	}
+	episodePairs, err := keepFullyMovedEpisodePairs(ctx, tx, derivedEpisodePairs)
+	if err != nil {
+		return nil, err
+	}
+	report, err := reattribute.Run(ctx, tx, reattribute.Options{
+		FromContentID: opts.FromContentID,
+		ToContentID:   opts.ToContentID,
+		MovedFileIDs:  fileIDs,
+		Mode:          opts.HistoryMode,
+		EpisodePairs:  episodePairs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("filesplit: reattributing user state: %w", err)
+	}
+
+	// Existing matched series already have deterministic target episode rows.
+	// Relink immediately when they are available; a later metadata refresh can
+	// fill any episode that does not exist yet.
+	if opts.ItemType == itemTypeSeries {
+		if _, err := tx.Exec(ctx, `
+			UPDATE media_files mf
+			SET episode_id = e.content_id,
+				updated_at = NOW()
+			FROM episodes e
+			WHERE mf.id = ANY($1::bigint[])
+			  AND e.series_id = $2
+			  AND e.season_number = mf.season_number
+			  AND e.episode_number = mf.episode_number
+		`, fileIDs, opts.ToContentID); err != nil {
+			return nil, fmt.Errorf("filesplit: relinking target episodes: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO episode_libraries (
+				episode_id, media_folder_id, first_seen_at, first_seen_scan_run_id
+			)
+			SELECT mf.episode_id,
+			       mf.media_folder_id,
+			       MIN(mf.created_at),
+			       (array_agg(mf.first_seen_scan_run_id ORDER BY mf.created_at ASC, mf.id ASC))[1]
+			FROM media_files mf
+			WHERE mf.id = ANY($1::bigint[])
+			  AND mf.episode_id IS NOT NULL
+			GROUP BY mf.episode_id, mf.media_folder_id
+			ON CONFLICT (episode_id, media_folder_id) DO NOTHING
+		`, fileIDs); err != nil {
+			return nil, fmt.Errorf("filesplit: adding target episode library membership: %w", err)
+		}
+		if _, err := catalog.InsertSpannedEpisodeMemberships(ctx, tx, "mf.id = ANY($1::bigint[])", fileIDs); err != nil {
+			return nil, fmt.Errorf("filesplit: %w", err)
+		}
+		if len(sourceEpisodeIDs) > 0 {
+			if _, err := tx.Exec(ctx, `
+				DELETE FROM episode_libraries el
+				WHERE el.episode_id IN `+catalog.SpanReachSQL("$1::text[]")+`
+				  AND `+catalog.NoServingEpisodeFileSQL+`
+			`, sourceEpisodeIDs); err != nil {
+				return nil, fmt.Errorf("filesplit: removing stale source episode library membership: %w", err)
+			}
+		}
+		if err := catalog.RecomputeSeriesEpisodeMembershipDenorms(
+			ctx,
+			tx,
+			[]string{opts.FromContentID, opts.ToContentID},
+		); err != nil {
+			return nil, fmt.Errorf("filesplit: %w", err)
+		}
+	}
+
+	return &Result{
+		EpisodePairs:  episodePairs,
+		Reattribution: report,
+	}, nil
+}
+
+// DeriveEpisodePairs maps moved files' current episode ids onto deterministic
+// episode ids under the target series.
+func DeriveEpisodePairs(itemType string, files []File, targetContentID string) []reattribute.IDPair {
+	if itemType != itemTypeSeries || !contentid.IsProviderAnchored(targetContentID) {
+		return nil
+	}
+	seen := make(map[string]bool)
+	pairs := make([]reattribute.IDPair, 0)
+	for _, file := range files {
+		if file.EpisodeID == "" || file.SeasonNumber <= 0 || file.EpisodeNumber <= 0 || seen[file.EpisodeID] {
+			continue
+		}
+		newID, ok := contentid.ForEpisode(targetContentID, file.SeasonNumber, file.EpisodeNumber)
+		if !ok || newID == file.EpisodeID {
+			continue
+		}
+		seen[file.EpisodeID] = true
+		pairs = append(pairs, reattribute.IDPair{From: file.EpisodeID, To: newID})
+	}
+	return pairs
+}
+
+// spannedEpisodePairs maps the later episodes the moved multi-episode files
+// serve onto deterministic episode ids under the target series.
+func spannedEpisodePairs(ctx context.Context, tx pgx.Tx, opts Options, fileIDs []int) ([]reattribute.IDPair, error) {
+	if opts.ItemType != itemTypeSeries || !contentid.IsProviderAnchored(opts.ToContentID) {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, catalog.SpannedEpisodesSQL("mf.id = ANY($1::bigint[]) AND mf.content_id = $2"), fileIDs, opts.FromContentID)
+	if err != nil {
+		return nil, fmt.Errorf("filesplit: listing spanned source episodes: %w", err)
+	}
+	defer rows.Close()
+	var pairs []reattribute.IDPair
+	for rows.Next() {
+		var from string
+		var season, episode int
+		if err := rows.Scan(&from, &season, &episode); err != nil {
+			return nil, fmt.Errorf("filesplit: scanning spanned source episode: %w", err)
+		}
+		if to, ok := contentid.ForEpisode(opts.ToContentID, season, episode); ok && to != from {
+			pairs = append(pairs, reattribute.IDPair{From: from, To: to})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("filesplit: iterating spanned source episodes: %w", err)
+	}
+	return pairs, nil
+}
+
+// keepFullyMovedEpisodePairs excludes a source episode when another active
+// file still serves it after the selected files were detached: one linked to
+// it, or a multi-episode file spanning it. Episode progress has no file
+// dimension, so moving a shared episode's state would steal progress from the
+// source show.
+func keepFullyMovedEpisodePairs(
+	ctx context.Context,
+	tx pgx.Tx,
+	pairs []reattribute.IDPair,
+) ([]reattribute.IDPair, error) {
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	fromIDs := make([]string, 0, len(pairs))
+	toIDs := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		fromIDs = append(fromIDs, pair.From)
+		toIDs = append(toIDs, pair.To)
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT pair.from_id, pair.to_id
+		FROM UNNEST($1::text[], $2::text[]) AS pair(from_id, to_id)
+		CROSS JOIN LATERAL (SELECT pair.from_id AS content_id) e
+		WHERE NOT `+catalog.EpisodeHasServingFileSQL+`
+	`, fromIDs, toIDs)
+	if err != nil {
+		return nil, fmt.Errorf("filesplit: filtering shared episode state: %w", err)
+	}
+	defer rows.Close()
+
+	filtered := make([]reattribute.IDPair, 0, len(pairs))
+	for rows.Next() {
+		var pair reattribute.IDPair
+		if err := rows.Scan(&pair.From, &pair.To); err != nil {
+			return nil, fmt.Errorf("filesplit: scanning movable episode state: %w", err)
+		}
+		filtered = append(filtered, pair)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("filesplit: iterating movable episode state: %w", err)
+	}
+	return filtered, nil
+}
+
+func distinctFileIDs(files []File) []int {
+	seen := make(map[int]bool, len(files))
+	ids := make([]int, 0, len(files))
+	for _, file := range files {
+		if file.ID > 0 && !seen[file.ID] {
+			seen[file.ID] = true
+			ids = append(ids, file.ID)
+		}
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+func distinctFolderIDs(files []File) []int {
+	seen := make(map[int]bool, len(files))
+	ids := make([]int, 0)
+	for _, file := range files {
+		if file.MediaFolderID > 0 && !seen[file.MediaFolderID] {
+			seen[file.MediaFolderID] = true
+			ids = append(ids, file.MediaFolderID)
+		}
+	}
+	sort.Ints(ids)
+	return ids
+}

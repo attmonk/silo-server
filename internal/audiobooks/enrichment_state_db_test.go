@@ -1,0 +1,30 @@
+package audiobooks
+
+import (
+	"testing"
+)
+
+func TestClassifyProviderErrorSortsByHowItShouldRetry(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want EnrichmentErrorClass
+	}{
+		{"HTTP 429 too many requests", EnrichmentErrorRateLimited},
+		// Apple answers throttling with 403, and the plugin forwards it untyped.
+		{"itunes: HTTP 403", EnrichmentErrorRateLimited},
+		{"unauthorized: bad token", EnrichmentErrorPermanent},
+		{"connection reset by peer", EnrichmentErrorTransient},
+	}
+	for _, tc := range cases {
+		if got := classifyProviderError(errString(tc.msg)); got != tc.want {
+			t.Errorf("classifyProviderError(%q) = %q, want %q", tc.msg, got, tc.want)
+		}
+	}
+	if got := classifyProviderError(nil); got != EnrichmentErrorTransient {
+		t.Errorf("classifyProviderError(nil) = %q, want transient", got)
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }

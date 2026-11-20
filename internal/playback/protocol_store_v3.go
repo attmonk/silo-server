@@ -1,0 +1,608 @@
+package playback
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+var ErrIdempotencyKeyReusedV3 = errors.New("idempotency key reused")
+var ErrPlaybackAttemptExistsV3 = errors.New("playback attempt already exists")
+var ErrStaleReplanLeaseV3 = errors.New("stale replan lease")
+
+// ErrReplanSupersededV3 means a CompleteReplan lost the revision compare: a
+// newer replan already moved the attempt past the caller's base revision.
+var ErrReplanSupersededV3 = errors.New("replan superseded")
+
+// ErrProgressConflictV3 means a progress sample reused an already-applied
+// sequence number with a different payload: a retry must replay the exact
+// sample it originally sent.
+var ErrProgressConflictV3 = errors.New("progress sequence conflict")
+
+// ErrAttemptStoppedV3 means the attempt has already been stopped, so no
+// further progress can be applied to it.
+var ErrAttemptStoppedV3 = errors.New("playback attempt stopped")
+
+// ErrInvalidStopIDV3 means the stop id is not a UUID; the attempt row stores
+// it as one so a replayed stop can be matched exactly.
+var ErrInvalidStopIDV3 = errors.New("invalid stop id")
+
+// ProgressSampleV3 is one client-reported playback position. Samples for an
+// attempt are totally ordered by Sequence; a higher sequence always wins,
+// even when its position moves backward.
+type ProgressSampleV3 struct {
+	Sequence int64   `json:"sequence"`
+	Position float64 `json:"position"`
+	IsPaused bool    `json:"is_paused"`
+}
+
+// Progress receipt outcomes.
+const (
+	// ProgressAppliedV3: the sample was newer than the row and is now the
+	// latest accepted sample.
+	ProgressAppliedV3 = "applied"
+	// ProgressReplayedV3: the sample repeats the latest accepted one exactly
+	// (same sequence and payload), so a retry after a lost reply is a no-op.
+	ProgressReplayedV3 = "replayed"
+	// ProgressStaleSampleV3: the row already holds a newer sequence; Accepted
+	// carries that latest sample.
+	ProgressStaleSampleV3 = "stale_sample"
+)
+
+// ProgressReceiptV3 is the durable outcome of one ApplyProgress call.
+type ProgressReceiptV3 struct {
+	Outcome string
+	// Accepted is the latest sample the attempt holds after the call: the
+	// caller's sample when applied or replayed, the newer stored sample when
+	// stale, nil when nothing has been applied yet.
+	Accepted *ProgressSampleV3
+	// Lifecycle is the pause or resume the applied sample made to the
+	// session's announced lifecycle state, committed with the sample; nil
+	// when the state did not change or the store keeps no lifecycle.
+	Lifecycle *LifecycleChangeV3
+}
+
+// LifecycleChangeV3 is a lifecycle pause transition an accepted progress
+// sample made: its sequence number, commit time and new pause state.
+type LifecycleChangeV3 struct {
+	Seq    int64
+	At     time.Time
+	Paused bool
+}
+
+// StopReceiptV3 is what a stop returns, and what every later stop of the same
+// attempt replays. It is stored on the attempt row as JSON.
+type StopReceiptV3 struct {
+	StopID string `json:"stop_id"`
+	// Accepted is the final sample the stop settled on: the stop's own final
+	// sample when it was newer than the row, otherwise the last applied
+	// progress sample; nil when the attempt never reported progress.
+	Accepted *ProgressSampleV3 `json:"accepted,omitempty"`
+	// HistoryID is the watch-history row the stop writer produced, recorded
+	// through RecordStopReceipt after the writer runs.
+	HistoryID string `json:"history_id,omitempty"`
+	// Finalized is set by RecordStopReceipt once the stop's side effects
+	// (deny marker, teardown, history) have run. A replayed stop that finds it
+	// unset finishes them: the winning replica died between the CAS and the
+	// writers.
+	Finalized bool `json:"finalized,omitempty"`
+	// FinalizingUntil is the lease of the caller currently running the side
+	// effects (see ProgressStoreV3.ClaimStopFinalization). Zero when nobody
+	// holds the claim.
+	FinalizingUntil time.Time `json:"finalizing_until,omitempty"`
+}
+
+// ProgressStoreV3 is the durable per-attempt progress and stop sequencing.
+// Every method keys on the session id of a live (unexpired) attempt row and
+// returns ErrSessionNotFound when there is none.
+type ProgressStoreV3 interface {
+	// ApplyProgress is a compare-and-set on the attempt's last_sequence:
+	// applied when the sample is newer, replayed when it repeats the latest
+	// sample exactly, stale_sample when the row is already past it, and
+	// ErrProgressConflictV3 when the same sequence carries a different
+	// payload. A stopped attempt returns ErrAttemptStoppedV3.
+	ApplyProgress(ctx context.Context, sessionID string, sample ProgressSampleV3) (ProgressReceiptV3, error)
+	// StopAttempt is a compare-and-set on stopped_at. The first stop wins: it
+	// records stopID, applies the optional final sample when newer, and
+	// returns first=true with the accepted sample. Every later call, with any
+	// stop id, returns the stored receipt with first=false.
+	StopAttempt(ctx context.Context, sessionID, stopID string, final *ProgressSampleV3) (StopReceiptV3, bool, error)
+	// RecordStopReceipt stores the completed receipt (history id, accepted
+	// sample) on a stopped row after the stop writer has run, so replayed
+	// stops return what the first one produced.
+	RecordStopReceipt(ctx context.Context, sessionID string, receipt StopReceiptV3) error
+	// ClaimStopFinalization is a compare-and-set on the receipt's Finalizing
+	// flag. Exactly one caller wins the claim on a stopped, unfinalized row
+	// and runs the non-idempotent writers (history, scrobbles); every other
+	// caller returns false and replays the stored receipt as is. A claim is
+	// released by RecordStopReceipt with Finalized set, or by a later
+	// ClaimStopFinalization once the claim's lease has passed.
+	ClaimStopFinalization(ctx context.Context, sessionID string, leaseUntil time.Time) (bool, error)
+}
+
+type AttemptRecordV3 struct {
+	PlaybackAttemptID      string
+	SessionID              string
+	UserID                 int
+	ProfileID              string
+	RequestedMediaFileID   int
+	EffectiveMediaFileID   int
+	CurrentPlanID          string
+	CurrentReplanRequestID string
+	CurrentPlan            PlanV3
+	FrozenRecipe           ExecutableRecipeV3
+	NormalizedRequest      StartRequestV3
+	// ServerBitrateCapKbps is fixed when the attempt starts; replans must not
+	// pick up later administrator edits to the account or access group.
+	ServerBitrateCapKbps int
+	// StartResponse is the latest durable decision for this attempt. It begins
+	// as the exact start response and advances atomically with each completed
+	// replan so an idempotent start retry never resurrects a superseded plan.
+	StartResponse DecisionResponseV3
+	// RequestDigest fingerprints the normalized start request so an attempt-ID
+	// reused with different input is a detectable idempotency violation rather
+	// than a silent replay of the old plan.
+	RequestDigest string
+	ExpiresAt     time.Time
+	// LastSequence and LastSample are the durable progress sequencing state
+	// (see ProgressStoreV3); SaveAttempt ignores them, a new row starts at 0.
+	LastSequence int64
+	LastSample   *ProgressSampleV3
+	// StoppedAt is set once the attempt has been stopped; a stopped attempt
+	// never replays as a playable decision.
+	StoppedAt *time.Time
+	// StopID is the stop_id the attempt was stopped under; empty while it is
+	// live. Server-minted ids tell who ended it (for example an administrator).
+	StopID string
+	// LastSampleAt is when the row last accepted a progress sample or a stop.
+	// A replica reaping a stale local copy compares it with its own activity
+	// clock, since requests can land on other replicas.
+	LastSampleAt time.Time
+	// CreatedAt is when the attempt row was saved, which is when its session
+	// started. SaveAttempt ignores it.
+	CreatedAt time.Time
+	// LoginSessionID is the login session that started the attempt; empty
+	// for an API key. The plan URL's stream reference authorizes the
+	// attempt's media on its own only while that session is active.
+	LoginSessionID string
+	// DesiredTracks is the audio and subtitle the viewer asked for, which
+	// can differ from CurrentPlan's selection after a version change had to
+	// fall back. Nil on rows written before it existed.
+	DesiredTracks *DesiredTracksV3
+}
+
+// AttemptIdentityV3 carries only the ownership columns of an attempt so
+// per-event authorization checks avoid decoding the plan and request JSONB.
+type AttemptIdentityV3 struct {
+	PlaybackAttemptID string
+	SessionID         string
+	UserID            int
+	ProfileID         string
+	// Stopped reports that the attempt has been stopped (StoppedAt is set).
+	Stopped bool
+	// LoginSessionID is the login session that started the attempt, or
+	// empty; see AttemptRecordV3.LoginSessionID.
+	LoginSessionID string
+}
+
+type RouteEventRecordV3 struct {
+	ConnectionDeviceID string
+	ConnectionKey      string
+	Delivery           string
+	ReceivedAt         time.Time
+	// SampleLifetime is the speed reading lifetime when the event was
+	// received; a plan summary's throughput replaces an older sample.
+	SampleLifetime time.Duration
+	RouteEventV3
+	// EventID is the client-minted identity of one report. Empty for legacy
+	// v1 reports; a v2 report always carries one so a retry after a lost 202
+	// records the event once.
+	EventID       string
+	UserID        int
+	ProfileID     string
+	ClientName    string
+	ClientVersion string
+	// ClientBuild and ClientChannel are opaque client-reported identifiers,
+	// recorded so a route decision can be attributed to an exact app build.
+	ClientBuild   string
+	ClientChannel string
+	ClientModel   string
+}
+
+type ReplanLeaseStateV3 string
+
+const (
+	ReplanLeaseOwnedV3     ReplanLeaseStateV3 = "owned"
+	ReplanLeaseInFlightV3  ReplanLeaseStateV3 = "in_flight"
+	ReplanLeaseCompletedV3 ReplanLeaseStateV3 = "completed"
+)
+
+type ReplanLeaseV3 struct {
+	State ReplanLeaseStateV3
+	// LeaseToken identifies one ownership generation of an active replan. It
+	// is opaque to callers and must accompany release and completion writes.
+	LeaseToken string
+	Response   json.RawMessage
+}
+
+type PlanStoreV3 interface {
+	AcquireSessionLock(context.Context, string) (func(), error)
+	SaveAttempt(context.Context, AttemptRecordV3) error
+	GetAttempt(context.Context, string) (*AttemptRecordV3, error)
+	GetAttemptByPlaybackAttemptID(context.Context, string) (*AttemptRecordV3, error)
+	GetAttemptIdentity(context.Context, string) (*AttemptIdentityV3, error)
+	GetAttemptIdentityByPlaybackAttemptID(context.Context, string) (*AttemptIdentityV3, error)
+	BeginReplan(context.Context, string, string, string, string, time.Time) (ReplanLeaseV3, error)
+	// ReleaseReplan abandons an owned, incomplete lease after the handler fails
+	// before producing a durable response. The token prevents cleanup from an
+	// expired owner deleting a lease that has since been reclaimed.
+	ReleaseReplan(context.Context, string, string, string) error
+	// CompleteReplan commits a replan atomically; the attempt row is only
+	// updated while the caller still owns the lease and its
+	// current_replan_request_id equals the caller's base revision, otherwise
+	// ErrReplanSupersededV3 is returned.
+	CompleteReplan(ctx context.Context, sessionID, requestID, leaseToken, baseReplanRequestID string, response json.RawMessage, record AttemptRecordV3) error
+	// RecordRouteEvent reports whether it stored a new row. A v2 report that
+	// repeats an event_id already stored for its attempt is a no-op and
+	// returns false, so derived metrics count a retried report once.
+	RecordRouteEvent(context.Context, RouteEventRecordV3) (inserted bool, err error)
+	CleanupExpired(context.Context, time.Time) (int64, error)
+}
+
+type memoryReplanV3 struct {
+	digest     string
+	base       string
+	lease      time.Time
+	leaseToken string
+	completed  bool
+	response   json.RawMessage
+}
+
+type MemoryPlanStoreV3 struct {
+	mu           sync.Mutex
+	attempts     map[string]AttemptRecordV3
+	replans      map[string]memoryReplanV3
+	stopReceipts map[string]StopReceiptV3
+	events       []RouteEventRecordV3
+}
+
+func NewMemoryPlanStoreV3() *MemoryPlanStoreV3 {
+	return &MemoryPlanStoreV3{attempts: make(map[string]AttemptRecordV3), replans: make(map[string]memoryReplanV3)}
+}
+
+// AcquireSessionLock is deliberately a no-op. The store lock exists to
+// serialize replans across processes sharing one PostgreSQL database; the
+// memory store only ever backs a single-process, DB-less deployment, where
+// the handler's own per-session replan mutex already provides the same
+// serialization before this lock is taken.
+func (s *MemoryPlanStoreV3) AcquireSessionLock(context.Context, string) (func(), error) {
+	return func() {}, nil
+}
+
+func (s *MemoryPlanStoreV3) SaveAttempt(_ context.Context, record AttemptRecordV3) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	// Expired rows are replaceable, mirroring the Postgres pre-delete: they
+	// linger until the hourly cleanup and must not wedge a legitimate retry.
+	for attemptID, existing := range s.attempts {
+		if existing.ExpiresAt.After(now) {
+			continue
+		}
+		if existing.PlaybackAttemptID == record.PlaybackAttemptID || (record.SessionID != "" && existing.SessionID == record.SessionID) {
+			s.deleteAttemptLocked(attemptID)
+		}
+	}
+	for _, existing := range s.attempts {
+		if existing.PlaybackAttemptID != record.PlaybackAttemptID && (record.SessionID == "" || existing.SessionID != record.SessionID) {
+			continue
+		}
+		if existing.PlaybackAttemptID == record.PlaybackAttemptID &&
+			existing.RequestDigest != "" && record.RequestDigest != "" && existing.RequestDigest != record.RequestDigest {
+			return ErrIdempotencyKeyReusedV3
+		}
+		return ErrPlaybackAttemptExistsV3
+	}
+	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID = 0, nil, nil, ""
+	record.CreatedAt = now
+	s.attempts[record.PlaybackAttemptID] = record
+	return nil
+}
+
+// ReplaceAttempt overwrites a session's attempt record unconditionally. It is
+// not part of PlanStoreV3: durable stores treat attempts as insert-once and
+// replan-updated, so only in-memory test setups may rewrite one in place.
+func (s *MemoryPlanStoreV3) ReplaceAttempt(_ context.Context, record AttemptRecordV3) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for attemptID, existing := range s.attempts {
+		if existing.PlaybackAttemptID == record.PlaybackAttemptID || (record.SessionID != "" && existing.SessionID == record.SessionID) {
+			// ReplaceAttempt simulates a mixed-version writer in tests. Preserve
+			// its replan rows just as an UPDATE of the durable attempt would.
+			delete(s.attempts, attemptID)
+		}
+	}
+	s.attempts[record.PlaybackAttemptID] = record
+}
+
+func (s *MemoryPlanStoreV3) deleteAttemptLocked(attemptID string) {
+	record, ok := s.attempts[attemptID]
+	delete(s.attempts, attemptID)
+	if !ok || record.SessionID == "" {
+		return
+	}
+	delete(s.stopReceipts, record.SessionID)
+	for key := range s.replans {
+		if strings.HasPrefix(key, record.SessionID+":") {
+			delete(s.replans, key)
+		}
+	}
+}
+
+func (s *MemoryPlanStoreV3) GetAttemptByPlaybackAttemptID(_ context.Context, attemptID string) (*AttemptRecordV3, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.attempts[attemptID]
+	if ok && record.ExpiresAt.After(time.Now()) {
+		copy := record
+		return &copy, nil
+	}
+	return nil, ErrSessionNotFound
+}
+
+func (s *MemoryPlanStoreV3) GetAttempt(_ context.Context, sessionID string) (*AttemptRecordV3, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, record := range s.attempts {
+		if record.SessionID == sessionID && record.ExpiresAt.After(time.Now()) {
+			copy := record
+			return &copy, nil
+		}
+	}
+	return nil, ErrSessionNotFound
+}
+
+func (s *MemoryPlanStoreV3) BeginReplan(_ context.Context, sessionID, requestID, digest, baseReplanRequestID string, leaseUntil time.Time) (ReplanLeaseV3, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := sessionID + ":" + requestID
+	existing, ok := s.replans[key]
+	if !ok {
+		leaseToken := uuid.NewString()
+		s.replans[key] = memoryReplanV3{digest: digest, base: baseReplanRequestID, lease: leaseUntil, leaseToken: leaseToken}
+		return ReplanLeaseV3{State: ReplanLeaseOwnedV3, LeaseToken: leaseToken}, nil
+	}
+	if existing.digest != digest {
+		return ReplanLeaseV3{}, ErrIdempotencyKeyReusedV3
+	}
+	if existing.completed {
+		return ReplanLeaseV3{State: ReplanLeaseCompletedV3, Response: append(json.RawMessage(nil), existing.response...)}, nil
+	}
+	if time.Now().Before(existing.lease) {
+		return ReplanLeaseV3{State: ReplanLeaseInFlightV3}, nil
+	}
+	if existing.base != baseReplanRequestID {
+		return ReplanLeaseV3{}, ErrStaleReplanLeaseV3
+	}
+	existing.lease = leaseUntil
+	existing.leaseToken = uuid.NewString()
+	s.replans[key] = existing
+	return ReplanLeaseV3{State: ReplanLeaseOwnedV3, LeaseToken: existing.leaseToken}, nil
+}
+
+func (s *MemoryPlanStoreV3) ReleaseReplan(_ context.Context, sessionID, requestID, leaseToken string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := sessionID + ":" + requestID
+	entry, ok := s.replans[key]
+	if ok && !entry.completed && entry.leaseToken == leaseToken {
+		delete(s.replans, key)
+	}
+	return nil
+}
+
+func (s *MemoryPlanStoreV3) CompleteReplan(_ context.Context, sessionID, requestID, leaseToken, baseReplanRequestID string, response json.RawMessage, record AttemptRecordV3) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var attemptID string
+	var existing AttemptRecordV3
+	for candidateID, candidate := range s.attempts {
+		if candidate.SessionID == sessionID {
+			attemptID, existing = candidateID, candidate
+			break
+		}
+	}
+	if attemptID == "" {
+		return ErrSessionNotFound
+	}
+	if existing.StoppedAt != nil {
+		return ErrAttemptStoppedV3
+	}
+	if existing.CurrentReplanRequestID != baseReplanRequestID {
+		return ErrReplanSupersededV3
+	}
+	key := sessionID + ":" + requestID
+	entry, ok := s.replans[key]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	if entry.completed || entry.leaseToken != leaseToken {
+		return ErrReplanSupersededV3
+	}
+	entry.completed = true
+	entry.response = append(json.RawMessage(nil), response...)
+	s.replans[key] = entry
+	record.LastSequence, record.LastSample, record.StoppedAt, record.StopID = existing.LastSequence, existing.LastSample, existing.StoppedAt, existing.StopID
+	s.attempts[attemptID] = record
+	return nil
+}
+
+func (s *MemoryPlanStoreV3) GetAttemptIdentity(ctx context.Context, sessionID string) (*AttemptIdentityV3, error) {
+	record, err := s.GetAttempt(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return &AttemptIdentityV3{PlaybackAttemptID: record.PlaybackAttemptID, SessionID: record.SessionID, UserID: record.UserID, ProfileID: record.ProfileID, Stopped: record.StoppedAt != nil, LoginSessionID: record.LoginSessionID}, nil
+}
+
+func (s *MemoryPlanStoreV3) GetAttemptIdentityByPlaybackAttemptID(ctx context.Context, attemptID string) (*AttemptIdentityV3, error) {
+	record, err := s.GetAttemptByPlaybackAttemptID(ctx, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	return &AttemptIdentityV3{PlaybackAttemptID: record.PlaybackAttemptID, SessionID: record.SessionID, UserID: record.UserID, ProfileID: record.ProfileID, Stopped: record.StoppedAt != nil, LoginSessionID: record.LoginSessionID}, nil
+}
+
+func (s *MemoryPlanStoreV3) RecordRouteEvent(_ context.Context, record RouteEventRecordV3) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if record.EventID != "" {
+		for _, existing := range s.events {
+			if existing.EventID == record.EventID && existing.PlaybackAttemptID == record.PlaybackAttemptID {
+				return false, nil
+			}
+		}
+	}
+	s.events = append(s.events, record)
+	return true, nil
+}
+
+func (s *MemoryPlanStoreV3) CleanupExpired(_ context.Context, now time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var count int64
+	for attemptID, record := range s.attempts {
+		if !record.ExpiresAt.After(now) {
+			s.deleteAttemptLocked(attemptID)
+			count++
+		}
+	}
+	return count, nil
+}
+
+// findAttemptLocked returns the live attempt for a session; the caller holds
+// s.mu.
+func (s *MemoryPlanStoreV3) findAttemptLocked(sessionID string) (string, *AttemptRecordV3) {
+	for attemptID, record := range s.attempts {
+		if record.SessionID == sessionID && record.ExpiresAt.After(time.Now()) {
+			return attemptID, &record
+		}
+	}
+	return "", nil
+}
+
+func (s *MemoryPlanStoreV3) ApplyProgress(_ context.Context, sessionID string, sample ProgressSampleV3) (ProgressReceiptV3, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attemptID, record := s.findAttemptLocked(sessionID)
+	if record == nil {
+		return ProgressReceiptV3{}, ErrSessionNotFound
+	}
+	if record.StoppedAt != nil {
+		return ProgressReceiptV3{}, ErrAttemptStoppedV3
+	}
+	if sample.Sequence > record.LastSequence {
+		applied := sample
+		record.LastSequence, record.LastSample = sample.Sequence, &applied
+		record.LastSampleAt = time.Now()
+		s.attempts[attemptID] = *record
+		return ProgressReceiptV3{Outcome: ProgressAppliedV3, Accepted: &sample}, nil
+	}
+	return ResolveUnappliedProgressV3(record.LastSequence, record.LastSample, sample)
+}
+
+// ResolveUnappliedProgressV3 classifies a sample the compare-and-set rejected
+// against the row's committed state; shared by the memory and Postgres stores.
+func ResolveUnappliedProgressV3(lastSequence int64, last *ProgressSampleV3, sample ProgressSampleV3) (ProgressReceiptV3, error) {
+	var accepted *ProgressSampleV3
+	if last != nil {
+		copy := *last
+		accepted = &copy
+	}
+	if sample.Sequence == lastSequence && last != nil {
+		if last.Position == sample.Position && last.IsPaused == sample.IsPaused {
+			return ProgressReceiptV3{Outcome: ProgressReplayedV3, Accepted: accepted}, nil
+		}
+		return ProgressReceiptV3{}, ErrProgressConflictV3
+	}
+	return ProgressReceiptV3{Outcome: ProgressStaleSampleV3, Accepted: accepted}, nil
+}
+
+func (s *MemoryPlanStoreV3) StopAttempt(_ context.Context, sessionID, stopID string, final *ProgressSampleV3) (StopReceiptV3, bool, error) {
+	if _, err := uuid.Parse(stopID); err != nil {
+		return StopReceiptV3{}, false, ErrInvalidStopIDV3
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attemptID, record := s.findAttemptLocked(sessionID)
+	if record == nil {
+		return StopReceiptV3{}, false, ErrSessionNotFound
+	}
+	if record.StoppedAt != nil {
+		receipt, ok := s.stopReceipts[sessionID]
+		if !ok {
+			return StopReceiptV3{}, false, ErrSessionNotFound
+		}
+		return receipt, false, nil
+	}
+	if final != nil && final.Sequence > record.LastSequence {
+		applied := *final
+		record.LastSequence, record.LastSample = final.Sequence, &applied
+	}
+	now := time.Now()
+	record.StoppedAt = &now
+	record.StopID = stopID
+	record.LastSampleAt = now
+	s.attempts[attemptID] = *record
+	receipt := StopReceiptV3{StopID: stopID}
+	if record.LastSample != nil {
+		accepted := *record.LastSample
+		receipt.Accepted = &accepted
+	}
+	if s.stopReceipts == nil {
+		s.stopReceipts = make(map[string]StopReceiptV3)
+	}
+	s.stopReceipts[sessionID] = receipt
+	return receipt, true, nil
+}
+
+func (s *MemoryPlanStoreV3) RecordStopReceipt(_ context.Context, sessionID string, receipt StopReceiptV3) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, record := s.findAttemptLocked(sessionID)
+	if record == nil || record.StoppedAt == nil {
+		return ErrSessionNotFound
+	}
+	if stored, ok := s.stopReceipts[sessionID]; !ok || stored.StopID != receipt.StopID {
+		return ErrSessionNotFound
+	}
+	if receipt.Finalized {
+		receipt.FinalizingUntil = time.Time{}
+	}
+	s.stopReceipts[sessionID] = receipt
+	return nil
+}
+
+func (s *MemoryPlanStoreV3) ClaimStopFinalization(_ context.Context, sessionID string, leaseUntil time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, record := s.findAttemptLocked(sessionID)
+	if record == nil || record.StoppedAt == nil {
+		return false, ErrSessionNotFound
+	}
+	stored, ok := s.stopReceipts[sessionID]
+	if !ok {
+		return false, ErrSessionNotFound
+	}
+	if stored.Finalized || time.Now().Before(stored.FinalizingUntil) {
+		return false, nil
+	}
+	stored.FinalizingUntil = leaseUntil
+	s.stopReceipts[sessionID] = stored
+	return true, nil
+}

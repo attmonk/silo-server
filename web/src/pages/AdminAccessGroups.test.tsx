@@ -1,0 +1,613 @@
+import { setAccessToken, setProfileId, setProfileToken } from "@/api/client";
+// @vitest-environment jsdom
+
+import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { installPolicyStorageMocks, jsonResponse } from "./admin-policy/policyTestUtils";
+import { stubRadixDom } from "./adminPage.test-support";
+import {
+  GROUP,
+  INHERIT_LIMIT,
+  pickOption,
+  renderPage,
+  REQUEST_SETTINGS,
+} from "./AdminAccessGroups.test-support";
+
+vi.mock("@/hooks/useAuth", () => ({ useAuth: () => ({}) }));
+const adminUsers = vi.hoisted(() => ({
+  update: vi.fn(),
+  currentGroups: new Map<number, number | null>(),
+  data: [] as Array<{
+    id: number;
+    username: string;
+    email: string;
+    role: string;
+    access_group_id: number | null;
+    requests_allowed?: boolean | null;
+  }>,
+}));
+vi.mock("@/hooks/queries/admin/users", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/queries/admin/users")>()),
+  useAdminUsers: () => ({
+    data: adminUsers.data,
+    isPending: false,
+    isError: false,
+    isSuccess: true,
+    refetch: vi.fn(),
+  }),
+}));
+vi.mock("@/api/v2/adminUsers", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/api/v2/adminUsers")>()),
+  updateAdminUser: (...args: unknown[]) => adminUsers.update(...args),
+  getAdminUser: async (id: number) => ({
+    user: {
+      id,
+      access_group_id: adminUsers.currentGroups.has(id)
+        ? adminUsers.currentGroups.get(id)
+        : adminUsers.data.find((candidate) => candidate.id === id)?.access_group_id,
+    },
+    etag: `"user-${id}"`,
+    profileContext: null,
+  }),
+}));
+const toastSuccess = vi.hoisted(() => vi.fn());
+vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: vi.fn() } }));
+
+stubRadixDom();
+
+describe("AdminAccessGroups", () => {
+  let putBody: unknown;
+  let group: typeof GROUP;
+  // The group's request limit as stored, and every write to it, in order.
+  let groupLimit: Record<string, unknown>;
+  let groupLimitTag: string;
+  let writes: Array<{ url: string; ifMatch: string | null; body: Record<string, unknown> }>;
+  let refuseLimitWrites: number;
+
+  beforeEach(() => {
+    installPolicyStorageMocks();
+    setAccessToken("account");
+    setProfileId("owner");
+    setProfileToken(null);
+    putBody = undefined;
+    group = GROUP;
+    groupLimit = INHERIT_LIMIT;
+    groupLimitTag = '"limit-initial"';
+    writes = [];
+    refuseLimitWrites = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input, init) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (method === "PUT") {
+          writes.push({
+            url,
+            ifMatch: new Headers(init?.headers).get("If-Match"),
+            body: JSON.parse(String(init?.body)),
+          });
+        }
+        if (url === "/api/v2/admin/request-settings") return jsonResponse(REQUEST_SETTINGS);
+        if (url === "/api/v2/admin/request-groups/1/limit" && method === "GET") {
+          return jsonResponse(groupLimit, 200, groupLimitTag);
+        }
+        if (url === "/api/v2/admin/request-groups/1/limit" && method === "PUT") {
+          if (refuseLimitWrites > 0) {
+            refuseLimitWrites--;
+            groupLimitTag = '"limit-newer"';
+            return jsonResponse(
+              {
+                type: "https://silo.example/problems/precondition_failed",
+                title: "Changed",
+                status: 412,
+                detail: "The access group's request limit changed; reload before saving.",
+              },
+              412,
+              groupLimitTag,
+            );
+          }
+          groupLimit = { group_id: "1", ...JSON.parse(String(init?.body)) };
+          groupLimitTag = '"limit-saved"';
+          return jsonResponse(groupLimit, 200, groupLimitTag);
+        }
+        if (url === "/api/v2/admin/users/capabilities")
+          return jsonResponse({ access_groups: true });
+        if (url === "/api/v2/admin/access-groups?limit=200" && method === "GET") {
+          return jsonResponse({ items: [group], page: { has_more: false } });
+        }
+        if (url === "/api/v2/admin/access-groups/1" && method === "GET") {
+          return new Response(JSON.stringify(group), {
+            headers: { "Content-Type": "application/json", ETag: '"initial"' },
+          });
+        }
+        if (url === "/api/v1/admin/libraries") {
+          return jsonResponse([
+            { id: 2, name: "Movies", type: "movie", enabled: true },
+            { id: 3, name: "Anime", type: "series", enabled: true },
+          ]);
+        }
+        if (url === "/api/v2/libraries") {
+          return jsonResponse({
+            items: [
+              { id: "2", name: "Movies", type: "movie", enabled: true },
+              { id: "3", name: "Anime", type: "series", enabled: true },
+            ],
+          });
+        }
+        if (url === "/api/v2/admin/access-groups/1" && method === "PUT") {
+          putBody = JSON.parse(String(init?.body));
+          return new Response(JSON.stringify({ ...GROUP, download_allowed: true }), {
+            headers: { "Content-Type": "application/json", ETag: '"saved"' },
+          });
+        }
+        return jsonResponse({ error: "not_found", message: url }, 404);
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    adminUsers.currentGroups.clear();
+  });
+
+  it("saves only the request approval and limit when no group field changed", async () => {
+    group = { ...GROUP, requests_allowed: true };
+    toastSuccess.mockClear();
+    const user = userEvent.setup();
+    const router = renderPage("/admin/access-groups/1");
+    const requests = await screen.findByRole("region", { name: "Requests" });
+    // Inheriting fields say what the server-wide default is.
+    expect(
+      await within(requests).findByText("Server default: approved automatically"),
+    ).toBeInTheDocument();
+    expect(
+      within(requests).getByText("Server default: 12 requests per 14 days"),
+    ).toBeInTheDocument();
+
+    await pickOption(user, "Approval", "An admin approves");
+    await user.click(screen.getByRole("combobox", { name: "Limit" }));
+    expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual([
+      "Use server default",
+      "Custom limit",
+      "No limit",
+    ]);
+    await user.click(screen.getByRole("option", { name: "Custom limit" }));
+    const max = screen.getByRole("spinbutton", { name: "Requests allowed" });
+    expect(max).toHaveValue(12);
+    fireEvent.change(max, { target: { value: "3" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(await screen.findByRole("heading", { name: "Access Groups" })).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/admin/access-groups");
+    expect(toastSuccess).toHaveBeenCalledWith("Group saved");
+    // The group itself was untouched, so its revision is left alone.
+    expect(writes.map((write) => write.url)).toEqual(["/api/v2/admin/request-groups/1/limit"]);
+    expect(writes[0]).toMatchObject({
+      ifMatch: '"limit-initial"',
+      body: { limit_mode: "custom", max_requests: 3, window_days: 14, approval_mode: "manual" },
+    });
+    expect(await screen.findByText("Admin approves · 3 per 14 days")).toBeInTheDocument();
+    expect(screen.getByText("Requests on")).toBeInTheDocument();
+  });
+
+  it("saves a group's limit of zero and says it only stops new requests", async () => {
+    groupLimit = { ...INHERIT_LIMIT, limit_mode: "custom", max_requests: 0, window_days: 7 };
+    const user = userEvent.setup();
+    renderPage("/admin/access-groups/1");
+    const max = await screen.findByRole("spinbutton", { name: "Requests allowed" });
+    expect(max).toHaveValue(0);
+    expect(
+      screen.getByText(
+        "0 stops new requests; to block this group, turn off Media requests instead.",
+      ),
+    ).toBeInTheDocument();
+    await pickOption(user, "Approval", "Approve automatically");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("heading", { name: "Access Groups" })).toBeInTheDocument();
+    expect(writes).toEqual([
+      expect.objectContaining({
+        url: "/api/v2/admin/request-groups/1/limit",
+        body: { limit_mode: "custom", max_requests: 0, window_days: 7, approval_mode: "auto" },
+      }),
+    ]);
+  });
+
+  it("stays on the group when its request limit could not be saved, and retries only the limit", async () => {
+    toastSuccess.mockClear();
+    refuseLimitWrites = 1;
+    const user = userEvent.setup();
+    const router = renderPage("/admin/access-groups/1");
+    await screen.findByRole("region", { name: "Requests" });
+    fireEvent.click(screen.getByRole("switch", { name: "Allow downloads" }));
+    await pickOption(user, "Limit", "No limit");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(
+      await screen.findByText(/The group was saved, but its request approval and limit were not/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/changed by another administrator/)).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/admin/access-groups/1");
+    expect(toastSuccess).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Reload latest version" }));
+    await waitFor(() =>
+      expect(screen.getByRole("combobox", { name: "Limit" })).toHaveTextContent(
+        "Use server default",
+      ),
+    );
+    await pickOption(user, "Limit", "No limit");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("heading", { name: "Access Groups" })).toBeInTheDocument();
+    // The group was written once; the retry wrote only the limit.
+    expect(writes.map((write) => write.url)).toEqual([
+      "/api/v2/admin/access-groups/1",
+      "/api/v2/admin/request-groups/1/limit",
+      "/api/v2/admin/request-groups/1/limit",
+    ]);
+    const limitWrites = writes.filter((write) => write.url.includes("request-groups"));
+    expect(limitWrites.map((write) => write.ifMatch)).toEqual(['"limit-initial"', '"limit-newer"']);
+    expect(limitWrites[1]?.body).toMatchObject({ limit_mode: "unlimited", max_requests: null });
+  });
+
+  it("stays in the editor with the error when a save fails", async () => {
+    toastSuccess.mockClear();
+    const serve = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input, init) =>
+        String(input) === "/api/v2/admin/access-groups/1" && init?.method === "PUT"
+          ? jsonResponse({ error: "internal_error", message: "Could not save the group." }, 500)
+          : serve(input, init),
+      ),
+    );
+    const router = renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /Kids/ }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Allow downloads" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/admin/access-groups/1");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeInTheDocument();
+    expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
+  it("retries a failed group load when the same group is opened again", async () => {
+    const serve = globalThis.fetch;
+    let groupReads = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input, init) => {
+        if (
+          String(input) === "/api/v2/admin/access-groups/1" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          groupReads += 1;
+          if (groupReads === 1) return jsonResponse({ error: "unavailable", message: "down" }, 503);
+        }
+        return serve(input, init);
+      }),
+    );
+    const router = renderPage("/admin/access-groups/1");
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.queryByText("Loading group editor...")).not.toBeInTheDocument();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Kids/ }));
+    expect(await screen.findByLabelText("Name")).toHaveValue("Kids");
+    expect(groupReads).toBe(2);
+    expect(router.state.location.pathname).toBe("/admin/access-groups/1");
+  });
+
+  function holdCreate() {
+    const serve = globalThis.fetch;
+    let finish: () => void = () => {};
+    const created = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input, init) => {
+        if (String(input) === "/api/v2/admin/access-groups" && init?.method === "POST") {
+          await created;
+          return jsonResponse({ ...GROUP, id: "7", name: "Guests", is_default: false }, 201);
+        }
+        return serve(input, init);
+      }),
+    );
+    return finish;
+  }
+
+  async function startCreate(name: string) {
+    fireEvent.click(await screen.findByRole("button", { name: /New group/ }));
+    fireEvent.change(screen.getByLabelText("New group name"), { target: { value: name } });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+  }
+
+  it("keeps the admin on a group they opened while another was being created", async () => {
+    const finish = holdCreate();
+    const router = renderPage();
+    await startCreate("Guests");
+    fireEvent.click(await screen.findByRole("button", { name: /Kids/ }));
+    expect(await screen.findByLabelText("Name")).toHaveValue("Kids");
+
+    finish();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Create" })).toBeNull());
+    expect(router.state.location.pathname).toBe("/admin/access-groups/1");
+    expect(screen.getByLabelText("Name")).toHaveValue("Kids");
+  });
+
+  it("keeps the admin on a group they reopened while it was being deleted", async () => {
+    const serve = globalThis.fetch;
+    let finish: () => void = () => {};
+    const deleted = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const deleteStarted = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input, init) => {
+        const method = init?.method ?? "GET";
+        if (String(input) === "/api/v2/admin/access-groups/1" && method === "GET") {
+          return new Response(JSON.stringify({ ...GROUP, is_default: false }), {
+            headers: { "Content-Type": "application/json", ETag: '"initial"' },
+          });
+        }
+        if (method === "DELETE") {
+          deleteStarted();
+          await deleted;
+          return new Response(null, { status: 204 });
+        }
+        return serve(input, init);
+      }),
+    );
+    const router = renderPage("/admin/access-groups/1");
+    fireEvent.click(await screen.findByRole("button", { name: "Delete group" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(deleteStarted).toHaveBeenCalledOnce());
+    await act(() => router.navigate("/admin/access-groups"));
+    fireEvent.click(await screen.findByRole("button", { name: /Kids/ }));
+    expect(await screen.findByLabelText("Name")).toHaveValue("Kids");
+    const reopened = router.state.location.key;
+
+    await act(async () => finish());
+    expect(router.state.location.key).toBe(reopened);
+    expect(router.state.location.pathname).toBe("/admin/access-groups/1");
+  });
+
+  it("locks demotion and deletion for the default group", async () => {
+    const router = renderPage("/admin/access-groups/1");
+    expect(await screen.findByLabelText("Name")).toHaveValue("Kids");
+
+    // The server rejects demoting or deleting the default group, so the
+    // editor disables both paths and explains the promote-another-group flow.
+    expect(await screen.findByRole("switch", { name: "Default for new users" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /delete group/i })).toBeDisabled();
+    expect(screen.getByText(/make another group the default first/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "All groups" }));
+    expect(await screen.findByRole("heading", { name: "Access Groups" })).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/admin/access-groups");
+  });
+
+  it("keeps the move warning when the cached member count is zero", async () => {
+    // The list's count can be stale: an account may have joined since it loaded.
+    group = { ...GROUP, is_default: false, member_count: 0 };
+    const everyone = { ...GROUP, id: "2", name: "Everyone", is_default: true, member_count: 0 };
+    const serve = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input, init) =>
+        String(input) === "/api/v2/admin/access-groups?limit=200" &&
+        (init?.method ?? "GET") === "GET"
+          ? jsonResponse({ items: [group, everyone], page: { has_more: false } })
+          : serve(input, init),
+      ),
+    );
+    renderPage("/admin/access-groups/1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Delete group" }));
+    const dialog = await screen.findByRole("alertdialog");
+    await waitFor(() =>
+      expect(dialog).toHaveTextContent(
+        "Any members (none when this list last loaded) will move to the default group, Everyone, and get its access right away, without being signed out",
+      ),
+    );
+    expect(dialog).not.toHaveTextContent("This group has no members");
+  });
+
+  it("saves the group's profile limit and won't save one below 1", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /Kids/ }));
+    const limit = await screen.findByRole("spinbutton", { name: "Max profiles" });
+    expect(limit).toHaveValue(5);
+    fireEvent.change(limit, { target: { value: "0" } });
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    fireEvent.change(limit, { target: { value: "3" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => {
+      expect(putBody).toMatchObject({ max_profiles: 3 });
+    });
+  });
+
+  it("blocks saving until a custom limit is a valid Mbps value and warns below 1 Mbps", async () => {
+    group = { ...GROUP, max_remote_stream_bitrate_kbps: 4500 };
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /Kids/ }));
+    const limit = await screen.findByLabelText("Max remote stream bitrate in Mbps");
+    expect(limit).toHaveValue("4.5");
+    expect(screen.getByRole("combobox", { name: "Max remote stream bitrate" })).toHaveTextContent(
+      "Custom",
+    );
+    expect(screen.getByRole("combobox", { name: "Max local stream bitrate" })).toHaveTextContent(
+      "Unlimited",
+    );
+    const save = screen.getByRole("button", { name: "Save changes" });
+
+    // A cleared box is an unsaved edit, never a silent 0 (unlimited).
+    fireEvent.change(limit, { target: { value: "" } });
+    expect(save).toBeDisabled();
+    expect(screen.getByText(/Enter a value above 0 Mbps/)).toBeInTheDocument();
+
+    // 0 means unlimited and has its own choice, so a half-typed "0." is not a cap.
+    fireEvent.change(limit, { target: { value: "0." } });
+    expect(save).toBeDisabled();
+    // kbps resolution is the floor; finer values are rejected, not rounded.
+    fireEvent.change(limit, { target: { value: "0.0005" } });
+    expect(limit).toHaveValue("0.0005");
+    expect(save).toBeDisabled();
+
+    fireEvent.change(limit, { target: { value: "0.5" } });
+    expect(save).toBeEnabled();
+    expect(screen.getByText(/Below 1 Mbps/)).toBeInTheDocument();
+    fireEvent.click(save);
+    await waitFor(() => {
+      expect(putBody).toMatchObject({ max_remote_stream_bitrate_kbps: 500 });
+    });
+  });
+});
+
+/** The 412 a stale write gets; `headers` adds to the problem content type. */
+function reloadCurrentState(headers: Record<string, string> = {}) {
+  return new Response(
+    JSON.stringify({
+      type: "https://silo.example/problems/precondition_failed",
+      title: "Changed",
+      status: 412,
+      detail: "Reload current state",
+    }),
+    { status: 412, headers: { "Content-Type": "application/problem+json", ...headers } },
+  );
+}
+
+describe("AdminAccessGroups revisions and capability", () => {
+  beforeEach(() => {
+    installPolicyStorageMocks();
+    setAccessToken("account");
+    setProfileId("owner");
+    setProfileToken(null);
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps a stale draft and requires explicit canonical reload before resubmission", async () => {
+    let reads = 0;
+    const tags: (string | null)[] = [];
+    const bodies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input, init) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url === "/api/v2/admin/users/capabilities")
+          return jsonResponse({ access_groups: true });
+        if (url.includes("/admin/access-groups?"))
+          return jsonResponse({ items: [GROUP], page: { has_more: false } });
+        if (url === "/api/v2/admin/access-groups/1" && method === "GET") {
+          reads++;
+          return new Response(
+            JSON.stringify({ ...GROUP, name: reads === 1 ? "Canonical" : "Someone else's name" }),
+            {
+              headers: {
+                "Content-Type": "application/json",
+                ETag: reads === 1 ? '"old"' : '"fresh"',
+              },
+            },
+          );
+        }
+        if (method === "PUT") {
+          tags.push(new Headers(init?.headers).get("If-Match"));
+          bodies.push(JSON.parse(String(init?.body)));
+          if (tags.length === 1) return reloadCurrentState({ ETag: '"must-not-adopt"' });
+          return new Response(JSON.stringify(GROUP), {
+            headers: { "Content-Type": "application/json", ETag: '"saved"' },
+          });
+        }
+        if (url.includes("libraries")) return jsonResponse([]);
+        return jsonResponse({}, 404);
+      }),
+    );
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /Kids/ }));
+    const name = await screen.findByLabelText("Name");
+    expect(name).toHaveValue("Canonical");
+    fireEvent.change(name, { target: { value: "My draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText(/Your draft is preserved/);
+    expect(name).toHaveValue("My draft");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    expect(reads).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: "Reload current group" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled());
+    expect(name).toHaveValue("My draft");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(tags).toEqual(['"old"', '"fresh"']));
+    expect(bodies.map((body) => body.name)).toEqual(["My draft", "My draft"]);
+  });
+
+  it("keeps delete confirmation after conflict and reloads before retry", async () => {
+    let reads = 0;
+    const tags: (string | null)[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input, init) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url === "/api/v2/admin/users/capabilities")
+          return jsonResponse({ access_groups: true });
+        if (url.includes("/admin/access-groups?"))
+          return jsonResponse({ items: [GROUP], page: { has_more: false } });
+        if (url === "/api/v2/admin/access-groups/1" && method === "GET") {
+          reads++;
+          return new Response(JSON.stringify({ ...GROUP, is_default: false }), {
+            headers: {
+              "Content-Type": "application/json",
+              ETag: reads === 1 ? '"old"' : '"fresh"',
+            },
+          });
+        }
+        if (method === "DELETE") {
+          tags.push(new Headers(init?.headers).get("If-Match"));
+          if (tags.length === 1) return reloadCurrentState();
+          return new Response(null, { status: 204 });
+        }
+        return jsonResponse([]);
+      }),
+    );
+    const router = renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /Kids/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete group" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Delete" })).toBeDisabled());
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    expect(reads).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: "Reload current group" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Delete" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    expect(tags).toEqual(['"old"', '"fresh"']);
+    // Deleting replaces the group's history entry, so Back can't reopen it.
+    await waitFor(() => expect(router.state.location.pathname).toBe("/admin/access-groups"));
+    await router.navigate(-1);
+    expect(router.state.location.pathname).toBe("/admin/access-groups");
+  });
+
+  it("blocks configuration controls when capability is unavailable", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async (input) =>
+      String(input).includes("capabilities")
+        ? jsonResponse({ access_groups: false })
+        : jsonResponse({ items: [GROUP], page: { has_more: false } }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /Kids/ }));
+    expect(screen.getByText("Access group editing is unavailable.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New group" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Name")).not.toBeInTheDocument();
+    expect(fetch.mock.calls.every(([url]) => !String(url).endsWith("/1"))).toBe(true);
+  });
+});

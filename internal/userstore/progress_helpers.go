@@ -1,0 +1,347 @@
+package userstore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+type HistoryVisibilityStore interface {
+	VisibleHistoryTimestamps(ctx context.Context, profileID string, mediaItemIDs []string, at time.Time) (map[string]string, error)
+}
+
+// ErrHistoryEntryExists reports that a history entry with the given ID is
+// already stored. Random IDs never collide; a caller that derives the ID from
+// a play uses it to record that play once. A completed entry repeating an ID
+// stored incomplete is not refused: it marks the stored entry completed.
+var ErrHistoryEntryExists = errors.New("watch history entry already exists")
+
+type VisibleHistoryAdder interface {
+	AddVisibleHistory(ctx context.Context, entry WatchHistoryEntry) (WatchHistoryEntry, error)
+}
+
+func AddVisibleHistory(ctx context.Context, store UserStore, entry WatchHistoryEntry) (WatchHistoryEntry, error) {
+	if adder, ok := store.(VisibleHistoryAdder); ok {
+		return adder.AddVisibleHistory(ctx, entry)
+	}
+	entryTimes, err := VisibleHistoryTimestamps(ctx, store, entry.ProfileID, []string{entry.MediaItemID}, parseHistoryTimestamp(entry.WatchedAt))
+	if err != nil {
+		return entry, err
+	}
+	if entryTime := entryTimes[entry.MediaItemID]; entryTime != "" {
+		entry.WatchedAt = entryTime
+	}
+	if err := store.AddHistory(ctx, entry); err != nil {
+		return entry, err
+	}
+	return entry, nil
+}
+
+// UpdateProgressReportingCompletion writes one playback sample through
+// UpdateProgress and reports whether that write marked the item watched.
+// Only a sample past the watched threshold can, so the prior row is read for
+// those samples alone. A failed read does not block the write; it reports
+// completion, so the caller errs toward treating the sample as a change.
+func UpdateProgressReportingCompletion(ctx context.Context, store UserStore, profileID, mediaItemID string, position, duration float64, thresholds ProgressThresholds) (completed bool, err error) {
+	if _, pastThreshold, skip := ResolveProgressState(position, duration, thresholds); skip || !pastThreshold {
+		return false, store.UpdateProgress(ctx, profileID, mediaItemID, position, duration, thresholds)
+	}
+	prior, priorErr := store.GetProgress(ctx, profileID, mediaItemID)
+	wasCompleted := priorErr == nil && prior != nil && prior.Completed
+	if err := store.UpdateProgress(ctx, profileID, mediaItemID, position, duration, thresholds); err != nil {
+		return false, err
+	}
+	return !wasCompleted, nil
+}
+
+// MarkWatchedTarget is one leaf item to mark watched, carrying the duration
+// that belongs on its progress row.
+type MarkWatchedTarget struct {
+	MediaItemID     string
+	DurationSeconds float64
+	// EventAt preserves an explicitly supplied progress date while the write
+	// timestamp advances independently. Nil retains normal manual-mark timing.
+	EventAt *time.Time
+	// RecordRewatch marks a completed target that has a resume position again,
+	// recording its play; otherwise a completed target is left as it is.
+	RecordRewatch bool
+}
+
+// WatchedBatchWriter is an optional store capability: mark every target
+// watched and insert its history row in a single transaction, so a canceled
+// request leaves nothing marked instead of a partial subset. Marking a large
+// series is the motivating case — the per-target fallback below commits each
+// episode independently, so losing the request mid-loop strands the series
+// half-watched.
+//
+// Implementations preserve per-target duration on the progress
+// row; already-completed visible targets produce no history or returned entry.
+// The completed-state check and writes are atomic. Both respect the
+// hidden-history watermark the single-row MarkWatched/AddVisibleHistory paths
+// apply. The returned entries carry the resolved (possibly watermark-adjusted)
+// WatchedAt, in the order given.
+type WatchedBatchWriter interface {
+	MarkWatchedBatch(ctx context.Context, profileID string, targets []MarkWatchedTarget, entries []WatchHistoryEntry) ([]WatchHistoryEntry, error)
+}
+
+// MarkWatchedBatch marks every target watched and records its history entry,
+// atomically where the store supports it. targets and entries are parallel:
+// entries[i] is the history row for targets[i].
+func MarkWatchedBatch(ctx context.Context, store UserStore, profileID string, targets []MarkWatchedTarget, entries []WatchHistoryEntry) ([]WatchHistoryEntry, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	if writer, ok := store.(WatchedBatchWriter); ok {
+		return writer.MarkWatchedBatch(ctx, profileID, targets, entries)
+	}
+	for _, target := range targets {
+		if target.EventAt != nil {
+			return nil, fmt.Errorf("explicit dated marks require transactional batch support")
+		}
+	}
+	written := make([]WatchHistoryEntry, 0, len(entries))
+	for i, target := range targets {
+		if err := store.MarkWatched(ctx, profileID, target.MediaItemID, target.DurationSeconds); err != nil {
+			return written, err
+		}
+		if i >= len(entries) {
+			continue
+		}
+		entry, err := AddVisibleHistory(ctx, store, entries[i])
+		if err != nil {
+			return written, err
+		}
+		written = append(written, entry)
+	}
+	return written, nil
+}
+
+func VisibleHistoryTimestamps(ctx context.Context, store UserStore, profileID string, mediaItemIDs []string, at time.Time) (map[string]string, error) {
+	mediaItemIDs = compactHistoryMediaItemIDs(mediaItemIDs)
+	result := make(map[string]string, len(mediaItemIDs))
+	if len(mediaItemIDs) == 0 {
+		return result, nil
+	}
+	if visibilityStore, ok := store.(HistoryVisibilityStore); ok {
+		return visibilityStore.VisibleHistoryTimestamps(ctx, profileID, mediaItemIDs, at)
+	}
+	timestamp := at.UTC().Format(time.RFC3339)
+	if at.IsZero() {
+		timestamp = time.Now().UTC().Format(time.RFC3339)
+	}
+	for _, mediaItemID := range mediaItemIDs {
+		result[mediaItemID] = timestamp
+	}
+	return result, nil
+}
+
+func parseHistoryTimestamp(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
+}
+
+// SeriesWatchCounts is the aggregate episode watch state for one series or
+// season, as computed by SeriesEpisodeRollupStore.
+type SeriesWatchCounts struct {
+	TotalEpisodes   int
+	WatchedCount    int
+	InProgressCount int
+}
+
+// SeriesEpisodeRollupStore is an optional store capability: compute the
+// per-series or per-season episode watch-state rollup (total / watched /
+// in-progress episode counts) in SQL instead of materializing every episode
+// and batching per-episode progress lookups through
+// ListProgressWithCompletedHistory. Implemented by the Postgres store, where
+// episodes and progress live in the same database; SQLite-backed stores fall
+// back to the chunked in-memory path. Semantics must match
+// ListProgressWithCompletedHistory + catalog.EpisodeRollupUserData: an episode
+// counts when it is available (has library membership), is watched when its
+// visible progress row is completed or a visible completed history row
+// exists, and is in-progress when it is not watched and its visible progress
+// row has position_seconds > 0. Parents without available episodes are
+// absent from the result.
+type SeriesEpisodeRollupStore interface {
+	SeriesEpisodeWatchCounts(ctx context.Context, profileID string, seriesIDs []string) (map[string]SeriesWatchCounts, error)
+	// SeriesSeasonWatchCounts groups one series' episodes by season number.
+	SeriesSeasonWatchCounts(ctx context.Context, profileID, seriesID string) (map[int]SeriesWatchCounts, error)
+	// SeasonEpisodeWatchCounts groups episodes by their season row ID.
+	SeasonEpisodeWatchCounts(ctx context.Context, profileID string, seasonIDs []string) (map[string]SeriesWatchCounts, error)
+}
+
+// HomeDismissalItemReader reads a profile's dismissals of specific items on
+// one Home surface, so a caller that needs a series' episodes does not list
+// every dismissal of the surface. Implemented by the Postgres store; callers
+// fall back to ListHomeDismissals and filter.
+type HomeDismissalItemReader interface {
+	ListHomeDismissalsForItems(ctx context.Context, profileID, surface string, mediaItemIDs []string) ([]HomeItemDismissal, error)
+}
+
+// EpisodeParentCompletionStore determines whether every available episode of a
+// series or season is completed. Empty parents are not completed. Implementations
+// must use the same progress and completed-history visibility rules as
+// ListProgressWithCompletedHistory, and count episode-library membership as
+// availability, including missing files. Callers needing only a played flag can
+// stop at the first incomplete episode instead of materializing all child IDs.
+type EpisodeParentCompletionStore interface {
+	SeriesCompletion(ctx context.Context, profileID string, seriesIDs []string) (map[string]bool, error)
+	SeasonCompletion(ctx context.Context, profileID string, seasonIDs []string) (map[string]bool, error)
+}
+
+// CompletedHistoryItemMap returns the latest completed-history item row for a
+// scoped item query. Lookup failures degrade to an empty map so user-data
+// enrichment can keep returning progress rows.
+func CompletedHistoryItemMap(ctx context.Context, store ProgressCompletionStore, query CompletedHistoryItemQuery) map[string]CompletedHistoryItem {
+	result := map[string]CompletedHistoryItem{}
+	if store == nil || query.ProfileID == "" {
+		return result
+	}
+	query.MediaItemIDs = compactHistoryMediaItemIDs(query.MediaItemIDs)
+	if len(query.MediaItemIDs) == 0 {
+		return result
+	}
+	items, err := store.ListCompletedHistoryItems(ctx, query)
+	if err != nil {
+		return result
+	}
+	for _, item := range items {
+		if item.MediaItemID != "" {
+			result[item.MediaItemID] = item
+		}
+	}
+	return result
+}
+
+// GetProgressWithCompletedHistory returns normal progress overlaid with
+// completed history for callers that present a single item's played state.
+func GetProgressWithCompletedHistory(ctx context.Context, store UserStore, profileID, mediaItemID string) (*WatchProgress, error) {
+	mediaItemID = strings.TrimSpace(mediaItemID)
+	if store == nil || profileID == "" || mediaItemID == "" {
+		return nil, nil
+	}
+	progress, err := store.GetProgress(ctx, profileID, mediaItemID)
+	if err != nil {
+		return nil, err
+	}
+	if progress != nil && progress.Completed {
+		return progress, nil
+	}
+	completed := CompletedHistoryItemMap(ctx, store, CompletedHistoryItemQuery{
+		ProfileID:    profileID,
+		MediaItemIDs: []string{mediaItemID},
+	})[mediaItemID]
+	return WithCompletedHistory(progress, completed, profileID, mediaItemID), nil
+}
+
+// WithCompletedHistory overlays one item's latest completed history entry on
+// its progress row the way GetProgressWithCompletedHistory presents it. A
+// completed row is returned as it is, and a zero entry (no completed watch)
+// leaves progress unchanged.
+func WithCompletedHistory(progress *WatchProgress, completed CompletedHistoryItem, profileID, mediaItemID string) *WatchProgress {
+	if (progress != nil && progress.Completed) || completed.MediaItemID == "" {
+		return progress
+	}
+	if progress == nil {
+		return &WatchProgress{
+			ProfileID:   profileID,
+			MediaItemID: mediaItemID,
+			Completed:   true,
+			UpdatedAt:   completed.WatchedAt,
+		}
+	}
+	progress.Completed = true
+	if timestampAfter(completed.WatchedAt, progress.UpdatedAt) {
+		progress.UpdatedAt = completed.WatchedAt
+	}
+	return progress
+}
+
+// ListProgressWithCompletedHistory returns progress for mediaItemIDs with
+// completed history folded into the map. History is only queried for IDs that
+// are not already completed by a progress row.
+func ListProgressWithCompletedHistory(ctx context.Context, store ProgressCompletionStore, profileID string, mediaItemIDs []string) (map[string]WatchProgress, error) {
+	mediaItemIDs = compactHistoryMediaItemIDs(mediaItemIDs)
+	if store == nil || profileID == "" || len(mediaItemIDs) == 0 {
+		return map[string]WatchProgress{}, nil
+	}
+	progressMap, err := store.ListProgressByMediaItems(ctx, profileID, mediaItemIDs)
+	if err != nil {
+		return nil, err
+	}
+	if progressMap == nil {
+		progressMap = map[string]WatchProgress{}
+	}
+
+	candidates := make([]string, 0, len(mediaItemIDs))
+	for _, mediaItemID := range mediaItemIDs {
+		if progress, ok := progressMap[mediaItemID]; ok && progress.Completed {
+			continue
+		}
+		candidates = append(candidates, mediaItemID)
+	}
+	if len(candidates) == 0 {
+		return progressMap, nil
+	}
+
+	completed := CompletedHistoryItemMap(ctx, store, CompletedHistoryItemQuery{
+		ProfileID:    profileID,
+		MediaItemIDs: candidates,
+	})
+	for mediaItemID, completedItem := range completed {
+		if progress, ok := progressMap[mediaItemID]; ok {
+			progress.Completed = true
+			if timestampAfter(completedItem.WatchedAt, progress.UpdatedAt) {
+				progress.UpdatedAt = completedItem.WatchedAt
+			}
+			progressMap[mediaItemID] = progress
+			continue
+		}
+		progressMap[mediaItemID] = WatchProgress{
+			ProfileID:   profileID,
+			MediaItemID: mediaItemID,
+			Completed:   true,
+			UpdatedAt:   completedItem.WatchedAt,
+		}
+	}
+	return progressMap, nil
+}
+
+func compactHistoryMediaItemIDs(mediaItemIDs []string) []string {
+	result := make([]string, 0, len(mediaItemIDs))
+	seen := make(map[string]struct{}, len(mediaItemIDs))
+	for _, mediaItemID := range mediaItemIDs {
+		mediaItemID = strings.TrimSpace(mediaItemID)
+		if mediaItemID == "" {
+			continue
+		}
+		if _, ok := seen[mediaItemID]; ok {
+			continue
+		}
+		seen[mediaItemID] = struct{}{}
+		result = append(result, mediaItemID)
+	}
+	return result
+}
+
+func timestampAfter(left, right string) bool {
+	if left == "" {
+		return false
+	}
+	if right == "" {
+		return true
+	}
+	leftTime, leftErr := time.Parse(time.RFC3339, left)
+	rightTime, rightErr := time.Parse(time.RFC3339, right)
+	if leftErr == nil && rightErr == nil {
+		return leftTime.After(rightTime)
+	}
+	return left > right
+}

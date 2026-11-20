@@ -1,0 +1,393 @@
+package apiv2
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/iotest"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	"github.com/Silo-Server/silo-server/internal/playback"
+)
+
+const deliveryTestSession = "11111111-1111-4111-8111-111111111111"
+
+func TestPlaybackDeliveryV2BytesErrorsAndAuthorization(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	calls := 0
+	deps.PlaybackMedia = &PlaybackMediaHandlers{Original: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Query().Get("st") != "opaque" {
+			t.Error("signed reference changed")
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		http.ServeContent(w, r, "fixture.mp4", time.Time{}, strings.NewReader("0123456789"))
+	})}
+	h := newTestHandler(t, deps)
+	path := Prefix + "/stream/" + deliveryTestSession + "?st=opaque"
+	full := do(t, h, http.MethodGet, path, "", viewerHeaders())
+	if full.Code != 200 || full.Body.String() != "0123456789" {
+		t.Fatalf("full bytes: %d %q", full.Code, full.Body.String())
+	}
+	rangeResponse := do(t, h, http.MethodGet, path, "", with(viewerHeaders(), "Range", "bytes=2-4"))
+	if rangeResponse.Code != 206 || rangeResponse.Body.String() != "234" || rangeResponse.Header().Get("Content-Range") != "bytes 2-4/10" {
+		t.Fatalf("range: %d %s %v", rangeResponse.Code, rangeResponse.Body.String(), rangeResponse.Header())
+	}
+	head := do(t, h, http.MethodHead, path, "", viewerHeaders())
+	if head.Code != 200 || head.Body.Len() != 0 || head.Header().Get("Content-Length") != "10" {
+		t.Fatalf("HEAD: %d %s %v", head.Code, head.Body.String(), head.Header())
+	}
+	invalidRange := do(t, h, http.MethodGet, path, "", with(viewerHeaders(), "Range", "bytes=30-40"))
+	requireProblem(t, invalidRange, TypeRangeNotSatisfiable)
+	if invalidRange.Header().Get("Content-Range") != "bytes */10" || invalidRange.Header().Get("Content-Length") != "" {
+		t.Fatalf("range problem metadata: %v", invalidRange.Header())
+	}
+	queryAuth := do(t, h, http.MethodGet, path+"&token="+memberToken, "", nil)
+	if queryAuth.Code != 200 || queryAuth.Body.String() != "0123456789" {
+		t.Fatalf("media query auth: %d %s", queryAuth.Code, queryAuth.Body.String())
+	}
+	before := calls
+	requireProblem(t, do(t, h, http.MethodGet, path, "", with(bearer(memberToken), "X-Profile-Id", "p-other")), TypeNotFound)
+	if calls != before {
+		t.Fatal("rejected viewer reached media")
+	}
+	deps.PlaybackMedia = nil
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodGet, path, "", viewerHeaders()), TypeDependencyUnavailable)
+}
+
+// A relay answers 502 when its transcode node is unreachable, keyless, or
+// refused the relay's signature: the node is unavailable, which v2 reports as
+// a retryable dependency failure rather than an internal error.
+func TestPlaybackDeliveryNodeUnavailableIsDependencyUnavailable(t *testing.T) {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, Prefix+"/stream/"+deliveryTestSession, nil)
+	writer := &playbackDeliveryWriter{ResponseWriter: w, request: r}
+	http.Error(writer, "transcode node unavailable", http.StatusBadGateway)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), TypeDependencyUnavailable.ID) {
+		t.Fatalf("node unavailable = %d %s, want 503 %s", w.Code, w.Body.String(), TypeDependencyUnavailable.ID)
+	}
+}
+
+func TestPlaybackDeliveryProblemDropsLegacyBodyAndHeaders(t *testing.T) {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, Prefix+"/stream/"+deliveryTestSession, nil)
+	writer := &playbackDeliveryWriter{ResponseWriter: w, request: r}
+	writer.Header().Set("Content-Length", "10000")
+	writer.Header().Set("Location", "PRIVATE_LOCATION")
+	writer.Header().Set("Content-Encoding", "gzip")
+	http.Error(writer, "PRIVATE_ERROR", http.StatusServiceUnavailable)
+	if w.Code != 503 || strings.Contains(w.Body.String(), "PRIVATE") || w.Header().Get("Content-Length") != "" || w.Header().Get("Location") != "" || w.Header().Get("Content-Encoding") != "" {
+		t.Fatalf("unsafe error: %d %s %v", w.Code, w.Body.String(), w.Header())
+	}
+}
+
+func TestPlaybackDeliveryFailureAfterBytesAborts(t *testing.T) {
+	w := httptest.NewRecorder()
+	writer := &playbackDeliveryWriter{ResponseWriter: w, request: httptest.NewRequest(http.MethodGet, "/", nil)}
+	_, _ = io.WriteString(writer, "first")
+	defer func() {
+		got := recover()
+		err, ok := got.(error)
+		if !ok || !errors.Is(err, http.ErrAbortHandler) {
+			t.Fatalf("late failure did not abort: %v", got)
+		}
+		if w.Body.String() != "first" {
+			t.Fatalf("appended error bytes: %q", w.Body.String())
+		}
+	}()
+	http.Error(writer, "PRIVATE_ERROR", 500)
+}
+
+// A file served on the v2 stream route must reach the connection's ReadFrom,
+// which is net/http's sendfile path, with the file still visible under at most
+// one limiter. io.Copy finds ReadFrom only by direct assertion, so every writer
+// on the route has to forward it. The handler is the real direct-play path,
+// with its rolling-deadline writer on top.
+func TestPlaybackDeliveryKeepsZeroCopy(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	body := strings.Repeat("x", 64<<10)
+	path := filepath.Join(t.TempDir(), "fixture.mp4")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deps.PlaybackMedia = &PlaybackMediaHandlers{Original: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := playback.ServeDirectPlay(w, r, path); err != nil {
+			t.Errorf("direct play: %v", err)
+		}
+	})}
+	h := newTestHandler(t, deps)
+	for _, tc := range []struct {
+		name, rangeHeader string
+		status            int
+		want              int64
+	}{
+		{"full", "", http.StatusOK, int64(len(body))},
+		{"range", "bytes=10-1033", http.StatusPartialContent, 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"?st=opaque", nil)
+			for k, v := range viewerHeaders() {
+				r.Header.Set(k, v)
+			}
+			if tc.rangeHeader != "" {
+				r.Header.Set("Range", tc.rangeHeader)
+			}
+			inner := &zeroCopyWriter{ResponseRecorder: httptest.NewRecorder()}
+			h.ServeHTTP(inner, r)
+			if inner.Code != tc.status || int64(inner.Body.Len()) != tc.want || inner.fromFile != tc.want {
+				t.Fatalf("status %d, body %d bytes, %d of them read from the file by ReadFrom; want %d and %d", inner.Code, inner.Body.Len(), inner.fromFile, tc.status, tc.want)
+			}
+		})
+	}
+}
+
+// A copy that starts before any status must not commit one until a byte
+// arrives: a source that fails at once still gets its problem response, and
+// one that fails after bytes ends the stream instead of appending JSON.
+func TestPlaybackDeliveryCopyBeforeStatus(t *testing.T) {
+	t.Run("fails before bytes", func(t *testing.T) {
+		inner := &zeroCopyWriter{ResponseRecorder: httptest.NewRecorder()}
+		writer := &playbackDeliveryWriter{ResponseWriter: inner, request: httptest.NewRequest(http.MethodGet, "/", nil)}
+		if _, err := io.Copy(writer, iotest.ErrReader(io.ErrUnexpectedEOF)); err == nil {
+			t.Fatal("copy succeeded")
+		}
+		http.Error(writer, "PRIVATE_ERROR", http.StatusServiceUnavailable)
+		if inner.Code != http.StatusServiceUnavailable || inner.Header().Get("Content-Type") != problemContentType || strings.Contains(inner.Body.String(), "PRIVATE") {
+			t.Fatalf("problem response: %d %v %s", inner.Code, inner.Header(), inner.Body.String())
+		}
+	})
+	t.Run("fails after bytes", func(t *testing.T) {
+		inner := &zeroCopyWriter{ResponseRecorder: httptest.NewRecorder()}
+		writer := &playbackDeliveryWriter{ResponseWriter: inner, request: httptest.NewRequest(http.MethodGet, "/", nil)}
+		// Hide MultiReader's WriteTo so io.Copy has to use the writer's ReadFrom.
+		src := struct{ io.Reader }{io.MultiReader(strings.NewReader("first"), iotest.ErrReader(io.ErrUnexpectedEOF))}
+		if _, err := io.Copy(writer, src); err == nil {
+			t.Fatal("copy succeeded")
+		}
+		defer func() {
+			if err, ok := recover().(error); !ok || !errors.Is(err, http.ErrAbortHandler) {
+				t.Fatalf("late failure did not abort: %v", err)
+			}
+			if inner.Code != http.StatusOK || inner.Body.String() != "first" {
+				t.Fatalf("appended error bytes: %d %q", inner.Code, inner.Body.String())
+			}
+		}()
+		http.Error(writer, "PRIVATE_ERROR", http.StatusBadGateway)
+	})
+}
+
+// A Google Cast receiver plays HLS from a script on its own origin: it can
+// read neither the playlist nor a segment, nor learn why one was refused,
+// unless every answer carries uncredentialed CORS.
+func TestPlaybackHLSDeliveryAnswersCrossOrigin(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	deps.PlaybackMedia = &PlaybackMediaHandlers{
+		Manifest: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte("#EXTM3U\n"))
+		}),
+		Segment: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/gone.m4s") {
+				http.Error(w, "gone", http.StatusGone)
+				return
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			http.ServeContent(w, r, "seg.m4s", time.Time{}, strings.NewReader("0123456789"))
+		}),
+		Original: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write([]byte("bytes"))
+		}),
+	}
+	h := newTestHandler(t, deps)
+	const castOrigin = "https://www.gstatic.com"
+	anonymous := map[string]string{"Origin": castOrigin}
+	viewer := with(viewerHeaders(), "Origin", castOrigin)
+	transcode := Prefix + "/playback/transcode/" + deliveryTestSession
+	requireCORS := func(name string, rec *httptest.ResponseRecorder) {
+		t.Helper()
+		if rec.Header().Get("Access-Control-Allow-Origin") != "*" ||
+			rec.Header().Get("Access-Control-Allow-Headers") != mediaCORSAllowHeaders ||
+			rec.Header().Get("Access-Control-Expose-Headers") != mediaCORSExposeHeaders ||
+			rec.Header().Get("Access-Control-Allow-Credentials") != "" {
+			t.Fatalf("%s: CORS headers %v", name, rec.Header())
+		}
+	}
+
+	manifest := do(t, h, http.MethodGet, transcode+"/master.m3u8?st=opaque", "", viewer)
+	if manifest.Code != http.StatusOK || manifest.Body.String() != "#EXTM3U\n" {
+		t.Fatalf("manifest: %d %q", manifest.Code, manifest.Body.String())
+	}
+	requireCORS("manifest", manifest)
+
+	segment := do(t, h, http.MethodGet, transcode+"/segment/seg_00001.m4s?st=opaque", "", with(viewer, "Range", "bytes=2-4"))
+	if segment.Code != http.StatusPartialContent || segment.Body.String() != "234" || segment.Header().Get("Content-Range") != "bytes 2-4/10" {
+		t.Fatalf("segment range: %d %q %v", segment.Code, segment.Body.String(), segment.Header())
+	}
+	requireCORS("segment", segment)
+
+	// The authorization gate refuses before the handler runs.
+	requireCORS("unauthenticated manifest", requireProblemResponse(t, do(t, h, http.MethodGet, transcode+"/master.m3u8?st=opaque", "", anonymous), TypeAuthenticationRequired))
+	requireCORS("unauthenticated segment", requireProblemResponse(t, do(t, h, http.MethodGet, transcode+"/segment/seg_00001.m4s?st=opaque", "", anonymous), TypeAuthenticationRequired))
+	// A handler failure becomes a problem through the delivery writer.
+	gone := do(t, h, http.MethodGet, transcode+"/segment/gone.m4s?st=opaque", "", viewer)
+	if gone.Code != http.StatusGone {
+		t.Fatalf("gone segment: %d %s", gone.Code, gone.Body.String())
+	}
+	requireCORS("gone segment", gone)
+
+	// Scope: other delivery and JSON operations keep the same-origin default.
+	for _, path := range []string{Prefix + "/stream/" + deliveryTestSession + "?st=opaque", Prefix + "/libraries"} {
+		if rec := do(t, h, http.MethodGet, path, "", viewer); rec.Header().Get("Access-Control-Allow-Origin") != "" {
+			t.Fatalf("%s gained CORS: %d %v", path, rec.Code, rec.Header())
+		}
+	}
+}
+
+func requireProblemResponse(t *testing.T, rec *httptest.ResponseRecorder, want ProblemType) *httptest.ResponseRecorder {
+	t.Helper()
+	requireProblem(t, rec, want)
+	return rec
+}
+
+func TestPlaybackDecisionV2ProjectsOnlyLocalMediaURLs(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"/api/v1/stream/session?st=opaque%2Btoken", "/api/v2/stream/session?st=opaque%2Btoken"},
+		{"/api/v1/playback/transcode/session/master.m3u8?st=opaque%2Btoken", "/api/v2/playback/transcode/session/master.m3u8?st=opaque%2Btoken"},
+		{"https://silo.example.test/opaque", "https://silo.example.test/opaque"},
+		{"/stream/s/subtitles/0.vtt?st=a%2Fb&file_id=7", "/api/v2/stream/s/subtitles/0.vtt?st=a%2Fb&file_id=7"},
+		{"/stream/s/subtitles/0/fonts?st=a%2Fb", "/api/v2/stream/s/subtitles/0/fonts?st=a%2Fb"},
+		{"/playback/transcode/s/master.m3u8?st=a%2Fb", "/api/v2/playback/transcode/s/master.m3u8?st=a%2Fb"},
+		{"https://stream.example/api/v1/stream/s?st=a%2Fb", "https://stream.example/api/v1/stream/s?st=a%2Fb"},
+		{"/api/v2/stream/s/subtitles/0.vtt?st=a%2Fb", "/api/v2/stream/s/subtitles/0.vtt?st=a%2Fb"},
+	} {
+		in := playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{Stream: playback.StreamV3{URL: tc.path}}}
+		out := playbackDecision(in)
+		if out.PlaybackPlan.Stream.URL != tc.want || in.PlaybackPlan.Stream.URL != tc.path {
+			t.Fatalf("projection of %q = %q, want %q; source = %q", tc.path, out.PlaybackPlan.Stream.URL, tc.want, in.PlaybackPlan.Stream.URL)
+		}
+	}
+}
+
+type fakeSubtitleFontService func(context.Context, handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error)
+
+func (f fakeSubtitleFontService) SubtitleFonts(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error) {
+	return f(ctx, in)
+}
+
+func TestPlaybackSubtitleDeliveryV2(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	subtitleCalls, fontCalls := 0, 0
+	var fontError error
+	var emptyFonts bool
+	deps.PlaybackMedia = &PlaybackMediaHandlers{
+		Subtitle: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			subtitleCalls++
+			if r.URL.Query().Get("st") != "opaque" || r.URL.Query().Get("file_id") != "42" {
+				t.Error("signed reference or source file changed")
+			}
+			w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			_, _ = w.Write([]byte("WEBVTT\n\n00:00.000 --> 00:01.000\ncue\n"))
+		}),
+		SubtitleFonts: fakeSubtitleFontService(func(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error) {
+			fontCalls++
+			if fontError != nil {
+				return nil, fontError
+			}
+			if in.SessionID != deliveryTestSession || in.Track != "1" || in.Query.Get("st") != "opaque" || in.Query.Get("file_id") != "42" || profileFrom(ctx) != "p-owner" {
+				t.Errorf("font service lost admission or inventory identity: %+v profile=%q", in, profileFrom(ctx))
+			}
+			if emptyFonts {
+				return nil, nil
+			}
+			return []playback.SubtitleFontBundleItem{{Name: "synthetic.ttf", Data: "AAEC"}}, nil
+		}),
+	}
+	h := newTestHandler(t, deps)
+	path := Prefix + "/stream/" + deliveryTestSession + "/subtitles/0.vtt?file_id=42&st=opaque"
+	get := do(t, h, http.MethodGet, path, "", viewerHeaders())
+	if get.Code != 200 || !strings.Contains(get.Body.String(), "WEBVTT") || get.Header().Get("Content-Type") != "text/vtt; charset=utf-8" {
+		t.Fatalf("subtitle: %d %q %v", get.Code, get.Body.String(), get.Header())
+	}
+	head := do(t, h, http.MethodHead, path, "", viewerHeaders())
+	if head.Code != 200 || head.Body.Len() != 0 {
+		t.Fatalf("HEAD: %d %q", head.Code, head.Body.String())
+	}
+	fonts := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"/subtitles/1/fonts?file_id=42&st=opaque", "", viewerHeaders())
+	var bundle Collection[PlaybackSubtitleFont]
+	decodeBody(t, fonts.Body, &bundle)
+	if fonts.Code != 200 || len(bundle.Items) != 1 || bundle.Items[0].Name != "synthetic.ttf" || bundle.Items[0].Data != "AAEC" || fonts.Header().Get("Cache-Control") != "no-store" || fonts.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("fonts: %d %+v %v", fonts.Code, bundle, fonts.Header())
+	}
+	emptyFonts = true
+	empty := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"/subtitles/1/fonts?file_id=42&st=opaque", "", viewerHeaders())
+	if empty.Code != http.StatusOK || !strings.Contains(empty.Body.String(), `"items":[]`) {
+		t.Fatalf("empty fonts: %d %s", empty.Code, empty.Body.String())
+	}
+	// Service refusals become v2 problems; extraction details remain private.
+	for _, refusal := range []struct {
+		err  error
+		want ProblemType
+	}{
+		{&handlers.APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "Subtitle font bundles are only available for ASS/SSA tracks"}, TypeValidationFailed},
+		{&handlers.APIError{Status: http.StatusNotFound, Code: "not_found", Message: "Embedded subtitle track not found"}, TypeNotFound},
+		{&handlers.APIError{Status: http.StatusForbidden, Code: "forbidden", Message: "Session belongs to another user"}, TypePermissionDenied},
+		{&handlers.APIError{Status: http.StatusGone, Code: "playback_session_ended", Message: "Playback session ended"}, TypePlaybackSessionEnded},
+		{&handlers.APIError{Status: http.StatusInternalServerError, Code: "font_extract_failed", Message: "PRIVATE_DETAIL"}, TypeInternalError},
+		{errors.New("PRIVATE_DETAIL"), TypeInternalError},
+	} {
+		fontError = refusal.err
+		rec := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"/subtitles/1/fonts?st=opaque", "", viewerHeaders())
+		requireProblem(t, rec, refusal.want)
+		if strings.Contains(rec.Body.String(), "PRIVATE_DETAIL") {
+			t.Fatalf("5xx message leaked: %s", rec.Body.String())
+		}
+	}
+	fontError = nil
+	// Two sidecar calls, two accepted font calls, and six refusals.
+	if subtitleCalls != 2 || fontCalls != 8 {
+		t.Fatalf("calls = %d/%d", subtitleCalls, fontCalls)
+	}
+	// Same gates as media bytes: a non-UUID session is a validation problem, a
+	// rejected viewer never reaches the producer, an unconfigured producer is 503.
+	requireProblem(t, do(t, h, http.MethodGet, Prefix+"/stream/not-a-uuid/subtitles/0.vtt?st=opaque", "", viewerHeaders()), TypeValidationFailed)
+	requireProblem(t, do(t, h, http.MethodGet, Prefix+"/stream/not-a-uuid/subtitles/0/fonts?st=opaque", "", viewerHeaders()), TypeValidationFailed)
+	before, fontsBefore := subtitleCalls, fontCalls
+	requireProblem(t, do(t, h, http.MethodGet, path, "", with(bearer(memberToken), "X-Profile-Id", "p-other")), TypeNotFound)
+	requireProblem(t, do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"/subtitles/1/fonts?st=opaque", "", with(bearer(memberToken), "X-Profile-Id", "p-other")), TypeNotFound)
+	if subtitleCalls != before || fontCalls != fontsBefore {
+		t.Fatal("rejected viewer reached the subtitle producer")
+	}
+	deps.PlaybackMedia = &PlaybackMediaHandlers{}
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodGet, path, "", viewerHeaders()), TypeDependencyUnavailable)
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"/subtitles/1/fonts?st=opaque", "", viewerHeaders()), TypeDependencyUnavailable)
+}
+
+func TestPlaybackDecisionV2ProjectsSubtitleURLsWithoutMutatingSource(t *testing.T) {
+	in := playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{Stream: playback.StreamV3{URL: "/api/v1/stream/s?st=x"}, Subtitle: playback.SubtitleDecisionV3{
+		Artifact: &playback.SubtitleArtifactV3{URL: "/api/v1/stream/s/subtitles/1.ass?file_id=42&st=x"},
+		Inventory: []playback.SubtitleInventoryItemV3{
+			{CombinedIndex: 0, URL: "/api/v1/stream/s/subtitles/0.vtt?file_id=42&st=x"},
+			{CombinedIndex: 1, URL: "/api/v1/stream/s/subtitles/1.ass?file_id=42&st=x", FontBundleURL: "/api/v1/stream/s/subtitles/1/fonts?file_id=42&st=x"},
+			{CombinedIndex: 2, URL: "/stream/legacy/subtitles/2.vtt?file_id=42"},
+		}}}}
+	out := playbackDecision(in)
+	sub := out.PlaybackPlan.Subtitle
+	if sub.Artifact.URL != Prefix+"/stream/s/subtitles/1.ass?file_id=42&st=x" || sub.Inventory[0].URL != Prefix+"/stream/s/subtitles/0.vtt?file_id=42&st=x" || sub.Inventory[1].FontBundleURL != Prefix+"/stream/s/subtitles/1/fonts?file_id=42&st=x" || sub.Inventory[2].URL != Prefix+"/stream/legacy/subtitles/2.vtt?file_id=42" {
+		t.Fatalf("projection: %+v %+v", sub.Artifact, sub.Inventory)
+	}
+	if in.PlaybackPlan.Subtitle.Artifact.URL != "/api/v1/stream/s/subtitles/1.ass?file_id=42&st=x" || in.PlaybackPlan.Subtitle.Inventory[0].URL != "/api/v1/stream/s/subtitles/0.vtt?file_id=42&st=x" {
+		t.Fatal("projection mutated the persisted decision")
+	}
+}

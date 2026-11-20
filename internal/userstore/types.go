@@ -1,0 +1,592 @@
+package userstore
+
+import (
+	"fmt"
+	"math"
+	"regexp"
+	"strconv"
+	"time"
+)
+
+// Profile represents a user profile.
+type Profile struct {
+	ID               string
+	Name             string
+	Avatar           string
+	PINHash          string
+	IsChild          bool
+	IsPrimary        bool
+	MaxContentRating string
+	// MaxAdvisoryAge is the profile's advisory-age limit (see
+	// access.MaturityLimits.MaxAdvisoryAge); 0 means no limit and is stored
+	// as NULL.
+	MaxAdvisoryAge int
+	// PINRevision advances whenever this profile's PIN is set, changed or
+	// cleared. Profile verification tokens are bound to it, so a PIN change
+	// invalidates the profile's outstanding tokens while edits to any other
+	// field, or to another profile, leave them valid.
+	PINRevision int64
+	// RequireAdvisoryAge hides titles with no advisory age from the profile
+	// (see access.MaturityLimits.RequireAdvisoryAge). It only takes effect
+	// with a MaxAdvisoryAge limit.
+	RequireAdvisoryAge bool
+	// RequestsBlocked keeps the profile out of requests and request discovery
+	// even when its account may request. Stored as a block, not an allow, so
+	// the zero value of a profile built anywhere keeps today's behavior.
+	RequestsBlocked            bool
+	QualityPreference          string
+	Language                   string
+	PreferredMetadataLanguage  string // ISO 639-1; "" = inherit library metadata language
+	SubtitleLanguage           string
+	SubtitleMode               string
+	AutoSkipIntro              bool
+	AutoSkipCredits            bool
+	AutoSkipRecap              bool
+	AutoPlayNextPreview        bool
+	ShowForcedSubtitles        bool
+	LibraryRestrictionsEnabled bool
+	AllowedLibraryIDs          []int
+	// AllowedTitleIDs are the movies and series the profile may watch above
+	// its maturity limits (access.MaturityLimits.AllowedTitleIDs): its title
+	// allowances plus the titles of its live-allowed collections, sorted.
+	// Read-only here; only single-profile reads fill it, and the allowance
+	// service writes the rows.
+	AllowedTitleIDs    []string
+	MaxPlaybackQuality string
+	CreatedAt          string
+	UpdatedAt          string
+}
+
+// DeviceSettingEntry is a server-managed setting override scoped to one
+// durable app/device identity for one profile within a user.
+type DeviceSettingEntry struct {
+	ProfileID      string
+	DeviceID       string
+	DeviceName     string
+	DevicePlatform string
+	Key            string
+	Value          string
+	UpdatedAt      string
+}
+
+// DeviceEntry is a durable app/device identity observed for one profile
+// within a user. It lets admins configure a device before it has overrides.
+type DeviceEntry struct {
+	ProfileID      string
+	DeviceID       string
+	DeviceName     string
+	DevicePlatform string
+	// LastSeenAt is an RFC3339 timestamp. Every store formats it the same way so
+	// callers can parse it and compare it against other RFC3339 timestamps.
+	LastSeenAt string
+}
+
+// UpdateProfileInput holds optional fields for updating a profile.
+type UpdateProfileInput struct {
+	Name   *string
+	Avatar *string
+	// PINHash replaces the profile's PIN: a bcrypt hash the caller made
+	// (passwordhash.Generate) before opening any transaction, or "" to remove
+	// the PIN.
+	PINHash          *string
+	IsChild          *bool
+	MaxContentRating *string
+	// MaxAdvisoryAge: nil leaves the limit untouched, 0 clears it, and a
+	// positive age sets it.
+	MaxAdvisoryAge *int
+	// RequireAdvisoryAge: nil leaves it untouched.
+	RequireAdvisoryAge *bool
+	// RequestsBlocked: nil leaves it untouched.
+	RequestsBlocked            *bool
+	QualityPreference          *string
+	Language                   *string
+	PreferredMetadataLanguage  *string
+	SubtitleLanguage           *string
+	SubtitleMode               *string
+	AutoSkipIntro              *bool
+	AutoSkipCredits            *bool
+	AutoSkipRecap              *bool
+	AutoPlayNextPreview        *bool
+	ShowForcedSubtitles        *bool
+	LibraryRestrictionsEnabled *bool
+	AllowedLibraryIDs          *[]int
+	MaxPlaybackQuality         *string
+}
+
+// ProgressKey is the keyset position ListProgressPage resumes after: the
+// (UpdatedAt, MediaItemID) of the last row a caller already holds, copied
+// verbatim from a WatchProgress that ListProgressPage returned. The pair is
+// unique per profile (media_item_id is in the primary key), so together with
+// the fixed ORDER BY updated_at DESC, media_item_id DESC it orders every row
+// totally. UpdatedAt keeps whatever sub-second precision the store keeps, so
+// a round trip through the string compares equal to the stored value.
+type ProgressKey struct {
+	UpdatedAt   string
+	MediaItemID string
+}
+
+// ListKey is the keyset position ListFavoritesPage, ListWatchlistPage and
+// ListNotInterestedPage resume after: the (AddedAt, MediaItemID) of the last
+// row a caller already holds, copied verbatim from an entry the page
+// returned. media_item_id is unique per profile in each table, so with the fixed
+// ORDER BY added_at DESC, media_item_id DESC the pair orders every row
+// totally, and a row added or removed between pages neither repeats nor
+// hides another.
+type ListKey struct {
+	AddedAt     string
+	MediaItemID string
+}
+
+// HistoryKey is the keyset position of one visible history row in
+// (watched_at DESC, id DESC) order, in the store's own string form.
+type HistoryKey struct {
+	WatchedAt string
+	ID        string
+}
+
+// WatchProgress represents watch progress for a media item.
+type WatchProgress struct {
+	ProfileID       string
+	MediaItemID     string
+	PositionSeconds float64
+	DurationSeconds float64
+	Completed       bool
+	UpdatedAt       string
+	// UpdatedAtTime is UpdatedAt at the store's full precision, which
+	// UpdatedAt's whole seconds can lose. Zero when the store sets only
+	// UpdatedAt.
+	UpdatedAtTime  time.Time
+	LastFileID     *int
+	LastResolution *string
+	LastHDR        *bool
+	LastCodecVideo *string
+	LastEditionKey *string
+}
+
+const (
+	HomeSurfaceContinueWatching = "continue_watching"
+	HomeSurfaceNextUp           = "next_up"
+)
+
+type HomeItemDismissal struct {
+	ProfileID         string
+	Surface           string
+	MediaItemID       string
+	SeriesID          *string
+	ProgressUpdatedAt *string
+	DismissedAt       string
+}
+
+// VersionHints stores the file version traits from the last playback session.
+type VersionHints struct {
+	FileID     int
+	Resolution string
+	HDR        bool
+	CodecVideo string
+	EditionKey string
+}
+
+// WatchHistoryEntry represents a single watch history record.
+type WatchHistorySource string
+
+const (
+	WatchHistorySourceLegacy      WatchHistorySource = "legacy"
+	WatchHistorySourceManual      WatchHistorySource = "manual"
+	WatchHistorySourcePlayback    WatchHistorySource = "playback"
+	WatchHistorySourceImport      WatchHistorySource = "import"
+	WatchHistorySourceJellycompat WatchHistorySource = "jellycompat"
+	WatchHistorySourceTrakt       WatchHistorySource = "trakt"
+	WatchHistorySourceSimkl       WatchHistorySource = "simkl"
+	WatchHistorySourceMDBList     WatchHistorySource = "mdblist"
+)
+
+// pluginWatchSource is the source of plays a watch-sync plugin imported:
+// plugin:<installation id>:<capability id>, the plugin provider key
+// (watchsync.PluginProviderKey). A watch-sync capability id is a lowercase
+// path-safe slug, as the plugin manifest requires.
+var pluginWatchSource = regexp.MustCompile(`^plugin:([1-9][0-9]{0,9}):([a-z0-9]+(?:[._-][a-z0-9]+)*)$`)
+
+// maxPluginCapabilityID bounds a plugin watch source's capability id.
+const maxPluginCapabilityID = 128
+
+// PluginWatchSource is the source of a play a watch-sync plugin capability
+// of an installation imported.
+func PluginWatchSource(installationID int, capabilityID string) WatchHistorySource {
+	return WatchHistorySource(fmt.Sprintf("plugin:%d:%s", installationID, capabilityID))
+}
+
+// ParsePluginWatchSource reads PluginWatchSource; false for anything else,
+// including a zero or overflowing installation id and an overlong or
+// malformed capability id.
+func ParsePluginWatchSource(source string) (installationID int, capabilityID string, ok bool) {
+	m := pluginWatchSource.FindStringSubmatch(source)
+	if m == nil || len(m[2]) > maxPluginCapabilityID {
+		return 0, "", false
+	}
+	id, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil || id <= 0 || id > math.MaxInt32 {
+		return 0, "", false
+	}
+	return int(id), m[2], true
+}
+
+// WatchIdentity is the write-once archive payload stored with each history
+// row so that StableIdentityResolver can re-resolve a content ID after a
+// rescan or catalog rebind without hitting the catalog at query time.
+type WatchIdentity struct {
+	StableType        string            `json:"stable_type,omitempty"`
+	ProviderIDs       map[string]string `json:"provider_ids,omitempty"`
+	SeriesProviderIDs map[string]string `json:"series_provider_ids,omitempty"`
+	Season            *int              `json:"season,omitempty"`
+	Episode           *int              `json:"episode,omitempty"`
+}
+
+type WatchHistoryEntry struct {
+	ID          string
+	ProfileID   string
+	MediaItemID string
+	WatchedAt   string
+	// WatchedAtTime is WatchedAt at the store's full precision, which
+	// WatchedAt's whole seconds can lose. Zero when the store sets only
+	// WatchedAt.
+	WatchedAtTime   time.Time
+	DurationSeconds float64
+	Completed       bool
+	Source          WatchHistorySource
+	Identity        WatchIdentity
+}
+
+// CompletedHistoryKey is the keyset position ListCompletedHistory resumes
+// after: the last row a caller already holds, in the fixed (watched_at ASC,
+// id ASC) order. Build it with WatchHistoryEntry.CompletedHistoryKey so
+// WatchedAt keeps the store's full precision; a whole-second key would
+// repeat or skip rows that share its second.
+type CompletedHistoryKey struct {
+	WatchedAt string
+	ID        string
+}
+
+// CompletedHistoryKey returns the keyset position of e, a row
+// ListCompletedHistory returned.
+func (e WatchHistoryEntry) CompletedHistoryKey() *CompletedHistoryKey {
+	watchedAt := e.WatchedAt
+	if !e.WatchedAtTime.IsZero() {
+		watchedAt = e.WatchedAtTime.Format(time.RFC3339Nano)
+	}
+	return &CompletedHistoryKey{WatchedAt: watchedAt, ID: e.ID}
+}
+
+type CompletedHistoryQuery struct {
+	ProfileID      string
+	MediaItemIDs   []string
+	IncludeSources []WatchHistorySource
+	ExcludeSources []WatchHistorySource
+	// After, when set, starts the page after this row. Paging by key reads
+	// only the page; Offset re-reads every row before it, and a row added or
+	// hidden mid-walk shifts later pages.
+	After  *CompletedHistoryKey
+	Limit  int
+	Offset int
+}
+
+type CompletedHistoryItemQuery struct {
+	ProfileID      string
+	MediaItemIDs   []string
+	IncludeSources []WatchHistorySource
+	ExcludeSources []WatchHistorySource
+}
+
+// CompletedHistoryItem is one item's visible completed plays:
+// ListCompletedHistoryItems sets WatchedAt to the latest play and PlayCount to
+// how many plays it has.
+type CompletedHistoryItem struct {
+	MediaItemID string
+	WatchedAt   string
+	PlayCount   int
+}
+
+// Favorite represents a favorited media item.
+type Favorite struct {
+	ProfileID   string
+	MediaItemID string
+	AddedAt     string
+}
+
+// WatchlistEntry represents a watchlist item.
+type WatchlistEntry struct {
+	ProfileID   string
+	MediaItemID string
+	AddedAt     string
+}
+
+// NotInterestedEntry is a movie or series a profile marked Not interested.
+type NotInterestedEntry struct {
+	ProfileID   string
+	MediaItemID string
+	AddedAt     string
+}
+
+// Collection represents a user-created collection. CreatorProfileID owns it:
+// only that profile changes it. IsShared shows it to every profile on the
+// login, including profiles added later; otherwise only its creator sees it.
+type Collection struct {
+	ID                         string
+	ProfileID                  string
+	CreatorProfileID           string
+	Name                       string
+	Description                string
+	CollectionType             string
+	IsShared                   bool
+	QueryDefinition            string
+	SortConfig                 string
+	SourceURL                  string
+	SourceConfig               string
+	SyncSchedule               *string
+	NextSyncAt                 *time.Time
+	LastSyncAt                 *time.Time
+	LastSyncStatus             string
+	LastSyncMessage            string
+	DisplayQueryDefinition     string
+	ItemCount                  int
+	IncludeInServerCollections bool
+	PosterURL                  string
+	PosterThumbhash            string
+	SortOrder                  int
+	GroupID                    *string
+	CreatedAt                  string
+	UpdatedAt                  string
+}
+
+// VisibleTo reports whether profileID, a profile on the collection's login,
+// may read the collection: it created it, or the collection is shared. Stores
+// only return collections of the login they serve, so this never crosses
+// logins.
+func (c *Collection) VisibleTo(profileID string) bool {
+	return c != nil && profileID != "" && (c.CreatorProfileID == profileID || c.IsShared)
+}
+
+type GroupSortMode string
+
+const (
+	GroupSortManual    GroupSortMode = "manual"
+	GroupSortNameAsc   GroupSortMode = "name_asc"
+	GroupSortNameDesc  GroupSortMode = "name_desc"
+	GroupSortRecent    GroupSortMode = "recent"
+	GroupSortMostItems GroupSortMode = "most_items"
+)
+
+// CollectionGroup is a per-user bucket that groups personal collections in the
+// gallery view. A nil group_id on a collection means it falls into the implicit
+// "Ungrouped" section (no row in this table).
+type CollectionGroup struct {
+	ID              string
+	Name            string
+	Slug            string
+	DefaultSortMode GroupSortMode
+	SortOrder       int
+	CreatedAt       string
+	UpdatedAt       string
+}
+
+type CreateCollectionInput struct {
+	CreatorProfileID           string
+	Name                       string
+	Description                string
+	CollectionType             string
+	IsShared                   bool
+	QueryDefinition            string
+	SortConfig                 string
+	SourceURL                  string
+	SourceConfig               string
+	SyncSchedule               *string
+	NextSyncAt                 *time.Time
+	DisplayQueryDefinition     string
+	IncludeInServerCollections bool
+	PosterURL                  string
+}
+
+type UpdateCollectionInput struct {
+	// ExpectedRevision, when set, is atomically checked in the mutation transaction.
+	ExpectedRevision *int64
+	ID               string
+	RequestProfileID string
+	Name             *string
+	Description      *string
+	IsShared         *bool
+	QueryDefinition  *string
+	SortConfig       *string
+	SourceURL        *string
+	SourceConfig     *string
+	// SourceConfigPatch atomically merges only present top-level source config members.
+	// Imported collections are supported only by the PostgreSQL store.
+	SourceConfigPatch          *string
+	SyncSchedule               *string
+	ClearSyncSchedule          bool
+	NextSyncAt                 *time.Time
+	ClearNextSyncAt            bool
+	DisplayQueryDefinition     *string
+	IncludeInServerCollections *bool
+	PosterURL                  *string
+	PosterThumbhash            *string
+	GroupID                    **string
+}
+
+type UpdateCollectionSyncStateInput struct {
+	ID         string
+	Status     string
+	Message    string
+	ItemCount  int
+	LastSyncAt time.Time
+	NextSyncAt *time.Time
+	// ScheduleAtStart and NextSyncAtAtStart are the collection's sync_schedule
+	// and next_sync_at when the sync began. NextSyncAt is written only while
+	// the stored row still holds both, so a schedule edited during the sync,
+	// on any node, keeps the next_sync_at the edit wrote, even when the edit
+	// saved the same cadence again. The rest of the sync state is written
+	// either way.
+	ScheduleAtStart   *string
+	NextSyncAtAtStart *time.Time
+	// RequireLastSyncAt writes nothing unless the stored last_sync_at still
+	// equals LastSyncAtAtStart (nil for never synced). A failed sync sets
+	// it, so it never overwrites a sync that started later and finished
+	// first.
+	RequireLastSyncAt bool
+	LastSyncAtAtStart *time.Time
+}
+
+type CollectionItemReplacement struct {
+	MediaItemID string
+	Position    int
+}
+
+// CollectionItem represents an item within a collection.
+type CollectionItem struct {
+	CollectionID string
+	MediaItemID  string
+	Position     int
+	AddedAt      string
+}
+
+// SettingEntry represents a key-value setting.
+type SettingEntry struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// OnboardingState is one profile's progress through one onboarding tour.
+// Timestamps are RFC3339 strings, empty when unset, matching the store's
+// other per-profile tables.
+type OnboardingState struct {
+	ProfileID   string
+	TourID      string
+	LastStep    string
+	CompletedAt string
+	SkippedAt   string
+	UpdatedAt   string
+}
+
+// SectionOverride represents a per-profile section customization.
+type SectionOverride struct {
+	ID          string
+	ProfileID   string
+	Scope       string
+	LibraryID   string
+	SectionID   string // empty for user-added sections
+	Position    *int
+	Hidden      bool
+	Removed     bool
+	SectionType string
+	Title       string
+	Featured    *bool
+	ItemLimit   *int
+	Config      string // JSON string
+	CreatedAt   string
+	UpdatedAt   string
+
+	// IsUserAdded marks this override as a profile-built recipe instance
+	// rather than a customization of an admin section. When true, SectionID
+	// is empty and UserSectionType / UserConfig / UserTitle take precedence
+	// over the legacy SectionType / Config / Title fields.
+	IsUserAdded     bool
+	UserSectionType string
+	UserConfig      string // JSON string
+	UserTitle       string
+}
+
+// SubtitlePreference stores per-series subtitle settings.
+type SubtitlePreference struct {
+	ProfileID              string                  `json:"profile_id"`
+	SeriesID               string                  `json:"series_id"`
+	SubtitleLanguage       string                  `json:"subtitle_language"`
+	SubtitleTrackIndex     int                     `json:"subtitle_track_index"`
+	ExternalSubtitlePath   string                  `json:"external_subtitle_path"`
+	SubtitleMode           string                  `json:"subtitle_mode"`
+	TrackSignature         *SubtitleTrackSignature `json:"track_signature,omitempty"`
+	ShowForcedSubtitles    bool                    `json:"show_forced_subtitles"`
+	HasShowForcedSubtitles bool                    `json:"-"`
+	UpdatedAt              string                  `json:"updated_at"`
+}
+
+// AudioPreference stores per-series audio track settings.
+type AudioPreference struct {
+	ProfileID       string               `json:"profile_id"`
+	SeriesID        string               `json:"series_id"`
+	AudioTrackIndex int                  `json:"audio_track_index"`
+	AudioLanguage   string               `json:"audio_language"`
+	TrackSignature  *AudioTrackSignature `json:"track_signature,omitempty"`
+	UpdatedAt       string               `json:"updated_at"`
+}
+
+// SeriesPlaybackPreference stores per-series file version traits.
+type SeriesPlaybackPreference struct {
+	ProfileID  string `json:"profile_id"`
+	SeriesID   string `json:"series_id"`
+	Resolution string `json:"resolution"`
+	HDR        bool   `json:"hdr"`
+	CodecVideo string `json:"codec_video"`
+	// FileID and EditionKey name the exact version for a row keyed by a
+	// movie's own content ID; series rows leave them empty.
+	FileID     int    `json:"file_id,omitempty"`
+	EditionKey string `json:"edition_key,omitempty"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+// Collection kinds for CollectionSortPreference. Collection ids are unique
+// within a kind, so the kind is part of the preference's identity. Personal
+// list sources use PersonalSortPreferenceCollectionID because they have no
+// collection resource id of their own.
+const (
+	CollectionKindLibrary   = "library"
+	CollectionKindUser      = "user"
+	CollectionKindWatchlist = "watchlist"
+	CollectionKindFavorites = "favorites"
+
+	PersonalSortPreferenceCollectionID = "personal"
+)
+
+// CollectionSortPreference records that a profile changed the sort order while
+// browsing a collection or personal list. An empty SortField is a real choice
+// to use source order and is distinct from having no preference row at all.
+type CollectionSortPreference struct {
+	ProfileID      string `json:"profile_id"`
+	CollectionKind string `json:"collection_kind"`
+	CollectionID   string `json:"collection_id"`
+	SortField      string `json:"sort_field"`
+	SortOrder      string `json:"sort_order"`
+	UpdatedAt      string `json:"updated_at"`
+}
+
+// LibraryPlaybackPreference stores per-library playback settings.
+type LibraryPlaybackPreference struct {
+	ProfileID              string `json:"profile_id"`
+	LibraryID              int    `json:"library_id"`
+	AudioLanguage          string `json:"audio_language"`
+	HasAudioLanguage       bool   `json:"-"`
+	SubtitleLanguage       string `json:"subtitle_language"`
+	HasSubtitleLanguage    bool   `json:"-"`
+	SubtitleMode           string `json:"subtitle_mode"`
+	HasSubtitleMode        bool   `json:"-"`
+	ShowForcedSubtitles    bool   `json:"show_forced_subtitles"`
+	HasShowForcedSubtitles bool   `json:"-"`
+	UpdatedAt              string `json:"updated_at"`
+}

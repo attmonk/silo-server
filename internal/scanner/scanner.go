@@ -1,0 +1,4635 @@
+package scanner
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/fspath"
+	"github.com/Silo-Server/silo-server/internal/librarykind"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/naming"
+	"github.com/Silo-Server/silo-server/internal/pathscope"
+	"github.com/Silo-Server/silo-server/internal/rootcheck"
+	"github.com/Silo-Server/silo-server/internal/themesongs"
+)
+
+// ignoredDirNames holds the NAS and OS housekeeping directory names skipped
+// during scanning, lower case. Hidden directories are skipped by their dot
+// prefix (SkippedDirName), so none are listed here.
+var ignoredDirNames = map[string]bool{
+	"@recycle":     true,
+	"@eadir":       true,
+	"#recycle":     true,
+	"$recycle.bin": true,
+}
+
+// ignoredMovieSupplementalDirNames holds movie-library directory names whose
+// contents are never playable content (noise). Extras-shaped directories
+// (Trailers/, Featurettes/, ...) are NOT in this set: they are walked and
+// classified via extrasDirKinds instead of discarded. Subtitle discovery
+// reads the subtitle folders (subtitleDirLabels) on its own.
+var ignoredMovieSupplementalDirNames = map[string]bool{
+	"sample":    true,
+	"samples":   true,
+	"subs":      true,
+	"subtitles": true,
+}
+
+// extraDirLabel and extrasDirLabel are the normalized names of an Extras/
+// folder, the one extras folder where an episode code can keep a file an
+// episode (see keepsEpisodeToken).
+const (
+	extraDirLabel  = "extra"
+	extrasDirLabel = "extras"
+)
+
+// extrasDirKinds classifies supplemental directory names (normalized via
+// normalizeScannerDirLabel) into the shared extra-kind vocabulary. The set
+// mirrors the Jellyfin/Plex extras folder convention ("other" included: both
+// conventions document it).
+//
+// Deliberately absent: the plural "others", which is in neither convention.
+// Convention labels can also appear as content-scope folder names ("movies/
+// other/<Movie>/<file>", "movies/shorts/..."); those never classify as extras
+// because extrasClassifier only honors a convention-named dir owned by a
+// title folder — one that holds media of its own or belongs to a show, which
+// library roots and organizational folders do not.
+var extrasDirKinds = map[string]models.ExtraKind{
+	extraDirLabel:       models.ExtraKindOther,
+	extrasDirLabel:      models.ExtraKindOther,
+	"other":             models.ExtraKindOther,
+	"featurette":        models.ExtraKindFeaturette,
+	"featurettes":       models.ExtraKindFeaturette,
+	"behind the scenes": models.ExtraKindBehindTheScenes,
+	"deleted scene":     models.ExtraKindDeletedScene,
+	"deleted scenes":    models.ExtraKindDeletedScene,
+	"trailer":           models.ExtraKindTrailer,
+	"trailers":          models.ExtraKindTrailer,
+	"teaser":            models.ExtraKindTeaser,
+	"teasers":           models.ExtraKindTeaser,
+	"clip":              models.ExtraKindClip,
+	"clips":             models.ExtraKindClip,
+	"bloopers":          models.ExtraKindBloopers,
+	"interviews":        models.ExtraKindOther,
+	"scenes":            models.ExtraKindOther,
+	"shorts":            models.ExtraKindOther,
+}
+
+func normalizeScannerDirLabel(name string) string {
+	surface := strings.ToLower(strings.TrimSpace(name))
+	surface = strings.NewReplacer(".", " ", "_", " ", "-", " ").Replace(surface)
+	return strings.Join(strings.Fields(surface), " ")
+}
+
+func shouldSkipMovieSupplementalDir(path string) bool {
+	label := normalizeScannerDirLabel(filepath.Base(path))
+	if label == "" {
+		return false
+	}
+	return ignoredMovieSupplementalDirNames[label]
+}
+
+func shouldSkipMovieSupplementalFile(path string) bool {
+	baseNoExt := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	surface := normalizeScannerDirLabel(baseNoExt)
+	if surface == "" {
+		return false
+	}
+	if surface != "sample" && !strings.HasPrefix(surface, "sample ") && !strings.HasSuffix(surface, " sample") {
+		return false
+	}
+
+	parentTitle, parentYear, trusted := naming.ParseInferFolderTitleYear(filepath.Base(filepath.Dir(path)))
+	if !trusted {
+		return true
+	}
+	stem := naming.ParseInferMovieStem(baseNoExt, parentTitle, parentYear)
+	return stem.Title == "" || !naming.InferTitlesCoherent(parentTitle, stem.Title)
+}
+
+// Scanner discovers and indexes media files in media folders.
+// scannerImageCacher is the slice of imagecache.Cacher the book scanners and
+// local extras use.
+// Wired via SetImageCacher; nil-safe when absent.
+type scannerImageCacher interface {
+	audiobookCoverCacher
+	ebookCoverCacher
+	extraStillCacher
+}
+
+type Scanner struct {
+	fileRepo             *FileRepository
+	rootSnapshotRepo     *ScannedRootRepository
+	groupSnapshotRepo    *ScannedGroupRepository
+	rootOverrideRepo     *MediaRootOverrideRepository
+	groupOverrideRepo    *MediaGroupOverrideRepository
+	identityOverrideRepo *MediaIdentityOverrideRepository
+	locationRepo         *ObservedLocationRepository
+	groupLocationRepo    *GroupLocationRepository
+	folderRepo           *catalog.FolderRepository
+	libraryRepo          *catalog.LibraryItemRepository
+	episodeLibraryRepo   *catalog.EpisodeLibraryRepository
+	itemRepo             *catalog.ItemRepository
+	personRepo           *catalog.PersonRepository
+	episodeRepo          *catalog.EpisodeRepository
+	extraRepo            *catalog.ExtraRepository
+	ffprobePath          string
+	artworkStore         blobstore.Store // artwork backend (may be nil)
+	imageCacher          scannerImageCacher
+	// workers is atomic so admin settings changes can resize the per-scan
+	// worker pool while a scan is running (applies to the next scan).
+	workers             atomic.Int32
+	emptyTrashAfterScan bool
+	// fileRemovalGrace is how long a file must have been marked missing before
+	// emptying trash hard-deletes its row. Missing files are hidden from
+	// clients immediately; the grace only delays losing per-file state so a
+	// file that reappears (flapping mount, reverted upgrade) restores cheaply.
+	// Membership reconciliation also holds an orphaned item for as long, so a
+	// replacement file relinks to it (see catalog WithRemovalGrace).
+	fileRemovalGrace     time.Duration
+	markerFetcher        func(context.Context, string) *IntroCreditsMarkers
+	markerPrefix         markerPrefixCache
+	metadataQueue        MetadataQueueProducer
+	ebookEnrichmentQueue EbookEnrichmentQueue
+	movieQueueSyncer     MovieQueueSyncer
+	seriesQueueSyncer    SeriesQueueSyncer
+	literaryWorkLinker   LiteraryWorkLinker
+	// scanBatchSize overrides defaultFullScanBatchSize when positive.
+	scanBatchSize int
+}
+
+// SetImageCacher installs the imagecache.Cacher used by book scanners to push
+// embedded cover art into the public assets bucket. Optional; if unset, local
+// covers are not extracted.
+func (s *Scanner) SetImageCacher(cacher scannerImageCacher) {
+	if s == nil {
+		return
+	}
+	s.imageCacher = cacher
+}
+
+// SetWorkers updates the scan worker pool size. Safe for concurrent use; the
+// next scan run picks the new value up. Values below 1 are ignored.
+func (s *Scanner) SetWorkers(workers int) {
+	if s == nil || workers < 1 {
+		return
+	}
+	s.workers.Store(int32(workers))
+}
+
+func (s *Scanner) workerCount() int { return int(s.workers.Load()) }
+
+const scanProgressLogInterval = 10 * time.Second
+
+// MetadataQueueProducer enqueues durable initial metadata work rows after a
+// successful scan upsert.
+type MetadataQueueProducer interface {
+	EnqueueMovieFile(ctx context.Context, fileID int) error
+	EnqueueSeriesRoot(ctx context.Context, folderID int, observedRootPath string) error
+}
+
+// EbookEnrichmentQueue durably schedules provider enrichment without running
+// provider work in the scanner.
+type EbookEnrichmentQueue interface {
+	Enqueue(ctx context.Context, contentID string, priority int) error
+	ReconcileMissing(ctx context.Context, folderID, priority, limit int) (reconciled, inspected int, wrapped bool, err error)
+}
+
+type LiteraryWorkLinker interface {
+	AutoLinkContent(ctx context.Context, contentID string) (workID string, linked bool, err error)
+}
+
+func (s *Scanner) SetLiteraryWorkLinker(linker LiteraryWorkLinker) {
+	if s == nil {
+		return
+	}
+	s.literaryWorkLinker = linker
+}
+
+// MovieQueueSyncer synchronizes pending movie-file match queue state from the
+// scanner's persisted file rows.
+type MovieQueueSyncer interface {
+	SyncForFolder(ctx context.Context, folderID int) error
+	SyncInScope(ctx context.Context, folderID int, scopePath string) error
+}
+
+// SeriesQueueSyncer synchronizes pending series-root match queue state from
+// the scanner's persisted snapshot tables.
+type SeriesQueueSyncer interface {
+	SyncForFolder(ctx context.Context, folderID int) error
+	SyncInScope(ctx context.Context, folderID int, scopePath string) error
+}
+
+// NewScanner creates a new Scanner with the given dependencies.
+func NewScanner(fileRepo *FileRepository, ffprobePath string, artworkStore blobstore.Store, workers int, emptyTrashAfterScan bool, fileRemovalGrace time.Duration) *Scanner {
+	if workers < 1 {
+		workers = 8
+	}
+	if fileRemovalGrace < 0 {
+		fileRemovalGrace = 0
+	}
+	s := &Scanner{
+		fileRepo:             fileRepo,
+		rootSnapshotRepo:     NewScannedRootRepository(fileRepo.Pool()),
+		groupSnapshotRepo:    NewScannedGroupRepository(fileRepo.Pool()),
+		rootOverrideRepo:     NewMediaRootOverrideRepository(fileRepo.Pool()),
+		groupOverrideRepo:    NewMediaGroupOverrideRepository(fileRepo.Pool()),
+		identityOverrideRepo: NewMediaIdentityOverrideRepository(fileRepo.Pool()),
+		locationRepo:         NewObservedLocationRepository(fileRepo.Pool()),
+		groupLocationRepo:    NewGroupLocationRepository(fileRepo.Pool()),
+		folderRepo:           catalog.NewFolderRepository(fileRepo.Pool()),
+		libraryRepo:          catalog.NewLibraryItemRepository(fileRepo.Pool()).WithRemovalGrace(fileRemovalGrace),
+		episodeLibraryRepo:   catalog.NewEpisodeLibraryRepository(fileRepo.Pool()),
+		itemRepo:             catalog.NewItemRepository(fileRepo.Pool()),
+		personRepo:           catalog.NewPersonRepository(fileRepo.Pool()),
+		episodeRepo:          catalog.NewEpisodeRepository(fileRepo.Pool()),
+		extraRepo:            catalog.NewExtraRepository(fileRepo.Pool()),
+		ffprobePath:          ffprobePath,
+		artworkStore:         artworkStore,
+		emptyTrashAfterScan:  emptyTrashAfterScan,
+		fileRemovalGrace:     fileRemovalGrace,
+		markerFetcher:        nil,
+	}
+	s.SetWorkers(workers)
+	return s
+}
+
+func (s *Scanner) SetSearchIndexProvider(provider string) {
+	if s == nil || s.itemRepo == nil {
+		return
+	}
+	s.itemRepo.WithActiveSearchProvider(provider)
+}
+
+// SetSeriesQueueSyncer installs the optional pending-series root queue synchronizer.
+func (s *Scanner) SetSeriesQueueSyncer(syncer SeriesQueueSyncer) {
+	if s == nil {
+		return
+	}
+	s.seriesQueueSyncer = syncer
+}
+
+// SetMovieQueueSyncer installs the optional pending movie-file match queue synchronizer.
+func (s *Scanner) SetMovieQueueSyncer(syncer MovieQueueSyncer) {
+	if s == nil {
+		return
+	}
+	s.movieQueueSyncer = syncer
+}
+
+// SetMetadataQueueProducer installs the optional inline metadata queue producer.
+func (s *Scanner) SetMetadataQueueProducer(producer MetadataQueueProducer) {
+	if s == nil {
+		return
+	}
+	s.metadataQueue = producer
+}
+
+func (s *Scanner) SetEbookEnrichmentQueue(queue EbookEnrichmentQueue) {
+	if s == nil {
+		return
+	}
+	s.ebookEnrichmentQueue = queue
+}
+
+// ScanFolder walks a media folder's directory tree, discovers media files,
+// probes them for technical data, and upserts them into the database.
+// Files previously in the DB that no longer exist on disk are marked as missing.
+//
+// Audiobook libraries are handled by ScanAudiobookFolder and podcast
+// libraries by ScanPodcastFolder; both bypass the per-file movie/TV
+// pipeline entirely.
+func (s *Scanner) ScanFolder(ctx context.Context, folder *models.MediaFolder) (*ScanResult, error) {
+	watchCtx, stopWatch := s.watchFolderContext(ctx, folder.ID)
+	defer stopWatch()
+
+	if librarykind.IsAudiobook(folder.Type) {
+		if err := s.ScanAudiobookFolder(watchCtx, folder, true); err != nil {
+			return nil, err
+		}
+		if err := s.syncFolderScopedAudioLibraryState(watchCtx, folder.ID); err != nil {
+			return nil, err
+		}
+		return &ScanResult{}, nil
+	}
+
+	if librarykind.IsPodcast(folder.Type) {
+		if err := s.ScanPodcastFolder(watchCtx, folder); err != nil {
+			return nil, err
+		}
+		if err := s.syncFolderScopedAudioLibraryState(watchCtx, folder.ID); err != nil {
+			return nil, err
+		}
+		return &ScanResult{}, nil
+	}
+
+	if librarykind.IsManga(folder.Type) {
+		if err := s.ScanMangaFolder(watchCtx, folder); err != nil {
+			return nil, err
+		}
+		return &ScanResult{}, nil
+	}
+
+	if librarykind.IsEbook(folder.Type) {
+		if err := s.ScanEbookFolder(watchCtx, folder); err != nil {
+			return nil, err
+		}
+		return &ScanResult{}, nil
+	}
+
+	result, err := s.scanPaths(watchCtx, folder, folder.Paths, folder.Paths, true)
+	if err == nil && result != nil && !result.EmptyRootGuarded {
+		err = s.scanOptionalThemeSongs(watchCtx, folder, "", false)
+	}
+	return result, err
+}
+
+// ScanSubtree walks a single subtree within a media folder and reconciles only
+// files that live beneath that subtree. subtreePath must lie under one of
+// folder's roots. A podcast library scans the whole show folder that holds
+// the subtree (see scanPodcastSubtree).
+func (s *Scanner) ScanSubtree(ctx context.Context, folder *models.MediaFolder, subtreePath string) (*ScanResult, error) {
+	cleanSubtree := filepath.Clean(subtreePath)
+	if err := requirePathInLibrary(cleanSubtree, folder); err != nil {
+		return nil, err
+	}
+	// A subtree scan under a skipped library root would walk nothing and
+	// retire the subtree piece by piece, bypassing the empty-root guard. Only
+	// a full library scan decides what happens to a skipped root's catalog.
+	// Every root that holds the subtree counts, and a root nested in another
+	// is also skipped when the outer root's rules exclude it.
+	for _, root := range cleanScanRoots(folder.Paths) {
+		if !pathWithinAnyRoot(cleanSubtree, []string{root}) {
+			continue
+		}
+		skipped, err := libraryRootSkipped(root)
+		if err != nil {
+			// Without the root's rules the scope cannot tell what it excludes.
+			return nil, fmt.Errorf("library root %s: %w", root, err)
+		}
+		if !skipped {
+			// An unreadable ancestor is left to the walk, which records it
+			// as a walk failure and protects the subtree.
+			_, skipped, _ = scanRootIgnoreRules(root, folder.Paths)
+		}
+		if skipped {
+			slog.InfoContext(ctx, "scanner: library root is skipped by its ignore files; leaving subtree to a full library scan", "component", "scanner",
+				"folder_id", folder.ID,
+				"root", root,
+				"scope", cleanSubtree,
+			)
+			return &ScanResult{}, nil
+		}
+	}
+	watchCtx, stopWatch := s.watchFolderContext(ctx, folder.ID)
+	defer stopWatch()
+	if librarykind.IsAudiobook(folder.Type) {
+		// collectAudiobookRootScans widens the scope (audiobookScopeRoot); a
+		// file is scanned through its folder.
+		scope := filepath.Clean(subtreePath)
+		if info, statErr := fspath.Stat(scope); statErr == nil && !info.IsDir() {
+			scope = filepath.Dir(scope)
+		}
+		scanRoot, err := cleanScopedAudiobookScanRoot(scope)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.scanAudiobookPaths(watchCtx, folder, []string{scanRoot}, false, true, ""); err != nil {
+			return nil, err
+		}
+		if err := s.syncFolderScopedAudioLibraryState(watchCtx, folder.ID); err != nil {
+			return nil, err
+		}
+		return &ScanResult{}, nil
+	}
+	if librarykind.IsPodcast(folder.Type) {
+		return s.scanPodcastSubtree(watchCtx, folder, cleanSubtree)
+	}
+	if librarykind.IsManga(folder.Type) {
+		if err := s.scanMangaPaths(watchCtx, folder, []string{cleanSubtree}, false); err != nil {
+			return nil, err
+		}
+		return &ScanResult{}, nil
+	}
+	if librarykind.IsEbook(folder.Type) {
+		if err := s.scanEbookPaths(watchCtx, folder, []string{cleanSubtree}, false); err != nil {
+			return nil, err
+		}
+		return &ScanResult{}, nil
+	}
+	result, err := s.scanPaths(watchCtx, folder, []string{cleanSubtree}, []string{cleanSubtree}, false)
+	if err == nil && result != nil && !result.EmptyRootGuarded {
+		err = s.scanOptionalThemeSongs(watchCtx, folder, cleanSubtree, false)
+	}
+	return result, err
+}
+
+func cleanScopedAudiobookScanRoot(path string) (string, error) {
+	clean := filepath.Clean(path)
+	if clean == "" || clean == "." || clean == ".." || clean == string(filepath.Separator) ||
+		strings.HasPrefix(clean, ".."+string(filepath.Separator)) || !filepath.IsAbs(clean) {
+		return "", fmt.Errorf("invalid audiobook scan root: %s", path)
+	}
+	return clean, nil
+}
+
+// walkMode tells walkLogicalTree which file extensions to surface and
+// which library-specific filename heuristics (sample/extra skipping)
+// to apply.
+type walkMode int
+
+const (
+	walkModeVideo     walkMode = iota // bare video walk: video extensions, no movie skipping
+	walkModeMovie                     // movie library: video extensions + sample/extra skipping
+	walkModeAudiobook                 // audiobook library: audio extensions, no skipping
+	walkModePodcast                   // podcast library: audio extensions, no skipping
+	walkModeEbook                     // ebook library: ebook extensions, no skipping
+)
+
+// walkModeFor derives a walkMode from a media_folders.type string.
+// Unknown types default to walkModeVideo so existing call sites that
+// pass arbitrary types preserve their prior behavior.
+func walkModeFor(folderType string) walkMode {
+	switch {
+	case librarykind.IsMovie(folderType):
+		return walkModeMovie
+	case librarykind.IsAudiobook(folderType):
+		return walkModeAudiobook
+	case librarykind.IsPodcast(folderType):
+		return walkModePodcast
+	case librarykind.IsEbook(folderType):
+		return walkModeEbook
+	case librarykind.IsManga(folderType):
+		// Manga chapters are .cbz/.cbr archives, surfaced by the ebook walk.
+		return walkModeEbook
+	default:
+		return walkModeVideo
+	}
+}
+
+// acceptsPath reports whether the file at path belongs to the file types
+// this walk mode is looking for. Video modes need the full path, not just the
+// name: SupportsVideoFile rejects streams inside disc folder structures.
+func (m walkMode) acceptsPath(path string) bool {
+	switch m {
+	case walkModeAudiobook, walkModePodcast:
+		return SupportsAudioFile(path)
+	case walkModeEbook:
+		return SupportsEbookFile(path)
+	default:
+		return SupportsVideoFile(path)
+	}
+}
+
+// collectWalkFile appends path to filePaths when the walk mode accepts it.
+// Video walks log, at debug level, a video file they deliberately skip, so a
+// title missing from the catalog can be traced to the file.
+func (m walkMode) collectWalkFile(ctx context.Context, path string, filePaths *[]string) {
+	if m.acceptsPath(path) {
+		*filePaths = append(*filePaths, path)
+		return
+	}
+	if m != walkModeVideo && m != walkModeMovie {
+		return
+	}
+	if reason := unsupportedVideoFileReason(path); reason != "" {
+		slog.DebugContext(ctx, "scanner: skipped unsupported video file", "component", "scanner", "path", path, "reason", reason)
+	}
+}
+
+func canonicalWalkPath(path string) (string, error) {
+	resolved, err := fspath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(resolved)
+	if err == nil {
+		resolved = abs
+	}
+	return filepath.Clean(resolved), nil
+}
+
+// SkippedDirName reports whether scans skip a directory with this name below
+// a library root, together with everything under it: a hidden (dot-prefixed)
+// directory, as in Jellyfin, or a NAS or OS housekeeping folder. A configured
+// library root is walked whatever its name.
+func SkippedDirName(name string) bool {
+	return strings.HasPrefix(name, ".") || ignoredDirNames[strings.ToLower(name)]
+}
+
+// recordWalkFailure counts an entry the walk could not read or resolve.
+// Callers that pass a non-nil counter (the book scanners) use it to exclude
+// incompletely walked roots from missing-file reconciliation; the video walk
+// passes nil and keeps its historical log-and-continue behavior.
+// recordWalkFailure notes the logical path the walk could not read or resolve.
+//
+// The path matters, not just the count: an unreadable directory hides whatever
+// was inside it, but a dangling symlink hides nothing beyond itself. Recording
+// where each failure happened lets callers protect exactly the affected
+// subtree instead of the whole library root — otherwise a single permanently
+// broken symlink would suppress missing-file reconciliation for that root on
+// every future scan, and genuinely deleted titles would never be retired.
+func recordWalkFailure(failures *[]string, path string) {
+	if failures != nil {
+		*failures = append(*failures, path)
+	}
+}
+
+// readDirectoryWithRetry tolerates transient mount/listing failures without
+// slowing successful reads. Three attempts add at most 300ms of backoff;
+// cancellation interrupts that wait but cannot interrupt os.ReadDir itself.
+func readDirectoryWithRetry(ctx context.Context, path string, readDir func(string) ([]os.DirEntry, error)) ([]os.DirEntry, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		entries, err := readDir(path)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if err == nil || attempt == 2 {
+			return entries, err
+		}
+		timer := time.NewTimer(100 * time.Millisecond << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// Callers filter inherited patterns before resolving or entering a path.
+func walkLogicalTree(
+	ctx context.Context,
+	logicalPath string,
+	physicalPath string,
+	mode walkMode,
+	visitedPhysicalDirs map[string]struct{},
+	ignoreRulesStack []ignoreRules,
+	filePaths *[]string,
+	walkFailures *[]string,
+	sidecars SidecarListing,
+	readDir func(string) ([]os.DirEntry, error),
+) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	info, err := fspath.Lstat(physicalPath)
+	if err != nil {
+		slog.WarnContext(ctx, "scanner: walk lstat failed", "component", "scanner", "path", logicalPath, "physical_path", physicalPath, "error", err)
+		recordWalkFailure(walkFailures, logicalPath)
+		return nil
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		resolved, err := fspath.EvalSymlinks(physicalPath)
+		if err != nil {
+			slog.WarnContext(ctx, "scanner: symlink resolve failed", "component", "scanner", "path", logicalPath, "physical_path", physicalPath, "error", err)
+			recordWalkFailure(walkFailures, logicalPath)
+			return nil
+		}
+		targetInfo, err := fspath.Stat(resolved)
+		if err != nil {
+			slog.WarnContext(ctx, "scanner: symlink stat failed", "component", "scanner", "path", logicalPath, "resolved_path", resolved, "error", err)
+			recordWalkFailure(walkFailures, logicalPath)
+			return nil
+		}
+		if targetInfo.IsDir() {
+			return walkLogicalTree(ctx, logicalPath, resolved, mode, visitedPhysicalDirs, ignoreRulesStack, filePaths, walkFailures, sidecars, readDir)
+		}
+		if mode == walkModeMovie && shouldSkipMovieSupplementalFile(logicalPath) {
+			return nil
+		}
+		mode.collectWalkFile(ctx, logicalPath, filePaths)
+		return nil
+	}
+
+	if !info.IsDir() {
+		if mode == walkModeMovie && shouldSkipMovieSupplementalFile(logicalPath) {
+			return nil
+		}
+		mode.collectWalkFile(ctx, logicalPath, filePaths)
+		return nil
+	}
+
+	canonicalDir, err := canonicalWalkPath(physicalPath)
+	if err != nil {
+		slog.WarnContext(ctx, "scanner: canonical path resolution failed", "component", "scanner", "path", logicalPath, "physical_path", physicalPath, "error", err)
+		recordWalkFailure(walkFailures, logicalPath)
+		return nil
+	}
+	if _, seen := visitedPhysicalDirs[canonicalDir]; seen {
+		return nil
+	}
+	visitedPhysicalDirs[canonicalDir] = struct{}{}
+
+	if mode == walkModeMovie && shouldSkipMovieSupplementalDir(logicalPath) {
+		return nil
+	}
+
+	entries, err := readDirectoryWithRetry(ctx, physicalPath, readDir)
+	if err != nil {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		slog.WarnContext(ctx, "scanner: directory read failed", "component", "scanner", "path", logicalPath, "physical_path", physicalPath, "error", err)
+		recordWalkFailure(walkFailures, logicalPath)
+		return nil
+	}
+	if sidecars != nil {
+		sidecars.record(logicalPath, entries)
+	}
+
+	childRules, skip, err := dirIgnoreRules(ignoreRulesStack, logicalPath, physicalPath, entries)
+	if err != nil {
+		slog.WarnContext(ctx, "scanner: ignore file read failed", "component", "scanner", "path", logicalPath, "physical_path", physicalPath, "error", err)
+		recordWalkFailure(walkFailures, logicalPath)
+		return nil
+	}
+	if skip {
+		return nil
+	}
+	for _, entry := range entries {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+
+		logicalChild := filepath.Join(logicalPath, entry.Name())
+		physicalChild := filepath.Join(physicalPath, entry.Name())
+		if ignoreRulesMatch(childRules, logicalChild, entry.IsDir()) {
+			continue
+		}
+
+		if entry.Type()&os.ModeSymlink != 0 {
+			resolved, err := fspath.EvalSymlinks(physicalChild)
+			if err != nil {
+				slog.WarnContext(ctx, "scanner: symlink resolve failed", "component", "scanner", "path", logicalChild, "physical_path", physicalChild, "error", err)
+				recordWalkFailure(walkFailures, logicalChild)
+				continue
+			}
+			targetInfo, err := fspath.Stat(resolved)
+			if err != nil {
+				slog.WarnContext(ctx, "scanner: symlink stat failed", "component", "scanner", "path", logicalChild, "resolved_path", resolved, "error", err)
+				recordWalkFailure(walkFailures, logicalChild)
+				continue
+			}
+			if targetInfo.IsDir() {
+				// Directory-only patterns apply once the link resolves to a directory.
+				if SkippedDirName(entry.Name()) || ignoreRulesMatch(childRules, logicalChild, true) {
+					continue
+				}
+				if err := walkLogicalTree(ctx, logicalChild, resolved, mode, visitedPhysicalDirs, childRules, filePaths, walkFailures, sidecars, readDir); err != nil {
+					return err
+				}
+				continue
+			}
+			if mode == walkModeMovie && shouldSkipMovieSupplementalFile(logicalChild) {
+				continue
+			}
+			mode.collectWalkFile(ctx, logicalChild, filePaths)
+			continue
+		}
+
+		if entry.IsDir() {
+			if SkippedDirName(entry.Name()) {
+				continue
+			}
+			if err := walkLogicalTree(ctx, logicalChild, physicalChild, mode, visitedPhysicalDirs, childRules, filePaths, walkFailures, sidecars, readDir); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if mode == walkModeMovie && shouldSkipMovieSupplementalFile(logicalChild) {
+			continue
+		}
+		mode.collectWalkFile(ctx, logicalChild, filePaths)
+	}
+
+	return nil
+}
+
+// collectLogicalFilePaths walks the given roots and returns the media files
+// found, plus how many entries the walk could not read or resolve.
+//
+// walkLogicalTree deliberately swallows per-entry Lstat/ReadDir failures so one
+// bad file cannot abort a scan of a million. That makes the returned list
+// non-authoritative wherever a failure occurred: a mount that dies partway
+// through traversal yields a short list that looks exactly like a large
+// deletion.
+//
+// The second return value is the logical path of every entry the walk could
+// not read or resolve. Callers must treat those paths as unreconcilable —
+// anything cataloged at or under one of them may exist without having been
+// seen. Scoping the protection to those paths rather than to the whole root
+// matters: a dangling symlink is permanent, and protecting its entire library
+// root would suppress missing-file reconciliation there on every future scan.
+func collectLogicalFilePaths(ctx context.Context, walkRoots []string, libraryType string, libraryRoots []string) ([]string, []string, error) {
+	filePaths, walkFailures, _, err := collectLogicalFilePathsAndSidecars(ctx, walkRoots, libraryType, libraryRoots)
+	return filePaths, walkFailures, err
+}
+
+// collectLogicalFilePathsAndSidecars is collectLogicalFilePaths that also
+// returns the local metadata sidecars in every directory a video walk read
+// (nil for other library types).
+func collectLogicalFilePathsAndSidecars(ctx context.Context, walkRoots []string, libraryType string, libraryRoots []string) ([]string, []string, SidecarListing, error) {
+	filePaths := make([]string, 0)
+	visitedPhysicalDirs := make(map[string]struct{})
+	mode := walkModeFor(libraryType)
+	walkFailures := make([]string, 0)
+	var sidecars SidecarListing
+	if mode == walkModeVideo || mode == walkModeMovie {
+		sidecars = make(SidecarListing)
+	}
+
+	for _, rootPath := range walkRoots {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, nil, err
+			}
+		}
+		cleanRoot := filepath.Clean(rootPath)
+		if cleanRoot == "" || cleanRoot == "." {
+			continue
+		}
+		if scopeRootVanished(cleanRoot, libraryRoots) {
+			slog.InfoContext(ctx, "scanner: scope no longer exists under its library root; reconciling it as empty", "component", "scanner", "path", cleanRoot)
+			continue
+		}
+		rules, ignored, err := scanRootIgnoreRules(cleanRoot, libraryRoots)
+		if err != nil {
+			recordWalkFailure(&walkFailures, cleanRoot)
+			slog.WarnContext(ctx, "scanner: ignore ancestor read failed", "path", cleanRoot, "error", err)
+			continue
+		}
+		if ignored {
+			continue
+		}
+		if err := walkLogicalTree(ctx, cleanRoot, cleanRoot, mode, visitedPhysicalDirs, rules, &filePaths, &walkFailures, sidecars, fspath.ReadDir); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	return filePaths, walkFailures, sidecars, nil
+}
+
+// scopeRootVanished reports whether a walk root below a configured library
+// root is confirmed gone while its parent directory is still there: a deleted
+// movie or series folder that a monitor or webhook scan is scoped to. Such a
+// scope is empty, not unreadable, so its cataloged files are reconciled the way
+// a full library scan would. Only ENOENT counts, and the parent must resolve to
+// a directory. A missing parent (a missing library root, or storage that
+// dropped further up), a dangling symlink at or above the scope, and permission
+// or I/O errors stay walk failures. An unreachable or suspect-empty library
+// root keeps its own protection. scope and libraryRoots are encoded paths.
+func scopeRootVanished(scope string, libraryRoots []string) bool {
+	root := scopeLibraryRoot(scope, libraryRoots)
+	if root == "" || root == scope {
+		return false
+	}
+	if _, err := fspath.Lstat(scope); !errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	parent, err := fspath.Stat(filepath.Dir(scope))
+	return err == nil && parent.IsDir()
+}
+
+func (s *Scanner) scanPaths(
+	ctx context.Context,
+	folder *models.MediaFolder,
+	walkRoots []string,
+	reconcileRoots []string,
+	allowEmptyRootGuard bool,
+) (*ScanResult, error) {
+	if err := s.ensureFolderEnabled(ctx, folder.ID); err != nil {
+		return nil, err
+	}
+	if allowEmptyRootGuard {
+		return s.scanFolderByRoots(ctx, folder, walkRoots, reconcileRoots)
+	}
+
+	result := &ScanResult{}
+
+	// Get existing files in this scan scope from the DB. Full library scans
+	// returned above, so this is always a single subtree.
+	existingFiles, err := s.fileRepo.GetScanStateByFolderAndPathPrefix(ctx, folder.ID, reconcileRoots[0])
+	if err != nil {
+		return nil, fmt.Errorf("getting existing files for folder %d path %q: %w", folder.ID, reconcileRoots[0], err)
+	}
+
+	// Build a set of existing file paths for quick lookup.
+	existingByPath := make(map[string]*scanStateFile, len(existingFiles))
+	for _, f := range existingFiles {
+		existingByPath[f.FilePath] = f
+	}
+	existingContentStatuses, err := s.itemRepo.GetStatusByIDs(ctx, collectScanStateContentIDs(existingFiles))
+	if err != nil {
+		return nil, fmt.Errorf("loading item statuses for folder %d: %w", folder.ID, err)
+	}
+
+	// Phase 1: Collect all media file paths.
+	reportProgress(ctx, ProgressUpdate{
+		Phase:        "walking",
+		Message:      "Discovering media files",
+		CurrentScope: firstScope(reconcileRoots),
+	})
+	filePaths, walkFailures, sidecars, walkErr := collectLogicalFilePathsAndSidecars(ctx, walkRoots, folder.Type, folder.Paths)
+	if walkErr != nil {
+		return nil, fmt.Errorf("walking media roots: %w", walkErr)
+	}
+	result.Sidecars = sidecars
+	slog.InfoContext(ctx, "scanner: discovered files", "component", "scanner",
+		"folder_id", folder.ID,
+		"scope", firstScope(reconcileRoots),
+		"files", len(filePaths),
+	)
+	if len(walkFailures) > 0 {
+		logIncompleteWalk(ctx, folder.ID, reconcileRoots, walkFailures)
+		if err := s.setPartialWalkWarning(ctx, folder.ID, len(walkFailures), true); err != nil {
+			return nil, err
+		}
+	}
+	reportProgress(ctx, ProgressUpdate{
+		Phase:           "processing",
+		Message:         "Processing discovered files",
+		CurrentScope:    firstScope(reconcileRoots),
+		TotalFiles:      len(filePaths),
+		FilesDiscovered: len(filePaths),
+	})
+
+	// Track which paths we see on disk so we can detect missing files.
+	// Extras count as seen (they own media_files rows) but are partitioned
+	// out of identity inference and match processing below.
+	seenPaths := make(map[string]bool, len(filePaths))
+	for _, p := range filePaths {
+		seenPaths[p] = true
+	}
+	primaryPaths, extraCandidates := partitionExtraPaths(filePaths, folder.Type, folder.Paths, walkRoots)
+	// Files already known to hold no video take no part in inference.
+	primaryPaths, knownNoVideo, retiredNoVideo, err := s.dropNoVideoPaths(ctx, folder, primaryPaths)
+	if err != nil {
+		return nil, fmt.Errorf("reading files without video: %w", err)
+	}
+	rootOverrides, err := s.loadRootOverrides(ctx, folder.ID, reconcileRoots)
+	if err != nil {
+		return nil, fmt.Errorf("loading root overrides: %w", err)
+	}
+	rootInference := inferRootAssignments(primaryPaths, folder.Type, folder.ID, rootOverrides, folder.Paths...)
+	identityOverrides, err := s.loadIdentityOverrides(ctx, folder.ID)
+	if err != nil {
+		return nil, fmt.Errorf("loading identity overrides: %w", err)
+	}
+	groupInference := inferGroupAssignments(primaryPaths, folder.Type, folder.ID, rootInference.Assignments, identityOverrides)
+	groupOverrides, err := s.loadGroupOverrides(ctx, folder.ID)
+	if err != nil {
+		return nil, fmt.Errorf("loading group overrides: %w", err)
+	}
+	applyGroupOverrides(&groupInference, groupOverrides)
+	result.RootObservations = rootInference.Observations
+	s.logRootInferenceDisagreements(rootInference.Assignments)
+
+	// Probe before any reconciliation, not just before missing-marking.
+	// Pruning deletes snapshots and observed/group locations the walk did not
+	// see, so it is unsound for the same reasons marking is: a suspect-empty
+	// mountpoint walks clean and reports no failures, and pruning against that
+	// empty inventory strips metadata for media that is still there. Deciding
+	// protection after these calls preserved the media rows while their
+	// snapshots had already been deleted.
+	protectedRoots, err := s.protectedConfiguredRoots(ctx, folder)
+	if err != nil {
+		return nil, err
+	}
+	// Wherever the walk could not read, its file list is a lower bound rather
+	// than an inventory, so anything cataloged under those paths must not be
+	// reconciled. Only those paths are protected — a dangling symlink must not
+	// exempt its whole library root forever.
+	if len(walkFailures) > 0 {
+		protectedRoots = append(append([]string(nil), protectedRoots...), walkFailures...)
+	}
+	pruneUnseen := len(walkFailures) == 0 && !anyPathWithinRoots(protectedRoots, reconcileRoots)
+
+	if err := s.reconcileScannedRoots(
+		ctx,
+		folder.ID,
+		reconcileRoots,
+		rootInference.Snapshots,
+		pruneUnseen,
+		allowEmptyRootGuard,
+	); err != nil {
+		return nil, fmt.Errorf("reconciling scanned roots: %w", err)
+	}
+	if _, err := s.clearLegacyLinksForUnmatchableRoots(ctx, folder.ID, result.RootObservations); err != nil {
+		return nil, fmt.Errorf("clearing legacy links for unmatchable roots: %w", err)
+	}
+
+	allowEmptyCleanup := false
+	if allowEmptyRootGuard && len(filePaths) == 0 && len(existingFiles) > 0 {
+		var err error
+		allowEmptyCleanup, err = s.folderRepo.ConsumeEmptyCleanupAllowance(ctx, folder.ID)
+		if err != nil {
+			return nil, fmt.Errorf("checking empty cleanup confirmation for folder %d: %w", folder.ID, err)
+		}
+		if !allowEmptyCleanup {
+			result.EmptyRootGuarded = true
+			if err := s.folderRepo.SetScanWarning(ctx, folder.ID,
+				"empty_root",
+				"Scan found 0 media files; cleanup was skipped until deletion is confirmed.",
+				time.Now().UTC(),
+			); err != nil {
+				return nil, fmt.Errorf("recording empty-root warning for folder %d: %w", folder.ID, err)
+			}
+			return result, nil
+		}
+	}
+
+	// Phase 2: Process files concurrently with a worker pool.
+	var wg sync.WaitGroup
+	pathCh := make(chan string, s.workerCount())
+	var newCount, updatedCount, unchangedCount, noVideoCount, retiredCount, errorCount, processedCount atomic.Int64
+	noVideoCount.Add(int64(knownNoVideo))
+	retiredCount.Add(int64(retiredNoVideo))
+	processedCount.Add(int64(knownNoVideo))
+	subtitleCache := newExternalSubtitleDirCache(folder.Type)
+
+	for range s.workerCount() {
+		wg.Go(func() {
+			for path := range pathCh {
+				if ctx.Err() != nil {
+					continue // drain channel
+				}
+				action, updateReasons, processErr := s.processFile(ctx, path, folder, existingByPath, existingContentStatuses, rootInference.Assignments[path], groupInference.Assignments[path], subtitleCache)
+				if processErr != nil {
+					slog.ErrorContext(ctx, "scanner: file processing failed", "component", "scanner", "path", path, "error", processErr)
+					errorCount.Add(1)
+					continue
+				}
+				switch action {
+				case actionNew:
+					newCount.Add(1)
+					slog.DebugContext(ctx, "scanner: new file added", "component", "scanner", "path", path)
+				case actionUpdated:
+					updatedCount.Add(1)
+					slog.DebugContext(ctx, "scanner: file updated", "component", "scanner", "path", path, "reasons", updateReasons)
+				case actionUnchanged:
+					unchangedCount.Add(1)
+				case actionNoVideoRetired:
+					retiredCount.Add(1)
+					noVideoCount.Add(1)
+				case actionNoVideo:
+					noVideoCount.Add(1)
+				}
+				processedCount.Add(1)
+			}
+		})
+	}
+
+	stopProgress := reportProgressEvery(ctx, scanProgressLogInterval, func() ProgressUpdate {
+		processed := int(processedCount.Load())
+		total := len(filePaths)
+		slog.InfoContext(ctx, "scanner: processing progress", "component", "scanner",
+			"folder_id", folder.ID,
+			"scope", firstScope(reconcileRoots),
+			"processed", processed,
+			"total", total,
+			"new", newCount.Load(),
+			"updated", updatedCount.Load(),
+			"unchanged", unchangedCount.Load(),
+			"no_video", noVideoCount.Load(),
+			"errors", errorCount.Load(),
+		)
+		return ProgressUpdate{
+			Phase:           "processing",
+			Message:         "Processing discovered files",
+			CurrentScope:    firstScope(reconcileRoots),
+			TotalFiles:      total,
+			FilesDiscovered: total,
+			FilesProcessed:  processed,
+			New:             int(newCount.Load()),
+			Updated:         int(updatedCount.Load()),
+			Unchanged:       int(unchangedCount.Load()),
+			Errors:          int(errorCount.Load()),
+		}
+	})
+
+	for _, p := range primaryPaths {
+		pathCh <- p
+	}
+	close(pathCh)
+	wg.Wait()
+	stopProgress()
+
+	result.New = int(newCount.Load())
+	result.Updated = int(updatedCount.Load())
+	result.Unchanged = int(unchangedCount.Load())
+	result.NoVideo = int(noVideoCount.Load())
+	// A retired row left the library like a vanished file's.
+	result.Missing = int(retiredCount.Load())
+	result.Errors = int(errorCount.Load())
+	reportProgress(ctx, ProgressUpdate{
+		Phase:           "reconciling",
+		Message:         "Reconciling scan state",
+		CurrentScope:    firstScope(reconcileRoots),
+		TotalFiles:      len(filePaths),
+		FilesDiscovered: len(filePaths),
+		FilesProcessed:  int(processedCount.Load()),
+		New:             result.New,
+		Updated:         result.Updated,
+		Unchanged:       result.Unchanged,
+		Errors:          result.Errors,
+	})
+
+	// If the scan was cancelled, return partial results without marking
+	// files as missing or deleting records — that would corrupt state.
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+
+	extraStats := s.processExtraFiles(ctx, folder, extraCandidates, existingByPath, sidecars)
+	result.New += extraStats.New
+	result.Updated += extraStats.Updated
+	result.Unchanged += extraStats.Unchanged
+	result.Errors += extraStats.Errors
+
+	if err := s.syncPresentPathState(ctx, folder.ID, reconcileRoots[0]); err != nil {
+		return nil, fmt.Errorf("syncing present library state for folder %d: %w", folder.ID, err)
+	}
+
+	// Group pruning follows the same rule as snapshot pruning above.
+	if err := s.reconcileScannedGroups(ctx, folder.ID, allowEmptyRootGuard, reconcileRoots,
+		!allowEmptyRootGuard && pruneUnseen, groupInference); err != nil {
+		return nil, fmt.Errorf("reconciling scanned groups: %w", err)
+	}
+
+	// protectedRoots was resolved above, before any reconciliation ran.
+	existingPresence := scanPresenceOf(existingFiles)
+	s.markMissingExcludingProtected(ctx, folder.ID, existingPresence, seenPaths, protectedRoots, result)
+
+	// Reconcile only the content this subtree's files link to, now or before
+	// processing. Present-state repair above was scoped the same way.
+	removedMemberships, deletedItems, orphanedImageDirs, err := s.reconcileScopedLibraryMemberships(
+		ctx, folder.ID, reconcileRoots[0], existingFiles, s.emptyTrashAfterScan, protectedRoots)
+	if err != nil {
+		return nil, fmt.Errorf("reconciling library membership for folder %d: %w", folder.ID, err)
+	}
+	result.MembershipsRemoved = removedMemberships
+	result.ItemsDeleted = deletedItems
+	// Empty trash across the whole folder, not just this subtree: a deleted
+	// directory is never scanned again, so its missing rows would otherwise
+	// wait for a full library scan. Protected roots are still exempt, and the
+	// reconcile above already checked the items of every missing row.
+	if s.emptyTrashAfterScan {
+		trashed, err := s.fileRepo.DeleteMissingByFolder(ctx, folder.ID, s.fileRemovalGrace, protectedRoots)
+		if err != nil {
+			return nil, fmt.Errorf("emptying trash for folder %d: %w", folder.ID, err)
+		}
+		if trashed > 0 {
+			slog.InfoContext(ctx, "scanner: emptied trash", "component", "scanner", "folder_id", folder.ID, "deleted", trashed)
+		}
+		result.FilesDeleted += trashed
+	}
+
+	staleFileIDs := collectStaleRemovedPathFileIDs(existingPresence, seenPaths, reconcileRoots)
+	if len(filePaths) == 0 && allowEmptyCleanup {
+		staleFileIDs = make([]int, 0, len(existingFiles))
+		for _, existing := range existingFiles {
+			staleFileIDs = append(staleFileIDs, existing.ID)
+		}
+	}
+	deletedFiles, err := s.fileRepo.DeleteByIDs(ctx, staleFileIDs)
+	if err != nil {
+		return nil, fmt.Errorf("deleting stale files for folder %d: %w", folder.ID, err)
+	}
+	result.FilesDeleted += deletedFiles
+
+	if s.seriesQueueSyncer != nil {
+		if allowEmptyRootGuard {
+			if err := s.seriesQueueSyncer.SyncForFolder(ctx, folder.ID); err != nil {
+				return nil, fmt.Errorf("syncing series match queue for folder %d: %w", folder.ID, err)
+			}
+			slog.InfoContext(ctx, "metadata: series root queue sync", "component", "scanner",
+				"folder_id", folder.ID,
+				"scope", "folder",
+			)
+		} else if len(reconcileRoots) > 0 {
+			for _, scopePath := range reconcileRoots {
+				if err := s.seriesQueueSyncer.SyncInScope(ctx, folder.ID, scopePath); err != nil {
+					return nil, fmt.Errorf("syncing series match queue for scope %q: %w", scopePath, err)
+				}
+				slog.InfoContext(ctx, "metadata: series root queue sync", "component", "scanner",
+					"folder_id", folder.ID,
+					"scope", scopePath,
+				)
+			}
+		}
+	}
+	if s.movieQueueSyncer != nil {
+		if allowEmptyRootGuard {
+			if err := s.movieQueueSyncer.SyncForFolder(ctx, folder.ID); err != nil {
+				return nil, fmt.Errorf("syncing movie match queue for folder %d: %w", folder.ID, err)
+			}
+			slog.InfoContext(ctx, "metadata: movie file queue sync", "component", "scanner",
+				"folder_id", folder.ID,
+				"scope", "folder",
+			)
+		} else if len(reconcileRoots) > 0 {
+			for _, scopePath := range reconcileRoots {
+				if err := s.movieQueueSyncer.SyncInScope(ctx, folder.ID, scopePath); err != nil {
+					return nil, fmt.Errorf("syncing movie match queue for scope %q: %w", scopePath, err)
+				}
+				slog.InfoContext(ctx, "metadata: movie file queue sync", "component", "scanner",
+					"folder_id", folder.ID,
+					"scope", scopePath,
+				)
+			}
+		}
+	}
+
+	// Best-effort S3 image cleanup for orphaned items.
+	if s.artworkStore != nil && len(orphanedImageDirs) > 0 {
+		for _, dir := range orphanedImageDirs {
+			_, _ = s.artworkStore.DeletePrefix(ctx, dir)
+		}
+	}
+
+	return result, nil
+}
+
+type scopedScan struct {
+	walkRoots      []string
+	reconcileRoots []string
+	// existingCount is how many files were cataloged under the scope before
+	// the walk, and unseenExisting holds the ones the walk did not see: the
+	// only rows reconciliation acts on. walkedFiles is how many files the
+	// walk found. The walked paths and the scan state of the files that are
+	// still there are not kept once the scope's files have been processed.
+	existingCount  int
+	unseenExisting []scanPresence
+	walkedFiles    int
+	// rootInference and groupInference hold the scope's snapshots; their
+	// per-file Assignments are nil.
+	rootInference  rootInferenceResult
+	groupInference groupInferenceResult
+	result         *ScanResult
+	// walkFailures holds the logical paths this scope's walk could not read or
+	// resolve. Anything cataloged at or under one of them may exist without
+	// having been seen, so those paths are excluded from missing
+	// reconciliation — and their presence also suppresses snapshot/group
+	// pruning, which would otherwise prune against a partial inventory.
+	walkFailures []string
+}
+
+func (s *Scanner) scanFolderByRoots(
+	ctx context.Context,
+	folder *models.MediaFolder,
+	walkRoots []string,
+	reconcileRoots []string,
+) (*ScanResult, error) {
+	warning, err := s.scanWarningBeforeWalk(ctx, folder.ID, true)
+	if err != nil {
+		return nil, err
+	}
+	result := &ScanResult{}
+	configuredRoots := cleanScanRoots(reconcileRoots)
+	if len(configuredRoots) == 0 {
+		configuredRoots = cleanScanRoots(walkRoots)
+	}
+	roots := compactScanRoots(configuredRoots)
+
+	// An unreachable root (dead drive, lost mount) is temporarily offline, not
+	// removed from the library: its files are left untouched below — not
+	// marked missing, not trashed, not purged — for as long as it stays
+	// unreachable. Marking would be enough to hide them, since every catalog
+	// read filters on missing_since IS NULL. Probe every CONFIGURED path, not
+	// the compacted traversal roots: a nested child mount is dropped by
+	// compaction but can die independently of its reachable parent.
+	configuredProbes := rootcheck.ProbeManyWithTimeout(ctx, configuredRoots, rootcheck.DefaultProbeTimeout)
+	unreachableRoots := make([]string, 0)
+	emptyRoots := make([]string, 0)
+	for i, root := range configuredRoots {
+		probe := configuredProbes[i]
+		if !probe.Reachable {
+			logUnreachableRoot(ctx, folder.ID, root, probe)
+			unreachableRoots = append(unreachableRoots, root)
+			continue
+		}
+		if probe.Empty {
+			emptyRoots = append(emptyRoots, root)
+		}
+	}
+	// Ask only whether the catalog holds anything under each empty root.
+	// Loading the rows to count them decoded every file row of a dropped
+	// mount in full, with its track, chapter and marker JSON, on every scan
+	// for as long as the drive stayed missing.
+	suspectRoots, err := s.fileRepo.ListRootsWithCatalogedFiles(ctx, folder.ID, emptyRoots)
+	if err != nil {
+		return nil, fmt.Errorf("listing files under empty roots: %w", err)
+	}
+	if suspectRoots == nil {
+		suspectRoots = make([]string, 0)
+	}
+	result.UnreachableRoots = unreachableRoots
+	unreachableSet := make(map[string]bool, len(unreachableRoots))
+	for _, root := range unreachableRoots {
+		unreachableSet[root] = true
+	}
+
+	// Whether the operator has armed the one-time cleanup allowance decides
+	// how a suspect-empty NESTED child is treated in the walked-parent branch
+	// below. That branch runs before the allowance is consumed, and a scope it
+	// has already reconciled cannot be revisited — so without checking here,
+	// arming the allowance would consume the confirmation while the child's
+	// rows stayed protected indefinitely. Read it without consuming; the
+	// consume still happens in its existing places.
+	cleanupArmed, err := s.emptyCleanupArmed(ctx, folder.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Protection discovered after the initial probe must reach every later
+	// destructive step, not just the scope that found it. Repeatedly missing
+	// one of these propagation edges is what produced several defects in this
+	// area, so each source accumulates folder-wide here and every consumer
+	// reads the combined set via protectedScanRoots below.
+	//
+	// Unreachable and suspect are tracked apart because they mean different
+	// things to an operator and are reported separately.
+	reprobedUnreachable := make([]string, 0)
+	reprobedSuspect := make([]string, 0)
+	// unreadablePaths are paths some scope's walk could not read. Rows beneath
+	// them were never verified this scan, so they must survive the sweep just
+	// as an offline root's do.
+	unreadablePaths := make([]string, 0)
+
+	pendingEmptyScopes := make([]*scopedScan, 0)
+	totalExisting := 0
+	seenAnyFiles := false
+	allowEmptyCleanup := false
+
+	for _, root := range roots {
+		reportProgress(ctx, ProgressUpdate{
+			Phase:        "walking",
+			Message:      "Scanning library root",
+			CurrentScope: root,
+		})
+		scopeWalkRoots := []string{root}
+		if unreachableSet[root] {
+			// Skip walking a dead root — it would yield nothing anyway. Its
+			// scope still reconciles below (roots, groups, memberships), but
+			// its existing rows are protected from missing-marking rather
+			// than swept up by the empty walk.
+			scopeWalkRoots = nil
+		}
+		scope, err := s.scanScope(ctx, folder, scopeWalkRoots, []string{root})
+		if err != nil {
+			return nil, err
+		}
+		totalExisting += scope.existingCount
+		mergeScanResult(result, scope.result)
+
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
+
+		if scope.walkedFiles > 0 {
+			seenAnyFiles = true
+			beforeErrors := scope.result.Errors
+			// Pass both protected sets even though this scope walked files: a
+			// nested child mount compacted into this root can be dead, or can
+			// be a suspect-empty mountpoint, and either way its rows fall
+			// inside this scope's existing files. Without them the child's
+			// catalog gets marked missing on the parent's success.
+			//
+			// Suspect-empty children are protected unless the operator has
+			// explicitly confirmed cleanup — that confirmation is the
+			// deliberate way to retire an emptied root, and honouring it here
+			// is what stops the allowance being consumed to no effect.
+			// Unreachable roots are protected either way: an outage is never
+			// a confirmation to erase a root's catalog.
+			scopeProtected := append([]string(nil), unreachableRoots...)
+			if !cleanupArmed {
+				scopeProtected = append(scopeProtected, suspectRoots...)
+			}
+			// unreachableRoots/suspectRoots were sampled before the walk. A
+			// nested child can drop in between — healthy at probe time, gone
+			// by the time its parent is walked — and the post-walk re-probe
+			// below only revisits scopes that walked empty, never a populated
+			// parent like this one. Re-probe this root's configured children
+			// now so a mid-scan disconnect is caught before its rows are
+			// reconciled.
+			freshUnreachable, freshSuspect, err := s.reprobeNestedRoots(ctx, folder.ID, configuredRoots, root, cleanupArmed)
+			if err != nil {
+				return nil, err
+			}
+			scopeProtected = append(scopeProtected, freshUnreachable...)
+			scopeProtected = append(scopeProtected, freshSuspect...)
+			// A root discovered offline here must stay protected for the rest
+			// of the scan, not just for this scope: the folder-wide membership
+			// reconcile and trash sweep below run off these sets too. Without
+			// that, rows under a child that dropped mid-scan and are already
+			// past the removal grace get hard-deleted by the very scan that
+			// noticed the outage.
+			for _, protectedRoot := range freshUnreachable {
+				reprobedUnreachable = appendUniquePath(reprobedUnreachable, protectedRoot)
+			}
+			for _, protectedRoot := range freshSuspect {
+				reprobedSuspect = appendUniquePath(reprobedSuspect, protectedRoot)
+			}
+			for _, unreadable := range scope.walkFailures {
+				unreadablePaths = appendUniquePath(unreadablePaths, unreadable)
+			}
+			if err := s.applyScopedScan(ctx, folder, scope, false, scopeProtected); err != nil {
+				return nil, err
+			}
+			mergeCleanupResult(result, scope.result, beforeErrors)
+			continue
+		}
+
+		// Empty scopes stay pending until after the loop: whether they may
+		// force-delete (confirmed cleanup) and whether their roots must be
+		// treated as suspect depends on what the other roots produced.
+		for _, unreadable := range scope.walkFailures {
+			unreadablePaths = appendUniquePath(unreadablePaths, unreadable)
+		}
+		pendingEmptyScopes = append(pendingEmptyScopes, scope)
+	}
+
+	// Re-probe empty scopes after walking. A root can disconnect after the
+	// initial check; promote that transition into the protected set before any
+	// empty-root guard or reconciliation decision is made.
+	for _, pending := range pendingEmptyScopes {
+		root := firstScope(pending.reconcileRoots)
+		if root == "" || unreachableSet[root] || pending.existingCount == 0 {
+			continue
+		}
+		// Re-probe this scope's nested configured children too. A parent whose
+		// only media lived in a child walks empty when that child drops, and
+		// probing the parent alone says nothing — it still contains the
+		// child's bare mountpoint directory, so it reads as present and
+		// non-empty. Without this the child is never classified and its rows
+		// are marked or swept. The populated-scope branch does the same.
+		nestedUnreachable, nestedSuspect, nerr := s.reprobeNestedRoots(ctx, folder.ID, configuredRoots, root, cleanupArmed)
+		if nerr != nil {
+			return nil, nerr
+		}
+		for _, protectedRoot := range nestedUnreachable {
+			reprobedUnreachable = appendUniquePath(reprobedUnreachable, protectedRoot)
+		}
+		for _, protectedRoot := range nestedSuspect {
+			reprobedSuspect = appendUniquePath(reprobedSuspect, protectedRoot)
+		}
+		probe := rootcheck.ProbeWithTimeout(ctx, root, rootcheck.DefaultProbeTimeout)
+		if !probe.Reachable {
+			logUnreachableRoot(ctx, folder.ID, root, probe)
+			unreachableSet[root] = true
+			unreachableRoots = appendUniquePath(unreachableRoots, root)
+			result.UnreachableRoots = unreachableRoots
+			suspectRoots = removePath(suspectRoots, root)
+		} else if probe.Empty {
+			suspectRoots = appendUniquePath(suspectRoots, root)
+		}
+	}
+
+	// When EVERY configured root is unreachable this is an outage, not an
+	// intentionally emptied library: skip the empty-root confirm flow (and do
+	// not consume the operator's one-time cleanup allowance) and let the
+	// dead_root warning below explain the state. The pending scopes still run,
+	// but every root is in the protected set, so their files are neither
+	// marked missing nor deleted.
+	allRootsUnreachable := len(unreachableRoots) > 0 && len(unreachableRoots) == len(configuredRoots)
+	if !seenAnyFiles && totalExisting > 0 && !allRootsUnreachable {
+		var err error
+		allowEmptyCleanup, err = s.folderRepo.ConsumeEmptyCleanupAllowance(ctx, folder.ID)
+		if err != nil {
+			return nil, fmt.Errorf("checking empty cleanup confirmation for folder %d: %w", folder.ID, err)
+		}
+		if !allowEmptyCleanup {
+			result.EmptyRootGuarded = true
+			if err := s.folderRepo.SetScanWarning(ctx, folder.ID,
+				"empty_root",
+				"Scan found 0 media files; cleanup was skipped until deletion is confirmed.",
+				time.Now().UTC(),
+			); err != nil {
+				return nil, fmt.Errorf("recording empty-root warning for folder %d: %w", folder.ID, err)
+			}
+			if err := s.setPartialWalkWarning(ctx, folder.ID, len(unreadablePaths), true); err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
+	}
+
+	// A reachable root that is a LITERALLY empty directory while rows remain
+	// cataloged under it carries the lost-mount signature: the mountpoint
+	// survived, its contents vanished with the mount (NFS/SMB drop, dead
+	// bind-mount source), and the reachability probe cannot tell it from an
+	// intentionally emptied root. Treat such roots as suspect: their rows are
+	// only marked missing, and the sweep/purge below exempts them until the
+	// operator confirms cleanup or the files return. A root that still has
+	// entries but no media files walked its files genuinely deleted and keeps
+	// the historical purge path. When the whole folder walked empty the
+	// allowance was already consumed above; the mixed case (other roots
+	// healthy) consumes it here so a confirmed single-root cleanout still
+	// completes.
+	if seenAnyFiles && len(suspectRoots) > 0 {
+		var err error
+		allowEmptyCleanup, err = s.folderRepo.ConsumeEmptyCleanupAllowance(ctx, folder.ID)
+		if err != nil {
+			return nil, fmt.Errorf("checking empty cleanup confirmation for folder %d: %w", folder.ID, err)
+		}
+	}
+	if allowEmptyCleanup {
+		suspectRoots = nil
+	}
+	// A root that dropped mid-scan is as much an outage as one that failed the
+	// initial probe; report it so the folder warning and scan result do not
+	// present a partial scan as clean. Each keeps its own classification —
+	// reporting a suspect-empty child as unreachable would hand an operator
+	// contradictory failure information.
+	for _, protectedRoot := range reprobedUnreachable {
+		unreachableRoots = appendUniquePath(unreachableRoots, protectedRoot)
+	}
+	if !allowEmptyCleanup {
+		for _, protectedRoot := range reprobedSuspect {
+			suspectRoots = appendUniquePath(suspectRoots, protectedRoot)
+		}
+	}
+	result.UnreachableRoots = unreachableRoots
+	result.SuspectEmptyRoots = suspectRoots
+
+	// The single protected set every later destructive step reads: offline
+	// roots, suspect-empty roots, and paths no walk could read. Anything that
+	// discovers protection must land here, or the trash sweep will delete rows
+	// this scan never verified.
+	protectedScanRoots := append(append([]string(nil), unreachableRoots...), suspectRoots...)
+	for _, unreadable := range unreadablePaths {
+		protectedScanRoots = appendUniquePath(protectedScanRoots, unreadable)
+	}
+	for _, pending := range pendingEmptyScopes {
+		beforeErrors := pending.result.Errors
+		// forceDeleteAll only ever fires for confirmed cleanup, and even then
+		// rows under a probe-dead root must survive: an outage is not a
+		// confirmation to erase that root's catalog.
+		if err := s.applyScopedScan(ctx, folder, pending, allowEmptyCleanup, protectedScanRoots); err != nil {
+			return nil, err
+		}
+		mergeCleanupResult(result, pending.result, beforeErrors)
+	}
+
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+
+	reportProgress(ctx, ProgressUpdate{
+		Phase:        "reconciling",
+		Message:      "Reconciling library state",
+		CurrentScope: "folder",
+	})
+	if err := s.syncPresentLibraryState(ctx, folder.ID); err != nil {
+		return nil, fmt.Errorf("syncing present library state for folder %d: %w", folder.ID, err)
+	}
+
+	// Reuse the same protected set the scoped cleanup used, so membership
+	// removal and the trash sweep below honour roots the mid-loop re-probe
+	// found offline. Rebuilding from only the initial probe here would let a
+	// child that dropped during this scan have its already-missing rows hard
+	// deleted once they pass the removal grace — by the very scan that
+	// noticed the outage.
+	protectedRoots := protectedScanRoots
+	removedMemberships, deletedItems, orphanedImageDirs, err := s.reconcileLibraryMemberships(ctx, folder.ID, false, protectedRoots)
+	if err != nil {
+		return nil, fmt.Errorf("reconciling library membership for folder %d: %w", folder.ID, err)
+	}
+	result.MembershipsRemoved = removedMemberships
+	result.ItemsDeleted = deletedItems
+	if s.emptyTrashAfterScan {
+		trashed, err := s.fileRepo.DeleteMissingByFolder(ctx, folder.ID, s.fileRemovalGrace, protectedRoots)
+		if err != nil {
+			return nil, fmt.Errorf("emptying trash for folder %d: %w", folder.ID, err)
+		}
+		if trashed > 0 {
+			slog.InfoContext(ctx, "scanner: emptied trash", "component", "scanner", "folder_id", folder.ID, "deleted", trashed)
+		}
+		result.FilesDeleted += trashed
+	}
+
+	staleOutsideRoots, err := s.fileRepo.ListIDsOutsideRoots(ctx, folder.ID, roots)
+	if err != nil {
+		return nil, fmt.Errorf("listing stale files outside configured roots for folder %d: %w", folder.ID, err)
+	}
+	deletedOutsideRoots, err := s.fileRepo.DeleteByIDs(ctx, staleOutsideRoots)
+	if err != nil {
+		return nil, fmt.Errorf("deleting stale files outside configured roots for folder %d: %w", folder.ID, err)
+	}
+	result.FilesDeleted += deletedOutsideRoots
+
+	if len(protectedScanRoots) == 0 && s.rootSnapshotRepo != nil {
+		allSeenRoots := make([]string, 0, len(result.RootObservations))
+		for _, obs := range result.RootObservations {
+			allSeenRoots = append(allSeenRoots, obs.RootPath)
+		}
+		if err := s.rootSnapshotRepo.DeleteMissingByFolder(ctx, folder.ID, allSeenRoots); err != nil {
+			return nil, fmt.Errorf("deleting missing scanned roots for folder %d: %w", folder.ID, err)
+		}
+	}
+
+	if s.seriesQueueSyncer != nil {
+		reportProgress(ctx, ProgressUpdate{
+			Phase:        "queue_sync",
+			Message:      "Syncing series match queue",
+			CurrentScope: "folder",
+		})
+		if err := s.seriesQueueSyncer.SyncForFolder(ctx, folder.ID); err != nil {
+			return nil, fmt.Errorf("syncing series match queue for folder %d: %w", folder.ID, err)
+		}
+		slog.InfoContext(ctx, "metadata: series root queue sync", "component", "scanner",
+			"folder_id", folder.ID,
+			"scope", "folder",
+		)
+	}
+	if s.movieQueueSyncer != nil {
+		reportProgress(ctx, ProgressUpdate{
+			Phase:        "queue_sync",
+			Message:      "Syncing movie match queue",
+			CurrentScope: "folder",
+		})
+		if err := s.movieQueueSyncer.SyncForFolder(ctx, folder.ID); err != nil {
+			return nil, fmt.Errorf("syncing movie match queue for folder %d: %w", folder.ID, err)
+		}
+		slog.InfoContext(ctx, "metadata: movie file queue sync", "component", "scanner",
+			"folder_id", folder.ID,
+			"scope", "folder",
+		)
+	}
+
+	if s.artworkStore != nil && len(orphanedImageDirs) > 0 {
+		for _, dir := range orphanedImageDirs {
+			_, _ = s.artworkStore.DeletePrefix(ctx, dir)
+		}
+	}
+
+	switch {
+	case len(unreachableRoots) > 0 || len(suspectRoots) > 0:
+		// Surface the outage so the admin UI explains why part of the library
+		// vanished; the mount-check endpoint or the next fully-healthy scan
+		// clears it (both clear "dead_root" the same way as "empty_root").
+		if err := s.folderRepo.SetScanWarning(ctx, folder.ID,
+			"dead_root",
+			deadRootWarningMessage(len(configuredRoots), unreachableRoots, suspectRoots),
+			time.Now().UTC(),
+		); err != nil {
+			return nil, fmt.Errorf("recording dead-root warning for folder %d: %w", folder.ID, err)
+		}
+		if err := s.setPartialWalkWarning(ctx, folder.ID, len(unreadablePaths), true); err != nil {
+			return nil, err
+		}
+	case len(unreadablePaths) > 0:
+		if err := s.setPartialWalkWarning(ctx, folder.ID, len(unreadablePaths), false); err != nil {
+			return nil, err
+		}
+	case seenAnyFiles || allowEmptyCleanup:
+		if err := s.folderRepo.UpdateScanWarningIfUnchanged(ctx, folder.ID, warning, catalog.ScanWarning{}); err != nil {
+			return nil, fmt.Errorf("clearing scan warning for folder %d: %w", folder.ID, err)
+		}
+	default:
+		if err := s.clearPartialWalkWarning(ctx, folder.ID, warning); err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
+}
+
+// probeUnreachableRoots returns the subset of roots that are currently
+// unreachable (missing, not a directory, unlistable, or hung past the probe
+// timeout), in input order. The timeout matters because probes run on scan
+// hot paths (including per-file autoscan events): a wedged mount must degrade
+// into the protected "unreachable" path instead of stalling the scanner.
+func probeUnreachableRoots(ctx context.Context, folderID int, roots []string) []string {
+	var unreachable []string
+	probes := rootcheck.ProbeManyWithTimeout(ctx, roots, rootcheck.DefaultProbeTimeout)
+	for i, root := range roots {
+		if probe := probes[i]; !probe.Reachable {
+			logUnreachableRoot(ctx, folderID, root, probe)
+			unreachable = append(unreachable, root)
+		}
+	}
+	return unreachable
+}
+
+func logUnreachableRoot(ctx context.Context, folderID int, root string, probe rootcheck.Result) {
+	slog.WarnContext(ctx, "scanner: library root unreachable", "component", "scanner",
+		"folder_id", folderID,
+		"root", root,
+		"error_code", probe.ErrorCode,
+		"error", probe.ErrorMessage,
+	)
+}
+
+func appendUniquePath(paths []string, path string) []string {
+	for _, existing := range paths {
+		if existing == path {
+			return paths
+		}
+	}
+	return append(paths, path)
+}
+
+func removePath(paths []string, path string) []string {
+	for i, existing := range paths {
+		if existing == path {
+			return append(paths[:i], paths[i+1:]...)
+		}
+	}
+	return paths
+}
+
+// suspectEmptyRoots returns configured roots that probe as reachable but
+// LITERALLY empty directories while the database still holds rows (all
+// missing-marked) under them. That is the signature of a mount that dropped
+// out leaving its bare mountpoint directory behind (NFS/SMB drop, dead
+// bind-mount source) — a reachability probe cannot tell it apart from an
+// intentionally emptied root, so destructive cleanup under these roots is
+// deferred until the operator confirms or the files return. A root that
+// still has directory entries keeps the historical purge path.
+func (s *Scanner) suspectEmptyRoots(ctx context.Context, folderID int, configuredRoots, unreachableRoots []string) ([]string, error) {
+	if s == nil || s.fileRepo == nil {
+		return nil, nil
+	}
+	unreachableSet := make(map[string]bool, len(unreachableRoots))
+	for _, root := range unreachableRoots {
+		unreachableSet[root] = true
+	}
+	emptyRoots := make([]string, 0, len(configuredRoots))
+	probes := rootcheck.ProbeManyWithTimeout(ctx, configuredRoots, rootcheck.DefaultProbeTimeout)
+	for i, root := range configuredRoots {
+		if unreachableSet[root] {
+			continue
+		}
+		if probe := probes[i]; probe.Reachable && probe.Empty {
+			emptyRoots = append(emptyRoots, root)
+		}
+	}
+	if len(emptyRoots) == 0 {
+		return nil, nil
+	}
+	// Any cataloged row under an empty-but-reachable root makes it suspect,
+	// not just a root whose rows are already all missing. Requiring the
+	// latter made this protection reactive: on the first scan after a mount
+	// dropped, the rows are still live, the root is not classified suspect,
+	// and the scan marks everything missing — the exact outage this guards
+	// against, recognised only in time to protect the wreckage.
+	suspect, err := s.fileRepo.ListRootsWithCatalogedFiles(ctx, folderID, emptyRoots)
+	if err != nil {
+		return nil, fmt.Errorf("listing suspect-empty roots for folder %d: %w", folderID, err)
+	}
+	if len(suspect) > 0 {
+		slog.WarnContext(ctx, "scanner: empty roots still hold cataloged files; protecting them from cleanup", "component", "scanner",
+			"folder_id", folderID,
+			"roots", suspect,
+		)
+	}
+	return suspect, nil
+}
+
+// protectedConfiguredRoots probes the folder's configured root paths
+// (uncompacted, so a nested child mount is probed independently of its
+// reachable parent) and returns every root that must be exempted from
+// destructive cleanup right now: probe-unreachable roots plus suspect-empty
+// ones. Callers must pass a folder whose Paths is the full configured list.
+func (s *Scanner) protectedConfiguredRoots(ctx context.Context, folder *models.MediaFolder) ([]string, error) {
+	configuredRoots := cleanScanRoots(folder.Paths)
+	unreachableRoots := probeUnreachableRoots(ctx, folder.ID, configuredRoots)
+	suspectRoots, err := s.suspectEmptyRoots(ctx, folder.ID, configuredRoots, unreachableRoots)
+	if err != nil {
+		return nil, err
+	}
+	return append(unreachableRoots, suspectRoots...), nil
+}
+
+// configuredFolderPaths returns the folder's full configured root list for
+// dead-root protection. Scoped scans (ScanSubtree, ScanFile) pass a folder
+// clone whose Paths holds only the scanned subtree, but the cleanup they
+// trigger is folder-wide, so protection must consider every configured root:
+// reload them instead of trusting the possibly-scoped clone.
+func (s *Scanner) configuredFolderPaths(ctx context.Context, folder *models.MediaFolder) ([]string, error) {
+	if s.folderRepo == nil {
+		return folder.Paths, nil
+	}
+	full, err := s.folderRepo.GetByID(ctx, folder.ID)
+	if err != nil {
+		return nil, fmt.Errorf("loading configured paths for folder %d: %w", folder.ID, err)
+	}
+	if full == nil || len(full.Paths) == 0 {
+		// No persisted paths (fresh row, tests): the caller's view is all
+		// there is to probe.
+		return folder.Paths, nil
+	}
+	return full.Paths, nil
+}
+
+func deadRootWarningMessage(totalRoots int, unreachableRoots, suspectRoots []string) string {
+	parts := make([]string, 0, 2)
+	if len(unreachableRoots) > 0 {
+		parts = append(parts, fmt.Sprintf("%d of %d roots unreachable: %s",
+			len(unreachableRoots), totalRoots, strings.Join(unreachableRoots, ", ")))
+	}
+	if len(suspectRoots) > 0 {
+		parts = append(parts, fmt.Sprintf("%d of %d roots returned no files while the library still has cataloged files (lost mount?): %s",
+			len(suspectRoots), totalRoots, strings.Join(suspectRoots, ", ")))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (s *Scanner) scanScope(
+	ctx context.Context,
+	folder *models.MediaFolder,
+	walkRoots []string,
+	reconcileRoots []string,
+) (*scopedScan, error) {
+	result := &ScanResult{}
+	// List what is cataloged under the scope before walking it, so a file
+	// another scan adds meanwhile is never taken for one the walk missed.
+	existing, err := s.fileRepo.ListScanPresenceByFolderAndPathPrefix(ctx, folder.ID, reconcileRoots[0])
+	if err != nil {
+		return nil, fmt.Errorf("getting existing files for folder %d path %q: %w", folder.ID, reconcileRoots[0], err)
+	}
+
+	filePaths, walkFailures, sidecars, walkErr := collectLogicalFilePathsAndSidecars(ctx, walkRoots, folder.Type, folder.Paths)
+	if walkErr != nil {
+		return nil, fmt.Errorf("walking media roots for %q: %w", reconcileRoots[0], walkErr)
+	}
+	result.Sidecars = sidecars
+	slog.InfoContext(ctx, "scanner: discovered files", "component", "scanner",
+		"folder_id", folder.ID,
+		"scope", firstScope(reconcileRoots),
+		"files", len(filePaths),
+	)
+	if len(walkFailures) > 0 {
+		logIncompleteWalk(ctx, folder.ID, reconcileRoots, walkFailures)
+	}
+
+	// Extras count as seen (so reconciliation keeps their rows) but are
+	// partitioned out of identity inference and match processing.
+	unseenExisting := unseenScanPresence(existing, filePaths)
+	existingCount := len(existing)
+	primaryPaths, extraCandidates := partitionExtraPaths(filePaths, folder.Type, folder.Paths, walkRoots)
+	run, err := s.newScopeRun(ctx, folder, reconcileRoots, len(filePaths))
+	if err != nil {
+		return nil, err
+	}
+	reportProgress(ctx, run.progress("processing", "Processing discovered files"))
+
+	if err := s.processPrimaryPaths(ctx, run, primaryPaths); err != nil {
+		return nil, err
+	}
+	rootInference, groupInference := run.inference()
+	result.RootObservations = append(result.RootObservations, rootInference.Observations...)
+	if _, err := s.clearLegacyLinksForUnmatchableRoots(ctx, folder.ID, result.RootObservations); err != nil {
+		return nil, fmt.Errorf("clearing legacy links for unmatchable roots: %w", err)
+	}
+
+	result.New = int(run.newCount.Load())
+	result.Updated = int(run.updatedCount.Load())
+	result.Unchanged = int(run.unchangedCount.Load())
+	result.NoVideo = int(run.noVideoCount.Load())
+	// A retired row left the library like a vanished file's.
+	result.Missing = int(run.retiredCount.Load())
+	result.Errors = int(run.errorCount.Load())
+	reportProgress(ctx, run.progress("reconciling", "Reconciling scan state"))
+
+	if err := s.processScopeExtras(ctx, folder, extraCandidates, sidecars, result); err != nil {
+		return nil, err
+	}
+
+	return &scopedScan{
+		walkRoots:      append([]string(nil), walkRoots...),
+		reconcileRoots: append([]string(nil), reconcileRoots...),
+		existingCount:  existingCount,
+		unseenExisting: unseenExisting,
+		walkedFiles:    run.totalFiles,
+		rootInference:  rootInference,
+		groupInference: groupInference,
+		result:         result,
+		walkFailures:   walkFailures,
+	}, nil
+}
+
+// applyScopedScan reconciles one root's scope. forceDeleteAll (confirmed
+// empty cleanup) hard-deletes the scope's rows instead of marking them
+// missing — except rows under protectedRoots (probe-dead roots, including a
+// nested dead child inside this scope's root): an outage is never a
+// confirmation to erase that root's catalog.
+func (s *Scanner) applyScopedScan(
+	ctx context.Context,
+	folder *models.MediaFolder,
+	scope *scopedScan,
+	forceDeleteAll bool,
+	protectedRoots []string,
+) error {
+	if scope == nil || scope.result == nil {
+		return nil
+	}
+
+	// Snapshot and group reconciliation prune whatever this walk did not see.
+	// That is only sound against a complete inventory: after a partial walk it
+	// would delete root snapshots, observed locations and group locations for
+	// the portion that could not be read, corrupting later metadata matching
+	// even though the media_files rows themselves stay protected below.
+	// Upserting what we did see is always safe; pruning is what must wait for
+	// a scan that read the whole tree.
+	// Pruning deletes whatever this walk did not observe, so it is only sound
+	// when the walk actually observed the scope. Three cases must suppress it:
+	// an incomplete walk (some of the tree was unreadable), a scope that was
+	// never walked at all (an unreachable root gets nil walkRoots), and a
+	// scope containing a protected path (a suspect-empty child compacted into
+	// a populated parent). In each case the observed set is a lower bound, and
+	// pruning against it deletes snapshots, observed locations and group
+	// locations for media that is still there — corrupting later matching even
+	// though the media_files rows themselves are protected.
+	//
+	// Keeping stale metadata is harmless by comparison: the next complete scan
+	// prunes it.
+	pruneUnseen := len(scope.walkFailures) == 0 &&
+		len(scope.walkRoots) > 0 &&
+		!anyPathWithinRoots(protectedRoots, scope.reconcileRoots)
+	if err := s.reconcileScannedRoots(
+		ctx,
+		folder.ID,
+		scope.reconcileRoots,
+		scope.rootInference.Snapshots,
+		pruneUnseen,
+		false,
+	); err != nil {
+		return fmt.Errorf("reconciling scanned roots for scope %q: %w", scope.reconcileRoots[0], err)
+	}
+	if err := s.reconcileScannedGroups(ctx, folder.ID, false, scope.reconcileRoots, pruneUnseen, scope.groupInference); err != nil {
+		return fmt.Errorf("reconciling scanned groups for scope %q: %w", scope.reconcileRoots[0], err)
+	}
+
+	// Wherever this scope's walk could not read, its picture of the disk is a
+	// lower bound. Protect exactly those paths from missing-marking rather
+	// than the whole scope, so one unreadable entry cannot permanently exempt
+	// a healthy root.
+	if len(scope.walkFailures) > 0 {
+		protectedRoots = append(append([]string(nil), protectedRoots...), scope.walkFailures...)
+	}
+	// unseenExisting is already the cataloged files the walk did not see, so
+	// there is no seen set left to check them against.
+	s.markMissingExcludingProtected(ctx, folder.ID, scope.unseenExisting, nil, protectedRoots, scope.result)
+
+	staleFileIDs := collectStaleRemovedPathFileIDs(scope.unseenExisting, nil, scope.reconcileRoots)
+	if forceDeleteAll && scope.walkedFiles == 0 {
+		staleFileIDs = make([]int, 0, len(scope.unseenExisting))
+		for _, existing := range scope.unseenExisting {
+			if pathWithinAnyRoot(existing.FilePath, protectedRoots) {
+				continue
+			}
+			staleFileIDs = append(staleFileIDs, existing.ID)
+		}
+	}
+	deletedFiles, err := s.fileRepo.DeleteByIDs(ctx, staleFileIDs)
+	if err != nil {
+		return fmt.Errorf("deleting stale files for scope %q: %w", scope.reconcileRoots[0], err)
+	}
+	scope.result.FilesDeleted += deletedFiles
+
+	return nil
+}
+
+func mergeScanResult(dst *ScanResult, src *ScanResult) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.New += src.New
+	dst.Updated += src.Updated
+	dst.Unchanged += src.Unchanged
+	dst.NoVideo += src.NoVideo
+	dst.Errors += src.Errors
+	dst.MissingSkippedProtected += src.MissingSkippedProtected
+	dst.RootObservations = append(dst.RootObservations, src.RootObservations...)
+	dst.EmptyRootGuarded = dst.EmptyRootGuarded || src.EmptyRootGuarded
+	if src.Sidecars != nil {
+		if dst.Sidecars == nil {
+			dst.Sidecars = make(SidecarListing, len(src.Sidecars))
+		}
+		dst.Sidecars.merge(src.Sidecars)
+	}
+}
+
+// markMissingExcludingProtected marks every cataloged file the walk did not
+// see as missing, except those under a protected root.
+//
+// Protection is the whole point: catalog reads filter on
+// missing_since IS NULL, so marking a file is user-visible deletion. A root
+// that is unreachable, is a suspect-empty mountpoint, or whose walk came back
+// incomplete tells us nothing about whether its files exist, and hiding them
+// on that basis turns a storage blip into a library outage.
+//
+// Shared by the folder scan and the scoped scan so the two cannot drift.
+func (s *Scanner) markMissingExcludingProtected(
+	ctx context.Context,
+	folderID int,
+	existingFiles []scanPresence,
+	seenPaths map[string]bool,
+	protectedRoots []string,
+	result *ScanResult,
+) {
+	now := time.Now().UTC()
+	for _, existing := range existingFiles {
+		if seenPaths[existing.FilePath] {
+			continue
+		}
+		if pathWithinAnyRoot(existing.FilePath, protectedRoots) {
+			result.MissingSkippedProtected++
+			continue
+		}
+		// A file already marked by an earlier scan is waiting out the removal
+		// grace period; it is not news to this scan, so it is not counted.
+		if existing.MissingSince != nil {
+			continue
+		}
+		if err := s.fileRepo.MarkMissing(ctx, existing.ID, existing.FilePath, now); err != nil {
+			if errors.Is(err, ErrFileNotFound) {
+				// This scan relinked the row to the file's new path, or it
+				// was deleted meanwhile. Either way nothing is missing here.
+				continue
+			}
+			slog.ErrorContext(ctx, "scanner: failed to mark file missing", "component", "scanner",
+				"path", existing.FilePath,
+				"error", err,
+			)
+			result.Errors++
+			continue
+		}
+		result.Missing++
+	}
+	logProtectedMissingSkips(ctx, folderID, result.MissingSkippedProtected, protectedRoots)
+}
+
+// reprobeNestedRoots re-checks the configured roots nested strictly beneath
+// parent and returns those that must now be protected, split by why.
+//
+// Root compaction folds a child mount into its parent for traversal, so a
+// child that dies after the initial probe leaves no scope of its own and is
+// never revisited by the post-walk re-probe, which only inspects scopes that
+// walked empty. Without this, a child dropping mid-scan is indistinguishable
+// from its contents having been deleted.
+//
+// Classification comes from ONE probe batch. Probing twice — once for
+// reachability, then again for emptiness — leaves a window where a child that
+// drops between the two samples is seen as reachable by the first and
+// discarded by the second (which only returns reachable-and-empty roots),
+// yielding no protection at all during exactly the disconnect this is meant
+// to catch.
+//
+// cleanupArmed mirrors the caller's rule: an unreachable child is protected
+// regardless, while a suspect-empty one yields to an explicit operator
+// confirmation.
+func (s *Scanner) reprobeNestedRoots(
+	ctx context.Context,
+	folderID int,
+	configuredRoots []string,
+	parent string,
+	cleanupArmed bool,
+) (unreachable []string, suspect []string, err error) {
+	nested := make([]string, 0)
+	for _, root := range configuredRoots {
+		if root == parent {
+			continue
+		}
+		if pathWithinAnyRoot(root, []string{parent}) {
+			nested = append(nested, root)
+		}
+	}
+	if len(nested) == 0 {
+		return nil, nil, nil
+	}
+
+	probes := rootcheck.ProbeManyWithTimeout(ctx, nested, rootcheck.DefaultProbeTimeout)
+	unreachable = make([]string, 0)
+	emptyRoots := make([]string, 0)
+	for i, root := range nested {
+		probe := probes[i]
+		switch {
+		case !probe.Reachable:
+			logUnreachableRoot(ctx, folderID, root, probe)
+			unreachable = append(unreachable, root)
+		case probe.Empty:
+			emptyRoots = append(emptyRoots, root)
+		}
+	}
+
+	if cleanupArmed || len(emptyRoots) == 0 || s == nil || s.fileRepo == nil {
+		return unreachable, nil, nil
+	}
+	// An empty child that still owns cataloged rows is a lost mount, not an
+	// emptied library — the same rule suspectEmptyRoots applies, reusing the
+	// probe results already gathered above.
+	suspect, err = s.fileRepo.ListRootsWithCatalogedFiles(ctx, folderID, emptyRoots)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing suspect-empty nested roots for folder %d: %w", folderID, err)
+	}
+	if len(suspect) > 0 {
+		slog.WarnContext(ctx, "scanner: nested empty roots still hold cataloged files; protecting them from cleanup",
+			"component", "scanner", "folder_id", folderID, "roots", suspect)
+	}
+	return unreachable, suspect, nil
+}
+
+// emptyCleanupArmed reports whether the operator has armed the folder's
+// one-time empty-root cleanup allowance, WITHOUT consuming it.
+//
+// Consumption stays where it was, gated on what the scan actually found. This
+// is only a read, so a scan that never reaches a consume path leaves the
+// allowance armed for the next one.
+func (s *Scanner) emptyCleanupArmed(ctx context.Context, folderID int) (bool, error) {
+	if s == nil || s.folderRepo == nil || folderID <= 0 {
+		return false, nil
+	}
+	folder, err := s.folderRepo.GetByID(ctx, folderID)
+	if err != nil {
+		return false, fmt.Errorf("reading cleanup allowance for folder %d: %w", folderID, err)
+	}
+	if folder == nil {
+		return false, nil
+	}
+	return folder.AllowEmptyCleanupOnce, nil
+}
+
+// anyPathWithinRoots reports whether any of paths lies at or under one of
+// roots. Used to detect a protected path inside a scope about to be pruned.
+func anyPathWithinRoots(paths, roots []string) bool {
+	for _, path := range paths {
+		if pathWithinAnyRoot(path, roots) {
+			return true
+		}
+	}
+	return false
+}
+
+// logIncompleteWalk reports that a scope's traversal could not read part of
+// its tree, so its file list is a lower bound rather than an inventory.
+func logIncompleteWalk(ctx context.Context, folderID int, reconcileRoots []string, walkFailures []string) {
+	slog.WarnContext(ctx, "scanner: walk could not read part of this scope; affected paths excluded from missing-file reconciliation",
+		"component", "scanner",
+		"folder_id", folderID,
+		"scope", firstScope(reconcileRoots),
+		"walk_failures", len(walkFailures),
+		"unreadable_paths", truncatePaths(walkFailures, 10),
+	)
+}
+
+const partialWalkWarningCode = "partial_walk"
+
+func (s *Scanner) setPartialWalkWarning(ctx context.Context, folderID, failures int, preserveWarning bool) error {
+	if s.folderRepo == nil || failures == 0 {
+		return nil
+	}
+	warning, err := s.folderRepo.GetScanWarning(ctx, folderID)
+	if err != nil {
+		return fmt.Errorf("reading scan warning for folder %d: %w", folderID, err)
+	}
+	pathLabel := "paths"
+	if failures == 1 {
+		pathLabel = "path"
+	}
+	code := partialWalkWarningCode
+	message := fmt.Sprintf("Scan could not read or resolve %d %s; some files were not scanned. Unreadable paths were protected from missing-file cleanup.", failures, pathLabel)
+	if preserveWarning && warning.Code != nil && *warning.Code != partialWalkWarningCode {
+		// Preserve stronger warnings raised by this scan's cleanup, or a
+		// prior folder warning when only a subtree was scanned.
+		code = *warning.Code
+		if warning.Message != nil {
+			previous, _, _ := strings.Cut(*warning.Message, "\nPartial scan: ")
+			message = previous + "\nPartial scan: " + message
+		}
+	}
+	// A warning published after the read takes precedence over this update.
+	replacement := catalog.ScanWarning{Code: &code, Message: &message, At: new(time.Now().UTC())}
+	if err := s.folderRepo.UpdateScanWarningIfUnchanged(ctx, folderID, warning, replacement); err != nil {
+		return fmt.Errorf("recording partial-walk warning for folder %d: %w", folderID, err)
+	}
+	return nil
+}
+
+// Snapshot before walking: a scoped scan may publish a warning while a full
+// scan is running. Only the warning this scan observed can be cleared afterward.
+func (s *Scanner) scanWarningBeforeWalk(ctx context.Context, folderID int, fullScan bool) (catalog.ScanWarning, error) {
+	if s.folderRepo == nil || !fullScan {
+		return catalog.ScanWarning{}, nil
+	}
+	warning, err := s.folderRepo.GetScanWarning(ctx, folderID)
+	if err != nil {
+		return catalog.ScanWarning{}, fmt.Errorf("reading scan warning for folder %d: %w", folderID, err)
+	}
+	return warning, nil
+}
+
+// A healthy full walk clears a stale partial warning, including when it found
+// no media. Preserve empty/dead-root warnings raised by the cleanup guards.
+func (s *Scanner) clearPartialWalkWarning(ctx context.Context, folderID int, warning catalog.ScanWarning) error {
+	if s.folderRepo == nil {
+		return nil
+	}
+	if warning.Code != nil && *warning.Code == partialWalkWarningCode {
+		if err := s.folderRepo.UpdateScanWarningIfUnchanged(ctx, folderID, warning, catalog.ScanWarning{}); err != nil {
+			return fmt.Errorf("clearing partial-walk warning for folder %d: %w", folderID, err)
+		}
+	} else if warning.Code != nil && warning.Message != nil {
+		// Remove only the recovered suffix, retaining the stronger warning's
+		// timestamp and cleanup allowance. Compare the whole original warning
+		// atomically so a concurrent warning cannot be rewritten here.
+		if message, _, found := strings.Cut(*warning.Message, "\nPartial scan: "); found {
+			replacement := warning
+			replacement.Message = &message
+			if err := s.folderRepo.UpdateScanWarningIfUnchanged(ctx, folderID, warning, replacement); err != nil {
+				return fmt.Errorf("clearing partial-walk warning suffix for folder %d: %w", folderID, err)
+			}
+		}
+	}
+	return nil
+}
+
+// truncatePaths bounds a path list for logging; an outage can produce
+// thousands and the first few identify the affected subtree well enough.
+func truncatePaths(paths []string, limit int) []string {
+	if len(paths) <= limit {
+		return paths
+	}
+	return paths[:limit]
+}
+
+// logProtectedMissingSkips reports files a scan declined to mark missing
+// because their root was offline. This is the signal an operator needs to tell
+// "my library shrank" from "my mount dropped": without it the scan looks
+// clean while silently covering for absent storage.
+func logProtectedMissingSkips(ctx context.Context, folderID, skipped int, protectedRoots []string) {
+	if skipped == 0 {
+		return
+	}
+	slog.WarnContext(ctx, "scanner: left files untouched under offline roots", "component", "scanner",
+		"folder_id", folderID,
+		"files_skipped", skipped,
+		"protected_roots", protectedRoots,
+	)
+}
+
+func firstScope(scopes []string) string {
+	if len(scopes) == 0 {
+		return ""
+	}
+	return scopes[0]
+}
+
+func mergeCleanupResult(dst *ScanResult, src *ScanResult, priorErrors int) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.Missing += src.Missing
+	dst.MissingSkippedProtected += src.MissingSkippedProtected
+	dst.FilesDeleted += src.FilesDeleted
+	if src.Errors > priorErrors {
+		dst.Errors += src.Errors - priorErrors
+	}
+}
+
+// cleanScanRoots normalizes and dedupes configured root paths WITHOUT
+// removing nested roots. Reachability must be probed against every
+// configured path: a child mount (/media/drive under /media) is dropped by
+// compactScanRoots for traversal, but can die independently and its files
+// must still be protected from deletion.
+func cleanScanRoots(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, rawPath := range paths {
+		if strings.TrimSpace(rawPath) == "" {
+			continue
+		}
+		path := filepath.Clean(rawPath)
+		if path == "" || path == "." || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	return out
+}
+
+func compactScanRoots(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, rawPath := range paths {
+		if strings.TrimSpace(rawPath) == "" {
+			continue
+		}
+		path := filepath.Clean(rawPath)
+		if path == "" || path == "." {
+			continue
+		}
+		if pathWithinAnyRoot(path, out) {
+			continue
+		}
+		filtered := out[:0]
+		for _, existing := range out {
+			if pathWithinAnyRoot(existing, []string{path}) {
+				continue
+			}
+			filtered = append(filtered, existing)
+		}
+		out = append(filtered, path)
+	}
+	return out
+}
+
+// syncPresentLibraryState repairs the catalog memberships owned by every
+// present media file in a folder.
+func (s *Scanner) syncPresentLibraryState(ctx context.Context, folderID int) error {
+	return s.syncPresentState(ctx, folderID, presentStateScope{})
+}
+
+// syncPresentFileState repairs the catalog memberships owned by one present
+// media file. Single-file Autoscan work must not pay the folder-wide cost of
+// syncPresentLibraryState: a large library can contain hundreds of thousands
+// of files while this path has exactly one changed row to reconcile.
+func (s *Scanner) syncPresentFileState(ctx context.Context, folderID int, filePath string) error {
+	if strings.TrimSpace(filePath) == "" {
+		return fmt.Errorf("syncing present file state: empty file path")
+	}
+	return s.syncPresentState(ctx, folderID, presentStateScope{filePath: filePath})
+}
+
+// syncPresentPathState repairs only the files at or beneath a scan's root.
+func (s *Scanner) syncPresentPathState(ctx context.Context, folderID int, pathPrefix string) error {
+	if strings.TrimSpace(pathPrefix) == "" {
+		return fmt.Errorf("syncing present path state: empty path prefix")
+	}
+	return s.syncPresentState(ctx, folderID, presentStateScope{pathPrefix: pathPrefix})
+}
+
+// presentStateScope narrows present-state repair to one file or one subtree.
+// The zero value covers the whole folder.
+type presentStateScope struct {
+	filePath   string
+	pathPrefix string
+}
+
+// predicate returns the SQL filter on mf.file_path and its arguments, numbered
+// from $2 because $1 is always the folder ID.
+func (scope presentStateScope) predicate() (string, []any) {
+	switch {
+	case scope.filePath != "":
+		return "\n\t\t  AND mf.file_path = $2", []any{scope.filePath}
+	case scope.pathPrefix != "":
+		clauses, args := pathscope.RangeCoverageClauses("mf.file_path", []string{scope.pathPrefix}, 2)
+		return "\n\t\t  AND (" + strings.Join(clauses, " OR ") + ")", args
+	default:
+		return "", nil
+	}
+}
+
+// syncPresentState shares the repair statements across folder, path and file
+// scans. Appending a concrete path predicate lets PostgreSQL use the folder/path
+// index instead of planning an optional filter over the whole library.
+func (s *Scanner) syncPresentState(ctx context.Context, folderID int, scope presentStateScope) error {
+	filePredicate, scopeArgs := scope.predicate()
+	args := append([]any{folderID}, scopeArgs...)
+
+	statements := []struct {
+		desc string
+		sql  string
+	}{
+		{
+			desc: "clearing dangling content links",
+			sql: `
+		UPDATE media_files mf
+		SET content_id = NULL,
+			updated_at = NOW()
+		WHERE mf.media_folder_id = $1` + filePredicate + `
+		  AND mf.missing_since IS NULL
+		  AND mf.content_id IS NOT NULL
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM media_items mi
+			WHERE mi.content_id = mf.content_id
+		  )
+	`,
+		},
+		{
+			desc: "clearing dangling episode links",
+			sql: `
+		UPDATE media_files mf
+		SET episode_id = NULL,
+			updated_at = NOW()
+		WHERE mf.media_folder_id = $1` + filePredicate + `
+		  AND mf.missing_since IS NULL
+		  AND mf.episode_id IS NOT NULL
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM episodes e
+			WHERE e.content_id = mf.episode_id
+		  )
+	`,
+		},
+		{
+			desc: "restoring folder memberships",
+			sql: `
+		INSERT INTO media_item_libraries (content_id, media_folder_id, first_seen_at)
+		SELECT DISTINCT mf.content_id, mf.media_folder_id, NOW()
+		FROM media_files mf
+		JOIN media_items mi ON mi.content_id = mf.content_id
+		WHERE mf.media_folder_id = $1` + filePredicate + `
+		  AND mf.missing_since IS NULL
+		  AND mf.content_id IS NOT NULL
+		ON CONFLICT (content_id, media_folder_id) DO NOTHING
+	`,
+		},
+	}
+
+	// target_episode selects the episodes in scope; candidate then re-joins
+	// every active file of those episodes so first_seen_at and the scan-run
+	// provenance aggregate over the whole episode, not just the scanned path.
+	// It returns the parent series of the genuinely new links.
+	restoreEpisodeMembershipsSQL := `
+		WITH target_episode AS (
+			SELECT DISTINCT mf.episode_id, mf.media_folder_id
+			FROM media_files mf
+			JOIN episodes e ON e.content_id = mf.episode_id
+			WHERE mf.media_folder_id = $1` + filePredicate + `
+			  AND mf.missing_since IS NULL
+			  AND mf.episode_id IS NOT NULL
+			  AND NOT EXISTS (
+				SELECT 1 FROM episode_libraries el
+				WHERE el.episode_id = mf.episode_id
+				  AND el.media_folder_id = mf.media_folder_id
+			  )
+		),
+		candidate AS (
+			SELECT target.episode_id,
+			       target.media_folder_id,
+			       MIN(mf.created_at) AS first_seen_at,
+			       (array_agg(mf.first_seen_scan_run_id ORDER BY mf.created_at ASC, mf.id ASC))[1] AS first_seen_scan_run_id
+			FROM target_episode target
+			JOIN media_files mf
+			  ON mf.episode_id = target.episode_id
+			 AND mf.media_folder_id = target.media_folder_id
+			 AND mf.missing_since IS NULL
+			GROUP BY target.episode_id, target.media_folder_id
+		),
+		inserted AS (
+			INSERT INTO episode_libraries (
+				episode_id, media_folder_id, first_seen_at, first_seen_scan_run_id
+			)
+			SELECT episode_id, media_folder_id, first_seen_at, first_seen_scan_run_id
+			FROM candidate
+			ON CONFLICT (episode_id, media_folder_id) DO NOTHING
+			RETURNING episode_id
+		)
+		SELECT COALESCE(array_agg(DISTINCT e.series_id), ARRAY[]::text[])
+		FROM inserted i
+		JOIN episodes e ON e.content_id = i.episode_id
+	`
+
+	// One transaction: a crash part-way through must not leave a row with some
+	// links cleared and its memberships unrepaired.
+	tx, err := s.fileRepo.Pool().Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning present state repair: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	for _, stmt := range statements {
+		if _, err := tx.Exec(ctx, stmt.sql, args...); err != nil {
+			return fmt.Errorf("%s: %w", stmt.desc, err)
+		}
+	}
+	var linkedSeriesIDs []string
+	if err := tx.QueryRow(ctx, restoreEpisodeMembershipsSQL, args...).Scan(&linkedSeriesIDs); err != nil {
+		return fmt.Errorf("restoring episode folder memberships: %w", err)
+	}
+	spannedSeriesIDs, err := catalog.InsertSpannedEpisodeMemberships(ctx, tx, "mf.media_folder_id = $1"+filePredicate, args...)
+	if err != nil {
+		return err
+	}
+	linkedSeriesIDs = append(linkedSeriesIDs, spannedSeriesIDs...)
+	// New links move the series' membership denorms ("Latest Episodes",
+	// issue #202; "Latest Episode Air Date", issue #2741). Recompute them in
+	// a later statement: one that waited on a concurrent air-date
+	// correction's series lock would still apply the older episode dates.
+	if err := catalog.RecomputeSeriesEpisodeMembershipDenorms(ctx, tx, linkedSeriesIDs); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing present state repair: %w", err)
+	}
+	return nil
+}
+
+func (s *Scanner) syncFolderScopedAudioLibraryState(ctx context.Context, folderID int) error {
+	if err := s.syncPresentLibraryState(ctx, folderID); err != nil {
+		return err
+	}
+
+	if _, err := s.fileRepo.Pool().Exec(ctx, `
+		INSERT INTO media_item_roots (media_folder_id, canonical_root_path, content_id)
+		SELECT DISTINCT ON (mf.media_folder_id, mf.canonical_root_path)
+			mf.media_folder_id, mf.canonical_root_path, mf.content_id
+		FROM media_files mf
+		JOIN media_items mi ON mi.content_id = mf.content_id
+		WHERE mf.media_folder_id = $1
+		  AND mf.missing_since IS NULL
+		  AND mf.content_id IS NOT NULL
+		  AND COALESCE(mf.canonical_root_path, '') <> ''
+		  AND mi.type IN ('audiobook', 'podcast')
+		ON CONFLICT (media_folder_id, canonical_root_path)
+		DO UPDATE SET content_id = EXCLUDED.content_id,
+			last_seen_at = NOW()
+	`, folderID); err != nil {
+		return fmt.Errorf("restoring folder-scoped audio roots: %w", err)
+	}
+
+	return nil
+}
+
+// reconcileScopedLibraryMemberships revisits only content touched by a scoped
+// scan: the links its files had before processing (processing can replace or
+// clear them when a file becomes an extra or its inferred identity changes)
+// and the links they have now. Presence is still checked across the whole
+// folder, so a version outside the scope keeps its item available.
+//
+// Links changed outside the scanner are not visible here, so whatever
+// relinks a file must remove the memberships it leaves stale (filesplit.Move
+// does). trashFollows adds the items and episodes of every missing file in the
+// folder, so the folder-wide trash sweep that follows cannot delete a file row
+// before its item's orphan check and its episode's membership check have run.
+func (s *Scanner) reconcileScopedLibraryMemberships(ctx context.Context, folderID int, pathPrefix string, previous []*scanStateFile, trashFollows bool, protectedRoots []string) (int, int, []string, error) {
+	contentIDs, episodeIDs, err := s.fileRepo.ListMembershipTargets(ctx, folderID, pathPrefix, trashFollows)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	contentIDs = append(contentIDs, collectScanStateContentIDs(previous)...)
+	for _, file := range previous {
+		if file != nil && file.EpisodeID != "" {
+			episodeIDs = append(episodeIDs, file.EpisodeID)
+		}
+	}
+	slices.Sort(contentIDs)
+	slices.Sort(episodeIDs)
+	if s.episodeLibraryRepo != nil {
+		if _, err := s.episodeLibraryRepo.RemoveStaleEpisodeMemberships(ctx, folderID, slices.Compact(episodeIDs)); err != nil {
+			return 0, 0, nil, err
+		}
+	}
+	return s.libraryRepo.ReconcileItemMemberships(ctx, folderID, slices.Compact(contentIDs), protectedRoots)
+}
+
+// reconcileLibraryMemberships removes memberships for content with no
+// remaining non-missing files in the folder and purges orphaned items.
+// restoreEpisodes also re-inserts episode memberships from present files;
+// pass false when syncPresentLibraryState already did that for this scan.
+// unreachableRoots exempts items whose files sit under a currently
+// unreachable library root from the orphan purge (membership removal still
+// happens so the items stay hidden); pass nil when every root is reachable.
+func (s *Scanner) reconcileLibraryMemberships(ctx context.Context, folderID int, restoreEpisodes bool, unreachableRoots []string) (int, int, []string, error) {
+	if s.episodeLibraryRepo != nil {
+		reconcileEpisodes := s.episodeLibraryRepo.RemoveStaleFolderMemberships
+		if restoreEpisodes {
+			reconcileEpisodes = s.episodeLibraryRepo.ReconcileFolderMembership
+		}
+		if _, err := reconcileEpisodes(ctx, folderID); err != nil {
+			return 0, 0, nil, err
+		}
+	}
+	return s.libraryRepo.ReconcileFolderMembership(ctx, folderID, unreachableRoots)
+}
+
+// sweepMissingAndReconcile finishes an audio/ebook/podcast missing-file pass:
+// it reconciles library memberships, empties trash (when enabled), and
+// best-effort deletes orphaned S3 image dirs. The folder-wide sweep and
+// orphan purge must not destroy rows/items whose files sit under a currently
+// unreachable or suspect-empty library root (see the video scanner's
+// dead-root protection): unreachable is not removed. The folder argument may
+// be a scoped clone (ScanSubtree/ScanFile), so the configured roots are
+// reloaded and probed uncompacted — a nested child mount can die
+// independently of its reachable parent. confirmedCleanup skips the
+// suspect-empty exemption for a scan the operator explicitly confirmed.
+// unreadablePaths preserves files under failed walk entries through both
+// membership reconciliation and trash removal, even if already marked missing.
+// Counts are returned for the caller's flavor-specific logging.
+func (s *Scanner) sweepMissingAndReconcile(ctx context.Context, folder *models.MediaFolder, confirmedCleanup bool, unreadablePaths ...string) (trashed, removedMemberships, deletedItems int, err error) {
+	protectedRoots, err := s.sweepProtectedRoots(ctx, folder, confirmedCleanup, unreadablePaths)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return s.sweepMissingWithProtectedRoots(ctx, folder, protectedRoots)
+}
+
+// sweepProtectedRoots returns the paths sweepMissingAndReconcile exempts from
+// destructive cleanup: unreadablePaths, every unreachable configured root, and,
+// unless confirmedCleanup, every suspect-empty one. A caller that also needs
+// them before marking files missing computes them once and passes them to
+// sweepMissingWithProtectedRoots.
+func (s *Scanner) sweepProtectedRoots(ctx context.Context, folder *models.MediaFolder, confirmedCleanup bool, unreadablePaths []string) ([]string, error) {
+	configuredPaths, err := s.configuredFolderPaths(ctx, folder)
+	if err != nil {
+		return nil, err
+	}
+	configuredRoots := cleanScanRoots(configuredPaths)
+	protectedRoots := probeUnreachableRoots(ctx, folder.ID, configuredRoots)
+	protectedRoots = append(protectedRoots, unreadablePaths...)
+	if !confirmedCleanup {
+		suspectRoots, serr := s.suspectEmptyRoots(ctx, folder.ID, configuredRoots, protectedRoots)
+		if serr != nil {
+			return nil, serr
+		}
+		protectedRoots = append(protectedRoots, suspectRoots...)
+	}
+	return protectedRoots, nil
+}
+
+// sweepMissingWithProtectedRoots is sweepMissingAndReconcile with the
+// protected roots already computed by sweepProtectedRoots.
+func (s *Scanner) sweepMissingWithProtectedRoots(ctx context.Context, folder *models.MediaFolder, protectedRoots []string) (trashed, removedMemberships, deletedItems int, err error) {
+	var orphanedImageDirs []string
+	removedMemberships, deletedItems, orphanedImageDirs, err = s.reconcileLibraryMemberships(ctx, folder.ID, true, protectedRoots)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("reconciling library membership for folder %d: %w", folder.ID, err)
+	}
+	if s.emptyTrashAfterScan {
+		trashed, err = s.fileRepo.DeleteMissingByFolder(ctx, folder.ID, s.fileRemovalGrace, protectedRoots)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("emptying trash for folder %d: %w", folder.ID, err)
+		}
+	}
+	if s.artworkStore != nil && len(orphanedImageDirs) > 0 {
+		for _, dir := range orphanedImageDirs {
+			_, _ = s.artworkStore.DeletePrefix(ctx, dir)
+		}
+	}
+	return trashed, removedMemberships, deletedItems, nil
+}
+
+func collectStaleRemovedPathFileIDs(existingFiles []scanPresence, seenPaths map[string]bool, roots []string) []int {
+	ids := make([]int, 0)
+	for _, existing := range existingFiles {
+		if seenPaths[existing.FilePath] {
+			continue
+		}
+		if pathWithinAnyRoot(existing.FilePath, roots) {
+			continue
+		}
+		ids = append(ids, existing.ID)
+	}
+	return ids
+}
+
+func collectScanStateContentIDs(files []*scanStateFile) []string {
+	contentIDs := make([]string, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if file == nil || strings.TrimSpace(file.ContentID) == "" {
+			continue
+		}
+		if _, ok := seen[file.ContentID]; ok {
+			continue
+		}
+		seen[file.ContentID] = struct{}{}
+		contentIDs = append(contentIDs, file.ContentID)
+	}
+	return contentIDs
+}
+
+func pathWithinAnyRoot(path string, roots []string) bool {
+	cleanPath := filepath.Clean(path)
+	for _, root := range roots {
+		cleanRoot := filepath.Clean(root)
+		rel, err := filepath.Rel(cleanRoot, cleanPath)
+		if err != nil {
+			continue
+		}
+		if rel == "." || rel == "" {
+			return true
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrPathOutsideLibrary reports a scoped scan of a path that is not under any
+// of the library's configured roots.
+var ErrPathOutsideLibrary = errors.New("path is outside the library")
+
+// requirePathInLibrary returns ErrPathOutsideLibrary unless path lies
+// lexically under one of folder's roots. Walks keep the logical path below a
+// symlinked root, so this covers every path the catalog records. A physical
+// or aliased path that only resolves into a root is refused: scanning it would
+// record a second row for a file the catalog already holds under its logical
+// path.
+func requirePathInLibrary(path string, folder *models.MediaFolder) error {
+	if pathWithinAnyRoot(path, folder.Paths) {
+		return nil
+	}
+	return fmt.Errorf("%w: library %d, path %s", ErrPathOutsideLibrary, folder.ID, path)
+}
+
+type explicitFileRequestKey struct{}
+
+// WithExplicitFileRequest marks ctx as an admin's scan request for an exact
+// file path. ScanFile then scans the file even if the library's ignore files
+// exclude it.
+func WithExplicitFileRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, explicitFileRequestKey{}, true)
+}
+
+// audiobookFileScanIgnores reports how an audiobook file scan applies the
+// library's ignore files to the books it rebuilds. A scan Silo starts on its
+// own applies them. When an admin named this file explicitly, the admin's
+// file is scanned rather than refused, as when the request is resolved: if
+// the ignore files exclude it, it is admitted past them and nothing else they
+// exclude is (admit); if one of them cannot be read, the rules are unknown and
+// the rebuild reads no ignore files (honor is false).
+func audiobookFileScanIgnores(ctx context.Context, file string, libraryRoots []string) (honor bool, admit string) {
+	if explicit, _ := ctx.Value(explicitFileRequestKey{}).(bool); !explicit {
+		return true, ""
+	}
+	ignored, err := FileIgnored(file, libraryRoots)
+	switch {
+	case err != nil:
+		return false, ""
+	case ignored:
+		return true, file
+	}
+	return true, ""
+}
+
+// ScanFile scans a single file and upserts it into the database. filePath
+// must lie under one of folder's roots.
+func (s *Scanner) ScanFile(ctx context.Context, filePath string, folder *models.MediaFolder) error {
+	if err := requirePathInLibrary(filepath.Clean(filePath), folder); err != nil {
+		return err
+	}
+	var stopWatch context.CancelFunc
+	ctx, stopWatch = s.watchFolderContext(ctx, folder.ID)
+	defer stopWatch()
+	if err := s.ensureFolderEnabled(ctx, folder.ID); err != nil {
+		return err
+	}
+
+	cleanFile := filepath.Clean(filePath)
+	if librarykind.IsAudiobook(folder.Type) {
+		if !SupportsAudioFile(cleanFile) {
+			return fmt.Errorf("unrecognized audio extension: %s", strings.ToLower(filepath.Ext(cleanFile)))
+		}
+		// Widen before checking the folder exists, so a file in a deleted
+		// disc folder still rebuilds its book.
+		widened, _ := audiobookScopeRoot(filepath.Dir(cleanFile), folder.Paths)
+		scanRoot, err := cleanScopedAudiobookScanRoot(widened)
+		if err != nil {
+			return err
+		}
+		honorIgnores, admit := audiobookFileScanIgnores(ctx, cleanFile, folder.Paths)
+		if handled, err := s.reconcileVanishedFileIfNeeded(ctx, folder, cleanFile); handled {
+			if err != nil {
+				return err
+			}
+			if info, statErr := fspath.Stat(scanRoot); statErr == nil && info.IsDir() {
+				if err := s.scanAudiobookPaths(ctx, folder, []string{scanRoot}, false, honorIgnores, admit); err != nil {
+					return err
+				}
+			} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+				return fmt.Errorf("stat audiobook directory %s: %w", scanRoot, statErr)
+			}
+			return s.syncFolderScopedAudioLibraryState(ctx, folder.ID)
+		}
+		if err := s.scanAudiobookPaths(ctx, folder, []string{scanRoot}, false, honorIgnores, admit); err != nil {
+			return err
+		}
+		return s.syncFolderScopedAudioLibraryState(ctx, folder.ID)
+	}
+	if librarykind.IsManga(folder.Type) {
+		if !SupportsEbookFile(cleanFile) {
+			return fmt.Errorf("unrecognized manga extension: %s", strings.ToLower(filepath.Ext(cleanFile)))
+		}
+		if handled, err := s.reconcileVanishedFileIfNeeded(ctx, folder, cleanFile); handled {
+			return err
+		}
+		return s.scanMangaPaths(ctx, folder, []string{cleanFile}, false)
+	}
+	if librarykind.IsEbook(folder.Type) {
+		if !SupportsEbookFile(cleanFile) {
+			return fmt.Errorf("unrecognized ebook extension: %s", strings.ToLower(filepath.Ext(cleanFile)))
+		}
+		if handled, err := s.reconcileVanishedFileIfNeeded(ctx, folder, cleanFile); handled {
+			return err
+		}
+		return s.scanEbookPaths(ctx, folder, []string{cleanFile}, false)
+	}
+	// Verify the file extension is recognized.
+	if dir, ok := themesongs.OwnerDirectory(cleanFile); ok && supportsThemeSongs(folder.Type) {
+		if !pathWithinAnyRoot(dir, folder.Paths) {
+			return fmt.Errorf("theme owner is outside the library")
+		}
+		return s.scanThemeSongs(ctx, folder, dir, true)
+	}
+	if !SupportsVideoFile(cleanFile) {
+		if reason := unsupportedVideoFileReason(cleanFile); reason != "" {
+			return fmt.Errorf("unsupported video file %s: %s", cleanFile, reason)
+		}
+		return fmt.Errorf("unrecognized video extension: %s", strings.ToLower(filepath.Ext(cleanFile)))
+	}
+	if handled, err := s.reconcileVanishedFileIfNeeded(ctx, folder, cleanFile); handled {
+		if err != nil {
+			return err
+		}
+		return s.syncVanishedVideoQueues(ctx, folder.ID, cleanFile)
+	}
+
+	// Look up only this specific file instead of loading the entire folder.
+	existingByPath := make(map[string]*scanStateFile, 1)
+	existing, err := s.fileRepo.GetByPath(ctx, filePath)
+	if err == nil {
+		existingByPath[filePath] = scanStateFromMediaFile(existing)
+	}
+
+	// A local extra (Trailers/ dir, -trailer suffix, ...) bypasses identity
+	// inference and matching entirely.
+	if candidate, isExtra := newWatchExtrasClassifier(folder.Type, folder.Paths).classify(cleanFile); isExtra {
+		stats := s.processExtraFiles(ctx, folder, []extraCandidate{candidate}, existingByPath, nil)
+		if stats.Errors > 0 {
+			return fmt.Errorf("processing extra file %s failed", cleanFile)
+		}
+		// The Upsert above already nulled this row's content/episode links as
+		// part of converting it into an extra. What still needs repair is the
+		// library membership: if this was the last primary file behind an
+		// item, the folder membership must go away too. Only the row's former
+		// links can have changed, so reconcile just those.
+		protectedRoots, err := s.protectedConfiguredRoots(ctx, folder)
+		if err != nil {
+			return err
+		}
+		if _, _, _, err := s.reconcileScopedLibraryMemberships(
+			ctx, folder.ID, cleanFile, []*scanStateFile{existingByPath[filePath]}, false, protectedRoots); err != nil {
+			return fmt.Errorf("reconciling library membership after extra file scan: %w", err)
+		}
+		return nil
+	}
+	// A file already known to hold no video is left out before anything is
+	// inferred from its path.
+	if kept, _, _, err := s.dropNoVideoPaths(ctx, folder, []string{filePath}); err != nil {
+		return fmt.Errorf("reading files without video: %w", err)
+	} else if len(kept) == 0 {
+		return s.reconcileRetiredNoVideoFile(ctx, folder, cleanFile, existingByPath[filePath])
+	}
+	existingContentStatuses, err := s.itemRepo.GetStatusByIDs(ctx, collectScanStateContentIDs([]*scanStateFile{existingByPath[filePath]}))
+	if err != nil {
+		return fmt.Errorf("loading item statuses for file: %w", err)
+	}
+	observation, ok := ObserveRoot(filePath, folder.Type, folder.Paths...)
+	if ok {
+		cleared, clearErr := s.clearLegacyLinksForUnmatchableRoots(ctx, folder.ID, []RootObservation{observation})
+		if clearErr != nil {
+			return clearErr
+		}
+		if cleared > 0 {
+			protectedRoots, protErr := s.protectedConfiguredRoots(ctx, folder)
+			if protErr != nil {
+				return protErr
+			}
+			if _, _, _, reconcileErr := s.reconcileLibraryMemberships(ctx, folder.ID, true, protectedRoots); reconcileErr != nil {
+				return fmt.Errorf("reconciling folder membership after clearing legacy links: %w", reconcileErr)
+			}
+		}
+	}
+
+	rootOverrides, err := s.loadRootOverrides(ctx, folder.ID, []string{filepath.Dir(filePath)})
+	if err != nil {
+		return fmt.Errorf("loading root overrides for file: %w", err)
+	}
+	rootInference := inferRootAssignments([]string{filePath}, folder.Type, folder.ID, rootOverrides, folder.Paths...)
+	s.logRootInferenceDisagreements(rootInference.Assignments)
+
+	identityOverrides, err := s.loadIdentityOverrides(ctx, folder.ID)
+	if err != nil {
+		return fmt.Errorf("loading identity overrides for file: %w", err)
+	}
+	groupInference := inferGroupAssignments([]string{filePath}, folder.Type, folder.ID, rootInference.Assignments, identityOverrides)
+	groupOverrides, err := s.loadGroupOverrides(ctx, folder.ID)
+	if err != nil {
+		return fmt.Errorf("loading group overrides for file: %w", err)
+	}
+	applyGroupOverrides(&groupInference, groupOverrides)
+	action, _, err := s.processFile(ctx, filePath, folder, existingByPath, existingContentStatuses, rootInference.Assignments[filepath.Clean(filePath)], groupInference.Assignments[filepath.Clean(filePath)], newExternalSubtitleDirCache(folder.Type))
+	if err != nil {
+		return err
+	}
+	if action == actionNoVideo || action == actionNoVideoRetired {
+		// Nothing was cataloged, so no root or group is recorded for the path.
+		return s.reconcileRetiredNoVideoFile(ctx, folder, cleanFile, existingByPath[filePath])
+	}
+	if err := s.reconcileScannedRoots(
+		ctx,
+		folder.ID,
+		nil,
+		rootInference.Snapshots,
+		true,
+		false,
+	); err != nil {
+		return fmt.Errorf("reconciling scanned root for file: %w", err)
+	}
+	scopePath := filepath.Dir(filePath)
+	if err := s.reconcileScannedGroups(ctx, folder.ID, false, []string{scopePath}, false, groupInference); err != nil {
+		return fmt.Errorf("reconciling scanned groups for file: %w", err)
+	}
+	if err := s.syncPresentFileState(ctx, folder.ID, filePath); err != nil {
+		return fmt.Errorf("syncing present library state for file: %w", err)
+	}
+	if s.seriesQueueSyncer != nil {
+		if err := s.seriesQueueSyncer.SyncInScope(ctx, folder.ID, scopePath); err != nil {
+			return fmt.Errorf("syncing series match queue for file: %w", err)
+		}
+		slog.InfoContext(ctx, "metadata: series root queue sync", "component", "scanner",
+			"folder_id", folder.ID,
+			"scope", scopePath,
+		)
+	}
+	if s.movieQueueSyncer != nil {
+		if err := s.movieQueueSyncer.SyncInScope(ctx, folder.ID, filepath.Clean(filePath)); err != nil {
+			return fmt.Errorf("syncing movie match queue for file: %w", err)
+		}
+		slog.InfoContext(ctx, "metadata: movie file queue sync", "component", "scanner",
+			"folder_id", folder.ID,
+			"scope", filepath.Clean(filePath),
+		)
+	}
+	return s.scanOptionalThemeSongs(ctx, folder, filepath.Dir(filePath), true)
+}
+
+// reconcileRetiredNoVideoFile finishes a single-file scan that left the file
+// out for having no video. Only the title of the row at the path, retired now
+// or by an earlier scan, can have lost its last file, so only its memberships
+// are reconciled, and the row waits for a folder scan's trash sweep. An
+// earlier scan's row is reconciled again because its own reconcile may have
+// failed after the row was marked. A file that never had a row needs nothing.
+func (s *Scanner) reconcileRetiredNoVideoFile(ctx context.Context, folder *models.MediaFolder, filePath string, retired *scanStateFile) error {
+	if retired == nil {
+		return nil
+	}
+	protectedRoots, err := s.protectedConfiguredRoots(ctx, folder)
+	if err != nil {
+		return err
+	}
+	if _, _, _, err := s.reconcileScopedLibraryMemberships(ctx, folder.ID, filePath, []*scanStateFile{retired}, false, protectedRoots); err != nil {
+		return fmt.Errorf("reconciling library membership after leaving out file without video: %w", err)
+	}
+	return s.syncVanishedVideoQueues(ctx, folder.ID, filePath)
+}
+
+func (s *Scanner) reconcileVanishedFileIfNeeded(ctx context.Context, folder *models.MediaFolder, filePath string) (bool, error) {
+	if gone, err := mediaFileGone(filePath); err != nil || !gone {
+		return err != nil, err
+	}
+	if s == nil || s.fileRepo == nil || folder == nil {
+		return true, fmt.Errorf("reconcile vanished file: scanner repositories not configured")
+	}
+	outcome, err := s.markVanishedFile(ctx, folder, filePath)
+	switch {
+	case err != nil:
+		return true, err
+	case outcome == vanishedFileRestored:
+		return false, nil
+	case outcome == vanishedFileUncataloged:
+		return true, nil
+	}
+	if _, _, _, err := s.sweepMissingAndReconcile(ctx, folder, false); err != nil {
+		return true, err
+	}
+	if librarykind.IsManga(folder.Type) {
+		if err := s.deleteOrphanedMangaSeries(ctx, folder.ID); err != nil {
+			return true, err
+		}
+	}
+	if librarykind.IsEbook(folder.Type) || librarykind.IsManga(folder.Type) {
+		s.reconcileMissingEbookEnrichment(ctx, folder.ID)
+	}
+	return true, nil
+}
+
+// mediaFileGone reports whether no file exists at filePath.
+func mediaFileGone(filePath string) (bool, error) {
+	_, err := fspath.Stat(filePath)
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, os.ErrNotExist):
+		return true, nil
+	default:
+		return true, fmt.Errorf("stat media file %s: %w", filePath, err)
+	}
+}
+
+type vanishedFileOutcome int
+
+const (
+	vanishedFileNeedsSweep  vanishedFileOutcome = iota // marked missing or already missing
+	vanishedFileRestored                               // the file is back on disk
+	vanishedFileUncataloged                            // no row records the path
+)
+
+// markVanishedFile marks missing the row of a file found gone from disk.
+//
+// The file can come back once it is checked, and a single-file scan of a book
+// can then see its row unchanged and skip it before this mark. That scan
+// writes the row (confirmUnchangedFiles), so only a row written before the
+// check is marked. Any other write since the check also leaves the row
+// unmarked, so the check runs once more with a new time: a file still gone
+// is then marked. If the row is written again before that mark too, the scan
+// fails rather than report success with the file still listed.
+func (s *Scanner) markVanishedFile(ctx context.Context, folder *models.MediaFolder, filePath string) (vanishedFileOutcome, error) {
+	const attempts = 2
+	for attempt := 1; attempt <= attempts; attempt++ {
+		checkedAt, err := s.scanInventoryTime(ctx)
+		if err != nil {
+			return vanishedFileNeedsSweep, fmt.Errorf("reconcile vanished file: %w", err)
+		}
+		if gone, err := mediaFileGone(filePath); err != nil {
+			return vanishedFileNeedsSweep, err
+		} else if !gone {
+			return vanishedFileRestored, nil
+		}
+		file, err := s.fileRepo.GetByPath(ctx, filePath)
+		if errors.Is(err, ErrFileNotFound) {
+			return vanishedFileUncataloged, nil
+		}
+		if err != nil {
+			return vanishedFileNeedsSweep, fmt.Errorf("loading vanished media file %s: %w", filePath, err)
+		}
+		if file.MediaFolderID != folder.ID {
+			return vanishedFileNeedsSweep, fmt.Errorf("vanished media file %s belongs to library %d, not %d", filePath, file.MediaFolderID, folder.ID)
+		}
+		if file.MissingSince != nil {
+			return vanishedFileNeedsSweep, nil
+		}
+		err = s.fileRepo.MarkMissingWrittenBefore(ctx, file.ID, file.FilePath, time.Now().UTC(), checkedAt)
+		if errors.Is(err, ErrFileNotFound) {
+			continue
+		}
+		if err != nil {
+			return vanishedFileNeedsSweep, fmt.Errorf("marking vanished media file %s missing: %w", filePath, err)
+		}
+		return vanishedFileNeedsSweep, nil
+	}
+	return vanishedFileNeedsSweep, fmt.Errorf("marking vanished media file %s missing: its row changed during each of %d attempts", filePath, attempts)
+}
+
+func (s *Scanner) syncVanishedVideoQueues(ctx context.Context, folderID int, filePath string) error {
+	if s.seriesQueueSyncer != nil {
+		if err := s.seriesQueueSyncer.SyncInScope(ctx, folderID, filepath.Dir(filePath)); err != nil {
+			return fmt.Errorf("syncing series match queue after vanished file: %w", err)
+		}
+	}
+	if s.movieQueueSyncer != nil {
+		if err := s.movieQueueSyncer.SyncInScope(ctx, folderID, filepath.Clean(filePath)); err != nil {
+			return fmt.Errorf("syncing movie match queue after vanished file: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Scanner) watchFolderContext(ctx context.Context, folderID int) (context.Context, context.CancelFunc) {
+	cancel := func() {}
+	if ctx == nil || folderID <= 0 || s == nil || s.folderRepo == nil {
+		return ctx, cancel
+	}
+
+	watchCtx, cancel := context.WithCancel(ctx)
+	enabled, err := s.folderEnabledState(watchCtx, folderID)
+	if err != nil {
+		slog.WarnContext(ctx, "scanner: failed to load folder state", "component", "scanner", "folder_id", folderID, "error", err)
+		cancel()
+		return watchCtx, cancel
+	}
+	if !enabled {
+		cancel()
+		return watchCtx, cancel
+	}
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-ticker.C:
+				enabled, err := s.folderEnabledState(watchCtx, folderID)
+				if watchCtx.Err() != nil {
+					// The scan finished while the check ran.
+					return
+				}
+				if err != nil {
+					slog.WarnContext(ctx, "scanner: failed to refresh folder state", "component", "scanner", "folder_id", folderID, "error", err)
+					continue
+				}
+				if !enabled {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	return watchCtx, cancel
+}
+
+func (s *Scanner) ensureFolderEnabled(ctx context.Context, folderID int) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if s == nil || s.folderRepo == nil || folderID <= 0 {
+		return nil
+	}
+
+	enabled, err := s.folderEnabledState(ctx, folderID)
+	switch {
+	case errors.Is(err, catalog.ErrFolderNotFound):
+		return context.Canceled
+	case err != nil:
+		return fmt.Errorf("loading folder state: %w", err)
+	case !enabled:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
+func (s *Scanner) folderEnabledState(ctx context.Context, folderID int) (bool, error) {
+	if s == nil || s.folderRepo == nil || folderID <= 0 {
+		return true, nil
+	}
+	folder, err := s.folderRepo.GetByID(ctx, folderID)
+	switch {
+	case errors.Is(err, catalog.ErrFolderNotFound):
+		return false, err
+	case err != nil:
+		return false, err
+	case folder == nil:
+		return false, catalog.ErrFolderNotFound
+	default:
+		return folder.Enabled, nil
+	}
+}
+
+// fileAction represents what happened when processing a file.
+type fileAction int
+
+const (
+	actionNew fileAction = iota
+	actionUpdated
+	actionUnchanged
+	// actionNoVideo is a file in a video library that holds no video stream
+	// and was left out of the catalog (see no_video.go).
+	// actionNoVideoRetired is one whose present row was marked missing.
+	actionNoVideo
+	actionNoVideoRetired
+)
+
+// processFile handles a single file: checks if it changed, gathers hints,
+// probes it, and upserts it.
+func (s *Scanner) processFile(
+	ctx context.Context,
+	filePath string,
+	folder *models.MediaFolder,
+	existingByPath map[string]*scanStateFile,
+	existingContentStatuses map[string]string,
+	assignment fileRootAssignment,
+	groupAssignment fileGroupAssignment,
+	subtitleCache *externalSubtitleDirCache,
+) (resultAction fileAction, resultWarnings []string, resultErr error) {
+	defer func() { observeFile(resultAction, resultErr) }()
+	// Stat the file.
+	info, err := fspath.Stat(filePath)
+	if err != nil {
+		return 0, nil, fmt.Errorf("stat %s: %w", filePath, err)
+	}
+
+	fileSize := info.Size()
+	fileModifiedAt := normalizeFileModifiedAt(info.ModTime())
+	var externalSubs []ExternalSubtitleInfo
+	externalSubsLoaded := false
+	externalSubsChecked := false
+	loadExternalSubs := func() []ExternalSubtitleInfo {
+		if externalSubsLoaded {
+			return externalSubs
+		}
+		externalSubsLoaded = true
+		var subErr error
+		externalSubs, subErr = subtitleCache.Detect(filePath)
+		if subErr != nil {
+			// Keep what was found (sidecars beside the video when only a
+			// Subs/ folder failed), but leave the set unchecked so the
+			// failure never reads as a change to the stored sidecars.
+			slog.WarnContext(ctx, "scanner: subtitle detection failed", "component", "scanner", "path", filePath, "error", subErr)
+			externalSubsChecked = false
+			return externalSubs
+		}
+		externalSubsChecked = true
+		return externalSubs
+	}
+	// externalSubsToStore is the sidecar list a write to an existing row
+	// stores. After a failed listing it keeps the stored sidecars the scan
+	// could not see instead of storing only the ones it found.
+	externalSubsToStore := func() ([]models.ExternalSubtitle, error) {
+		found := externalSubtitleModels(loadExternalSubs())
+		if externalSubsChecked {
+			return found, nil
+		}
+		// Read by path, the key both writes use, not the snapshot's ID.
+		stored, err := s.fileRepo.GetByPath(ctx, filePath)
+		if errors.Is(err, ErrFileNotFound) {
+			// Deleted since the snapshot: there is nothing stored to keep,
+			// and the upsert re-ingests the file.
+			return found, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading stored sidecars of file %s: %w", filePath, err)
+		}
+		return keepUnlistedSidecars(stored.ExternalSubtitles, found), nil
+	}
+
+	// Check if unchanged (same size) only when playback-critical probe data
+	// is already present or this scanner cannot repair it on this node. This
+	// lets rescans repair legacy rows when local ffprobe metadata is available
+	// without forcing endless rewrites on nodes that cannot probe.
+	if existing, ok := existingByPath[filePath]; ok {
+		// A missing row may be a retitle's stand-in, and the file the one that
+		// left it; that row takes its path back before anything probes the
+		// file onto the stand-in.
+		if existing.MissingSince != nil {
+			reclaimed, err := s.reclaimStandIn(ctx, folder, filePath, existing, fileSize, fileModifiedAt, assignment, groupAssignment, loadExternalSubs)
+			if err != nil {
+				// Left for a later scan; see reclaimStandIn.
+				return 0, nil, err
+			}
+			if reclaimed {
+				return actionUpdated, []string{"moved"}, nil
+			}
+		}
+		currentExternalSubtitlePaths := externalSubtitleInfoPaths(loadExternalSubs())
+		updateReasons := scanStateUpdateReasons(existing, fileSize, fileModifiedAt, currentExternalSubtitlePaths, externalSubsChecked, assignment, groupAssignment, folder.Type, s.ffprobePath != "")
+		if shouldSkipStableConfirmedScanState(existing, existingContentStatuses[existing.ContentID], fileSize, fileModifiedAt, updateReasons, s.ffprobePath != "") {
+			return actionUnchanged, nil, nil
+		}
+		if len(updateReasons) == 0 {
+			return actionUnchanged, nil, nil
+		}
+
+		// Metadata-only fast path: when the only thing that changed is the
+		// derived identity/grouping (root or content-group-key reassignment),
+		// the media bytes are untouched and existing probe data is still valid.
+		// Rewrite just the identity columns in place — no ffprobe, no OSHash,
+		// no probe-column churn. This decouples identity/grouping-scheme changes
+		// from probing: a library-wide group-key scheme bump (see #319) converges
+		// the stored keys on the next scan without a full-library ffprobe storm.
+		if identityOnlyFastPathEligible(existing, updateReasons) {
+			mf := models.MediaFile{
+				MediaFolderID: folder.ID,
+				FilePath:      filePath,
+			}
+			populateScanIdentity(&mf, filePath, folder.Type, assignment, groupAssignment, existing)
+			applied, persistErr := persistIdentityUpdate(&mf,
+				func(file models.MediaFile) (int, error) { return s.fileRepo.UpdateIdentity(ctx, file) },
+				func(file *models.MediaFile) error { return s.enqueueMetadataWork(ctx, folder, file) },
+			)
+			switch {
+			case persistErr != nil:
+				return 0, nil, fmt.Errorf("persisting identity update for file %s: %w", filePath, persistErr)
+			case applied:
+				return actionUpdated, updateReasons, nil
+			default:
+				// The row vanished between the scan-state snapshot and this
+				// write (concurrent delete). Fall through to the full path,
+				// whose upsert re-ingests the file in this scan — the old
+				// behavior before the fast path existed.
+			}
+		}
+
+		action := actionUpdated
+		// Gather hints (OSHash only).
+		hints := s.gatherHints(filePath)
+		fileHash := hints.FileHash
+
+		// Try to get probe data.
+		probe, probeSource, probeRejected := s.probeFile(ctx, filePath)
+		probe, noVideo := s.confirmNoVideo(ctx, folder, filePath, probe)
+		if noVideo {
+			return s.excludeNoVideoFile(ctx, folder, existing, noVideoFile{FilePath: filePath, FileSize: fileSize, FileModifiedAt: fileModifiedAt, FileHash: fileHash})
+		}
+		rejectionStands := probeRejectionStands(existing, fileSize, fileModifiedAt)
+		if shouldPreserveExistingProbeAfterProbeFailure(updateReasons, probe, rejectionStands) {
+			if probeRejected {
+				// Nothing else about the row changes here, so the rejection
+				// is recorded on its own. The repository only marks rows with
+				// no successful probe, so valid metadata stays authoritative.
+				if err := s.fileRepo.MarkProbeFailed(ctx, existing.ID, fileSize, &fileModifiedAt); err != nil {
+					return 0, nil, fmt.Errorf("recording probe failure for file %s: %w", filePath, err)
+				}
+			}
+			// Leave the migrated row's probe_updated_at NULL so a later scan
+			// retries without replacing valid metadata with zero values. A
+			// standing rejection has no probe_repair reason, so every reason
+			// it has is an identity or subtitle change to write.
+			if rejectionStands || len(updateReasons) > 1 {
+				mf := models.MediaFile{MediaFolderID: folder.ID, FilePath: filePath}
+				populateScanIdentity(&mf, filePath, folder.Type, assignment, groupAssignment, existing)
+				externalSubtitles, err := externalSubsToStore()
+				if err != nil {
+					return 0, nil, err
+				}
+				mf.ExternalSubtitles = externalSubtitles
+				applied, persistErr := persistIdentityUpdate(&mf,
+					func(file models.MediaFile) (int, error) {
+						return s.fileRepo.UpdateIdentityAndExternalSubtitles(ctx, file)
+					},
+					func(file *models.MediaFile) error { return s.enqueueMetadataWork(ctx, folder, file) },
+				)
+				switch {
+				case persistErr != nil:
+					return 0, nil, fmt.Errorf("persisting identity update for file %s: %w", filePath, persistErr)
+				case applied:
+					return actionUpdated, updateReasons, nil
+				default:
+					// The old row is gone, so there is no probe metadata left to
+					// preserve. Continue through the normal upsert path.
+				}
+			} else {
+				return actionUnchanged, updateReasons, nil
+			}
+		}
+
+		externalSubtitles, err := externalSubsToStore()
+		if err != nil {
+			return 0, nil, err
+		}
+
+		// Check for intro/credits markers from S3.
+		markerFetcher := s.markerFetcher
+		if markerFetcher == nil {
+			markerFetcher = s.fetchMarkers
+		}
+		markers := markerFetcher(ctx, fileHash)
+
+		// Build the media file for upsert.
+		mf := models.MediaFile{
+			MediaFolderID:  folder.ID,
+			FilePath:       filePath,
+			FileSize:       fileSize,
+			FileModifiedAt: &fileModifiedAt,
+			FileHash:       fileHash,
+		}
+		populateScanIdentity(&mf, filePath, folder.Type, assignment, groupAssignment, existing)
+
+		// Apply probe data if available.
+		if probe != nil {
+			applyProbeData(&mf, probe, probeSource)
+			s.keepStoredHDR10PlusStatus(ctx, existing, &mf)
+		} else if probeRejected {
+			markProbeRejected(&mf)
+		}
+
+		if mf.SubtitleTracks == nil {
+			mf.SubtitleTracks = []models.SubtitleTrack{}
+		}
+
+		mf.ExternalSubtitles = externalSubtitles
+
+		upserted, upsertErr := s.fileRepo.Upsert(ctx, mf)
+		if upsertErr != nil {
+			return 0, nil, fmt.Errorf("upserting file %s: %w", filePath, upsertErr)
+		}
+		if err := s.enqueueMetadataWork(ctx, folder, upserted); err != nil {
+			return 0, nil, fmt.Errorf("enqueueing metadata work for file %s: %w", filePath, err)
+		}
+		if markers != nil {
+			applied, markerErr := s.fileRepo.UpsertMarkers(ctx, upserted.ID, MarkerUpdate{
+				IntroStart:    markers.IntroStart,
+				IntroEnd:      markers.IntroEnd,
+				CreditsStart:  markers.CreditsStart,
+				CreditsEnd:    markers.CreditsEnd,
+				MarkersSource: models.MarkerSourceS3,
+			})
+			if markerErr != nil {
+				return 0, nil, fmt.Errorf("upserting markers for file %s: %w", filePath, markerErr)
+			}
+			if !applied {
+				slog.DebugContext(ctx, "scanner: skipped lower-priority s3 markers", "component", "scanner", "path", filePath, "hash", fileHash)
+			}
+		}
+
+		return action, updateReasons, nil
+	}
+
+	action := actionNew
+
+	// Gather hints (OSHash only).
+	hints := s.gatherHints(filePath)
+	fileHash := hints.FileHash
+
+	if s.relinkMovedFile(ctx, folder, filePath, fileSize, fileModifiedAt, fileHash, assignment, groupAssignment, loadExternalSubs) {
+		return actionUpdated, []string{"moved"}, nil
+	}
+
+	// Try to get probe data.
+	probe, probeSource, probeRejected := s.probeFile(ctx, filePath)
+	probe, noVideo := s.confirmNoVideo(ctx, folder, filePath, probe)
+	if noVideo {
+		return s.excludeNoVideoFile(ctx, folder, nil, noVideoFile{FilePath: filePath, FileSize: fileSize, FileModifiedAt: fileModifiedAt, FileHash: fileHash})
+	}
+	if probe == nil && s.sameBytesHaveNoVideo(ctx, folder, fileHash, fileSize, fileModifiedAt) {
+		slog.InfoContext(ctx, "scanner: file matches one left out for having no video and could not be probed; leaving it for a later scan", "component", "scanner",
+			"folder_id", folder.ID,
+			"path", filePath,
+		)
+		return actionNoVideo, nil, nil
+	}
+
+	// Detect external subtitles.
+	externalSubs = loadExternalSubs()
+
+	// Check for intro/credits markers from S3.
+	markerFetcher := s.markerFetcher
+	if markerFetcher == nil {
+		markerFetcher = s.fetchMarkers
+	}
+	markers := markerFetcher(ctx, fileHash)
+
+	// Build the media file for upsert.
+	mf := models.MediaFile{
+		MediaFolderID:  folder.ID,
+		FilePath:       filePath,
+		FileSize:       fileSize,
+		FileModifiedAt: &fileModifiedAt,
+		FileHash:       fileHash,
+	}
+	// This branch only runs when the path is absent from existingByPath, so
+	// there is no prior row to preserve import editions from.
+	populateScanIdentity(&mf, filePath, folder.Type, assignment, groupAssignment, nil)
+
+	// Apply probe data if available.
+	if probe != nil {
+		applyProbeData(&mf, probe, probeSource)
+	} else if probeRejected {
+		markProbeRejected(&mf)
+	}
+
+	if mf.SubtitleTracks == nil {
+		mf.SubtitleTracks = []models.SubtitleTrack{}
+	}
+
+	mf.ExternalSubtitles = externalSubtitleModels(externalSubs)
+
+	// Upsert into DB.
+	upserted, upsertErr := s.fileRepo.Upsert(ctx, mf)
+	if upsertErr != nil {
+		return 0, nil, fmt.Errorf("upserting file %s: %w", filePath, upsertErr)
+	}
+	if err := s.enqueueMetadataWork(ctx, folder, upserted); err != nil {
+		return 0, nil, fmt.Errorf("enqueueing metadata work for file %s: %w", filePath, err)
+	}
+	if markers != nil {
+		applied, markerErr := s.fileRepo.UpsertMarkers(ctx, upserted.ID, MarkerUpdate{
+			IntroStart:    markers.IntroStart,
+			IntroEnd:      markers.IntroEnd,
+			CreditsStart:  markers.CreditsStart,
+			CreditsEnd:    markers.CreditsEnd,
+			MarkersSource: models.MarkerSourceS3,
+		})
+		if markerErr != nil {
+			return 0, nil, fmt.Errorf("upserting markers for file %s: %w", filePath, markerErr)
+		}
+		if !applied {
+			slog.DebugContext(ctx, "scanner: skipped lower-priority s3 markers", "component", "scanner", "path", filePath, "hash", fileHash)
+		}
+	}
+
+	return action, nil, nil
+}
+
+// populateScanIdentity fills mf's derived root/group/identity and
+// edition/presentation columns from freshly inferred scan assignments. Every
+// field it sets is derived from the file's path and sibling layout — never from
+// ffprobe — so the full update path and the metadata-only update path share it.
+func populateScanIdentity(
+	mf *models.MediaFile,
+	filePath string,
+	folderType string,
+	assignment fileRootAssignment,
+	groupAssignment fileGroupAssignment,
+	existing *scanStateFile,
+) {
+	if assignment.RootPath != "" {
+		mf.CanonicalRootPath = filepath.Clean(assignment.RootPath)
+	} else if root, ok := naming.DetectCanonicalRoot(filePath, folderType, assignment.LibraryRootPath); ok {
+		mf.CanonicalRootPath = filepath.Clean(root.RootPath)
+	}
+	mf.ObservedRootPath = filepath.Clean(groupAssignment.ObservedRootPath)
+	mf.ContentGroupKey = groupAssignment.ContentGroupKey
+	mf.GroupKeyVersion = groupAssignment.GroupKeyVersion
+	mf.BaseTitle = groupAssignment.BaseTitle
+	mf.BaseYear = groupAssignment.BaseYear
+	mf.BaseType = groupAssignment.BaseType
+	mf.IdentityConfidence = groupAssignment.Confidence
+	mf.IdentityJSON = append([]byte(nil), groupAssignment.EvidenceJSON...)
+	if filenameHints := naming.ParseFilename(filePath, folderType, assignment.LibraryRootPath); filenameHints != nil &&
+		filenameHints.Type == "series" && filenameHints.EpisodeNum > 0 {
+		mf.SeasonNumber = filenameHints.SeasonNum
+		mf.EpisodeNumber = filenameHints.EpisodeNum
+	}
+	variantHints := naming.ParseVariantHints(filePath, folderType, assignment.LibraryRootPath)
+	if existing != nil && existing.EditionSource == editionSourceImport && existing.EditionKey != "" {
+		variantHints = &naming.VariantHints{
+			EditionRaw:            existing.EditionRaw,
+			EditionKey:            existing.EditionKey,
+			EditionSource:         existing.EditionSource,
+			EditionConfidence:     existing.EditionConfidence,
+			PresentationKind:      existing.PresentationKind,
+			PresentationGroupKey:  existing.PresentationGroupKey,
+			PresentationPartIndex: existing.PresentationPartIndex,
+			MultiEpisodeStart:     existing.MultiEpisodeStart,
+			MultiEpisodeEnd:       existing.MultiEpisodeEnd,
+		}
+	}
+	if variantHints != nil {
+		mf.EditionRaw = variantHints.EditionRaw
+		mf.EditionKey = variantHints.EditionKey
+		mf.EditionConfidence = variantHints.EditionConfidence
+		mf.EditionSource = variantHints.EditionSource
+		mf.PresentationKind = variantHints.PresentationKind
+		mf.PresentationGroupKey = variantHints.PresentationGroupKey
+		mf.PresentationPartIndex = variantHints.PresentationPartIndex
+		mf.MultiEpisodeStart = variantHints.MultiEpisodeStart
+		mf.MultiEpisodeEnd = variantHints.MultiEpisodeEnd
+	}
+}
+
+// identityOnlyUpdateReasons reports whether every update reason is a pure
+// identity/grouping reclassification (root or content-group-key reassignment)
+// that can be persisted without re-probing the media bytes. Any other reason —
+// size/mtime change, a reappeared file, missing-probe repair, or a subtitle
+// sidecar change — needs the full update path that re-reads the file. Returns
+// false for an empty slice (nothing to update).
+func identityOnlyUpdateReasons(reasons []string) bool {
+	if len(reasons) == 0 {
+		return false
+	}
+	for _, reason := range reasons {
+		switch reason {
+		case "group_assignment_changed", "root_assignment_changed":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// identityOnlyFastPathEligible reports whether an existing row may take the
+// metadata-only update path (UpdateIdentity, no probe) for the given reasons.
+// Beyond the reasons being pure identity/grouping reassignments, the row
+// itself must not need the full path's side effects:
+//
+//   - A row still linked as an extra is being reclassified as primary content
+//     (extras never reach processFile); only the full upsert clears the extra
+//     linkage so the file can re-enter matching.
+//   - A row without an OSHash needs the full path once — it backfills the hash
+//     and fetches the hash-keyed S3 intro/credits markers, which no later scan
+//     reason would ever repair.
+func identityOnlyFastPathEligible(existing *scanStateFile, reasons []string) bool {
+	return identityOnlyUpdateReasons(reasons) &&
+		existing.ExtraID == "" &&
+		existing.FileHash != ""
+}
+
+// scanStateUpdateReasons lists why a scan must write an existing file's row.
+// The file's content counts as changed only when its size or modification
+// time differs from the row's. A replacement with the same size and mtime
+// (a copy tool that preserves mtime, or a filesystem whose coarse timestamps
+// hide the rewrite) keeps the old probe data, markers and trickplay until one
+// of them changes; touching the file is the remedy. That limit is accepted:
+// inode numbers are not stable on SMB, FUSE and mergerfs mounts, so comparing
+// them would re-probe whole libraries after a remount; ctime also changes with
+// permissions and ownership; and hashing even part of each file would read
+// every unchanged file on every scan, which the stable-file skip exists to
+// avoid.
+func scanStateUpdateReasons(
+	existing *scanStateFile,
+	fileSize int64,
+	fileModifiedAt time.Time,
+	currentExternalSubtitlePaths []string,
+	externalSubtitlesChecked bool,
+	assignment fileRootAssignment,
+	groupAssignment fileGroupAssignment,
+	libraryType string,
+	canRepairProbe bool,
+) []string {
+	if existing == nil {
+		return nil
+	}
+
+	reasons := make([]string, 0, 7)
+	if existing.FileSize != fileSize {
+		reasons = append(reasons, "size_changed")
+	}
+	if !sameFileModifiedAt(existing.FileModifiedAt, fileModifiedAt) {
+		reasons = append(reasons, "mtime_changed")
+	}
+	if existing.MissingSince != nil {
+		reasons = append(reasons, "was_missing")
+	}
+	if scanStateNeedsProbeRepair(existing, fileSize, fileModifiedAt, canRepairProbe) {
+		reasons = append(reasons, "probe_repair")
+	}
+	if externalSubtitlesChecked {
+		if !sameStringSet(existing.ExternalSubtitlePaths, currentExternalSubtitlePaths) {
+			reasons = append(reasons, "external_subtitle_changed")
+		}
+	} else if hasMissingExternalSubtitlePath(existing.ExternalSubtitlePaths) {
+		reasons = append(reasons, "external_subtitle_missing")
+	}
+	if scanStateRootAssignmentChanged(existing, assignment, libraryType) {
+		reasons = append(reasons, "root_assignment_changed")
+	}
+	if scanStateGroupAssignmentChanged(existing, groupAssignment) {
+		reasons = append(reasons, "group_assignment_changed")
+	}
+	return reasons
+}
+
+func externalSubtitleInfoPaths(subtitles []ExternalSubtitleInfo) []string {
+	paths := make([]string, 0, len(subtitles))
+	for _, subtitle := range subtitles {
+		path := strings.TrimSpace(subtitle.Path)
+		if path == "" {
+			continue
+		}
+		paths = append(paths, filepath.Clean(path))
+	}
+	return paths
+}
+
+func sameStringSet(left, right []string) bool {
+	seen := make(map[string]int, len(left))
+	for _, value := range left {
+		value = filepath.Clean(strings.TrimSpace(value))
+		if value == "." || value == "" {
+			continue
+		}
+		seen[value]++
+	}
+	for _, value := range right {
+		value = filepath.Clean(strings.TrimSpace(value))
+		if value == "." || value == "" {
+			continue
+		}
+		if seen[value] == 0 {
+			return false
+		}
+		seen[value]--
+	}
+	for _, count := range seen {
+		if count != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func hasMissingExternalSubtitlePath(paths []string) bool {
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		if sidecarConfirmedGone(path) {
+			return true
+		}
+	}
+	return false
+}
+
+// sidecarConfirmedGone reports that a stored sidecar no longer exists. Any
+// other stat failure leaves it unconfirmed.
+func sidecarConfirmedGone(path string) bool {
+	_, err := fspath.Stat(path)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+func shouldSkipStableConfirmedScanState(
+	existing *scanStateFile,
+	itemStatus string,
+	fileSize int64,
+	fileModifiedAt time.Time,
+	updateReasons []string,
+	canRepairProbe bool,
+) bool {
+	if existing == nil || existing.ContentID == "" {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(itemStatus), "matched") {
+		return false
+	}
+	if existing.FileSize != fileSize {
+		return false
+	}
+	if !sameFileModifiedAt(existing.FileModifiedAt, fileModifiedAt) {
+		return false
+	}
+	if existing.MissingSince != nil {
+		return false
+	}
+	if scanStateNeedsProbeRepair(existing, fileSize, fileModifiedAt, canRepairProbe) {
+		return false
+	}
+	if len(updateReasons) > 0 {
+		return false
+	}
+	return true
+}
+
+func scannerUpdateReasons(
+	existing *models.MediaFile,
+	fileSize int64,
+	fileModifiedAt time.Time,
+	assignment fileRootAssignment,
+	groupAssignment fileGroupAssignment,
+	libraryType string,
+	canRepairProbe bool,
+) []string {
+	if existing == nil {
+		return nil
+	}
+
+	reasons := make([]string, 0, 6)
+	if existing.FileSize != fileSize {
+		reasons = append(reasons, "size_changed")
+	}
+	if !sameFileModifiedAt(existing.FileModifiedAt, fileModifiedAt) {
+		reasons = append(reasons, "mtime_changed")
+	}
+	if existing.MissingSince != nil {
+		reasons = append(reasons, "was_missing")
+	}
+	if canRepairProbe && NeedsCriticalProbeRepair(existing) {
+		reasons = append(reasons, "probe_repair")
+	}
+	if rootAssignmentChanged(existing, assignment, libraryType) {
+		reasons = append(reasons, "root_assignment_changed")
+	}
+	if groupAssignmentChanged(existing, groupAssignment) {
+		reasons = append(reasons, "group_assignment_changed")
+	}
+	return reasons
+}
+
+func shouldSkipStableConfirmedFile(
+	existing *models.MediaFile,
+	itemStatus string,
+	fileSize int64,
+	fileModifiedAt time.Time,
+	updateReasons []string,
+	canRepairProbe bool,
+) bool {
+	if existing == nil || existing.ContentID == "" {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(itemStatus), "matched") {
+		return false
+	}
+	if existing.FileSize != fileSize {
+		return false
+	}
+	if !sameFileModifiedAt(existing.FileModifiedAt, fileModifiedAt) {
+		return false
+	}
+	if existing.MissingSince != nil {
+		return false
+	}
+	if canRepairProbe && NeedsCriticalProbeRepair(existing) {
+		return false
+	}
+	if len(updateReasons) > 0 {
+		return false
+	}
+	return true
+}
+
+func sameFileModifiedAt(existing *time.Time, current time.Time) bool {
+	if existing == nil {
+		return false
+	}
+	return normalizeFileModifiedAt(*existing).Equal(normalizeFileModifiedAt(current))
+}
+
+func normalizeFileModifiedAt(ts time.Time) time.Time {
+	return models.NormalizeFileModifiedAt(ts)
+}
+
+// scanStateNeedsProbeRepair reports whether a scan should probe an unchanged
+// file again to fill in playback-critical metadata. ffprobe has already
+// rejected a file marked probe_failed_at that never probed successfully, and
+// the mark only stands while its size and modification time are the ones that
+// were probed, so probing the same bytes again would only fail again. Changed
+// bytes drop the mark and are probed as usual. Playback still probes a marked
+// file when it is played.
+func scanStateNeedsProbeRepair(existing *scanStateFile, fileSize int64, fileModifiedAt time.Time, canRepairProbe bool) bool {
+	if !canRepairProbe || probeRejectionStands(existing, fileSize, fileModifiedAt) {
+		return false
+	}
+	return needsCriticalProbeRepairScanState(existing)
+}
+
+// probeRejectionStands reports that ffprobe rejected the bytes the row still
+// describes: it is marked probe_failed_at, never probed successfully, and its
+// size and modification time match the file on disk.
+func probeRejectionStands(existing *scanStateFile, fileSize int64, fileModifiedAt time.Time) bool {
+	return existing != nil && existing.ProbeFailedAt != nil && existing.ProbeUpdatedAt == nil &&
+		existing.FileSize == fileSize && sameFileModifiedAt(existing.FileModifiedAt, fileModifiedAt)
+}
+
+func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
+	if file == nil {
+		return true
+	}
+	if file.DVProvenanceCurrent != nil && !*file.DVProvenanceCurrent {
+		return true
+	}
+	if strings.TrimSpace(file.ProbeSource) == "" || file.ProbeUpdatedAt == nil {
+		return true
+	}
+	if file.Duration <= 0 {
+		return true
+	}
+	if legacyDurationRepairNeeded(file.Duration, file.FileSize, file.HasVideoTracks, file.ProbeUpdatedAt) {
+		return true
+	}
+	if strings.TrimSpace(file.Container) == "" {
+		return true
+	}
+	probeFacts := models.AudioOnlyProbeFacts{
+		BaseType:               file.BaseType,
+		CodecVideo:             file.CodecVideo,
+		CodecAudio:             file.CodecAudio,
+		HasVideoTracks:         file.HasVideoTracks,
+		HasAudioTracks:         file.HasAudioTracks,
+		HasNonImageVideoTracks: file.HasNonImageVideoTracks,
+	}
+	if probeFacts.HasLegacyAttachedPictureVideo() {
+		return true
+	}
+	hasVideo := strings.TrimSpace(file.CodecVideo) != "" || file.HasVideoTracks
+	hasAudio := strings.TrimSpace(file.CodecAudio) != "" || file.HasAudioTracks
+	if !hasVideo && !hasAudio {
+		return true
+	}
+	if hasVideo && (strings.TrimSpace(file.CodecVideo) == "" || strings.TrimSpace(file.Resolution) == "" || !file.HasVideoTracks) {
+		return true
+	}
+	if hasAudio && (strings.TrimSpace(file.CodecAudio) == "" || !file.HasAudioTracks) {
+		return true
+	}
+	if !hasVideo && hasAudio && !probeFacts.IsAudioOnly() {
+		return true
+	}
+	if !file.HasChapters {
+		return true
+	}
+	return false
+}
+
+// shouldPreserveExistingProbeAfterProbeFailure reports whether a failed probe
+// must leave the row's stored probe metadata alone: the scan was there to
+// repair it, alongside at most identity and subtitle changes. A standing
+// rejection skips the repair reason but is the same case.
+func shouldPreserveExistingProbeAfterProbeFailure(updateReasons []string, probe *ProbeData, rejectionStands bool) bool {
+	if probe != nil || len(updateReasons) == 0 {
+		return false
+	}
+	foundRepair := rejectionStands
+	for _, reason := range updateReasons {
+		switch reason {
+		case "probe_repair":
+			foundRepair = true
+		case "group_assignment_changed", "root_assignment_changed", "external_subtitle_changed", "external_subtitle_missing":
+		default:
+			return false
+		}
+	}
+	return foundRepair
+}
+
+// keepUnlistedSidecars merges the sidecars a failed listing found into the
+// stored ones. A stored sidecar the listing did not return is kept unless it
+// is confirmed gone; one the listing found takes its freshly parsed form.
+func keepUnlistedSidecars(stored, found []models.ExternalSubtitle) []models.ExternalSubtitle {
+	foundByPath := make(map[string]models.ExternalSubtitle, len(found))
+	for _, sub := range found {
+		foundByPath[filepath.Clean(sub.Path)] = sub
+	}
+	result := make([]models.ExternalSubtitle, 0, len(stored)+len(found))
+	for _, sub := range stored {
+		path := filepath.Clean(sub.Path)
+		if fresh, ok := foundByPath[path]; ok {
+			result = append(result, fresh)
+			delete(foundByPath, path)
+			continue
+		}
+		if sidecarConfirmedGone(sub.Path) {
+			continue
+		}
+		result = append(result, sub)
+	}
+	for _, sub := range found {
+		if _, ok := foundByPath[filepath.Clean(sub.Path)]; ok {
+			result = append(result, sub)
+		}
+	}
+	return result
+}
+
+func externalSubtitleModels(externalSubs []ExternalSubtitleInfo) []models.ExternalSubtitle {
+	result := make([]models.ExternalSubtitle, len(externalSubs))
+	for i, es := range externalSubs {
+		result[i] = models.ExternalSubtitle{
+			Path: es.Path, Language: es.Language, Format: es.Format,
+			Title: es.Title, Forced: es.Forced, HearingImpaired: es.HearingImpaired,
+		}
+	}
+	return result
+}
+
+func persistIdentityUpdate(
+	file *models.MediaFile,
+	update func(models.MediaFile) (int, error),
+	enqueue func(*models.MediaFile) error,
+) (bool, error) {
+	id, err := update(*file)
+	if errors.Is(err, ErrFileNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	file.ID = id
+	if err := enqueue(file); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (s *Scanner) enqueueMetadataWork(ctx context.Context, folder *models.MediaFolder, file *models.MediaFile) error {
+	if s == nil || s.metadataQueue == nil || folder == nil || file == nil {
+		return nil
+	}
+
+	switch strings.ToLower(strings.TrimSpace(folder.Type)) {
+	case "movie", "movies":
+		if err := s.metadataQueue.EnqueueMovieFile(ctx, file.ID); err != nil {
+			return err
+		}
+		slog.DebugContext(ctx, "metadata queue: movie file enqueued", "component", "scanner",
+			"folder_id", folder.ID,
+			"file_id", file.ID,
+			"path", file.FilePath,
+		)
+	case "series", "tv", "show", "tvshows":
+		if strings.TrimSpace(file.ObservedRootPath) == "" {
+			return nil
+		}
+		if err := s.metadataQueue.EnqueueSeriesRoot(ctx, folder.ID, file.ObservedRootPath); err != nil {
+			return err
+		}
+		slog.DebugContext(ctx, "metadata queue: series root touched", "component", "scanner",
+			"folder_id", folder.ID,
+			"observed_root_path", file.ObservedRootPath,
+			"file_id", file.ID,
+		)
+	}
+
+	return nil
+}
+
+func (s *Scanner) reconcileScannedGroups(
+	ctx context.Context,
+	folderID int,
+	fullFolderScan bool,
+	scopeRoots []string,
+	deleteMissingInScope bool,
+	groups groupInferenceResult,
+) error {
+	if s == nil {
+		return nil
+	}
+	if s.groupSnapshotRepo != nil {
+		if fullFolderScan {
+			if err := s.groupSnapshotRepo.ReplaceForFolder(ctx, folderID, groups.ScannedGroups); err != nil {
+				return err
+			}
+		} else if deleteMissingInScope {
+			for _, scope := range scopeRoots {
+				if err := s.groupSnapshotRepo.ReplaceInScope(ctx, folderID, scope, filterScannedGroupsByScope(groups.ScannedGroups, scope)); err != nil {
+					return err
+				}
+			}
+		} else {
+			if err := s.groupSnapshotRepo.UpsertMany(ctx, groups.ScannedGroups); err != nil {
+				return err
+			}
+		}
+	}
+	if s.locationRepo != nil {
+		if fullFolderScan {
+			if err := s.locationRepo.ReplaceForFolder(ctx, folderID, groups.Locations); err != nil {
+				return err
+			}
+		} else if deleteMissingInScope {
+			for _, scope := range scopeRoots {
+				if err := s.locationRepo.ReplaceInScope(ctx, folderID, scope, filterObservedLocationsByScope(groups.Locations, scope)); err != nil {
+					return err
+				}
+			}
+		} else {
+			if err := s.locationRepo.UpsertMany(ctx, groups.Locations); err != nil {
+				return err
+			}
+		}
+	}
+	if s.groupLocationRepo != nil {
+		if fullFolderScan {
+			if err := s.groupLocationRepo.ReplaceForFolder(ctx, folderID, groups.GroupLocations); err != nil {
+				return err
+			}
+		} else if deleteMissingInScope {
+			for _, scope := range scopeRoots {
+				if err := s.groupLocationRepo.ReplaceInScope(ctx, folderID, scope, filterGroupLocationsByScope(groups.GroupLocations, scope)); err != nil {
+					return err
+				}
+			}
+		} else {
+			if err := s.groupLocationRepo.UpsertMany(ctx, groups.GroupLocations); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func filterScannedGroupsByScope(groups []models.ScannedMediaGroup, scopePath string) []models.ScannedMediaGroup {
+	filtered := make([]models.ScannedMediaGroup, 0, len(groups))
+	for _, group := range groups {
+		if pathWithinAnyRoot(group.SampleObservedRootPath, []string{scopePath}) {
+			filtered = append(filtered, group)
+		}
+	}
+	return filtered
+}
+
+func filterObservedLocationsByScope(locations []models.ObservedMediaLocation, scopePath string) []models.ObservedMediaLocation {
+	filtered := make([]models.ObservedMediaLocation, 0, len(locations))
+	for _, location := range locations {
+		if pathWithinAnyRoot(location.ObservedRootPath, []string{scopePath}) {
+			filtered = append(filtered, location)
+		}
+	}
+	return filtered
+}
+
+func filterGroupLocationsByScope(locations []models.MediaGroupLocation, scopePath string) []models.MediaGroupLocation {
+	filtered := make([]models.MediaGroupLocation, 0, len(locations))
+	for _, location := range locations {
+		if pathWithinAnyRoot(location.ObservedRootPath, []string{scopePath}) {
+			filtered = append(filtered, location)
+		}
+	}
+	return filtered
+}
+
+// reconcileScannedRoots upserts the root snapshots this scan observed and,
+// when pruneUnseen is set, deletes the snapshots that it did not.
+// When isFullScan is true, unobserved snapshots across the entire folder are pruned.
+// Otherwise, only snapshots under the scoped roots are pruned.
+// Callers must pass pruneUnseen=false when the walk could not read part of the
+// tree: the observed set is then a lower bound, and pruning against it drops
+// snapshots for media that is still there.
+func (s *Scanner) reconcileScannedRoots(
+	ctx context.Context,
+	folderID int,
+	scopeRoots []string,
+	roots []models.ScannedMediaRoot,
+	pruneUnseen bool,
+	isFullScan bool,
+) error {
+	if s == nil || s.rootSnapshotRepo == nil {
+		return nil
+	}
+
+	if err := s.rootSnapshotRepo.UpsertMany(ctx, roots); err != nil {
+		return err
+	}
+
+	if !pruneUnseen {
+		return nil
+	}
+
+	if isFullScan {
+		seenAllRoots := make([]string, 0, len(roots))
+		for _, root := range roots {
+			seenAllRoots = append(seenAllRoots, root.RootPath)
+		}
+		return s.rootSnapshotRepo.DeleteMissingByFolder(ctx, folderID, seenAllRoots)
+	}
+
+	seenByScope := make(map[string][]string, len(scopeRoots))
+	for _, scope := range scopeRoots {
+		seenByScope[scope] = []string{}
+	}
+
+	for _, root := range roots {
+		for scope := range seenByScope {
+			if pathWithinAnyRoot(root.RootPath, []string{scope}) {
+				seenByScope[scope] = append(seenByScope[scope], root.RootPath)
+			}
+		}
+	}
+
+	for scope, seenRoots := range seenByScope {
+		if err := s.rootSnapshotRepo.DeleteMissingInScope(ctx, folderID, scope, seenRoots); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Scanner) loadRootOverrides(
+	ctx context.Context,
+	folderID int,
+	scopeRoots []string,
+) (map[string]models.MediaRootOverride, error) {
+	overridesByRoot := map[string]models.MediaRootOverride{}
+	if s == nil || s.rootOverrideRepo == nil || folderID <= 0 {
+		return overridesByRoot, nil
+	}
+
+	overrides, err := s.rootOverrideRepo.ListByFolder(ctx, folderID)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, override := range overrides {
+		if len(scopeRoots) > 0 && !pathWithinAnyRoot(override.RootPath, scopeRoots) {
+			continue
+		}
+		overridesByRoot[filepath.Clean(override.RootPath)] = override
+	}
+	return overridesByRoot, nil
+}
+
+func (s *Scanner) loadIdentityOverrides(
+	ctx context.Context,
+	folderID int,
+) (*identityOverrideSet, error) {
+	if s == nil || s.identityOverrideRepo == nil || folderID <= 0 {
+		return nil, nil
+	}
+	overrides, err := s.identityOverrideRepo.ListByFolder(ctx, folderID)
+	if err != nil {
+		return nil, err
+	}
+	return newIdentityOverrideSet(overrides), nil
+}
+
+func (s *Scanner) loadGroupOverrides(
+	ctx context.Context,
+	folderID int,
+) (map[string]models.MediaGroupOverride, error) {
+	overridesByKey := map[string]models.MediaGroupOverride{}
+	if s == nil || s.groupOverrideRepo == nil || folderID <= 0 {
+		return overridesByKey, nil
+	}
+
+	overrides, err := s.groupOverrideRepo.ListByFolder(ctx, folderID)
+	if err != nil {
+		return nil, err
+	}
+	for _, override := range overrides {
+		overridesByKey[groupOverrideKey(override.GroupKeyVersion, override.ContentGroupKey)] = override
+	}
+	return overridesByKey, nil
+}
+
+func (s *Scanner) logRootInferenceDisagreements(assignments map[string]fileRootAssignment) {
+	for _, assignment := range assignments {
+		if assignment.LegacyRootPath == "" {
+			continue
+		}
+		if assignment.LegacyRootPath == assignment.RootPath && assignment.LegacyType == assignment.InferredType {
+			continue
+		}
+		slog.Info("scanner: root inference disagreement",
+			"file_path", assignment.FilePath,
+			"legacy_root_path", assignment.LegacyRootPath,
+			"inferred_root_path", assignment.RootPath,
+			"legacy_type", assignment.LegacyType,
+			"inferred_type", assignment.InferredType,
+			"wrapper_collapsed", assignment.WrapperCollapsed,
+			"promoted_ancestor", assignment.PromotedAncestor,
+		)
+	}
+}
+
+func scanStateRootAssignmentChanged(existing *scanStateFile, assignment fileRootAssignment, libraryType string) bool {
+	if existing == nil {
+		return true
+	}
+	expectedRoot := assignment.RootPath
+	if expectedRoot == "" {
+		if root, ok := naming.DetectCanonicalRoot(existing.FilePath, libraryType, assignment.LibraryRootPath); ok {
+			expectedRoot = filepath.Clean(root.RootPath)
+		}
+	}
+	if filepath.Clean(existing.CanonicalRootPath) != filepath.Clean(expectedRoot) {
+		return true
+	}
+
+	hints := naming.ParseVariantHints(existing.FilePath, libraryType, assignment.LibraryRootPath)
+	if existing.EditionSource == editionSourceImport && existing.EditionKey != "" {
+		hints = &naming.VariantHints{
+			EditionRaw:            existing.EditionRaw,
+			EditionKey:            existing.EditionKey,
+			EditionSource:         existing.EditionSource,
+			EditionConfidence:     existing.EditionConfidence,
+			PresentationKind:      existing.PresentationKind,
+			PresentationGroupKey:  existing.PresentationGroupKey,
+			PresentationPartIndex: existing.PresentationPartIndex,
+			MultiEpisodeStart:     existing.MultiEpisodeStart,
+			MultiEpisodeEnd:       existing.MultiEpisodeEnd,
+		}
+	}
+	if hints == nil {
+		hints = &naming.VariantHints{}
+	}
+	if existing.EditionRaw != hints.EditionRaw ||
+		existing.EditionKey != hints.EditionKey ||
+		existing.EditionSource != hints.EditionSource ||
+		existing.PresentationKind != hints.PresentationKind ||
+		existing.PresentationGroupKey != hints.PresentationGroupKey ||
+		existing.PresentationPartIndex != hints.PresentationPartIndex ||
+		existing.MultiEpisodeStart != hints.MultiEpisodeStart ||
+		existing.MultiEpisodeEnd != hints.MultiEpisodeEnd {
+		return true
+	}
+	switch {
+	case existing.EditionConfidence == nil && hints.EditionConfidence == nil:
+		return false
+	case existing.EditionConfidence == nil || hints.EditionConfidence == nil:
+		return true
+	default:
+		return *existing.EditionConfidence != *hints.EditionConfidence
+	}
+}
+
+func scanStateGroupAssignmentChanged(existing *scanStateFile, assignment fileGroupAssignment) bool {
+	if existing == nil {
+		return true
+	}
+	if filepath.Clean(existing.ObservedRootPath) != filepath.Clean(assignment.ObservedRootPath) {
+		return true
+	}
+	if existing.ContentGroupKey != assignment.ContentGroupKey ||
+		existing.GroupKeyVersion != assignment.GroupKeyVersion ||
+		existing.BaseTitle != assignment.BaseTitle ||
+		existing.BaseYear != assignment.BaseYear ||
+		existing.BaseType != assignment.BaseType ||
+		existing.IdentityConfidence != assignment.Confidence {
+		return true
+	}
+	return !identityEvidenceEqual(existing.IdentityJSON, assignment.EvidenceJSON)
+}
+
+func rootAssignmentChanged(existing *models.MediaFile, assignment fileRootAssignment, libraryType string) bool {
+	if existing == nil {
+		return true
+	}
+	expectedRoot := assignment.RootPath
+	if expectedRoot == "" {
+		if root, ok := naming.DetectCanonicalRoot(existing.FilePath, libraryType, assignment.LibraryRootPath); ok {
+			expectedRoot = filepath.Clean(root.RootPath)
+		}
+	}
+	if filepath.Clean(existing.CanonicalRootPath) != filepath.Clean(expectedRoot) {
+		return true
+	}
+
+	hints := naming.ParseVariantHints(existing.FilePath, libraryType, assignment.LibraryRootPath)
+	if existing.EditionSource == editionSourceImport && existing.EditionKey != "" {
+		hints = &naming.VariantHints{
+			EditionRaw:            existing.EditionRaw,
+			EditionKey:            existing.EditionKey,
+			EditionSource:         existing.EditionSource,
+			EditionConfidence:     existing.EditionConfidence,
+			PresentationKind:      existing.PresentationKind,
+			PresentationGroupKey:  existing.PresentationGroupKey,
+			PresentationPartIndex: existing.PresentationPartIndex,
+			MultiEpisodeStart:     existing.MultiEpisodeStart,
+			MultiEpisodeEnd:       existing.MultiEpisodeEnd,
+		}
+	}
+	if hints == nil {
+		hints = &naming.VariantHints{}
+	}
+	if existing.EditionRaw != hints.EditionRaw ||
+		existing.EditionKey != hints.EditionKey ||
+		existing.EditionSource != hints.EditionSource ||
+		existing.PresentationKind != hints.PresentationKind ||
+		existing.PresentationGroupKey != hints.PresentationGroupKey ||
+		existing.PresentationPartIndex != hints.PresentationPartIndex ||
+		existing.MultiEpisodeStart != hints.MultiEpisodeStart ||
+		existing.MultiEpisodeEnd != hints.MultiEpisodeEnd {
+		return true
+	}
+	switch {
+	case existing.EditionConfidence == nil && hints.EditionConfidence == nil:
+		return false
+	case existing.EditionConfidence == nil || hints.EditionConfidence == nil:
+		return true
+	default:
+		return *existing.EditionConfidence != *hints.EditionConfidence
+	}
+}
+
+func groupAssignmentChanged(existing *models.MediaFile, assignment fileGroupAssignment) bool {
+	if existing == nil {
+		return true
+	}
+	if filepath.Clean(existing.ObservedRootPath) != filepath.Clean(assignment.ObservedRootPath) {
+		return true
+	}
+	if existing.ContentGroupKey != assignment.ContentGroupKey ||
+		existing.GroupKeyVersion != assignment.GroupKeyVersion ||
+		existing.BaseTitle != assignment.BaseTitle ||
+		existing.BaseYear != assignment.BaseYear ||
+		existing.BaseType != assignment.BaseType ||
+		existing.IdentityConfidence != assignment.Confidence {
+		return true
+	}
+	return !identityEvidenceEqual(existing.IdentityJSON, assignment.EvidenceJSON)
+}
+
+func identityEvidenceEqual(existing, expected []byte) bool {
+	if bytes.Equal(existing, expected) {
+		return true
+	}
+	if len(bytes.TrimSpace(existing)) == 0 || len(bytes.TrimSpace(expected)) == 0 {
+		return len(bytes.TrimSpace(existing)) == 0 && len(bytes.TrimSpace(expected)) == 0
+	}
+
+	var existingValue any
+	if err := json.Unmarshal(existing, &existingValue); err != nil {
+		return false
+	}
+	var expectedValue any
+	if err := json.Unmarshal(expected, &expectedValue); err != nil {
+		return false
+	}
+
+	return reflect.DeepEqual(existingValue, expectedValue)
+}
+
+// applyProbeData copies normalized probe facts onto a media file.
+func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) {
+	mf.CodecVideo = probe.CodecVideo
+	mf.CodecAudio = probe.CodecAudio
+	mf.Resolution = probe.Resolution
+	mf.AudioChannels = probe.AudioChannels
+	mf.HDR = probe.HDR
+	mf.Container = probe.Container
+	mf.Duration = probe.Duration
+	mf.Bitrate = probe.Bitrate
+	mf.ProbeSource = probeSource
+
+	now := time.Now().UTC()
+	mf.ProbeUpdatedAt = &now
+	mf.ProbeFailedAt = nil
+
+	videoTracks := make([]models.VideoTrack, len(probe.VideoTracks))
+	for i, vt := range probe.VideoTracks {
+		videoTracks[i] = models.VideoTrack{
+			Title:               vt.Title,
+			Codec:               vt.Codec,
+			DolbyVision:         vt.DolbyVision,
+			DVProfile:           vt.DVProfile,
+			DVLevel:             vt.DVLevel,
+			DVBLCompatID:        vt.DVBLCompatID,
+			DVConfigPresent:     vt.DVConfigPresent,
+			DVBLCompatIDPresent: vt.DVBLCompatIDPresent,
+			DVBLPresent:         vt.DVBLPresent,
+			DVRPUPresent:        vt.DVRPUPresent,
+			DVELPresent:         vt.DVELPresent,
+			DVEnhancementLayer:  vt.DVEnhancementLayer,
+			HDR10Plus:           vt.HDR10Plus,
+			Profile:             vt.Profile,
+			Level:               vt.Level,
+			Width:               vt.Width,
+			Height:              vt.Height,
+			AspectRatio:         vt.AspectRatio,
+			Interlaced:          vt.Interlaced,
+			FrameRate:           vt.FrameRate,
+			Bitrate:             vt.Bitrate,
+			VideoRange:          vt.VideoRange,
+			VideoRangeType:      vt.VideoRangeType,
+			ColorRange:          vt.ColorRange,
+			FrameColorRange:     vt.FrameColorRange,
+			ColorPrimaries:      vt.ColorPrimaries,
+			ColorSpace:          vt.ColorSpace,
+			ColorTransfer:       vt.ColorTransfer,
+			BitDepth:            vt.BitDepth,
+			PixelFormat:         vt.PixelFormat,
+			ReferenceFrames:     vt.ReferenceFrames,
+			HDR10PlusUnchecked:  vt.HDR10PlusUnchecked,
+		}
+	}
+	mf.VideoTracks = videoTracks
+
+	audioTracks := make([]models.AudioTrack, len(probe.AudioTracks))
+	for i, at := range probe.AudioTracks {
+		audioTracks[i] = models.AudioTrack{
+			Title:         at.Title,
+			EmbeddedTitle: at.EmbeddedTitle,
+			Language:      at.Language,
+			Codec:         at.Codec,
+			Profile:       at.Profile,
+			Layout:        at.Layout,
+			Channels:      at.Channels,
+			Bitrate:       at.Bitrate,
+			SampleRate:    at.SampleRate,
+			BitDepth:      at.BitDepth,
+			Default:       at.Default,
+		}
+	}
+	mf.AudioTracks = audioTracks
+
+	subtitleTracks := make([]models.SubtitleTrack, len(probe.SubtitleTracks))
+	for i, st := range probe.SubtitleTracks {
+		subtitleTracks[i] = models.SubtitleTrack{
+			ContainerTrackID: st.ContainerTrackID,
+			Index:            st.Index,
+			Language:         st.Language,
+			Codec:            st.Codec,
+			Title:            st.Title,
+			EmbeddedTitle:    st.EmbeddedTitle,
+			Resolution:       st.Resolution,
+			Forced:           st.Forced,
+			Default:          st.Default,
+			HearingImpaired:  st.HearingImpaired,
+			IndexOnly:        st.IndexOnly,
+		}
+	}
+	mf.SubtitleTracks = subtitleTracks
+
+	chapters := make([]models.MediaChapter, len(probe.Chapters))
+	for i, chapter := range probe.Chapters {
+		chapters[i] = models.MediaChapter{
+			Index:        chapter.Index,
+			Title:        chapter.Title,
+			StartSeconds: chapter.StartSeconds,
+			EndSeconds:   chapter.EndSeconds,
+			Source:       chapter.Source,
+		}
+	}
+	mf.Chapters = chapters
+}
+
+// clearLegacyLinksForUnmatchableRoots was previously used to clear content
+// links for files under roots without embedded folder IDs. With the library
+// matching redesign, roots without folder IDs are now valid and create
+// pending items, so this function is a no-op.
+// TODO: remove callers and delete this function
+func (s *Scanner) clearLegacyLinksForUnmatchableRoots(_ context.Context, _ int, _ []RootObservation) (int, error) {
+	return 0, nil
+}
+
+// gatherHints computes the OSHash for a media file.
+func (s *Scanner) gatherHints(filePath string) FileHints {
+	hints := FileHints{}
+	hash, err := ComputeOSHash(filePath)
+	if err != nil {
+		slog.Warn("scanner: OSHash computation failed", "path", filePath, "error", err)
+	} else {
+		hints.FileHash = hash
+	}
+	return hints
+}
+
+// probeSourceLocal is the media_files.probe_source of a probe this node ran.
+const probeSourceLocal = "local"
+
+// probeFile attempts to get probe data by running local ffprobe. rejected
+// reports that ffprobe ran and refused the file (see IsProbeRejection), as
+// opposed to no probe having run or one failing for reasons unrelated to the
+// file.
+func (s *Scanner) probeFile(ctx context.Context, filePath string) (probe *ProbeData, probeSource string, rejected bool) {
+	probeSource = probeSourceLocal
+	if s.ffprobePath == "" {
+		return nil, probeSource, false
+	}
+	probe, err := ProbeFile(ctx, s.ffprobePath, filePath)
+	if err != nil {
+		slog.WarnContext(ctx, "scanner: ffprobe failed", "component", "scanner", "path", filePath, "error", err)
+		return nil, probeSource, IsProbeRejection(ctx, filePath, err)
+	}
+	return probe, probeSource, false
+}
+
+// keepStoredHDR10PlusStatus keeps the HDR10+ status already recorded for an
+// unchanged file whose first-frame read failed in this rescan, as playback's
+// probe repair does, so a transient failure does not drop a status that was
+// read. The stored row is read only on that failure path.
+func (s *Scanner) keepStoredHDR10PlusStatus(ctx context.Context, existing *scanStateFile, mf *models.MediaFile) {
+	if existing == nil || len(mf.VideoTracks) == 0 || !mf.VideoTracks[0].HDR10PlusUnchecked {
+		return
+	}
+	// A changed file's old status no longer describes it.
+	if existing.FileSize != mf.FileSize || mf.FileModifiedAt == nil || !sameFileModifiedAt(existing.FileModifiedAt, *mf.FileModifiedAt) {
+		return
+	}
+	stored, err := s.fileRepo.GetByID(ctx, existing.ID)
+	if err != nil {
+		slog.DebugContext(ctx, "scanner: could not read the stored HDR10+ status",
+			"component", "scanner", "file_id", existing.ID, "error", err)
+		return
+	}
+	carryCheckedHDR10Plus(stored.VideoTracks, mf.VideoTracks)
+}
+
+// markProbeRejected records on a media file being written that ffprobe
+// refused it. applyProbeData clears the mark when a later probe succeeds.
+func markProbeRejected(mf *models.MediaFile) {
+	now := time.Now().UTC()
+	mf.ProbeFailedAt = &now
+}
+
+// fetchMarkers reads intro/credits markers for the given file hash from
+// artwork storage, where an external process may have placed them under
+// markers/{hash}.json.
+func (s *Scanner) fetchMarkers(ctx context.Context, fileHash string) *IntroCreditsMarkers {
+	if fileHash == "" || s.artworkStore == nil {
+		return nil
+	}
+	if s.markerPrefixEmpty(ctx) {
+		return nil
+	}
+
+	key := fmt.Sprintf("markers/%s.json", fileHash)
+	reader, _, err := s.artworkStore.Get(ctx, key)
+	if err != nil {
+		// Not found is expected; don't log it.
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, 1<<20))
+	_ = reader.Close()
+	if err != nil {
+		return nil
+	}
+
+	var markers IntroCreditsMarkers
+	if err := json.Unmarshal(data, &markers); err != nil {
+		slog.WarnContext(ctx, "scanner: markers JSON parse failed", "component", "scanner",
+			"hash", fileHash,
+			"error", err,
+		)
+		return nil
+	}
+
+	return &markers
+}
+
+// markerPrefixCheckTTL is how long one LIST of markers/ answers for every
+// file this scanner reads markers for.
+const markerPrefixCheckTTL = time.Minute
+
+// markerPrefixListTimeout bounds the LIST. A LIST that runs longer counts as
+// failed, so a slow or unresponsive store costs each worker at most this long
+// once per markerPrefixCheckTTL before reads fall back to the per-file GET.
+const markerPrefixListTimeout = 5 * time.Second
+
+// markerPrefixCache remembers whether markers/ held any object at the last
+// check.
+type markerPrefixCache struct {
+	mu         sync.Mutex
+	checkedAt  time.Time
+	empty      bool
+	listFailed bool
+	// checking is closed when the LIST in flight finishes; nil when none runs.
+	checking chan struct{}
+	// listTimeout overrides markerPrefixListTimeout when set (tests).
+	listTimeout time.Duration
+}
+
+func (c *markerPrefixCache) freshLocked(now time.Time) bool {
+	return !c.checkedAt.IsZero() && now.Sub(c.checkedAt) < markerPrefixCheckTTL
+}
+
+// markerPrefixEmpty reports whether markers/ holds no objects, so the caller
+// can skip a GET that would miss. Only an optional external process writes
+// markers, so most deployments have none, and on S3 the skipped GET is a
+// round trip per new or changed file.
+//
+// One LIST answers for markerPrefixCheckTTL across concurrent scans and
+// single-file ingests, and every node checks on its own. A producer's first
+// marker is therefore missed only by files scanned within that window after a
+// check, the same outcome as a marker written just after its file was
+// scanned. A failed or timed-out LIST counts as non-empty, so reads fall back
+// to the per-file GET. The LIST runs outside the lock: callers that arrive
+// while it runs wait for its answer, bounded by markerPrefixListTimeout and
+// their own context.
+func (s *Scanner) markerPrefixEmpty(ctx context.Context) bool {
+	c := &s.markerPrefix
+	c.mu.Lock()
+	if c.freshLocked(time.Now()) {
+		empty := c.empty
+		c.mu.Unlock()
+		return empty
+	}
+	if done := c.checking; done != nil {
+		c.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return false
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		// A check abandoned by its caller's cancellation records nothing, so
+		// this caller reads the file directly.
+		return c.freshLocked(time.Now()) && c.empty
+	}
+	done := make(chan struct{})
+	c.checking = done
+	timeout := c.listTimeout
+	c.mu.Unlock()
+	if timeout <= 0 {
+		timeout = markerPrefixListTimeout
+	}
+
+	startedAt := time.Now()
+	listCtx, cancel := context.WithTimeout(ctx, timeout)
+	objects, _, err := s.artworkStore.List(listCtx, "markers", "", 1)
+	cancel()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.checking = nil
+	close(done)
+	if err != nil && ctx.Err() != nil {
+		return false
+	}
+	if err != nil {
+		if c.listFailed {
+			slog.DebugContext(ctx, "scanner: markers prefix check failed", "component", "scanner", "error", err)
+		} else {
+			slog.WarnContext(ctx, "scanner: markers prefix check failed; reading markers for every new or changed file",
+				"component", "scanner", "error", err)
+		}
+	}
+	c.listFailed = err != nil
+	c.checkedAt = startedAt
+	c.empty = err == nil && len(objects) == 0
+	return c.empty
+}

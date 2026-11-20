@@ -1,0 +1,103 @@
+package userdb
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+func setJellycompatProgress(ctx context.Context, tx *sql.Tx, profileID, itemID string, position, duration float64, completed bool, date time.Time) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO watch_progress
+ (profile_id,media_item_id,position_seconds,duration_seconds,completed,updated_at,event_at)
+ SELECT ?,?,?,?,?,MAX(strftime('%Y-%m-%dT%H:%M:%fZ','now'),COALESCE((SELECT strftime('%Y-%m-%dT%H:%M:%fZ',hidden_before,'+1 second') FROM hidden_history_items WHERE profile_id=? AND media_item_id=?),'')),? WHERE true ON CONFLICT(profile_id,media_item_id) DO UPDATE SET
+ position_seconds=excluded.position_seconds,duration_seconds=excluded.duration_seconds,
+ completed=excluded.completed,updated_at=excluded.updated_at,event_at=excluded.event_at`,
+		profileID, itemID, position, duration, completed, profileID, itemID, nil)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, "UPDATE watch_progress SET event_at = ? WHERE profile_id = ? AND media_item_id = ?", date.UTC().Format(time.RFC3339Nano), profileID, itemID)
+	return err
+}
+
+// ListJellycompatPlayedByDate implements userstore.JellycompatPlayedByDateLister.
+// The per-user SQLite store has no catalog tables, so types and libraryID are
+// left to the caller, as in ListProgressFiltered. event_at is RFC 3339 text
+// with or without fractional seconds, so it is ordered by its julianday value
+// rather than as text.
+func (s *SQLiteUserStore) ListJellycompatPlayedByDate(_ context.Context, profileID string, _ []string, _ *int, ascending bool, limit, offset int) ([]userstore.WatchProgress, error) {
+	direction := "DESC"
+	if ascending {
+		direction = "ASC"
+	}
+	query := progressListSelect + progressStatusPredicate("completed") + `
+		ORDER BY julianday(COALESCE(event_at, updated_at)) ` + direction + `, media_item_id ` + direction + `
+		LIMIT ? OFFSET ?`
+	return queryProgressRows(s.db, query, profileID, limit, offset)
+}
+
+func (s *SQLiteUserStore) ListJellycompatProgressDates(ctx context.Context, profileID string, ids []string) (map[string]string, error) {
+	encoded, err := json.Marshal(ids)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT media_item_id,event_at FROM watch_progress WHERE profile_id=? AND media_item_id IN (SELECT value FROM json_each(?))`, profileID, string(encoded))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	dates := make(map[string]string)
+	for rows.Next() {
+		var id, date string
+		if err := rows.Scan(&id, &date); err != nil {
+			return nil, err
+		}
+		dates[id] = date
+	}
+	return dates, rows.Err()
+}
+
+func (s *SQLiteUserStore) ApplyJellycompatProgress(ctx context.Context, profileID string, edit userstore.JellycompatProgressEdit) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if edit.ClearWatched {
+		if err := clearWatchedState(ctx, tx, profileID, []string{edit.MediaItemID}, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+	if edit.History != nil {
+		// The played mark is idempotent, as on the mark-played path: a leaf
+		// that is already completed gets no new history row.
+		entry := *edit.History
+		entry.ProfileID, entry.MediaItemID = profileID, edit.MediaItemID
+		target := userstore.MarkWatchedTarget{MediaItemID: edit.MediaItemID, DurationSeconds: edit.DurationSeconds, EventAt: &edit.EventAt}
+		if _, err := markWatchedBatchTx(ctx, tx, profileID, []userstore.MarkWatchedTarget{target}, []userstore.WatchHistoryEntry{entry}); err != nil {
+			return err
+		}
+	}
+	if err := setJellycompatProgress(ctx, tx, profileID, edit.MediaItemID, edit.PositionSeconds, edit.DurationSeconds, edit.Completed, edit.EventAt); err != nil {
+		return err
+	}
+	if edit.IsFavorite != nil {
+		if err := setJellycompatFavorite(ctx, tx, profileID, edit.MediaItemID, *edit.IsFavorite); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func setJellycompatFavorite(ctx context.Context, tx *sql.Tx, profileID, itemID string, favorite bool) error {
+	var err error
+	if favorite {
+		_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO favorites (profile_id, media_item_id, added_at) VALUES (?, ?, ?)`, profileID, itemID, time.Now().UTC().Format(time.RFC3339))
+	} else {
+		_, err = tx.ExecContext(ctx, `DELETE FROM favorites WHERE profile_id = ? AND media_item_id = ?`, profileID, itemID)
+	}
+	return err
+}

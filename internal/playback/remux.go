@@ -1,0 +1,987 @@
+package playback
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"runtime"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/fspath"
+	"github.com/Silo-Server/silo-server/internal/httpstream"
+	"github.com/Silo-Server/silo-server/internal/playback/keyframes"
+	"github.com/Silo-Server/silo-server/internal/processmetrics"
+
+	"github.com/Silo-Server/silo-server/internal/procgroup"
+)
+
+const (
+	jellyfinFFmpegPath             = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+	homebrewFFmpegFullAppleSilicon = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+	homebrewFFmpegFullIntel        = "/usr/local/opt/ffmpeg-full/bin/ffmpeg"
+	ffmpegExecutable               = ffmpegComponent
+)
+
+var (
+	resolvedFFmpegPath string
+	ffmpegOnce         sync.Once
+
+	doviRPUMu    sync.Mutex
+	doviRPUCache map[string]bool
+
+	leadingPictureDropMu    sync.Mutex
+	leadingPictureDropCache map[string]bool
+)
+
+// ResumeLeadingPictureDropBitstreamFilter drops the non-key packets whose
+// presentation time precedes the first packet of a seeked stream copy: the
+// open-GOP leading pictures that reference frames the copy never sent. The
+// escaped comma is part of one FFmpeg argument.
+const ResumeLeadingPictureDropBitstreamFilter = `noise=drop=lt(pts\,startpts)*not(key)`
+
+// primedResumeLeadingPictureDropBitstreamFilter is the drop for a primed copy
+// (see remuxIDRPrimer). It keeps the first packet, the primer IDR, and drops
+// everything else until the seek's keyframe, which the concat list places
+// remuxIDRPrimerSeconds (0.001) after it; register 0 marks that keyframe as
+// seen and register 1 holds its pts. From there it drops the keyframe's
+// leading pictures as ResumeLeadingPictureDropBitstreamFilter does. The concat
+// outpoint is checked against DTS, so frames that follow the IDR in decode
+// order, a keyframe among them, still pass it; matching the seek's keyframe by
+// time rather than by keyframe count drops them all. The 3 ms window absorbs a
+// time base too coarse to hold the 1 ms offset (a 1/500 MP4 track rounds it to
+// zero) and stays clear of the next frame at up to 240 fps.
+const primedResumeLeadingPictureDropBitstreamFilter = `noise=drop=if(gt(n\,0)*key*lte(abs((pts-startpts)*tb-0.001)\,0.003)\,st(0\,1)+st(1\,pts));gt(n\,0)*(not(ld(0))+not(key)*lt(pts\,ld(1)))`
+
+// remuxIDRPrimerSeconds is the primer's span in the concat list, and the
+// offset primedResumeLeadingPictureDropBitstreamFilter finds the seek's
+// keyframe at.
+const remuxIDRPrimerSeconds = 0.001
+
+// ffmpegBinary returns the path to the ffmpeg binary.
+// Resolved once at first call, then cached for the process lifetime.
+func ffmpegBinary() string {
+	ffmpegOnce.Do(func() {
+		resolvedFFmpegPath = discoverFFmpegPath(runtime.GOOS, exec.LookPath)
+	})
+	return resolvedFFmpegPath
+}
+
+func discoverFFmpegPath(goos string, lookPath func(string) (string, error)) string {
+	candidates := []string{jellyfinFFmpegPath}
+	if goos == darwinGOOS {
+		// Homebrew's regular FFmpeg omits libass and other filters Silo uses.
+		// Prefer the keg-only full build on both Apple Silicon and Intel Macs
+		// when it is installed; PATH remains the final portable fallback.
+		candidates = []string{
+			homebrewFFmpegFullAppleSilicon,
+			homebrewFFmpegFullIntel,
+			jellyfinFFmpegPath,
+		}
+	}
+	for _, candidate := range candidates {
+		if _, err := lookPath(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ffmpegExecutable
+}
+
+// ResolveFFmpegPath returns the ffmpeg binary the playback pipeline executes
+// for the given configured path: the configured path when set, otherwise the
+// process-global discovery (jellyfin-ffmpeg install, then PATH). Capability
+// probes must resolve through this same function so a feature advertised at
+// planning time is guaranteed present in the binary that later runs.
+func ResolveFFmpegPath(configured string) string {
+	return resolveFFmpegPath(configured, exec.LookPath, ffmpegBinary)
+}
+
+func resolveFFmpegPath(
+	configured string,
+	lookPath func(string) (string, error),
+	discover func() string,
+) string {
+	configured = strings.TrimSpace(configured)
+	if configured == "" {
+		return discover()
+	}
+	// Older and container-oriented settings use Jellyfin's Linux-only path as
+	// the default. Treat that conventional default as discovery only when it is
+	// absent; genuinely custom invalid paths must still fail loudly.
+	if configured == jellyfinFFmpegPath {
+		if _, err := lookPath(configured); err != nil {
+			return discover()
+		}
+	}
+	return configured
+}
+
+// supportsDoviRPUFilter reports whether the given FFmpeg binary can run
+// DV7ToHDR10BitstreamFilter: the dovi_rpu bitstream filter (FFmpeg 7.1+) that
+// strips the Dolby Vision metadata, and filter_units, which removes a Profile
+// 7 enhancement layer interleaved in the video stream. Probed once per binary
+// path.
+func supportsDoviRPUFilter(bin string) bool {
+	doviRPUMu.Lock()
+	defer doviRPUMu.Unlock()
+	if available, ok := doviRPUCache[bin]; ok {
+		return available
+	}
+	out, err := procgroup.CommandContext(context.Background(), bin, "-hide_banner", "-bsfs").Output()
+	available := err == nil && bytes.Contains(out, []byte("dovi_rpu")) && bytes.Contains(out, []byte("filter_units"))
+	if !available {
+		slog.Warn("ffmpeg lacks the dovi_rpu or filter_units bitstream filter (dovi_rpu needs FFmpeg 7.1+); validated Profile 7 HDR10 remux is disabled", "ffmpeg", bin)
+	}
+	if doviRPUCache == nil {
+		doviRPUCache = make(map[string]bool)
+	}
+	doviRPUCache[bin] = available
+	return available
+}
+
+// supportsLeadingPictureDropFilter reports whether the given FFmpeg binary's
+// noise bitstream filter takes the drop expression the resume recipe uses.
+// Older builds expose only the integer dropamount option. Probed once per
+// binary path, like the dovi_rpu check.
+func supportsLeadingPictureDropFilter(bin string) bool {
+	leadingPictureDropMu.Lock()
+	defer leadingPictureDropMu.Unlock()
+	if available, ok := leadingPictureDropCache[bin]; ok {
+		return available
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := procgroup.CommandContext(ctx, bin, "-hide_banner", "-h", "bsf=noise").CombinedOutput()
+	available := err == nil && slices.Contains(strings.Fields(string(out)), "-drop")
+	if !available {
+		slog.Warn("ffmpeg's noise bitstream filter has no drop expression; HEVC resume remuxes keep their leading pictures", "ffmpeg", bin)
+	}
+	if leadingPictureDropCache == nil {
+		leadingPictureDropCache = make(map[string]bool)
+	}
+	leadingPictureDropCache[bin] = available
+	return available
+}
+
+// remuxDVProfile neutralizes a Dolby Vision profile the local ffmpeg cannot
+// handle. Profile 7 is the only profile that triggers an RPU strip in
+// buildRemuxArgs; when the strip is unavailable — the dovi_rpu filter is
+// missing, or this source's RPU cannot be parsed — the remux must still start
+// (an unknown bitstream filter aborts ffmpeg immediately, and a filter that
+// rejects every packet hangs the session), so fall back to the pre-strip
+// behavior instead of failing playback. Only the legacy/auto mode takes this
+// route; the explicit v3 strip recipe fails loudly instead, because it has
+// promised the client an HDR10 output it could not then produce.
+func remuxDVProfile(dvProfile int, canStripRPU bool) int {
+	if dvProfile == 7 && !canStripRPU {
+		return 0
+	}
+	return dvProfile
+}
+
+// RemuxSession represents a running ffmpeg remux process that copies
+// codecs to a new container format without re-encoding.
+type RemuxSession struct {
+	cmd        *exec.Cmd
+	ctx        context.Context
+	cancel     context.CancelFunc
+	outputPipe io.ReadCloser
+	stderr     *remuxStderr
+	closeOnce  sync.Once
+	closeErr   error
+	// contextEnded records that the session's context ended before it was
+	// reaped: the request went away or Abort withdrew the stream.
+	contextEnded bool
+}
+
+// ffmpegDemuxErrorLine starts the line FFmpeg logs when reading its input
+// fails with anything other than end of file: a disk that drops out, an I/O
+// error, a network source that closes early. FFmpeg then finishes the output
+// as though the input had ended there and exits 0, so this line is the only
+// sign that the output stops short of the source. FFmpeg 7.1.4 (the
+// jellyfin-ffmpeg build) and 9.0.2 both behave this way.
+const ffmpegDemuxErrorLine = "Error during demuxing"
+
+// remuxStderrTailBytes bounds the FFmpeg diagnostics a remux keeps for its
+// failure log. -loglevel error keeps them short; the bound only matters for a
+// damaged source that logs an error per packet.
+const remuxStderrTailBytes = 4 << 10
+
+// remuxStderr keeps the end of FFmpeg's diagnostics and notes whether the
+// demuxer stopped on an error. exec copies stderr on its own goroutine, and
+// Wait returns only after that copy finishes.
+type remuxStderr struct {
+	mu         sync.Mutex
+	tail       []byte
+	demuxError bool
+}
+
+func (e *remuxStderr) Write(p []byte) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Search from just before the new bytes so a line split across writes
+	// is still found.
+	from := max(len(e.tail)-len(ffmpegDemuxErrorLine)+1, 0)
+	e.tail = append(e.tail, p...)
+	if !e.demuxError && bytes.Contains(e.tail[from:], []byte(ffmpegDemuxErrorLine)) {
+		e.demuxError = true
+	}
+	if excess := len(e.tail) - remuxStderrTailBytes; excess > 0 {
+		e.tail = append(e.tail[:0], e.tail[excess:]...)
+	}
+	return len(p), nil
+}
+
+func (e *remuxStderr) snapshot() (tail string, demuxError bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return strings.TrimSpace(string(e.tail)), e.demuxError
+}
+
+// errRemuxSourceEndedEarly reports an FFmpeg run that exited 0 after its
+// demuxer failed, so its output ends before the source does.
+var errRemuxSourceEndedEarly = errors.New("ffmpeg stopped reading the source on a demux error")
+
+// RemuxDVMode makes Profile 7 handling an explicit byte-level recipe choice.
+// The empty/legacy mode exists only for pre-v3 callers and old stream tokens.
+type RemuxDVMode string
+
+const (
+	RemuxDVLegacyAutoV3   RemuxDVMode = "legacy_auto"
+	RemuxDVPreserveV3     RemuxDVMode = "preserve"
+	RemuxDVStripToHDR10V3 RemuxDVMode = "strip_to_hdr10"
+	RemuxDVRejectP7V3     RemuxDVMode = "reject_profile_7"
+)
+
+// buildRemuxArgs constructs the ffmpeg argument list for a remux operation.
+// The args perform codec copy (-c copy) into the target container format,
+// using fragmented output for streaming (frag_keyframe+delay_moov+default_base_moof) and
+// pipe:1 for stdout output.
+// When transcodeAudio is true, video is copied but audio is transcoded to
+// stereo AAC (handles cases like DTS/TrueHD that browsers cannot decode).
+// dvProfile is the file's Dolby Vision profile (0 = none). Profile 7 remuxes
+// run DV7ToHDR10BitstreamFilter: the video map drops a separate
+// enhancement-layer track, but a single-track source interleaves it as NAL
+// unit type 63, and its RPUs would dangle either way. The result is a clean
+// HDR10 base layer (the Apple-parity fallback for devices without a P7
+// decoder). Profile 8 RPUs stay: the base layer is self-contained and DV
+// clients can render it.
+func buildRemuxArgs(filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, tagSampleEntry, audioOnly bool) []string {
+	return buildRemuxArgsWithAudioV3(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, tagSampleEntry, audioOnly, 0, 0, 0)
+}
+
+func buildRemuxArgsWithAudioV3(filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, tagSampleEntry, audioOnly bool, sourceAudioChannels, targetAudioChannels, targetAudioBitrateKbps int) []string {
+	return buildRemuxArgsWithLeadingPictureDropV3(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, tagSampleEntry, audioOnly, sourceAudioChannels, targetAudioChannels, targetAudioBitrateKbps, false, "", nil)
+}
+
+// remuxIDRPrimer puts the source's first frame ahead of a seeked HEVC copy.
+// The copy starts on the keyframe before the seek, and in an open-GOP encode
+// that is a CRA; macOS Firefox shows nothing from a stream that does not
+// start on an IDR. The first frame of most encodes is an IDR, and it shares
+// the parameter sets of the rest of the file, so the decoder starts on it and
+// then takes the CRA as an ordinary keyframe.
+//
+// shortcut: the primer holds the screen for 1 ms and shifts the stream that
+// much behind the plan's origin, under a frame, so the timeline ignores it.
+type remuxIDRPrimer struct {
+	// fileURL names the source in the concat list.
+	fileURL string
+	// firstPTS and anchorPTS are the Matroska cue times of the first
+	// keyframe and of the one the copy starts on, the raw timestamps the
+	// concat demuxer seeks by. anchorSeconds is the plan's origin: that
+	// keyframe relative to the source start.
+	firstPTS, anchorPTS, anchorSeconds float64
+}
+
+const (
+	// remuxIDRPrimerBudget bounds how long a remux start waits for the
+	// primer lookup. A warm lookup is a few small reads; a cold one also
+	// reads the file's Cues, and keeps running past the budget to cache
+	// them for the next start.
+	remuxIDRPrimerBudget = 300 * time.Millisecond
+	// maxRemuxIDRPrimerLookups bounds the lookups in flight. When storage
+	// stalls they all wait on it, and later starts skip the primer at once
+	// rather than queue.
+	maxRemuxIDRPrimerLookups = 8
+	// remuxIDRPrimerOriginTolerance is how far the plan's origin may sit from
+	// its keyframe's cue time. The origin counts from the source's start
+	// time and the cue from zero; in a file whose first keyframe is at
+	// remuxIDRPrimerMaxFirstKeyframe or earlier they differ by a few
+	// milliseconds. A file that starts later could put a cue a whole GOP
+	// away within the tolerance, so it gets no primer.
+	remuxIDRPrimerOriginTolerance  = 0.03
+	remuxIDRPrimerMaxFirstKeyframe = 0.1
+)
+
+var remuxIDRPrimerLookups = make(chan struct{}, maxRemuxIDRPrimerLookups)
+
+// lookupRemuxIDRPrimer finds the primer for a copy starting at the plan's
+// origin; tests replace it.
+var lookupRemuxIDRPrimer = findRemuxIDRPrimer
+
+// resolveRemuxIDRPrimer returns the primer for a copy whose plan starts it
+// on the keyframe at origin, or nil so the remux serves the plain seeked
+// copy. It runs no FFmpeg and waits at most remuxIDRPrimerBudget.
+func resolveRemuxIDRPrimer(ctx context.Context, filePath string, origin float64) *remuxIDRPrimer {
+	select {
+	case remuxIDRPrimerLookups <- struct{}{}:
+	default:
+		return nil
+	}
+	lookup := lookupRemuxIDRPrimer
+	result := make(chan *remuxIDRPrimer, 1)
+	go func() {
+		defer func() { <-remuxIDRPrimerLookups }()
+		result <- lookup(filePath, origin)
+	}()
+	budget := time.NewTimer(remuxIDRPrimerBudget)
+	defer budget.Stop()
+	select {
+	case primer := <-result:
+		return primer
+	case <-budget.C:
+		slog.WarnContext(ctx, "remux IDR primer lookup exceeded its budget; serving the seeked copy without it", "budget", remuxIDRPrimerBudget)
+		return nil
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// findRemuxIDRPrimer reads a primer from the source's Matroska Cues
+// (keyframes.Load, cached per file version) and the headers of two keyframe
+// blocks: the first keyframe must be an IDR, and the one at the plan's origin
+// must not be. A source without usable Cues, such as any MP4 or MPEG-TS
+// file, gets no primer, and neither does a relayed input (a transcode node
+// reading through the core): the concat list would name it outside the
+// restrictions fspath.CommandContext gives it, so fspath.FFConcatFileURL
+// refuses it before any read.
+func findRemuxIDRPrimer(filePath string, origin float64) *remuxIDRPrimer {
+	fileURL, err := fspath.FFConcatFileURL(filePath)
+	if err != nil {
+		return nil
+	}
+	idx, err := keyframes.Load(context.Background(), filePath)
+	if err != nil || len(idx.Keyframes) < 2 || idx.Keyframes[0] > remuxIDRPrimerMaxFirstKeyframe {
+		return nil
+	}
+	cues := idx.Keyframes
+	k := sort.SearchFloat64s(cues, origin)
+	if k == len(cues) || (k > 0 && origin-cues[k-1] < cues[k]-origin) {
+		k--
+	}
+	if k == 0 {
+		return nil // the copy starts on the first keyframe, the IDR itself
+	}
+	// The origin must name one cue unmistakably.
+	near := func(j int, within float64) bool { return j >= 0 && j < len(cues) && math.Abs(cues[j]-origin) <= within }
+	tolerance := remuxIDRPrimerOriginTolerance
+	if !near(k, tolerance) || near(k-1, 2*tolerance) || near(k+1, 2*tolerance) {
+		return nil
+	}
+	if firstIDR, err := idx.HEVCKeyframeIsIDR(0); err != nil || !firstIDR {
+		return nil
+	}
+	if anchorIDR, err := idx.HEVCKeyframeIsIDR(k); err != nil || anchorIDR {
+		return nil
+	}
+	return &remuxIDRPrimer{fileURL: fileURL, firstPTS: cues[0], anchorPTS: cues[k], anchorSeconds: origin}
+}
+
+// concatList is the ffconcat script for the primed video: the source's first
+// frame, then the source from the seek's keyframe. The outpoint still lets
+// more than one frame through; primedResumeLeadingPictureDropBitstreamFilter
+// keeps only the first. Inpoints round up to the microsecond the demuxer
+// parses, so they never fall just before the keyframe they name.
+func (p *remuxIDRPrimer) concatList() string {
+	format := func(seconds float64) string { return strconv.FormatFloat(math.Ceil(seconds*1e6)/1e6, 'f', 6, 64) }
+	return "ffconcat version 1.0\n" +
+		"file " + p.fileURL + "\ninpoint " + format(p.firstPTS) + "\noutpoint " + format(p.firstPTS+remuxIDRPrimerSeconds) + "\n" +
+		"file " + p.fileURL + "\ninpoint " + format(p.anchorPTS) + "\n"
+}
+
+// RemuxStreamOriginQueryParam is the query parameter a seeked progressive
+// remux URL carries when its plan asked for the resume leading-picture drop:
+// the plan's stream origin in seconds (RemuxServeOptions.StreamOriginSeconds).
+const RemuxStreamOriginQueryParam = "origin"
+
+// RemuxStreamOrigin returns the stream origin a progressive remux URL
+// carries, or nil when it has none or it isn't a finite, non-negative number.
+func RemuxStreamOrigin(query url.Values) *float64 {
+	origin, err := strconv.ParseFloat(query.Get(RemuxStreamOriginQueryParam), 64)
+	if err != nil || origin < 0 || math.IsInf(origin, 0) || math.IsNaN(origin) {
+		return nil
+	}
+	return &origin
+}
+
+// buildRemuxArgsWithLeadingPictureDropV3 adds the resume leading-picture drop
+// to the video bitstream filters. It applies only to a seeked copy with video:
+// a start at zero begins on the stream's first keyframe and has no leading
+// pictures to drop. copyAudioCodec is the codec of the source audio track a
+// copy remux carries over. A non-nil primer takes the video from the concat
+// list remuxIDRPrimer.concatList writes to stdin; audio keeps the seeked
+// input.
+func buildRemuxArgsWithLeadingPictureDropV3(filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, tagSampleEntry, audioOnly bool, sourceAudioChannels, targetAudioChannels, targetAudioBitrateKbps int, dropLeadingPictures bool, copyAudioCodec string, primer *remuxIDRPrimer) []string {
+	args := []string{
+		"-nostdin",
+		"-hide_banner",
+		"-loglevel", "error",
+	}
+	// Cap the input probe to speed up startup on large MKV containers
+	// (defaults scan up to 5 seconds / several MB). Mirrors the transcode
+	// pipeline, which has run these caps in production without issue.
+	inputFlags := []string{
+		"-fflags", "+genpts+fastseek",
+		"-analyzeduration", "3000000",
+		"-probesize", "5000000",
+	}
+	audioInput := 0
+	if primer != nil {
+		args = append(args, inputFlags...)
+		args = append(args, "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe", "-i", "pipe:0")
+		audioInput = 1
+	}
+	args = append(args, inputFlags...)
+
+	// Add seek if requested (before input for fast seek).
+	if seekSeconds > 0 {
+		args = append(args, "-ss", strconv.FormatFloat(seekSeconds, 'f', 3, 64))
+		if transcodeAudio {
+			// In copy mode (-c:v copy) video must start at a keyframe, but
+			// accurate_seek (the default) trims re-encoded audio to the exact
+			// seek point. This mismatch causes A/V desync equal to the gap
+			// between the keyframe and the seek point. Disabling accurate seek
+			// keeps both streams aligned at the keyframe boundary.
+			args = append(args, "-noaccurate_seek")
+		}
+	}
+	if primer != nil {
+		// The concat video starts its clock at the keyframe; this seek starts
+		// at the requested position, which lies past it.
+		args = append(args, "-itsoffset", strconv.FormatFloat(seekSeconds-primer.anchorSeconds, 'f', 6, 64))
+	}
+
+	args = append(args, "-i", filePath)
+
+	// Strip metadata/chapters and skip subtitle/data streams — the remux
+	// output is fed to an HTML <video> tag, none of it is consumed.
+	args = append(args,
+		"-map_metadata", "-1",
+		"-map_chapters", "-1",
+	)
+
+	// A planned video remux must fail if the promised video stream disappeared
+	// or became unreadable. Only positively identified audio-only media may
+	// make the video map optional.
+	videoMap := "0:V:0"
+	if audioOnly {
+		videoMap += "?"
+	}
+	args = append(args, "-map", videoMap)
+	if audioTrackIndex < 0 {
+		audioTrackIndex = 0
+	}
+	args = append(args, "-map", fmt.Sprintf("%d:a:%d?", audioInput, audioTrackIndex))
+	args = append(args, "-sn", "-dn")
+
+	videoBitstreamFilters := make([]string, 0, 2)
+	if primer != nil {
+		videoBitstreamFilters = append(videoBitstreamFilters, primedResumeLeadingPictureDropBitstreamFilter)
+	} else if dropLeadingPictures && seekSeconds > 0 && !audioOnly {
+		videoBitstreamFilters = append(videoBitstreamFilters, ResumeLeadingPictureDropBitstreamFilter)
+	}
+	if dvProfile == 7 {
+		videoBitstreamFilters = append(videoBitstreamFilters, DV7ToHDR10BitstreamFilter)
+	}
+	if len(videoBitstreamFilters) > 0 {
+		args = append(args, "-bsf:v", strings.Join(videoBitstreamFilters, ","))
+	}
+	if dvProfile == 7 {
+		if tagSampleEntry {
+			// The explicit v3 strip recipe promised the client plain HDR10.
+			// Safari's media element only answers "probably" for hvc1 — the
+			// sample entry Apple's HLS authoring spec requires — so relabel
+			// FFmpeg's default hev1 to match the evidence the web probe
+			// collects. Stripped output carries no DOVI record, so no -strict
+			// relaxation is needed. Legacy/auto strips keep hev1.
+			args = append(args, "-tag:v", "hvc1")
+		}
+	} else if (dvProfile == 5 || dvProfile == 8) && tagSampleEntry {
+		// FFmpeg carries the DOVI configuration record into MP4 but otherwise
+		// labels copied HEVC as hev1. Media3 keys decoder selection from the
+		// sample entry, and Safari's media element only answers "probably" for
+		// dvh1 — the sample entry Apple's HLS authoring spec calls for — so tag
+		// dvh1. FFmpeg refuses to write the dvvC configuration record box under
+		// either tag without -strict unofficial; dvh1 plus -strict unofficial is
+		// verified (7.1.4, 8.1.3) to retain the full record. Media3 accepts both
+		// sample entries, so Android preserve consumers are unaffected. Only the
+		// explicit v3 preserve recipe opts in: legacy web/jellycompat consumers
+		// keep the pre-v3 hev1 labeling their demuxers accept.
+		args = append(args, "-tag:v", "dvh1", "-strict", "unofficial")
+	}
+
+	if transcodeAudio {
+		channels, bitrateKbps := ResolveAACOutputV3(targetAudioChannels, targetAudioBitrateKbps)
+		// Video copy + AAC encode is effectively single-threaded work.
+		// ffmpeg's default auto-threading spawns one filter thread per CPU
+		// core for the implicit downmix/resampler, all idle. Pin to one.
+		args = append(args,
+			"-threads", "1",
+			"-filter_threads", "1",
+			"-filter_complex_threads", "1",
+			"-c:v", "copy",
+			"-c:a", "aac",
+			"-ac", strconv.Itoa(channels),
+			"-b:a", strconv.Itoa(bitrateKbps)+"k",
+		)
+		args = appendAACEncodeFilterArgs(args, sourceAudioChannels, "aac", targetAudioChannels, channels)
+	} else {
+		args = append(args, "-c", "copy")
+		args = appendCopiedAACToMP4Args(args, copyAudioCodec)
+	}
+
+	args = append(args,
+		"-avoid_negative_ts", "make_zero",
+		"-f", outputFormat,
+		// delay_moov lets the MP4 muxer inspect the first audio packet before
+		// writing codec configuration. empty_moov fails immediately for copied
+		// E-AC-3/Atmos tracks because their frame size is not known at header time.
+		"-movflags", "frag_keyframe+delay_moov+default_base_moof",
+		"pipe:1",
+	)
+
+	return args
+}
+
+// StartRemux starts an ffmpeg process that copies codecs to a new container.
+// When transcodeAudio is false the command is:
+//
+//	ffmpeg -i {input} -c copy -f {format} -movflags frag_keyframe+delay_moov+default_base_moof pipe:1
+//
+// When transcodeAudio is true video is copied but audio is transcoded to AAC.
+// The caller must call Close() when done to clean up resources.
+func StartRemux(ctx context.Context, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int) (*RemuxSession, error) {
+	return StartRemuxWithDVMode(ctx, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, RemuxDVLegacyAutoV3, "")
+}
+
+// StartRemuxWithDVMode starts a remux with explicit Dolby Vision behavior.
+// ffmpegPath selects the binary to execute (empty = process-global discovery);
+// v3 callers must pass the configured playback path so the strip capability
+// promised by the planner's probe holds for the binary that actually runs.
+func StartRemuxWithDVMode(ctx context.Context, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, mode RemuxDVMode, ffmpegPath string) (*RemuxSession, error) {
+	return startRemuxWithOptions(ctx, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, false, 0, 0, 0, false, "", nil)
+}
+
+func startRemuxWithOptions(ctx context.Context, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, mode RemuxDVMode, ffmpegPath string, audioOnly bool, sourceAudioChannels, targetAudioChannels, targetAudioBitrateKbps int, dropLeadingPictures bool, copyAudioCodec string, streamOrigin *float64) (*RemuxSession, error) {
+	ctx, cancel := context.WithCancel(ctx)
+
+	bin := ResolveFFmpegPath(ffmpegPath)
+	effectiveProfile := dvProfile
+	tagSampleEntry := false
+	switch mode {
+	case "", RemuxDVLegacyAutoV3:
+		effectiveProfile = remuxDVProfile(dvProfile, supportsDoviRPUFilter(bin) &&
+			(dvProfile != 7 || sharedDVRPUProbe.CanStrip(ctx, bin, filePath)))
+	case RemuxDVStripToHDR10V3:
+		if dvProfile != 7 && dvProfile != 8 {
+			cancel()
+			return nil, fmt.Errorf("Dolby Vision HDR10 strip requires profile 7 or 8")
+		}
+		if !supportsDoviRPUFilter(bin) {
+			cancel()
+			return nil, fmt.Errorf("the Dolby Vision HDR10 remux requires the dovi_rpu and filter_units bitstream filters")
+		}
+		// The planner refuses this recipe for a source that fails the probe,
+		// so reaching here means a session or stream token minted before the
+		// verdict was known. Fail definitively: copying the base layer without
+		// the strip would leave dangling RPUs (the decoder stall this recipe
+		// exists to prevent) while still claiming HDR10, and attempting the
+		// strip anyway is the per-packet rejection that hangs the session. The
+		// next start re-plans against the now-cached verdict.
+		if !sharedDVRPUProbe.CanStrip(ctx, bin, filePath) {
+			cancel()
+			return nil, fmt.Errorf("this source's Dolby Vision RPU cannot be stripped to HDR10")
+		}
+		// buildRemuxArgs uses profile 7 as the explicit strip sentinel; the
+		// filter is equally required for a compatible profile 8 base layer.
+		// The explicit recipe also labels the output hvc1: the web HDR10
+		// probe collects evidence for that sample entry, and the plan must
+		// deliver the shape it validated. Legacy/auto strips keep hev1.
+		effectiveProfile = 7
+		tagSampleEntry = true
+	case RemuxDVPreserveV3:
+		if dvProfile == 7 {
+			// The remux maps only the base-layer stream, so dual-layer P7
+			// cannot be preserved: the EL is dropped and its RPUs would
+			// dangle. Callers must strip to HDR10 or transcode instead.
+			cancel()
+			return nil, fmt.Errorf("Dolby Vision profile 7 cannot be preserved in a progressive remux")
+		}
+		tagSampleEntry = true
+	case RemuxDVRejectP7V3:
+		if dvProfile == 7 {
+			cancel()
+			return nil, fmt.Errorf("profile 7 remux is not eligible")
+		}
+	default:
+		cancel()
+		return nil, fmt.Errorf("unknown remux Dolby Vision mode %q", mode)
+	}
+	// The leading-picture drop is best effort: a binary without the drop
+	// expression serves the plain copy rather than failing the route. Only
+	// probe when the filter would actually run.
+	dropLeadingPictures = dropLeadingPictures && seekSeconds > 0 && !audioOnly && supportsLeadingPictureDropFilter(bin)
+	var primer *remuxIDRPrimer
+	// The copy starts on a keyframe at or before the seek; an origin past
+	// it isn't the plan's.
+	if dropLeadingPictures && streamOrigin != nil && *streamOrigin <= seekSeconds {
+		primer = resolveRemuxIDRPrimer(ctx, filePath, *streamOrigin)
+	}
+	args := buildRemuxArgsWithLeadingPictureDropV3(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, effectiveProfile, tagSampleEntry, audioOnly, sourceAudioChannels, targetAudioChannels, targetAudioBitrateKbps, dropLeadingPictures, copyAudioCodec, primer)
+	cmd := fspath.CommandContext(ctx, bin, args...)
+	if primer != nil {
+		cmd.Stdin = strings.NewReader(primer.concatList())
+	}
+	stderr := &remuxStderr{}
+	cmd.Stderr = stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		processmetrics.Record(processmetrics.Remux, nil, err, ctx.Err())
+		cancel()
+		return nil, fmt.Errorf("start ffmpeg: %w", err)
+	}
+
+	return &RemuxSession{
+		cmd:        cmd,
+		ctx:        ctx,
+		cancel:     cancel,
+		outputPipe: stdout,
+		stderr:     stderr,
+	}, nil
+}
+
+// Read implements io.Reader, piping ffmpeg stdout to the caller.
+func (s *RemuxSession) Read(p []byte) (int, error) {
+	return s.outputPipe.Read(p)
+}
+
+// Abort kills the ffmpeg process without draining or reaping it.
+//
+// It exists for callers that are not the owner of the session: killing ffmpeg
+// closes the output pipe, which is what unblocks a copy loop parked in Read, and
+// the owner's deferred Close then does the draining and the wait. Close itself
+// cannot be used for that — it reads the pipe and calls cmd.Wait, neither of
+// which may run concurrently with the owner's Read.
+func (s *RemuxSession) Abort() {
+	if s == nil || s.cancel == nil {
+		return
+	}
+	s.cancel()
+}
+
+// Close stops the ffmpeg process and cleans up all resources.
+// It is safe to call Close multiple times.
+func (s *RemuxSession) Close() error {
+	return s.close(true)
+}
+
+// finishOutput reaps an FFmpeg whose output stopped with readErr and reports
+// whether that output ends before the source does: reading it failed with
+// anything other than EOF, FFmpeg exited non-zero or was killed, or it logged
+// a demux error and then exited 0. It does not cancel first, so an exit
+// status is FFmpeg's own and not this cleanup's. A session whose context
+// ended first, because the request went away or Abort withdrew the stream,
+// reports nil: that end was the caller's choice.
+func (s *RemuxSession) finishOutput(readErr error) error {
+	err := s.close(false)
+	if s.contextEnded {
+		return nil
+	}
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return fmt.Errorf("reading ffmpeg remux output: %w", readErr)
+	}
+	// ErrWaitDelay means FFmpeg exited 0 but something it started still held
+	// a pipe: the output is complete.
+	if err != nil && !errors.Is(err, exec.ErrWaitDelay) {
+		return fmt.Errorf("ffmpeg remux failed: %w", err)
+	}
+	if s.stderr != nil {
+		if _, demuxError := s.stderr.snapshot(); demuxError {
+			return errRemuxSourceEndedEarly
+		}
+	}
+	return nil
+}
+
+// stderrTail returns the end of FFmpeg's diagnostics for a failure log.
+func (s *RemuxSession) stderrTail() string {
+	if s.stderr == nil {
+		return ""
+	}
+	tail, _ := s.stderr.snapshot()
+	return tail
+}
+
+func (s *RemuxSession) close(cancelFirst bool) error {
+	s.closeOnce.Do(func() {
+		contextErr := s.ctx.Err()
+		if cancelFirst {
+			s.cancel()
+		}
+		// The owner drains and waits exactly once, including repeated Close.
+		_, _ = io.Copy(io.Discard, s.outputPipe)
+		s.closeErr = s.cmd.Wait()
+		if !cancelFirst && contextErr == nil {
+			// The request went away, or Abort fired, while FFmpeg was reaped.
+			contextErr = s.ctx.Err()
+		}
+		s.contextEnded = contextErr != nil
+		s.cancel()
+		// Cleanup cancellation must not relabel an already completed FFmpeg
+		// failure. A process killed by this Close has a signal exit instead.
+		if cancelFirst && contextErr == nil && s.closeErr != nil && s.cmd.ProcessState != nil && !s.cmd.ProcessState.Exited() {
+			contextErr = context.Canceled
+		}
+		metricsErr := s.closeErr
+		if metricsErr == nil && contextErr == nil && s.stderr != nil {
+			if _, demuxError := s.stderr.snapshot(); demuxError {
+				metricsErr = errRemuxSourceEndedEarly
+			}
+		}
+		processmetrics.Record(processmetrics.Remux, s.cmd.ProcessState, metricsErr, contextErr)
+	})
+	return s.closeErr
+}
+
+// containerMIME maps output format names to MIME types for HTTP responses.
+func containerMIME(format string) string {
+	switch format {
+	case "mp4":
+		return "video/mp4"
+	case "webm":
+		return "video/webm"
+	case "matroska":
+		return "video/x-matroska"
+	case "mpegts":
+		return "video/mp2t"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// appendCopiedAACToMP4Args adds aac_adtstoasc when a copied audio track of
+// codec copyAudioCodec is muxed into MP4 (the progressive fMP4 remux and fMP4
+// HLS segments). AAC in MPEG-TS (and raw .aac) is ADTS-framed; MP4 needs the
+// ADTS headers stripped into a config record. FFmpeg normally inserts this
+// filter on its own, but neither under delay_moov nor inside the HLS muxer's
+// fMP4 segments: the muxer rejects the first ADTS packet ("Malformed AAC
+// bitstream") and the output ends there. The filter passes already-raw AAC
+// from MKV/MP4 through unchanged, but it refuses any other codec, so it is only
+// added for a copied AAC track. An empty codec (older tokens and recipes)
+// keeps the plain copy.
+func appendCopiedAACToMP4Args(args []string, copyAudioCodec string) []string {
+	if !copiedAudioIsAAC(copyAudioCodec) {
+		return args
+	}
+	return append(args, "-bsf:a", "aac_adtstoasc")
+}
+
+func copiedAudioIsAAC(copyAudioCodec string) bool {
+	return strings.EqualFold(strings.TrimSpace(copyAudioCodec), "aac")
+}
+
+// RemuxServeOptions carries the optional serving concerns that not every
+// caller sets, keeping the positional argument list from growing further.
+type RemuxServeOptions struct {
+	// DVMode is the explicitly declared Dolby Vision recipe. The zero value
+	// decodes as the legacy auto behavior, matching old stream tokens.
+	DVMode RemuxDVMode
+	// FFmpegPath selects the binary to execute (empty = global discovery).
+	FFmpegPath string
+	// ContentType overrides the container-derived response type. Audio-only
+	// sources mux an audio-only fMP4, which must not be announced as video.
+	ContentType string
+	// AudioOnly permits the otherwise-mandatory video map to be absent.
+	AudioOnly bool
+	// SourceAudioChannels identifies a real surround-to-stereo conversion so an
+	// already-stereo source keeps its authored level. TargetAudioChannels and
+	// TargetAudioBitrateKbps freeze the planned AAC output. Zero target values
+	// retain the historical stereo 192 kbps behavior.
+	SourceAudioChannels    int
+	TargetAudioChannels    int
+	TargetAudioBitrateKbps int
+	// CopyAudioCodec is the codec of the source audio track the remux copies;
+	// a copied AAC track gets aac_adtstoasc. Empty (older tokens) keeps the
+	// plain copy. It is ignored when audio is transcoded.
+	CopyAudioCodec string
+	// DropResumeLeadingPictures removes open-GOP leading pictures from a
+	// seeked video copy when this executor's FFmpeg supports it. It is a
+	// best-effort client workaround frozen into the session, so an executor
+	// without the filter, or one that predates the field, serves the plain copy.
+	DropResumeLeadingPictures bool
+	// StreamOriginSeconds is the plan's stream origin, from the URL's
+	// RemuxStreamOriginQueryParam: the keyframe the seeked copy starts on,
+	// relative to the source start. With DropResumeLeadingPictures, a
+	// Matroska HEVC copy that starts on a CRA there is led with the source's
+	// first frame (see remuxIDRPrimer). Nil serves the plain copy.
+	StreamOriginSeconds *float64
+	// Abort ends the response early when it is closed. A progressive remux is
+	// one long response, so without it the only thing that can stop the stream
+	// is the client itself — a server-initiated session stop cannot withdraw a
+	// route the client is still being fed. Callers that serve a session pass
+	// SessionManager.WatchTransportStop's channel.
+	Abort <-chan struct{}
+}
+
+// RemuxContentType returns the override required for an audio-only fMP4.
+func RemuxContentType(audioOnly bool) string {
+	if audioOnly {
+		return AudioOnlyRemuxMIMEV3
+	}
+	return ""
+}
+
+// ServeRemux streams a remuxed file to the HTTP response.
+// It starts an ffmpeg remux session and copies the output directly to the
+// response writer. The response is streamed (chunked transfer) since the
+// total size is not known in advance.
+// When transcodeAudio is true, audio is transcoded to AAC while video is copied.
+func ServeRemux(w http.ResponseWriter, r *http.Request, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int) error {
+	return ServeRemuxWithOptions(w, r, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, RemuxServeOptions{})
+}
+
+// ServeRemuxWithDVMode streams an explicitly declared Dolby Vision recipe.
+// ffmpegPath selects the binary to execute (empty = process-global discovery).
+func ServeRemuxWithDVMode(w http.ResponseWriter, r *http.Request, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, mode RemuxDVMode, ffmpegPath string) error {
+	return ServeRemuxWithOptions(w, r, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, RemuxServeOptions{DVMode: mode, FFmpegPath: ffmpegPath})
+}
+
+// ServeRemuxWithOptions is the full remux transport, taking its optional
+// serving concerns as a struct.
+func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, opts RemuxServeOptions) error {
+	mode, ffmpegPath := opts.DVMode, opts.FFmpegPath
+	// Remux output streams for the length of the title; roll the write
+	// deadline with progress instead of the server's absolute WriteTimeout.
+	streamWriter := httpstream.NewRollingDeadlineWriter(w)
+	w = streamWriter
+	// Check file exists before starting ffmpeg to return a proper 404.
+	// Headers must be written before streaming begins, so we can't detect
+	// ffmpeg errors after WriteHeader(200) has been sent.
+	if _, err := fspath.Stat(filePath); err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "file not found", http.StatusNotFound)
+			return err
+		}
+		http.Error(w, "failed to access file", http.StatusInternalServerError)
+		return err
+	}
+
+	contentType := opts.ContentType
+	if contentType == "" {
+		contentType = containerMIME(outputFormat)
+	}
+	setStreamHeaders := func() {
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Transfer-Encoding", "chunked")
+	}
+	// net/http discards a HEAD response's body, so a remux started for one
+	// would run ffmpeg over the whole file for nothing. Answer with the
+	// headers a GET sends instead.
+	if r.Method == http.MethodHead {
+		setStreamHeaders()
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}
+
+	session, err := startRemuxWithOptions(r.Context(), filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, opts.AudioOnly, opts.SourceAudioChannels, opts.TargetAudioChannels, opts.TargetAudioBitrateKbps, opts.DropResumeLeadingPictures, opts.CopyAudioCodec, opts.StreamOriginSeconds)
+	if err != nil {
+		http.Error(w, "failed to start remux", http.StatusInternalServerError)
+		return err
+	}
+	defer session.Close()
+
+	if opts.Abort != nil {
+		// Deferred after session.Close, so it runs before it: the watcher is
+		// gone by the time the owner drains and reaps the process.
+		served := make(chan struct{})
+		watcherDone := make(chan struct{})
+		defer func() {
+			close(served)
+			<-watcherDone
+		}()
+		go func() {
+			defer close(watcherDone)
+			select {
+			case <-opts.Abort:
+				_ = streamWriter.Abort()
+				session.Abort()
+			case <-served:
+			}
+		}()
+	}
+
+	setStreamHeaders()
+	w.WriteHeader(http.StatusOK)
+
+	// Stream ffmpeg output to the HTTP response.
+	buf := make([]byte, 32*1024) // 32 KB buffer
+	for {
+		n, readErr := session.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return nil // Client disconnected.
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if readErr != nil {
+			finishRemuxResponse(r, filePath, session, streamWriter, readErr)
+			return nil
+		}
+	}
+}
+
+// finishRemuxResponse ends a progressive remux whose FFmpeg output stopped
+// with readErr. A complete output ends the response normally. An output that stops
+// short of the source, such as a disk that stopped returning data mid-title,
+// must not: a clean end of a chunked response tells the player it has
+// reached the end of the title, which marks it watched and starts the next
+// one. Aborting the response instead leaves the stream visibly broken, so
+// the player stalls and then reports a network error that its reconnect
+// handling owns.
+func finishRemuxResponse(r *http.Request, filePath string, session *RemuxSession, streamWriter *httpstream.RollingDeadlineWriter, readErr error) {
+	err := session.finishOutput(readErr)
+	if err == nil || r.Context().Err() != nil {
+		return
+	}
+	slog.WarnContext(r.Context(), "progressive remux ended before the end of its source; aborting the response",
+		"component", "playback",
+		"path", filePath,
+		"bytes_written", streamWriter.BytesWritten(),
+		"error", err,
+		"ffmpeg_stderr", session.stderrTail(),
+	)
+	// The status and some of the body are already on the wire, so the only
+	// way left to report the failure is to break the response: net/http then
+	// omits the final chunk on HTTP/1.1 and resets the stream on HTTP/2.
+	panic(http.ErrAbortHandler)
+}

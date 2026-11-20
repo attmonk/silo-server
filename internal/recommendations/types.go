@@ -1,0 +1,155 @@
+package recommendations
+
+import (
+	"context"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+)
+
+// ScoredItem represents a recommended item with a relevance score and explanation.
+type ScoredItem struct {
+	MediaItemID  string  `json:"media_item_id"`
+	Score        float64 `json:"score"`
+	Reason       string  `json:"reason"`
+	ReasonDetail string  `json:"reason_detail,omitempty"`
+}
+
+// ForYouRow represents a single row in the ForYou response.
+type ForYouRow struct {
+	Type         string       `json:"type"`
+	Label        string       `json:"label"`
+	ClusterIndex int          `json:"cluster_index,omitempty"`
+	Items        []ScoredItem `json:"items"`
+	// Subject is what a taste-cluster row is about, its genre label without
+	// the title's wording, for clients that word the reason themselves. It is
+	// empty on every other row and on a cluster whose label names no genre.
+	Subject string `json:"-"`
+	// AnchorItemID is the title a Because You Watched row was built from.
+	AnchorItemID string `json:"-"`
+	// personalKey is the cache key of a personal taste row, the main row
+	// (RecTypeForYouMain) or a cluster row, and empty on every other row.
+	// Reads rotate these rows daily (see rotateTail).
+	personalKey string
+}
+
+// ForYouResponse is the grouped response of the For You rows endpoint.
+type ForYouResponse struct {
+	Rows []ForYouRow `json:"rows"`
+}
+
+// TasteCluster represents a sub-profile cluster from k-means.
+type TasteCluster struct {
+	UserID         int       `json:"-"`
+	ProfileID      string    `json:"-"`
+	ClusterIdx     int       `json:"cluster_idx"`
+	Embedding      []float32 `json:"-"`
+	DominantGenres []string  `json:"dominant_genres"`
+	Label          string    `json:"label"`
+	MemberCount    int       `json:"member_count"`
+	TotalWeight    float64   `json:"total_weight"`
+	UpdatedAt      time.Time `json:"-"`
+}
+
+// CowatchPair represents a co-watch similarity between two items.
+type CowatchPair struct {
+	ItemID        string  `json:"item_id"`
+	SimilarItemID string  `json:"similar_item_id"`
+	JaccardScore  float64 `json:"jaccard_score"`
+	CowatchCount  int     `json:"cowatch_count"`
+}
+
+// WatchSignal holds computed watch progress signal data for a single item.
+type WatchSignal struct {
+	MediaItemID   string
+	ProgressPct   float64
+	Completed     bool
+	RewatchCount  int
+	LastWatchedAt time.Time
+}
+
+// Recommender provides recommendation operations. The profile-scoped reads
+// take the viewer's access filter and leave out what it cannot see before
+// ranking, so a restricted viewer still gets a full list.
+type Recommender interface {
+	SimilarItems(ctx context.Context, userID int, profileID, itemID string, limit int, filter catalog.AccessFilter) ([]ScoredItem, error)
+	SimilarItemsWithReasons(ctx context.Context, userID int, profileID, itemID string, limit int, filter catalog.AccessFilter) ([]ScoredItem, error)
+	BecauseYouWatched(ctx context.Context, userID int, profileID string, sourceItemID string, limit int, filter catalog.AccessFilter) ([]ScoredItem, error)
+	SimilarUsersLiked(ctx context.Context, userID int, profileID string, limit int, filter catalog.AccessFilter) ([]ScoredItem, error)
+	RefreshTasteProfile(ctx context.Context, userID int, profileID string) error
+	GetTasteProfileSummary(ctx context.Context, userID int, profileID string) (*TasteProfileSummary, error)
+	EmbedAll(ctx context.Context) (EmbedCounts, error)
+}
+
+// TasteProfileSummary is the user-facing taste profile response.
+type TasteProfileSummary struct {
+	TopGenres         []string       `json:"top_genres"`
+	FavoriteDirectors []string       `json:"favorite_directors"`
+	SignalCounts      map[string]int `json:"signal_counts"`
+	UpdatedAt         string         `json:"updated_at"`
+}
+
+// Signal weights for taste profile computation.
+const (
+	WeightRated5    = 1.0
+	WeightRewatch   = 0.9 // Completed 2+ times
+	WeightRated4    = 0.7
+	WeightFavorited = 0.8  // Strong deliberate action
+	WeightWatchHigh = 0.8  // Watch progress >= 90%
+	WeightWatchMed  = 0.3  // Watch progress 50-89%
+	WeightWatchlist = 0.15 // Intent signal
+	WeightWatchLow  = -0.2 // Abandoned (< 15%)
+	WeightRatedLow  = -0.5 // 1-2 star ratings (scores 1 to 4)
+)
+
+// DislikedScoreMax is the highest rating score (1 to 10) that marks a title
+// the profile disliked, 2 stars: reads leave such titles out of every row,
+// and they never anchor a Because You Watched row.
+const DislikedScoreMax = 4
+
+// RecType constants for recommendation cache.
+const (
+	RecTypeForYouMain          = "for_you_main"
+	RecTypeForYouClusterPrefix = "for_you_cluster_"
+	RecTypePopular             = "popular"
+	RecTypeRecentlyAdded       = "recently_added"
+	RecTypeTopRated            = "top_rated"
+	RecTypeGenreSamplerPrefix  = "genre_sampler_"
+	RecTypeSimilarUsersLiked   = "similar_users_liked"
+	RecTypeBecauseWatched      = "because_you_watched"
+)
+
+// GlobalCacheUserID is the sentinel user_id for global (non-personalized) cache entries.
+const GlobalCacheUserID = 0
+
+// GlobalCacheProfileID is the sentinel profile_id for global cache entries.
+const GlobalCacheProfileID = "__global__"
+
+// Cold-start thresholds for graduated warm-up, in positive titles (see
+// coldStartLevelOf). Mixed matches the taste-seed picker's three-pick
+// minimum, so a seeded profile opens on its own row; ten titles is where its
+// taste first splits into two clusters.
+const (
+	ColdStartFullPersonalized = 10
+	ColdStartMixed            = 3
+	ColdStartMinimal          = 1
+)
+
+// RecencyBoostDays is the number of days a new item gets a relevance boost.
+const RecencyBoostDays = 14
+
+// RecencyBoostMultiplier is the max multiplier for newly added items. The
+// boost applies before selection, where a candidate pool's scores spread by
+// about a tenth, so a small multiplier already lifts a new title several
+// places.
+const RecencyBoostMultiplier = 1.05
+
+// CacheCandidateLimit is the default number of candidates cached per row so
+// read paths have headroom for watched, low-rated, access, and dedup filters.
+const CacheCandidateLimit = 60
+
+// ServedRowSize is how many items of a row a public read serves by default:
+// the window ranking shapes for what a viewer sees first. The rest of a cached
+// row is headroom for read-time filters and for library sections, which scope
+// the whole row to their libraries.
+const ServedRowSize = 20

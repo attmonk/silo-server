@@ -1,0 +1,873 @@
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { act, fireEvent, render, renderHook } from "@testing-library/react";
+import { createElement, useEffect, type MutableRefObject, type ReactNode } from "react";
+import { PlayerConfigProvider, type PlayerConfig } from "@/player";
+import { useAudiobookPlayback, type AudiobookPlayback } from "./useAudiobookPlayback";
+import type { AudiobookFile } from "@/lib/audiobooks/types";
+import type { PlaybackRealtimeCommandEnvelope } from "@/player/realtime-protocol";
+import { resetCodecDetectionForTests } from "@/player/hooks/useCodecDetection";
+import { resetSessionMutations } from "@/player/session-mutations";
+import { forgetBandwidthEstimate } from "@/player/bandwidth-readings";
+
+const realtimeOptions = vi.hoisted(() => ({
+  current: null as null | {
+    sessionId: string | null;
+    onCommand: (command: PlaybackRealtimeCommandEnvelope) => Promise<void> | void;
+  },
+}));
+
+const reportBookProgress = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/queries/progress", () => ({
+  useReportMediaProgress: () => ({ mutate: reportBookProgress }),
+}));
+// The v2 start and replan helpers own capability discovery, installation
+// binding and retry; those are covered by their own suites. Here they are
+// reduced to the request the hook is expected to make, so the assertions stay
+// about the audiobook timeline rather than the transport.
+vi.mock("@/player/start-v2", () => ({
+  startPlaybackV2: async (config: PlayerConfig, body: unknown) => {
+    const { playerFetch } = await import("@/player/player-fetch");
+    const decision = await playerFetch<{
+      session_id?: string;
+      playback_plan?: { session_id?: string };
+    }>({ ...config, apiBaseUrl: "/api/v2" }, "/playback/start", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const sessionId = decision?.playback_plan?.session_id ?? decision?.session_id;
+    if (decision?.playback_plan && sessionId) {
+      const { registerSessionMutations } = await import("@/player/session-mutations");
+      registerSessionMutations(sessionId, "installation");
+    }
+    return decision;
+  },
+}));
+vi.mock("@/player/lifecycle-v2", () => ({
+  replanV2: async (config: PlayerConfig, sessionId: string, body: unknown) => {
+    const { playerFetch } = await import("@/player/player-fetch");
+    return playerFetch({ ...config, apiBaseUrl: "/api/v2" }, `/playback/${sessionId}/replan`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+}));
+const releasedMedia = vi.hoisted(() => vi.fn());
+vi.mock("@/player/bandwidth-probe", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/player/bandwidth-probe")>();
+  return {
+    ...actual,
+    mediaElementReleased: (element: HTMLMediaElement) => {
+      releasedMedia(element);
+      actual.mediaElementReleased(element);
+    },
+  };
+});
+vi.mock("@/player/hooks/usePlaybackRealtime", () => ({
+  usePlaybackRealtime: vi.fn((options) => {
+    realtimeOptions.current = options;
+    return { connectionState: "connected" };
+  }),
+}));
+
+const files: AudiobookFile[] = [
+  {
+    id: 1,
+    path: "a.m4b",
+    duration_seconds: 600,
+    chapters: [
+      { index: 0, title: "One", source: "embedded", start_seconds: 0, end_seconds: 300 },
+      { index: 1, title: "Two", source: "embedded", start_seconds: 300, end_seconds: 600 },
+    ],
+  },
+];
+
+const multiFile: AudiobookFile[] = [
+  {
+    id: 1,
+    path: "a.mp3",
+    duration_seconds: 300,
+    chapters: [{ index: 0, title: "One", source: "embedded", start_seconds: 0, end_seconds: 300 }],
+  },
+  {
+    id: 2,
+    path: "b.mp3",
+    duration_seconds: 300,
+    chapters: [{ index: 0, title: "Two", source: "embedded", start_seconds: 0, end_seconds: 300 }],
+  },
+];
+
+function makeAudio() {
+  const audio = document.createElement("audio");
+  Object.defineProperty(audio, "duration", { value: 600, writable: true });
+  Object.defineProperty(audio, "paused", { value: true, writable: true });
+  audio.play = vi.fn().mockResolvedValue(undefined);
+  audio.pause = vi.fn();
+  audio.load = vi.fn();
+  return audio;
+}
+
+const playerConfig: PlayerConfig = {
+  apiBaseUrl: "/api/v1",
+  getAccessToken: () => "token",
+  getProfileId: () => "profile-1",
+  getDeviceId: () => "test-device",
+  getProfileToken: () => null,
+};
+
+function wrapper({ children }: { children: ReactNode }) {
+  return createElement(PlayerConfigProvider, { config: playerConfig, children });
+}
+
+function renderAudiobookPlayback(
+  options: Partial<Parameters<typeof useAudiobookPlayback>[0]> = {},
+) {
+  return renderHook(
+    () =>
+      useAudiobookPlayback({
+        contentId: "c",
+        files,
+        initialPositionSeconds: 0,
+        ...options,
+      }),
+    { wrapper },
+  );
+}
+
+/**
+ * A minimal audio-only v3 decision: the `original_http` route the planner takes
+ * when the browser can already decode the source, whose player clock starts at
+ * the requested position.
+ */
+function audioOnlyDecision(
+  sessionId: string,
+  startPosition: number,
+  timeline: Partial<{
+    stream_origin_seconds: number;
+    timeline_offset_seconds: number;
+    player_start_seconds: number;
+    can_seek_anywhere: boolean;
+  }> = {},
+) {
+  return {
+    protocol_version: 3,
+    server_features: ["playback_plan_v3"],
+    outcome: "playable",
+    session_id: sessionId,
+    playback_plan: {
+      protocol_version: 3,
+      plan_id: `plan:${sessionId}`,
+      plan_attempt_key: "v3:0000000000000001",
+      session_id: sessionId,
+      delivery: "original_http",
+      stream: {
+        url: `/stream/${sessionId}`,
+        protocol: "http_progressive",
+        headers: {},
+        header_refresh: "session",
+      },
+      timeline: {
+        source_start_seconds: startPosition,
+        stream_origin_seconds: 0,
+        player_start_seconds: startPosition,
+        timeline_offset_seconds: 0,
+        can_seek_anywhere: true,
+        seek_restoration: "player_position",
+        ...timeline,
+      },
+      selected_tracks: {},
+      effective_recipe: {},
+      claims: {},
+      subtitle: { mode: "off", inventory: [] },
+      transformations: [],
+      applied_quirks: [],
+      runtime_corrections: [],
+      available_qualities: [{ label: "original", preserves_source: true }],
+      degradation_warnings: [],
+      decision_reason: "validated_original_playback",
+      requested_media_file_id: 1,
+      effective_media_file_id: 1,
+      source: { media_file_id: 1, duration_seconds: 600 },
+      subtitle_fidelity_policy: "preserve",
+    },
+  };
+}
+
+function jsonResponse(body: unknown, init: ResponseInit = {}) {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+}
+
+/**
+ * The v2 stop receipt. The sequenced stop reads an outcome from the body, so a
+ * bare 204 would look like a malformed reply rather than a retired session.
+ */
+function stopReceipt() {
+  return jsonResponse({ outcome: "stopped" });
+}
+
+function realtimeCommand(
+  name: PlaybackRealtimeCommandEnvelope["name"],
+  payload?: Record<string, unknown>,
+): PlaybackRealtimeCommandEnvelope {
+  return {
+    type: "command",
+    command_id: `cmd-${name}`,
+    session_id: realtimeOptions.current?.sessionId ?? "session-1",
+    name,
+    payload,
+  };
+}
+
+async function flushAsyncWork() {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+/**
+ * Stubs the playback transport. `start` builds the decision for each start
+ * (numbered from 1); `route` may answer any other request first, and the rest
+ * fall through to the default route-event, progress and stop replies.
+ */
+function stubPlaybackFetch(
+  start: (body: { start_position: number }, count: number) => unknown,
+  route?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined,
+) {
+  let count = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        count += 1;
+        const body = JSON.parse(String(init?.body)) as { start_position: number };
+        return jsonResponse(start(body, count), { status: 201 });
+      }
+      const routed = await route?.(url, init);
+      if (routed) return routed;
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (url.includes("/progress")) return new Response(null, { status: 204 });
+      if (init?.method === "DELETE") return stopReceipt();
+      return jsonResponse({});
+    }),
+  );
+}
+
+/**
+ * The sequencing suite's replies: a stop settles through `onStop`, progress is
+ * applied, and everything else is accepted.
+ */
+function sequencedRoute(onStop: () => Promise<void> | void = () => {}) {
+  return async (url: string, init?: RequestInit) => {
+    if (init?.method === "DELETE") {
+      await onStop();
+      return stopReceipt();
+    }
+    if (url.includes("/progress")) return jsonResponse({ outcome: "applied" });
+    return new Response(null, { status: 202 });
+  };
+}
+
+function startCalls() {
+  return vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith("/playback/start"));
+}
+
+function attachAudio(
+  result: { current: { audioRef: AudiobookPlayback["audioRef"] } },
+  audio = makeAudio(),
+) {
+  act(() => {
+    (result.current.audioRef as MutableRefObject<HTMLAudioElement | null>).current = audio;
+  });
+  return audio;
+}
+
+/** Mounts the hook against a real audio element and records each playback state. */
+async function renderAudioHarness(initialPositionSeconds = 0) {
+  const onPlayback = vi.fn<(playback: AudiobookPlayback) => void>();
+  function Harness() {
+    const playback = useAudiobookPlayback({ contentId: "c", files, initialPositionSeconds });
+    useEffect(() => {
+      onPlayback(playback);
+    }, [playback]);
+    return createElement("audio", {
+      ref: playback.audioRef,
+      src: playback.streamUrl || undefined,
+    });
+  }
+  const { container } = render(createElement(Harness), { wrapper });
+  await flushAsyncWork();
+  const audio = container.querySelector("audio");
+  if (!audio) throw new Error("expected audio element");
+  return { audio, onPlayback };
+}
+
+describe("useAudiobookPlayback", () => {
+  beforeEach(() => {
+    reportBookProgress.mockClear();
+    vi.useFakeTimers();
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
+      ["audio/mp4", "audio/mpeg", "audio/flac", "audio/ogg"].some((supported) =>
+        mime.startsWith(supported),
+      )
+        ? "probably"
+        : "",
+    );
+    stubPlaybackFetch((body, count) =>
+      audioOnlyDecision(`session-${count}`, body.start_position ?? 0),
+    );
+    realtimeOptions.current = null;
+  });
+
+  afterEach(() => {
+    resetCodecDetectionForTests();
+    resetSessionMutations();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it.each(["missing", "terminal"])(
+    "closes a %s start without writing watch progress",
+    async (mode) => {
+      const onStopRequested = vi.fn();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          mode === "missing"
+            ? jsonResponse({ detail: "Source media file is missing." }, { status: 404 })
+            : jsonResponse({ outcome: "terminal", terminal: { reason: "no_playable_route" } }),
+        ),
+      );
+      const { result, unmount } = renderAudiobookPlayback({ onStopRequested });
+      const audio = attachAudio(result);
+      await flushAsyncWork();
+      expect(onStopRequested).toHaveBeenCalledOnce();
+      expect(result.current.streamUrl).toBe("");
+      expect(result.current.playing).toBe(false);
+      act(() => {
+        result.current.seekTo(20);
+        fireEvent.pause(audio);
+        vi.advanceTimersByTime(20_000);
+      });
+      unmount();
+      expect(reportBookProgress).not.toHaveBeenCalled();
+      expect(vi.mocked(fetch).mock.calls.every(([url]) => !String(url).includes("/progress"))).toBe(
+        true,
+      );
+    },
+  );
+
+  it("persists the final book position once before stopping a started session", async () => {
+    const { result, unmount } = renderAudiobookPlayback();
+    attachAudio(result);
+    await flushAsyncWork();
+    act(() => result.current.seekTo(42));
+    await flushAsyncWork();
+    reportBookProgress.mockClear();
+    vi.mocked(fetch).mockClear();
+    unmount();
+    await flushAsyncWork();
+    expect(reportBookProgress).toHaveBeenCalledExactlyOnceWith({
+      contentId: "c",
+      positionSeconds: 42,
+      durationSeconds: 600,
+    });
+    const progressCalls = vi
+      .mocked(fetch)
+      .mock.calls.filter(([url]) => String(url).includes("/progress"));
+    expect(progressCalls).toHaveLength(1);
+    expect(progressCalls[0]?.[1]?.keepalive).toBe(true);
+    expect(JSON.parse(String(progressCalls[0]?.[1]?.body))).toMatchObject({
+      position: 42,
+      is_paused: true,
+    });
+  });
+
+  // H7: a removed element's media events never reach the document, where the
+  // speed test watches for media.
+  it("releases its element's media hold when the player goes away", async () => {
+    function Harness() {
+      const playback = useAudiobookPlayback({ contentId: "c", files, initialPositionSeconds: 0 });
+      return createElement("audio", { ref: playback.audioRef });
+    }
+    const { container, unmount } = render(createElement(Harness), { wrapper });
+    await flushAsyncWork();
+    const audio = container.querySelector("audio");
+    unmount();
+    expect(releasedMedia).toHaveBeenCalledWith(audio);
+  });
+
+  it("starts a playback session and builds a tokenized stream URL", async () => {
+    const { result } = renderAudiobookPlayback();
+
+    await flushAsyncWork();
+
+    expect(result.current.streamUrl).toBe("/api/v2/stream/session-1?token=token");
+
+    const startCall = startCalls()[0];
+    expect(startCall).toBeTruthy();
+    expect(JSON.parse(String(startCall?.[1]?.body))).toMatchObject({
+      protocol_version: 3,
+      file_id: 1,
+      profile_id: "profile-1",
+      // Zero is sent explicitly: the book-absolute position is already resolved
+      // to this part's local clock, so an omitted value would hand resume policy
+      // back to the server for a timeline it does not own.
+      start_position: 0,
+      progress_persistence: "client",
+      quality_preference: "original",
+    });
+  });
+
+  it("waits for the capability probe before starting playback", async () => {
+    let resolveProbe!: (value: MediaCapabilitiesDecodingInfo) => void;
+    const probeResult = new Promise<MediaCapabilitiesDecodingInfo>((resolve) => {
+      resolveProbe = resolve;
+    });
+    vi.stubGlobal("navigator", {
+      userAgent: "test-browser",
+      mediaCapabilities: { decodingInfo: vi.fn(() => probeResult) },
+    });
+
+    const { result } = renderAudiobookPlayback();
+    await act(async () => Promise.resolve());
+    expect(startCalls()).toHaveLength(0);
+
+    await act(async () => {
+      resolveProbe({
+        supported: false,
+        smooth: false,
+        powerEfficient: false,
+        keySystemAccess: null,
+      });
+      await probeResult;
+    });
+    await flushAsyncWork();
+    expect(result.current.streamUrl).toBe("/api/v2/stream/session-1?token=token");
+    expect(startCalls()).toHaveLength(1);
+  });
+
+  it("advertises the delivery classes the audio-only planner routes to", async () => {
+    renderAudiobookPlayback();
+
+    await flushAsyncWork();
+
+    const body = JSON.parse(String(startCalls()[0]?.[1]?.body)) as {
+      client_capabilities: { codecs_audio: string[]; containers: string[] };
+      client_playback_context: { deliveries: Record<string, unknown> };
+    };
+    expect(body.client_capabilities.codecs_audio).toEqual(
+      expect.arrayContaining(["mp3", "flac", "opus", "vorbis"]),
+    );
+    expect(body.client_capabilities.containers).toEqual(
+      expect.arrayContaining(["mp4", "mp3", "flac", "ogg"]),
+    );
+    expect(Object.keys(body.client_playback_context.deliveries).sort()).toEqual([
+      "hls",
+      "original_http",
+      "progressive",
+    ]);
+  });
+
+  it("replans a failed media-element route without starting a new attempt", async () => {
+    // A speed reading this device keeps: the start sends it, a replan never does.
+    onTestFinished(forgetBandwidthEstimate);
+    localStorage.setItem(
+      "silo-bandwidth-estimate",
+      JSON.stringify({
+        readings: [
+          { kbps: 48_000, measuredAt: Date.now(), maxAgeMs: 86_400_000, network: "unknown" },
+        ],
+        writtenAt: Date.now(),
+      }),
+    );
+    const observed: {
+      startBody?: Record<string, unknown>;
+      replanBody?: Record<string, unknown>;
+    } = {};
+    const replacement = audioOnlyDecision("session-1", 0);
+    replacement.playback_plan.plan_id = "plan:replacement";
+    replacement.playback_plan.plan_attempt_key = "v3:0000000000000002";
+    replacement.playback_plan.stream.url = "/stream/replacement";
+
+    stubPlaybackFetch(
+      (body) => {
+        observed.startBody = body as Record<string, unknown>;
+        return audioOnlyDecision("session-1", 0);
+      },
+      (url, init) => {
+        if (!url.endsWith("/playback/session-1/replan")) return undefined;
+        observed.replanBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse(replacement);
+      },
+    );
+
+    const { audio, onPlayback } = await renderAudioHarness();
+    expect(onPlayback.mock.lastCall?.[0].streamUrl).toContain("/stream/session-1");
+
+    Object.defineProperty(audio, "error", {
+      configurable: true,
+      value: { code: 3, message: "decoder rejected original container" },
+    });
+    fireEvent.error(audio);
+
+    await flushAsyncWork();
+    expect(onPlayback.mock.lastCall?.[0].streamUrl).toContain("/stream/replacement");
+    expect(observed.replanBody).toMatchObject({
+      operation: "failure_recovery",
+      playback_attempt_id: observed.startBody?.playback_attempt_id,
+      failed_plan_id: "plan:session-1",
+      plan_attempt_key: "v3:0000000000000001",
+      attempted_plan_keys: ["v3:0000000000000001"],
+      attempt_count: 1,
+      quality_preference: "original",
+      failure: {
+        classification: "decoder_error",
+        message: "decoder rejected original container",
+      },
+    });
+    expect(typeof observed.replanBody?.plan_attempt_id).toBe("string");
+    expect(startCalls()).toHaveLength(1);
+    expect(observed.startBody).toMatchObject({
+      bandwidth_estimate_kbps: 48_000,
+      bandwidth_estimate_source: "probe",
+    });
+    expect(observed.replanBody).not.toHaveProperty("bandwidth_estimate_kbps");
+  });
+
+  it("allows another recovery attempt after a transient recovery request failure", async () => {
+    let replanCount = 0;
+    stubPlaybackFetch(
+      () => audioOnlyDecision("session-1", 0),
+      (url) => {
+        if (!url.endsWith("/playback/session-1/replan")) return undefined;
+        replanCount += 1;
+        return jsonResponse({ message: "temporary failure" }, { status: 503 });
+      },
+    );
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { audio } = await renderAudioHarness();
+    Object.defineProperty(audio, "error", {
+      configurable: true,
+      value: { code: 3, message: "decoder rejected original container" },
+    });
+
+    fireEvent.error(audio);
+    await flushAsyncWork();
+    expect(replanCount).toBe(1);
+
+    fireEvent.error(audio);
+    await flushAsyncWork();
+    expect(replanCount).toBe(2);
+  });
+
+  it("starts from the part containing the initial absolute position", async () => {
+    const { result } = renderAudiobookPlayback({
+      files: multiFile,
+      initialPositionSeconds: 450,
+    });
+
+    await flushAsyncWork();
+
+    expect(result.current.streamUrl).toBe("/api/v2/stream/session-1?token=token");
+    expect(result.current.currentTime).toBe(450);
+    expect(result.current.duration).toBe(600);
+
+    expect(JSON.parse(String(startCalls()[0]?.[1]?.body))).toMatchObject({
+      file_id: 2,
+      start_position: 150,
+    });
+  });
+
+  it("maps anchored player time and restarts a non-global seek at its file-local target", async () => {
+    stubPlaybackFetch((body, count) =>
+      audioOnlyDecision(`anchored-${count}`, body.start_position, {
+        stream_origin_seconds: body.start_position,
+        timeline_offset_seconds: body.start_position,
+        player_start_seconds: 0,
+        can_seek_anywhere: false,
+      }),
+    );
+
+    const { audio, onPlayback } = await renderAudioHarness(300);
+    act(() => {
+      audio.currentTime = 5;
+      fireEvent.timeUpdate(audio);
+    });
+    expect(onPlayback.mock.lastCall?.[0].currentTime).toBe(305);
+
+    act(() => onPlayback.mock.lastCall?.[0].seekTo(360));
+    await flushAsyncWork();
+    const starts = startCalls();
+    expect(starts).toHaveLength(2);
+    expect(JSON.parse(String(starts[1]?.[1]?.body))).toMatchObject({
+      start_position: 360,
+      progress_persistence: "client",
+    });
+  });
+
+  it("maps native seeks with the contract timeline offset", async () => {
+    stubPlaybackFetch((body) =>
+      audioOnlyDecision("offset-contract", body.start_position, {
+        stream_origin_seconds: 300,
+        timeline_offset_seconds: 290,
+        player_start_seconds: 10,
+        can_seek_anywhere: true,
+      }),
+    );
+
+    const { result } = renderAudiobookPlayback({ initialPositionSeconds: 300 });
+    const audio = attachAudio(result);
+    await flushAsyncWork();
+
+    act(() => result.current.seekTo(360));
+    expect(audio.currentTime).toBe(70);
+  });
+
+  it("preserves negative timeline offsets and clamps absolute buffered ranges", async () => {
+    stubPlaybackFetch((body) =>
+      audioOnlyDecision("negative-offset", body.start_position, {
+        timeline_offset_seconds: -5,
+        player_start_seconds: 5,
+        can_seek_anywhere: true,
+      }),
+    );
+
+    const { audio, onPlayback } = await renderAudioHarness();
+    Object.defineProperty(audio, "buffered", {
+      configurable: true,
+      value: {
+        length: 1,
+        start: () => 0,
+        end: () => 8,
+      } as TimeRanges,
+    });
+
+    act(() => {
+      audio.currentTime = 7;
+      fireEvent.timeUpdate(audio);
+      fireEvent.progress(audio);
+    });
+    await flushAsyncWork();
+
+    expect(onPlayback.mock.lastCall?.[0].currentTime).toBe(2);
+    expect(onPlayback.mock.lastCall?.[0].buffered?.start(0)).toBe(0);
+    expect(onPlayback.mock.lastCall?.[0].buffered?.end(0)).toBe(3);
+  });
+
+  it("executes realtime playback commands against the audio element", async () => {
+    const onStopRequested = vi.fn();
+    const { result } = renderAudiobookPlayback({ onStopRequested });
+    const audio = attachAudio(result);
+
+    await flushAsyncWork();
+
+    expect(realtimeOptions.current?.sessionId).toBe("session-1");
+
+    await act(async () => {
+      await realtimeOptions.current?.onCommand(realtimeCommand("unpause"));
+    });
+    expect(audio.play).toHaveBeenCalled();
+
+    Object.defineProperty(audio, "paused", { value: false, writable: true });
+    await act(async () => {
+      await realtimeOptions.current?.onCommand(realtimeCommand("pause"));
+    });
+    expect(audio.pause).toHaveBeenCalled();
+
+    await act(async () => {
+      await realtimeOptions.current?.onCommand(realtimeCommand("seek", { position_seconds: 120 }));
+    });
+    expect(result.current.currentTime).toBe(120);
+
+    await act(async () => {
+      await realtimeOptions.current?.onCommand(realtimeCommand("stop"));
+    });
+    act(() => {
+      vi.runOnlyPendingTimers();
+    });
+    expect(onStopRequested).toHaveBeenCalled();
+  });
+
+  it("rejects a realtime resume the audio element refuses to play", async () => {
+    const { result } = renderAudiobookPlayback();
+    const audio = makeAudio();
+    audio.play = vi.fn().mockRejectedValue(new Error("NotAllowedError"));
+    attachAudio(result, audio);
+
+    await flushAsyncWork();
+
+    await act(async () => {
+      await expect(realtimeOptions.current?.onCommand(realtimeCommand("unpause"))).rejects.toThrow(
+        "NotAllowedError",
+      );
+    });
+  });
+
+  it("reports the player paused when a deferred play is refused", async () => {
+    const { result } = renderAudiobookPlayback({ autoPlay: true });
+    const audio = makeAudio();
+    audio.play = vi.fn().mockRejectedValue(new Error("NotAllowedError"));
+    attachAudio(result, audio);
+    await flushAsyncWork();
+    vi.mocked(fetch).mockClear();
+
+    act(() => audio.dispatchEvent(new Event("loadedmetadata")));
+    await flushAsyncWork();
+
+    expect(audio.play).toHaveBeenCalled();
+    const progressCalls = vi
+      .mocked(fetch)
+      .mock.calls.filter(([url]) => String(url).includes("/progress"));
+    expect(progressCalls).toHaveLength(1);
+    expect(JSON.parse(String(progressCalls[0]?.[1]?.body))).toMatchObject({ is_paused: true });
+  });
+
+  it("seekTo clamps to [0, duration]", () => {
+    const { result } = renderAudiobookPlayback();
+    const audio = attachAudio(result);
+    act(() => result.current.seekTo(1_000_000));
+    expect(audio.currentTime).toBe(599); // 600 - 1 (clamp to duration - 1 per existing behavior)
+    act(() => result.current.seekTo(-50));
+    expect(audio.currentTime).toBe(0);
+  });
+
+  it("setSleep arms a duration timer that fires after the configured seconds", () => {
+    const { result } = renderAudiobookPlayback();
+    const audio = makeAudio();
+    Object.defineProperty(audio, "paused", { value: false, writable: true });
+    attachAudio(result, audio);
+    act(() => result.current.setSleep({ kind: "duration", seconds: 1 }));
+    expect(result.current.sleep.remainingMs).toBeGreaterThan(0);
+    act(() => {
+      vi.advanceTimersByTime(1500);
+    });
+    expect(audio.pause).toHaveBeenCalled();
+  });
+
+  it("setSleep with off clears any armed timer", () => {
+    const { result } = renderAudiobookPlayback();
+    act(() => result.current.setSleep({ kind: "duration", seconds: 5 }));
+    expect(result.current.sleep.remainingMs).toBeGreaterThan(0);
+    act(() => result.current.setSleep({ kind: "off" }));
+    expect(result.current.sleep.remainingMs).toBeNull();
+  });
+});
+
+describe("useAudiobookPlayback sequencing", () => {
+  beforeEach(() => {
+    reportBookProgress.mockClear();
+    vi.useFakeTimers();
+    resetSessionMutations();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    resetSessionMutations();
+  });
+
+  it("waits for the previous part's stop before starting the next part", async () => {
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const events: string[] = [];
+    stubPlaybackFetch(
+      (body, count) => {
+        events.push(`start-${count}`);
+        return audioOnlyDecision(`part-${count}`, body.start_position);
+      },
+      sequencedRoute(async () => {
+        events.push("stop-requested");
+        await stopGate;
+        events.push("stop-done");
+      }),
+    );
+    const { result } = renderAudiobookPlayback({ files: multiFile, initialPositionSeconds: 0 });
+    attachAudio(result);
+    await flushAsyncWork();
+    expect(events).toEqual(["start-1"]);
+
+    // Crossing into the second part stops part 1 and starts part 2.
+    act(() => result.current.seekTo(310));
+    await flushAsyncWork();
+    await flushAsyncWork();
+    expect(events).toEqual(["start-1", "stop-requested"]);
+
+    releaseStop();
+    await flushAsyncWork();
+    await flushAsyncWork();
+    expect(events).toEqual(["start-1", "stop-requested", "stop-done", "start-2"]);
+  });
+
+  it("stops the session when the final part ends", async () => {
+    const events: string[] = [];
+    stubPlaybackFetch(
+      (body) => {
+        events.push("start");
+        return audioOnlyDecision("last-part", body.start_position);
+      },
+      sequencedRoute(() => {
+        events.push("stop");
+      }),
+    );
+    const { result } = renderAudiobookPlayback();
+    const audio = attachAudio(result);
+    await flushAsyncWork();
+    expect(events).toEqual(["start"]);
+
+    act(() => audio.dispatchEvent(new Event("ended")));
+    await flushAsyncWork();
+    await flushAsyncWork();
+    expect(events).toEqual(["start", "stop"]);
+    expect(result.current.playing).toBe(false);
+    expect(result.current.currentTime).toBe(600);
+    // The element stays mounted and nothing restarts on its own, but the
+    // control socket lets go of the stopped session.
+    expect(result.current.hasFile).toBe(true);
+    expect(realtimeOptions.current?.sessionId).toBeNull();
+
+    // Play after the end starts a new attempt from the beginning instead of
+    // playing the revoked stream.
+    act(() => result.current.togglePlay());
+    await flushAsyncWork();
+    await flushAsyncWork();
+    expect(events).toEqual(["start", "stop", "start"]);
+    expect(audio.play).not.toHaveBeenCalled();
+    const lastStart = startCalls().at(-1)!;
+    expect(JSON.parse(String((lastStart[1] as RequestInit).body))).toMatchObject({
+      start_position: 0,
+    });
+  });
+
+  it("seeks the loaded element when the start position changes within the same part", async () => {
+    stubPlaybackFetch(
+      (body) => audioOnlyDecision("same-part", body.start_position),
+      sequencedRoute(),
+    );
+    const { result, rerender } = renderHook(
+      ({ initialPositionSeconds }: { initialPositionSeconds: number }) =>
+        useAudiobookPlayback({ contentId: "c", files, initialPositionSeconds }),
+      { wrapper, initialProps: { initialPositionSeconds: 0 } },
+    );
+    const audio = attachAudio(result);
+    await flushAsyncWork();
+    Object.defineProperty(audio, "readyState", { value: 4, writable: true });
+    act(() => audio.dispatchEvent(new Event("loadedmetadata")));
+    await flushAsyncWork();
+
+    // The book page picks chapter two while this part is already loaded.
+    rerender({ initialPositionSeconds: 300 });
+    await flushAsyncWork();
+    expect(audio.currentTime).toBe(300);
+    expect(result.current.currentTime).toBe(300);
+    expect(startCalls()).toHaveLength(1);
+  });
+});

@@ -1,0 +1,93 @@
+import { useEffect, useMemo, useRef } from "react";
+
+import { AdvancedSection } from "@/components/settings/AdvancedSection";
+import { useSettingsForm } from "@/hooks/useSettingsForm";
+import { useT } from "@/i18n";
+import { SettingField } from "@/pages/admin-settings/SettingField";
+
+import { StepFrame, StepSection, StepSkeleton } from "../StepFrame";
+import { useStepSubmit, useStepSummary } from "../useStep";
+
+const KEYS = ["branding.server_name", "server.public_url", "clientip.trusted_proxies"];
+
+/** The address the browser opened the wizard on, offered as the public URL default. */
+function currentOrigin(): string {
+  if (typeof window === "undefined") return "";
+  return window.location.origin;
+}
+
+export function ServerStep() {
+  const t = useT();
+  const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
+  const { handleSubmit, busy, skip } = useStepSubmit(
+    "server",
+    form,
+    t("web.setup.server.saveFailed"),
+  );
+  const prefilled = useRef(false);
+
+  const serverName = form.getValue("branding.server_name");
+
+  // Offer the URL the admin is looking at as the public URL. It is staged,
+  // not saved, so an install behind a reverse proxy can still clear it.
+  const { loaded, getPersistedValue, setValue } = form;
+  useEffect(() => {
+    if (prefilled.current || !loaded) return;
+    prefilled.current = true;
+    if (getPersistedValue("server.public_url") === "" && currentOrigin() !== "") {
+      setValue("server.public_url", currentOrigin());
+    }
+  }, [loaded, getPersistedValue, setValue]);
+
+  useStepSummary("server", serverName.trim() || undefined);
+
+  if (form.isPending) return <StepSkeleton rows={3} />;
+
+  return (
+    <StepFrame
+      title={t("web.setup.server.title")}
+      lede={t("web.setup.server.lede")}
+      onSubmit={handleSubmit}
+      busy={busy}
+      onSkip={skip}
+      footnote={t("web.setup.server.footnote")}
+    >
+      <StepSection>
+        <SettingField
+          label={t("web.setup.server.nameLabel")}
+          description={t("web.setup.server.nameDescription")}
+          // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an example value, not text
+          hint="Silo"
+          value={serverName}
+          onChange={(v) => form.setValue("branding.server_name", v)}
+          managedByEnv={form.envVar("branding.server_name")}
+        />
+        <SettingField
+          label={t("web.setup.server.publicUrlLabel")}
+          description={t("web.setup.server.publicUrlDescription")}
+          // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an example value, not text
+          hint="https://silo.example.com"
+          value={form.getValue("server.public_url")}
+          onChange={(v) => form.setValue("server.public_url", v)}
+          managedByEnv={form.envVar("server.public_url")}
+        />
+        <AdvancedSection
+          id="setup.server"
+          title={t("web.setup.server.proxyTitle")}
+          count={1}
+          forceOpen={form.isDirty("clientip.trusted_proxies")}
+        >
+          <SettingField
+            label={t("web.setup.server.trustedProxiesLabel")}
+            description={t("web.setup.server.trustedProxiesDescription")}
+            // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an example value, not text
+            hint="172.16.0.0/12, 203.0.113.7/32"
+            value={form.getValue("clientip.trusted_proxies")}
+            onChange={(v) => form.setValue("clientip.trusted_proxies", v)}
+            managedByEnv={form.envVar("clientip.trusted_proxies")}
+          />
+        </AdvancedSection>
+      </StepSection>
+    </StepFrame>
+  );
+}

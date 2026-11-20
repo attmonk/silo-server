@@ -1,0 +1,535 @@
+import {
+  lazy,
+  startTransition,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { Link, useLocation } from "react-router";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { Menu, Search } from "lucide-react";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { useAuth } from "@/hooks/useAuth";
+import { useCurrentProfile } from "@/hooks/useCurrentProfile";
+import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
+import AppSidebar from "@/components/AppSidebar";
+import { LocalErrorBoundary } from "@/components/LocalErrorBoundary";
+import { SiloBrand } from "@/components/SiloBrand";
+import { GlobalSearch } from "@/components/GlobalSearch";
+import ViewTransitionLink from "@/components/ViewTransitionLink";
+import { buildQueryCatalogHref, parseCatalogSearchParams } from "@/pages/catalogSearchParams";
+import { prefetchCatalog } from "@/pages/catalogRoute";
+import type { ReactNode, TransitionEvent as ReactTransitionEvent } from "react";
+import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
+import { useAudiobookPlaybackController } from "@/pages/audiobooks/player/audiobookPlaybackContext";
+import { useImmediateSidebarCollapse } from "@/hooks/useImmediateSidebarCollapse";
+import { prefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
+import SidebarItemNavigationProvider from "@/components/SidebarItemNavigationProvider";
+import {
+  hasRunningSidebarTransition,
+  isCollapsedSidebarSurface,
+  parseItemNavigationHref,
+  SIDEBAR_DETAILS_REVEAL_DEADLINE_MS,
+  type SidebarItemNavigationRequest,
+} from "@/components/sidebarItemNavigation";
+import { useSidebarItemDetailsGate } from "@/hooks/useSidebarItemDetailsGate";
+import { useViewTransitionNavigate } from "@/hooks/useViewTransition";
+import { catalogKeys } from "@/hooks/queries/keys";
+import { fetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
+import { markCriticalContentLoaded, useCriticalContentLoaded } from "@/lib/startupPriority";
+import { useSettingsReturnPath } from "@/hooks/useSettingsReturnPath";
+import { useT } from "@/i18n";
+import { useSidebarSwap } from "@/hooks/useSidebarSwap";
+
+// Only admins see the activity indicator, so everyone else skips downloading it.
+const ServerActivity = lazy(() => import("@/components/ServerActivity"));
+// Settings swap the app sidebar for their own; it loads with the settings pages.
+const UserSettingsSidebar = lazy(() => import("@/components/settings/UserSettingsSidebar"));
+
+/**
+ * The lazily loaded activity indicator. Layout wraps every page, so a chunk
+ * that fails to load leaves the indicator out instead of breaking the page.
+ */
+function AdminActivityIndicator() {
+  return (
+    <LocalErrorBoundary>
+      <Suspense fallback={null}>
+        <ServerActivity hideWhenEmpty />
+      </Suspense>
+    </LocalErrorBoundary>
+  );
+}
+
+interface LayoutProps {
+  children: ReactNode;
+}
+
+export default function Layout({ children }: LayoutProps) {
+  const t = useT();
+  const shellRef = useRef<HTMLDivElement>(null);
+  const mobileHeaderRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const shell = shellRef.current;
+    const header = mobileHeaderRef.current;
+    if (!shell || !header) return;
+    const measureHeader = () => {
+      const height = header.getBoundingClientRect().height;
+      const margin = height ? parseFloat(getComputedStyle(header).marginTop) || 0 : 0;
+      shell.style.setProperty("--detail-header-height", `${height + margin}px`);
+    };
+    const observer = new ResizeObserver(measureHeader);
+    observer.observe(header);
+    window.addEventListener("resize", measureHeader);
+    measureHeader();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", measureHeader);
+    };
+  }, []);
+  const location = useLocation();
+  const navigate = useViewTransitionNavigate();
+  const queryClient = useQueryClient();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  // Tracks whether the mobile header should slide off-screen on scroll.
+  // We auto-hide on Calendar to maximize vertical room for the sticky week strip
+  // and the day timeline below it. Pulling up restores the header.
+  const [mobileHeaderHidden, setMobileHeaderHidden] = useState(false);
+  const { user } = useAuth();
+  const { profile } = useCurrentProfile();
+  const criticalContentLoaded = useCriticalContentLoaded();
+  // The indicator's four requests wait for Home's first rows (see startupPriority).
+  const showAdminActivity = useIsActingAdmin() && criticalContentLoaded;
+  const { isBackgroundBarVisible } = useWatchPlaybackController();
+  const audiobookPlayback = useAudiobookPlaybackController();
+  const hasBackgroundBar = isBackgroundBarVisible || audiobookPlayback?.isBackgroundBarVisible;
+
+  const isHomePath = location.pathname === "/";
+  // Only Home marks its own first content; every other page releases the
+  // deferred widgets as soon as it mounts.
+  useEffect(() => {
+    if (!isHomePath) markCriticalContentLoaded();
+  }, [isHomePath]);
+  const isLibraryRoute = location.pathname.startsWith("/library/");
+  const isItemRoute = location.pathname.startsWith("/item/");
+  const isPersonRoute = location.pathname.startsWith("/person/");
+  const isBoxSetRoute = location.pathname.startsWith("/box-sets/");
+  const isSettingsRoute = /^\/settings(\/|$)/.test(location.pathname);
+  const settingsReturnPath = useSettingsReturnPath(isSettingsRoute, "/");
+  const sidebarSwap = useSidebarSwap(isSettingsRoute);
+  const itemRouteLocation = `${location.pathname}${location.search}`;
+  // Breakpoint changes naturally cause other layout renders; navigation only
+  // needs the viewport value at the moment it is attempted.
+  const hasDesktopSidebar = window.matchMedia("(min-width: 64rem)").matches;
+  const isSearchLandingRoute =
+    location.pathname === "/catalog" &&
+    (() => {
+      const state = parseCatalogSearchParams(new URLSearchParams(location.search));
+      return state.source === "query" && !state.q;
+    })();
+  const isRecommendationsRoute = location.pathname === "/recommendations";
+  const isCalendarRoute = location.pathname === "/calendar";
+  // The Requests hub, its Discover row pages, and its studio/network/genre
+  // browse pages lay out their own gutter so text rows line up with
+  // MediaCarousel's edge padding.
+  const isRequestsRoute =
+    /^\/requests\/?$/.test(location.pathname) ||
+    location.pathname.startsWith("/requests/browse/") ||
+    location.pathname.startsWith("/requests/discover/");
+  // A title outside the library gets the item page's treatment. The old
+  // /requests/movie/… and /requests/series/… links redirect there, so they
+  // keep it too rather than expanding the sidebar for one frame.
+  const isTitleRoute =
+    location.pathname.startsWith("/title/") ||
+    /^\/requests\/(movie|series)\//.test(location.pathname);
+  // A watch-party room owns its own full-height layout; the hub does not.
+  const isWatchPartyRoomRoute = /^\/rooms\/(?!join$)[^/]+$/.test(location.pathname);
+  const needsNoPadding =
+    isHomePath ||
+    isWatchPartyRoomRoute ||
+    isLibraryRoute ||
+    isItemRoute ||
+    isBoxSetRoute ||
+    isRequestsRoute ||
+    isTitleRoute ||
+    isSearchLandingRoute ||
+    isRecommendationsRoute ||
+    isCalendarRoute;
+
+  // Cold item routes commit a lightweight shell while the sidebar collapses.
+  // A detail already cached before navigation skips that gate and renders on
+  // the destination's first frame.
+  const isDetailImmersion = isItemRoute || isPersonRoute || isTitleRoute || isBoxSetRoute;
+  const targetDetailImmersion = isDetailImmersion;
+  const visualDetailImmersion = useImmediateSidebarCollapse(targetDetailImmersion);
+  const {
+    itemDetailsReady,
+    pendingLocationKey,
+    enteredItemFromHome,
+    animateHomeItemEntry,
+    returnedHomeFromItem,
+    prepareItemNavigation,
+    reveal: revealItemDetails,
+  } = useSidebarItemDetailsGate(location.key, location.pathname, isItemRoute && hasDesktopSidebar, {
+    itemRouteLocation,
+    itemDetailsAvailableOnEntry: isItemRoute && hasCachedItemDetail(queryClient, itemRouteLocation),
+  });
+
+  const revealPreparedItemDetails = useCallback(
+    (expectedLocationKey: string) => {
+      if (!enteredItemFromHome) {
+        revealItemDetails(expectedLocationKey);
+        return;
+      }
+
+      // A cached detail tree is substantially heavier than the handoff shell.
+      // Keep the shell committed while React prepares that tree concurrently,
+      // then swap it in atomically instead of blocking the last sidebar frame.
+      startTransition(() => revealItemDetails(expectedLocationKey));
+    },
+    [enteredItemFromHome, revealItemDetails],
+  );
+
+  const beginItemNavigation = useCallback(
+    (request: SidebarItemNavigationRequest) => {
+      const itemTarget = parseItemNavigationHref(request.href, window.location.origin);
+      if (isItemRoute || !itemTarget || !hasDesktopSidebar) {
+        return false;
+      }
+
+      const queryKey = catalogKeys.itemDetail(itemTarget.contentId, itemTarget.libraryId);
+      const destination = new URL(request.href, window.location.origin);
+      prepareItemNavigation(
+        `${destination.pathname}${destination.search}`,
+        // This must be read before prefetchQuery. A fast response is still a
+        // cold navigation and should keep the lightweight handoff shell.
+        queryClient.getQueryData(queryKey) !== undefined,
+      );
+      void queryClient.prefetchQuery({
+        queryKey,
+        queryFn: ({ signal }) =>
+          fetchCatalogItemDetail(itemTarget.contentId, itemTarget.libraryId, { signal }),
+      });
+      navigate(request.href, {
+        replace: request.replace,
+        state: request.state,
+      });
+      return true;
+    },
+    [hasDesktopSidebar, isItemRoute, navigate, prepareItemNavigation, queryClient],
+  );
+
+  // Transitionend is the fast path. Polling handles reconstructed layers, and
+  // the hard deadline guarantees hover expansion or a hidden-tab suspended rAF
+  // can never leave the item route on its lightweight shell indefinitely.
+  useEffect(() => {
+    if (!isItemRoute || !pendingLocationKey) return;
+
+    // A cold prefetch may finish after the route commits. Non-Home entries can
+    // reveal at that point; cold Home entries keep the stable handoff shell
+    // until the sidebar settles.
+    if (!enteredItemFromHome && hasCachedItemDetail(queryClient, itemRouteLocation)) {
+      revealPreparedItemDetails(pendingLocationKey);
+      return;
+    }
+
+    const startedAt = Date.now();
+    let timer: number;
+    let cancelled = false;
+
+    const revealWhenSettled = () => {
+      if (cancelled) return;
+      const surface = document.querySelector<HTMLElement>(".sidebar-surface");
+      const deadlineReached =
+        prefersReducedMotion() || Date.now() - startedAt >= SIDEBAR_DETAILS_REVEAL_DEADLINE_MS;
+      if (
+        !deadlineReached &&
+        surface &&
+        (!isCollapsedSidebarSurface(surface) || hasRunningSidebarTransition(surface))
+      ) {
+        const remaining = SIDEBAR_DETAILS_REVEAL_DEADLINE_MS - (Date.now() - startedAt);
+        timer = window.setTimeout(revealWhenSettled, Math.min(50, Math.max(0, remaining)));
+        return;
+      }
+      revealPreparedItemDetails(pendingLocationKey);
+    };
+
+    revealWhenSettled();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    enteredItemFromHome,
+    isItemRoute,
+    itemRouteLocation,
+    pendingLocationKey,
+    queryClient,
+    revealPreparedItemDetails,
+  ]);
+
+  const handleSidebarTransitionEnd = useCallback(
+    (event: ReactTransitionEvent<HTMLDivElement>) => {
+      if (event.propertyName === "transform" && isCollapsedSidebarSurface(event.target)) {
+        if (pendingLocationKey) revealPreparedItemDetails(pendingLocationKey);
+      }
+    },
+    [pendingLocationKey, revealPreparedItemDetails],
+  );
+
+  // Publish both sidebar states on the document root so out-of-tree chrome
+  // (notably ImpersonationBanner, which renders above all routes) can align
+  // with the sidebar. The target drives the snapped `--app-sidebar-offset`;
+  // the visual state is the same paint handoff `.sidebar-main-stage` uses
+  // in-tree, letting that chrome animate its edge instead of jumping.
+  //
+  // Layout effect, not effect: the sidebar receives `data-collapsed` during
+  // render, so publishing these after paint would start the banner's transition
+  // a frame late and it would trail the sidebar by ~23px at peak velocity.
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    // Marks that this shell is mounted, and with it the only element named
+    // `main-content`. app.css holds the root view-transition group still while
+    // it is set, so the frozen sidebar snapshot cannot cross-fade over the live
+    // collapse — and the routes rendered outside this shell keep the default
+    // root transition, which is the only thing they have to animate. It also
+    // gates `--app-sidebar-offset`: the sidebar only exists while this shell is
+    // mounted, so out-of-tree chrome must not reserve room for it elsewhere.
+    root.dataset.appShell = "true";
+    if (isHomePath) {
+      root.dataset.homeRoute = "true";
+    } else {
+      delete root.dataset.homeRoute;
+    }
+    if (animateHomeItemEntry) {
+      root.dataset.homeItemEntry = "true";
+    } else {
+      delete root.dataset.homeItemEntry;
+    }
+    if (returnedHomeFromItem) {
+      root.dataset.homeItemReturn = "true";
+    } else {
+      delete root.dataset.homeItemReturn;
+    }
+    if (targetDetailImmersion) {
+      root.dataset.sidebarCollapsed = "true";
+    } else {
+      delete root.dataset.sidebarCollapsed;
+    }
+    if (visualDetailImmersion) {
+      root.dataset.sidebarVisualCollapsed = "true";
+    } else {
+      delete root.dataset.sidebarVisualCollapsed;
+    }
+    return () => {
+      delete root.dataset.appShell;
+      delete root.dataset.homeRoute;
+      delete root.dataset.homeItemEntry;
+      delete root.dataset.homeItemReturn;
+      delete root.dataset.sidebarCollapsed;
+      delete root.dataset.sidebarVisualCollapsed;
+    };
+  }, [
+    animateHomeItemEntry,
+    isHomePath,
+    returnedHomeFromItem,
+    targetDetailImmersion,
+    visualDetailImmersion,
+  ]);
+
+  // Auto-hide the mobile header on scroll-down for the Calendar route only.
+  // Direction-based (not threshold-based) so a small scroll-up reveals the
+  // header even mid-page — matches the iOS Safari pattern.
+  useEffect(() => {
+    if (!isCalendarRoute) {
+      setMobileHeaderHidden(false);
+      return;
+    }
+    let lastY = window.scrollY;
+    let ticking = false;
+    const onScroll = () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        const y = window.scrollY;
+        const delta = y - lastY;
+        if (Math.abs(delta) > 4) {
+          if (delta > 0 && y > 80) setMobileHeaderHidden(true);
+          else if (delta < 0) setMobileHeaderHidden(false);
+          lastY = y;
+        }
+        ticking = false;
+      });
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, [isCalendarRoute]);
+
+  // Publish the header visibility on <html> so child sticky elements (e.g. the
+  // calendar's WeekNavigator wrapper) can pin closer to the viewport top when
+  // the mobile header is off-screen — keeping the visual gap from collapsing.
+  useEffect(() => {
+    const root = document.documentElement;
+    if (mobileHeaderHidden) {
+      root.dataset.mobileHeaderHidden = "true";
+    } else {
+      delete root.dataset.mobileHeaderHidden;
+    }
+    return () => {
+      delete root.dataset.mobileHeaderHidden;
+    };
+  }, [mobileHeaderHidden]);
+
+  return (
+    <SidebarItemNavigationProvider
+      begin={beginItemNavigation}
+      itemDetailsReady={itemDetailsReady}
+      enteredItemFromHome={enteredItemFromHome}
+    >
+      <div ref={shellRef} className="bg-background relative min-h-[100dvh] overflow-x-clip">
+        <a
+          href="#main-content"
+          className="focus:bg-background focus:text-foreground focus:ring-ring sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-lg focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:ring-2 focus:outline-none"
+        >
+          {t("web.shell.layout.skipToContent")}
+        </a>
+        <GlobalSearch />
+        <div className="from-primary/8 pointer-events-none fixed inset-x-0 top-0 z-0 h-40 bg-gradient-to-b to-transparent blur-3xl" />
+        {/* Desktop sidebar — hidden below lg. Its box stays 260px wide in both
+          states; `collapsed` only drives the moving frame that hides everything
+          past the 64px rail, so entering a detail page never resizes it. */}
+        <div className="hidden lg:block" onTransitionEnd={handleSidebarTransitionEnd}>
+          {isSettingsRoute ? (
+            // Settings take over the sidebar column rather than adding a
+            // second one beside it. The placeholder holds the column's place
+            // while the chunk loads; if it fails to load, the app sidebar
+            // stands in so the page stays usable.
+            <LocalErrorBoundary
+              fallback={<AppSidebar collapsed={visualDetailImmersion} swap={sidebarSwap} />}
+            >
+              <Suspense
+                fallback={
+                  <div className="border-sidebar-border/70 bg-sidebar/92 fixed start-0 top-0 bottom-0 z-40 w-[260px] border-e" />
+                }
+              >
+                <UserSettingsSidebar backTo={settingsReturnPath} swap={sidebarSwap} />
+              </Suspense>
+            </LocalErrorBoundary>
+          ) : (
+            <AppSidebar collapsed={visualDetailImmersion} swap={sidebarSwap} />
+          )}
+        </div>
+
+        {/* Mobile header — visible below lg. Slides up on scroll-down within
+          the Calendar route to free vertical space; pulling up reveals it. */}
+        <div
+          ref={mobileHeaderRef}
+          data-sticky-header
+          className={`mobile-header glass-dark border-border/70 sticky top-0 z-30 mx-3 mt-3 flex items-center justify-between rounded-2xl border px-4 py-3 transition-transform duration-200 ease-out motion-reduce:transition-none lg:hidden ${
+            mobileHeaderHidden ? "-translate-y-[140%]" : "translate-y-0"
+          }`}
+        >
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setMobileOpen(true)}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent/60 flex h-10 w-10 items-center justify-center rounded-xl transition-all active:scale-[0.98]"
+              aria-label={t("web.shell.layout.openMenu")}
+            >
+              <Menu className="h-5 w-5" />
+            </button>
+            <ViewTransitionLink to="/" className="flex items-center gap-2.5">
+              <SiloBrand className="h-10 w-[94px]" />
+            </ViewTransitionLink>
+          </div>
+          <div className="flex items-center gap-2">
+            <ViewTransitionLink
+              to={buildQueryCatalogHref()}
+              onPointerDown={prefetchCatalog}
+              onFocus={prefetchCatalog}
+              aria-label={t("web.shell.sidebar.search")}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent/60 flex h-10 w-10 items-center justify-center rounded-xl transition-all active:scale-[0.98]"
+            >
+              <Search className="h-5 w-5" />
+            </ViewTransitionLink>
+            {showAdminActivity && <AdminActivityIndicator />}
+            <Link
+              to="/settings"
+              aria-label={t("web.shell.layout.profileSettings", {
+                name: profile?.name ?? user?.username ?? t("web.shell.profile.fallbackName"),
+              })}
+              className="flex h-9 w-9 items-center justify-center rounded-full transition-transform active:scale-[0.98]"
+            >
+              <Avatar className="h-9 w-9 shadow-[0_16px_32px_-22px_rgba(0,0,0,0.7)]">
+                {profile?.avatar_url ? (
+                  <AvatarImage src={profile.avatar_url} alt={profile.name} />
+                ) : null}
+                <AvatarFallback className="bg-primary text-primary-foreground text-xs font-bold">
+                  {profile?.name?.charAt(0).toUpperCase() ??
+                    user?.username?.charAt(0).toUpperCase() ??
+                    // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- placeholder initial, not a word
+                    "?"}
+                </AvatarFallback>
+              </Avatar>
+            </Link>
+          </div>
+        </div>
+
+        {/* Mobile sidebar drawer */}
+        <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
+          <SheetContent side="left" className="w-[280px] p-0 sm:max-w-[280px]">
+            <SheetHeader className="sr-only">
+              <SheetTitle>{t("web.shell.layout.navigationTitle")}</SheetTitle>
+            </SheetHeader>
+            <AppSidebar onNavigate={() => setMobileOpen(false)} />
+          </SheetContent>
+        </Sheet>
+
+        {/* Desktop admin activity indicator (top-right, hidden on mobile) */}
+        {showAdminActivity && (
+          <div className="fixed end-5 top-6 z-40 hidden lg:block">
+            <AdminActivityIndicator />
+          </div>
+        )}
+
+        {/* Main content — offset by sidebar width on desktop */}
+        <main
+          id="main-content"
+          tabIndex={-1}
+          data-sidebar-target-collapsed={targetDetailImmersion ? "true" : undefined}
+          data-sidebar-visual-collapsed={visualDetailImmersion ? "true" : undefined}
+          className={`sidebar-main-stage relative min-h-screen outline-none ${
+            targetDetailImmersion ? "lg:ms-16" : "lg:ms-[260px]"
+          } ${hasBackgroundBar ? "pb-32 sm:pb-36" : ""}`}
+          style={{ viewTransitionName: "main-content" }}
+        >
+          {needsNoPadding ? (
+            children
+          ) : (
+            // `--page-gutter` is published so fixed page chrome (the collection
+            // editor's save bar) can line up with this content column.
+            <div className="relative z-10 px-(--page-gutter) py-4 [--page-gutter:1rem] sm:[--page-gutter:1.5rem] lg:py-8 lg:[--page-gutter:2.5rem] xl:[--page-gutter:3rem]">
+              {children}
+            </div>
+          )}
+        </main>
+      </div>
+    </SidebarItemNavigationProvider>
+  );
+}
+
+/**
+ * Reports whether the detail for the item route currently being entered is
+ * already in the query cache — either prefetched by `beginItemNavigation` or
+ * left behind by an earlier visit.
+ */
+function hasCachedItemDetail(queryClient: QueryClient, itemRouteLocation: string): boolean {
+  const target = parseItemNavigationHref(itemRouteLocation, window.location.origin);
+  if (!target) return false;
+  return (
+    queryClient.getQueryData(catalogKeys.itemDetail(target.contentId, target.libraryId)) !==
+    undefined
+  );
+}

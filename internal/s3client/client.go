@@ -1,0 +1,1206 @@
+// Package s3client provides a thin wrapper around the AWS SDK v2 S3 client
+// that works with any S3-compatible backend (CephRGW, MinIO, etc.).
+// It uses only standard S3 APIs and supports per-bucket credentials via
+// BucketConfig.
+package s3client
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	"golang.org/x/sync/semaphore"
+
+	"github.com/Silo-Server/silo-server/internal/telemetry"
+)
+
+// ErrNotFound is returned when the requested S3 object does not exist.
+var ErrNotFound = errors.New("s3: object not found")
+
+// URL auth strategies for generating read URLs.
+const (
+	URLAuthPresigned       = "presigned"        // standard S3 presigned URLs (default)
+	URLAuthPublic          = "public"           // unsigned public URLs via custom domain
+	URLAuthCloudflareToken = "cloudflare_token" // Cloudflare WAF token authentication
+)
+
+// streamUploadPartSize bounds per-upload memory for unsized streaming uploads.
+// S3-compatible backends require parts of at least 5 MiB (except the last).
+const streamUploadPartSize = 8 * 1024 * 1024
+
+// publicDeliveryProbeTimeout bounds one ObjectAvailable probe of the
+// client-facing read URL.
+const publicDeliveryProbeTimeout = 5 * time.Second
+
+const mutationFenceWeight int64 = 1 << 30
+
+// BucketConfig holds the configuration for connecting to a single S3 bucket.
+// Each bucket may have different credentials and endpoints, allowing per-bucket
+// configuration for metadata, operational, and user-db buckets.
+type BucketConfig struct {
+	// Role is an operational category, never a bucket name or endpoint.
+	Role           string
+	Endpoint       string
+	PublicEndpoint string // optional: public CDN domain for reads (e.g. R2 custom domain)
+	Region         string
+	Bucket         string
+	KeyPrefix      string
+	AccessKey      string
+	SecretKey      string
+	PathStyle      bool
+	URLAuth        string // "presigned" (default) or "cloudflare_token"
+	TokenSecret    string // HMAC-SHA256 secret for Cloudflare token auth
+	TokenParam     string // query param name (default: "verify")
+	TokenTTL       int    // token lifetime in seconds (default: 10800 = 3h)
+}
+
+// Client wraps an AWS SDK v2 S3 client configured for a specific bucket.
+type Client struct {
+	role           string
+	s3Client       *s3.Client
+	presignClient  *s3.PresignClient
+	bucket         string
+	keyPrefix      string
+	endpoint       string
+	publicEndpoint string
+	pathStyle      bool
+	urlAuth        string
+	tokenSecret    string
+	tokenParam     string
+	tokenTTL       int
+	mutations      *semaphore.Weighted
+}
+
+// ObjectInfo describes an object stored in S3.
+type ObjectInfo struct {
+	Key          string
+	SizeBytes    int64
+	LastModified *time.Time
+	ETag         string
+}
+
+// NewClient creates a new S3 Client from the given BucketConfig.
+// The caller creates multiple Client instances for different buckets.
+func NewClient(cfg BucketConfig) *Client {
+	region := cfg.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	role := telemetry.Role(cfg.Role)
+	s3Client := s3.New(s3.Options{
+		APIOptions:   []func(*middleware.Stack) error{observeS3(role), markThrottled, boundListResponses},
+		HTTPClient:   observedHTTPClient{inner: sharedHTTPClient(), role: role},
+		Region:       region,
+		BaseEndpoint: aws.String(cfg.Endpoint),
+		Credentials: credentials.NewStaticCredentialsProvider(
+			cfg.AccessKey,
+			cfg.SecretKey,
+			"",
+		),
+		UsePathStyle: cfg.PathStyle,
+		Retryer:      newRetryer(),
+	})
+
+	// URL signing is local work, so it must not appear as a storage call.
+	presignClient := s3.NewPresignClient(s3Client, s3.WithPresignClientFromClientOptions(func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			_, _ = stack.Initialize.Remove("SiloObserve")
+			return nil
+		})
+	}))
+
+	tokenParam := cfg.TokenParam
+	if tokenParam == "" {
+		tokenParam = "verify"
+	}
+	tokenTTL := cfg.TokenTTL
+	if tokenTTL <= 0 {
+		tokenTTL = 10800 // 3 hours
+	}
+	keyPrefix := NormalizeKeyPrefix(cfg.KeyPrefix)
+
+	return &Client{
+		role:           role,
+		s3Client:       s3Client,
+		presignClient:  presignClient,
+		bucket:         cfg.Bucket,
+		keyPrefix:      keyPrefix,
+		endpoint:       cfg.Endpoint,
+		publicEndpoint: cfg.PublicEndpoint,
+		pathStyle:      cfg.PathStyle,
+		urlAuth:        cfg.URLAuth,
+		tokenSecret:    cfg.TokenSecret,
+		tokenParam:     tokenParam,
+		tokenTTL:       tokenTTL,
+		mutations:      semaphore.NewWeighted(mutationFenceWeight),
+	}
+}
+
+// Bucket returns the bucket name this client is configured for.
+func (c *Client) Bucket() string {
+	return c.bucket
+}
+
+// Endpoint returns the S3 API endpoint objects are written to.
+func (c *Client) Endpoint() string { return c.endpoint }
+
+// KeyPrefix returns the normalized key prefix applied to every object key.
+func (c *Client) KeyPrefix() string { return c.keyPrefix }
+
+// BeginMutationFence waits for active object mutations and blocks new ones
+// until the returned function is called. Reads and presigning remain available.
+func (c *Client) BeginMutationFence(ctx context.Context) (func(), error) {
+	if err := c.mutations.Acquire(ctx, mutationFenceWeight); err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() { once.Do(func() { c.mutations.Release(mutationFenceWeight) }) }, nil
+}
+
+// GetObject fetches the object at the given key and returns its contents.
+// Returns ErrNotFound if the object does not exist.
+func (c *Client) GetObject(ctx context.Context, bucket, key string) ([]byte, error) {
+	objectKey := c.prefixedKey(key)
+	out, err := c.s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+	})
+	if err != nil {
+		if isNotFoundErr(err) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("s3 GetObject %s/%s: %w", bucket, key, err)
+	}
+	defer out.Body.Close()
+
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, fmt.Errorf("s3 reading body %s/%s: %w", bucket, key, err)
+	}
+
+	return data, nil
+}
+
+// GetObjectStream fetches the object at the given key and returns a streaming
+// body. The caller must close the returned ReadCloser.
+func (c *Client) GetObjectStream(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+	body, _, err := c.GetObjectStreamInfo(ctx, bucket, key)
+	return body, err
+}
+
+// GetObjectStreamInfo returns metadata from the same read as the object bytes.
+func (c *Client) GetObjectStreamInfo(ctx context.Context, bucket, key string) (io.ReadCloser, ObjectInfo, error) {
+	objectKey := c.prefixedKey(key)
+	out, err := c.s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+	})
+	if err != nil {
+		if isNotFoundErr(err) {
+			return nil, ObjectInfo{}, ErrNotFound
+		}
+		return nil, ObjectInfo{}, fmt.Errorf("s3 GetObject %s/%s: %w", bucket, key, err)
+	}
+
+	return out.Body, ObjectInfo{Key: key, SizeBytes: aws.ToInt64(out.ContentLength), LastModified: out.LastModified, ETag: aws.ToString(out.ETag)}, nil
+}
+
+// PutObject uploads data to the given key, inferring Content-Type from the
+// file extension so that CDNs and browsers serve files with the correct MIME type.
+func (c *Client) PutObject(ctx context.Context, bucket, key string, data []byte) error {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
+	body := newBytesReadSeeker(data)
+	objectKey := c.prefixedKey(key)
+
+	input := &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+		Body:   body,
+		Metadata: map[string]string{
+			"silo-sha256": objectSHA256(data),
+		},
+	}
+	if ct := contentTypeFromKey(key); ct != "" {
+		input.ContentType = aws.String(ct)
+	}
+
+	_, err := c.s3Client.PutObject(ctx, input)
+	if err != nil {
+		return fmt.Errorf("s3 PutObject %s/%s: %w", bucket, key, err)
+	}
+
+	return nil
+}
+
+// ErrObjectExists reports a conditional create that found an object at its
+// key. Nothing was written.
+var ErrObjectExists = errors.New("s3: object already exists")
+
+// ErrConditionalWriteUnsupported reports a backend that refused the
+// If-None-Match header of a conditional create.
+var ErrConditionalWriteUnsupported = errors.New("s3: conditional writes are not supported by this backend")
+
+// PutObjectIfAbsent uploads data only when no object exists at key, with
+// If-None-Match: *, so a concurrent writer is never overwritten. It returns
+// ErrObjectExists when one does (412, or 409 for a conflicting concurrent
+// conditional write), and ErrConditionalWriteUnsupported when the backend
+// rejects the header (501, or a 400 naming it).
+func (c *Client) PutObjectIfAbsent(ctx context.Context, bucket, key string, data []byte) error {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
+	input := &s3.PutObjectInput{
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(c.prefixedKey(key)),
+		Body:        newBytesReadSeeker(data),
+		IfNoneMatch: aws.String("*"),
+		Metadata:    map[string]string{"silo-sha256": objectSHA256(data)},
+	}
+	if ct := contentTypeFromKey(key); ct != "" {
+		input.ContentType = aws.String(ct)
+	}
+	_, err := c.s3Client.PutObject(ctx, input)
+	switch {
+	case err == nil:
+		return nil
+	case httpStatusCode(err) == http.StatusPreconditionFailed, httpStatusCode(err) == http.StatusConflict:
+		return ErrObjectExists
+	case httpStatusCode(err) == http.StatusNotImplemented, conditionalHeaderRejected(err):
+		return ErrConditionalWriteUnsupported
+	}
+	return fmt.Errorf("s3 PutObject if absent %s/%s: %w", bucket, key, err)
+}
+
+// conditionalHeaderRejected recognizes a 400 that names the If-None-Match
+// header or reports it as not implemented, as some S3-compatible backends
+// answer instead of 501.
+func conditionalHeaderRejected(err error) bool {
+	if httpStatusCode(err) != http.StatusBadRequest {
+		return false
+	}
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok &&
+		(apiErr.ErrorCode() == "NotImplemented" || strings.Contains(apiErr.ErrorMessage(), "If-None-Match")) {
+		return true
+	}
+	return strings.Contains(err.Error(), "If-None-Match")
+}
+
+// PutObjectStream uploads a streaming body to the given key. When contentType is
+// empty, it falls back to the same extension-based inference used by PutObject.
+// The body length is untrusted until streamed, so the upload goes through the
+// SDK's multipart manager: it buffers fixed-size parts and sends each with a
+// known Content-Length, which backends like Cloudflare R2 require (a plain
+// PutObject with an unsized stream is rejected with 411 MissingContentLength).
+func (c *Client) PutObjectStream(ctx context.Context, bucket, key string, r io.Reader, contentType string) error {
+	return c.PutObjectStreamParts(ctx, bucket, key, r, contentType, streamUploadPartSize)
+}
+
+// MaxUploadParts is the most parts one multipart upload may have.
+const MaxUploadParts = 10_000
+
+// PutObjectStreamParts is PutObjectStream with partSize-byte parts, for
+// objects that may be larger than 10,000 default parts: the multipart upload
+// holds one part in memory at a time, and an object can be at most
+// MaxUploadParts parts. A partSize below the default uses the default.
+func (c *Client) PutObjectStreamParts(ctx context.Context, bucket, key string, r io.Reader, contentType string, partSize int64) error {
+	partSize = max(partSize, streamUploadPartSize)
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
+	objectKey := c.prefixedKey(key)
+
+	input := &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+		Body:   r,
+	}
+	if contentType != "" {
+		input.ContentType = aws.String(contentType)
+	} else if ct := contentTypeFromKey(key); ct != "" {
+		input.ContentType = aws.String(ct)
+	}
+
+	uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) {
+		u.PartSize = partSize
+		u.Concurrency = 1
+	})
+	if _, err := uploader.Upload(ctx, input); err != nil {
+		return fmt.Errorf("s3 PutObject stream %s/%s: %w", bucket, key, err)
+	}
+
+	return nil
+}
+
+// MakeObjectPublic updates the object ACL to allow anonymous reads.
+func (c *Client) MakeObjectPublic(ctx context.Context, bucket, key string) error {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
+	objectKey := c.prefixedKey(key)
+	_, err := c.s3Client.PutObjectAcl(ctx, &s3.PutObjectAclInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+		ACL:    s3types.ObjectCannedACLPublicRead,
+	})
+	if err != nil {
+		return fmt.Errorf("s3 PutObjectAcl %s/%s: %w", bucket, key, err)
+	}
+	return nil
+}
+
+// UploadFile uploads the file at path to the given key and returns the size in bytes.
+func (c *Client) UploadFile(ctx context.Context, bucket, key, path, contentType string) (int64, error) {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return 0, err
+	}
+	defer c.mutations.Release(1)
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("opening upload file %s: %w", path, err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("stating upload file %s: %w", path, err)
+	}
+
+	input := &s3.PutObjectInput{
+		Bucket:        aws.String(bucket),
+		Key:           aws.String(c.prefixedKey(key)),
+		Body:          file,
+		ContentLength: aws.Int64(info.Size()),
+	}
+	if contentType != "" {
+		input.ContentType = aws.String(contentType)
+	}
+
+	if _, err := c.s3Client.PutObject(ctx, input); err != nil {
+		return 0, fmt.Errorf("s3 PutObject file %s/%s: %w", bucket, key, err)
+	}
+
+	return info.Size(), nil
+}
+
+// maxPresignLifetime is the longest X-Amz-Expires that SigV4 accepts.
+const maxPresignLifetime = 7 * 24 * time.Hour
+
+// PresignGetURL generates a read URL for the given object. The strategy depends
+// on the configured URLAuth:
+//   - "cloudflare_token": HMAC-signed URL via the public endpoint
+//   - "public": unsigned URL via the public endpoint
+//   - "presigned" (default): standard S3 presigned URL
+func (c *Client) PresignGetURL(ctx context.Context, bucket, key string, expiry time.Duration) (string, error) {
+	u, _, err := c.PresignGetURLAt(ctx, bucket, key, time.Now(), expiry, 0)
+	return u, err
+}
+
+// PresignGetURLAt is PresignGetURL issued for the window containing now, and
+// it also reports when the URL stops working. Every call in the same window,
+// on any replica, returns the same URL, so clients and CDNs that cache by URL
+// keep hitting. A zero window issues a fresh URL, as PresignGetURL does.
+//
+// A presigned URL is signed at the window start and stays valid for window
+// plus expiry, so it outlives now by at least expiry; SigV4's seven-day limit
+// shortens the window, never the expiry. The WAF rule fixes a Cloudflare
+// token's lifetime from its timestamp, so the window is capped to a quarter of
+// the token TTL and the URL stays valid for at least three quarters of it.
+func (c *Client) PresignGetURLAt(ctx context.Context, bucket, key string, now time.Time, expiry, window time.Duration) (string, time.Time, error) {
+	objectKey := c.prefixedKey(key)
+	if c.publicEndpoint != "" {
+		switch c.urlAuth {
+		case URLAuthCloudflareToken:
+			tokenTTL := time.Duration(c.tokenTTL) * time.Second
+			issued := now.Truncate(min(window, tokenTTL/4))
+			return c.cloudflareTokenURL(objectKey, issued), issued.Add(tokenTTL), nil
+		case URLAuthPublic:
+			u, err := c.PublicURL(bucket, key)
+			if err != nil {
+				return "", time.Time{}, err
+			}
+			return u, now.Add(expiry), nil
+		}
+	}
+
+	window = max(0, min(window, maxPresignLifetime-expiry))
+	issued := now.Truncate(window)
+	lifetime := window + expiry
+	req, err := c.presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+	}, s3.WithPresignExpires(lifetime), signAt(issued))
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("s3 PresignGetObject %s/%s: %w", bucket, key, err)
+	}
+
+	return req.URL, issued.Add(lifetime), nil
+}
+
+// signAt makes a presign use a fixed signing time instead of the SDK clock.
+func signAt(at time.Time) func(*s3.PresignOptions) {
+	return func(o *s3.PresignOptions) {
+		o.Presigner = fixedTimePresigner{inner: o.Presigner, at: at}
+	}
+}
+
+type fixedTimePresigner struct {
+	inner s3.HTTPPresignerV4
+	at    time.Time
+}
+
+func (p fixedTimePresigner) PresignHTTP(
+	ctx context.Context, credentials aws.Credentials, r *http.Request,
+	payloadHash, service, region string, _ time.Time, optFns ...func(*v4.SignerOptions),
+) (string, http.Header, error) {
+	return p.inner.PresignHTTP(ctx, credentials, r, payloadHash, service, region, p.at, optFns...)
+}
+
+// EffectivePresignTTL returns the longest validity window that the client can
+// honor for a read URL generated with PresignGetURL.
+func (c *Client) EffectivePresignTTL(requested time.Duration) time.Duration {
+	if requested <= 0 {
+		return requested
+	}
+	if c.urlAuth == URLAuthCloudflareToken && c.tokenTTL > 0 {
+		tokenTTL := time.Duration(c.tokenTTL) * time.Second
+		if tokenTTL < requested {
+			return tokenTTL
+		}
+	}
+	return requested
+}
+
+// cloudflareTokenURL generates a Cloudflare WAF token-authenticated URL issued
+// at the given time.
+// Format: {publicEndpoint}/{key}?{param}={timestamp}-{base64_hmac}
+// The HMAC is SHA256(secret, "/{key}" + timestamp).
+func (c *Client) cloudflareTokenURL(key string, issued time.Time) string {
+	path := "/" + key
+	ts := strconv.FormatInt(issued.Unix(), 10)
+
+	mac := hmac.New(sha256.New, []byte(c.tokenSecret))
+	mac.Write([]byte(path))
+	mac.Write([]byte(ts))
+	token := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	return strings.TrimRight(c.publicEndpoint, "/") + path +
+		"?" + c.tokenParam + "=" + ts + "-" + url.QueryEscape(token)
+}
+
+// UsesExternalAuth reports whether the configured URL auth mode is public or
+// token-based. Use UsesExternalDelivery when endpoint availability matters.
+func (c *Client) UsesExternalAuth() bool {
+	return c.urlAuth == URLAuthCloudflareToken || c.urlAuth == URLAuthPublic
+}
+
+// UsesExternalDelivery reports whether generated read URLs actually use a
+// separately configured public or token-authenticated endpoint. An auth mode
+// without its endpoint still falls back to standard S3 presigning.
+func (c *Client) UsesExternalDelivery() bool {
+	return c.publicEndpoint != "" && c.UsesExternalAuth()
+}
+
+// PublicURL returns the deterministic public URL for an object based on the
+// configured endpoint and path-style setting. When a public endpoint is set
+// (e.g. an R2 custom domain), it is used instead of the API endpoint and the
+// bucket prefix is omitted (the custom domain maps directly to the bucket).
+func (c *Client) PublicURL(bucket, key string) (string, error) {
+	objectKey := c.prefixedKey(key)
+
+	// Public endpoint: domain is bound to the bucket, so just /{key}.
+	if c.publicEndpoint != "" {
+		baseURL, err := url.Parse(c.publicEndpoint)
+		if err != nil {
+			return "", fmt.Errorf("parse public endpoint %q: %w", c.publicEndpoint, err)
+		}
+		path := normalizedURLBasePath(baseURL.Path)
+		path = appendURLObjectKey(path, objectKey)
+		return buildPublicURL(baseURL, baseURL.Host, path), nil
+	}
+
+	// Standard S3 endpoint: include bucket per path-style setting.
+	baseURL, err := url.Parse(c.endpoint)
+	if err != nil {
+		return "", fmt.Errorf("parse S3 endpoint %q: %w", c.endpoint, err)
+	}
+	if baseURL.Scheme == "" || baseURL.Host == "" {
+		return "", fmt.Errorf("parse S3 endpoint %q: missing scheme or host", c.endpoint)
+	}
+
+	host := baseURL.Host
+	path := normalizedURLBasePath(baseURL.Path)
+	if c.pathStyle {
+		path = appendURLPathSegment(path, bucket)
+		path = appendURLObjectKey(path, objectKey)
+		return buildPublicURL(baseURL, host, path), nil
+	}
+
+	host = bucket + "." + host
+	path = appendURLObjectKey(path, objectKey)
+	return buildPublicURL(baseURL, host, path), nil
+}
+
+// SetBucketCORS configures CORS on the bucket to allow browser GET requests
+// from the given origins. This is required for presigned URL fetches from the frontend.
+func (c *Client) SetBucketCORS(ctx context.Context, bucket string, allowedOrigins []string) error {
+	_, err := c.s3Client.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+		Bucket: aws.String(bucket),
+		CORSConfiguration: &s3types.CORSConfiguration{
+			CORSRules: []s3types.CORSRule{
+				{
+					AllowedOrigins: allowedOrigins,
+					AllowedMethods: []string{"GET"},
+					AllowedHeaders: []string{"*"},
+					MaxAgeSeconds:  aws.Int32(86400),
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("s3 PutBucketCors %s: %w", bucket, err)
+	}
+	return nil
+}
+
+// HeadBucket checks whether the configured bucket exists and is accessible.
+// This is useful for readiness checks.
+func (c *Client) HeadBucket(ctx context.Context, bucket string) error {
+	_, err := c.s3Client.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return fmt.Errorf("s3 HeadBucket %s: %w", bucket, err)
+	}
+
+	return nil
+}
+
+// ObjectExists checks whether an object exists at the given key.
+func (c *Client) ObjectExists(ctx context.Context, bucket, key string) (bool, error) {
+	_, err := c.HeadObject(ctx, bucket, key)
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// HeadObject returns metadata for an object without downloading its bytes.
+func (c *Client) HeadObject(ctx context.Context, bucket, key string) (ObjectInfo, error) {
+	objectKey := c.prefixedKey(key)
+	result, err := c.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+	})
+	if err != nil {
+		if isNotFoundErr(err) {
+			return ObjectInfo{}, ErrNotFound
+		}
+		return ObjectInfo{}, fmt.Errorf("s3 HeadObject %s/%s: %w", bucket, key, err)
+	}
+	return ObjectInfo{Key: key, SizeBytes: aws.ToInt64(result.ContentLength), LastModified: result.LastModified, ETag: aws.ToString(result.ETag)}, nil
+}
+
+// ArtworkDeliveryScope names the storage, delivery endpoint, and URL policy, so
+// a confirmation recorded under one (see internal/trickplay) lapses when any
+// of them changes. Credentials are excluded from this persisted digest:
+// rotated credentials sign fresh URLs for the same objects.
+func (c *Client) ArtworkDeliveryScope() string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		c.endpoint, c.bucket, c.keyPrefix, c.publicEndpoint, c.urlAuth,
+		c.tokenParam,
+	}, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
+// ObjectAvailable reports whether a client-facing read URL is fetchable now.
+// Public and token-authenticated endpoints are a separate delivery path from
+// the S3 API, so they are probed with the same GET method clients use. A
+// one-byte range avoids transferring the image body when the endpoint honors
+// ranges. Standard presigned delivery keeps using the cheaper storage HEAD.
+func (c *Client) ObjectAvailable(ctx context.Context, bucket, key string) (bool, error) {
+	if !c.UsesExternalDelivery() {
+		return c.ObjectExists(ctx, bucket, key)
+	}
+
+	readURL, err := c.PresignGetURL(ctx, bucket, key, publicDeliveryProbeTimeout)
+	if err != nil {
+		return false, err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, publicDeliveryProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, readURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("s3 create public delivery probe for %s/%s", bucket, key)
+	}
+	req.Header.Set("Range", "bytes=0-0")
+
+	// The probe shares the S3 transport and its dial metrics: external
+	// delivery GETs are part of the same verifier burst as the storage HEADs.
+	resp, err := observedHTTPClient{inner: sharedDeliveryHTTPClient, role: c.role}.Do(req)
+	if err != nil {
+		// The underlying url.Error includes the signed URL, so do not wrap it:
+		// token-auth query values must never reach logs.
+		return false, fmt.Errorf("s3 public delivery probe for %s/%s failed", bucket, key)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		var firstByte [1]byte
+		if _, err := io.ReadFull(resp.Body, firstByte[:]); err != nil {
+			return false, fmt.Errorf("s3 public delivery probe for %s/%s returned no readable body", bucket, key)
+		}
+		return true, nil
+	}
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return false, nil
+	}
+	return false, fmt.Errorf("s3 public delivery probe for %s/%s returned status %d", bucket, key, resp.StatusCode)
+}
+
+// ObjectMatches checks that an immutable object exists with the expected
+// length and application-recorded SHA-256. Objects written before checksums
+// were recorded return false and are safely rewritten by the caller.
+//
+// A 403 also returns false. A HEAD response has no body, so it cannot say
+// whether the key is missing (AWS S3 answers 403 for a missing key when the
+// credential lacks s3:ListBucket) or access is denied. The caller's rewrite
+// settles it: a credential that may write succeeds, and a real denial fails
+// the PUT with the backend's error code.
+func (c *Client) ObjectMatches(ctx context.Context, bucket, key string, data []byte) (bool, error) {
+	objectKey := c.prefixedKey(key)
+	out, err := c.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+	})
+	if err != nil {
+		if isNotFoundErr(err) || httpStatusCode(err) == http.StatusForbidden {
+			return false, nil
+		}
+		return false, fmt.Errorf("s3 HeadObject %s/%s: %w", bucket, key, err)
+	}
+	if out.ContentLength == nil || *out.ContentLength != int64(len(data)) {
+		return false, nil
+	}
+	return strings.EqualFold(out.Metadata["silo-sha256"], objectSHA256(data)), nil
+}
+
+func objectSHA256(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// DeleteObject deletes the object at the given key.
+func (c *Client) DeleteObject(ctx context.Context, bucket, key string) error {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
+	return c.deleteObject(ctx, bucket, key)
+}
+
+func (c *Client) deleteObject(ctx context.Context, bucket, key string) error {
+	objectKey := c.prefixedKey(key)
+	_, err := c.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+	})
+	if err != nil {
+		if apiErr, ok := errors.AsType[smithy.APIError](err); ok && isMissingObjectCode(apiErr.ErrorCode()) {
+			return nil
+		}
+		return fmt.Errorf("s3 DeleteObject %s/%s: %w", bucket, key, err)
+	}
+
+	return nil
+}
+
+// DeletePrefix deletes all objects matching the given prefix using batch
+// DeleteObjects (up to 1000 keys per request). Returns the number of objects
+// deleted. Falls back to individual deletes if batch is not supported.
+func (c *Client) DeletePrefix(ctx context.Context, bucket, prefix string) (int, error) {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return 0, err
+	}
+	defer c.mutations.Release(1)
+	keys, err := c.ListObjects(ctx, bucket, prefix)
+	if err != nil {
+		return 0, err
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	return c.deleteObjects(ctx, bucket, keys)
+}
+
+// DeleteObjects deletes the given keys in batches of up to 1000 (the S3 API
+// limit). Returns the total number of successfully deleted objects. Missing
+// keys count as deleted; any other failure is returned as an error alongside
+// the count, and a canceled context stops the deletion with its error.
+func (c *Client) DeleteObjects(ctx context.Context, bucket string, keys []string) (int, error) {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return 0, err
+	}
+	defer c.mutations.Release(1)
+	return c.deleteObjects(ctx, bucket, keys)
+}
+
+func (c *Client) deleteObjects(ctx context.Context, bucket string, keys []string) (int, error) {
+	const batchSize = 1000
+	deleted := 0
+	failed := 0
+	var firstErr error
+	recordFailure := func(err error) {
+		failed++
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	for i := 0; i < len(keys); i += batchSize {
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+		end := i + batchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[i:end]
+
+		objects := make([]s3types.ObjectIdentifier, len(batch))
+		for j, key := range batch {
+			objects[j] = s3types.ObjectIdentifier{Key: aws.String(c.prefixedKey(key))}
+		}
+
+		out, err := c.s3Client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(bucket),
+			Delete: &s3types.Delete{
+				Objects: objects,
+				Quiet:   aws.Bool(true),
+			},
+		})
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return deleted, ctxErr
+			}
+			if !isBatchDeleteUnsupported(err) {
+				// Several callers discard the error, so log it here as the
+				// per-key failures below are.
+				code := s3ErrorCode(err)
+				slog.WarnContext(ctx, "s3 DeleteObjects: batch request failed", "component", "s3client",
+					"keys", len(batch), "code", code)
+				return deleted, fmt.Errorf("s3 DeleteObjects %s: %s", bucket, code)
+			}
+			// Fall back to individual deletes if batch is not supported.
+			for _, key := range batch {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return deleted, ctxErr
+				}
+				if delErr := c.deleteObject(ctx, bucket, key); delErr != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return deleted, ctxErr
+					}
+					slog.WarnContext(ctx, "s3 DeleteObjects fallback: failed to delete", "component", "s3client", "key", key, "code", s3ErrorCode(delErr))
+					recordFailure(fmt.Errorf("s3 DeleteObjects %s/%s: %s", bucket, key, s3ErrorCode(delErr)))
+					continue
+				}
+				deleted++
+			}
+			continue
+		}
+
+		deleted += len(batch)
+		if out != nil && len(out.Errors) > 0 {
+			// Name each failure by the key the caller asked for. The key in the
+			// response comes from the backend, like its message, so one that
+			// matches no requested key is never logged or returned.
+			requested := make(map[string]string, len(batch))
+			for _, key := range batch {
+				requested[c.prefixedKey(key)] = key
+			}
+			for _, e := range out.Errors {
+				if isMissingObjectCode(aws.ToString(e.Code)) {
+					continue
+				}
+				deleted--
+				key, ok := requested[aws.ToString(e.Key)]
+				if !ok {
+					key = "unrecognized key"
+				}
+				code := safeErrorCode(aws.ToString(e.Code))
+				slog.WarnContext(ctx, "s3 DeleteObjects: partial failure", "component", "s3client",
+					"key", key, "code", code)
+				// The backend's free-form message is omitted from both the log
+				// and the returned error: it may echo credentials or signed URLs.
+				recordFailure(fmt.Errorf("s3 DeleteObjects %s/%s: %s", bucket, key, code))
+			}
+		}
+	}
+
+	if failed > 0 {
+		return deleted, fmt.Errorf("s3 DeleteObjects %s: %d of %d objects not deleted: %w", bucket, failed, len(keys), firstErr)
+	}
+	return deleted, nil
+}
+
+// ErrorCode returns the backend's error code for err, such as "AccessDenied"
+// or "NoSuchBucket", or "" when err carries none (a network failure). The
+// backend's free-form message is never returned.
+func ErrorCode(err error) string {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+		return safeErrorCode(apiErr.ErrorCode())
+	}
+	return ""
+}
+
+// HTTPStatus returns the HTTP status of the response behind err, or 0 when
+// no response arrived.
+func HTTPStatus(err error) int { return httpStatusCode(err) }
+
+// s3ErrorCode returns the backend error code for err without its free-form
+// message, which may echo credentials or signed URLs.
+func s3ErrorCode(err error) string {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+		return safeErrorCode(apiErr.ErrorCode())
+	}
+	return "request failed"
+}
+
+const unrecognizedErrorCode = "unrecognized error code"
+
+// safeErrorCode returns code when it looks like an S3 error code (a short
+// identifier such as "AccessDenied") and a fixed placeholder otherwise. The code
+// comes from the backend, so an unexpected value is never logged or returned.
+func safeErrorCode(code string) string {
+	if code == "" || len(code) > 64 {
+		return unrecognizedErrorCode
+	}
+	for _, r := range code {
+		if !isErrorCodeRune(r) {
+			return unrecognizedErrorCode
+		}
+	}
+	return code
+}
+
+// isErrorCodeRune reports whether r may appear in an S3 error code.
+func isErrorCodeRune(r rune) bool {
+	switch {
+	case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		return true
+	case r == '.', r == '_', r == '-':
+		return true
+	}
+	return false
+}
+
+// isBatchDeleteUnsupported reports whether a DeleteObjects error means the
+// endpoint does not accept batch deletes as the SDK sends them, so per-object
+// deletes should be used instead. Besides an unimplemented operation, that
+// covers the checksum: the SDK sends a CRC32 checksum on batch deletes, and
+// S3-compatible backends that still require Content-MD5 (older MinIO releases
+// among them) reject the batch with one of the codes below, while single
+// deletes need no checksum. Any other error, such as a wrong region, a bad
+// bucket name, or an auth failure, would fail every per-object delete the same
+// way, so it is returned instead.
+func isBatchDeleteUnsupported(err error) bool {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+		switch apiErr.ErrorCode() {
+		case "NotImplemented", "MissingContentMD5", "InvalidRequest", "InvalidDigest", "BadDigest":
+			return true
+		}
+	}
+	switch httpStatusCode(err) {
+	case http.StatusNotImplemented, http.StatusMethodNotAllowed:
+		return true
+	}
+	return false
+}
+
+func isMissingObjectCode(code string) bool {
+	return code == "NoSuchKey" || code == "NotFound"
+}
+
+// ListObjects lists all object keys with the given prefix.
+func (c *Client) ListObjects(ctx context.Context, bucket, prefix string) ([]string, error) {
+	objects, err := c.ListObjectInfos(ctx, bucket, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	keys := make([]string, 0, len(objects))
+	for _, obj := range objects {
+		keys = append(keys, obj.Key)
+	}
+
+	return keys, nil
+}
+
+// ErrListingTooLarge reports a full listing that passed maxListEntries or
+// maxListPages. Callers that need every key of a larger prefix page through it
+// with ListObjectInfosAfter or ListObjectInfosPage.
+var ErrListingTooLarge = errors.New("s3 listing exceeds the full-listing limit")
+
+// Full-listing ceilings. Real callers list one item's images, one backup
+// upload's parts (a terabyte at the 1 MiB minimum part size), catalog seeds, or
+// diagnostic reports, all well under a million keys. The ceilings stop an endpoint that keeps returning truncated pages with
+// fresh continuation tokens from growing the result, or the request count,
+// without bound. Variables so tests can lower them.
+var (
+	maxListEntries = 1_000_000
+	maxListPages   = 10_000
+)
+
+// ListObjectInfos lists objects with the given prefix and returns summary
+// metadata. It returns ErrListingTooLarge past maxListEntries entries or
+// maxListPages pages.
+func (c *Client) ListObjectInfos(ctx context.Context, bucket, prefix string) ([]ObjectInfo, error) {
+	var objects []ObjectInfo
+	prefixedPrefix := c.prefixedKey(prefix)
+
+	paginator := s3.NewListObjectsV2Paginator(c.s3Client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefixedPrefix),
+	})
+
+	for pages := 0; paginator.HasMorePages(); pages++ {
+		if pages == maxListPages || len(objects) >= maxListEntries {
+			return nil, fmt.Errorf("s3 ListObjectsV2 %s prefix=%s: %w (%d pages, %d entries)", bucket, prefix, ErrListingTooLarge, pages, len(objects))
+		}
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3 ListObjectsV2 %s prefix=%s: %w", bucket, prefix, err)
+		}
+
+		for _, obj := range page.Contents {
+			if obj.Key != nil {
+				logicalKey, ok := c.stripKeyPrefix(*obj.Key)
+				if !ok {
+					continue
+				}
+				var size int64
+				if obj.Size != nil {
+					size = *obj.Size
+				}
+				objects = append(objects, ObjectInfo{
+					Key:          logicalKey,
+					SizeBytes:    size,
+					LastModified: obj.LastModified,
+				})
+			}
+		}
+	}
+
+	return objects, nil
+}
+
+// isNotFoundErr checks whether an error indicates that the object was not found.
+func isNotFoundErr(err error) bool {
+	var noSuchKey *s3types.NoSuchKey
+	if errors.As(err, &noSuchKey) {
+		return true
+	}
+
+	var notFound *s3types.NotFound
+	if errors.As(err, &notFound) {
+		return true
+	}
+
+	// Some S3-compatible backends return a generic error with "NotFound" or
+	// "NoSuchKey" in the message, or an HTTP 404 status.
+	return httpStatusCode(err) == http.StatusNotFound
+}
+
+// httpStatusCode returns the HTTP status of the S3 response behind err, or 0
+// when err did not come from a response.
+func httpStatusCode(err error) int {
+	type httpResponseError interface {
+		HTTPStatusCode() int
+	}
+	var httpErr httpResponseError
+	if errors.As(err, &httpErr) {
+		return httpErr.HTTPStatusCode()
+	}
+	return 0
+}
+
+// bytesReadSeeker wraps a byte slice to implement io.ReadSeeker for PutObject.
+type bytesReadSeeker struct {
+	data   []byte
+	offset int64
+}
+
+func newBytesReadSeeker(data []byte) *bytesReadSeeker {
+	return &bytesReadSeeker{data: data}
+}
+
+// NormalizeKeyPrefix returns the canonical form of a bucket key prefix as the
+// client applies it to object keys: whitespace- and slash-trimmed, case
+// preserved (S3 keys are case-sensitive). Exported so storage-identity
+// comparisons elsewhere normalize prefixes exactly the way this client does.
+func NormalizeKeyPrefix(prefix string) string {
+	return strings.Trim(strings.TrimSpace(prefix), "/")
+}
+
+func (c *Client) prefixedKey(key string) string {
+	trimmed := strings.TrimLeft(key, "/")
+	if c.keyPrefix == "" {
+		return trimmed
+	}
+	if trimmed == "" {
+		return c.keyPrefix
+	}
+	return c.keyPrefix + "/" + trimmed
+}
+
+func (c *Client) stripKeyPrefix(key string) (string, bool) {
+	trimmed := strings.TrimLeft(key, "/")
+	if c.keyPrefix == "" {
+		return trimmed, true
+	}
+	if trimmed == c.keyPrefix {
+		return "", true
+	}
+	prefix := c.keyPrefix + "/"
+	if !strings.HasPrefix(trimmed, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(trimmed, prefix), true
+}
+
+func normalizedURLBasePath(basePath string) string {
+	if basePath == "" {
+		return ""
+	}
+	return strings.TrimRight(basePath, "/")
+}
+
+func appendURLPathSegment(path string, segment string) string {
+	trimmed := strings.Trim(segment, "/")
+	if trimmed == "" {
+		return path
+	}
+	if path == "" {
+		return "/" + trimmed
+	}
+	return path + "/" + trimmed
+}
+
+func appendURLObjectKey(path string, key string) string {
+	if key == "" {
+		return path
+	}
+	if path == "" {
+		return "/" + key
+	}
+	return path + "/" + key
+}
+
+func buildPublicURL(baseURL *url.URL, host, path string) string {
+	var b strings.Builder
+	b.WriteString(baseURL.Scheme)
+	b.WriteString("://")
+	if baseURL.User != nil {
+		b.WriteString(baseURL.User.String())
+		b.WriteString("@")
+	}
+	b.WriteString(host)
+	b.WriteString(encodeURLPath(path))
+	if baseURL.RawQuery != "" {
+		b.WriteString("?")
+		b.WriteString(baseURL.RawQuery)
+	}
+	if baseURL.Fragment != "" {
+		b.WriteString("#")
+		b.WriteString(baseURL.Fragment)
+	}
+	return b.String()
+}
+
+func encodeURLPath(path string) string {
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		segments[i] = url.PathEscape(segment)
+	}
+	return strings.Join(segments, "/")
+}
+
+func (b *bytesReadSeeker) Read(p []byte) (int, error) {
+	if b.offset >= int64(len(b.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.offset:])
+	b.offset += int64(n)
+	return n, nil
+}
+
+func (b *bytesReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	var newOffset int64
+	switch whence {
+	case io.SeekStart:
+		newOffset = offset
+	case io.SeekCurrent:
+		newOffset = b.offset + offset
+	case io.SeekEnd:
+		newOffset = int64(len(b.data)) + offset
+	default:
+		return 0, fmt.Errorf("bytesReadSeeker: invalid whence %d", whence)
+	}
+
+	if newOffset < 0 {
+		return 0, fmt.Errorf("bytesReadSeeker: negative position %d", newOffset)
+	}
+
+	b.offset = newOffset
+	return newOffset, nil
+}
+
+// contentTypeFromKey returns a MIME type based on the file extension, or empty
+// string if unknown. This ensures CDNs and browsers serve files correctly.
+func contentTypeFromKey(key string) string {
+	switch {
+	case strings.HasSuffix(key, ".jpg"), strings.HasSuffix(key, ".jpeg"):
+		return "image/jpeg"
+	case strings.HasSuffix(key, ".png"):
+		return "image/png"
+	case strings.HasSuffix(key, ".webp"):
+		return "image/webp"
+	case strings.HasSuffix(key, ".gif"):
+		return "image/gif"
+	case strings.HasSuffix(key, ".svg"):
+		return "image/svg+xml"
+	case strings.HasSuffix(key, ".json"):
+		return "application/json"
+	case strings.HasSuffix(key, ".zip"):
+		return "application/zip"
+	default:
+		return ""
+	}
+}

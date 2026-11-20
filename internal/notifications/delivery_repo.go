@@ -1,0 +1,456 @@
+package notifications
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// DeliveryRepository owns notification_deliveries.
+type DeliveryRepository struct {
+	pool *pgxpool.Pool
+}
+
+// NewDeliveryRepository creates a DeliveryRepository.
+func NewDeliveryRepository(pool *pgxpool.Pool) *DeliveryRepository {
+	return &DeliveryRepository{pool: pool}
+}
+
+// Cursor is an opaque pagination cursor over (created_at, id).
+type Cursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+// Encode returns the opaque wire form of the cursor.
+func (c Cursor) Encode() string {
+	raw := c.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + c.ID
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// deliveryRowSelect joins display metadata so clients can render a row
+// without an extra lookup. LEFT JOINs keep operational delivery types (no
+// episode/series) and deleted catalog rows renderable.
+const deliveryRowSelect = `
+	SELECT d.id, d.release_event_id, d.user_id, d.profile_id, d.library_id, d.series_id, d.episode_id,
+	       d.type, d.reason_flags, d.status, d.read_at, d.delivered_at, d.created_at,
+	       COALESCE(s.title, '') AS series_title,
+	       COALESCE(e.title, '') AS episode_title,
+	       e.season_number, e.episode_number,
+	       COALESCE(s.poster_path, '') AS poster_path,
+	       COALESCE(s.poster_thumbhash, '') AS poster_thumbhash,
+	       COALESCE(s.poster_source_path, '') AS poster_source_path,
+	       COALESCE(s.type, '') AS media_type,
+	       COALESCE(s.year, 0) AS year,
+	       COALESCE(s.overview, '') AS series_overview,
+	       COALESCE(e.overview, '') AS episode_overview,
+	       COALESCE(s.genres, '{}'::text[]) AS genres,
+	       COALESCE(s.content_rating, '') AS content_rating,
+	       COALESCE(s.rating_imdb, 0) AS rating_imdb,
+	       COALESCE(s.rating_tmdb, 0) AS rating_tmdb,
+	       COALESCE(s.imdb_id, '') AS imdb_id,
+	       COALESCE(s.tmdb_id, '') AS tmdb_id,
+	       COALESCE(s.tvdb_id, '') AS tvdb_id
+	FROM notification_deliveries d
+	LEFT JOIN episodes e ON e.content_id = d.episode_id
+	LEFT JOIN media_items s ON s.content_id = d.series_id`
+
+func scanDeliveryRows(rows pgx.Rows) ([]DeliveryRow, error) {
+	defer rows.Close()
+	out := make([]DeliveryRow, 0, 25)
+	for rows.Next() {
+		var row DeliveryRow
+		if err := rows.Scan(
+			&row.ID, &row.ReleaseEventID, &row.UserID, &row.ProfileID,
+			&row.LibraryID, &row.SeriesID, &row.EpisodeID,
+			&row.Type, &row.ReasonFlags, &row.Status, &row.ReadAt, &row.DeliveredAt, &row.CreatedAt,
+			&row.SeriesTitle, &row.EpisodeTitle, &row.SeasonNumber, &row.EpisodeNumber,
+			&row.PosterPath, &row.PosterThumbhash, &row.PosterSourcePath,
+			&row.MediaType, &row.Year, &row.SeriesOverview, &row.EpisodeOverview,
+			&row.Genres, &row.ContentRating, &row.RatingIMDB, &row.RatingTMDB,
+			&row.IMDBID, &row.TMDBID, &row.TVDBID,
+		); err != nil {
+			return nil, fmt.Errorf("scan delivery row: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// BulkInsert inserts deliveries with ON CONFLICT DO NOTHING (both partial
+// uniques participate: per-release-event and cross-library per-episode) and
+// returns only the rows actually inserted. Realtime publish and channel
+// dispatch must operate on the returned set, never the candidate set.
+func (r *DeliveryRepository) BulkInsert(ctx context.Context, tx pgx.Tx, deliveries []Delivery) ([]InsertedDelivery, error) {
+	profiles := make([]string, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		profiles = append(profiles, delivery.ProfileID)
+	}
+	if err := r.LockInboxProfiles(ctx, tx, profiles); err != nil {
+		return nil, err
+	}
+	const chunkSize = 500
+	inserted := make([]InsertedDelivery, 0, len(deliveries))
+	for start := 0; start < len(deliveries); start += chunkSize {
+		end := min(start+chunkSize, len(deliveries))
+		chunk := deliveries[start:end]
+
+		var sb strings.Builder
+		sb.WriteString(`
+			INSERT INTO notification_deliveries
+				(id, release_event_id, user_id, profile_id, library_id, series_id, episode_id,
+				 type, reason_flags, status, delivered_at)
+			VALUES `)
+		args := make([]any, 0, len(chunk)*11)
+		for i, delivery := range chunk {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			base := len(args)
+			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11))
+			status := delivery.Status
+			if status == "" {
+				status = "delivered"
+			}
+			args = append(args,
+				delivery.ID, delivery.ReleaseEventID, delivery.UserID, delivery.ProfileID,
+				delivery.LibraryID, delivery.SeriesID, delivery.EpisodeID,
+				delivery.Type, delivery.ReasonFlags, status, time.Now().UTC(),
+			)
+		}
+		sb.WriteString(" ON CONFLICT DO NOTHING RETURNING id, user_id, profile_id, created_at")
+
+		rows, err := tx.Query(ctx, sb.String(), args...)
+		if err != nil {
+			return nil, fmt.Errorf("bulk insert deliveries: %w", err)
+		}
+		for rows.Next() {
+			var row InsertedDelivery
+			if err := rows.Scan(&row.ID, &row.UserID, &row.ProfileID, &row.CreatedAt); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan inserted delivery: %w", err)
+			}
+			inserted = append(inserted, row)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("read inserted deliveries: %w", err)
+		}
+	}
+	return inserted, nil
+}
+
+// HasRequestFulfilled reports whether the account's profile already has a
+// request.fulfilled delivery for requestID: the key of the at-most-once
+// index notification_deliveries_account_profile_request_key. The type is a
+// literal so the planner can use that partial index.
+func (r *DeliveryRepository) HasRequestFulfilled(ctx context.Context, userID int, profileID, requestID string) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM notification_deliveries
+			WHERE type = '`+DeliveryTypeRequestFulfilled+`'
+			  AND user_id = $1 AND profile_id = $2 AND reason_flags->>'request_id' = $3)`,
+		userID, profileID, requestID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check request.fulfilled delivery: %w", err)
+	}
+	return exists, nil
+}
+
+// LockInboxProfiles orders the per-profile writer locks held until commit.
+// Callers issuing multiple BulkInsert calls in one transaction must lock their
+// complete recipient union first. The insert trigger then assigns timestamps
+// strictly above the preceding committed delivery for each profile.
+func (r *DeliveryRepository) LockInboxProfiles(ctx context.Context, tx pgx.Tx, profileIDs []string) error {
+	return lockInboxProfiles(ctx, tx, profileIDs)
+}
+
+func lockInboxProfiles(ctx context.Context, tx pgx.Tx, profileIDs []string) error {
+	profiles := slices.Clone(profileIDs)
+	slices.Sort(profiles)
+	for _, profile := range slices.Compact(profiles) {
+		if _, err := tx.Exec(ctx, `INSERT INTO notification_inbox_clocks(profile_id) VALUES($1) ON CONFLICT DO NOTHING`, profile); err != nil {
+			return fmt.Errorf("create inbox clock: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT profile_id FROM notification_inbox_clocks WHERE profile_id=$1 FOR UPDATE`, profile); err != nil {
+			return fmt.Errorf("lock inbox clock: %w", err)
+		}
+	}
+	return nil
+}
+
+// ListSync returns rows ascending from the cursor for forward sync (the
+// mobile wake-fetch endpoint). A nil cursor returns the most recent page
+// (still ascending) so first-time callers get a cursor to persist.
+func (r *DeliveryRepository) ListSync(ctx context.Context, userID int, profileID string, since *Cursor, limit int) ([]DeliveryRow, error) {
+	if since != nil {
+		rows, err := r.pool.Query(ctx,
+			deliveryRowSelect+`
+			WHERE d.user_id = $1 AND d.profile_id = $2 AND (d.created_at, d.id) > ($3, $4)
+			ORDER BY d.created_at ASC, d.id ASC
+			LIMIT $5`,
+			userID, profileID, since.CreatedAt, since.ID, limit)
+		if err != nil {
+			return nil, fmt.Errorf("list sync: %w", err)
+		}
+		return scanDeliveryRows(rows)
+	}
+	// No cursor: most recent page, returned in ascending order.
+	rows, err := r.pool.Query(ctx, `
+		SELECT * FROM (`+deliveryRowSelect+`
+			WHERE d.user_id = $1 AND d.profile_id = $2
+			ORDER BY d.created_at DESC, d.id DESC
+			LIMIT $3
+		) recent ORDER BY recent.created_at ASC, recent.id ASC`,
+		userID, profileID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list sync: %w", err)
+	}
+	return scanDeliveryRows(rows)
+}
+
+// GetByID returns one delivery scoped to the profile; (nil, nil) when absent.
+func (r *DeliveryRepository) GetByID(ctx context.Context, userID int, profileID, id string) (*DeliveryRow, error) {
+	rows, err := r.pool.Query(ctx,
+		deliveryRowSelect+` WHERE d.user_id = $1 AND d.profile_id = $2 AND d.id = $3`, userID, profileID, id)
+	if err != nil {
+		return nil, fmt.Errorf("get delivery: %w", err)
+	}
+	out, err := scanDeliveryRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return &out[0], nil
+}
+
+// GetRowByID loads one delivery without profile scoping. Internal use only
+// (webhook attempt processing); API paths must use GetByID.
+func (r *DeliveryRepository) GetRowByID(ctx context.Context, id string) (*DeliveryRow, error) {
+	rows, err := r.pool.Query(ctx, deliveryRowSelect+` WHERE d.id = $1`, id)
+	if err != nil {
+		return nil, fmt.Errorf("get delivery row: %w", err)
+	}
+	out, err := scanDeliveryRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return &out[0], nil
+}
+
+// ListForUserSince returns the account's deliveries newer than the watermark,
+// ascending, across all of its profiles. A non-zero until excludes rows
+// created at or after it (digest window upper edge). Runs inside the channel
+// worker's claim transaction so the rows read are the rows the advanced
+// watermark covers.
+func (r *DeliveryRepository) ListForUserSince(ctx context.Context, tx pgx.Tx, userID int, since Cursor, until time.Time, limit int) ([]DeliveryRow, error) {
+	query := deliveryRowSelect + `
+		WHERE d.user_id = $1 AND (d.created_at, d.id) > ($2, $3)`
+	args := []any{userID, since.CreatedAt, since.ID}
+	if !until.IsZero() {
+		args = append(args, until)
+		query += fmt.Sprintf(" AND d.created_at < $%d", len(args))
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY d.created_at ASC, d.id ASC LIMIT $%d", len(args))
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list user deliveries since: %w", err)
+	}
+	return scanDeliveryRows(rows)
+}
+
+// HasForUserSince reports whether the account has any delivery newer than the
+// given watermark. Cheap pre-check (index-only) so account-channel sweeps do
+// not open a claim transaction for idle accounts every pass.
+func (r *DeliveryRepository) HasForUserSince(ctx context.Context, userID int, since Cursor) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM notification_deliveries
+			WHERE user_id = $1 AND (created_at, id) > ($2, $3)
+		)`,
+		userID, since.CreatedAt, since.ID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check deliveries since watermark: %w", err)
+	}
+	return exists, nil
+}
+
+// HasTransactionalForUserSince reports whether the account has any
+// transactional delivery (digest-bypassing request-status notice; see
+// transactionalDeliveryTypes) newer than the given watermark.
+func (r *DeliveryRepository) HasTransactionalForUserSince(ctx context.Context, userID int, since Cursor) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM notification_deliveries
+			WHERE user_id = $1 AND (created_at, id) > ($2, $3) AND type = ANY($4)
+		)`,
+		userID, since.CreatedAt, since.ID, transactionalDeliveryTypes,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check transactional deliveries since watermark: %w", err)
+	}
+	return exists, nil
+}
+
+// ListForProfileSince returns the profile's deliveries newer than the
+// watermark, ascending. A non-zero until excludes rows created at or after it
+// (digest window upper edge). Runs inside the channel worker's claim
+// transaction so the rows read are the rows the advanced watermark covers.
+func (r *DeliveryRepository) ListForProfileSince(ctx context.Context, tx pgx.Tx, userID int, profileID string, since Cursor, until time.Time, limit int) ([]DeliveryRow, error) {
+	query := deliveryRowSelect + `
+		WHERE d.user_id = $1 AND d.profile_id = $2 AND (d.created_at, d.id) > ($3, $4)`
+	args := []any{userID, profileID, since.CreatedAt, since.ID}
+	if !until.IsZero() {
+		args = append(args, until)
+		query += fmt.Sprintf(" AND d.created_at < $%d", len(args))
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY d.created_at ASC, d.id ASC LIMIT $%d", len(args))
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list profile deliveries since: %w", err)
+	}
+	return scanDeliveryRows(rows)
+}
+
+// HasForProfileSince reports whether the profile has any delivery newer than
+// the given watermark. Cheap pre-check (index-only) so account-channel sweeps
+// do not open a claim transaction for idle profiles every pass.
+func (r *DeliveryRepository) HasForProfileSince(ctx context.Context, userID int, profileID string, since Cursor) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM notification_deliveries
+			WHERE user_id = $1 AND profile_id = $2 AND (created_at, id) > ($3, $4)
+		)`,
+		userID, profileID, since.CreatedAt, since.ID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check profile deliveries since watermark: %w", err)
+	}
+	return exists, nil
+}
+
+// HasTransactionalForProfileSince reports whether the profile has any
+// transactional delivery (digest-bypassing request-status notice; see
+// transactionalDeliveryTypes) newer than the given watermark.
+func (r *DeliveryRepository) HasTransactionalForProfileSince(ctx context.Context, userID int, profileID string, since Cursor) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM notification_deliveries
+			WHERE user_id = $1 AND profile_id = $2 AND (created_at, id) > ($3, $4) AND type = ANY($5)
+		)`,
+		userID, profileID, since.CreatedAt, since.ID, transactionalDeliveryTypes,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check profile transactional deliveries since watermark: %w", err)
+	}
+	return exists, nil
+}
+
+// RecentUnread returns the newest unread rows for the websocket snapshot.
+func (r *DeliveryRepository) RecentUnread(ctx context.Context, userID int, profileID string, limit int) ([]DeliveryRow, error) {
+	rows, err := r.pool.Query(ctx,
+		deliveryRowSelect+`
+		WHERE d.user_id = $1 AND d.profile_id = $2 AND d.read_at IS NULL
+		ORDER BY d.created_at DESC, d.id DESC
+		LIMIT $3`,
+		userID, profileID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent unread: %w", err)
+	}
+	return scanDeliveryRows(rows)
+}
+
+// UnreadCount returns the unread badge count for the profile.
+func (r *DeliveryRepository) UnreadCount(ctx context.Context, userID int, profileID string) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx,
+		`SELECT count(*) FROM notification_deliveries WHERE user_id = $1 AND profile_id = $2 AND read_at IS NULL`,
+		userID, profileID,
+	).Scan(&count)
+	return count, err
+}
+
+// MarkRead marks one delivery read. Idempotent; reports whether the row
+// transitioned from unread to read.
+func (r *DeliveryRepository) MarkRead(ctx context.Context, userID int, profileID, id string) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE notification_deliveries
+		SET read_at = now()
+		WHERE user_id = $1 AND profile_id = $2 AND id = $3 AND read_at IS NULL`,
+		userID, profileID, id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// Exists reports whether a delivery belongs to the profile (used to make
+// mark-read idempotent without leaking other profiles' IDs).
+func (r *DeliveryRepository) Exists(ctx context.Context, userID int, profileID, id string) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM notification_deliveries WHERE user_id = $1 AND profile_id = $2 AND id = $3)`,
+		userID, profileID, id,
+	).Scan(&exists)
+	return exists, err
+}
+
+// DeleteAllForProfile removes every delivery for a deleted profile (profiles
+// may live outside Postgres, so no cascade).
+func (r *DeliveryRepository) DeleteAllForProfile(ctx context.Context, userID int, profileID string) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM notification_deliveries WHERE user_id = $1 AND profile_id = $2`, userID, profileID)
+	return err
+}
+
+// DeleteOld applies retention: rows read longer ago than readCutoff, unread
+// rows created before unreadCutoff. Read rows age from read_at, not
+// created_at — an old notification read today starts a fresh read window.
+// A watchlist.available row created at or after arrivalCutoff, the fanout
+// staleness horizon, is kept whatever the retention settings: it is what
+// stops a later episode inside the horizon from telling the profile again.
+// A row with a webhook or plugin destination attempt still to finish is
+// kept, since its deletion would cascade to the attempt: always while the
+// attempt is claimed or scheduled (retrying with next_retry_at ahead, which
+// covers a live claim lease), and while it waits otherwise for as long as
+// the row is younger than pluginAttemptMaxAge, past which a plugin attempt
+// is finished without a send. The bound lets the row go when an attempt is
+// stranded, such as while webhooks are turned off.
+func (r *DeliveryRepository) DeleteOld(ctx context.Context, readCutoff, unreadCutoff, arrivalCutoff time.Time) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM notification_deliveries d
+		WHERE ((d.read_at IS NOT NULL AND d.read_at < $1)
+		       OR (d.read_at IS NULL AND d.created_at < $2))
+		  AND NOT (d.type = '`+DeliveryTypeWatchlistAvailable+`' AND d.created_at >= $3)
+		  AND NOT EXISTS (SELECT 1 FROM webhook_delivery_attempts a
+		                  WHERE a.notification_delivery_id = d.id AND a.outcome IN ('pending', 'retrying')
+		                    AND ((a.outcome = 'retrying' AND a.next_retry_at > now()) OR d.created_at > now() - $4::interval))
+		  AND NOT EXISTS (SELECT 1 FROM plugin_destination_delivery_attempts a
+		                  WHERE a.notification_delivery_id = d.id AND a.outcome IN ('pending', 'retrying')
+		                    AND ((a.outcome = 'retrying' AND a.next_retry_at > now()) OR d.created_at > now() - $4::interval))`,
+		readCutoff, unreadCutoff, arrivalCutoff, pluginAttemptMaxAge)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

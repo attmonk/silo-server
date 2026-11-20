@@ -1,0 +1,626 @@
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { DndContext, type Announcements, type UniqueIdentifier } from "@dnd-kit/core";
+import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { AlertTriangle, GripVertical, MoreHorizontal, Plus } from "lucide-react";
+
+import type { RequestIntegration } from "@/api/types";
+import type { RequestRoute, RequestRouteDestination } from "@/api/v2/adminRequests";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import {
+  useReorderRequestRoutes,
+  useRequestIntegrationOptions,
+  useUpdateRequestRoute,
+} from "@/hooks/queries/admin/requests";
+import { useMotionSafeSortable, useSortableList } from "@/hooks/useSortableList";
+import { useAppLanguage, useT } from "@/i18n";
+import { cn } from "@/lib/utils";
+
+import { RequestFallbackEditor } from "./RequestFallbackEditor";
+import { DeleteRuleDialog, RequestRuleEditor, type RoutingScope } from "./RequestRuleEditor";
+import { AddRuleFlow } from "./RequestRulePresets";
+import {
+  destinationSentence,
+  fallbackBody,
+  passThroughLabel,
+  routeBody,
+  ruleSentence,
+  sameDestination,
+  SERVER_NAMED_OVERRIDES,
+  serverOverrideFields,
+} from "./requestRoutingModel";
+import { serverFitsTier } from "./requestServerModel";
+import {
+  animeSeriesTypeTiers,
+  fixLabel,
+  routingWarnings,
+  type RoutingWarning,
+  type RoutingWarningFix,
+  type RoutingWarningInput,
+} from "./requestRoutingWarnings";
+
+const KIND_NAMES = { movie: "Radarr", series: "Sonarr" } as const;
+
+type DialogState =
+  | { kind: "add" }
+  | { kind: "custom" }
+  | { kind: "edit"; id: string }
+  | { kind: "fallback" }
+  | null;
+
+/**
+ * A destination as one line, with quality profiles and tags named from the
+ * server's options once they load (IDs until then).
+ */
+function DestinationText({ dest, scope }: { dest: RequestRouteDestination; scope: RoutingScope }) {
+  useAppLanguage();
+  const server = scope.allServers.find((candidate) => candidate.id === dest.integration_id);
+  const needsNames = Object.keys(dest.overrides ?? {}).some((key) =>
+    SERVER_NAMED_OVERRIDES.has(key),
+  );
+  const options = useRequestIntegrationOptions(needsNames && server ? server.id : undefined);
+  const fields = server ? serverOverrideFields(server, scope.installations) : [];
+  return <>{destinationSentence(dest, scope.allServers, { options: options.data, fields })}</>;
+}
+
+/** Amber warnings under a row, each with its fix when it has one. */
+function RowWarnings({
+  warnings,
+  onFix,
+  busy,
+}: {
+  warnings: readonly RoutingWarning[];
+  onFix: (fix: RoutingWarningFix) => void;
+  busy: boolean;
+}) {
+  useAppLanguage();
+  if (warnings.length === 0) return null;
+  return (
+    <ul className="mt-1.5 flex list-none flex-col gap-1">
+      {warnings.map((warning) => (
+        <li
+          key={warning.key}
+          className="flex items-start gap-2 text-xs text-amber-600 dark:text-amber-400"
+        >
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="min-w-0 flex-[1_1_12rem]">{warning.text}</span>
+            {warning.fix ? (
+              <Button
+                type="button"
+                size="xs"
+                variant="outline"
+                className="ms-auto h-6 border-amber-500/40 text-amber-600 dark:text-amber-300"
+                disabled={busy}
+                onClick={() => onFix(warning.fix!)}
+              >
+                {fixLabel(warning.fix)}
+              </Button>
+            ) : null}
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function RuleRow({
+  rule,
+  index,
+  count,
+  scope,
+  warnings,
+  highlighted,
+  busy,
+  onEdit,
+  onToggle,
+  onMove,
+  onDelete,
+  onFix,
+}: {
+  rule: RequestRoute;
+  index: number;
+  count: number;
+  scope: RoutingScope;
+  warnings: readonly RoutingWarning[];
+  highlighted: boolean;
+  busy: boolean;
+  onEdit: () => void;
+  onToggle: (enabled: boolean) => void;
+  onMove: (delta: -1 | 1) => void;
+  onDelete: () => void;
+  onFix: (fix: RoutingWarningFix) => void;
+}) {
+  const t = useT();
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useMotionSafeSortable({
+      id: rule.id,
+      disabled: busy,
+    });
+  const fallback = scope.fallback;
+  const below = scope.rules.slice(index + 1);
+  const fourK: ReactNode = rule.skip_uhd
+    ? fallback?.uhd.integration_id
+      ? t("web.admin.settings.requests.list.uhdNone")
+      : null
+    : rule.uhd.integration_id && !sameDestination(rule.uhd, fallback?.uhd ?? {})
+      ? t("web.admin.settings.requests.list.uhdTo", {
+          destination: <DestinationText dest={rule.uhd} scope={scope} />,
+        })
+      : null;
+
+  return (
+    <li
+      ref={setNodeRef}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+      }}
+      data-highlighted={highlighted || undefined}
+      className={cn(
+        "rounded-lg px-1 py-3 transition-colors duration-700",
+        highlighted && "bg-[var(--settings-accent-soft)]",
+      )}
+    >
+      <div className="flex items-start gap-2">
+        <button
+          type="button"
+          aria-label={t("web.admin.settings.requests.list.drag", { rule: rule.name })}
+          className="text-muted-foreground hover:bg-accent mt-0.5 shrink-0 cursor-grab touch-none rounded-md p-1 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={busy}
+          {...attributes}
+          {...listeners}
+        >
+          <GripVertical className="size-4" aria-hidden="true" />
+        </button>
+        <span
+          className="text-muted-foreground mt-1 w-5 shrink-0 text-end text-xs tabular-nums"
+          aria-hidden="true"
+        >
+          {index + 1}
+        </span>
+        <div className="min-w-0 flex-1">
+          <button
+            type="button"
+            onClick={onEdit}
+            className="focus-visible:ring-ring group block w-full rounded-sm text-start focus-visible:ring-2 focus-visible:outline-none"
+          >
+            <span
+              className={cn(
+                "flex flex-wrap items-center gap-2 text-sm font-medium group-hover:underline",
+                !rule.enabled && "text-muted-foreground",
+              )}
+            >
+              {rule.name}
+              {!rule.enabled ? (
+                <Badge variant="secondary">{t("web.admin.settings.requests.list.off")}</Badge>
+              ) : null}
+            </span>
+            <span
+              className={cn(
+                "text-muted-foreground block text-xs leading-relaxed",
+                !rule.enabled && "opacity-70",
+              )}
+            >
+              <span className="text-foreground/80 block">
+                {ruleSentence(rule.conditions, scope.mediaType, scope.names)}
+              </span>
+              <span className="block">
+                {rule.hd.integration_id
+                  ? t("web.admin.settings.requests.list.sendsTo", {
+                      destination: <DestinationText dest={rule.hd} scope={scope} />,
+                    })
+                  : t("web.admin.settings.requests.list.hdTo", {
+                      destination: passThroughLabel("hd", below, fallback, scope.allServers),
+                    })}
+              </span>
+              {fourK ? <span className="block">{fourK}</span> : null}
+            </span>
+          </button>
+        </div>
+        <Switch
+          className="mt-0.5 shrink-0"
+          checked={rule.enabled}
+          onCheckedChange={onToggle}
+          disabled={busy}
+          aria-label={t("web.admin.settings.requests.list.enabled", { rule: rule.name })}
+        />
+        {/* Not modal: Edit and Delete open a dialog, and a modal menu closing
+          under it can leave the page unclickable. */}
+        <DropdownMenu modal={false}>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              className="-mt-1 shrink-0"
+              aria-label={t("web.admin.settings.requests.list.more", { rule: rule.name })}
+            >
+              <MoreHorizontal />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={onEdit}>
+              {t("web.admin.settings.requests.shared.edit")}
+            </DropdownMenuItem>
+            <DropdownMenuItem disabled={busy || index === 0} onSelect={() => onMove(-1)}>
+              {t("web.admin.settings.requests.list.moveUp")}
+            </DropdownMenuItem>
+            <DropdownMenuItem disabled={busy || index === count - 1} onSelect={() => onMove(1)}>
+              {t("web.admin.settings.requests.list.moveDown")}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem variant="destructive" disabled={busy} onSelect={onDelete}>
+              {t("web.admin.settings.requests.shared.delete")}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+      {/* Under the rule's text, but across to the row's end edge, so a fix
+          button lines up with the switches above it. */}
+      <div className="ps-15">
+        <RowWarnings warnings={warnings} onFix={onFix} busy={busy} />
+      </div>
+    </li>
+  );
+}
+
+/** Everything else, pinned last: a sentence once saved, a server picker until then. */
+function FallbackRow({
+  scope,
+  warnings,
+  busy,
+  onEdit,
+  onFix,
+}: {
+  scope: RoutingScope;
+  warnings: readonly RoutingWarning[];
+  busy: boolean;
+  onEdit: () => void;
+  onFix: (fix: RoutingWarningFix) => void;
+}) {
+  const t = useT();
+  const fallback = scope.fallback;
+  const save = useUpdateRequestRoute();
+  const mediaType = { media_type: scope.mediaType };
+  if (!fallback) return null;
+  const saved = Boolean(fallback.hd.integration_id);
+
+  return (
+    <div
+      role="group"
+      aria-label={t("web.admin.settings.requests.shared.everythingElse")}
+      className="border-border/60 flex items-start gap-2 border-t px-1 py-3"
+    >
+      <span className="mt-0.5 w-[3.25rem] shrink-0" aria-hidden="true" />
+      <div className="min-w-0 flex-1">
+        {saved ? (
+          <button
+            type="button"
+            onClick={onEdit}
+            className="focus-visible:ring-ring group block w-full rounded-sm text-start focus-visible:ring-2 focus-visible:outline-none"
+          >
+            <span className="block text-sm font-medium group-hover:underline">
+              {t("web.admin.settings.requests.shared.everythingElse")}
+            </span>
+            <span className="text-muted-foreground block text-xs leading-relaxed">
+              <span className="text-foreground/80 block">
+                {t("web.admin.settings.requests.list.fallbackHd", {
+                  ...mediaType,
+                  destination: <DestinationText dest={fallback.hd} scope={scope} />,
+                })}
+              </span>
+              <span className="block">
+                {fallback.uhd.integration_id
+                  ? t("web.admin.settings.requests.list.uhdTo", {
+                      destination: <DestinationText dest={fallback.uhd} scope={scope} />,
+                    })
+                  : t("web.admin.settings.requests.list.uhdNone")}
+              </span>
+            </span>
+          </button>
+        ) : (
+          <div className="space-y-2">
+            <p className="text-sm font-medium">
+              {t("web.admin.settings.requests.shared.everythingElse")}
+            </p>
+            <p className="text-muted-foreground text-xs">
+              {t("web.admin.settings.requests.list.fallbackChoose", mediaType)}
+            </p>
+            <Select
+              value=""
+              disabled={save.isPending || busy}
+              onValueChange={(id) =>
+                save.mutate({
+                  route: fallback,
+                  body: fallbackBody(fallback, {
+                    hd: { integration_id: id, overrides: {} },
+                    uhd: { integration_id: "", overrides: {} },
+                  }),
+                })
+              }
+            >
+              <SelectTrigger
+                aria-label={t("web.admin.settings.requests.list.fallbackServer")}
+                className="w-full sm:w-64"
+              >
+                <SelectValue placeholder={t("web.admin.settings.requests.shared.chooseServer")} />
+              </SelectTrigger>
+              <SelectContent>
+                {scope.servers
+                  .filter((server) => serverFitsTier(server, "hd"))
+                  .map((server) => (
+                    <SelectItem key={server.id} value={server.id}>
+                      {server.name}
+                    </SelectItem>
+                  ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+        <RowWarnings warnings={warnings} onFix={onFix} busy={busy} />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One media type's routing: its rules in order (drag, or the ⋯ menu, to
+ * reorder), Everything else pinned last, and "Add a rule". Every change saves
+ * right away.
+ */
+export function RequestRoutingList({
+  scope,
+  routesFetching,
+}: {
+  scope: RoutingScope;
+  /** The list is being read again; its order and validators may be stale. */
+  routesFetching: boolean;
+}) {
+  const t = useT();
+  const { mediaType, rules, fallback } = scope;
+  const [dialog, setDialog] = useState<DialogState>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [highlight, setHighlight] = useState<string | null>(null);
+  const toggleRule = useUpdateRequestRoute();
+  const reorder = useReorderRequestRoutes();
+
+  // Until the reread lands, the order and validators on screen are the ones a
+  // reorder or save just replaced, so nothing may be computed from them.
+  const busy = reorder.isPending || toggleRule.isPending || routesFetching;
+  const ids = useMemo(() => rules.map((rule) => rule.id), [rules]);
+  const sortable = useSortableList(
+    rules,
+    (rule: RequestRoute) => rule.id,
+    (next: string[]) => reorder.mutate({ mediaType, ids: next }),
+  );
+
+  // Screen readers hear rule names and positions, not IDs.
+  const nameOf = (id: UniqueIdentifier) =>
+    rules.find((rule) => rule.id === id)?.name ??
+    t("web.admin.settings.requests.list.dragUnknownRule");
+  const at = (id: UniqueIdentifier, position: UniqueIdentifier = id) => ({
+    rule: nameOf(id),
+    position: ids.indexOf(String(position)) + 1,
+    total: ids.length,
+  });
+  const announcements: Announcements = {
+    onDragStart: ({ active }) => t("web.admin.settings.requests.list.dragStart", at(active.id)),
+    onDragOver: ({ active, over }) =>
+      over
+        ? t("web.admin.settings.requests.list.dragOver", at(active.id, over.id))
+        : t("web.admin.settings.requests.list.dragOutside", { rule: nameOf(active.id) }),
+    onDragEnd: ({ active, over }) =>
+      over
+        ? t("web.admin.settings.requests.list.dragEnd", at(active.id, over.id))
+        : t("web.admin.settings.requests.list.dragDropped", { rule: nameOf(active.id) }),
+    onDragCancel: ({ active }) =>
+      t("web.admin.settings.requests.list.dragCancel", { rule: nameOf(active.id) }),
+  };
+
+  useEffect(() => {
+    if (!highlight) return;
+    const timer = window.setTimeout(() => setHighlight(null), 2500);
+    return () => window.clearTimeout(timer);
+  }, [highlight]);
+
+  const warningInput: RoutingWarningInput = {
+    mediaType,
+    rules,
+    fallback,
+    servers: scope.allServers,
+    installations: scope.installations,
+    serverFields: (server: RequestIntegration) => serverOverrideFields(server, scope.installations),
+    language: scope.language,
+    forceDual: scope.forceDual,
+  };
+  const warnings = routingWarnings(warningInput);
+
+  function move(index: number, target: number) {
+    if (target < 0 || target >= ids.length || target === index) return;
+    const next = [...ids];
+    const [moved] = next.splice(index, 1);
+    next.splice(target, 0, moved!);
+    reorder.mutate({ mediaType, ids: next });
+  }
+
+  function fix(rule: RequestRoute | undefined, action: RoutingWarningFix) {
+    if (action.kind === "edit-fallback") {
+      setDialog({ kind: "fallback" });
+      return;
+    }
+    if (!rule) return;
+    if (action.kind === "move-above") {
+      const index = ids.indexOf(rule.id);
+      const target = ids.indexOf(action.targetId);
+      if (index > target && target !== -1) move(index, target);
+      return;
+    }
+    const tiers = animeSeriesTypeTiers(rule, warningInput);
+    const body = routeBody(rule);
+    for (const tier of tiers) {
+      const dest = body[tier];
+      body[tier] = { ...dest, overrides: { ...(dest.overrides ?? {}), series_type: "anime" } };
+    }
+    toggleRule.mutate({ route: rule, body });
+  }
+
+  function closeDialog(addedId?: string) {
+    setDialog(null);
+    if (addedId) setHighlight(addedId);
+  }
+
+  const deleting = deletingId ? rules.find((rule) => rule.id === deletingId) : undefined;
+  const editing = dialog?.kind === "edit" ? rules.find((rule) => rule.id === dialog.id) : undefined;
+  const fallbackReady = Boolean(fallback?.hd.integration_id);
+  const kindName = KIND_NAMES[mediaType];
+  const fallbackServer = scope.allServers.find(
+    (server) => server.id === fallback?.hd.integration_id,
+  );
+
+  if (scope.servers.length === 0 && rules.length === 0) {
+    return (
+      <p className="text-muted-foreground py-3.5 text-sm">
+        {t("web.admin.settings.requests.list.noServers", { kind: kindName, media_type: mediaType })}
+      </p>
+    );
+  }
+
+  return (
+    <div className="py-2">
+      {rules.length === 0 && fallbackReady ? (
+        <p className="text-muted-foreground py-2 text-sm">
+          {t("web.admin.settings.requests.list.noRules", {
+            media_type: mediaType,
+            server: fallbackServer?.name ?? kindName,
+          })}
+        </p>
+      ) : null}
+
+      {rules.length > 0 ? (
+        <DndContext
+          sensors={sortable.sensors}
+          collisionDetection={sortable.collisionDetection}
+          onDragEnd={sortable.handleDragEnd}
+          accessibility={{
+            announcements,
+            screenReaderInstructions: { draggable: t("web.common.sortable.instructions") },
+          }}
+        >
+          <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+            <ol
+              aria-label={t("web.admin.settings.requests.list.rules", { media_type: mediaType })}
+              className="divide-border/60 list-none divide-y"
+            >
+              {rules.map((rule, index) => (
+                <RuleRow
+                  key={rule.id}
+                  rule={rule}
+                  index={index}
+                  count={rules.length}
+                  scope={scope}
+                  warnings={warnings.get(rule.id) ?? []}
+                  highlighted={highlight === rule.id}
+                  busy={busy}
+                  onEdit={() => setDialog({ kind: "edit", id: rule.id })}
+                  onToggle={(enabled) =>
+                    toggleRule.mutate({ route: rule, body: { ...routeBody(rule), enabled } })
+                  }
+                  onMove={(delta) => move(index, index + delta)}
+                  onDelete={() => setDeletingId(rule.id)}
+                  onFix={(action) => fix(rule, action)}
+                />
+              ))}
+            </ol>
+          </SortableContext>
+        </DndContext>
+      ) : null}
+
+      <FallbackRow
+        scope={scope}
+        warnings={fallback ? (warnings.get(fallback.id) ?? []) : []}
+        busy={busy}
+        onEdit={() => setDialog({ kind: "fallback" })}
+        onFix={(action) => fix(undefined, action)}
+      />
+
+      <div className="flex flex-wrap items-center gap-3 pt-1 pb-2">
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={!fallbackReady}
+          onClick={() => setDialog({ kind: "add" })}
+        >
+          <Plus aria-hidden="true" />
+          {t("web.admin.settings.requests.list.addRule")}
+        </Button>
+        {!fallbackReady ? (
+          <p className="text-muted-foreground text-xs">
+            {t("web.admin.settings.requests.list.fallbackFirst")}
+          </p>
+        ) : null}
+      </div>
+
+      <Dialog
+        open={dialog !== null && (dialog.kind !== "edit" || Boolean(editing))}
+        onOpenChange={(open) => {
+          if (!open) setDialog(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl [&>*]:min-w-0">
+          {dialog?.kind === "add" ? (
+            <AddRuleFlow
+              scope={scope}
+              onCustom={() => setDialog({ kind: "custom" })}
+              onDone={closeDialog}
+            />
+          ) : dialog?.kind === "custom" ? (
+            <RequestRuleEditor key="new" scope={scope} source={null} onDone={closeDialog} />
+          ) : dialog?.kind === "edit" && editing ? (
+            // Keyed by id alone: a refresh that brings a newer revision must
+            // not throw away edits; the save's 412 reports it instead.
+            <RequestRuleEditor
+              key={editing.id}
+              scope={scope}
+              source={editing}
+              onDone={closeDialog}
+            />
+          ) : dialog?.kind === "fallback" && fallback ? (
+            <RequestFallbackEditor scope={scope} route={fallback} onDone={() => setDialog(null)} />
+          ) : null}
+        </DialogContent>
+      </Dialog>
+
+      {deleting ? (
+        // Read from the list each render, so a refresh brings its newest
+        // validator; a refused (412) delete closes and the list is read again.
+        <DeleteRuleDialog
+          rule={deleting}
+          open
+          onOpenChange={(open) => {
+            if (!open) setDeletingId(null);
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}

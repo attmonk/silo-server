@@ -1,0 +1,330 @@
+// TODO: this file redefines document, which is not configurable in VM contexts,
+// so it runs on the threads pool (THREADS_TESTS in vite.config.ts). Make it VM-
+// safe and drop it from that list.
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  buildClientCapabilitiesV3,
+  buildClientPlaybackContextV3,
+  buildDeliveriesV3,
+  detectBandwidthEstimateKbpsV3,
+  detectHLSSupport,
+  type WebCapabilityProbe,
+} from "./client-context-v3";
+import { readMeasuredBandwidthKbps } from "./bandwidth-probe";
+import { FEATURE_PROGRESSIVE_RANGE_REFUSAL_V3 } from "./protocol-v3";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("detectHLSSupport", () => {
+  it("accepts native HLS when Media Source Extensions are unavailable", () => {
+    vi.stubGlobal("MediaSource", undefined);
+    vi.stubGlobal("document", {
+      createElement: () => ({ canPlayType: () => "maybe" }),
+    });
+
+    expect(detectHLSSupport()).toEqual({ supported: true, native: true });
+  });
+
+  it("falls back to the hls.js Media Source Extensions probe", () => {
+    vi.stubGlobal("document", {
+      createElement: () => ({ canPlayType: () => "" }),
+    });
+    vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
+
+    expect(detectHLSSupport()).toEqual({ supported: true, native: false });
+  });
+});
+
+describe("buildDeliveriesV3", () => {
+  it("advertises the embedded text and PGS artifacts rendered by the web player", () => {
+    const deliveries = buildDeliveriesV3({
+      containers: ["mp4"],
+      codecsVideo: ["h264"],
+      progressiveCodecsVideo: ["h264"],
+      codecsAudio: ["aac"],
+      progressiveCodecsAudio: ["aac"],
+      maxResolution: "1080p",
+      hdr: false,
+      hdrDetails: {
+        hdr10: false,
+        hdr10_plus: false,
+        hlg: false,
+        dolby_vision_profiles: [],
+        dolby_vision_profile_levels: [],
+      },
+      hls: true,
+      nativeHLS: false,
+    });
+
+    for (const delivery of Object.values(deliveries)) {
+      expect(delivery.subtitles.embedded_text).toBe(true);
+      expect(delivery.subtitles.sidecar_text).toBe(true);
+      expect(delivery.subtitles.embedded_bitmap).toBe(true);
+      expect(delivery.subtitles.sidecar_bitmap).toBe(false);
+    }
+  });
+});
+
+describe("structured HDR capabilities", () => {
+  const safariUA =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/26.0 Safari/605.1.15";
+  const chromeUA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36";
+  const probe: WebCapabilityProbe = {
+    containers: ["mp4"],
+    codecsVideo: ["hevc"],
+    progressiveCodecsVideo: ["hevc"],
+    codecsAudio: ["eac3"],
+    progressiveCodecsAudio: ["eac3"],
+    maxResolution: "2160p",
+    hdr: true,
+    hdrDetails: {
+      hdr10: true,
+      hdr10_plus: false,
+      hlg: false,
+      hdr10_max_width: 3840,
+      hdr10_max_height: 2160,
+      hdr10_max_frame_rate: 24,
+      hdr10_max_bitrate_kbps: 80_000,
+      dolby_vision_profiles: [8],
+      dolby_vision_profile_levels: [{ profile: 8, max_level: 6, bl_compatibility_ids: [1] }],
+    },
+    hls: true,
+    nativeHLS: false,
+  };
+
+  it("publishes the structured formats in both device and active-output contexts", () => {
+    expect(buildClientCapabilitiesV3(probe).hdr_details).toEqual(probe.hdrDetails);
+    expect(buildClientPlaybackContextV3(probe).output.hdr_details).toEqual(probe.hdrDetails);
+  });
+
+  it("scopes normalized HDR sample entries to native HLS", () => {
+    const deliveries = buildDeliveriesV3({ ...probe, nativeHLS: true }, safariUA);
+
+    expect(deliveries.progressive?.hdr_details?.dolby_vision_profiles).toEqual([]);
+    expect(deliveries.hls?.hdr_details).toEqual(probe.hdrDetails);
+    expect(deliveries.hls?.video_codecs).toContain("hevc");
+    expect(deliveries.original_http?.hdr_details?.hdr10).toBe(false);
+    expect(deliveries.original_http?.hdr_details?.dolby_vision_profiles).toEqual([]);
+  });
+
+  it("opts only Chromium's media loader in a reopening player into progressive range refusal", () => {
+    const uas = {
+      chrome: chromeUA,
+      edge: `${chromeUA} Edg/151.0.0.0`,
+      safari: safariUA,
+      chromeOnIOS:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 CriOS/151.0.0.0 Mobile/15E148 Safari/604.1",
+      firefox: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0",
+    };
+    const optedIn = Object.fromEntries(
+      Object.entries(uas).map(([name, ua]) => [
+        name,
+        buildDeliveriesV3(probe, ua, null, {
+          reopensProgressiveAtPosition: true,
+        }).progressive?.features.includes(FEATURE_PROGRESSIVE_RANGE_REFUSAL_V3),
+      ]),
+    );
+
+    expect(optedIn).toEqual({
+      chrome: true,
+      edge: true,
+      safari: false,
+      chromeOnIOS: false,
+      firefox: false,
+    });
+    // A player without the reopen (audiobooks) would take the refusal as a
+    // failed route.
+    expect(buildDeliveriesV3(probe, chromeUA).progressive?.features).toEqual([]);
+  });
+
+  it("keeps Chromium native-HLS evidence scoped to its hls.js engine", () => {
+    const chromiumProbe = {
+      ...probe,
+      nativeHLS: true,
+      codecsVideo: ["h264"],
+      progressiveCodecsVideo: ["h264", "hevc"],
+    };
+
+    const deliveries = buildDeliveriesV3(chromiumProbe, chromeUA);
+
+    expect(deliveries.progressive?.hdr_details).toEqual(probe.hdrDetails);
+    expect(deliveries.hls?.hdr_details?.hdr10).toBe(false);
+    expect(deliveries.hls?.hdr_details?.dolby_vision_profiles).toEqual([]);
+    expect(deliveries.hls?.video_codecs).toEqual(["h264"]);
+  });
+
+  it("keeps normalized HDR sample entries on progressive without native HLS", () => {
+    const deliveries = buildDeliveriesV3({ ...probe, nativeHLS: false });
+
+    expect(deliveries.progressive?.hdr_details).toEqual(probe.hdrDetails);
+    expect(deliveries.hls?.hdr_details?.dolby_vision_profiles).toEqual([]);
+    expect(deliveries.original_http?.hdr_details?.hdr10).toBe(false);
+    expect(deliveries.original_http?.hdr_details?.dolby_vision_profiles).toEqual([]);
+  });
+
+  it("keeps media-element-only HEVC evidence out of original and HLS delivery", () => {
+    const progressiveOnlyProbe = {
+      ...probe,
+      codecsVideo: ["h264"],
+      progressiveCodecsVideo: ["h264", "hevc"],
+    };
+
+    expect(buildClientCapabilitiesV3(progressiveOnlyProbe).codecs_video).toEqual(["h264", "hevc"]);
+    const deliveries = buildDeliveriesV3(progressiveOnlyProbe);
+    expect(deliveries.original_http?.video_codecs).toEqual(["h264"]);
+    expect(deliveries.progressive?.video_codecs).toEqual(["h264", "hevc"]);
+    expect(deliveries.hls?.video_codecs).toEqual(["h264"]);
+  });
+
+  it("scopes container-specific audio evidence to progressive MP4", () => {
+    const containerScopedProbe = {
+      ...probe,
+      codecsAudio: ["aac", "vorbis"],
+      progressiveCodecsAudio: ["aac"],
+    };
+
+    const deliveries = buildDeliveriesV3(containerScopedProbe);
+
+    expect(deliveries.original_http?.audio_decode_codecs).toEqual(["aac", "vorbis"]);
+    expect(deliveries.progressive?.audio_decode_codecs).toEqual(["aac"]);
+    expect(deliveries.hls?.audio_decode_codecs).toEqual(["aac", "vorbis"]);
+  });
+});
+
+describe("browser decode engine capabilities", () => {
+  const probe: WebCapabilityProbe = {
+    containers: ["mp4", "webm"],
+    codecsVideo: ["h264", "av1"],
+    progressiveCodecsVideo: ["h264", "av1"],
+    codecsAudio: ["aac", "opus"],
+    progressiveCodecsAudio: ["aac", "opus"],
+    maxResolution: "2160p",
+    hdr: false,
+    hdrDetails: {
+      hdr10: false,
+      hdr10_plus: false,
+      hlg: false,
+      dolby_vision_profiles: [],
+      dolby_vision_profile_levels: [],
+    },
+    hls: true,
+    nativeHLS: false,
+  };
+  const engine = {
+    containers: ["mkv", "mp4"],
+    videoCodecs: ["h264", "hevc", "av1"],
+    audioCodecs: ["aac", "opus", "ac3", "eac3", "dts", "truehd"],
+    hdr: true,
+  };
+
+  it("widens only original_http and claims track selection and managed range", () => {
+    const deliveries = buildDeliveriesV3(probe, "test", engine);
+    expect(deliveries.original_http).toMatchObject({
+      containers: ["mp4", "webm", "mkv"],
+      video_codecs: ["h264", "av1", "hevc"],
+      audio_decode_codecs: ["aac", "opus", "ac3", "eac3", "dts", "truehd"],
+      validated_claims: ["client_selected_audio_track_v1", "client_managed_dynamic_range_v1"],
+    });
+    expect(deliveries.progressive?.audio_decode_codecs).toEqual(["aac", "opus"]);
+    expect(deliveries.progressive?.validated_claims).toEqual([]);
+    expect(deliveries.hls?.video_codecs).toEqual(["h264", "av1"]);
+  });
+
+  it("claims managed range only when WebGPU can tone-map", () => {
+    const deliveries = buildDeliveriesV3(probe, "test", { ...engine, hdr: false });
+    expect(deliveries.original_http?.validated_claims).toEqual(["client_selected_audio_track_v1"]);
+  });
+
+  it("leaves HDR to HDR-preserving routes on an HDR display", () => {
+    // The engine tone-maps to SDR; claiming managed range here would take HDR
+    // sources off the remux that keeps them HDR.
+    const deliveries = buildDeliveriesV3({ ...probe, hdr: true }, "test", engine);
+    expect(deliveries.original_http?.validated_claims).toEqual(["client_selected_audio_track_v1"]);
+  });
+
+  it("carries the engine codecs in the device-level lists the planner reads first", () => {
+    const capabilities = buildClientCapabilitiesV3(probe, engine);
+    expect(capabilities.codecs_audio).toContain("truehd");
+    expect(capabilities.codecs_video).toContain("hevc");
+    expect(capabilities.containers).toContain("mkv");
+    expect(buildClientCapabilitiesV3(probe).codecs_audio).toEqual(["aac", "opus"]);
+    expect(
+      buildClientPlaybackContextV3(probe, engine).deliveries.original_http?.validated_claims,
+    ).toHaveLength(2);
+  });
+});
+
+describe("detectBandwidthEstimateKbpsV3", () => {
+  // Chromium rounds and caps `downlink`, so it is a guess. Auto sends the
+  // source when nothing was measured, rather than plan from it.
+  it("sends no estimate when only connection.downlink is available", () => {
+    for (const downlink of [4.5, 10, 0.05, undefined]) {
+      vi.stubGlobal("navigator", { connection: { downlink } });
+      expect(detectBandwidthEstimateKbpsV3()).toBeUndefined();
+    }
+  });
+
+  const week = 7 * 24 * 60 * 60 * 1000;
+  /** A reading this device measured on the named connection type. */
+  const keptReading = (kbps: number, network = "unknown") => ({
+    readings: [{ kbps, measuredAt: Date.now(), maxAgeMs: week, network }],
+    writtenAt: Date.now(),
+  });
+
+  // `kept` is what the page has read back, so a row that sends nothing shows
+  // the reading was there to send.
+  it.each<[string, Record<string, unknown>, unknown, number | undefined, number | undefined]>([
+    [
+      "prefers the kept speed reading over the downlink hint",
+      { downlink: 10 },
+      keptReading(180_000),
+      180_000,
+      180_000,
+    ],
+    [
+      "ignores a cached measurement while Data Saver is on",
+      { downlink: 10, saveData: true },
+      keptReading(180_000),
+      180_000,
+      undefined,
+    ],
+    [
+      "ignores a cached measurement on cellular without falling back to the downlink",
+      { downlink: 4.5, type: "cellular" },
+      keptReading(180_000, "cellular"),
+      180_000,
+      undefined,
+    ],
+    [
+      "does not send a server's reading kept from before this page read the server",
+      { downlink: 10 },
+      {
+        readings: [{ kbps: 180_000, measuredAt: Date.now(), maxAgeMs: week }],
+        writtenAt: Date.now(),
+      },
+      undefined,
+      undefined,
+    ],
+    [
+      "sends no estimate from a stall limit an older build cached",
+      { downlink: 8 },
+      { kbps: 4_200, measuredAt: Date.now(), observed: true },
+      undefined,
+      undefined,
+    ],
+  ])("%s", (_name, connection, stored, kept, sent) => {
+    vi.stubGlobal("navigator", { connection });
+    localStorage.setItem("silo-bandwidth-estimate", JSON.stringify(stored));
+    try {
+      expect(readMeasuredBandwidthKbps()).toBe(kept);
+      expect(detectBandwidthEstimateKbpsV3()).toBe(sent);
+    } finally {
+      localStorage.removeItem("silo-bandwidth-estimate");
+    }
+  });
+});

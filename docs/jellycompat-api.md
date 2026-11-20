@@ -1,0 +1,1082 @@
+# Jellyfin compatibility API
+
+Jellycompat exposes Silo's movie and TV catalog, viewer state, and playback through
+Jellyfin-shaped routes. It is a supported subset of the Jellyfin protocol; a
+registered route does not imply every Jellyfin parameter or media type is
+supported. The reference contract is Jellyfin 12.1: Jellyfin 12.0 carried the
+API changes, and 12.1 is a bug-fix release with the same OpenAPI surface.
+`/System/Info` and `/System/Info/Public` report the configured emulated
+version, `12.1.0` on new installs.
+
+`/System/Info` also returns `CastReceiverApplications: []`. Silo does not
+advertise Chromecast receiver applications; the empty array lets Jellyfin Web
+initialize playback preferences without attempting to iterate a missing field.
+
+`GET` and `POST /System/Ping` return the product name as a JSON string
+(`"Jellyfin Server"`), as Jellyfin does; `HEAD` answers 200 for reachability
+probes. `/Branding/Css` and `/Branding/Css.css` return 200 with an empty
+`text/css` body. Jellyfin Web 10.10 and earlier fetch it at startup. Silo has no
+Jellyfin Web custom CSS: its own custom CSS styles Silo's web client, so it is
+not served here.
+
+Authenticated `GET /System/Configuration/encoding` returns
+`{"EnableFallbackFont":false,"EnableSubtitleExtraction":true}`. Jellyfin Web
+loads it before drawing ASS/SSA subtitles and draws nothing when the request
+fails; Silo serves no fallback fonts. The Kodi add-on reads
+`EnableSubtitleExtraction` before offering embedded text subtitles, which Silo
+serves as External. The key matches case-insensitively; any other key returns
+404.
+
+`internal/jellycompat/testdata/media_routes.txt` records the routes of a router
+built from configuration alone, so routes that need further dependencies, such
+as `GET /Persons/{name}` and `POST /Library/Media/Updated`, are not in it.
+`internal/jellycompat/router.go`
+owns registration; the native `/api/v2` contract is separate.
+
+## Users and avatars
+
+A Jellyfin user is one household profile on one account. Its `Id` is a
+deterministic UUID derived from the account and profile. It is sent the way
+Jellyfin serializes a Guid: 32 lowercase hex digits without dashes, in the user
+DTO, `SessionInfo.UserId`, `/Sessions`, and `UserDataChanged` socket messages.
+Seerr's avatar proxy rejects any other shape. Routes and queries that take a
+user ID also accept the dashed form, which clients that signed in before this
+format still send. Item, library, and server IDs keep the dashed form.
+
+The user DTO carries `PrimaryImageTag` when the profile has an uploaded avatar
+and the caller signed in (a session for an `sa_` API key is never stored, so
+its avatar could not be served).
+The tag changes whenever the profile row changes, so a new upload busts client
+caches. Preset avatars are SVGs that most Jellyfin clients cannot draw, so they
+get no tag. `GET`/`HEAD /UserImage?userId=` and `/Users/{id}/Images/Primary`
+are anonymous, as in Jellyfin. They resolve the ID through the stored compat
+sessions, so any replica answers. They return the 256px WebP with
+`Last-Modified`, or `404` for a user with no uploaded avatar, an unknown ID, or
+no live session. A compat session whose login session was signed out or
+expired does not count as live. Seerr falls back to its default avatar on that
+`404`. Unlike item artwork, these routes spend the per-IP rate-limit budget,
+because each request reads the session, profile, and blob stores.
+
+## Viewer state and preferences
+
+| Routes | Behavior |
+|---|---|
+| `GET`, `POST /UserItems/{itemId}/UserData` | Read or partially update the current profile's state; POST returns the resulting user-data DTO. |
+| `GET`, `POST /Users/{userId}/Items/{itemId}/UserData` | Legacy aliases with the same profile and item access checks. |
+| `POST`, `DELETE /UserPlayedItems/{itemId}` and `/Users/{userId}/PlayedItems/{itemId}` | Mark played or unplayed; return HTTP 200 and the resulting DTO. POST accepts `datePlayed`. |
+| `POST /Users/Configuration`, `/Users/{userId}/Configuration` | Persist profile settings and client presentation preferences; return 204. Current-user responses return effective settings. |
+| `GET`, `POST /DisplayPreferences/{displayPreferencesId}` | Store preferences separately by account, profile, client, and preference ID. Writes return 204. Reads always include `skipBackLength` and `skipForwardLength`, defaulting to 10000 and 30000 ms as Jellyfin does. As in Jellyfin 12, a write without either stores 15000 ms for it, and empty `landing-*` values are dropped. |
+| `GET /Localization/Cultures` | Language choices with two- and three-letter ISO codes. Accepts case-insensitive paths, including `/Localization/cultures`. |
+| `GET /UserViews/GroupingOptions`, `/Users/{userId}/GroupingOptions` | Authenticated empty array; library grouping is unsupported. The legacy alias requires the current profile's user ID. |
+| `GET /SyncPlay/List` | Authenticated empty array for client discovery. Group playback remains unsupported and user policy reports `SyncPlayAccess: "None"`. |
+
+User-data updates support `Played`, `IsFavorite`, `PlaybackPositionTicks`,
+`PlayedPercentage`, `LastPlayedDate`, and `PlayCount` values 0 or 1. Omitted
+fields retain their values. An explicit historical `LastPlayedDate` remains the
+reported date without making a new edit disappear behind a history tombstone.
+`datePlayed` and `LastPlayedDate` accept the compact Emby form `yyyyMMddHHmmss`,
+which Jellyfin accepts for `datePlayed`, and ISO 8601 forms: `YYYY-MM-DD` alone,
+or followed by `Thh:mm` or by `Thh:mm:ss` with an optional fraction of a second,
+each with an optional `Z`, `±hh:mm` or (with seconds) `±hhmm` offset. A space may
+replace the `T` before `hh:mm:ss` when there is no offset. A fraction needs
+seconds: `Thh:mm.f` returns 400. A value without an offset is read as UTC. Other
+values return 400.
+A `LastPlayedDate` or `datePlayed` more than two minutes ahead of the server
+clock is stored and reported as the server's current time, the same bound
+native progress sync applies, so a client with a wrong clock cannot block
+later progress for the item.
+Positional updates require a playable item; marking a series or season played
+uses its child episodes. Parent reads and mutation responses derive `Played`,
+`PlayCount`, and `UnplayedItemCount` from those episodes while retaining the
+parent's favorite status; an empty parent remains unplayed. As in Jellyfin,
+reads derive `PlayedPercentage` from the resume position, so a watched movie or
+episode with no resume point omits it, while a played series or season reports
+100. A combined
+played/favorite update commits the child progress and history together with the
+series or season's favorite status; a storage failure rolls back the entire
+update. Marking played or unplayed clears the resume position unless the request
+supplies an explicit position. Read-only
+echoed fields such as `UnplayedItemCount`, `Key`, and `ItemId` are ignored.
+Non-null `Rating` or `Likes` values return 400. `PlayCount` accepts only 0 or 1;
+other values return 400. Inaccessible items and another profile's user ID are
+rejected before mutation.
+
+Configuration maps audio language, subtitle language, autoplay, subtitle mode,
+and `HidePlayedInLatest` into Silo's canonical profile settings. Field names are case-insensitive;
+duplicate casing variants of the same field return 400. Other declared
+presentation preferences round-trip for clients. Storage failures produce
+errors instead of success responses.
+
+`HidePlayedInLatest` is `home.hide_watched_items`, the profile's "Hide watched
+items from Home" switch, so turning it on in either client applies to both.
+When it is on, `/Items/Latest` requests that don't send `IsPlayed` (or an
+`IsPlayed`/`IsUnplayed` filter) leave out items the profile has watched, as
+Jellyfin does. Jellyfin Web's home Latest rows send neither, so they rely on it.
+A request that sends `IsPlayed` gets what it asked for.
+
+`/UserViews` lists libraries in the profile's native `ui.library_order`, then
+the server's library order. `OrderedViews` then applies Jellyfin's rule: views
+it lists come first in that order, and the rest keep the order above. IDs match
+regardless of case and dashes, and unknown IDs are ignored. `OrderedViews` is
+stored only in the Jellyfin configuration and is not written to
+`ui.library_order`, so once a Jellyfin client saves it, a later reorder in a
+Silo app moves only the views it doesn't list.
+
+`SubtitleMode` sets both `playback.subtitle_mode` and
+`playback.show_forced_subtitles`, so it reads back unchanged and native clients
+behave the same way:
+
+| Jellyfin mode | Silo settings |
+|---|---|
+| `Smart` | `auto` (Silo's auto is Jellyfin's Smart) |
+| `Default` | `auto`; the saved Jellyfin configuration keeps `Default` |
+| `Always` | `always` |
+| `OnlyForced` | `off`, forced subtitles shown |
+| `None` | `off`, forced subtitles hidden |
+
+A profile with no stored subtitle mode reads as `Default`, Jellyfin's default.
+Modes set outside a Jellyfin client read as the matching row (`off` with forced
+subtitles shown reads as `OnlyForced`).
+
+Audio and subtitle language preferences use three-letter ISO codes for recognized
+languages (for example, `eng`). They match Jellyfin Web's selector only when
+`/Localization/Cultures` offers that language; `fil`, for example, has no option.
+Unrecognized and undefined tags are preserved. Native settings retain canonical
+BCP 47 tags. Returning an unchanged language choice preserves a native region or
+script preference, such as `pt-BR`; selecting a different language replaces it,
+and an empty or null preference clears it.
+
+`AudioLanguagePreference` `OriginalLanguage` stores the settings-contract tag
+`x-silo-original` and reads back as `OriginalLanguage`; playback then prefers
+each item's original-language audio, as native clients do.
+
+Movie and episode detail responses select `DefaultSubtitleStreamIndex` from the
+viewer's effective subtitle mode and language, including downloaded subtitles.
+In `Always` mode, a track the viewer picked for the series in a Silo or
+Jellyfin client (its source, language, codec, label, forced and
+hearing-impaired traits) wins when the file has one that matches; otherwise the
+language rules apply.
+The detail-page selection therefore carries into playback instead of sending
+an unintended Off choice. Explicit playback choices, including Off, still win.
+If playback negotiates a different audio language, clients must omit
+`SubtitleStreamIndex` to request a fresh automatic subtitle selection. An echoed
+`-1` remains Off because it is indistinguishable from an intentional Off choice.
+As in Jellyfin, `AudioStreamIndex` and `SubtitleStreamIndex` in PlaybackInfo and
+session report bodies accept a number or a numeric string, and `null`, an empty
+string, or a blank string counts as omitting the field; Jellyfin Web sends an
+empty `SubtitleStreamIndex` when playback starts from a series page. An explicit
+`0` is stream 0.
+
+`PlaybackInfo` defaults follow the viewer's settings. `DefaultAudioStreamIndex`
+is the audio track Silo selects for the viewer (audio language preference,
+original language, and the series' remembered track), falling back to the
+file's default track. `DefaultSubtitleStreamIndex` follows Jellyfin 12.1's
+`MediaStreamSelector` for the effective subtitle mode and language, judged
+against the starting audio track, with one change: Jellyfin sorts external files
+first, while Silo ranks them by Jellyfin's remaining rules and uses the source
+only to break ties, preferring embedded tracks over external and downloaded
+files. A file's default-flagged track therefore beats an external file in
+`Default` mode, and an external file is still chosen when nothing embedded is
+flagged. An unset subtitle language matches any language.
+In `Always` mode, Silo's per-series remembered subtitle track is applied first,
+as on item details. An explicit `SubtitleStreamIndex` in the request still wins.
+
+Playback reports save the viewer's track choices for the next episode. For a
+play negotiated through `PlaybackInfo`, an `AudioStreamIndex` or
+`SubtitleStreamIndex` in `/Sessions/Playing`, `/Sessions/Playing/Progress`, or
+`/Sessions/Playing/Stopped` that differs from the default `PlaybackInfo`
+offered, or from the track last saved for that play, becomes the series'
+remembered track (a movie's is kept under the movie). Silo writes it the way
+`PUT /api/v2/audio-prefs/{series_id}` and `PUT /api/v2/subtitle-prefs/{series_id}`
+do: the audio track's language and signature; a subtitle track's language,
+signature and v3 combined index in mode `always`; or mode `off` with no track
+for `SubtitleStreamIndex: -1`, which later plays offer as `OnlyForced` or
+`None` depending on the forced-subtitle setting. Reports cannot tell a pick
+from a client's automatic choice, so a report of the offered defaults saves
+nothing; neither does the audio track the viewer's preferences select when
+`PlaybackInfo` offered a device fallback in its place (AC3 for TrueHD). A
+client that plays a different track from the one offered has it saved. Plays
+that skip `PlaybackInfo` (static direct play), an audio switch the server
+refused, and repeated or late Stopped reports for a finished play save
+nothing. A failed write is logged and not retried. `RememberAudioSelections`
+or `RememberSubtitleSelections` set to `false` in the user configuration turns
+either half off. Jellyfin remembers choices per item; Silo remembers them per
+series, as its own clients do.
+
+Each change is claimed on the play before it is written. After writing, the
+report reads the play's latest claim back and writes it again until the two
+match, so overlapping reports leave the newest choice. Known gap: a write that
+stalls until after a later Stopped report has finished the play and its record
+is removed has nothing to read back, so the older choice can remain. Closing it
+would need ordering on the stored preference itself.
+
+## Browse and response fields
+
+Item queries compose genre, year, search, selected-ID, collection, favorite,
+and watched-state predicates rather than selecting one filter and discarding
+the others. SQL state predicates bind both account and profile. Series and
+season episode queries apply their scope and supported predicates before
+counting and paging; detail and user-state hydration run on the selected page.
+
+As in Jellyfin 12, a `/Items` request at the user root (no `ParentId`)
+returns the user's libraries only when it carries no filter. Any parameter that
+sets Jellyfin's `HasFilters` (item types, genres, tags, studios, media types,
+IDs, `Is*`/`Has*` flags, name bounds, languages, and so on) makes it a
+recursive search, including filters Silo does not apply. `LocationTypes` and
+`ExcludeLocationTypes` are the exception: Silo has no virtual items, and older
+clients send `ExcludeLocationTypes=Virtual` with their library-list request.
+
+`AudioLanguages` and `SubtitleLanguages` (comma-separated or repeated) keep
+items with a present file the viewer may play (library access and playback
+quality limit) carrying an audio track, or an embedded or external subtitle,
+in any listed language. Series match through their episode files. The
+`Filters2` language facets count the same files.
+ISO 639-2 codes such as `eng` match the stored canonical codes.
+`HasSubtitles=false` ignores `SubtitleLanguages`, as upstream does.
+
+An `/Items` browse whose only item type is `Episode`, with no series or season
+`ParentId` (such as `IncludeItemTypes=Episode&Recursive=true`), lists the
+visible episodes of every series, or of the library `ParentId` names, in series
+sort-title order, then season and episode number. `SortName` keeps that order,
+since a Jellyfin episode's sort name is its season and episode number. Episode
+listings here and on series and season parents apply the item-query predicates,
+`IsFavorite=true` included; studios, official ratings and genres are the
+series', and premiere dates are the episodes' air dates.
+
+`/Shows/{id}/Episodes` accepts numeric `Season`, `SeasonId`, `StartItemId`,
+`StartIndex`, and `Limit`. As in Jellyfin 12.1, an explicit `SeasonId` selects
+its owning series and takes precedence over the path series and numeric season.
+When `Limit` is omitted, episode listings on this route and series/season
+`/Items?ParentId=` requests use a 1,000-row page. Explicit limits retain their
+requested page size, subject to the 1,000-row cap; `Limit=0` requests only the
+count. Longer lists still require paging using `TotalRecordCount` and
+`StartIndex`. An `/Items?Ids=` request without `Limit` returns every named
+item the viewer can see, as in Jellyfin. When it names no collection and also
+filters, searches, or sorts, that list is capped at 1,000 rows. Other `/Items`
+browsing retains the 24-row default.
+
+`/Items?ParentId={boxSetId}` lists a collection's members (movies, series, and
+the episodes of episode-scoped smart collections) in collection order unless
+`SortBy` is sent. Members get the same detail fields, such as `MediaSources` and
+`Path`, as they do when listed from their library. Episode-scoped smart
+collections honor `SortBy` over their own members; catalog and user-state
+filters on them are not supported yet and return no episodes.
+
+A BoxSet with an uploaded or template poster shows it to everyone. Otherwise
+its `Primary` image is a collage of the first members the viewer can access, so
+the image and its tag differ by viewer. A collage tag is 32 hex digits: the
+collage's key followed by its signature. `GET /Items/{boxSetId}/Images/Primary`
+accepts a signed collage tag without authentication and serves the collage the
+tag names. An untagged request authorized by its session gets that viewer's
+collage. When no collage is built yet, the BoxSet shows the generated title
+poster and the collage is built in the background for the next request.
+
+`Recursive=true` together with `Filters=IsNotFolder`, or with an
+`IncludeItemTypes` that names `Episode` but not `Series` or `Season`, returns the
+collection's playable leaves for Play all and Shuffle: movies and episodes, with
+member series expanded to the episodes that have a live file in a library the
+profile may access. Regular seasons come first, then specials. `SortBy=Random`
+shuffles the leaves; other sorts keep collection order. Other recursive
+requests list the members. For members and leaves alike, `Limit=0` returns no
+`Items`, only `TotalRecordCount`.
+
+`EnableImages=false`, `EnableImageTypes`, `ImageTypeLimit`, and
+`EnableUserData=false` control item response presentation. Fields requiring
+real detail are hydrated from the catalog; list responses no longer invent
+media-source IDs or person IDs from titles. When `Fields` requests
+`MediaSourceCount`, library, Latest, and NextUp lists report the number of
+present, accessible versions of each movie or episode. When it requests
+`Width`, `Height`, or `IsHD`, the same lists report the first video track of
+the version the item's detail response lists first (the widest), so a client
+can show quality across a library without fetching each item. `IsHD` means
+720 lines and up, on lists and detail alike, as in Jellyfin; series and seasons
+carry none of the three. Similar and Suggestions ignore `Fields`.
+
+Item list fields such as `Genres`, `GenreItems`, `Studios`, `Tags`,
+`Taglines`, `People`, `MediaSources` and `MediaStreams` follow Jellyfin, which
+leaves out null fields but sends empty arrays: a list field the response fills
+is `[]` when the item has none, and an empty one that `Fields` didn't request is
+left out, including on `/Items?Ids=` without `Fields`. Item detail fills every
+list field. Roku (BrightScript) clients index some of these arrays without
+checking that they exist.
+
+The Resume lists honor `ParentId`: a library limits them to that library, and
+a series or season to its episodes. A series or season is answered from the
+progress of that series' episodes, not from the profile's recent progress, so
+an episode left long ago still resumes. As in Jellyfin, a movie or episode
+`ParentId` lists nothing. Moonfin for Roku resumes a series by asking for one
+resumable item under it.
+
+Global `/Shows/NextUp` and the Resume lists leave out series the profile dropped,
+as Silo's Home does; `/Shows/NextUp?SeriesId=` still answers for a dropped series.
+See [dropped-shows.md](architecture/dropped-shows.md). It orders series as
+Silo's Home does: by when the profile finished the previous episode, the order
+Jellyfin uses. A profile that turns on `ui.next_up_new_releases_first` instead
+gets a caught-up series back at the front when its next episode is released to
+the server. `nextUpDateCutoff` still filters on last played.
+
+`CommunityRating` is the IMDb rating (0-10). `CriticRating` is the stored
+Rotten Tomatoes critic score (0-100), present only while an enabled metadata
+plugin declares the `rt_critic` rating source and an administrator shows it under
+`catalog.extra_rating_sources`, the setting native item ratings follow (see
+`GET /api/v2/capabilities/ratings`). `SortBy=CriticRating` and `MinCriticRating`
+follow the same rule: while the source is shown they sort and filter on that
+score, unrated items last and episodes matching no minimum. While it is hidden,
+`CriticRating` sorts as an unknown key (the next `SortBy` key and its
+`SortOrder` entry apply) and `MinCriticRating` is ignored, so neither the order
+nor the filter reveals the score.
+
+Items carry Jellyfin 12's `OriginalLanguage` (movies and series). Episodes set
+`ParentPrimaryImageItemId` and `ParentPrimaryImageTag` to their season's poster,
+or to the series poster when the season has none; both are removed when the
+request disables Primary images. Episodes also set `ParentLogoItemId` and
+`ParentLogoImageTag` to their series' logo when it has one, as Jellyfin does,
+since clients read an episode's show logo there; both are removed when a list
+request disables Logo images. `/Shows/Upcoming` episodes carry no series
+artwork, so they have neither these nor the parent poster and backdrop.
+
+Local extras in `/Items/{id}/SpecialFeatures` and `/Items/{id}/LocalTrailers`
+carry a `Primary` tag in `ImageTags` when they have a still: the image beside
+the extra's file, or a frame the server took from it. `/Items/{extraId}/Images/Primary`
+serves that 16:9 still, `Backdrop` and `Logo` serve the parent item's, and the
+request is allowed only when the parent item is.
+
+### Extended artwork
+
+Movies and series that have a banner, landscape thumb, clear art or disc art
+list it in `ImageTags` under Jellyfin's image types `Banner`, `Thumb`, `Art` and
+`Disc`, on lists and detail alike. `BackdropImageTags` lists every backdrop,
+the primary first, and is empty when the item has no primary backdrop.
+
+| Route | Serves |
+|---|---|
+| `GET /Items/{id}/Images/Banner` | The banner; 404 without one. |
+| `GET /Items/{id}/Images/Thumb` | The landscape thumb. Without one it serves the backdrop, then the poster, as before. |
+| `GET /Items/{id}/Images/Art` | The clear art; 404 without one. |
+| `GET /Items/{id}/Images/Disc` | The disc art; 404 without one. |
+| `GET /Items/{id}/Images/Backdrop/{index}` | Index 0 (or no index) is the primary backdrop; index `i` is the item's `i`-th backdrop after it, 404 past the last. Other image types ignore the index. |
+| `GET /Items/{id}/Images` | Jellyfin's image list: one entry per type in `ImageTags` and one `Backdrop` entry per backdrop tag, with its `ImageIndex`. `Width` and `Height` are omitted because Silo does not record artwork dimensions. |
+| `HEAD /Items/{id}/Images/{type}[/{index}]` | `200` with no body when the GET would serve the image, without redirecting or proxying it; Roku checks for a logo this way. |
+
+An episode's `ParentThumbImageTag` still names its series' backdrop; the series'
+`Thumb` route serves its landscape thumb when it has one.
+
+| Routes | Behavior |
+|---|---|
+| `GET /Items/{id}/Ancestors` | Visible episode/season/series/library ancestry. When an item belongs to multiple libraries, chooses its first visible library parent. |
+| `GET /Library/MediaFolders` | The session's visible libraries as a `QueryResult` of `CollectionFolder` items, with the `Id` and `CollectionType` that `/UserViews` reports (`movies`, `tvshows`, …). The synthetic Collections view is not a media folder and is left out. Silo has no hidden media folders, so `isHidden=true` returns an empty list. Jellyfin SDK `getMediaFolders()` discovers libraries here. |
+| `GET /Items/Filters`, `/Items/Filters2` | Visible catalog genre facets; the legacy shape includes years and official ratings. For Movie, Series, Season, or Episode queries, `Filters2` also lists `AudioLanguages` and `SubtitleLanguages` as `{Name: "English (en)", Value: "en"}` pairs sorted by name. |
+| `GET /Items/Counts` | Jellyfin's `ItemCounts` for what the session can see: `MovieCount`, `SeriesCount`, `EpisodeCount`, and `BoxSetCount`, with `ItemCount` their sum (Jellyfin also counts seasons there). `isFavorite=true` counts the profile's favorites; box sets cannot be favorites, so they count zero. Silo serves no music, trailers, books or Live TV, so those counts are zero. A `userId` other than the session's answers 404. |
+| `GET /Items/{id}/Collections` | Jellyfin 12 "Included In": visible BoxSets that store the item, sorted by name and paged by `StartIndex`/`Limit`. An item the viewer cannot see returns 404 regardless of membership; visible episodes and any season return an empty result. Smart collections have no stored membership and are not listed. |
+| `GET /Studios` | Visible catalog studios with paging. |
+| `GET /Shows/Upcoming` | Scoped episodes dated from yesterday in UTC onward, with paging. |
+| `GET /Items/{id}/ThemeMedia` | `ThemeSongsResult` and `ThemeVideosResult` envelopes after validating the owner. |
+| `GET /Items/{id}/ThemeSongs`, `/ThemeVideos` | Local theme songs for a visible owner; theme videos remain empty. |
+| `GET /Videos/{id}/AdditionalParts` | An empty `QueryResult`. Silo lists each file as a version, not as an additional part. |
+| `GET /Movies/Recommendations` | The profile's cached recommendation rows, filtered for the session and kept to movies, in Jellyfin's category shape. Only rows a Jellyfin heading describes truthfully are sent: up to two Because You Watched rows anchored on a movie as `SimilarToRecentlyPlayed` with the watched title as `BaselineItemName`, then taste-cluster rows as `SimilarToLikedItem` with the cluster's genre label (jellyfin-web shows "Because you watched {0}" and "Because you like {0}"). A library `ParentId` (jellyfin-web sends the movie library it shows suggestions for) keeps the titles and watched titles to that library; a library the session cannot browse, or any other parent, gets `[]`. A row whose watched title is a series or one the session cannot see, the main For You row, an unlabeled cluster, Similar Users and the server-wide rows are left out; a profile without such rows gets `[]`. A title appears in the first category that holds it, each category has its own `CategoryId`, and `categoryLimit` (default 5) and `itemLimit` (default 8) apply. |
+| `GET /Items/{id}/Similar`, `/Movies/{id}/Similar`, `/Shows/{id}/Similar` | With recommendations enabled, the item's nearest titles by embedding and co-watch, in that order, keeping those the session may see; otherwise, or when none is left, the top-rated titles of the same type in the item's first genre. An item the session cannot see answers an empty list. |
+| `GET /Persons`, `/Persons/{name}` | People with a credit on a movie, series, or episode visible to the current profile, under the native person-detail rule: an episode credit counts when the profile can see the parent series. `/Persons` accepts Jellyfin 12's `StartIndex`, `NameStartsWith`, `NameLessThan`, and `NameStartsWithOrGreater` (lowercased name comparisons) and a library, movie, series, or episode `ParentId`; a series parent includes its episodes' guest stars, a library parent includes the guest stars of its series, and other parents match nobody. Pages without `SearchTerm` hold up to 100 people; searches stay capped at 20. Person photo tags are signed and appear only in responses that passed this visibility check. `GET /Items/{personId}/Images/Primary` accepts a matching signed `tag` without authentication, as Jellyfin Web sends image requests without credentials; otherwise the session must see a credit for the person. Either check runs before cached artwork is used. |
+
+`/Library/VirtualFolders` reports `LibraryOptions.EnableRealtimeMonitor` from
+Silo's configuration: `true` only while both the server-wide
+`scanner.realtime_monitoring` setting and the library's own
+`realtime_monitoring` switch are on. The server setting is read live, so a
+change shows on the next request. This applies to both the viewer response and
+the admin API-key response that autoscan tools read. Jellyfin clients cannot
+change either switch through this surface.
+
+These changes do not implement every advanced query option. Compound sorts,
+full `IsMissing` semantics, multiple person-ID predicates, populated tag facets,
+and the `Tags` and `HasSubtitles` item filters remain outside this subset.
+`/Items` applies `StudioIds`, keeping items with any named studio; when no value
+names a studio, it returns no items. Episode listings filter by the parent
+series' studios, except the `AdjacentTo` window of `/Shows/{id}/Episodes`.
+Season listings do not filter by studio.
+
+## Playback negotiation and media
+
+`GET` and `POST /Items/{id}/PlaybackInfo` evaluate source and output
+capabilities, including client bitrate ceilings, audio-channel limits, container
+conditions, and subtitle delivery profiles. The negotiated source records the
+selected output constraints so local and remote encoders use the same decision.
+As in Jellyfin 10.11, `SupportsDirectStream` accompanies `SupportsDirectPlay`,
+and a source that needs a remux is offered through its `TranscodingUrl` as an
+HLS video copy where the profile allows one: Jellyfin Android TV plays the
+`TranscodingUrl` whenever `SupportsDirectStream` is set, and in that mode
+cannot map the HLS audio track to a stream index, so it restarts playback
+endlessly to "switch" audio. A progressive remux (`SupportsDirectStream` without
+`SupportsDirectPlay`, `static=false`) is offered only when the source has no
+`TranscodingUrl`, for example with `EnableTranscoding=false` or when a
+tone map or subtitle burn-in the encode needs is unavailable, and only when the
+routing policy admits a progressive-remux transport. It evaluates container
+constraints against its MP4 output; direct play evaluates them against the
+original source container.
+
+`EnableDirectStream=false` rules out serving the source streams unchanged but
+not copying video, which only `AllowVideoStreamCopy=false` forbids: such a
+request gets a video copy with the audio encoded when the profile accepts it
+and the encode changes the audio. When the audio is already AAC within the
+channel target, or the source has no audio, the video is encoded instead.
+
+Profile `VideoBitrate` and `AudioBitrate` conditions are in bits per second, as
+in Jellyfin; Silo stores track bitrates in kbps and converts them before
+comparing. When ffprobe reports no bitrate for a Matroska audio track (AAC,
+FLAC, Opus and TrueHD, for example), the scanner reads its `BPS` statistics tag
+(`BPS-eng` first).
+Unknown or excessive source bitrate prevents copying under a client ceiling.
+An automatic VideoToolbox bitrate must not override an explicit client cap.
+The server also applies the account's effective per-stream bitrate limit for
+the request's location (local or remote) at PlaybackInfo negotiation, before it
+advertises direct or transcoded sources.
+A lower client limit wins. Over-limit sources require a compliant video
+transcode; if none is available, PlaybackInfo returns `PlaybackUnavailable`.
+Static direct-play requests without PlaybackInfo cannot transcode an over-limit
+source and receive `PlaybackUnavailable` instead. Negotiated limits are kept
+with the playback session, so policy edits affect only new sessions.
+Query `StartTimeTicks` is honored. Remux-only URLs use `static=false`.
+
+PlaybackInfo never offers a version whose file ffprobe rejected with no usable
+stream data recorded (the native API marks it unreadable). Files that have not
+been probed yet are still offered. When no version the request can use is
+readable, including a `MediaSourceId` that names an unreadable one,
+PlaybackInfo answers as Jellyfin does when nothing can play: `200` with an
+empty `MediaSources` list and `ErrorCode: "NoCompatibleStream"`, which Jellyfin
+Web shows as a playback error instead of trying to play. `GET /Items/{id}`
+still lists such a version, and `Static=true` direct play does not check it.
+
+PlaybackInfo answers the same way when every version is readable but none can
+direct play, direct stream or transcode under the request's limits, unless the
+server's bitrate cap is the reason (that keeps `PlaybackUnavailable`, above).
+H.264 encodes are packaged only as MPEG-TS segments and HEVC encodes only as
+fMP4, so a profile whose HLS transcoding profiles list only `mp4` gets an
+encode only while HEVC encoding is allowed. Streamyfin sends such a profile on
+phones that decode AV1. The `found no route` log line records the profile's
+HLS transcoding containers and whether HEVC encoding is allowed.
+
+Silo gives each version its own `MediaSources[i].Id`, while real Jellyfin reuses
+the item id. Some clients therefore send a media-source id where an item id
+belongs. `PlaybackInfo`, `GET /Items/{id}`, `MediaSegments`, `Download`, static
+`/Videos/{id}/stream`, and the user-data and played-state routes accept a
+media-source id there and resolve it to the item that owns its file (the
+episode for an episode file). On `PlaybackInfo` the id selects that version
+unless the body names a `MediaSourceId`. A stale body `MediaSourceId` falls back
+to the route's version, and a route version the item no longer has answers
+`404`. The negotiated session keeps the client's id as its route item id, so the
+stream URLs it hands out and later session reports can carry that id.
+
+Every compat user is a non-administrator, and only a viewer who may curate
+metadata sees where a file lives or what it is called (see
+[File paths and names](catalog-api.md#file-paths-and-names)). So an item's
+`Path` and `MediaSources[i].Path` are a stand-in, `/silo/{file id}.{container}`,
+and `MediaSources[i].Name` is the version's edition and quality, such as
+`Extended - 2160p HEVC HDR`.
+
+`GET` and `HEAD /Items/{id}/Download` serve the original file through the
+native direct download, the same service as `/api/v2/direct-download`, so they
+follow its rules. Both answer `403` when **Allow downloads** is off, the
+account's download permission is off, or the policy engine refuses the
+download, and `404` for a file outside the viewer's library or quality scope.
+The server and per-user download bandwidth limits pace the transfer. Like
+native downloads, each API server process applies them on its own, to its
+native and Jellyfin downloads together. As with the native
+direct download, these requests create no download record and do not count
+toward the concurrent or per-period download limits: a Jellyfin client
+registers nothing with the server, so there is no download to list, count, or
+revoke. Stream bitrate limits apply to playback, not downloads, as on the
+native API. The response carries the same `ETag` as a `Static=true` stream of
+the file, for clients that resume with `If-Range`.
+
+Playable movies and episodes report `CanDownload: true` wherever the item is
+mapped in full: item detail, `/Items?Ids=` lookups that apply no filter, search
+or sort, and list rows whose `Fields` include `MediaSources` or another field
+that triggers it (`MediaStreams`, `Chapters`, `People`, `ProviderIds`,
+`RemoteTrailers`). Other list rows leave the field out. Every account's policy
+reports `EnableContentDownloading: true`, whatever the account may download.
+Infuse refuses Direct Play of an item it believes it cannot download, so the
+download rules act on the `Download` route alone, and a client may offer a
+download that the route then refuses. A client that saves a file
+from a `Static=true` stream URL looks the same as playback and follows the
+playback rules.
+
+Items whose library generates seek-bar previews carry Jellyfin's `Trickplay`
+member on single-item reads and on list reads that request the field and
+already take the detail path (`Chapters` or `MediaSources` among the
+fields, as Jellyfin Web and Findroid request). It is keyed by media source
+id, then by width as a string, with `Interval` in milliseconds; a version
+without previews is absent. `GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg`
+proxies a sheet (Roku does not follow image redirects) with an `ETag` and
+`private, no-cache`, requiring revalidation after a source switch or
+regeneration, and `…/tiles.m3u8` writes Jellyfin's HLS image playlist.
+Where Jellyfin puts the caller's token on each sheet URL, Silo puts the
+`PlaySessionId` of a live play of the caller that covers that item and
+source: the one the playlist request names, else the most recent. With no
+such play, or when plays cannot be read, the lines carry no credential.
+Sheets are media requests (see below); the playlist requires a login/API
+token. Both pick the version from `mediaSourceId`, else from a media-source
+id in the item position, else the version selected by the play a
+`PlaySessionId` names, else the version this token is playing for the item
+(Swiftfin and Findroid send no `mediaSourceId`), else the default version.
+They serve only versions the account can see, and a sheet a `PlaySessionId`
+authorized only a version that negotiation offered. The selected playback
+file is persisted in compat session state, so previews follow that source
+across API replicas and restarts. An index past the last sheet answers
+`404`.
+
+The managed Jellyfin Web build opts into `SiloSeekReanchor=true` on
+`PlaybackInfo`. For a copied-video HLS source, the response echoes
+`SiloSeekReanchor=true`. The client can seek locally only within the available
+media range and at or after the current generation's requested start position.
+Otherwise it requests fresh `PlaybackInfo` with `StartTimeTicks` and uses the
+new playback-session URL. This applies to forward seeks, backward seeks, and
+initial resume. Video remains copied; audio conversion follows the negotiated
+profile.
+
+An opted-in nonzero start resolves the actual copied-video keyframe before
+starting HLS. The source-aligned playlist uses that origin and actual fragment
+durations; any preceding gap entries represent unavailable media, not playable
+fragments. Client positions and progress remain source-relative Jellyfin ticks.
+Clients that omit the extension retain the existing source-zero HLS bootstrap.
+Unmodified clients still cannot seek beyond a growing copied-video playlist
+without renegotiating; this extension does not claim a complete copy-HLS VOD
+index.
+
+Long-running copied-video sessions retain one observed playlist window and carry
+its source origin forward using actual fragment durations. If an fMP4 session
+loses that observation, bounded probes recover its origin when the generation's
+first fragment remains available to calibrate any muxer timestamp shift.
+MPEG-TS requires an observed window because its timestamps wrap. When the
+required timing evidence is unavailable, start a new playback session rather
+than guessing the source origin. Restarted generations never reuse an older
+generation's timeline.
+
+Deploying the server change requires reinstalling the managed Jellyfin Web
+component to enable its seek handling. The installer applies the source patch
+before building and records `silo-seek-reanchor-v1` in the component provenance.
+If upstream source no longer matches the patch, installation fails while the
+previous active bundle remains available.
+
+`POST /Sessions/Capabilities` and `/Sessions/Capabilities/Full` persist device
+profiles in PostgreSQL when available, keyed by a hash of the login/API token
+and the client device ID. A request without a device ID uses the legacy empty
+scope. Database failures return 503 instead of silently negotiating with a
+profile lost on another API node. Expired registrations are removed in bounded
+batches by the existing hourly cleanup.
+
+Capabilities and `PlaybackInfo` requests accept bodies up to 1 MiB. A stored
+device profile may contain up to 256 KiB of JSON and 1,024 entries total across
+its profile arrays and nested conditions. Larger requests or profiles return
+413. Device IDs longer than 256 bytes are stored under their SHA-256 hash.
+Jellyfin Web derives its device ID from the browser's user agent, and
+Jellyfin accepts these long IDs.
+
+Each login/API token can register up to 64 active device IDs. Registering a new
+ID at capacity returns 429; an existing ID can still update its profile. Expired
+registrations release their slots when the token next registers a profile.
+The quota is enforced across API processes.
+
+Media requests require a login/API token, an unexpired `PlaySessionId` grant,
+or, on a static video stream only, a per-play `tag`. With the setting below
+off, nothing else grants a media request.
+
+`PlaybackInfo` sets each `MediaSources[].ETag` to a per-play value: the play
+session ID in compact form (32 lowercase hex digits) followed by the source's
+16-hex item-detail ETag, and the play records that value for the source. Item
+detail keeps the 16-hex value. Jellyfin for Android TV 0.19+ and its Kotlin
+forks open static direct-play URLs with no auth header, `api_key` or
+`PlaySessionId`, but echo that ETag as `tag` (upstream Jellyfin ignores `tag`).
+So a GET or HEAD of `/Videos/{id}/stream` or `/Videos/{id}/stream.{container}`
+with `Static=true`, a `MediaSourceId`, and a `tag` (parameter name in any case)
+is granted exactly as that play's `PlaySessionId` would be, and the stream is
+served as that play. A 16-hex item-detail ETag, a `tag` repeated with
+different values, or a `tag` on any other route grants nothing. The tag is no
+narrower a credential than the `PlaySessionId` it starts with: whoever holds
+one can send those 32 digits as `PlaySessionId` and reach every source and
+media route that play covers, so a URL carrying a tag needs the same care as
+one carrying a `PlaySessionId`.
+
+The address-only static-stream grant runs only while the administrator turns
+on `jellyfin_compat.address_stream_grant_enabled`; its default is the
+`config.DefaultJellyfinCompatAddressStreamGrantEnabled` constant. Findroid
+sends only `Static=true&MediaSourceId=...` and has no way to carry a
+credential, so it needs this grant. With the setting on, a credential-less GET
+or HEAD of a static video stream with a `MediaSourceId` is served as the caller
+of an authenticated `PlaybackInfo` that offered that item and source from the
+same client address and connection path, has not stopped or expired, and was
+active in the last two hours, while that caller's login or API key is still
+valid. Anyone sharing that address (household or carrier NAT, a VPN exit, a
+proxy that collapses clients to one address) who knows the item and source IDs
+can then stream the file. Each request that reaches this grant reads the
+setting from the database, so a change applies on every API server without a
+restart, and requests that carry a credential never read it. An unreadable
+setting refuses the grant. Each grant is logged as `jellycompat static stream
+granted without credentials` with the negotiating client's name and version.
+
+A grant authorizes GET/HEAD for its negotiated item and source; catalog item and
+source IDs alone are not credentials. An invalid explicit token does not fall
+back to a playback grant, and a grant does not cover a request whose
+`MediaSourceId` spellings name different sources. Revoked owner credentials
+invalidate the grant.
+Media URLs that Silo builds (`DirectStreamUrl`, `TranscodingUrl`, subtitle
+`DeliveryUrl`, attachment URLs, trickplay playlist sheets) carry only
+`PlaySessionId`, never the login token, so a URL recorded by a proxy or player
+log grants that media only until the play session ends. A client that fetches
+one after the play session expired or stopped, or after a newer negotiation
+from the same device replaced an unstarted one, must send its own token.
+A `PlaySessionId` or `tag` grant whose play session cannot be read because the
+database is unavailable answers a retryable `503`, not `401`, unless the API server that
+answers still holds the play session. HLS master playlist, playlist and
+segment requests that carry a token answer the same retryable `503` when their
+play session cannot be read, and so do progressive stream, subtitle and
+attachment requests; a play session that is absent or belongs to another token
+answers `404`. When this API server looks up the media file for one of these
+requests or for a local transcode start, a failed lookup answers a retryable
+`503` and keeps the play session for the retry, and `404` means the file is
+gone; a progressive stream GET or HEAD, or a master playlist GET, that answers it
+ends the play, while a master playlist HEAD keeps it. A remote transcode's failover answers `502` as before. `PlaybackInfo` answers `503` instead of
+returning a `PlaySessionId` it could not store, since other API servers could
+not resolve it.
+
+The HLS master playlist (`/Videos/{id}/master.m3u8` and its `audio-v2`,
+`hevc-v1`, `remux-v1`, `remux-ts-v1` and `remux-dv-v1` forms) answers HEAD as
+well as GET, as Jellyfin does for its master playlists; DLNA controllers check
+a `TranscodingUrl` with HEAD before handing it to a TV. A HEAD answers `200`
+with the playlist content type and no body, `404` when the media file is gone,
+`410` when the play's upstream session has ended, or a retryable `503` when the
+file lookup fails, and starts no transcode;
+the GET starts it, so a HEAD's `200` does not promise the GET a route or
+capacity. Variant playlists and segments are GET only, as in Jellyfin.
+
+Copied-video HLS master playlists name copied audio as Jellyfin 12 does:
+HE-AAC as `mp4a.40.5`, TrueHD as `mlpa`, and DTS as `dtsc`, `dtsh` (DTS-HD HRA
+and MA), or `dtse` (DTS Express). HE-AACv2 is `mp4a.40.29` (RFC 6381), where
+Jellyfin writes `mp4a.40.2`. Copied AV1 Main profile is `av01.0.LLM.DD`, always
+Main tier because the probe does not record the tier. Copied VP9 profiles 0 and
+2 are `vp09.PP.LL.DD`. FFprobe reports no VP9 level, so the level comes from the
+picture size alone, as FFmpeg writes it into the init segment's `vpcC` box;
+Jellyfin also counts the frame rate. These short forms imply BT.709,
+limited-range, non-monochrome video, so HDR, full-range, and monochrome AV1 or
+VP9 get no entry. When Silo cannot name every format a variant carries (an
+unknown level, another AV1 or VP9 profile or color, or copied audio with no
+entry), that variant has no `CODECS` or `SUPPLEMENTAL-CODECS`, where Jellyfin
+writes a partial list or a short form. For Dolby Vision without a compatible
+base layer (HEVC profile 5, AV1 profile 10), a client whose device profile lists
+`DOVI` in a `VideoRangeType` condition also gets Jellyfin 12's `dvh1`/`dav1`
+variant, listed before the fallback variant, unless the copied audio has no
+entry. MPEG-TS remuxes keep the single variant. Audio and subtitle streams
+carry `LocalizedLanguage`, and audio streams carry `LocalizedOriginal`, in
+English. `LocalizedLanguage` and `DisplayTitle` name a tag with a region or
+script by its CLDR name, such as "Brazilian Portuguese" for `pt-BR` or
+"Portuguese (Angola)" for `pt-AO`; `Language` keeps the stored tag. A tag
+with any other subtag, or a script or region CLDR has no name for, keeps the
+title-cased tag ("Ca ES Valencia"), so distinct tags never share a label.
+A video stream's `DisplayTitle` follows Jellyfin's: resolution, upper-cased
+codec, then the Dolby Vision profile or the video range ("4K HEVC Dolby Vision
+Profile 8.1 (HDR10)", "1080p H264 SDR"). Silo also names HDR10+ ("4K HEVC
+HDR10+", "Dolby Vision Profile 8.1 (HDR10+)"), where Jellyfin writes `HDR` and
+`(HDR10)`, writes "Dolby Vision" for a track whose range type names Dolby
+Vision but whose profile was never recorded, where Jellyfin writes `HDR`, and
+leaves out the stream title, which Silo cannot tell apart from ffprobe's codec
+name.
+
+An audio stream's `DisplayTitle` is the language name, the codec (or the
+profile, except AAC's "LC") and the channels ("English - EAC3 5.1"). The file's
+own title tag follows only when it adds a word the label does not already
+carry, such as "English - AAC Stereo - Commentary". A tag made only of words
+from the label, the language's ISO 639 codes, the codec, the channel layout or
+channel words that fit the track ("English", "ENG 5.1", "Surround") is left
+off, while one that contradicts the track ("Mono" on a stereo track, "de-DE"
+on a `de-AT` track) stays. An untagged track gets no suffix: its stored
+`title` is ffprobe's codec long name.
+
+HEVC Dolby Vision Profile 8 with a proven HDR10 base layer and no enhancement
+layer can use HLS fMP4 remux when a positive video-range condition names both
+`DOVI` and `HDR10`. The source retains its `DOVIWithHDR10` metadata and Dolby
+Vision bitstream. Explicit exclusions and all other codec, audio, sample-entry,
+resolution, and level constraints remain enforced. HDR10-only clients do not
+gain this Dolby Vision-preserving route. Original-file direct play is unchanged.
+
+When a client's `VideoRangeType` conditions reject a Dolby Vision stream with
+an HDR10 base layer (HEVC profile 7, or profile 8 with compatibility ID 1) but
+accept HDR10, `PlaybackInfo` offers an HLS remux that strips the Dolby Vision
+RPUs with FFmpeg's `dovi_rpu` filter, as Jellyfin does, and removes a profile 7
+enhancement layer's NAL units with `filter_units`. The client receives the
+HDR10 base layer tagged `hvc1` with `VIDEO-RANGE=PQ`, without a re-encode or
+tone mapping. The strip runs only where the remux routing policy allows: on
+the API server when its FFmpeg has both filters (FFmpeg 7.1 or later), or on a
+transcode node that advertises `server_dv7_to_hdr10`. With no such executor,
+or when the file's RPUs cannot be parsed, negotiation falls back to a full
+encode, which needs tone mapping.
+
+Subtitle inventory preserves text and bitmap tracks. Selected embedded text or
+bitmap subtitles can burn through the existing local or remote full-encode
+path when that output is supported. Unsupported output combinations are not
+advertised as playable.
+
+| Routes | Behavior |
+|---|---|
+| `GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/stream.{format}` | VTT/SRT conversion, Jellyfin `.js` track-event JSON, and requested timing windows; raw ASS when compatible with the request. Subtitle bytes are sent with `Content-Length`, which Infuse needs to load an external subtitle. |
+| `GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/{startPositionTicks}/stream.{format}` | Path start position, with query `StartPositionTicks` taking precedence. |
+| `GET /Videos/{itemId}/{mediaSourceId}/Attachments/{index}` | Actual embedded font bytes by original container stream index, with item/source access checks. |
+| `GET /Playback/BitrateTest` | Returns `Size` random bytes, 1 to 100,000,000; default 102,400. Random bytes keep a compressing proxy from shrinking the probe and inflating the measured bandwidth. |
+
+Text subtitles support `EndPositionTicks`, `CopyTimestamps`, and
+`AddVttTimeMap`. The VTT time map follows the segment container of the play
+session's HLS route. MPEG-TS segments (encoded H.264, `remux-ts-v1`, and
+copied MPEG-2 video) carry the muxer's shift of twice `-max_delay` (10 s): with
+`CopyTimestamps=true` the map is `MPEGTS:900000`, as in Jellyfin, and otherwise
+the start position plus that shift. fMP4 segments (`remux-v1`, `remux-dv-v1`,
+`hevc-v1`, and other copied-video routes) keep the source clock, so the map is
+`MPEGTS:0` or the start position. Direct play and progressive remux have no
+HLS segments and get the same map as fMP4. JSON track events apply the same clipping and timestamp
+rebasing; an empty timing window returns `TrackEvents: []`. Raw ASS requests requiring conversion or time-window rewriting
+return 406. There is no fallback-font service, external/downloaded subtitle
+burn-in, or subtitle HLS playlist implementation. Changing a subtitle filter
+requires fresh playback negotiation.
+
+Stored (downloaded) subtitles take the stream indexes after the file's own
+tracks, in the order they are listed, so deleting one moves the later ones down.
+Their `DeliveryUrl` therefore also carries `StoredSubtitleId`, as the native
+stream route's issued URLs carry `downloaded_subtitle_id`. When the query names
+an ID, the route serves that stored subtitle of the media source's file
+whatever `{index}` says, and answers 404 once it is deleted, for an ID that is
+not one of that file's, or for a malformed ID. A URL without it, as a client
+builds from the index, resolves the index against the current list.
+
+An external subtitle's `Path`, sidecar or stored, is its stream route
+`/Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/stream.{format}` with no
+query, so a client that loads external subtitles by `Path` gets the subtitle.
+A stored subtitle's `Path` therefore resolves by index; only its `DeliveryUrl`
+carries `StoredSubtitleId`.
+
+Extracting an embedded text subtitle reads the whole source file, which can
+take minutes for a large remux on network storage. As in Jellyfin, the first
+request for an embedded text track extracts every text track of the file in
+one pass, and the results are cached on the serving node. A request for a
+track that is already being extracted waits for that pass, and a track with no
+cues is remembered so the file is not read again for it. When `PlaybackInfo`
+offers an embedded text subtitle with `DeliveryMethod: External` (Jellyfin Web
+does) and the viewer's `SubtitleMode` is not `None`, the server starts that
+extraction in the background for the source the client will play, so a later
+switch to any text track is served from the cache. Background extractions share
+the subtitle cache's two server-wide warm slots and are skipped when both are
+busy.
+
+Chrome on macOS decodes H.264 with VideoToolbox, which rejects some open-GOP
+Blu-ray encodes whose I-frames carry recovery points instead of IDR frames and
+a new PPS per GOP. Copied video from such a file stops with
+`PIPELINE_ERROR_DECODE` (`-12909`); Jellyfin Web then reloads the stream, which
+shows as periodic stutter. The bitstream is valid, and Jellyfin copies H.264 the
+same way. Turning off hardware video decoding in Chrome avoids it.
+
+## Sessions and socket
+
+Sign-in refuses an account holding a temporary password with `401` and a message to
+sign in to Silo first: Jellyfin clients cannot run the password change it requires
+(see [temporary passwords](auth-api.md#temporary-passwords)). The account's other
+state is unaffected, and signing in works again once the password is changed.
+
+Each sign-in, by password or Quick Connect, opens its own Silo login session, and the
+compat session lives only as long as it (see
+[login sessions](auth-api.md#login-sessions)). Every authenticated request, stream
+grant, and socket re-check reads the stored compatibility session and looks its login
+session up, two indexed reads, on whichever node answers. A revoked or expired
+login session ends the compat session with `401`; a lookup that fails is a
+retryable `503` and keeps it. `sa_` API keys have no login session and are checked
+as keys instead.
+
+With the Postgres user store, deleting a profile deletes the compatibility sessions
+signed in as it in the same transaction, so their next request gets `401` on every
+node. With the SQLite user store they are deleted after the profile; if that fails,
+the profile stays deleted, the error is logged, and the sessions keep working until
+they expire or the account is signed out. The account's other profiles keep their
+sessions.
+As with token logout below, an open socket closes at its next re-check and signed
+node stream URLs already issued keep their lifetime.
+
+Once token logout deletes the stored compatibility row, later checks through the
+session store refuse it on every node, including media requests and playback-grant
+resolution. Cached copies and missed eviction events do not grant authority. Other
+compatibility sessions and the linked native login session are unchanged. A request
+whose authority read preceded a concurrent logout may finish. Already issued signed
+node stream URLs retain their existing lifetime; logout does not withdraw them or
+cancel a transfer already authorized. Socket re-check timing is unchanged.
+
+`POST /Sessions/Logout` drops this node's cached copy of the compat session and
+deletes its stored row, returning `204` when the row is deleted or was already
+gone. When the delete fails it returns `500` with `Error: "ServerError"` and
+`Message: "Could not sign out"`. The stored row normally survives that failure,
+so the token keeps working until a later sign-out succeeds or the session
+expires; jellyfin-web clears its saved token whatever the status. The route
+authenticates first, so retrying after a delete that completed despite the error
+returns `401`.
+
+### Quick Connect
+
+Jellyfin apps sign in with Quick Connect on top of Silo's device sign-in
+([device-login.md](architecture/device-login.md#jellyfin-quick-connect)). It
+needs no Silo password, so it also serves accounts that sign in only through an
+external provider, and it picks the profile without the `username#profile`
+syntax.
+
+| Route | Behavior |
+|---|---|
+| `GET /QuickConnect/Enabled` | `true` whenever device sign-in is wired. |
+| `POST /QuickConnect/Initiate` (and `GET`, for Jellyfin 10.8 apps) | Opens a request and answers Jellyfin's `QuickConnectResult`: a six-digit `Code` without a leading zero, a 64-character hex `Secret`, and `DeviceName`, `AppName`, `DeviceId` and `AppVersion` from the MediaBrowser authorization header. |
+| `GET /QuickConnect/Connect?secret=` | `Authenticated: false` while pending, `true` once approved or collected, with the same `Code` on every poll. A denied, expired or unknown request is `404`, so the app stops polling. The secret parameter matches in any case. |
+| `POST /QuickConnect/Authorize?code=` | From an app already signed in here: approves the code for the session's own account and profile and answers `true`. An API key is refused; `userId`, if given, must be the session's own user (`403`). An unknown or finished code is `404`, a code another approver already approved is `409`, and a spent code budget is `429` with `Retry-After`. |
+| `POST /Users/AuthenticateWithQuickConnect` | Exchanges the secret of an approved request for a session answered like `AuthenticateByName`. Asking again with the same secret while the request lives returns the same session, as Jellyfin does, so an app that lost the answer can still sign in; once the app signs out, it is `404`. Its user name is what password sign-in accepts for the same profile: `username#profile`, or the bare account name for the profile named after the account. A secret that is not approved is `404`. |
+
+A person approves the code on `/activate` or in a Silo app, choosing one of the
+account's profiles (a PIN profile needs its PIN), or from a signed-in Jellyfin
+app with `Authorize`. The request expires, is held open by approver lookups,
+and survives a node restart exactly as a device sign-in request does. Jellyfin
+has no route for an app to withdraw its own request; an abandoned code expires.
+Authorize also spends the account's Quick Connect code budget; the
+per-address budgets are listed under [Rate limiting](#rate-limiting).
+
+`GET /Sessions` lists started playback mappings owned by the caller's token,
+including mappings persisted by another API process. Device and activity filters
+apply to the returned list. Each entry's `Id` is 32 lowercase hex characters
+that stay the same for the life of the play; it is derived from the
+`PlaySessionId`, is not accepted in its place, and authorizes nothing. Current native play state is included when locally
+available and its account/profile ownership matches; unavailable remote state
+is omitted.
+
+Direct players such as webOS may send an empty `PlaySessionId` on
+`/Sessions/Playing`, `/Sessions/Playing/Progress`, and `/Sessions/Playing/Stopped`.
+Silo saves their reported position when the authenticated item/source identifiers
+match exactly one started, active playback. Pending negotiations and terminal
+sessions do not qualify; ambiguous matches are ignored. A final stop sample is
+saved even when the viewer did not pause first. Samples remain last-write-wins,
+including backward seeks to a positive position. Zero or omitted positions leave
+the bookmark unchanged so startup reports cannot erase a saved resume point.
+Without a per-play identifier a delayed sample cannot be distinguished from a new one. Unidentified stops do not change audio selection
+or tear down resources. Native idle cleanup reaps the upstream session, but the
+compatibility mapping remains routable until its configured expiry. A later play
+that creates another mapping for the same item can make ID-less reports ambiguous
+until the old mapping expires. Clients that send a valid per-play identifier
+retain immediate, generation-scoped teardown.
+ID-less static requests reject ambiguous matches and failed durable identity
+lookups rather than selecting another session. Durable identity checks remain
+fresh on every request; full session payloads use the normal per-session cache.
+
+A play ends at the first Stopped report carrying its per-play identifier or
+`DELETE /Videos/ActiveEncodings`; for ID-less players and clients that never
+stop, idle cleanup ends it. Silo then records the play the way it records native
+playback: a watch-history row with source `playback` once the position passes the
+minimum resume threshold, completed past the watched threshold, and an admin
+playback-history row. Each play is recorded once across retried stops, API
+replicas, and idle cleanup; a later copy of the session that saw more of the play
+completes the row and updates the admin row's watched time. The play's resume
+point comes from the client's reports, not from the stop. A play torn down before any position report, such as
+a start that failed to route, is not recorded. Mark-played requests keep writing
+`jellycompat` history rows.
+
+`POST /Sessions/Playing/Ping` touches the caller-owned playback activity without
+changing position or paused state. The native session owner consumes persisted
+activity before idle cleanup, so pings remain effective across API replicas.
+Shared expiry and pings are serialized: a successful ping prevents stale cleanup,
+while an already-retired session rejects the ping. A shared-store failure defers
+compat session cleanup instead of treating unknown activity as inactivity.
+Retained compatibility sessions count toward stream and transcode limits until
+removal; shared-store failures conservatively retain that capacity.
+Pings do not extend the absolute playback-grant lifetime; expiry requires fresh
+playback negotiation. `/socket` uses the Jellyfin keepalive
+exchange: `ForceKeepAlive` with a 60-second timeout and `KeepAlive`
+acknowledgements. Connections are bounded and periodically revalidate login/API
+credentials. Remote-control capabilities are false; accepting a socket does not
+claim remote-control command support.
+
+## Rate limiting
+
+The listener uses the native API's rate limiter instance, so the admin
+rate-limit settings, their hot reloads, and the counters (in memory or Redis)
+are shared with the native API. Budgets key on the resolved client IP, after
+trusted-proxy resolution and ingress-token stripping, as on the native API. A
+sign-in whose client IP came from forwarding headers also spends the
+connection's shared budget, as described in
+[Sign-in rate limits](auth-api.md#sign-in-rate-limits).
+
+- `POST /Users/AuthenticateByName` spends the per-IP and `login` budgets before
+  the global budget, like native sign-in (`POST /api/v2/auth/login`). It shares
+  the per-IP `login` counter with every native operation that spends that
+  budget. The account name also spends its
+  sign-in attempt budget, shared with native sign-in on every node
+  ([Sign-in attempts per name](auth-api.md#sign-in-attempts-per-name)); a
+  locked name answers 429 `TooManyRequests` with `Retry-After`. It reads at
+  most 64 KiB of the body: when decoding the JSON value needs more, it answers
+  413 with `{"Error":"PayloadTooLarge",...}` before any credential check. Only
+  the first JSON value is decoded; data after it is ignored, not rejected. A
+  server too busy to check the password answers 503 `ServiceUnavailable`
+  with `Retry-After`, not a wrong password (see
+  [When the server is too busy to check a password](auth-api.md#when-the-server-is-too-busy-to-check-a-password)).
+- The Quick Connect routes spend the native device sign-in budgets, as the
+  native device operations do: Initiate spends `device_start`, Connect and
+  `/Users/AuthenticateWithQuickConnect` spend `device_poll`, and Authorize
+  spends `device_lookup` in place of the generic limiter.
+- Authenticated routes, media and HLS included, run the generic limiter
+  (global, per-IP and account) after authentication, as the native authenticated routes
+  and v2 playback delivery do. Unauthenticated requests are refused before they
+  spend budget. Compat auth sets no native API-key claims, so the per-API-key
+  tier budget does not apply here. Compat sessions, admin API keys, explicit
+  `PlaySessionId` grants and per-play `tag` grants charge the owning login
+  account, shared with its native sessions and keys. The address-only
+  static-stream grant, which runs only while
+  `jellyfin_compat.address_stream_grant_enabled` is on, carries no caller
+  credential and spends only source/global budgets, without charging an
+  inferred owner's account. See [Authenticated account allowance](auth-api.md#authenticated-account-allowance)
+  for defaults and settings.
+- Anonymous routes are not limited: item and user images, `/api/v2/artwork/*`,
+  `/web/*`, and the public `/System/*`, `/Branding/Configuration`,
+  `/QuickConnect/Enabled`, and `/Users/Public` reads. Native artwork and public
+  server reads are not limited either.
+
+A limited request answers 429 with `Retry-After` and the `X-RateLimit-*`
+headers, in the listener's error envelope:
+`{"Error":"TooManyRequests","Message":"..."}`. With rate limiting disabled the
+listener applies no request limit. Profile PIN attempts keep their separate
+per-profile budget (see [auth-api.md](auth-api.md)).
+
+## Scope and deployment
+
+Migration `20260905013651_jellycompat_device_profiles.sql` creates the shared
+capability registration table. Migration
+`20260905015236_preserve_explicit_progress_event_time.sql` preserves an explicit
+Jellycompat event date while the write timestamp and sync cursor advance. The
+writer selects this behavior within its transaction; ordinary native writes
+retain their existing timestamp behavior. These migrations do not change native
+client API shapes.
+Apple and Android native clients keep their existing settings and playback
+contracts; shared font extraction retains the native font-bundle format.
+
+New installs report Jellyfin `12.1.0` and install Jellyfin Web `12.1`.
+Migration `20260923181531_jellyfin_compat_12_1_new_install_defaults.sql`
+replaces the `10.12.0` emulated-version seed (a version Jellyfin never
+released) only on databases that have not completed setup, and pins
+configured servers that never stored a Jellyfin Web version to the previous
+default, `10.11.6`. Existing servers keep what they report and install until an
+admin changes it in the Jellyfin compatibility settings.
+
+Jellyfin 12 behavior not yet provided: `MediaStream.IsOriginal` (needs the
+probed `original` disposition in the native track model), the
+`VideoRotation` profile condition and `VideoRotationNotSupported` reason
+(rotation is not probed), external delivery of PGS and VobSub tracks during
+direct play or remux (they burn in), `excludeActiveSessions` on resume lists,
+and `Accept-Language` localization.
+`/Devices`, `/Playlists`, and SyncPlay group operations are not served.
+`/SyncPlay/List` only provides the empty discovery response described above.
+
+The compatibility surface does not add audio-library playback, Live TV, IPTV,
+DVR, or `.strm` support. See `docs/non-goals.md` for permanent product boundaries.
+
+## Local theme audio
+
+`GET /Items/{id}/ThemeSongs` and `/Users/{userId}/Items/{id}/ThemeSongs`
+return `Items`, `TotalRecordCount`, `StartIndex`, and the resolved `OwnerId`.
+The corresponding `ThemeMedia` routes wrap that result in `ThemeSongsResult`;
+`ThemeVideosResult` and `SoundtrackSongsResult` remain empty. Both discovery
+forms honor `inheritFromParent` and `sortBy=Random`, and recheck item visibility.
+Omitting `inheritFromParent` defaults to `false`, as in Jellyfin.
+Theme IDs are stable numeric encodings that survive a server restart.
+Theme items include `ServerId` and can be fetched through `GET /Items/{id}`
+or `/Users/{userId}/Items/{id}` before playback. These lookups recheck visibility.
+
+The authenticated `GET|HEAD /Audio/{itemId}/stream`,
+`/Audio/{itemId}/stream.{container}`, and `/Audio/{itemId}/universal` routes
+serve theme audio. The original is served, with range and conditional-request
+support, when the accepted containers, codecs, channel limits, and bitrate
+limits permit it. Otherwise the request may receive a progressive AAC
+conversion in audio-only MP4 if it names an MP4 target and accepts AAC: a
+`stream.mp4`/`stream.m4a` route or `container=mp4|m4a` on the stream routes, or
+`TranscodingContainer=mp4|m4a` over HTTP on the universal route. `static=true`
+asks for the original only. The conversion honors `MaxAudioChannels=1` or
+`TranscodingAudioChannels=1`, caps its bitrate at 192 kbps and at any bitrate
+limit in the request, and seeks to `StartTimeTicks`. It has no byte ranges.
+HLS theme transcoding (`TranscodingProtocol=hls`, which Jellyfin Web requests)
+and requests that name no MP4 target return `400 PlaybackUnavailable`.
+Selecting a specific audio stream is unsupported. Transcode fallback hints on
+a universal request do not prevent direct play when the original fits.
+Theme audio follows the playback routing policy like compatibility video: a
+theme routed through a proxy is a `307` redirect to that proxy, and a policy no
+route satisfies answers `503` with the routing-policy or capacity code.
+For universal audio, `Container` declares accepted direct-play formats, including
+`container|codec` entries. `AudioCodec`, `AudioBitRate`, and
+`TranscodingAudioChannels` describe the fallback encoder. When the source bitrate
+is unknown, `MaxStreamingBitrate` uses Jellyfin's conservative 40 Mbps estimate. The
+stream routes treat `AudioCodec` as a constraint on the original audio.
+Themes do not create playback sessions or update watched state.
+
+See [local theme songs](catalog-api.md#local-theme-songs-v2) for file conventions,
+ownership, inheritance, and routing.
+
+## HEVC video encoding
+
+`playback.allow_hevc_encoding` enables HEVC output for negotiated HLS
+transcoding profiles that explicitly accept HEVC in fragmented MP4. The selected
+codec is preserved in the playback source, FFmpeg recipe, and restart recovery.
+Encoded HEVC playlists and segments use `/Videos/{id}/hevc-v1/...`; older
+API instances reject these routes during rolling upgrades instead of serving
+H.264 bytes for the negotiated HEVC stream.
+H.264 remains the fallback when the setting is disabled or the client profile
+cannot accept HEVC output, or no executor allowed by routing policy supports
+the complete HEVC recipe. Required audio conversion and tone mapping must be
+available on that same executor. Negotiation reads workers' stored capability
+reports; execution checks the selected worker again. Existing HEVC direct-play
+and remux routes are unchanged.
+
+## Encode limits
+
+As in Jellyfin, an H.264 encode targets the smallest `LessThanEqual` limits a
+profile sets on `VideoBitrate`, `Height` and `Width`, in its `Video` codec
+profiles for `h264` (those without a `Container` or `ApplyConditions`) and its
+HLS video transcoding profiles, instead of being refused for exceeding them:
+the video bitrate is capped and the frame is scaled to fit, keeping its aspect
+ratio. Unlike Jellyfin, the video bitrate also stops at the source's video
+rate, converted to the output codec's efficiency, so a client's generous
+`MaxStreamingBitrate` does not inflate the encode. The ceiling alone picks the
+frame size, so the source's rate never lowers it. A stored device profile keeps
+`IsRequired: false`; a missing key reads back as `true`. A profile that lists
+transcoding profiles but no `DirectPlayProfiles` gets no direct play or
+direct stream, as in Jellyfin; Roku clients send one to ask for a remux after
+direct play fails.
+
+## Transcode reasons
+
+`TranscodingUrl` carries a `TranscodeReasons` query parameter with Jellyfin's
+reason names. A video copy reports `ContainerNotSupported`, plus
+`AudioChannelsNotSupported` or `AudioCodecNotSupported` when the audio is
+encoded. A video encode reports one video reason: `SubtitleCodecNotSupported`
+for a burn-in, else `VideoBitrateNotSupported`, `VideoResolutionNotSupported`
+or `VideoCodecNotSupported`. Clients read it from the URL: Moonfin for Roku
+shows a text subtitle itself over a copy and asks for a burn-in only over an
+encode. Without the parameter, it took every copy for an encode and restarted
+it with the subtitle burned in. The HLS routes ignore the parameter.
+
+## Roku MPEG-TS copies
+
+Roku players can play the audio of an fMP4 HLS copy silently, as JellyRock
+documents, and Roku clients list their MPEG-TS transcoding profile first. A
+video-copy HLS stream for a client whose user agent starts with `Roku/` and
+whose profile offers MPEG-TS HLS is therefore packaged as MPEG-TS on the
+`remux-ts-v1` route, like the webOS Dolby Vision copies. The Dolby Vision strip
+keeps fMP4.
+
+Any other client that lists the source codecs for MPEG-TS HLS but not for fMP4
+also gets a video copy as MPEG-TS. This covers H.264 and HEVC with AAC, AC-3,
+E-AC-3, or MP3 audio; other audio converts to AAC when the profile accepts it.
+
+The webOS rule: a video-copy HLS stream of a Dolby Vision profile 5 or 8 source
+is packaged as MPEG-TS on the same route when the client's user agent contains
+`webOS` or `Web0S`, in any case, unless the source plays directly or takes the
+Dolby Vision strip. The device profile's MPEG-TS support is not checked.
+
+## AAC encodes
+
+Compatibility audio encodes are AAC, which FFmpeg's encoder writes as AAC-LC;
+the negotiated output states that profile, so codec-profile rules on
+`AudioProfile` (Roku requires `!= Main`) evaluate against it. Roku clients
+(jellyfin-roku and Moonfin for Roku) leave AAC out of their video transcoding
+profiles although every Roku decodes stereo AAC (JellyRock fixed the same bug
+by always listing it first), so a transcoding profile without AAC still admits
+the stereo AAC encode when the profile declares AAC decode in a video
+direct-play or `VideoAudio` codec profile.

@@ -1,0 +1,113 @@
+name: Set up Go for this repository
+description: >-
+  Installs the latest Go 1.27 patch, a shared module cache, a
+  per-commit build cache, and the stub frontend bundle that cmd/silo embeds,
+  then waits for the libvips install the job started before checkout.
+
+inputs:
+  cache-name:
+    description: >-
+      Distinguishes the build cache of one job from another's. Jobs compile
+      different things (a lint job type-checks, a test job builds test
+      binaries), so each keeps a cache that matches its own work.
+    required: true
+
+outputs:
+  cache-key:
+    description: The primary key to save after pruning the build cache.
+    value: ${{ steps.cache.outputs.cache-primary-key }}
+
+  module-cache-key:
+    description: The primary key for the shared module cache.
+    value: ${{ steps.modules.outputs.cache-primary-key }}
+
+  module-cache-hit:
+    description: Whether the shared module cache matched its exact key.
+    value: ${{ steps.modules.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    # setup-go's own cache is keyed on go.mod and written only on a
+    # miss, so between dependency bumps every run restored a build cache
+    # from weeks ago and recompiled the tree. The cache below is keyed on the
+    # commit and restored by prefix, so each run starts from the newest
+    # cache any earlier run saved.
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '>=1.27 <1.28'
+        # Without check-latest, an older 1.27 cached on the runner image wins
+        # and govulncheck fails on standard library fixes it lacks.
+        check-latest: true
+        cache: false
+
+    - name: Read the Go version
+      id: go
+      shell: bash
+      run: echo "version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore the shared Go module cache
+      if: runner.environment == 'github-hosted'
+      id: modules
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/go/pkg/mod
+        key: go-mod-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('**/go.mod') }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          go-mod-${{ runner.os }}-${{ steps.go.outputs.version }}-
+
+    # The restore below unpacks the build cache while libvips installs in the
+    # background. On tmpfs, those writes and the job's compile output stay off
+    # the disk the install writes to. The path, and so the cache key, is unchanged.
+    - name: Keep the Go build cache in memory
+      if: runner.environment == 'github-hosted'
+      shell: bash
+      run: |
+        mkdir -p ~/.cache/go-build
+        sudo mount -t tmpfs -o "uid=$(id -u),gid=$(id -g),mode=0755" tmpfs ~/.cache/go-build
+
+    - name: Restore the Go build cache
+      if: runner.environment == 'github-hosted'
+      id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/go-build
+        key: go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+        restore-keys: |
+          go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-
+          go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-
+
+    - name: Mark restored Go cache entries unused
+      if: runner.environment == 'github-hosted'
+      shell: bash
+      run: |
+        cache_dir="$(go env GOCACHE)"
+        mkdir -p "$cache_dir"
+        # Go marks use at most hourly; epoch mtimes force used entries to advance and leave unused entries at epoch.
+        find "$cache_dir" -mindepth 2 -maxdepth 2 \( -name '*-a' -o -name '*-d' \) -exec touch -d '@0' {} +
+        # A fresh trim stamp stops Go's daily trim from deleting those entries before the job uses them.
+        date +%s > "$cache_dir/trim.txt"
+
+    # cmd/silo embeds the built frontend, so nothing under ./... compiles
+    # without web/dist. The Go jobs never serve it, so a placeholder is
+    # enough; the Docker workflow builds the real bundle.
+    - name: Stub the embedded frontend bundle
+      shell: bash
+      run: make embed-stub
+
+    # Nothing compiles without libvips, so the wait only guards against an
+    # install that never reports back; apt times out and retries a stalled
+    # download itself. When the runner image has no cached packages, the
+    # install downloads about 150 packages, which a slow Ubuntu mirror stretches
+    # to several minutes.
+    - name: Wait for libvips
+      shell: bash
+      run: |
+        timeout 900 sh -c 'until [ -s "$RUNNER_TEMP/libvips.status" ]; do sleep 1; done' || {
+          echo "::error::The libvips install did not finish within 15 minutes."
+          cat "$RUNNER_TEMP/libvips.log"
+          exit 1
+        }
+        cat "$RUNNER_TEMP/libvips.log"
+        exit "$(cat "$RUNNER_TEMP/libvips.status")"

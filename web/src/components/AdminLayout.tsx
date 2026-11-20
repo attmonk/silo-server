@@ -1,0 +1,229 @@
+import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { Outlet, useLocation } from "react-router";
+import AdminSidebar from "@/components/AdminSidebar";
+import { AdminSectionCommandDialog } from "@/components/AdminSectionCommandDialog";
+import ServerActivity from "@/components/ServerActivity";
+import { RestartBanner } from "@/components/admin/RestartBanner";
+import { PageFrame } from "@/components/page/PageHeader";
+import { RouteLoading } from "@/components/RouteLoading";
+import {
+  Sheet,
+  SheetClose,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@/components/ui/sheet";
+import { AdminNavTopicsProvider } from "@/hooks/useAdminNavTopics";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { useAdminMessages, useT } from "@/i18n";
+import { useAdminPluginInstallations } from "@/hooks/queries/admin/plugins";
+import { usePolicyCapability } from "@/hooks/queries/admin/policy";
+import { useAdminServerStatus } from "@/hooks/queries/admin/settings";
+import { buildAdminCommandNavSections } from "@/lib/adminNavigation";
+import { resolveAdminDocumentTitle, resolveAdminHeaderTitle } from "@/lib/documentTitle";
+import { SEARCH_SHORTCUT_LABEL } from "@/lib/keyboardShortcut";
+import { Menu, Search, X } from "lucide-react";
+import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
+import { useAudiobookPlaybackController } from "@/pages/audiobooks/player/audiobookPlaybackContext";
+
+const ADMIN_DESKTOP_MEDIA_QUERY = "(min-width: 64rem)";
+/** The play-mark glyph on the phone header's logo tile; not text. */
+const LOGO_GLYPH = "▶";
+
+export default function AdminLayout() {
+  return (
+    <AdminNavTopicsProvider>
+      <AdminShell />
+    </AdminNavTopicsProvider>
+  );
+}
+
+function AdminShell() {
+  // Admin text is its own catalog chunk; show the route loading state until it has loaded.
+  return useAdminMessages() ? <AdminLayoutContent /> : <RouteLoading />;
+}
+
+function AdminLayoutContent() {
+  const t = useT();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [commandOpen, setCommandOpen] = useState(false);
+  const location = useLocation();
+  const { data: adminInstallations } = useAdminPluginInstallations();
+  const policyCapability = usePolicyCapability();
+  // The one restart prompt for the admin area. Read here, not in a page: a
+  // restart is owed by the server, not by the page that happened to ask for
+  // it, so the prompt has to survive navigating away from settings. The query
+  // is shared and cached, so the settings overview reading the same status
+  // costs nothing extra.
+  const { data: serverStatus } = useAdminServerStatus();
+  // Mounted here rather than on the dashboard so Cmd+K reaches every admin
+  // page, which is what the pages that advertise the shortcut assume.
+  const adminSearchSections = useMemo(
+    () =>
+      buildAdminCommandNavSections(adminInstallations, {
+        policyEditorAvailable: policyCapability.data?.editor_available === true,
+      }),
+    [adminInstallations, policyCapability.data?.editor_available],
+  );
+  const { isBackgroundBarVisible } = useWatchPlaybackController();
+  const audiobookPlayback = useAudiobookPlaybackController();
+  const hasBackgroundBar = isBackgroundBarVisible || audiobookPlayback?.isBackgroundBarVisible;
+  const documentTitle = resolveAdminDocumentTitle(location.pathname);
+  const mobileTitle = resolveAdminHeaderTitle(location.pathname);
+
+  useDocumentTitle(documentTitle);
+
+  // Publish this shell on the document root, as Layout does with
+  // `data-app-shell`. Out-of-tree chrome (the audiobook MiniBar, which stays
+  // mounted across admin navigation) sets its start edge from
+  // `--app-sidebar-offset`, and app.css resolves that to this shell's fixed
+  // 240px sidebar only while the attribute is present; otherwise the bar
+  // would start at 0px and paint over the bottom of the admin navigation.
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.dataset.adminShell = "true";
+    return () => {
+      delete root.dataset.adminShell;
+    };
+  }, []);
+
+  useEffect(() => {
+    const desktopMedia = window.matchMedia(ADMIN_DESKTOP_MEDIA_QUERY);
+    const closeMobileNavigation = (event: MediaQueryListEvent) => {
+      if (event.matches) {
+        setMobileOpen(false);
+      }
+    };
+
+    desktopMedia.addEventListener("change", closeMobileNavigation);
+    return () => desktopMedia.removeEventListener("change", closeMobileNavigation);
+  }, []);
+
+  return (
+    <div className="bg-background relative min-h-[100dvh] overflow-x-hidden">
+      <AdminSectionCommandDialog
+        sections={adminSearchSections}
+        open={commandOpen}
+        onOpenChange={setCommandOpen}
+      />
+      <a
+        href="#main-content"
+        className="focus:bg-background focus:text-foreground focus:ring-ring sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-lg focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:ring-2 focus:outline-none"
+      >
+        {t("web.admin.shell.skipToContent")}
+      </a>
+      <div className="from-primary/6 pointer-events-none fixed inset-x-0 top-0 z-0 h-40 bg-gradient-to-b to-transparent blur-3xl" />
+      {/* Desktop sidebar, with the admin search at its top */}
+      <div className="hidden lg:block">
+        <AdminSidebar onSearch={() => setCommandOpen(true)} />
+      </div>
+
+      <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
+        {/* Mobile header */}
+        <div className="glass-dark border-border/70 sticky top-0 z-30 mx-3 mt-3 flex items-center justify-between rounded-2xl border px-3 py-2.5 lg:hidden">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <SheetTrigger asChild>
+              <button
+                className="text-muted-foreground hover:text-foreground hover:bg-accent/60 focus-visible:ring-ring/60 flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all focus-visible:ring-[3px] focus-visible:outline-none"
+                aria-label={t("web.admin.shell.mobileHeader.openNavigation")}
+              >
+                <Menu className="h-5 w-5" />
+              </button>
+            </SheetTrigger>
+            <div className="flex min-w-0 items-center gap-2">
+              <div className="text-primary border-border/70 bg-surface flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border text-sm font-bold">
+                {LOGO_GLYPH}
+              </div>
+              <div className="min-w-0">
+                <span className="text-muted-foreground block text-[10px] leading-none font-semibold tracking-[0.16em] uppercase">
+                  {t("web.admin.shell.mobileHeader.eyebrow")}
+                </span>
+                <span className="mt-1 block truncate text-[15px] leading-none font-extrabold tracking-tight">
+                  {mobileTitle}
+                </span>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1">
+            <AdminSearchButton onClick={() => setCommandOpen(true)} />
+            <ServerActivity className="h-11 w-11" />
+          </div>
+        </div>
+
+        {/* Mobile sidebar drawer */}
+        <SheetContent
+          side="left"
+          showCloseButton={false}
+          onCloseAutoFocus={(event) => {
+            if (window.matchMedia(ADMIN_DESKTOP_MEDIA_QUERY).matches) {
+              event.preventDefault();
+              document.getElementById("main-content")?.focus({ preventScroll: true });
+            }
+          }}
+          className="w-[320px] max-w-[calc(100vw-3rem)] gap-0 border-e-0 p-0 sm:max-w-[320px]"
+        >
+          <SheetHeader className="sr-only">
+            <SheetTitle>{t("web.admin.shell.drawer.title")}</SheetTitle>
+          </SheetHeader>
+          <SheetClose asChild>
+            <button
+              type="button"
+              aria-label={t("web.admin.shell.drawer.close")}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent focus-visible:ring-ring/60 absolute end-4 top-4 z-10 flex h-11 w-11 items-center justify-center rounded-xl transition-colors focus-visible:ring-[3px] focus-visible:outline-none"
+            >
+              <X className="h-5 w-5" aria-hidden="true" />
+            </button>
+          </SheetClose>
+          <AdminSidebar embedded onNavigate={() => setMobileOpen(false)} />
+        </SheetContent>
+      </Sheet>
+
+      {/* Desktop activity indicator; search lives in the sidebar */}
+      <div className="fixed end-5 top-5 z-40 hidden items-center gap-2 lg:flex">
+        <ServerActivity />
+      </div>
+
+      {/* `lg:pt-16` starts the content below the fixed activity control
+          (top-5, h-9 → it ends 3.5rem down). With less, a page
+          header's right-aligned buttons sit underneath them until the capped
+          content column pulls away from the viewport's right edge.
+          `--page-gutter` is published so fixed page chrome (the collection
+          editor's save bar) can line up with the content column. */}
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className={`relative z-10 min-h-screen min-w-0 px-(--page-gutter) py-4 [--page-gutter:1rem] sm:[--page-gutter:1.5rem] lg:ms-[240px] lg:pt-16 lg:pb-8 lg:[--page-gutter:2rem] xl:[--page-gutter:2.5rem] ${
+          hasBackgroundBar ? "pb-32 sm:pb-36" : ""
+        }`}
+      >
+        <PageFrame className="admin-shell">
+          {/* Above the routed page and inside the content column, so every
+              admin page carries the prompt and none of them can be covered by
+              it. */}
+          <RestartBanner
+            restartRequired={serverStatus?.restart_required}
+            restartSignal={serverStatus?.restart_mark_count}
+          />
+          <Outlet />
+        </PageFrame>
+      </main>
+    </div>
+  );
+}
+
+/** The phone header's search button; desktop has the field in the sidebar. */
+function AdminSearchButton({ onClick }: { onClick: () => void }) {
+  const t = useT();
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={t("web.admin.shell.search.label")}
+      title={t("web.admin.shell.search.title", { shortcut: SEARCH_SHORTCUT_LABEL })}
+      className="text-muted-foreground hover:text-foreground hover:bg-accent/60 focus-visible:ring-ring/60 border-border/70 bg-surface/70 flex h-11 w-11 items-center justify-center rounded-xl border transition-colors focus-visible:ring-[3px] focus-visible:outline-none"
+    >
+      <Search className="h-4 w-4" aria-hidden="true" />
+    </button>
+  );
+}

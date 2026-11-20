@@ -1,0 +1,689 @@
+package jellycompat
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/logredact"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+
+	"github.com/Silo-Server/silo-server/internal/activitylog"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/ratelimit"
+)
+
+type sessionContextKey string
+
+const (
+	compatSessionKey sessionContextKey = "jellycompat_session"
+	// compatPlaybackGrantKey carries the negotiation whose PlaySessionId
+	// authorized a media request, when one did.
+	compatPlaybackGrantKey sessionContextKey = "jellycompat_playback_grant"
+)
+
+var mediaBrowserTokenPattern = regexp.MustCompile(`(?i)token="?([^",\s]+)"?`)
+
+const (
+	tokenRefreshBuffer  = 5 * time.Minute
+	tokenRefreshTimeout = 30 * time.Second
+)
+
+// tokenRefresher exchanges a session's Silo refresh token for a new pair;
+// *auth.Service implements it.
+type tokenRefresher interface {
+	Refresh(ctx context.Context, refreshToken string) (*auth.TokenPair, error)
+}
+
+// Authenticator extracts Jellyfin-style auth tokens and resolves compat sessions.
+type Authenticator struct {
+	sessions *SessionStore
+	// refresher is nil when no auth service is configured; sessions then
+	// keep their Silo tokens unrefreshed.
+	refresher tokenRefresher
+	now       func() time.Time
+}
+
+// NewAuthenticator creates a new compat authenticator.
+func NewAuthenticator(sessions *SessionStore, authService *auth.Service) *Authenticator {
+	a := &Authenticator{sessions: sessions, now: time.Now}
+	if authService != nil {
+		a.refresher = authService
+	}
+	return a
+}
+
+// ExtractToken extracts a compat token from Jellyfin-style request auth.
+// Checks Authorization, X-Emby-Authorization, X-Emby-Token,
+// X-Mediabrowser-Token headers and api_key query parameter.
+func ExtractToken(r *http.Request) (string, bool) {
+	// Check Authorization and X-Emby-Authorization headers for Bearer or
+	// MediaBrowser Token="..." formats.  The Jellyfin Kotlin SDK (used by
+	// Findroid and other Android clients) sends X-Emby-Authorization.
+	for _, headerName := range []string{"Authorization", "X-Emby-Authorization"} {
+		if header := strings.TrimSpace(r.Header.Get(headerName)); header != "" {
+			parts := strings.SplitN(header, " ", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+				token := strings.TrimSpace(parts[1])
+				if token != "" {
+					return token, true
+				}
+			}
+			if match := mediaBrowserTokenPattern.FindStringSubmatch(header); len(match) == 2 && match[1] != "" {
+				return match[1], true
+			}
+		}
+	}
+
+	if token := strings.TrimSpace(r.Header.Get("X-Emby-Token")); token != "" {
+		return token, true
+	}
+	if token := strings.TrimSpace(r.Header.Get("X-Mediabrowser-Token")); token != "" {
+		return token, true
+	}
+	// Query-param token. Jellyfin's current spelling is "ApiKey" (PascalCase,
+	// always enabled); "api_key" is the legacy spelling (gated behind
+	// EnableLegacyAuthorization on a real server). Clients vary the casing
+	// further (Api_Key / API_KEY), so match both keys case-insensitively.
+	// Ref: jellyfin Jellyfin.Server.Implementations/Security/AuthorizationContext.cs.
+	query := newCaseInsensitiveQuery(r.URL.Query())
+	for _, key := range []string{"ApiKey", "api_key"} {
+		if token := strings.TrimSpace(query.Get(key)); token != "" {
+			return token, true
+		}
+	}
+
+	return "", false
+}
+
+// RequireSession enforces a valid compat session for a route.
+func (a *Authenticator) RequireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, ok := ExtractToken(r)
+		if !ok {
+			slog.WarnContext(r.Context(), "jellycompat auth: no token in request", "component", "jellycompat",
+				"path", r.URL.Path,
+				"auth_header_present", r.Header.Get("Authorization") != "",
+				"x_emby_auth_present", r.Header.Get("X-Emby-Authorization") != "",
+			)
+			writeError(w, http.StatusUnauthorized, "Unauthorized", "Missing authentication token")
+			return
+		}
+
+		session, err := a.sessions.Lookup(r.Context(), token)
+		if err != nil && !errors.Is(err, ErrSessionNotFound) {
+			writeSessionLookupFailed(w, r, token, err)
+			return
+		}
+		if err != nil {
+			slog.WarnContext(r.Context(), "jellycompat auth: session not found", "component", "jellycompat",
+				"path", r.URL.Path,
+				"token_prefix", safeTokenPrefix(token),
+			)
+			writeError(w, http.StatusUnauthorized, "Unauthorized", "Invalid or expired authentication token")
+			return
+		}
+
+		// Refresh underlying Silo tokens if they're about to expire.
+		// Use a detached context so a client aborting the request mid-refresh
+		// (common on flaky mobile networks) doesn't revoke the compat session.
+		if a.refresher != nil && !session.StreamAppTokenExpiry.IsZero() &&
+			session.StreamAppTokenExpiry.Before(a.now().Add(tokenRefreshBuffer)) {
+			refreshCtx, cancel := context.WithTimeout(context.Background(), tokenRefreshTimeout)
+			newPair, err := a.refresher.Refresh(refreshCtx, session.StreamAppRefreshToken)
+			cancel()
+			if errors.Is(err, auth.ErrSessionCheckUnavailable) || errors.Is(err, auth.ErrProviderUnavailable) {
+				// The store could not be read, or the sign-in provider could
+				// not answer under the fail_closed outage policy: the refresh
+				// token was not refused. Keep the compat session; the client
+				// retries.
+				slog.WarnContext(r.Context(), "jellycompat auth: token refresh could not check the session; keeping it", "component", "jellycompat",
+					"path", r.URL.Path,
+					"token_prefix", safeTokenPrefix(token),
+					"error", logredact.SanitizeText(err.Error()),
+				)
+				writeSessionCheckUnavailable(w)
+				return
+			}
+			if err != nil {
+				slog.WarnContext(r.Context(), "jellycompat auth: token refresh failed, revoking session", "component", "jellycompat",
+					"path", r.URL.Path,
+					"token_prefix", safeTokenPrefix(token),
+					"error", logredact.SanitizeText(err.Error()),
+				)
+				_ = a.sessions.Delete(token)
+				writeError(w, http.StatusUnauthorized, "Unauthorized", "Session expired")
+				return
+			}
+			// The request uses the session exactly as Update stores it, so
+			// it never reads the session back after the write.
+			var refreshed Session
+			updateErr := a.sessions.Update(token, func(s *Session) error {
+				s.StreamAppAccessToken = newPair.AccessToken
+				s.StreamAppRefreshToken = newPair.RefreshToken
+				s.StreamAppTokenExpiry = a.now().Add(time.Duration(newPair.ExpiresIn) * time.Second)
+				refreshed = *s
+				return nil
+			})
+			switch {
+			case errors.Is(updateErr, ErrSessionNotFound):
+				// Signed out while the tokens refreshed, such as by an
+				// account-wide revocation.
+				writeError(w, http.StatusUnauthorized, "Unauthorized", "Session expired")
+				return
+			case updateErr != nil:
+				slog.WarnContext(r.Context(), "jellycompat auth: session update after refresh failed", "component", "jellycompat",
+					"token_prefix", safeTokenPrefix(token),
+					"error", updateErr,
+				)
+			default:
+				session = &refreshed
+			}
+		}
+
+		serveWithSession(next, w, r, session)
+	})
+}
+
+// writeSessionCheckUnavailable answers a request whose session could not be
+// checked with a retryable 503.
+func writeSessionCheckUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", strconv.Itoa(auth.SessionCheckRetryAfterSeconds))
+	writeError(w, http.StatusServiceUnavailable, "ServiceUnavailable", "Server is temporarily unavailable")
+}
+
+// writeSessionLookupFailed answers a request whose compat session could not
+// be read from the session store. The token was not judged: a retryable
+// 503, never a 401 that signs the client out.
+func writeSessionLookupFailed(w http.ResponseWriter, r *http.Request, token string, err error) {
+	if r.Context().Err() == nil {
+		slog.WarnContext(r.Context(), "jellycompat auth: session lookup failed; answering 503", "component", "jellycompat",
+			"path", redactHLSPlaySessionID(r.URL.Path),
+			"token_prefix", safeTokenPrefix(token),
+			"error", logredact.SanitizeText(err.Error()),
+		)
+	}
+	writeSessionCheckUnavailable(w)
+}
+
+// writePlaySessionLookupFailed answers a request whose play session could not
+// be read from the playback store.
+func writePlaySessionLookupFailed(w http.ResponseWriter, r *http.Request, playSessionID string, err error) {
+	if r.Context().Err() == nil {
+		slog.WarnContext(r.Context(), "jellycompat: play session lookup failed; answering 503", "component", "jellycompat",
+			"path", redactHLSPlaySessionID(r.URL.Path),
+			"play_session", playSessionFingerprint(playSessionID),
+			"error", logredact.SanitizeText(err.Error()),
+		)
+	}
+	writeSessionCheckUnavailable(w)
+}
+
+// attributeActivity records the session's account on the activity log entry
+// for this request, when the activity log middleware is mounted.
+func attributeActivity(r *http.Request, session *Session) {
+	if session == nil {
+		return
+	}
+	if lc := activitylog.GetLogContext(r.Context()); lc != nil {
+		uid := session.StreamAppUserID
+		lc.UserID = &uid
+	}
+}
+
+// safeTokenPrefix returns the first 8 characters of a token for logging.
+func safeTokenPrefix(token string) string {
+	if len(token) <= 8 {
+		return token
+	}
+	return token[:8] + "..."
+}
+
+// serveWithSession injects the resolved compat session into the request context
+// and continues the handler chain.
+func serveWithSession(next http.Handler, w http.ResponseWriter, r *http.Request, session *Session) {
+	r = r.WithContext(ratelimit.WithAccount(r.Context(), session.StreamAppUserID))
+	serveWithSessionContext(next, w, r, session)
+}
+
+func serveWithSessionContext(next http.Handler, w http.ResponseWriter, r *http.Request, session *Session) {
+	attributeActivity(r, session)
+	ctx := context.WithValue(r.Context(), compatSessionKey, session)
+	ctx = withRequestScope(ctx, session)
+	ctx = playback.WithClientInfo(ctx, compatPlaybackClientInfo(r))
+	next.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func compatPlaybackClientInfo(r *http.Request) playback.ClientInfo {
+	if r == nil {
+		return playback.ClientInfo{}
+	}
+	return playback.ClientInfo{
+		Name:      firstMediaBrowserAuthorizationValue(r, "Client"),
+		Version:   firstMediaBrowserAuthorizationValue(r, "Version"),
+		UserAgent: r.UserAgent(),
+		IsCompat:  true,
+	}
+}
+
+func firstMediaBrowserAuthorizationValue(r *http.Request, key string) string {
+	for _, headerName := range []string{"X-Emby-Authorization", "Authorization"} {
+		if value := mediaBrowserAuthorizationValue(r.Header.Get(headerName), key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func mediaBrowserAuthorizationValue(header, key string) string {
+	header = strings.TrimSpace(header)
+	if !strings.HasPrefix(strings.ToLower(header), "mediabrowser ") {
+		return ""
+	}
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(strings.ToLower(part), "mediabrowser ") {
+			part = strings.TrimSpace(part[len("MediaBrowser "):])
+		}
+		name, value, ok := strings.Cut(part, "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(name), key) {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(value), `"`)
+	}
+	return ""
+}
+
+// resolveCompatToken resolves a token to a compat session: a session-store token
+// (normal login) or, matching Jellyfin, an sa_ admin API key (synthesized
+// session bound to the key user's primary profile). Returns false when the token
+// matches neither, and an error when the session store could not be read, which
+// judges nothing about the token. keyAuth may be nil (resolveSession handles a
+// nil receiver).
+func resolveCompatToken(ctx context.Context, sessions *SessionStore, keyAuth *AdminAPIKeyAuthenticator, token string) (*Session, bool, error) {
+	if token == "" {
+		return nil, false, nil
+	}
+	if sessions != nil {
+		session, err := sessions.Lookup(ctx, token)
+		if err == nil {
+			return session, true, nil
+		}
+		if !errors.Is(err, ErrSessionNotFound) {
+			return nil, false, err
+		}
+	}
+	if strings.HasPrefix(token, "sa_") {
+		if session, _, _ := keyAuth.resolveSession(ctx, token); session != nil {
+			return session, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+// PlaybackSessionAuth accepts a login/API token, an unexpired PlaySessionId
+// scoped to the negotiated item and source, or, on a static video stream
+// only, the per-play tag PlaybackInfo handed out as the source's ETag (see
+// compatPlayTag). Catalog IDs are not credentials. The one credential-less
+// path is the address-only grant, which runs only while the administrator
+// turns on config.JellyfinCompatAddressStreamGrantSettingKey: a static video
+// stream of a source that the same client address negotiated through an
+// authenticated PlaybackInfo that is still live (staticStreamGrantIdle).
+// Clients behind one shared address (a household NAT, carrier-grade NAT) can
+// then reuse each other's live negotiation for that exact source. settings
+// may be nil, which refuses the address-only grant.
+func PlaybackSessionAuth(sessions *SessionStore, playbackStore CompatPlaybackStore, keyAuth *AdminAPIKeyAuthenticator, settings SettingsReader) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Try standard token auth first — a compat session token or an sa_
+			// admin key (synthesized session).
+			if token, ok := ExtractToken(r); ok {
+				session, ok, err := resolveCompatToken(r.Context(), sessions, keyAuth, token)
+				if err != nil {
+					writeSessionLookupFailed(w, r, token, err)
+					return
+				}
+				if ok {
+					serveWithSession(next, w, r, session)
+					return
+				}
+				writeError(w, http.StatusUnauthorized, "Unauthorized", "Invalid or expired authentication token")
+				return
+			}
+
+			// Follow-up HLS requests (master/segment) carry only PlaySessionId,
+			// no auth header or api_key. Resolve the negotiated session's
+			// CompatToken — which for an API-key stream is itself the sa_ key,
+			// so it must go through the same session-or-API-key resolution.
+			//
+			// The lookup must be case-insensitive: Wholphin's jellyfin-sdk-kotlin
+			// builds its own direct-play URL with a lowercase "playSessionId"
+			// (and no api_key / auth header), so a case-sensitive match would
+			// miss it and 401 the stream — forcing a needless transcode fallback.
+			playSessionID := newCaseInsensitiveQuery(r.URL.Query()).Get("PlaySessionId")
+			var playSessionErr error
+			if playSessionID != "" && playbackStore != nil {
+				var handled bool
+				if handled, playSessionErr = servePlaySessionGrant(next, w, r, sessions, playbackStore, keyAuth, playSessionID); handled {
+					return
+				}
+			}
+
+			staticStream := playbackStore != nil && isStaticStreamRequest(r)
+
+			// Jellyfin for Android TV 0.19+ and its Kotlin forks open static
+			// direct-play URLs with no auth header, api_key or PlaySessionId,
+			// but echo the source's ETag from the PlaybackInfo response as
+			// "tag" (upstream Jellyfin ignores it). That ETag names the play,
+			// so it grants exactly what that PlaySessionId would.
+			var tagSessionID string
+			var tagErr error
+			if staticStream {
+				var handled bool
+				if handled, tagSessionID, tagErr = servePlayTagGrant(next, w, r, sessions, playbackStore, keyAuth); handled {
+					return
+				}
+			}
+
+			// Findroid, and Jellyfin for Android TV when the tag does not
+			// grant, open static direct-play URLs with no credential at all
+			// (upstream Jellyfin serves them anonymously). Only while the
+			// administrator allows it, grant a static stream of a source the
+			// same client address negotiated through an authenticated
+			// PlaybackInfo that is still live and recently active, so an item
+			// or source id is never a credential on its own. Of several such
+			// negotiations, the most recent one whose caller is still signed
+			// in grants it. The setting is read only here, and only for a
+			// request FindStreamGrants could match, so requests that carry a
+			// credential or name no source never pay for it.
+			itemID := chi.URLParam(r, "id")
+			sourceID := newCaseInsensitiveQuery(r.URL.Query()).Get("MediaSourceId")
+			clientIP := clientip.FromContext(r.Context())
+			peer := requestPeerHost(r)
+			if staticStream && itemID != "" && sourceID != "" && clientIP != "" && peer != "" && addressStreamGrantEnabled(r.Context(), settings) {
+				for _, grant := range playbackStore.FindStreamGrants(itemID, sourceID, clientIP, peer, staticStreamGrantIdle) {
+					session, ok, err := resolveCompatToken(r.Context(), sessions, keyAuth, grant.CompatToken)
+					if err != nil {
+						writeSessionLookupFailed(w, r, grant.CompatToken, err)
+						return
+					}
+					if ok {
+						slog.InfoContext(r.Context(), "jellycompat static stream granted without credentials",
+							"play_session", playSessionFingerprint(grant.ID), "user_id", grant.UserID, "item_id", itemID, "media_source_id", sourceID, "client_ip", clientIP, "peer", peer, "negotiated_peer", grant.ClientPeer,
+							"client_name", grant.ClientName, "client_version", grant.ClientVersion)
+						// This grant infers an owner from a shared address; the
+						// caller supplied no credential. Keep source/global
+						// protection without spending that owner's account budget.
+						serveWithSessionContext(next, w, r, session)
+						return
+					}
+				}
+			}
+
+			if playSessionErr != nil {
+				// The PlaySessionId grant was not judged: answer a retryable
+				// 503, not a 401 that reads as a revoked play session.
+				writePlaySessionLookupFailed(w, r, playSessionID, playSessionErr)
+				return
+			}
+			if tagErr != nil {
+				// Likewise for the play session a per-play tag names.
+				writePlaySessionLookupFailed(w, r, tagSessionID, tagErr)
+				return
+			}
+			writeError(w, http.StatusUnauthorized, "Unauthorized", "Missing authentication token")
+		})
+	}
+}
+
+// addressStreamGrantEnabled reads the setting that allows the address-only
+// stream grant on every request that reaches it, so a change applies without
+// a restart and every API node reads the same stored row. An unset row is the
+// configured default; no settings reader, or an unreadable setting, refuses.
+func addressStreamGrantEnabled(ctx context.Context, settings SettingsReader) bool {
+	if settings == nil {
+		return false
+	}
+	value, err := settings.Get(ctx, config.JellyfinCompatAddressStreamGrantSettingKey)
+	return err == nil && config.AdminSettingEnabled(config.JellyfinCompatAddressStreamGrantSettingKey, value)
+}
+
+// servePlaySessionGrant answers a request through the play session that
+// playSessionID names when that session grants it. It reports handled=false
+// when the session is absent or does not cover the request, with the store
+// error when the session could not be read.
+func servePlaySessionGrant(
+	next http.Handler, w http.ResponseWriter, r *http.Request,
+	sessions *SessionStore, playbackStore CompatPlaybackStore, keyAuth *AdminAPIKeyAuthenticator,
+	playSessionID string,
+) (bool, error) {
+	playSession, found, err := playbackStore.Lookup(playSessionID)
+	if err != nil || !found || !playbackGrantMatchesRequest(r, playSession) {
+		return false, err
+	}
+	session, ok, err := resolveCompatToken(r.Context(), sessions, keyAuth, playSession.CompatToken)
+	switch {
+	case err != nil:
+		writeSessionLookupFailed(w, r, playSession.CompatToken, err)
+	case ok:
+		serveWithSession(next, w, r.WithContext(context.WithValue(r.Context(), compatPlaybackGrantKey, playSession)), session)
+	default:
+		writeError(w, http.StatusUnauthorized, "Unauthorized", "Session expired")
+	}
+	return true, nil
+}
+
+// servePlayTagGrant answers a static video stream through the play session a
+// per-play tag names, under the same rules as a PlaySessionId grant. The
+// request must name its source and carry one tag value in the per-play
+// shape. Only the play session ID in the tag is checked: whoever holds a tag
+// holds that ID, which already covers every source of the play. It returns
+// the play session ID it looked up so a store error can be logged against it.
+func servePlayTagGrant(
+	next http.Handler, w http.ResponseWriter, r *http.Request,
+	sessions *SessionStore, playbackStore CompatPlaybackStore, keyAuth *AdminAPIKeyAuthenticator,
+) (bool, string, error) {
+	query := r.URL.Query()
+	if sourceID, ok := queryMediaSourceID(query); !ok || sourceID == "" {
+		return false, "", nil
+	}
+	tag, ok := singleQueryValue(query, "tag")
+	if !ok {
+		return false, "", nil
+	}
+	tag = strings.ToLower(tag)
+	playSessionID, ok := playTagSessionID(tag)
+	if !ok {
+		return false, "", nil
+	}
+	handled, err := servePlaySessionGrant(next, w, r, sessions, playbackStore, keyAuth, playSessionID)
+	return handled, playSessionID, err
+}
+
+// compatPlayTagSessionHexLen is the length of the compact play session ID
+// that starts a per-play tag; mediaSourceETag's 16 hex digits follow it.
+const compatPlayTagSessionHexLen = 32
+
+// compatPlayTag is the ETag PlaybackInfo gives a source: the play session ID
+// in compact form (32 lowercase hex digits) followed by the source's
+// item-detail ETag. Clients that echo it as "tag" on a static stream (Jellyfin
+// for Android TV) authenticate with it; the suffix keeps the ETags of one
+// response distinct per source, which Swiftfin relies on.
+func compatPlayTag(playSessionID, sourceETag string) string {
+	return strings.ToLower(strings.ReplaceAll(playSessionID, "-", "")) + sourceETag
+}
+
+// playTagSessionID recovers the play session ID from a lowercase per-play
+// tag, and false for any other value, such as an item-detail ETag.
+func playTagSessionID(tag string) (string, bool) {
+	if len(tag) != compatPlayTagSessionHexLen+16 || strings.Trim(tag, "0123456789abcdef") != "" {
+		return "", false
+	}
+	id, err := uuid.Parse(tag[:compatPlayTagSessionHexLen])
+	if err != nil {
+		return "", false
+	}
+	return id.String(), true
+}
+
+// singleQueryValue is the value of the query parameter name, matched
+// case-insensitively, and false when it is absent or repeated with
+// different values.
+func singleQueryValue(query url.Values, name string) (string, bool) {
+	value, found := "", false
+	for key, values := range query {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, v := range values {
+			if found && v != value {
+				return "", false
+			}
+			value, found = v, true
+		}
+	}
+	return value, found
+}
+
+// staticStreamGrantIdle bounds how long after its last activity (PlaybackInfo,
+// progress report, or ping) a negotiation keeps granting credential-less static
+// streams. Playing clients report progress well within it; it also covers a
+// long pause followed by a seek.
+const staticStreamGrantIdle = 2 * time.Hour
+
+// isStaticStreamRequest reports a direct-file video stream read, using the
+// same Static=true test as HandleVideoStream. A request repeating Static or
+// MediaSourceId under different cases is refused, since the case-insensitive
+// lookup would pick one arbitrarily and auth and handler could disagree.
+func isStaticStreamRequest(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	pattern := chi.RouteContext(r.Context()).RoutePattern()
+	if !strings.HasSuffix(pattern, "/Videos/{id}/stream") && !strings.HasSuffix(pattern, "/Videos/{id}/stream.{container}") {
+		return false
+	}
+	query := r.URL.Query()
+	for _, name := range []string{"Static", "MediaSourceId"} {
+		values := 0
+		for key, vals := range query {
+			if strings.EqualFold(key, name) {
+				values += len(vals)
+			}
+		}
+		if values > 1 {
+			return false
+		}
+	}
+	return strings.EqualFold(newCaseInsensitiveQuery(query).Get("Static"), "true")
+}
+
+// requestPeerHost is the transport peer's host, before any forwarding header
+// was applied; see sameStreamPath.
+func requestPeerHost(r *http.Request) string {
+	peer := clientip.PeerFromContext(r.Context())
+	if peer == "" {
+		peer = r.RemoteAddr
+	}
+	if host, _, err := net.SplitHostPort(peer); err == nil {
+		return host
+	}
+	return peer
+}
+
+// staticStreamGrantTouchInterval throttles how often progress reports refresh
+// a grant's activity, so playback past staticStreamGrantIdle keeps seeking
+// without a store write on every report.
+const staticStreamGrantTouchInterval = 10 * time.Minute
+
+// touchStaticStreamGrant refreshes the activity of a started play that may
+// back a credential-less static stream. Best effort: a failed touch only
+// shortens the grant.
+func touchStaticStreamGrant(store CompatPlaybackStore, playSession *PlaybackSession, stop bool) {
+	if stop || store == nil || playSession == nil || playSession.ClientIP == "" || time.Since(playSession.UpdatedAt) < staticStreamGrantTouchInterval {
+		return
+	}
+	_ = store.Update(playSession.ID, func(*PlaybackSession) error { return nil })
+}
+
+func playbackGrantMatchesRequest(r *http.Request, session *PlaybackSession) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	itemID := firstNonEmpty(chi.URLParam(r, "id"), chi.URLParam(r, "routeItemId"))
+	sourceID := chi.URLParam(r, "routeMediaSourceId")
+	if sourceID == "" {
+		var ok bool
+		if sourceID, ok = queryMediaSourceID(r.URL.Query()); !ok {
+			return false
+		}
+	}
+	return playbackGrantCovers(session, itemID, sourceID)
+}
+
+// queryMediaSourceID is the MediaSourceId query value in any spelling the
+// handlers read (newCaseInsensitiveQuery also takes "MediaSourceId[]"), and
+// false when spellings carry different sources: the grant check and the
+// handler each read the key case-insensitively, and the lookup would pick one
+// arbitrarily. Empty values name no source.
+func queryMediaSourceID(query url.Values) (string, bool) {
+	sourceID := ""
+	for key, values := range query {
+		if !strings.EqualFold(strings.TrimSuffix(key, "[]"), "MediaSourceId") {
+			continue
+		}
+		for _, value := range values {
+			if value == "" {
+				continue
+			}
+			if sourceID != "" && !mediaSourceIDsEqual(sourceID, value) {
+				return "", false
+			}
+			sourceID = value
+		}
+	}
+	return sourceID, true
+}
+
+// playbackGrantCovers reports whether a live negotiation authorizes media
+// requests for routeItemID, the item as the request path names it, and for
+// sourceID when the request names one.
+func playbackGrantCovers(session *PlaybackSession, routeItemID, sourceID string) bool {
+	if session == nil || session.Terminal || routeItemID == "" || !mediaSourceIDsEqual(routeItemID, session.RouteItemID) {
+		return false
+	}
+	if sourceID == "" {
+		return true
+	}
+	for _, source := range session.MediaSources {
+		if mediaSourceIDsEqual(source.ID, sourceID) {
+			return true
+		}
+	}
+	return false
+}
+
+// playbackGrantFromContext returns the negotiation whose PlaySessionId
+// authorized the request, or nil when a token did.
+func playbackGrantFromContext(ctx context.Context) *PlaybackSession {
+	grant, _ := ctx.Value(compatPlaybackGrantKey).(*PlaybackSession)
+	return grant
+}
+
+// SessionFromContext returns the authenticated compat session, if present.
+func SessionFromContext(ctx context.Context) *Session {
+	session, _ := ctx.Value(compatSessionKey).(*Session)
+	return session
+}

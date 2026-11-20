@@ -1,0 +1,43 @@
+package mail
+
+import (
+	"context"
+	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/branding"
+)
+
+// AccountLinkBase is the externally reachable origin that account emails
+// (invitations, password resets) build their links on: the server.public_url
+// setting, else fallback. Empty when neither is set; such links cannot be made.
+func AccountLinkBase(ctx context.Context, settings SettingReader, fallback string) string {
+	if settings != nil {
+		if base, err := settings.Get(ctx, "server.public_url"); err == nil {
+			if base = strings.TrimRight(strings.TrimSpace(base), "/"); base != "" {
+				return base
+			}
+		}
+	}
+	return strings.TrimRight(fallback, "/")
+}
+
+// AccountLink is the address of the web screen at path that redeems a
+// one-time token, such as a password reset or an invitation. The token is the
+// URL fragment, which browsers never send to the server, so it stays out of
+// the access logs and Referer headers of anything in front of Silo.
+func AccountLink(base, path, token string) string {
+	return base + path + "#" + token
+}
+
+// ServerName is the branded server name account emails and their landing
+// screens show, defaulting to "Silo".
+func ServerName(ctx context.Context, settings SettingReader) string {
+	if settings != nil {
+		if name, err := settings.Get(ctx, branding.KeyServerName); err == nil {
+			if name = strings.TrimSpace(name); name != "" {
+				return name
+			}
+		}
+	}
+	return branding.DefaultServerName
+}

@@ -1,0 +1,1160 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/artworkurl"
+	"github.com/Silo-Server/silo-server/internal/auditmutation"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/auth/passwordhash"
+	"github.com/Silo-Server/silo-server/internal/blobstore"
+	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback/connectionstore"
+	"github.com/Silo-Server/silo-server/internal/ratelimit"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// ProfileHandler handles profile CRUD endpoints.
+type ProfileHandler struct {
+	storeProvider  userstore.UserStoreProvider
+	SessionsReader playbackSessionsReader
+	UserRepo       interface {
+		GetByID(ctx context.Context, id int) (*models.User, error)
+	}
+	// AccessGroups resolves the profile limit an account inherits from its
+	// access group. Nil resolves every account as ungrouped.
+	AccessGroups   access.GroupPolicyProvider
+	ProfileTokens  *access.ProfileTokenService
+	AvatarStore    profileAvatarStore
+	AvatarResolver artworkurl.Resolver
+	AvatarTTL      time.Duration
+	// ArtworkStore holds personal collection artwork; a profile delete
+	// removes the artwork of the collections it deleted.
+	ArtworkStore blobstore.Store
+	// DeviceLibraryPurger removes a deleted profile's device rows (and, via
+	// cascade, its managed downloads and subscriptions). Profiles may live
+	// outside Postgres, so no FK cascade covers these shared tables.
+	DeviceLibraryPurger interface {
+		PurgeProfileDevices(ctx context.Context, userID int, profileID string) error
+	}
+	// Connections, when set, deletes the playback connection rows of the
+	// deleted profile's devices that no other profile registers.
+	Connections *connectionstore.Store
+	// DroppedSeriesPurger removes a deleted profile's dropped series, which
+	// live in Postgres whichever store holds the profile.
+	DroppedSeriesPurger interface {
+		PurgeProfile(ctx context.Context, userID int, profileID string) error
+	}
+	// WatchlistTitlesPurger removes a deleted profile's watchlist entries for
+	// titles outside the library, and the titles no profile keeps any more.
+	// They live in Postgres whichever store holds the profile.
+	WatchlistTitlesPurger interface {
+		PurgeProfile(ctx context.Context, userID int, profileID string) error
+	}
+	// EbookReaderPurger removes a deleted profile's ebook reading progress,
+	// reader settings and annotations, which live in Postgres whichever
+	// store holds the profile.
+	EbookReaderPurger interface {
+		PurgeProfile(ctx context.Context, userID int, profileID string) error
+	}
+	// JellyfinSessionPurger signs out the Jellyfin-compatible sessions of a
+	// deleted profile, which live in Postgres whichever store holds it.
+	JellyfinSessionPurger interface {
+		PurgeProfile(ctx context.Context, userID int, profileID string) error
+	}
+	// RecommendationsPurger removes a deleted profile's ratings, taste
+	// profile and cached recommendations, which live in Postgres whichever
+	// store holds the profile.
+	RecommendationsPurger interface {
+		PurgeProfile(ctx context.Context, userID int, profileID string) error
+	}
+	// WatchlistRequestWithdrawer cancels the unsent requests a deleted
+	// profile's watchlist made, as removing each title would.
+	WatchlistRequestWithdrawer interface {
+		WithdrawProfileWatchlistRequests(ctx context.Context, userID int, profileID string) error
+	}
+	// EventsHub, when set, receives a user_settings.changed event for every
+	// canonical setting row a profile mutation syncs (see
+	// profiles_settings_sync.go). Nil (as in tests) simply skips publishing.
+	EventsHub *evt.Hub
+	// PINAttempts bounds wrong PIN guesses per profile (see
+	// ratelimit.ProfilePINPolicy). The router always sets it; nil, as in
+	// tests that do not exercise the limit, allows every attempt.
+	PINAttempts *ratelimit.AttemptLimiter
+	// RecWorker is told when an update changes a profile's access scope, so
+	// its recommendations are rebuilt under the new one. Optional.
+	RecWorker SignalsChangedNotifier
+}
+
+// NewProfileHandler creates a new ProfileHandler.
+func NewProfileHandler(provider userstore.UserStoreProvider) *ProfileHandler {
+	return &ProfileHandler{
+		storeProvider: provider,
+		AvatarTTL:     15 * time.Minute,
+	}
+}
+
+// --- Request/Response types ---
+
+// ProfileCreateRequest is the v1 POST /profiles body; v2 createProfile lowers
+// its own body onto it.
+type ProfileCreateRequest struct {
+	Name             string `json:"name"`
+	Avatar           string `json:"avatar,omitempty"`
+	PIN              string `json:"pin,omitempty"`
+	IsChild          bool   `json:"is_child"`
+	MaxContentRating string `json:"max_content_rating,omitempty"`
+	// MaxAdvisoryAge is the advisory-age limit, 0 for none. /api/v1 is frozen,
+	// so only v2 createProfile sets it (json:"-").
+	MaxAdvisoryAge int `json:"-"`
+	// RequireAdvisoryAge hides titles with no advisory age. v2-only, like
+	// MaxAdvisoryAge.
+	RequireAdvisoryAge bool `json:"-"`
+	// RequestsBlocked keeps the profile out of requests and request
+	// discovery. v2-only (json:"-"); v2 carries it as requests_allowed.
+	RequestsBlocked            bool   `json:"-"`
+	QualityPreference          string `json:"quality_preference,omitempty"`
+	Language                   string `json:"language,omitempty"`
+	PreferredMetadataLanguage  string `json:"preferred_metadata_language,omitempty"`
+	SubtitleLanguage           string `json:"subtitle_language,omitempty"`
+	SubtitleMode               string `json:"subtitle_mode,omitempty"`
+	AutoSkipIntro              bool   `json:"auto_skip_intro"`
+	AutoSkipCredits            bool   `json:"auto_skip_credits"`
+	AutoSkipRecap              bool   `json:"auto_skip_recap"`
+	AutoPlayNextPreview        bool   `json:"auto_play_next_preview"`
+	ShowForcedSubtitles        *bool  `json:"show_forced_subtitles,omitempty"`
+	LibraryRestrictionsEnabled bool   `json:"library_restrictions_enabled"`
+	AllowedLibraryIDs          []int  `json:"allowed_library_ids"`
+	MaxPlaybackQuality         string `json:"max_playback_quality"`
+}
+
+type ProfileUpdateRequest struct {
+	Name             *string `json:"name,omitempty"`
+	Avatar           *string `json:"avatar,omitempty"`
+	PIN              *string `json:"pin,omitempty"`
+	IsChild          *bool   `json:"is_child,omitempty"`
+	MaxContentRating *string `json:"max_content_rating,omitempty"`
+	// MaxAdvisoryAge: nil leaves the limit untouched, 0 clears it, and a
+	// positive age sets it. /api/v1 is frozen, so only v2 updateProfile sets
+	// it (json:"-").
+	MaxAdvisoryAge *int `json:"-"`
+	// RequireAdvisoryAge: nil leaves it untouched. v2-only (json:"-").
+	RequireAdvisoryAge *bool `json:"-"`
+	// RequestsBlocked: nil leaves it untouched. v2-only (json:"-").
+	RequestsBlocked            *bool   `json:"-"`
+	QualityPreference          *string `json:"quality_preference,omitempty"`
+	Language                   *string `json:"language,omitempty"`
+	PreferredMetadataLanguage  *string `json:"preferred_metadata_language,omitempty"`
+	SubtitleLanguage           *string `json:"subtitle_language,omitempty"`
+	SubtitleMode               *string `json:"subtitle_mode,omitempty"`
+	AutoSkipIntro              *bool   `json:"auto_skip_intro,omitempty"`
+	AutoSkipCredits            *bool   `json:"auto_skip_credits,omitempty"`
+	AutoSkipRecap              *bool   `json:"auto_skip_recap,omitempty"`
+	AutoPlayNextPreview        *bool   `json:"auto_play_next_preview,omitempty"`
+	ShowForcedSubtitles        *bool   `json:"show_forced_subtitles,omitempty"`
+	LibraryRestrictionsEnabled *bool   `json:"library_restrictions_enabled,omitempty"`
+	AllowedLibraryIDs          *[]int  `json:"allowed_library_ids,omitempty"`
+	MaxPlaybackQuality         *string `json:"max_playback_quality,omitempty"`
+}
+
+type ProfileView struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Avatar           string `json:"avatar,omitempty"`
+	AvatarURL        string `json:"avatar_url,omitempty"`
+	AvatarSource     string `json:"avatar_source,omitempty"`
+	HasPIN           bool   `json:"has_pin"`
+	IsChild          bool   `json:"is_child"`
+	IsPrimary        bool   `json:"is_primary"`
+	MaxContentRating string `json:"max_content_rating,omitempty"`
+	// MaxAdvisoryAge is the advisory-age limit, 0 for none. /api/v1 is frozen,
+	// so only v2 emits it (json:"-").
+	MaxAdvisoryAge int `json:"-"`
+	// RequireAdvisoryAge hides titles with no advisory age. v2-only (json:"-").
+	RequireAdvisoryAge bool `json:"-"`
+	// RequestsBlocked keeps the profile out of requests. v2-only (json:"-").
+	RequestsBlocked            bool   `json:"-"`
+	QualityPreference          string `json:"quality_preference,omitempty"`
+	Language                   string `json:"language,omitempty"`
+	PreferredMetadataLanguage  string `json:"preferred_metadata_language,omitempty"`
+	SubtitleLanguage           string `json:"subtitle_language,omitempty"`
+	SubtitleMode               string `json:"subtitle_mode,omitempty"`
+	AutoSkipIntro              bool   `json:"auto_skip_intro"`
+	AutoSkipCredits            bool   `json:"auto_skip_credits"`
+	AutoSkipRecap              bool   `json:"auto_skip_recap"`
+	AutoPlayNextPreview        bool   `json:"auto_play_next_preview"`
+	ShowForcedSubtitles        bool   `json:"show_forced_subtitles"`
+	LibraryRestrictionsEnabled bool   `json:"library_restrictions_enabled"`
+	AllowedLibraryIDs          []int  `json:"allowed_library_ids"`
+	MaxPlaybackQuality         string `json:"max_playback_quality"`
+	CreatedAt                  string `json:"created_at"`
+	UpdatedAt                  string `json:"updated_at"`
+}
+
+// ProfileListView is the v1 GET /profiles response.
+type ProfileListView struct {
+	Profiles            []ProfileView `json:"profiles"`
+	AvatarUploadEnabled bool          `json:"avatar_upload_enabled"`
+	// MaxProfiles is the household profile limit, 0 when it could not be
+	// read. Only v2 listProfiles reports it: the frozen v1 body leaves it out.
+	MaxProfiles int `json:"-"`
+}
+
+// profileNameConflicts reports whether a profile other than excludeID already
+// uses name within this account's store, comparing the trimmed forms
+// case-insensitively so "Laura" and " laura " count as the same household
+// member. Scoping is per account by construction: callers pass the profile
+// list of a single user's store, so another account's profiles can never
+// conflict.
+//
+// This is a check-then-write guard with no store-level uniqueness constraint
+// (the userstore's dual Postgres/SQLite backends carry no unique index on
+// name), so two concurrent requests can both pass and insert duplicates —
+// unlike the profile limit, which is re-counted inside the creating
+// transaction. Good enough for interactive profile management; a functional
+// unique index is the fix if that ever stops being true.
+func profileNameConflicts(profiles []userstore.Profile, name, excludeID string) bool {
+	trimmed := strings.TrimSpace(name)
+	for _, p := range profiles {
+		if p.ID == excludeID {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(p.Name), trimmed) {
+			return true
+		}
+	}
+	return false
+}
+
+// profileLimitReached is the 409 for a household already at its limit.
+func profileLimitReached(limit int) *APIError {
+	return apiError(http.StatusConflict, "profile_limit_reached",
+		fmt.Sprintf("This account has reached its profile limit (%d)", limit))
+}
+
+// householdProfileLimit is the account's household profile limit from its
+// effective access policy, or 0 when no limit can be read (no user
+// repository, or no such account). CreateProfile enforces it and
+// ListProfiles reports it, so the limit a client shows is the one a create
+// meets.
+func (h *ProfileHandler) householdProfileLimit(ctx context.Context, userID int) (int, *APIError) {
+	if h.UserRepo == nil {
+		return 0, nil
+	}
+	user, err := h.UserRepo.GetByID(ctx, userID)
+	if err != nil {
+		slog.WarnContext(ctx, "loading the account for its profile limit failed", "component", "api", "user_id", userID, "error", err)
+		return 0, apiError(http.StatusInternalServerError, "internal_error", "Failed to load user")
+	}
+	if user == nil {
+		return 0, nil
+	}
+	effective, err := access.EffectivePolicyForUser(ctx, user, h.AccessGroups)
+	if err != nil {
+		slog.WarnContext(ctx, "resolving the account's profile limit failed", "component", "api", "user_id", userID, "error", err)
+		return 0, apiError(http.StatusInternalServerError, "internal_error", "Failed to load the account's profile limit")
+	}
+	if effective.MaxProfiles < 1 {
+		return 0, nil
+	}
+	return effective.MaxProfiles, nil
+}
+
+// invalidAdvisoryAgeLimit is the field error for an advisory-age limit outside
+// the storable range.
+func invalidAdvisoryAgeLimit() *APIError {
+	return fieldError("max_advisory_age", fmt.Sprintf(
+		"max_advisory_age must be between %d and %d", access.MinAdvisoryAgeLimit, access.MaxAdvisoryAgeLimit))
+}
+
+// isAllowedSelfServiceProfileUpdate reports whether a non-admin update request
+// only touches fields the user is allowed to change on their own profiles.
+// Admin-only fields (access policy: library restrictions, content rating,
+// advisory-age limit and its strictness, playback-quality cap, child-profile
+// flag, requests block) must be rejected for non-admins.
+func isAllowedSelfServiceProfileUpdate(req ProfileUpdateRequest) bool {
+	return req.IsChild == nil &&
+		req.MaxContentRating == nil &&
+		req.MaxAdvisoryAge == nil &&
+		req.RequireAdvisoryAge == nil &&
+		req.RequestsBlocked == nil &&
+		req.LibraryRestrictionsEnabled == nil &&
+		req.AllowedLibraryIDs == nil &&
+		req.MaxPlaybackQuality == nil
+}
+
+// primaryLibraryLimitError rejects a library limit on the primary profile. The
+// primary inherits its account's libraries (access.ProfileLibraryLimit) and
+// hides the ones it doesn't want instead; turning the limit off, or an empty
+// allowlist, stays accepted so a client that always sends both still saves.
+func primaryLibraryLimitError(enabled bool, allowed []int) *APIError {
+	const message = "The primary profile can't be limited to some libraries; it can hide libraries instead"
+	switch {
+	case enabled:
+		return fieldError("library_restrictions_enabled", message)
+	case len(allowed) > 0:
+		return fieldError("allowed_library_ids", message)
+	}
+	return nil
+}
+
+// --- Handler methods ---
+
+// ListProfiles lists the account's household. v1 GET /profiles and v2
+// listProfiles both call it; a failure is an *APIError carrying the v1
+// status, code and message.
+func (h *ProfileHandler) ListProfiles(ctx context.Context, userID int) (ProfileListView, error) {
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return ProfileListView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	profiles, err := store.ListProfiles(ctx)
+	if err != nil {
+		return ProfileListView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to list profiles")
+	}
+	// A limit that cannot be read leaves MaxProfiles at 0 rather than failing
+	// the list: the picker needs the profiles more than the limit.
+	maxProfiles, limitErr := h.householdProfileLimit(ctx, userID)
+	if limitErr != nil {
+		maxProfiles = 0
+	}
+	return ProfileListView{
+		Profiles:            h.toProfileResponses(ctx, store, profiles),
+		AvatarUploadEnabled: h.AvatarStore != nil,
+		MaxProfiles:         maxProfiles,
+	}, nil
+}
+
+// GetProfile reads one profile of the account: 404 not_found when the
+// account has no profile with that ID, so another account's profile is
+// never found, and 500 when the store fails. v2 getAdminUserProfile calls
+// it.
+func (h *ProfileHandler) GetProfile(ctx context.Context, userID int, profileID string) (ProfileView, error) {
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil || store == nil {
+		return ProfileView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	profile, err := store.GetProfile(ctx, profileID)
+	if err != nil {
+		return ProfileView{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to load profile")
+	}
+	if profile == nil {
+		return ProfileView{}, apiError(http.StatusNotFound, "not_found", "Profile not found")
+	}
+	return h.toProfileResponse(ctx, store, *profile), nil
+}
+
+// checkAccountAdmin applies the Owner rules to an administrator's profile
+// write on an account (accountAdmin): only the Owner may change the Owner's
+// or another admin's profiles. A primary profile's PIN guards that account's
+// admin access, so another admin setting it could lock the account out of
+// administration. Household writes (accountAdmin false) pass.
+func (h *ProfileHandler) checkAccountAdmin(ctx context.Context, accountAdmin bool, userID int) error {
+	if !accountAdmin {
+		return nil
+	}
+	if h.UserRepo == nil {
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to load user")
+	}
+	target, err := h.UserRepo.GetByID(ctx, userID)
+	if err != nil {
+		if auth.IsNotFound(err) {
+			return apiError(http.StatusNotFound, "not_found", "User not found")
+		}
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to load user")
+	}
+	actor, err := requestOwnerActor(ctx, h.UserRepo)
+	if err != nil {
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to load user")
+	}
+	return ownerError(auth.CheckOwnerTarget(actor, target))
+}
+
+// manageHouseholdAs is householdManagerAs for a profile write: a server
+// administrator acting through the admin API (accountAdmin) manages the
+// household with no acting profile, so no PIN revision is bound to the write.
+func manageHouseholdAs(
+	ctx context.Context,
+	store userstore.UserStore,
+	accountAdmin bool,
+	activeProfileID string,
+	verify func(*userstore.Profile) error,
+) (bool, *userstore.Profile, error) {
+	if accountAdmin {
+		return true, nil, nil
+	}
+	return householdManagerAs(ctx, store, activeProfileID, verify)
+}
+
+// ProfileCreateCommand is a profile creation with its request already parsed
+// and its caller already reduced to an identity.
+type ProfileCreateCommand struct {
+	UserID int
+	// ActiveProfileID is the profile the caller acts as ("" when none).
+	ActiveProfileID string
+	Request         ProfileCreateRequest
+	// VerifyProfile confirms a PIN-locked primary profile is verified for
+	// this request; it returns access.ErrProfileUnverified when it is not.
+	VerifyProfile func(profile *userstore.Profile) error
+	// AccountAdmin marks a server administrator managing this account's
+	// household through the admin API (the caller already passed the acting
+	// admin check). It replaces the household-manager check: the
+	// administrator's own profile is not a member of this household, so there
+	// is no primary profile or PIN proof to require.
+	AccountAdmin bool
+}
+
+// CreateProfile creates a household profile: validation, the bootstrap or
+// household-manager authorization, the profile limit, the name-conflict
+// check, the atomic column and canonical-settings write, and the re-read.
+// v1 POST /profiles and v2 createProfile both call it; a failure is an
+// *APIError carrying the v1 status, code and message.
+func (h *ProfileHandler) CreateProfile(ctx context.Context, cmd ProfileCreateCommand) (ProfileView, error) {
+	var none ProfileView
+	if err := h.checkAccountAdmin(ctx, cmd.AccountAdmin, cmd.UserID); err != nil {
+		return none, err
+	}
+	req := cmd.Request
+	userID := cmd.UserID
+	if strings.TrimSpace(req.Name) == "" {
+		return none, fieldError("name", "Profile name is required")
+	}
+	if len(req.PIN) > 72 {
+		return none, fieldError("pin", "PIN must be at most 72 bytes")
+	}
+	avatarRef, err := normalizePresetAvatarReference(req.Avatar)
+	if err != nil {
+		return none, fieldError("avatar", err.Error())
+	}
+
+	maxPlaybackQuality, ok := access.ParsePlaybackQualityPreset(req.MaxPlaybackQuality)
+	if !ok {
+		return none, fieldError("max_playback_quality", "Invalid max_playback_quality")
+	}
+	if req.MaxAdvisoryAge != 0 && !access.ValidAdvisoryAgeLimit(req.MaxAdvisoryAge) {
+		return none, invalidAdvisoryAgeLimit()
+	}
+
+	// Planned before anything is written: a preference value the canonical
+	// store would refuse must fail the request while it is still a no-op.
+	settingsSync, err := planCreateProfileSettingsSync(req)
+	if err != nil {
+		return none, apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	existingProfiles, err := store.ListProfiles(ctx)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to list profiles")
+	}
+	// The very first profile on a user can be bootstrapped without
+	// primary/admin privileges (it becomes the primary); everything after
+	// requires the household manager (canManageHouseholdAs): the caller's
+	// active profile being the verified primary, whatever the account role.
+	var acting *userstore.Profile
+	isBootstrap := len(existingProfiles) == 0
+	if !isBootstrap {
+		allowed, active, err := manageHouseholdAs(ctx, store, cmd.AccountAdmin, cmd.ActiveProfileID, cmd.VerifyProfile)
+		if err != nil {
+			return none, profileManagementError(err)
+		}
+		acting = active
+		if !allowed {
+			return none, apiError(http.StatusForbidden, "forbidden", "Profile management requires the primary profile or admin access")
+		}
+	}
+	// Access-policy fields only make sense when set by a manager on a managed
+	// profile. On bootstrap the caller is becoming primary themselves, so non-
+	// admin bootstrap creations must leave those fields at their defaults.
+	if isBootstrap && !apimw.IsAdmin(ctx) &&
+		(req.IsChild || req.MaxContentRating != "" || req.MaxAdvisoryAge != 0 || req.RequireAdvisoryAge ||
+			req.RequestsBlocked ||
+			req.LibraryRestrictionsEnabled || len(req.AllowedLibraryIDs) > 0 ||
+			req.MaxPlaybackQuality != "") {
+		return none, apiError(http.StatusForbidden, "forbidden", "Profile access settings require the primary profile or admin access")
+	}
+	// The first profile becomes the primary.
+	if isBootstrap {
+		if apiErr := primaryLibraryLimitError(req.LibraryRestrictionsEnabled, req.AllowedLibraryIDs); apiErr != nil {
+			return none, apiErr
+		}
+	}
+	// profileLimit is the account's household limit (0 = unlimited). This
+	// early check answers a full household before the name check, as it always
+	// has; the guarantee under concurrency is the re-count inside the creating
+	// transaction (createProfileWithSettingsSync).
+	profileLimit, limitErr := h.householdProfileLimit(ctx, userID)
+	if limitErr != nil {
+		return none, limitErr
+	}
+	if profileLimit >= 1 && len(existingProfiles) >= profileLimit {
+		return none, profileLimitReached(profileLimit)
+	}
+
+	if profileNameConflicts(existingProfiles, req.Name, "") {
+		return none, apiError(http.StatusConflict, "name_conflict", "A profile with this name already exists")
+	}
+
+	showForcedSubtitles := true
+	if req.ShowForcedSubtitles != nil {
+		showForcedSubtitles = *req.ShowForcedSubtitles
+	}
+
+	// Prepare PIN protection before the transaction publishes the profile. A
+	// failed hash must not leave behind a profile that can be used without proof.
+	var pinHash string
+	if req.PIN != "" {
+		hash, err := passwordhash.Generate(ctx, []byte(req.PIN), bcrypt.DefaultCost)
+		if apiErr := busyError(err); apiErr != nil {
+			return none, apiErr
+		}
+		if err != nil {
+			return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to set profile PIN")
+		}
+		pinHash = string(hash)
+	}
+
+	profileID := uuid.New().String()
+	profile := userstore.Profile{
+		ID: profileID,
+		// Store the trimmed form the conflict check compared, so " Laura "
+		// doesn't persist with stray whitespace.
+		Name:                       strings.TrimSpace(req.Name),
+		PINHash:                    pinHash,
+		Avatar:                     avatarRef,
+		IsChild:                    req.IsChild,
+		MaxContentRating:           req.MaxContentRating,
+		MaxAdvisoryAge:             req.MaxAdvisoryAge,
+		RequireAdvisoryAge:         req.RequireAdvisoryAge,
+		RequestsBlocked:            req.RequestsBlocked,
+		QualityPreference:          req.QualityPreference,
+		Language:                   req.Language,
+		PreferredMetadataLanguage:  req.PreferredMetadataLanguage,
+		SubtitleLanguage:           req.SubtitleLanguage,
+		SubtitleMode:               req.SubtitleMode,
+		AutoSkipIntro:              req.AutoSkipIntro,
+		AutoSkipCredits:            req.AutoSkipCredits,
+		AutoSkipRecap:              req.AutoSkipRecap,
+		AutoPlayNextPreview:        req.AutoPlayNextPreview,
+		ShowForcedSubtitles:        showForcedSubtitles,
+		LibraryRestrictionsEnabled: req.LibraryRestrictionsEnabled,
+		AllowedLibraryIDs:          req.AllowedLibraryIDs,
+		MaxPlaybackQuality:         maxPlaybackQuality,
+	}
+
+	if err := h.createProfileWithSettingsSync(ctx, store, userID, profile, profileLimit, settingsSync, acting); err != nil {
+		if errors.Is(err, errProfileLimitReached) {
+			return none, profileLimitReached(profileLimit)
+		}
+		if errors.Is(err, access.ErrProfileUnverified) {
+			return none, profileManagementError(err)
+		}
+		slog.ErrorContext(ctx, "profile create failed to sync canonical settings",
+			"component", "api", "user_id", userID, "profile_id", profileID, "error", err)
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to store profile preferences")
+	}
+
+	// Fetch the created profile directly by ID (no race condition).
+	createdPtr, err := store.GetProfile(ctx, profileID)
+	if err != nil || createdPtr == nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to retrieve created profile")
+	}
+	created := *createdPtr
+
+	return h.toProfileResponse(ctx, store, created), nil
+}
+
+// ProfileUpdateCommand is a profile update with its request already parsed
+// and its caller already reduced to an identity.
+type ProfileUpdateCommand struct {
+	UserID    int
+	ProfileID string
+	// ActiveProfileID is the profile the caller acts as ("" when none).
+	ActiveProfileID string
+	Request         ProfileUpdateRequest
+	// VerifyProfile confirms a PIN-locked primary profile is verified for
+	// this request; it returns access.ErrProfileUnverified when it is not.
+	VerifyProfile func(profile *userstore.Profile) error
+	// AccountAdmin marks a server administrator managing this account's
+	// household through the admin API (the caller already passed the acting
+	// admin check). It replaces the household-manager check: the
+	// administrator's own profile is not a member of this household, so there
+	// is no primary profile or PIN proof to require.
+	AccountAdmin bool
+}
+
+// UpdateProfile applies a profile update: authorization (household manager
+// or self-service), validation, the name-conflict check, the atomic column
+// and canonical-settings write, and the re-read. v1 PUT /profiles/{id} and v2
+// updateProfile both call it; a failure is an *APIError carrying the v1
+// status, code and message.
+func (h *ProfileHandler) UpdateProfile(ctx context.Context, cmd ProfileUpdateCommand) (ProfileView, error) {
+	var none ProfileView
+	if err := h.checkAccountAdmin(ctx, cmd.AccountAdmin, cmd.UserID); err != nil {
+		return none, err
+	}
+	req := cmd.Request
+	userID, profileID := cmd.UserID, cmd.ProfileID
+	var avatarRef *string
+	if req.Avatar != nil {
+		normalized, err := normalizePresetAvatarReference(*req.Avatar)
+		if err != nil {
+			return none, fieldError("avatar", err.Error())
+		}
+		avatarRef = &normalized
+	}
+
+	var maxPlaybackQuality *string
+	if req.MaxPlaybackQuality != nil {
+		normalized, ok := access.ParsePlaybackQualityPreset(*req.MaxPlaybackQuality)
+		if !ok {
+			return none, fieldError("max_playback_quality", "Invalid max_playback_quality")
+		}
+		maxPlaybackQuality = &normalized
+	}
+	if req.MaxAdvisoryAge != nil && *req.MaxAdvisoryAge != 0 && !access.ValidAdvisoryAgeLimit(*req.MaxAdvisoryAge) {
+		return none, invalidAdvisoryAgeLimit()
+	}
+
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	currentProfile, err := store.GetProfile(ctx, profileID)
+	if err != nil || currentProfile == nil {
+		return none, apiError(http.StatusNotFound, "not_found", "Profile not found")
+	}
+
+	canManage, acting, err := manageHouseholdAs(ctx, store, cmd.AccountAdmin, cmd.ActiveProfileID, cmd.VerifyProfile)
+	if err != nil {
+		return none, profileManagementError(err)
+	}
+	if !canManage {
+		// Non-managers may only update their own active profile and only a
+		// narrow set of playback preferences.
+		if cmd.ActiveProfileID == "" || cmd.ActiveProfileID != profileID {
+			return none, apiError(http.StatusForbidden, "forbidden", "You can only update the active profile's playback preferences")
+		}
+		if !isAllowedSelfServiceProfileUpdate(req) {
+			return none, apiError(http.StatusForbidden, "forbidden", "Profile access settings require the primary profile or admin access")
+		}
+	}
+
+	if currentProfile.IsPrimary {
+		var allowed []int
+		if req.AllowedLibraryIDs != nil {
+			allowed = *req.AllowedLibraryIDs
+		}
+		if apiErr := primaryLibraryLimitError(req.LibraryRestrictionsEnabled != nil && *req.LibraryRestrictionsEnabled, allowed); apiErr != nil {
+			return none, apiErr
+		}
+	}
+
+	if req.Name != nil {
+		// Normalize to the trimmed form up front: the conflict check compares
+		// it and the store persists it, so " Laura " never lands verbatim.
+		trimmedName := strings.TrimSpace(*req.Name)
+		if trimmedName == "" {
+			return none, fieldError("name", "Profile name is required")
+		}
+		req.Name = &trimmedName
+		existingProfiles, err := store.ListProfiles(ctx)
+		if err != nil {
+			return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to list profiles")
+		}
+		if profileNameConflicts(existingProfiles, *req.Name, profileID) {
+			return none, apiError(http.StatusConflict, "name_conflict", "A profile with this name already exists")
+		}
+	}
+
+	// Planned before the transaction so an invalid preference fails while the
+	// request is still a no-op.
+	settingsSync, err := planUpdateProfileSettingsSync(req)
+	if err != nil {
+		return none, apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+
+	pinHash, err := hashProfilePIN(ctx, req.PIN)
+	if err != nil {
+		return none, err
+	}
+
+	input := userstore.UpdateProfileInput{
+		Name:                       req.Name,
+		Avatar:                     avatarRef,
+		PINHash:                    pinHash,
+		IsChild:                    req.IsChild,
+		MaxContentRating:           req.MaxContentRating,
+		MaxAdvisoryAge:             req.MaxAdvisoryAge,
+		RequireAdvisoryAge:         req.RequireAdvisoryAge,
+		RequestsBlocked:            req.RequestsBlocked,
+		QualityPreference:          req.QualityPreference,
+		Language:                   req.Language,
+		PreferredMetadataLanguage:  req.PreferredMetadataLanguage,
+		SubtitleLanguage:           req.SubtitleLanguage,
+		SubtitleMode:               req.SubtitleMode,
+		AutoSkipIntro:              req.AutoSkipIntro,
+		AutoSkipCredits:            req.AutoSkipCredits,
+		AutoSkipRecap:              req.AutoSkipRecap,
+		AutoPlayNextPreview:        req.AutoPlayNextPreview,
+		ShowForcedSubtitles:        req.ShowForcedSubtitles,
+		LibraryRestrictionsEnabled: req.LibraryRestrictionsEnabled,
+		AllowedLibraryIDs:          req.AllowedLibraryIDs,
+		MaxPlaybackQuality:         maxPlaybackQuality,
+	}
+
+	// The profile columns and their canonical projections commit together. A
+	// failure cannot leave a 500 response whose legacy values look saved while
+	// canonical readers continue serving the previous preference.
+	if err := h.applyProfileUpdateSettingsSync(
+		ctx, store, userID, profileID, input, settingsSync, acting,
+	); err != nil {
+		if errors.Is(err, access.ErrProfileUnverified) {
+			return none, profileManagementError(err)
+		}
+		slog.ErrorContext(ctx, "profile update failed to sync canonical settings",
+			"component", "api", "user_id", userID, "profile_id", profileID, "error", err)
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to store profile preferences")
+	}
+	// A new or removed PIN starts with a clean attempt count, so a manager
+	// who resets a locked profile's PIN can use the new one straight away.
+	// The PIN is already committed, so the reset must not depend on the
+	// client staying connected.
+	if req.PIN != nil {
+		resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		h.PINAttempts.Reset(resetCtx, ratelimit.ProfilePINKey(userID, profileID))
+		cancel()
+	}
+	if profileScopeSet(req) {
+		notifySignalsChanged(ctx, h.RecWorker, userID, profileID)
+	}
+	if currentProfile.Avatar != "" && avatarRef != nil && avatarRefReplacesUpload(currentProfile.Avatar, *avatarRef) {
+		if cleanupErr := deleteUploadedAvatarObjects(ctx, h.AvatarStore, userID, profileID); cleanupErr != nil {
+			slog.WarnContext(ctx, "profile avatar cleanup failed after update", "component", "api", "user_id", userID, "profile_id", profileID, "error", cleanupErr)
+		}
+	}
+
+	// Re-read the profile to return the updated state.
+	profile, err := store.GetProfile(ctx, profileID)
+	if err != nil || profile == nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to retrieve updated profile")
+	}
+
+	return h.toProfileResponse(ctx, store, *profile), nil
+}
+
+// codeProfileManagement is the error code of a household-management check
+// the caller did not pass; the v1 handlers branch on it to render the
+// PIN-verification message.
+const codeProfileManagement = "profile_management"
+
+// profileManagementError wraps a household-permission failure so the v1
+// handler can keep its exact wording (writeProfileManagementPermissionError)
+// and the v2 listener still sees the status.
+func profileManagementError(err error) *APIError {
+	out := &APIError{Status: http.StatusInternalServerError, Code: codeProfileManagement, Message: "Failed to check profile permissions", cause: err}
+	if errors.Is(err, access.ErrProfileUnverified) {
+		out.Status = http.StatusForbidden
+		out.Message = "Profile management requires verifying the primary profile PIN"
+	}
+	return out
+}
+
+// ProfileDeleteCommand is a profile deletion with its caller already reduced
+// to an identity.
+type ProfileDeleteCommand struct {
+	UserID    int
+	ProfileID string
+	// ActiveProfileID is the profile the caller acts as ("" when none).
+	ActiveProfileID string
+	// VerifyProfile confirms a PIN-locked primary profile is verified for
+	// this request; it returns access.ErrProfileUnverified when it is not.
+	VerifyProfile func(profile *userstore.Profile) error
+	// AccountAdmin marks a server administrator managing this account's
+	// household through the admin API (the caller already passed the acting
+	// admin check). It replaces the household-manager check: the
+	// administrator's own profile is not a member of this household, so there
+	// is no primary profile or PIN proof to require.
+	AccountAdmin bool
+}
+
+// DeleteProfile deletes a household profile: the household-manager
+// authorization, the primary-profile guard, the delete, and the best-effort
+// avatar and device-library cleanup. v1 DELETE /profiles/{id} and v2
+// deleteProfile both call it; a failure is an *APIError carrying the v1
+// status, code and message.
+func (h *ProfileHandler) DeleteProfile(ctx context.Context, cmd ProfileDeleteCommand) error {
+	if err := h.checkAccountAdmin(ctx, cmd.AccountAdmin, cmd.UserID); err != nil {
+		return err
+	}
+	userID, profileID := cmd.UserID, cmd.ProfileID
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	allowed, _, err := manageHouseholdAs(ctx, store, cmd.AccountAdmin, cmd.ActiveProfileID, cmd.VerifyProfile)
+	if err != nil {
+		return profileManagementError(err)
+	}
+	if !allowed {
+		return apiError(http.StatusForbidden, "forbidden", "Profile management requires the primary profile or admin access")
+	}
+	profile, err := store.GetProfile(ctx, profileID)
+	if err != nil || profile == nil {
+		return apiError(http.StatusNotFound, "not_found", "Profile not found")
+	}
+	if profile.IsPrimary {
+		return apiError(http.StatusConflict, "primary_profile_protected", "The primary profile cannot be deleted. Delete the user account instead.")
+	}
+
+	// The profile's devices, read before the delete takes their registrations.
+	registry, _ := store.(userstore.DeviceRegistry)
+	var devices []string
+	if registry != nil && h.Connections != nil {
+		entries, err := registry.ListDevices(ctx)
+		if err != nil {
+			slog.WarnContext(ctx, "listing profile devices before delete failed", "component", "api", "user_id", userID, "profile_id", profileID, "error", err)
+		}
+		for _, entry := range entries {
+			if entry.ProfileID == profileID {
+				devices = append(devices, entry.DeviceID)
+			}
+		}
+	}
+	var audit *auditmutation.Entry
+	var auditErr error
+	var deleteErr error
+	var deletedCollections []string
+	if deleter, ok := store.(userstore.AuditedProfileDeleter); ok && auditmutation.Recording(ctx) {
+		deletedCollections, deleteErr = deleter.DeleteProfileAudited(ctx, profileID, func(tx pgx.Tx, deleted *userstore.Profile) error {
+			audit, auditErr = recordProfileMutation(ctx, tx, deleted, nil)
+			return auditErr
+		})
+	} else {
+		deletedCollections, deleteErr = store.DeleteProfile(ctx, profileID)
+	}
+	if auditErr != nil {
+		return apiError(http.StatusInternalServerError, "internal_error", "Failed to delete profile")
+	}
+	if deleteErr != nil {
+		return apiError(http.StatusNotFound, "not_found", "Profile not found")
+	}
+	auditmutation.CommitMutation(ctx, audit)
+	if h.JellyfinSessionPurger != nil {
+		purgeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if purgeErr := h.JellyfinSessionPurger.PurgeProfile(purgeCtx, userID, profileID); purgeErr != nil {
+			slog.WarnContext(ctx, "profile Jellyfin session purge failed after delete", "component", "api", "user_id", userID, "profile_id", profileID, "error", purgeErr)
+		}
+	}
+	if h.WatchlistRequestWithdrawer != nil {
+		withdrawCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if withdrawErr := h.WatchlistRequestWithdrawer.WithdrawProfileWatchlistRequests(withdrawCtx, userID, profileID); withdrawErr != nil {
+			slog.WarnContext(ctx, "profile watchlist request withdrawal failed after delete", "component", "api", "user_id", userID, "profile_id", profileID, "error", withdrawErr)
+		}
+	}
+	if isUploadedAvatarRef(profile.Avatar) {
+		if cleanupErr := deleteUploadedAvatarObjects(ctx, h.AvatarStore, userID, profileID); cleanupErr != nil {
+			slog.WarnContext(ctx, "profile avatar cleanup failed after delete", "component", "api", "user_id", userID, "profile_id", profileID, "error", cleanupErr)
+		}
+	}
+	removeDeletedCollectionArtwork(ctx, h.ArtworkStore, userCollectionImagePrefix, deletedCollections...)
+	if h.DeviceLibraryPurger != nil {
+		purgeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if purgeErr := h.DeviceLibraryPurger.PurgeProfileDevices(purgeCtx, userID, profileID); purgeErr != nil {
+			slog.WarnContext(ctx, "profile device-library purge failed after delete", "component", "api", "user_id", userID, "profile_id", profileID, "error", purgeErr)
+		}
+	}
+	forgetPlaybackConnections(ctx, h.Connections, registry, userID, devices)
+	if h.DroppedSeriesPurger != nil {
+		purgeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if purgeErr := h.DroppedSeriesPurger.PurgeProfile(purgeCtx, userID, profileID); purgeErr != nil {
+			slog.WarnContext(ctx, "profile dropped-series purge failed after delete", "component", "api", "user_id", userID, "profile_id", profileID, "error", purgeErr)
+		}
+	}
+	if h.WatchlistTitlesPurger != nil {
+		purgeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if purgeErr := h.WatchlistTitlesPurger.PurgeProfile(purgeCtx, userID, profileID); purgeErr != nil {
+			slog.WarnContext(ctx, "profile watchlist-title purge failed after delete", "component", "api", "user_id", userID, "profile_id", profileID, "error", purgeErr)
+		}
+	}
+	if h.EbookReaderPurger != nil {
+		purgeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if purgeErr := h.EbookReaderPurger.PurgeProfile(purgeCtx, userID, profileID); purgeErr != nil {
+			slog.WarnContext(ctx, "profile ebook reader purge failed after delete", "component", "api", "user_id", userID, "profile_id", profileID, "error", purgeErr)
+		}
+	}
+	if h.RecommendationsPurger != nil {
+		purgeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if purgeErr := h.RecommendationsPurger.PurgeProfile(purgeCtx, userID, profileID); purgeErr != nil {
+			slog.WarnContext(ctx, "profile recommendation purge failed after delete", "component", "api", "user_id", userID, "profile_id", profileID, "error", purgeErr)
+		}
+	}
+	return nil
+}
+
+// ProfileVerifyPINCommand is a PIN check with its request already parsed
+// and its caller already reduced to an identity and login session.
+type ProfileVerifyPINCommand struct {
+	UserID    int
+	SessionID string
+	ProfileID string
+	PIN       string
+}
+
+// ProfileVerification is the outcome of a PIN check: whether the PIN
+// matched and, when it did and the server can mint one, the profile token
+// bound to the caller's login session with its expiry (zero when the token
+// does not expire).
+type ProfileVerification struct {
+	Valid        bool
+	ProfileToken string
+	ExpiresAt    time.Time
+}
+
+// VerifyPIN checks a profile's PIN and, on a match, mints the X-Profile-Token
+// the profile gates accept. v1 POST /profiles/{id}/verify-pin and v2
+// verifyProfilePIN both call it; a failure is an *APIError carrying the v1
+// status, code and message.
+func (h *ProfileHandler) VerifyPIN(ctx context.Context, cmd ProfileVerifyPINCommand) (ProfileVerification, error) {
+	var none ProfileVerification
+	store, err := h.storeProvider.ForUser(ctx, cmd.UserID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+
+	// Read the PIN revision before checking the PIN. A PIN change that lands
+	// between the two reads leaves the token on the older revision, which
+	// validation refuses; reading after would bind a proof of the old PIN to
+	// the new revision. Only a profile that exists and has a PIN gets an
+	// attempt budget, so requests naming arbitrary IDs add no limiter entries.
+	profile, err := store.GetProfile(ctx, cmd.ProfileID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to load profile")
+	}
+	if profile == nil || profile.PINHash == "" {
+		return none, apiError(http.StatusNotFound, "not_found", "Profile not found or has no PIN")
+	}
+
+	// The account revision is the claim an older node checks during a rolling
+	// deploy, so it is read before the PIN check for the same reason.
+	var user *models.User
+	if h.UserRepo != nil && h.ProfileTokens != nil {
+		user, err = h.UserRepo.GetByID(ctx, cmd.UserID)
+		if err != nil || user == nil {
+			return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to load user policy")
+		}
+	}
+
+	// The attempt is counted before the PIN is checked, so concurrent
+	// guesses cannot overrun the limit, and while the profile is locked even
+	// the right PIN is refused. The check then waits for a hashing turn ahead
+	// of sign-ins, and compares against the hash read with the revision above.
+	attemptKey := ratelimit.ProfilePINKey(cmd.UserID, cmd.ProfileID)
+	if retryAfter, ok := h.PINAttempts.Reserve(ctx, attemptKey); !ok {
+		return none, PINLockedError(retryAfter)
+	}
+	permit, err := passwordhash.AdmitAhead(ctx)
+	if apiErr := busyError(err); apiErr != nil {
+		return none, apiErr
+	}
+	valid, err := permit.Matches([]byte(profile.PINHash), []byte(cmd.PIN))
+	permit.Release()
+	if err != nil {
+		return none, apiError(http.StatusNotFound, "not_found", "Profile not found or has no PIN")
+	}
+	if valid {
+		h.PINAttempts.Reset(ctx, attemptKey)
+	}
+	if !valid || user == nil {
+		return ProfileVerification{Valid: valid}, nil
+	}
+
+	token, expiresAt, err := h.ProfileTokens.Mint(access.ProfileTokenClaims{
+		UserID:      cmd.UserID,
+		SessionID:   cmd.SessionID,
+		ProfileID:   cmd.ProfileID,
+		PINRevision: profile.PINRevision,
+		// Only for nodes running an older release during a rolling deploy.
+		PolicyRevision: user.AccessPolicyRevision,
+	})
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to issue profile token")
+	}
+	return ProfileVerification{Valid: true, ProfileToken: token, ExpiresAt: expiresAt}, nil
+}
+
+// hashProfilePIN prepares a requested PIN for storage before the profile
+// transaction opens, as creation does, so the transaction never waits for a
+// hashing turn: its bcrypt hash, "" to remove the PIN, or nil to keep it.
+func hashProfilePIN(ctx context.Context, pin *string) (*string, error) {
+	if pin == nil || *pin == "" {
+		return pin, nil
+	}
+	raw, err := passwordhash.Generate(ctx, []byte(*pin), bcrypt.DefaultCost)
+	if apiErr := busyError(err); apiErr != nil {
+		return nil, apiErr
+	}
+	if err != nil {
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to set profile PIN")
+	}
+	hash := string(raw)
+	return &hash, nil
+}
+
+// PINLockedError is the 429 a PIN check answers while the profile is locked
+// after too many wrong PINs. Both listeners render RetryAfter as the
+// Retry-After header.
+func PINLockedError(retryAfter time.Duration) *APIError {
+	e := apiError(http.StatusTooManyRequests, "rate_limited", "Too many incorrect PINs. Try again later.")
+	e.RetryAfter = ratelimit.RetryAfterSeconds(retryAfter)
+	return e
+}
+
+// --- Helpers ---
+
+// toProfileResponse serializes one profile, resolving its preference block on
+// its own. Callers serializing several profiles must use toProfileResponses
+// instead so the whole list costs one store read.
+func (h *ProfileHandler) toProfileResponse(
+	ctx context.Context, store userstore.UserStore, p userstore.Profile,
+) ProfileView {
+	prefs := resolveProfilePreferences(ctx, store, []string{p.ID})
+	return h.profileResponseWith(ctx, p, prefs[p.ID])
+}
+
+// toProfileResponses serializes a whole household, resolving every profile's
+// preference block in one store read rather than one per profile.
+func (h *ProfileHandler) toProfileResponses(
+	ctx context.Context, store userstore.UserStore, profiles []userstore.Profile,
+) []ProfileView {
+	ids := make([]string, 0, len(profiles))
+	for _, p := range profiles {
+		ids = append(ids, p.ID)
+	}
+	prefs := resolveProfilePreferences(ctx, store, ids)
+
+	out := make([]ProfileView, 0, len(profiles))
+	for _, p := range profiles {
+		out = append(out, h.profileResponseWith(ctx, p, prefs[p.ID]))
+	}
+	return out
+}
+
+// ResolveAvatar is the avatar_source and avatar_url a profile's stored avatar
+// reference renders as, delivered through this handler's avatar store.
+func (h *ProfileHandler) ResolveAvatar(ctx context.Context, ref string) (source, url string) {
+	return resolveProfileAvatar(ctx, h.AvatarStore, h.AvatarTTL, ref, h.AvatarResolver)
+}
+
+// profileResponseWith builds the DTO from a profile row and its already
+// resolved preferences.
+//
+// The preference fields come from prefs rather than from p: those five are
+// canonical now, and the legacy columns behind them are written but no longer
+// read (see profiles_settings_sync.go). Everything else is still column-backed.
+func (h *ProfileHandler) profileResponseWith(
+	ctx context.Context, p userstore.Profile, prefs profilePreferences,
+) ProfileView {
+	avatarSource, avatarURL := h.ResolveAvatar(ctx, p.Avatar)
+	// A primary profile has no library limit (access.ProfileLibraryLimit); a
+	// stored one, from an older server or a restored backup, is not reported.
+	libraryRestricted, allowedLibraryIDs := p.LibraryRestrictionsEnabled, p.AllowedLibraryIDs
+	if p.IsPrimary {
+		libraryRestricted, allowedLibraryIDs = false, nil
+	}
+	return ProfileView{
+		ID:                         p.ID,
+		Name:                       p.Name,
+		Avatar:                     p.Avatar,
+		AvatarURL:                  avatarURL,
+		AvatarSource:               avatarSource,
+		HasPIN:                     p.PINHash != "",
+		IsChild:                    p.IsChild,
+		IsPrimary:                  p.IsPrimary,
+		MaxContentRating:           p.MaxContentRating,
+		MaxAdvisoryAge:             p.MaxAdvisoryAge,
+		RequireAdvisoryAge:         p.RequireAdvisoryAge,
+		RequestsBlocked:            p.RequestsBlocked,
+		QualityPreference:          p.QualityPreference,
+		Language:                   prefs.AudioLanguage,
+		PreferredMetadataLanguage:  prefs.MetadataLanguage,
+		SubtitleLanguage:           prefs.SubtitleLanguage,
+		SubtitleMode:               prefs.SubtitleMode,
+		AutoSkipIntro:              p.AutoSkipIntro,
+		AutoSkipCredits:            p.AutoSkipCredits,
+		AutoSkipRecap:              p.AutoSkipRecap,
+		AutoPlayNextPreview:        p.AutoPlayNextPreview,
+		ShowForcedSubtitles:        prefs.ShowForcedSubtitles,
+		LibraryRestrictionsEnabled: libraryRestricted,
+		AllowedLibraryIDs:          append([]int(nil), allowedLibraryIDs...),
+		MaxPlaybackQuality:         access.NormalizePlaybackQuality(p.MaxPlaybackQuality),
+		CreatedAt:                  p.CreatedAt,
+		UpdatedAt:                  p.UpdatedAt,
+	}
+}
+
+// PlaybackSessionView is one live playback session as the session listings
+// serialize it.
+type PlaybackSessionView = playbackSessionRow
+
+// HouseholdSessionsQuery is a household session listing with its caller
+// already reduced to an identity.
+type HouseholdSessionsQuery struct {
+	UserID int
+	// ActiveProfileID is the profile the caller acts as ("" when none).
+	ActiveProfileID string
+	// VerifyProfile confirms a PIN-locked primary profile is verified for
+	// this request; it returns access.ErrProfileUnverified when it is not.
+	VerifyProfile func(profile *userstore.Profile) error
+}
+
+// ListHouseholdSessions lists the account's live playback sessions for a
+// household manager. v1 GET /profiles/household/sessions and v2
+// listHouseholdSessions both call it; a failure is an *APIError carrying
+// the v1 status, code and message.
+func (h *ProfileHandler) ListHouseholdSessions(ctx context.Context, q HouseholdSessionsQuery) ([]PlaybackSessionView, error) {
+	store, err := h.storeProvider.ForUser(ctx, q.UserID)
+	if err != nil {
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	allowed, err := canManageHouseholdAs(ctx, store, q.ActiveProfileID, q.VerifyProfile)
+	if err != nil {
+		return nil, profileManagementError(err)
+	}
+	if !allowed {
+		return nil, apiError(http.StatusForbidden, "forbidden", "Profile management requires the primary profile or admin access")
+	}
+	if h.SessionsReader == nil {
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Playback sessions are not configured")
+	}
+
+	sessions, err := h.SessionsReader.Load(ctx, PlaybackSessionsQuery{UserID: q.UserID})
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to list household playback sessions", "component", "api", "user_id", q.UserID, "error", err)
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to list playback sessions")
+	}
+	return sessions, nil
+}

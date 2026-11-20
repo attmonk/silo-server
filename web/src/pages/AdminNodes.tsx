@@ -1,0 +1,1782 @@
+import { useState } from "react";
+import { captureProfileRequestContext } from "@/api/client";
+import { V2ProblemError } from "@/api/v2/request";
+import { useT, type Translate } from "@/i18n";
+import type { NodeDeleteIntent } from "@/hooks/queries/admin/nodes";
+import { useAdminServerSettings } from "@/hooks/queries/admin/settings";
+import type { FormEvent, ReactNode } from "react";
+import type {
+  StreamNode,
+  CreateNodeRequest,
+  NodeSourceAccess,
+  UpdateNodeRequest,
+} from "@/api/types";
+import {
+  useAdminNodeCapabilities,
+  useAdminNodes,
+  useCreateNode,
+  useUpdateNode,
+  useDeleteNode,
+  useCheckNodeHealth,
+  useIssueNodeKey,
+  useReprobeNode,
+  useSetNodeDrain,
+  useToggleNode,
+} from "@/hooks/queries/admin/nodes";
+import { PageHeader } from "@/components/page/PageHeader";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Plus,
+  Pencil,
+  Trash2,
+  RefreshCw,
+  ScanSearch,
+  Info,
+  AlertTriangle,
+  CirclePause,
+  CirclePlay,
+  Copy,
+  KeyRound,
+} from "lucide-react";
+import { toast } from "sonner";
+import { LoadMeter } from "@/components/admin/LoadMeter";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { copyTextToClipboard } from "@/lib/clipboard";
+import { formatDateTime } from "@/lib/datetime";
+import { formatRelativeTime } from "@/lib/date";
+import { toggleHWDevice } from "@/lib/hwDevices";
+import { cn } from "@/lib/utils";
+import type {
+  NodeCapabilityStaleReason,
+  NodeGPULiveDevice,
+  NodeGroupOption,
+  NodeHWDeviceRow,
+  ResourceMetric,
+} from "./adminNodesPresentation";
+import {
+  HW_ACCEL_INHERIT,
+  buildNodeHWDeviceRows,
+  describeCapabilityDrift,
+  describeEffectiveAcceleration,
+  describeNodeAccelerationOverride,
+  describeNodeDrain,
+  describeNodeEgress,
+  describeNodeGPU,
+  describeNodeGroups,
+  describeNodeJobs,
+  describeNodeSystem,
+  describeSharedGPU,
+  filterNodesByGroup,
+  hwAccelOverrideOptions,
+  nodeHWDevicePaths,
+  nodeHasHWDeviceInventory,
+  NODE_STATE_LABEL,
+  nodeState,
+  type NodeState,
+  nodeReportsAcceleration,
+  hwDeviceSyntaxChanges,
+  nodeUsesCUDADevices,
+  parseHWDeviceOverride,
+  restoreEnvManagedFields,
+} from "./adminNodesPresentation";
+import { NodeRoutingSettings } from "@/pages/admin-settings/NodeRoutingSettings";
+
+type NodeType = "proxy" | "transcode";
+
+/**
+ * Status-rail tint. The rail runs down the left edge of every unit, so a rack
+ * of nodes is scannable as a column of state before any of it is read.
+ */
+const NODE_STATE_RAIL: Record<NodeState, string> = {
+  healthy: "bg-success/70",
+  draining: "bg-warning",
+  drained: "bg-info",
+  unhealthy: "bg-destructive",
+  disabled: "bg-muted-foreground/30",
+};
+
+const NODE_STATE_DOT: Record<NodeState, string> = {
+  healthy: "bg-success",
+  draining: "bg-warning",
+  drained: "bg-info",
+  unhealthy: "bg-destructive",
+  disabled: "bg-muted-foreground",
+};
+
+/** Micro-caps block label inside a node unit; the app's existing eyebrow idiom. */
+function UnitLabel({ children }: { children: ReactNode }) {
+  return <p className="hero-eyebrow mb-2.5 text-[0.62rem]">{children}</p>;
+}
+
+/**
+ * The grid every reading inside a unit is laid out on: a name, a bar, a value.
+ *
+ * One grid per block rather than one per row, so the browser sizes the name and
+ * value columns to the widest of each and the bars all start and end on the
+ * same two lines. Bars of different lengths cannot be compared by eye, which is
+ * the only reason to draw them.
+ */
+const METRIC_GRID = "grid grid-cols-[auto_minmax(2rem,1fr)_auto] items-center gap-x-3 gap-y-2.5";
+
+/** One derived reading, as three cells of the enclosing metric grid. */
+function NodeMetricRow({ metric }: { metric: ResourceMetric }) {
+  return (
+    <>
+      <span className="text-muted-foreground text-[11px]" title={metric.title}>
+        {metric.label}
+      </span>
+      <LoadMeter fill={metric.fill} warning={metric.warning} />
+      <span
+        className={cn(
+          "text-end font-mono text-[11px] tabular-nums",
+          metric.muted && "text-muted-foreground",
+          metric.warning && "text-warning font-medium",
+        )}
+        title={metric.title}
+      >
+        {metric.value}
+      </span>
+    </>
+  );
+}
+
+function NodeLoadBlock({ node }: { node: StreamNode }) {
+  const t = useT();
+  const system = describeNodeSystem(node);
+  return (
+    <div>
+      <UnitLabel>{t("web.admin.nodes.unit.load")}</UnitLabel>
+      {system.kind === "unreported" ? (
+        <p className="text-muted-foreground text-xs" title={system.title}>
+          {system.stale
+            ? t("web.admin.nodes.unit.staleSample")
+            : t("web.admin.nodes.unit.noSample")}
+        </p>
+      ) : (
+        <div className={METRIC_GRID}>
+          <NodeMetricRow metric={system.cpu} />
+          <NodeMetricRow metric={system.memory} />
+          <NodeMetricRow metric={system.disk} />
+          <NodeMetricRow metric={system.network} />
+          {system.processMemory ? <NodeMetricRow metric={system.processMemory} /> : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NodeCapacityBlock({ node, showEgress }: { node: StreamNode; showEgress: boolean }) {
+  const t = useT();
+  return (
+    <div>
+      <UnitLabel>{t("web.admin.nodes.unit.capacity")}</UnitLabel>
+      <div className={METRIC_GRID}>
+        <NodeMetricRow metric={describeNodeJobs(node)} />
+        {showEgress && <NodeMetricRow metric={describeNodeEgress(node)} />}
+        {/*
+          Relative, because the question this answers is "is anything still
+          talking to this node", and an absolute wall-clock stamp makes the
+          reader do that subtraction on every unit. The stamp stays in the title
+          for when the exact moment matters.
+        */}
+        <span className="text-muted-foreground text-[11px]">
+          {t("web.admin.nodes.unit.checked")}
+        </span>
+        <span />
+        <span
+          className="text-end font-mono text-[11px] tabular-nums"
+          title={node.last_health_check ? formatDateTime(node.last_health_check) : undefined}
+        >
+          {formatRelativeTime(node.last_health_check) ?? t("web.admin.nodes.unit.never")}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** The "override: qsv" line, or nothing on a node that inherits the cluster. */
+function NodeOverrideLine({ node }: { node: StreamNode }) {
+  const override = describeNodeAccelerationOverride(node);
+  if (!override) {
+    return null;
+  }
+  return (
+    <div className="text-muted-foreground text-xs" title={override.title}>
+      {override.label}
+    </div>
+  );
+}
+
+/**
+ * The "Shared GPU" marker, or nothing when this node's card is its own. Muted
+ * rather than tinted: sharing hardware is information an operator needs when
+ * reading job counts, not a fault.
+ */
+function NodeSharedGPUBadge({ node, allNodes }: { node: StreamNode; allNodes: StreamNode[] }) {
+  const shared = describeSharedGPU(node, allNodes);
+  if (!shared) {
+    return null;
+  }
+  return (
+    <Badge
+      variant="outline"
+      className="bg-surface text-muted-foreground border-border"
+      title={shared.title}
+    >
+      {shared.label}
+    </Badge>
+  );
+}
+
+/**
+ * The "Drift" marker on a node whose last capability refetch found its hardware
+ * got worse. Tinted, unlike the shared-GPU marker: this one is a regression an
+ * operator has to act on, and the Health column will not show it.
+ */
+function NodeDriftBadge({ node }: { node: StreamNode }) {
+  const drift = describeCapabilityDrift(node);
+  if (!drift) {
+    return null;
+  }
+  return (
+    <Badge
+      variant="outline"
+      className="bg-warning/10 text-warning border-warning/15"
+      title={drift.title}
+    >
+      {drift.label}
+    </Badge>
+  );
+}
+
+// Each reason names a different thing to go look at, so none of them is worth
+// collapsing into a generic "out of date": a contradicted report means the
+// refetch is failing, an unreported one means the node no longer speaks
+// capabilities at all, and an unconfirmed one means the health check stopped
+// landing.
+function staleInventoryTitle(
+  t: Translate,
+  reason: NodeCapabilityStaleReason,
+  node: StreamNode,
+): string {
+  const refreshed = formatDateTime(node.capabilities_refreshed_at ?? "");
+  switch (reason) {
+    case "contradicted":
+      return t("web.admin.nodes.staleInventory.contradicted", { refreshed });
+    case "unreported":
+      return t("web.admin.nodes.staleInventory.unreported", { refreshed });
+    case "unconfirmed":
+      return t("web.admin.nodes.staleInventory.unconfirmed", {
+        checked: formatDateTime(node.last_health_check ?? ""),
+        refreshed,
+      });
+  }
+}
+
+/**
+ * One GPU's video engine: which device, how hard it is working, what is on it.
+ *
+ * The bar is the point of the row. Per-device busy percentages are the reading
+ * an operator opens this page for when transcodes start queueing, and as four
+ * lines of near-identical text they have to be read one at a time instead of
+ * compared at a glance.
+ */
+function NodeEngineRow({ device }: { device: NodeGPULiveDevice }) {
+  return (
+    <>
+      <span
+        className="text-muted-foreground max-w-[7rem] truncate font-mono text-[11px]"
+        title={device.title}
+      >
+        {device.label}
+      </span>
+      <LoadMeter fill={device.busyFill} />
+      <span
+        className={cn(
+          "text-end font-mono text-[11px] tabular-nums",
+          device.busyMuted ? "text-muted-foreground" : "text-foreground",
+        )}
+        title={device.title}
+      >
+        {device.busy}
+      </span>
+      <span className="text-muted-foreground text-end text-[10px] whitespace-nowrap">
+        {device.sessions}
+      </span>
+    </>
+  );
+}
+
+function NodeAccelerationBlock({ node, allNodes }: { node: StreamNode; allNodes: StreamNode[] }) {
+  const t = useT();
+  const gpu = describeNodeGPU(node);
+  if (gpu.kind === "awaiting") {
+    return (
+      <div>
+        <UnitLabel>{t("web.admin.nodes.unit.acceleration")}</UnitLabel>
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-muted-foreground text-xs" title={gpu.title}>
+              {gpu.label}
+            </span>
+            <NodeDriftBadge node={node} />
+          </div>
+          <NodeOverrideLine node={node} />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <UnitLabel>{t("web.admin.nodes.unit.acceleration")}</UnitLabel>
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Badge variant="outline" className={gpu.backend.badgeClass} title={gpu.backend.title}>
+            {gpu.backend.label}
+          </Badge>
+          <NodeDriftBadge node={node} />
+          <NodeSharedGPUBadge node={node} allNodes={allNodes} />
+          {gpu.failures.length > 0 && (
+            <span
+              className="text-warning inline-flex"
+              title={gpu.failures
+                .map((failure) =>
+                  t("web.admin.nodes.unit.probeFailure", {
+                    backend: failure.label,
+                    reason: failure.reason,
+                  }),
+                )
+                .join("\n")}
+            >
+              <AlertTriangle
+                className="h-3.5 w-3.5"
+                aria-label={t("web.admin.nodes.unit.probeFailureCount", {
+                  count: gpu.failures.length,
+                  name: node.name,
+                })}
+              />
+            </span>
+          )}
+          {gpu.stale && (
+            <span
+              className="text-muted-foreground text-xs"
+              title={staleInventoryTitle(t, gpu.stale, node)}
+            >
+              {t("web.admin.nodes.unit.stale")}
+            </span>
+          )}
+        </div>
+        {gpu.deviceSummary && (
+          <p className="text-muted-foreground text-xs" title={gpu.deviceTitle ?? undefined}>
+            {gpu.deviceSummary}
+          </p>
+        )}
+        <NodeOverrideLine node={node} />
+        {gpu.live.length > 0 && (
+          <div className="grid grid-cols-[auto_minmax(2rem,1fr)_auto_auto] items-center gap-x-3 gap-y-2 pt-0.5">
+            {gpu.live.map((device) => (
+              <NodeEngineRow key={device.key} device={device} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One bucket in the group filter.
+ *
+ * A button rather than a link or a select: the whole point of the control is
+ * that the options are visible side by side, because the question it answers —
+ * which nodes belong to each other — is answered by seeing the buckets, not by
+ * opening a menu to read them one at a time.
+ */
+function GroupChip({
+  label,
+  count,
+  active,
+  degraded,
+  title,
+  onClick,
+}: {
+  label: string;
+  count: number;
+  active: boolean;
+  degraded?: boolean;
+  title?: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      title={title}
+      onClick={onClick}
+      className={cn(
+        "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs transition-colors",
+        // The selected chip is filled, not tinted. A 10% wash over this page's
+        // surfaces is the kind of difference that reads on a designer's monitor
+        // and nowhere else, and a filter whose current setting has to be hunted
+        // for is worse than no filter: the list looks wrong rather than narrowed.
+        active
+          ? "border-primary bg-primary text-primary-foreground"
+          : "border-border text-muted-foreground hover:bg-surface-hover hover:text-foreground",
+      )}
+    >
+      {degraded && (
+        <span
+          aria-hidden="true"
+          className="bg-warning h-1.5 w-1.5 shrink-0 rounded-full"
+          // The dot is decoration; the group's own title says what it means, and
+          // the unhealthy member is already spelled out on its own unit.
+        />
+      )}
+      <span className={cn(active && "font-medium")}>{label}</span>
+      <span
+        className={cn(
+          "font-mono text-[10px] tabular-nums",
+          active ? "opacity-70" : "text-muted-foreground",
+        )}
+      >
+        {count}
+      </span>
+    </button>
+  );
+}
+
+/**
+ * The group filter, shown above both sections because a group spans them: its
+ * proxy and its transcode node are the pair, and each section holds one half.
+ *
+ * Absent when there is only one bucket. A filter that can only be switched
+ * between "all" and "all" is a control that does nothing.
+ */
+function NodeGroupFilter({
+  options,
+  active,
+  total,
+  onSelect,
+}: {
+  options: NodeGroupOption[];
+  active: string | null;
+  total: number;
+  onSelect: (group: string | null) => void;
+}) {
+  const t = useT();
+  if (options.length < 2) {
+    return null;
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <p className="hero-eyebrow me-1 text-[0.62rem]">{t("web.admin.nodes.groupFilter.heading")}</p>
+      <GroupChip
+        label={t("web.admin.nodes.groupFilter.all")}
+        count={total}
+        active={active === null}
+        title={t("web.admin.nodes.groupFilter.allTitle")}
+        onClick={() => onSelect(null)}
+      />
+      {options.map((option) => (
+        <GroupChip
+          key={option.value}
+          label={option.label}
+          count={option.count}
+          active={active === option.value}
+          degraded={option.degraded}
+          title={option.title}
+          onClick={() => onSelect(option.value)}
+        />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * A transcode node's key status, and the button that issues or rotates it.
+ *
+ * The missing-key status is worded as its consequence: the node is listed and
+ * health-checked, but receives no work until it has a key. The button needs a
+ * server that can issue keys (`onKey` is undefined otherwise).
+ */
+function NodeKeyLine({ node, onKey }: { node: StreamNode; onKey?: (node: StreamNode) => void }) {
+  const t = useT();
+  if (node.key_issued === undefined) return null;
+  const issued = node.key_issued;
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+      <KeyRound
+        className={cn("h-3 w-3 shrink-0", issued ? "text-muted-foreground" : "text-warning")}
+        aria-hidden="true"
+      />
+      <span className={issued ? "text-muted-foreground" : "text-warning font-medium"}>
+        {issued ? t("web.admin.nodes.key.issued") : t("web.admin.nodes.key.missing")}
+      </span>
+      {onKey && (
+        <Button
+          variant="link"
+          size="sm"
+          className="h-auto p-0 text-xs"
+          aria-label={
+            issued
+              ? t("web.admin.nodes.key.rotateFor", { name: node.name })
+              : t("web.admin.nodes.key.issueFor", { name: node.name })
+          }
+          onClick={() => onKey(node)}
+        >
+          {issued ? t("web.admin.nodes.key.rotate") : t("web.admin.nodes.key.issue")}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+interface NodeUnitProps {
+  node: StreamNode;
+  /**
+   * Every node of both types. Shared-GPU detection needs it: a proxy and a
+   * transcode node on one host share that host's card, and each section holds
+   * only half of that pair.
+   */
+  allNodes: StreamNode[];
+  /** Proxy nodes relay bytes and are capped on egress; transcode nodes are not. */
+  showEgress: boolean;
+  onEdit: (node: StreamNode) => void;
+  onDelete: (node: StreamNode) => void;
+  onToggle: (node: StreamNode) => void;
+  onCheckHealth: (node: StreamNode) => void;
+  isChecking: boolean;
+  onReprobe: (node: StreamNode) => void;
+  isReprobing: boolean;
+  /** Drain (true) or resume (false) a transcode node. */
+  onSetDrain: (node: StreamNode, requested: boolean) => void;
+  isSettingDrain: boolean;
+  /** Issue or rotate a transcode node's key; undefined when the server cannot issue keys. */
+  onKey?: (node: StreamNode) => void;
+}
+
+/**
+ * One node, as one unit.
+ *
+ * What a node reports is two-dimensional — a backend and its devices, four host
+ * readings, a load against a cap — and a row of eleven columns could only hold
+ * that by scrolling sideways and flattening every reading into the same 11px
+ * grey. A unit gives the node a header worth scanning and three labelled blocks
+ * under it, and it reflows on a narrow screen instead of scrolling off one.
+ */
+function NodeUnit({
+  node,
+  allNodes,
+  showEgress,
+  onEdit,
+  onDelete,
+  onToggle,
+  onCheckHealth,
+  isChecking,
+  onReprobe,
+  isReprobing,
+  onSetDrain,
+  isSettingDrain,
+  onKey,
+}: NodeUnitProps) {
+  const t = useT();
+  const state = nodeState(node);
+  const drain = describeNodeDrain(node);
+  const drainRequested = node.drain_requested === true;
+  // Only transcode nodes drain. A disabled node already takes no work, so it
+  // offers only Resume, for a request it still carries.
+  const canDrain = node.type === "transcode" && (node.enabled || drainRequested);
+  // See nodeReportsAcceleration: a proxy reports no hardware, so it has neither
+  // an acceleration block to draw nor hardware to re-probe.
+  const showsAcceleration = nodeReportsAcceleration(node);
+
+  return (
+    <div
+      className={cn(
+        "surface-panel relative overflow-hidden rounded-2xl border-0 p-4 ps-5 sm:p-5 sm:ps-6",
+        // A disabled node is out of the rotation, and every number on it is
+        // whatever it was when it left. Dimming says that once, for the whole
+        // unit, instead of qualifying each reading.
+        state === "disabled" && "opacity-65",
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cn("absolute inset-y-4 start-0 w-[3px] rounded-full", NODE_STATE_RAIL[state])}
+      />
+
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+            <h3 className="text-[15px] leading-tight font-semibold tracking-tight">{node.name}</h3>
+            <span className="inline-flex items-center gap-1.5">
+              <span
+                aria-hidden="true"
+                className={cn("h-1.5 w-1.5 rounded-full", NODE_STATE_DOT[state])}
+              />
+              <span className="text-muted-foreground text-xs">{t(NODE_STATE_LABEL[state])}</span>
+            </span>
+            {node.group && (
+              <Badge variant="outline" className="font-mono text-[10px] font-normal">
+                {node.group}
+              </Badge>
+            )}
+          </div>
+          {/* The URL is the node's machine identity, so it is set in the mono
+              face along with the device paths and the readings — everything on
+              this page a person did not name. */}
+          <p className="text-muted-foreground mt-1 truncate font-mono text-xs" title={node.url}>
+            {node.url}
+          </p>
+          {node.public_url && (
+            <p
+              className="text-muted-foreground truncate font-mono text-xs"
+              title={t("web.admin.nodes.unit.publicUrlTitle")}
+            >
+              {t("web.admin.nodes.unit.publicUrl", { url: node.public_url })}
+            </p>
+          )}
+          {node.type === "transcode" && <NodeKeyLine node={node} onKey={onKey} />}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-1">
+          {/* Out of the table, this switch has no column header to name it. */}
+          <Switch
+            checked={node.enabled}
+            aria-label={t("web.admin.nodes.unit.enable", { name: node.name })}
+            onCheckedChange={() => onToggle(node)}
+          />
+          <span aria-hidden="true" className="bg-border/70 mx-1.5 h-5 w-px" />
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            disabled={isChecking}
+            aria-label={t("web.admin.nodes.unit.checkHealth", { name: node.name })}
+            onClick={() => onCheckHealth(node)}
+          >
+            <RefreshCw
+              className={`h-3 w-3 ${isChecking ? "animate-spin" : ""}`}
+              aria-hidden="true"
+            />
+          </Button>
+          {canDrain && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7"
+              disabled={isSettingDrain}
+              aria-label={
+                drainRequested
+                  ? t("web.admin.nodes.unit.resume", { name: node.name })
+                  : t("web.admin.nodes.unit.drain", { name: node.name })
+              }
+              title={
+                drainRequested
+                  ? t("web.admin.nodes.unit.resumeTitle")
+                  : t("web.admin.nodes.unit.drainTitle")
+              }
+              onClick={() => onSetDrain(node, !drainRequested)}
+            >
+              {drainRequested ? (
+                <CirclePlay className="h-3 w-3" aria-hidden="true" />
+              ) : (
+                <CirclePause className="h-3 w-3" aria-hidden="true" />
+              )}
+            </Button>
+          )}
+          {showsAcceleration && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7"
+              disabled={isReprobing}
+              aria-label={t("web.admin.nodes.unit.reprobe", { name: node.name })}
+              title={t("web.admin.nodes.unit.reprobeTitle")}
+              onClick={() => onReprobe(node)}
+            >
+              <ScanSearch
+                className={`h-3 w-3 ${isReprobing ? "animate-pulse" : ""}`}
+                aria-hidden="true"
+              />
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            aria-label={t("web.admin.nodes.unit.edit", { name: node.name })}
+            onClick={() => onEdit(node)}
+          >
+            <Pencil className="h-3 w-3" aria-hidden="true" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            aria-label={t("web.admin.nodes.unit.delete", { name: node.name })}
+            onClick={() => onDelete(node)}
+          >
+            <Trash2 className="h-3 w-3" aria-hidden="true" />
+          </Button>
+        </div>
+      </div>
+
+      {!node.enabled && (
+        <p className="text-muted-foreground mt-3 text-xs">
+          {t("web.admin.nodes.unit.disabledNote")}
+        </p>
+      )}
+
+      {drain && (
+        <p className="mt-3 text-xs" title={drain.detail}>
+          {t("web.admin.nodes.drain.statusLine", {
+            label: drain.label,
+            detail: drain.detail,
+            status: (chunks) => (
+              <span
+                className={cn(
+                  "font-medium",
+                  drain.phase === "drained" ? "text-info" : "text-warning",
+                )}
+              >
+                {chunks}
+              </span>
+            ),
+            muted: (chunks) => <span className="text-muted-foreground">{chunks}</span>,
+          })}
+        </p>
+      )}
+
+      {/* Two blocks on a proxy, three on a transcode node. The track list is
+          picked to match, so the survivors fill the row rather than leaving a
+          column-shaped hole where acceleration used to be. */}
+      <div
+        className={cn(
+          "border-border/50 mt-4 grid gap-x-8 gap-y-5 border-t pt-4 sm:grid-cols-2",
+          showsAcceleration
+            ? "xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)_minmax(0,0.85fr)]"
+            : "xl:grid-cols-[minmax(0,1fr)_minmax(0,0.85fr)]",
+        )}
+      >
+        {showsAcceleration && <NodeAccelerationBlock node={node} allNodes={allNodes} />}
+        <NodeLoadBlock node={node} />
+        <NodeCapacityBlock node={node} showEgress={showEgress} />
+      </div>
+    </div>
+  );
+}
+
+interface NodeSectionProps {
+  type: NodeType;
+  nodes: StreamNode[];
+  /** Every node of both types; see `NodeUnitProps.allNodes`. */
+  allNodes: StreamNode[];
+  infoBanner: ReactNode;
+  /** The group `nodes` was narrowed to, or null when it was not narrowed. */
+  activeGroup: string | null;
+  onClearGroup: () => void;
+  onAdd: () => void;
+  onEdit: (node: StreamNode) => void;
+  onDelete: (node: StreamNode) => void;
+  onToggle: (node: StreamNode) => void;
+  onCheckHealth: (node: StreamNode) => void;
+  checkingHealthId: StreamNode["id"] | null;
+  onReprobe: (node: StreamNode) => void;
+  reprobingId: StreamNode["id"] | null;
+  onSetDrain: (node: StreamNode, requested: boolean) => void;
+  settingDrainId: StreamNode["id"] | null;
+  onKey?: (node: StreamNode) => void;
+}
+
+function NodeSection({
+  type,
+  nodes,
+  allNodes,
+  infoBanner,
+  activeGroup,
+  onClearGroup,
+  onAdd,
+  onEdit,
+  onDelete,
+  onToggle,
+  onCheckHealth,
+  checkingHealthId,
+  onReprobe,
+  reprobingId,
+  onSetDrain,
+  settingDrainId,
+  onKey,
+}: NodeSectionProps) {
+  const t = useT();
+  const addLabel =
+    type === "proxy"
+      ? t("web.admin.nodes.section.addProxy")
+      : t("web.admin.nodes.section.addTranscode");
+
+  return (
+    <section className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <h2 className="text-lg font-semibold">
+            {type === "proxy"
+              ? t("web.admin.nodes.section.proxyTitle")
+              : t("web.admin.nodes.section.transcodeTitle")}
+          </h2>
+          <Badge variant="secondary">{nodes.length}</Badge>
+        </div>
+        <Button size="sm" onClick={onAdd}>
+          <Plus className="me-1 h-4 w-4" /> {addLabel}
+        </Button>
+      </div>
+
+      {infoBanner}
+
+      {nodes.length === 0 ? (
+        <div className="surface-panel-subtle space-y-3 rounded-xl px-4 py-10 text-center">
+          {/*
+            Under a filter the section is empty because of the filter, not
+            because the cluster has none of this kind — and for a transcode
+            node that is worth reading rather than dismissing: a group with no
+            proxy of its own has its transcodes served by any proxy in the
+            cluster instead of staying on one LAN.
+          */}
+          <p className="text-muted-foreground mx-auto max-w-md text-sm">
+            {activeGroup !== null
+              ? type === "proxy"
+                ? t("web.admin.nodes.section.emptyProxyInGroup")
+                : t("web.admin.nodes.section.emptyTranscodeInGroup")
+              : type === "proxy"
+                ? t("web.admin.nodes.section.emptyProxy")
+                : t("web.admin.nodes.section.emptyTranscode")}
+          </p>
+          {activeGroup !== null ? (
+            <Button variant="outline" size="sm" onClick={onClearGroup}>
+              {t("web.admin.nodes.section.showAllGroups")}
+            </Button>
+          ) : (
+            <Button variant="outline" size="sm" onClick={onAdd}>
+              <Plus className="me-1 h-4 w-4" /> {addLabel}
+            </Button>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {nodes.map((node) => (
+            <NodeUnit
+              key={node.id}
+              node={node}
+              allNodes={allNodes}
+              showEgress={type === "proxy"}
+              onEdit={onEdit}
+              onDelete={onDelete}
+              onToggle={onToggle}
+              onCheckHealth={onCheckHealth}
+              isChecking={checkingHealthId === node.id}
+              onReprobe={onReprobe}
+              isReprobing={reprobingId === node.id}
+              onSetDrain={onSetDrain}
+              isSettingDrain={settingDrainId === node.id}
+              onKey={onKey}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Per-device toggles for one node's device override, mirroring the cluster-wide
+ * picker on the Playback settings page — same control, same "nothing selected
+ * means inherit" rule, so the two overrides read the same way.
+ *
+ * "Inherit" is spelled two ways on purpose: it is what an empty selection means,
+ * and it is a button, because clearing several toggles one at a time to get back
+ * to the default is not an obvious way to say "follow the cluster".
+ */
+function NodeDevicePicker({
+  rows,
+  onToggle,
+  onInherit,
+  disabled = false,
+}: {
+  rows: NodeHWDeviceRow[];
+  onToggle: (path: string) => void;
+  onInherit: () => void;
+  disabled?: boolean;
+}) {
+  const t = useT();
+  const selectedCount = rows.filter((row) => row.selected).length;
+
+  return (
+    <div className="space-y-2">
+      <div className="space-y-2">
+        {rows.map((row) => (
+          <div key={row.path} className="flex items-center justify-between gap-3">
+            <div className="min-w-0" title={row.title}>
+              <p className={cn("truncate text-sm", !row.reported && "text-muted-foreground")}>
+                {row.description}
+              </p>
+              <p className="text-muted-foreground truncate font-mono text-xs">{row.path}</p>
+            </div>
+            <Switch
+              checked={row.selected}
+              disabled={disabled}
+              aria-label={t("web.admin.nodes.devicePicker.toggle", { path: row.path })}
+              onCheckedChange={() => onToggle(row.path)}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <p className="text-muted-foreground text-sm">
+          {/*
+            No claim about what the cluster default *is*: it may be unset (each
+            node auto-discovers) or an explicit device list, and this form does
+            not know which.
+          */}
+          {selectedCount === 0
+            ? t("web.admin.nodes.devicePicker.inheriting")
+            : selectedCount === 1
+              ? t("web.admin.nodes.devicePicker.singleDevice")
+              : t("web.admin.nodes.devicePicker.balanced")}
+        </p>
+        {selectedCount > 0 && !disabled && (
+          <Button type="button" variant="ghost" size="sm" className="h-7 px-2" onClick={onInherit}>
+            {t("web.admin.nodes.devicePicker.useClusterDefault")}
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function NodeForm({
+  node,
+  nodeType,
+  defaultGroup,
+  canSetSourceAccess,
+  onClose,
+  onCreated,
+}: {
+  node: StreamNode | null;
+  nodeType: NodeType;
+  /** The server stores a transcode node's source access (the source_access capability). */
+  canSetSourceAccess: boolean;
+  /**
+   * Group to start a new node in: the one the list is filtered to, so a node
+   * added from a filtered view lands in the group being looked at rather than
+   * disappearing out of it the moment it is saved. Ignored when editing, where
+   * the node's own group is the answer.
+   */
+  defaultGroup: string;
+  onClose: () => void;
+  /** Called with the stored node after a create succeeds, once the form has closed. */
+  onCreated?: (created: { id: string; name: string }) => void;
+}) {
+  const t = useT();
+  // Fields the node declares from its own environment: shown read-only, and
+  // sent back with their stored values (restoreEnvManagedFields).
+  const envManaged = new Set(node?.env_managed ?? []);
+  const isLocked = (field: string) => envManaged.has(field);
+  const lockedNote = (field: string) =>
+    isLocked(field) ? (
+      <p className="text-muted-foreground text-sm">{t("web.admin.nodes.form.envManaged")}</p>
+    ) : null;
+  const [name, setName] = useState(node?.name ?? "");
+  const [url, setUrl] = useState(node?.url ?? "");
+  const [publicUrl, setPublicUrl] = useState(node?.public_url ?? "");
+  const [group, setGroup] = useState(node?.group ?? defaultGroup);
+  const [maxJobs, setMaxJobs] = useState(node?.max_jobs?.toString() ?? "");
+  const [maxBandwidthMbps, setMaxBandwidthMbps] = useState(
+    node?.max_bandwidth_kbps ? (node.max_bandwidth_kbps / 1000).toString() : "",
+  );
+  const [hwAccelOverride, setHwAccelOverride] = useState(
+    node?.hw_accel_override?.trim() || HW_ACCEL_INHERIT,
+  );
+  const [hwDeviceOverride, setHwDeviceOverride] = useState(node?.hw_device_override ?? "");
+  const [sourceAccess, setSourceAccess] = useState<NodeSourceAccess>(
+    node?.source_access ?? "local",
+  );
+  // Only a transcode node reads sources, and only a server that stores the
+  // setting takes it; anything else leaves the field out of the request.
+  const showSourceAccess = nodeType === "transcode" && canSetSourceAccess;
+  // The picker is driven by the node's own reported inventory; a node that has
+  // never reported one keeps the free-text field, since the override still has
+  // to be settable on a node this server has not heard from yet.
+  // NVENC names GPUs by CUDA index or UUID, so the render-path picker is
+  // meaningless for it — the same rule the cluster-wide Playback form applies.
+  // The cluster setting is read because "inherit" means running what the
+  // cluster names, which this node's current resolution does not describe.
+  const { data: serverSettings } = useAdminServerSettings();
+  const clusterHWAccel = serverSettings?.["playback.hw_accel"];
+  const usesCUDADevices = nodeUsesCUDADevices(node, hwAccelOverride, clusterHWAccel);
+  // A device override written for one syntax means nothing in the other: a
+  // render path is not a CUDA identity and neither is settable as the other, so
+  // moving the selection between them drops the stored value rather than
+  // carrying it into a policy it cannot express.
+  //
+  // Driven by the operator's own edit rather than by watching usesCUDADevices,
+  // because that value also moves on its own: the cluster setting arrives after
+  // the first render, and an effect would read that as a change and erase a
+  // valid override on a dialog nobody had touched yet.
+  function selectHWAccelOverride(next: string) {
+    // A device the node declares is saved as stored, so it stays on screen.
+    if (
+      !isLocked("hw_device_override") &&
+      hwDeviceSyntaxChanges(node, hwAccelOverride, next, clusterHWAccel)
+    ) {
+      setHwDeviceOverride("");
+    }
+    setHwAccelOverride(next);
+  }
+  const hasDeviceInventory = nodeHasHWDeviceInventory(node) && !usesCUDADevices;
+  const deviceRows = buildNodeHWDeviceRows(node, hwDeviceOverride);
+  const devicePaths = nodeHWDevicePaths(node);
+  const effectiveAcceleration = node ? describeEffectiveAcceleration(node) : null;
+  const createMutation = useCreateNode();
+  const updateMutation = useUpdateNode();
+  const isPending = createMutation.isPending || updateMutation.isPending;
+
+  const urlPlaceholder =
+    nodeType === "proxy" ? "https://proxy1.example.com" : "http://10.0.0.5:8082";
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    // The backend treats an empty group as "ungrouped" and caps <= 0 as
+    // "unlimited", so cleared inputs reset those fields.
+    const parsedMaxJobs = parseInt(maxJobs, 10);
+    const parsedMaxBandwidthMbps = parseFloat(maxBandwidthMbps);
+    const fields = {
+      name,
+      url: url.trim(),
+      group: group.trim(),
+      max_jobs: Number.isNaN(parsedMaxJobs) ? 0 : parsedMaxJobs,
+      max_bandwidth_kbps: Number.isNaN(parsedMaxBandwidthMbps)
+        ? 0
+        : Math.round(parsedMaxBandwidthMbps * 1000),
+    };
+    if (node) {
+      // null on either override is what restores inheritance of the
+      // cluster-wide playback setting; omitting the key would leave the stored
+      // value alone instead. The override controls only render for transcode
+      // nodes, so a proxy edit must omit both keys rather than send null —
+      // sending null here would clear an existing value the form never showed.
+      const body: UpdateNodeRequest = { ...fields };
+      if (nodeType === "proxy") {
+        // Same shape as the overrides: null clears, so an emptied field sends
+        // clients back to the backend URL rather than silently keeping the
+        // old public one.
+        body.public_url = publicUrl.trim() || null;
+      }
+      if (nodeType === "transcode") {
+        const overrideDevices = parseHWDeviceOverride(hwDeviceOverride);
+        body.hw_accel_override = hwAccelOverride === HW_ACCEL_INHERIT ? null : hwAccelOverride;
+        body.hw_device_override = overrideDevices.length > 0 ? overrideDevices.join(",") : null;
+      }
+      if (showSourceAccess) {
+        body.source_access = sourceAccess;
+      }
+      updateMutation.mutate(
+        { node, body: restoreEnvManagedFields(body, node) },
+        { onSuccess: onClose },
+      );
+    } else {
+      const body: CreateNodeRequest = { type: nodeType, ...fields };
+      if (nodeType === "proxy" && publicUrl.trim() !== "") {
+        body.public_url = publicUrl.trim();
+      }
+      if (showSourceAccess && sourceAccess !== "local") {
+        body.source_access = sourceAccess;
+      }
+      createMutation.mutate(body, {
+        onSuccess: (saved) => {
+          onClose();
+          if (saved) onCreated?.({ id: saved.id, name: saved.name });
+        },
+      });
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-4">
+      <fieldset disabled={isPending} className="space-y-4">
+        <div className="space-y-2">
+          <Label>{t("web.admin.nodes.form.name")}</Label>
+          <Input
+            value={name}
+            disabled={isLocked("name")}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={
+              nodeType === "proxy"
+                ? t("web.admin.nodes.form.namePlaceholderProxy")
+                : t("web.admin.nodes.form.namePlaceholderTranscode")
+            }
+            required
+          />
+          {lockedNote("name")}
+        </div>
+
+        <div className="space-y-2">
+          <Label>{t("web.admin.nodes.form.type")}</Label>
+          <Badge variant="secondary" className="text-sm">
+            {nodeType === "proxy"
+              ? t("web.admin.nodes.form.typeProxy")
+              : t("web.admin.nodes.form.typeTranscode")}
+          </Badge>
+        </div>
+
+        <div className="space-y-2">
+          <Label>{t("web.admin.nodes.form.url")}</Label>
+          <Input
+            value={url}
+            disabled={isLocked("url")}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder={urlPlaceholder}
+            required
+          />
+          {lockedNote("url")}
+          {nodeType === "transcode" ? (
+            <p className="text-muted-foreground text-sm">
+              {t("web.admin.nodes.form.urlHelpTranscode")}
+            </p>
+          ) : (
+            <p className="text-muted-foreground text-sm">
+              {t("web.admin.nodes.form.urlHelpProxy")}
+            </p>
+          )}
+        </div>
+
+        {nodeType === "proxy" && (
+          <div className="space-y-2">
+            <Label>{t("web.admin.nodes.form.publicUrl")}</Label>
+            <Input
+              value={publicUrl}
+              disabled={isLocked("public_url")}
+              onChange={(e) => setPublicUrl(e.target.value)}
+              placeholder={t("web.admin.nodes.form.publicUrlPlaceholder")}
+            />
+            {lockedNote("public_url")}
+            <p className="text-muted-foreground text-sm">
+              {t("web.admin.nodes.form.publicUrlHelp")}
+            </p>
+          </div>
+        )}
+
+        <div className="space-y-2">
+          <Label>{t("web.admin.nodes.form.group")}</Label>
+          <Input
+            value={group}
+            disabled={isLocked("group")}
+            onChange={(e) => setGroup(e.target.value)}
+            placeholder={t("web.admin.nodes.form.groupPlaceholder")}
+          />
+          {lockedNote("group")}
+          <p className="text-muted-foreground text-sm">{t("web.admin.nodes.form.groupHelp")}</p>
+        </div>
+
+        <div className="space-y-2">
+          <Label>
+            {nodeType === "proxy"
+              ? t("web.admin.nodes.form.maxStreams")
+              : t("web.admin.nodes.form.maxTranscodes")}
+          </Label>
+          <Input
+            type="number"
+            min={0}
+            value={maxJobs}
+            disabled={isLocked("max_jobs")}
+            onChange={(e) => setMaxJobs(e.target.value)}
+            placeholder={t("web.admin.nodes.form.unlimited")}
+          />
+          {lockedNote("max_jobs")}
+          <p className="text-muted-foreground text-sm">{t("web.admin.nodes.form.maxJobsHelp")}</p>
+        </div>
+
+        {nodeType === "proxy" && (
+          <div className="space-y-2">
+            <Label>{t("web.admin.nodes.form.maxEgress")}</Label>
+            <Input
+              type="number"
+              min={0}
+              step="any"
+              value={maxBandwidthMbps}
+              disabled={isLocked("max_bandwidth_kbps")}
+              onChange={(e) => setMaxBandwidthMbps(e.target.value)}
+              placeholder={t("web.admin.nodes.form.unlimited")}
+            />
+            {lockedNote("max_bandwidth_kbps")}
+            <p className="text-muted-foreground text-sm">
+              {t("web.admin.nodes.form.maxEgressHelp")}
+            </p>
+          </div>
+        )}
+
+        {showSourceAccess && (
+          <div className="space-y-2">
+            <Label htmlFor="node-source-access">{t("web.admin.nodes.form.sourceAccess")}</Label>
+            <Select
+              value={sourceAccess}
+              disabled={isLocked("source_access")}
+              onValueChange={(value) => setSourceAccess(value as NodeSourceAccess)}
+            >
+              <SelectTrigger id="node-source-access" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="local">{t("web.admin.nodes.form.sourceAccessLocal")}</SelectItem>
+                <SelectItem value="core">{t("web.admin.nodes.form.sourceAccessCore")}</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-muted-foreground text-sm">
+              {t("web.admin.nodes.form.sourceAccessHelp")}
+            </p>
+            {lockedNote("source_access")}
+          </div>
+        )}
+
+        {/* Overrides are edit-only: the create endpoint takes no acceleration
+          fields, so offering them here would silently drop what was typed.
+          They are also transcode-only: a proxy node only remuxes/strips
+          bitstreams, so it never encodes and these fields would be
+          meaningless — and their absence keeps a proxy edit from sending
+          override fields at all. */}
+        {node && nodeType === "transcode" && (
+          <>
+            <div className="space-y-2">
+              <Label htmlFor="node-hw-accel-override">
+                {t("web.admin.nodes.form.hardwareAcceleration")}
+              </Label>
+              <Select
+                value={hwAccelOverride}
+                disabled={isLocked("hw_accel_override")}
+                onValueChange={selectHWAccelOverride}
+              >
+                <SelectTrigger id="node-hw-accel-override" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {hwAccelOverrideOptions().map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-muted-foreground text-sm">
+                {t("web.admin.nodes.form.hardwareAccelerationHelp")}
+              </p>
+              {effectiveAcceleration && (
+                <p className="text-muted-foreground text-sm">{effectiveAcceleration}</p>
+              )}
+              {lockedNote("hw_accel_override")}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor={hasDeviceInventory ? undefined : "node-hw-device-override"}>
+                {t("web.admin.nodes.form.gpuDevices")}
+              </Label>
+              {hasDeviceInventory ? (
+                <NodeDevicePicker
+                  rows={deviceRows}
+                  onToggle={(path) =>
+                    setHwDeviceOverride(toggleHWDevice(hwDeviceOverride, path, devicePaths))
+                  }
+                  onInherit={() => setHwDeviceOverride("")}
+                  disabled={isLocked("hw_device_override")}
+                />
+              ) : (
+                <>
+                  <Input
+                    id="node-hw-device-override"
+                    value={hwDeviceOverride}
+                    disabled={isLocked("hw_device_override")}
+                    onChange={(e) => setHwDeviceOverride(e.target.value)}
+                    placeholder={t("web.admin.nodes.form.gpuDevicesPlaceholder")}
+                  />
+                  {/*
+                  Each branch is a whole sentence rather than a shared tail: an
+                  NVENC node reaches the free-text field *with* a reported
+                  inventory (its render devices are real, they are just not what
+                  NVENC addresses), so "no inventory yet" is only true of the
+                  other branch — and splitting one sentence across the
+                  conditional also lets JSX drop the space before "empty".
+
+                  Neither branch says what leaving this empty resolves to. Empty
+                  inherits the cluster-wide playback.hw_device verbatim, and this
+                  form does not know that value — naming a default here would be
+                  a guess, and on the NVENC branch a dangerous one, since an
+                  inherited /dev/dri path reaches NVENC as a CUDA identity.
+                */}
+                  <p className="text-muted-foreground text-sm">
+                    {usesCUDADevices
+                      ? t("web.admin.nodes.form.cudaDeviceHelp", {
+                          index: "0",
+                          uuid: "GPU-a1b2c3d4",
+                          path: "/dev/dri",
+                          mono,
+                        })
+                      : t("web.admin.nodes.form.renderDeviceHelp", {
+                          example: "/dev/dri/renderD128,/dev/dri/renderD129",
+                          mono,
+                        })}
+                  </p>
+                </>
+              )}
+              {lockedNote("hw_device_override")}
+            </div>
+          </>
+        )}
+
+        <Button type="submit" className="w-full" disabled={isPending}>
+          {isPending ? t("web.admin.nodes.form.saving") : t("common.save")}
+        </Button>
+      </fieldset>
+    </form>
+  );
+}
+
+/** Rich-text tag for the device examples in the form help. */
+function mono(chunks: ReactNode[]) {
+  return <span className="font-mono">{chunks}</span>;
+}
+
+/** The node the key dialog acts on, and whether it has a key to replace. */
+interface NodeKeyTarget {
+  node: Pick<StreamNode, "id" | "name">;
+  rotate: boolean;
+}
+
+/** Example only: the address a node reaches this server at is not knowable from here. */
+const CORE_URL_PLACEHOLDER = "http://10.0.0.2:8080";
+
+function describeKeyFailure(t: Translate, error: unknown, name: string): string {
+  // A problem other than a server fault is a refusal, so nothing was issued and
+  // the server's reason (a proxy, demo mode, no data cipher) is the message. A
+  // lost answer or a server fault may have rotated the key anyway.
+  if (error instanceof V2ProblemError && error.status !== 500) return error.message;
+  return t("web.admin.nodes.key.unconfirmed", { name });
+}
+
+/**
+ * Issues or rotates one transcode node's key and shows it once, with the two
+ * settings the node starts with.
+ *
+ * The key lives in this component's state only: the issuing mutation keeps
+ * none, and the page unmounts this dialog when it closes, which drops the last
+ * copy. The server never returns it again. While the request is in flight the
+ * dialog cannot be closed, because a key that arrived after closing would be
+ * lost with the old one already revoked.
+ */
+function NodeKeyDialog({ target, onClose }: { target: NodeKeyTarget; onClose: () => void }) {
+  const t = useT();
+  const issue = useIssueNodeKey();
+  const [nodeKey, setNodeKey] = useState<string | null>(null);
+  const [copyFailed, setCopyFailed] = useState(false);
+  // SILO_CORE_URL is where the node calls this server, which only the admin
+  // knows for sure. The configured public URL is a fair first guess; the page's
+  // own origin is not (a dev proxy, or an address only browsers use), so with
+  // no public URL the field starts empty.
+  const { data: serverSettings } = useAdminServerSettings();
+  const [coreUrlInput, setCoreUrlInput] = useState<string | null>(null);
+  const coreUrlDraft = coreUrlInput ?? serverSettings?.["server.public_url"] ?? "";
+  const coreUrl = coreUrlDraft.trim().replace(/\/+$/, "");
+  const name = target.node.name;
+  const busy = issue.isPending;
+  const settings = `SILO_CORE_URL=${coreUrl}\nSILO_NODE_KEY=${nodeKey ?? ""}`;
+
+  async function copy(text: string) {
+    try {
+      await copyTextToClipboard(text);
+    } catch {
+      setCopyFailed(true);
+      return;
+    }
+    setCopyFailed(false);
+    toast.success(t("web.admin.nodes.key.copied"));
+  }
+
+  let body: ReactNode;
+  if (nodeKey !== null) {
+    body = (
+      <>
+        <DialogHeader>
+          <DialogTitle>{t("web.admin.nodes.key.dialogTitle", { name })}</DialogTitle>
+          <DialogDescription className="text-warning font-medium">
+            {t("web.admin.nodes.key.notShownAgain")}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-2">
+          <Label htmlFor="node-key-value">{t("web.admin.nodes.key.keyLabel")}</Label>
+          <div className="bg-muted flex items-center gap-2 rounded-lg p-3">
+            <output
+              id="node-key-value"
+              dir="ltr"
+              className="min-w-0 flex-1 font-mono text-xs break-all"
+            >
+              {nodeKey}
+            </output>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 shrink-0"
+              aria-label={t("web.admin.nodes.key.copyKey")}
+              onClick={() => void copy(nodeKey)}
+            >
+              <Copy className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          </div>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="node-core-url">{t("web.admin.nodes.key.coreUrlLabel")}</Label>
+          <Input
+            id="node-core-url"
+            dir="ltr"
+            value={coreUrlDraft}
+            onChange={(e) => setCoreUrlInput(e.target.value)}
+            placeholder={CORE_URL_PLACEHOLDER}
+          />
+          <p className="text-muted-foreground text-sm">{t("web.admin.nodes.key.coreUrlHelp")}</p>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="node-key-settings">{t("web.admin.nodes.key.settingsLabel")}</Label>
+          <div className="bg-muted flex items-start gap-2 rounded-lg p-3">
+            <output
+              id="node-key-settings"
+              dir="ltr"
+              className="block min-w-0 flex-1 font-mono text-xs break-all whitespace-pre-wrap"
+            >
+              {settings}
+            </output>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 shrink-0"
+              aria-label={t("web.admin.nodes.key.copySettings")}
+              disabled={coreUrl === ""}
+              onClick={() => void copy(settings)}
+            >
+              <Copy className="h-4 w-4" aria-hidden="true" />
+            </Button>
+          </div>
+          <p className="text-muted-foreground text-sm">
+            {coreUrl === ""
+              ? t("web.admin.nodes.key.coreUrlMissing")
+              : t("web.admin.nodes.key.settingsHelp")}
+          </p>
+        </div>
+        {copyFailed && (
+          <p role="alert" className="text-destructive text-sm font-medium">
+            {t("web.admin.nodes.key.copyFailed")}
+          </p>
+        )}
+        <DialogFooter>
+          <Button onClick={onClose}>{t("web.admin.nodes.key.saved")}</Button>
+        </DialogFooter>
+      </>
+    );
+  } else if (issue.error && !busy) {
+    body = (
+      <>
+        <DialogHeader>
+          <DialogTitle>{t("web.admin.nodes.key.dialogTitle", { name })}</DialogTitle>
+          <DialogDescription asChild>
+            <p role="alert" className="text-destructive font-medium">
+              {describeKeyFailure(t, issue.error, name)}
+            </p>
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            {t("web.admin.nodes.key.close")}
+          </Button>
+        </DialogFooter>
+      </>
+    );
+  } else {
+    body = (
+      <>
+        <DialogHeader>
+          <DialogTitle>
+            {target.rotate
+              ? t("web.admin.nodes.key.rotateTitle", { name })
+              : t("web.admin.nodes.key.dialogTitle", { name })}
+          </DialogTitle>
+          <DialogDescription>
+            {busy
+              ? t("web.admin.nodes.key.issuing")
+              : target.rotate
+                ? t("web.admin.nodes.key.rotateDescription")
+                : t("web.admin.nodes.key.offer", { name })}
+          </DialogDescription>
+        </DialogHeader>
+        {target.rotate && !busy && (
+          <p className="text-sm">{t("web.admin.nodes.key.rotateDrainHint")}</p>
+        )}
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={onClose}>
+            {target.rotate ? t("common.cancel") : t("web.admin.nodes.key.later")}
+          </Button>
+          <Button
+            variant={target.rotate ? "destructive" : "default"}
+            disabled={busy}
+            onClick={() => issue.mutate(target.node, setNodeKey)}
+          >
+            {target.rotate ? t("web.admin.nodes.key.rotate") : t("web.admin.nodes.key.issue")}
+          </Button>
+        </DialogFooter>
+      </>
+    );
+  }
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !busy) onClose();
+      }}
+    >
+      <DialogContent
+        showCloseButton={!busy}
+        // An outside click would throw a shown key away for good; closing a
+        // shown key takes the button, the close icon or Escape.
+        onInteractOutside={(event) => {
+          if (busy || nodeKey !== null) event.preventDefault();
+        }}
+      >
+        {body}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export default function AdminNodes() {
+  const t = useT();
+  const { data: nodes = [], isLoading } = useAdminNodes();
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [formVersion, setFormVersion] = useState(0);
+  const [editingNode, setEditingNode] = useState<StreamNode | null>(null);
+  const [addingNodeType, setAddingNodeType] = useState<NodeType | null>(null);
+  const [deleteIntent, setDeleteIntent] = useState<NodeDeleteIntent | null>(null);
+  const confirmDeleteNode = deleteIntent?.node ?? null;
+  const renderedAuthority = captureProfileRequestContext();
+  const [groupFilter, setGroupFilter] = useState<string | null>(null);
+  const deleteMutation = useDeleteNode();
+  const checkHealthMutation = useCheckNodeHealth();
+  const reprobeMutation = useReprobeNode();
+  const drainMutation = useSetNodeDrain();
+  const toggleMutation = useToggleNode();
+  const { data: nodeCapabilities } = useAdminNodeCapabilities();
+  const [keyTarget, setKeyTarget] = useState<NodeKeyTarget | null>(null);
+  // Key controls appear only against a server that can issue keys.
+  const canIssueKeys = nodeCapabilities?.node_keys === true;
+  const handleKey = canIssueKeys
+    ? (node: StreamNode) =>
+        setKeyTarget({ node: { id: node.id, name: node.name }, rotate: node.key_issued === true })
+    : undefined;
+
+  const groupOptions = describeNodeGroups(nodes);
+  // Derived rather than reset in an effect: the selected group can stop
+  // existing without anything on this page doing it — the last node in it is
+  // deleted, regrouped from another tab, or the poll simply arrives with a
+  // different cluster. Falling back here means the list can never be filtered
+  // to a bucket that is gone, and re-selecting the group heals it if it comes
+  // back, which a one-shot effect that cleared the state would not.
+  const activeGroup =
+    groupFilter !== null && groupOptions.some((option) => option.value === groupFilter)
+      ? groupFilter
+      : null;
+  const visibleNodes = filterNodesByGroup(nodes, activeGroup);
+
+  const proxyNodes = visibleNodes.filter((n) => n.type === "proxy");
+  const transcodeNodes = visibleNodes.filter((n) => n.type === "transcode");
+
+  const checkingHealthId =
+    checkHealthMutation.isPending && checkHealthMutation.variables
+      ? checkHealthMutation.variables.id
+      : null;
+
+  const reprobingId =
+    reprobeMutation.isPending && reprobeMutation.variables ? reprobeMutation.variables.id : null;
+
+  const settingDrainId =
+    drainMutation.isPending && drainMutation.variables ? drainMutation.variables.id : null;
+
+  const resolvedNodeType: NodeType = editingNode
+    ? (editingNode.type as NodeType)
+    : (addingNodeType ?? "proxy");
+
+  function handleAdd(type: NodeType) {
+    setFormVersion((version) => version + 1);
+    setAddingNodeType(type);
+    setEditingNode(null);
+    setDialogOpen(true);
+  }
+
+  function handleEdit(node: StreamNode) {
+    setFormVersion((version) => version + 1);
+    setEditingNode(node);
+    setAddingNodeType(null);
+    setDialogOpen(true);
+  }
+
+  function handleDelete(node: StreamNode) {
+    setDeleteIntent({ node: structuredClone(node), authority: renderedAuthority });
+  }
+
+  function handleDialogChange(open: boolean) {
+    setDialogOpen(open);
+    if (!open) {
+      setEditingNode(null);
+      setAddingNodeType(null);
+    }
+  }
+
+  if (isLoading) return <div className="pb-8">{t("web.admin.nodes.page.loading")}</div>;
+
+  return (
+    <div className="space-y-8 pb-4 sm:pb-6">
+      <PageHeader
+        title={t("web.admin.nodes.page.title")}
+        subtitle={t("web.admin.nodes.page.subtitle")}
+      />
+
+      <NodeGroupFilter
+        options={groupOptions}
+        active={activeGroup}
+        total={nodes.length}
+        onSelect={setGroupFilter}
+      />
+
+      <ConfirmDialog
+        open={confirmDeleteNode !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteIntent(null);
+        }}
+        title={t("web.admin.nodes.deleteDialog.title")}
+        description={t("web.admin.nodes.deleteDialog.description", {
+          name: confirmDeleteNode?.name ?? "",
+        })}
+        confirmLabel={t("web.admin.nodes.deleteDialog.confirm")}
+        variant="destructive"
+        onConfirm={() => {
+          if (deleteIntent) deleteMutation.mutate(deleteIntent);
+          setDeleteIntent(null);
+        }}
+      />
+
+      <NodeSection
+        type="proxy"
+        nodes={proxyNodes}
+        allNodes={nodes}
+        activeGroup={activeGroup}
+        onClearGroup={() => setGroupFilter(null)}
+        onAdd={() => handleAdd("proxy")}
+        onEdit={handleEdit}
+        onDelete={handleDelete}
+        onToggle={(node) => toggleMutation.mutate(node)}
+        onCheckHealth={(node) => checkHealthMutation.mutate(node)}
+        checkingHealthId={checkingHealthId}
+        onReprobe={(node) => reprobeMutation.mutate(node)}
+        reprobingId={reprobingId}
+        onSetDrain={(node, requested) => drainMutation.mutate(node, requested)}
+        settingDrainId={settingDrainId}
+        onKey={handleKey}
+        infoBanner={
+          <div className="surface-panel-subtle text-info flex items-start gap-2 rounded-xl p-3 text-sm">
+            <Info className="mt-0.5 h-4 w-4 shrink-0" />
+            <p>{t("web.admin.nodes.section.proxyInfo")}</p>
+          </div>
+        }
+      />
+
+      <NodeSection
+        type="transcode"
+        nodes={transcodeNodes}
+        allNodes={nodes}
+        activeGroup={activeGroup}
+        onClearGroup={() => setGroupFilter(null)}
+        onAdd={() => handleAdd("transcode")}
+        onEdit={handleEdit}
+        onDelete={handleDelete}
+        onToggle={(node) => toggleMutation.mutate(node)}
+        onCheckHealth={(node) => checkHealthMutation.mutate(node)}
+        checkingHealthId={checkingHealthId}
+        onReprobe={(node) => reprobeMutation.mutate(node)}
+        reprobingId={reprobingId}
+        onSetDrain={(node, requested) => drainMutation.mutate(node, requested)}
+        settingDrainId={settingDrainId}
+        onKey={handleKey}
+        infoBanner={
+          <div className="surface-panel-subtle text-warning flex items-start gap-2 rounded-xl p-3 text-sm">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <p>
+              {t("web.admin.nodes.section.transcodeInfo", {
+                strong: (chunks) => <strong>{chunks}</strong>,
+              })}
+            </p>
+          </div>
+        }
+      />
+
+      <section aria-labelledby="node-routing-heading" className="max-w-3xl space-y-3">
+        <h2 id="node-routing-heading" className="text-lg font-semibold">
+          {t("web.admin.nodes.page.routing")}
+        </h2>
+        <NodeRoutingSettings />
+      </section>
+
+      <Dialog open={dialogOpen} onOpenChange={handleDialogChange}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {editingNode
+                ? t("web.admin.nodes.formDialog.editTitle")
+                : resolvedNodeType === "proxy"
+                  ? t("web.admin.nodes.formDialog.addProxyTitle")
+                  : t("web.admin.nodes.formDialog.addTranscodeTitle")}
+            </DialogTitle>
+          </DialogHeader>
+          <NodeForm
+            key={formVersion}
+            node={editingNode}
+            nodeType={resolvedNodeType}
+            defaultGroup={activeGroup ?? ""}
+            canSetSourceAccess={nodeCapabilities?.source_access === true}
+            onClose={() => handleDialogChange(false)}
+            // A new transcode node takes no work until it has a key, so offer
+            // one straight away.
+            onCreated={
+              resolvedNodeType === "transcode" && canIssueKeys
+                ? (created) => setKeyTarget({ node: created, rotate: false })
+                : undefined
+            }
+          />
+        </DialogContent>
+      </Dialog>
+
+      {keyTarget && <NodeKeyDialog target={keyTarget} onClose={() => setKeyTarget(null)} />}
+    </div>
+  );
+}

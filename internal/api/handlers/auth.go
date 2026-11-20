@@ -1,0 +1,421 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/ratelimit"
+)
+
+// AuthHandler handles authentication-related HTTP endpoints.
+type AuthHandler struct {
+	service              *auth.Service
+	passwords            accountPasswordService
+	jwt                  *auth.JWTService
+	device               *auth.DeviceLoginService
+	oauthRoutesAvailable bool
+	accessGroups         access.GroupPolicyProvider
+	checkPrimaryProfile  apimw.PrimaryProfileChecker
+}
+
+type accountPasswordService interface {
+	PasswordChangeAvailable(ctx context.Context, userID int) (bool, error)
+	ChangePassword(ctx context.Context, userID int, sessionID, currentPassword, newPassword string, signOutOtherSessions bool) error
+}
+
+// NewAuthHandler creates a new AuthHandler backed by the given auth, JWT,
+// and device login services.
+func NewAuthHandler(service *auth.Service, jwt *auth.JWTService, device *auth.DeviceLoginService) *AuthHandler {
+	handler := &AuthHandler{
+		service: service,
+		jwt:     jwt,
+		device:  device,
+	}
+	if service != nil {
+		handler.passwords = service
+	}
+	return handler
+}
+
+// SetAccessGroupProvider wires the access-group policy source used to resolve
+// the effective (inherit/override) policy reported on login and /auth/me.
+func (h *AuthHandler) SetAccessGroupProvider(provider access.GroupPolicyProvider) {
+	h.accessGroups = provider
+}
+
+// SetPrimaryProfileChecker wires the account/profile ownership lookup used by
+// account credential endpoints. A declared secondary profile must never be
+// able to replace the shared account password, including on an admin account.
+func (h *AuthHandler) SetPrimaryProfileChecker(check apimw.PrimaryProfileChecker) {
+	h.checkPrimaryProfile = check
+}
+
+// SetOAuthRoutesAvailable controls whether OAuth login providers are
+// advertised by /auth/providers. The router only mounts OAuth routes when the
+// server has enough configuration to complete the flow.
+func (h *AuthHandler) SetOAuthRoutesAvailable(available bool) {
+	h.oauthRoutesAvailable = available
+}
+
+// --- Request/Response types ---
+
+// loginResponse represents the JSON body of a successful login response.
+type loginResponse struct {
+	AccessToken  string   `json:"access_token"`
+	RefreshToken string   `json:"refresh_token"`
+	ExpiresIn    int      `json:"expires_in"`
+	User         UserView `json:"user"`
+}
+
+type ImpersonationView struct {
+	Active               bool   `json:"active"`
+	ImpersonatorUserID   int    `json:"impersonator_user_id"`
+	ImpersonatorUsername string `json:"impersonator_username"`
+}
+
+// UserView represents a user in JSON responses.
+type UserView struct {
+	ID              int                `json:"id"`
+	Username        string             `json:"username"`
+	Email           string             `json:"email"`
+	Role            string             `json:"role"`
+	Permissions     []string           `json:"permissions"`
+	DownloadAllowed bool               `json:"download_allowed"`
+	Impersonation   *ImpersonationView `json:"impersonation,omitempty"`
+	// PasswordChangeRequired is v2-only: the frozen v1 body does not carry it.
+	PasswordChangeRequired bool `json:"-"`
+	// PolicyPermissions is v2-only (Account.permissions): the permissions
+	// after the access-group mask, without the admin role grant that the
+	// frozen v1 Permissions list keeps (v1AccountPermissions).
+	PolicyPermissions []string `json:"-"`
+}
+
+// errorResponse represents an error in JSON responses.
+type errorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+}
+
+// --- Handler methods ---
+
+// LoginInput is a password login as the transport received it.
+type LoginInput struct {
+	Provider   string
+	Username   string
+	Password   string
+	DeviceName string
+	IP         string
+}
+
+// Login authenticates a username and password and opens a login session. v1
+// POST /auth/login and v2 login both call it; a failure is an *APIError.
+func (h *AuthHandler) Login(ctx context.Context, in LoginInput) (TokenPairView, error) {
+	if in.Username == "" || in.Password == "" {
+		return TokenPairView{}, apiError(http.StatusBadRequest, "bad_request", "Username and password are required")
+	}
+	pair, user, err := h.service.LoginWithProvider(ctx, in.Provider, in.Username, in.Password, in.DeviceName, in.IP)
+	if err != nil {
+		if throttled, ok := errors.AsType[*auth.SignInThrottledError](err); ok {
+			return TokenPairView{}, signInThrottledError(throttled)
+		}
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			return TokenPairView{}, apiError(http.StatusUnauthorized, "invalid_credentials", "Invalid username or password")
+		}
+		if errors.Is(err, auth.ErrUserDisabled) {
+			return TokenPairView{}, apiError(http.StatusForbidden, "user_disabled", "User account is disabled")
+		}
+		if apiErr := busyError(err); apiErr != nil {
+			return TokenPairView{}, apiErr
+		}
+		if apiErr := externalSignInError(err); apiErr != nil {
+			return TokenPairView{}, apiErr
+		}
+		return TokenPairView{}, apiError(http.StatusInternalServerError, "internal_error", "An unexpected error occurred")
+	}
+	return TokenPairView{
+		AccessToken:  pair.AccessToken,
+		RefreshToken: pair.RefreshToken,
+		ExpiresIn:    pair.ExpiresIn,
+		User:         buildUserResponse(user, effectiveAccountPolicy(ctx, user, h.accessGroups), nil, nil),
+	}, nil
+}
+
+// NetworkSignInInput is a network identity sign-in as the transport received
+// it. The overlay peer travels on the request context (netaccess.Path).
+type NetworkSignInInput struct {
+	InstallationID int
+	DeviceName     string
+	IP             string
+}
+
+// NetworkSignIn signs in the overlay peer of the request through a network
+// identity provider (auth.Service.NetworkSignIn) and opens a login session.
+// v2 signInWithNetworkIdentity calls it; a failure is an *APIError.
+func (h *AuthHandler) NetworkSignIn(ctx context.Context, in NetworkSignInInput) (TokenPairView, error) {
+	pair, err := h.service.NetworkSignIn(ctx, auth.NetworkSignInInput{
+		InstallationID: in.InstallationID, DeviceName: in.DeviceName, IP: in.IP,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, auth.ErrUnknownAuthInstallation):
+			return TokenPairView{}, apiError(http.StatusNotFound, "not_found", "No enabled network sign-in provider has this installation")
+		case errors.Is(err, auth.ErrNetworkIdentityRequired):
+			return TokenPairView{}, apiError(http.StatusForbidden, "network_identity_required", "Open this server through the provider's network address to sign in this way")
+		case errors.Is(err, auth.ErrInvalidCredentials):
+			// The plugin could not identify the peer; there is no credential
+			// the person could correct.
+			return TokenPairView{}, apiError(http.StatusForbidden, "not_permitted", "This device is not permitted to sign in to this server")
+		case errors.Is(err, auth.ErrUserDisabled):
+			return TokenPairView{}, apiError(http.StatusForbidden, "user_disabled", "User account is disabled")
+		}
+		if apiErr := busyError(err); apiErr != nil {
+			return TokenPairView{}, apiErr
+		}
+		if apiErr := externalSignInError(err); apiErr != nil {
+			return TokenPairView{}, apiErr
+		}
+		return TokenPairView{}, apiError(http.StatusInternalServerError, "internal_error", "An unexpected error occurred")
+	}
+	return TokenPairView{
+		AccessToken:  pair.AccessToken,
+		RefreshToken: pair.RefreshToken,
+		ExpiresIn:    pair.ExpiresIn,
+		User:         buildUserResponse(pair.User, effectiveAccountPolicy(ctx, pair.User, h.accessGroups), nil, nil),
+	}, nil
+}
+
+// signInThrottledError is the 429 for a name that has used its sign-in
+// attempt budget: rate_limited on v1, as for a locked profile PIN, and the
+// rate_limited problem on v2. Both send Retry-After.
+func signInThrottledError(err *auth.SignInThrottledError) *APIError {
+	e := apiError(http.StatusTooManyRequests, "rate_limited", "Too many failed sign-ins for this name. Try again later.")
+	e.RetryAfter = ratelimit.RetryAfterSeconds(err.RetryAfter)
+	return e
+}
+
+// externalSignInError maps the refusals of the local-password policy and of
+// external sign-in (docs/architecture/external-sign-in.md) to their codes,
+// or returns nil for any other error.
+func externalSignInError(err error) *APIError {
+	switch {
+	case errors.Is(err, auth.ErrLocalLoginDisabled):
+		return apiError(http.StatusForbidden, "local_login_disabled", "Password sign-in is turned off on this server; sign in with the server's sign-in provider")
+	case errors.Is(err, auth.ErrNotPermitted):
+		// ErrAccountRequired is one too: v1 keeps answering not_permitted,
+		// and the cause lets the v2 login answer account_required.
+		return apiError(http.StatusForbidden, "not_permitted", "This account is not permitted to sign in to this server").WithCause(err)
+	case errors.Is(err, auth.ErrEmailInUse):
+		return apiError(http.StatusConflict, "email_in_use", "An account with this email already exists. Ask an admin to connect it")
+	case errors.Is(err, auth.ErrIdentityLinkedElsewhere):
+		return apiError(http.StatusConflict, "identity_linked_elsewhere", "This sign-in is already connected to another account")
+	case errors.Is(err, auth.ErrProviderPasswordExpired):
+		return apiError(http.StatusForbidden, "password_expired", "The password has expired; change it with the sign-in provider first")
+	case errors.Is(err, auth.ErrProviderUnavailable):
+		return apiError(http.StatusServiceUnavailable, "provider_unavailable", "The sign-in provider is unavailable; try again later")
+	}
+	return nil
+}
+
+// Logout revokes the caller's login session. v1 POST /auth/logout and v2
+// logout both call it.
+func (h *AuthHandler) Logout(ctx context.Context, claims *auth.Claims) error {
+	if err := h.service.Logout(ctx, claims.SessionID); err != nil {
+		return apiError(http.StatusInternalServerError, "internal_error", "An unexpected error occurred")
+	}
+	return nil
+}
+
+// EndImpersonation returns an impersonating session to the administrator.
+// v1 POST /auth/impersonation/end and v2 endImpersonation both call it.
+func (h *AuthHandler) EndImpersonation(ctx context.Context, claims *auth.Claims) error {
+	if claims.ImpersonatorUserID == nil {
+		return apiError(http.StatusBadRequest, "not_impersonating", "No active impersonation session")
+	}
+	if err := h.service.EndImpersonation(ctx, claims.SessionID, *claims.ImpersonatorUserID); err != nil {
+		if errors.Is(err, auth.ErrNotImpersonating) {
+			return apiError(http.StatusBadRequest, "not_impersonating", "No active impersonation session")
+		}
+		if errors.Is(err, auth.ErrImpersonationNotAllowed) {
+			return apiError(http.StatusForbidden, "impersonation_not_allowed", "Impersonation is not allowed")
+		}
+		return apiError(http.StatusInternalServerError, "internal_error", "An unexpected error occurred")
+	}
+	return nil
+}
+
+// NeedsSetup reports whether the first administrator still has to be created.
+// v1 GET /auth/setup and v2 getSetupStatus both answer from it.
+func (h *AuthHandler) NeedsSetup(ctx context.Context) (bool, error) {
+	return h.service.NeedsSetup(ctx)
+}
+
+// SetupWizardCompleted reports whether the first-run wizard was finished.
+func (h *AuthHandler) SetupWizardCompleted(ctx context.Context) (bool, error) {
+	return h.service.SetupWizardCompleted(ctx)
+}
+
+// CurrentUser builds the account view of the authenticated caller. v1 GET
+// /auth/me and v2 getCurrentUser both call it; a failure is an *APIError.
+func (h *AuthHandler) CurrentUser(ctx context.Context, claims *auth.Claims) (UserView, error) {
+	user, err := h.service.GetCurrentUser(ctx, claims)
+	if err != nil {
+		return UserView{}, apiError(http.StatusInternalServerError, "internal_error", "An unexpected error occurred")
+	}
+
+	impersonator, err := h.loadImpersonator(ctx, claims)
+	if err != nil && !auth.IsNotFound(err) {
+		return UserView{}, apiError(http.StatusInternalServerError, "internal_error", "An unexpected error occurred")
+	}
+
+	return buildUserResponse(user, effectiveAccountPolicy(ctx, user, h.accessGroups), claims.ImpersonatorUserID, impersonator), nil
+}
+
+// OAuthUserView projects the account read while redemption opened its login
+// session. Reading that account again could lose an already-redeemed login
+// during a temporary database failure.
+func (h *AuthHandler) OAuthUserView(ctx context.Context, user *models.User) UserView {
+	return buildUserResponse(user, effectiveAccountPolicy(ctx, user, h.accessGroups), nil, nil)
+}
+
+// --- Helper functions ---
+
+func buildLoginResponse(pair *auth.TokenPair, user *models.User, policy accountPolicy, impersonator *models.User) loginResponse {
+	return loginResponse{
+		AccessToken:  pair.AccessToken,
+		RefreshToken: pair.RefreshToken,
+		ExpiresIn:    pair.ExpiresIn,
+		User:         buildUserResponse(user, policy, impersonatorUserID(impersonator), impersonator),
+	}
+}
+
+// accountPolicy is the slice of the effective access policy the account
+// payload reports, so clients show only what the server's gates allow.
+type accountPolicy struct {
+	DownloadAllowed bool
+	Permissions     []string
+}
+
+// effectiveAccountPolicy resolves the account's download gate and permissions
+// through the inherit/override policy (user override, else access group, else
+// permissive default), the same resolution the route gates enforce. A failed
+// group lookup fails closed: no downloads and no permissions, matching the
+// gates, which deny when the policy cannot be resolved.
+func effectiveAccountPolicy(ctx context.Context, user *models.User, groups access.GroupPolicyProvider) accountPolicy {
+	if user == nil {
+		return accountPolicy{Permissions: []string{}}
+	}
+	effective, err := access.EffectivePolicyForUser(ctx, user, groups)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to resolve effective account policy", "component", "api", "user_id", user.ID, "error", err)
+		return accountPolicy{Permissions: []string{}}
+	}
+	policy := accountPolicy{DownloadAllowed: effective.DownloadAllowed, Permissions: []string{}}
+	if user.Enabled {
+		policy.Permissions = auth.PolicyPermissions(effective)
+	}
+	return policy
+}
+
+// v1AccountPermissions keeps the frozen v1 account list: an enabled admin
+// reports every assignable permission from its role, as v1 always has, and
+// every other account reports its policy permissions. No gate reads this list;
+// the role grant itself applies only while an admin acts as administrator.
+func v1AccountPermissions(user *models.User, policyPermissions []string) []string {
+	if user.Enabled && user.Role == models.RoleAdmin {
+		return auth.AssignablePermissions()
+	}
+	return policyPermissions
+}
+
+func buildUserResponse(user *models.User, policy accountPolicy, impersonatorUserID *int, impersonator *models.User) UserView {
+	resp := UserView{
+		ID:              user.ID,
+		Username:        user.Username,
+		Email:           user.Email,
+		Role:            user.Role,
+		DownloadAllowed: policy.DownloadAllowed,
+		// An impersonating administrator is not restricted (auth.Service.Refresh).
+		PasswordChangeRequired: user.PasswordChangeRequired && impersonatorUserID == nil,
+		PolicyPermissions:      policy.Permissions,
+	}
+	if resp.PolicyPermissions == nil {
+		// Clients iterate permissions; never serialize it as null.
+		resp.PolicyPermissions = []string{}
+	}
+	resp.Permissions = v1AccountPermissions(user, resp.PolicyPermissions)
+	if impersonatorUserID != nil {
+		resp.Impersonation = &ImpersonationView{
+			Active:             true,
+			ImpersonatorUserID: *impersonatorUserID,
+		}
+		if impersonator != nil {
+			resp.Impersonation.ImpersonatorUsername = impersonator.Username
+		}
+	}
+	return resp
+}
+
+func impersonatorUserID(impersonator *models.User) *int {
+	if impersonator == nil {
+		return nil
+	}
+	return &impersonator.ID
+}
+
+func isSecureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+// IsSecureRequest reports whether the request arrived over TLS, directly or
+// behind a proxy that forwards the scheme. It is the seam v2 shares with the
+// v1 cookie handlers so both surfaces mark cookies Secure the same way.
+func IsSecureRequest(r *http.Request) bool { return isSecureRequest(r) }
+
+func (h *AuthHandler) loadImpersonator(ctx context.Context, claims *auth.Claims) (*models.User, error) {
+	if claims == nil || claims.ImpersonatorUserID == nil {
+		return nil, nil
+	}
+	return h.service.GetCurrentUser(ctx, &auth.Claims{UserID: *claims.ImpersonatorUserID})
+}
+
+// writeJSON marshals the given value as JSON and writes it to the response.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeError writes a JSON error response with the given status code,
+// error code, and message.
+// writeAPIError renders an *APIError in the v1 {error, message} shape; any
+// other error is the generic internal error.
+func writeAPIError(w http.ResponseWriter, err error) {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(apiErr.RetryAfter))
+		}
+		writeError(w, apiErr.Status, apiErr.Code, apiErr.Message)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "internal_error", "An unexpected error occurred")
+}
+
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, errorResponse{
+		Error:   code,
+		Message: message,
+	})
+}

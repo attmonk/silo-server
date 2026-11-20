@@ -1,0 +1,2694 @@
+@import "tailwindcss";
+/* animate-in/animate-out and their fade-/zoom-/slide- modifiers, used by the
+   radix overlay primitives in components/ui. Radix keeps a closing overlay
+   mounted until its exit animation ends. The enter/exit keyframes are
+   replaced in @theme below, which only works while this import stays above
+   it. */
+@import "tw-animate-css";
+
+/* Tailwind v4 wraps every `hover:` and `group-hover:` utility in
+   `@media (hover: hover)`. That feature is false on Windows machines whose
+   Chromium under-reports pointer capability — the same devices the card
+   controls gate works around — so every hover style in the app is silently
+   inert there, not just the card controls.
+
+   Gate on the observed-pointer attribute instead (see lib/pointerCapability.ts,
+   which seeds it from the equivalent media query at boot). Behaviour is
+   unchanged wherever the media query was already right; touch devices still
+   get no hover styling, because a touch press clears the attribute.
+
+   The gate MUST stay inside :where(). Tailwind orders its state variants by
+   specificity, so an unwrapped `:root[data-fine-pointer="true"]` prefix would
+   make every hover: utility 0-4-0 against 0-2-0 for disabled:, active: and
+   focus-visible: — hover would then beat them on every device, not just the
+   ones this works around. :where() contributes nothing, leaving the compiled
+   selectors at exactly the specificity Tailwind intends. */
+@custom-variant hover (:where(:root[data-fine-pointer="true"]) &:hover);
+/* `rtl:` means right to left here and now: like the icon mirror rule, it stops
+   at a `dir="ltr"` box (Tailwind's own variant matches anything inside an rtl
+   root, and uses `:dir()`, which older browsers drop). */
+@custom-variant rtl (&:where([dir="rtl"], [dir="rtl"] *):not(:where([dir="ltr"], [dir="ltr"] *)));
+
+/* ================================================================
+   § 1  THEME BRIDGE — Tailwind ↔ CSS Custom Properties
+   ================================================================
+   Maps semantic CSS variables (set per-theme below) into
+   Tailwind's @theme system so they work as utility classes.
+   e.g.  bg-background, text-foreground, border-border, etc.
+   ================================================================ */
+
+@theme inline {
+  /* ── Surfaces ────────────────────────────────────────────── */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--surface-hover);
+  --color-surface-raised: var(--surface-raised);
+
+  /* ── Interactive ─────────────────────────────────────────── */
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+
+  /* ── Status ────────────────────────────────────────────────── */
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+
+  /* ── Borders & Focus ─────────────────────────────────────── */
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* ── Charts ──────────────────────────────────────────────── */
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* ── Sidebar ─────────────────────────────────────────────── */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-section-divider: var(--sidebar-section-divider);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* ── Border Radius ───────────────────────────────────────── */
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-pill: 9999px;
+
+  /* ── Shadows (dark-UI optimized) ─────────────────────────── */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.25);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.3), 0 2px 4px -2px rgb(0 0 0 / 0.3);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.4), 0 4px 6px -4px rgb(0 0 0 / 0.4);
+  --shadow-xl: 0 20px 25px -5px rgb(0 0 0 / 0.5), 0 8px 10px -6px rgb(0 0 0 / 0.5);
+
+  /* ── Animations ──────────────────────────────────────────── */
+  --animate-accordion-down: accordion-down 0.2s ease-out;
+  --animate-accordion-up: accordion-up 0.2s ease-out;
+  --animate-fade-in: fade-in 0.3s ease-out;
+  --animate-slide-up: slide-up 0.3s ease-out;
+  --animate-scale-in: scale-in 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+  --animate-ken-burns-a: ken-burns-a 14s linear infinite;
+
+  /* tw-animate-css's enter/exit keyframes, minus its `filter: blur()` step:
+     nothing here uses the blur modifiers, and animating filter isn't
+     compositor-only. They come after the package's keyframes of the same
+     name, so they are the ones that apply (the production build drops the
+     earlier copy). `--overlay-motion` is unset except under
+     reduced motion, where it is `none`, so overlays fade without sliding or
+     zooming. overlayAnimationCss.test.ts checks the compiled result. */
+  @keyframes enter {
+    from {
+      opacity: var(--tw-enter-opacity, 1);
+      transform: var(
+        --overlay-motion,
+        translate3d(var(--tw-enter-translate-x, 0), var(--tw-enter-translate-y, 0), 0)
+          scale3d(var(--tw-enter-scale, 1), var(--tw-enter-scale, 1), var(--tw-enter-scale, 1))
+          rotate(var(--tw-enter-rotate, 0))
+      );
+    }
+  }
+  @keyframes exit {
+    to {
+      opacity: var(--tw-exit-opacity, 1);
+      transform: var(
+        --overlay-motion,
+        translate3d(var(--tw-exit-translate-x, 0), var(--tw-exit-translate-y, 0), 0)
+          scale3d(var(--tw-exit-scale, 1), var(--tw-exit-scale, 1), var(--tw-exit-scale, 1))
+          rotate(var(--tw-exit-rotate, 0))
+      );
+    }
+  }
+
+  /* ── Motion: Duration ──────────────────────────────────────── */
+  --duration-instant: 0ms;
+  --duration-fast: 150ms;
+  --duration-normal: 250ms;
+  --duration-slow: 400ms;
+  --duration-glacial: 700ms;
+  --duration-cinematic: 1200ms;
+  --duration-drift: 2000ms;
+  /* Sidebar immersion collapse — see `.sidebar-surface`. */
+  --duration-sidebar-collapse: 300ms;
+  --duration-sidebar-entry: 340ms;
+  --duration-sidebar-return: 340ms;
+
+  /* ── Motion: Easing ────────────────────────────────────────── */
+  --ease-default: cubic-bezier(0.4, 0, 0.2, 1);
+  /* Long, flat tail — keeps the moving edge from appearing to step near the end. */
+  --ease-sidebar-collapse: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-gentle: cubic-bezier(0.25, 0, 0.35, 1);
+
+  /* ── Font Family ───────────────────────────────────────────── */
+  --font-family-display: var(--font-display, var(--font-body));
+
+  /* ── Hero Backdrop Defaults ─────────────────────────────────── */
+  --hero-backdrop-brightness: 0.9;
+  --hero-backdrop-saturate: 1;
+  /* Detail heroes tint their artwork with a flat `--background` wash instead
+     of a `filter`, so a viewport resize does not re-rasterize a filtered
+     layer every frame. This is the detail-page equivalent of
+     `--hero-backdrop-brightness`: 10% over a dark background lands close to
+     brightness(0.9). Themes tune it here rather than losing the knob. */
+  --hero-backdrop-scrim: 10%;
+  --hero-text-shadow: 0 18px 50px rgb(0 0 0 / 45%);
+}
+
+/* ================================================================
+   § 2  KEYFRAMES
+   ================================================================ */
+
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
+}
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes pulse-opacity {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+@keyframes fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+/* Collection hero backdrop drift: a slow pan over a fixed overscan. The scale
+   stays constant on purpose. Firefox redraws an element whose scale is
+   animating at each new size and lands it on whole pixels, so a slow zoom
+   stutters there. The pan stays inside its 3%-a-side overscan, so the frame
+   never shows an edge. */
+@keyframes ken-burns-a {
+  0%,
+  100% {
+    scale: 1.06;
+    translate: 0 0;
+  }
+  50% {
+    scale: 1.06;
+    translate: -1.5% -1%;
+  }
+}
+
+/* Soft radiating halo used behind the centered play button while paused —
+   communicates "tap to resume" without distracting during playback.      */
+@keyframes player-breathe {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 rgb(255 255 255 / 0.22),
+      0 20px 60px -18px rgb(0 0 0 / 0.7),
+      inset 0 1px 0 rgb(255 255 255 / 0.7);
+  }
+  60% {
+    box-shadow:
+      0 0 0 18px rgb(255 255 255 / 0),
+      0 20px 60px -18px rgb(0 0 0 / 0.7),
+      inset 0 1px 0 rgb(255 255 255 / 0.7);
+  }
+}
+
+/* 1 left to right, -1 right to left: multiplies horizontal motion that follows
+   the reading direction (page slides, the sidebar collapse). */
+:root {
+  --dir-sign: 1;
+}
+:root[dir="rtl"] {
+  --dir-sign: -1;
+}
+
+/* Directional page motion for nested navigation. `--nav-slide-shift` is the
+   distance the OUTGOING page travels; the incoming page always enters from the
+   opposite side, so one pair of keyframes covers both directions.            */
+@keyframes nav-slide-out {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(calc(var(--nav-slide-shift) * var(--dir-sign)));
+  }
+}
+@keyframes nav-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(calc(-1 * var(--nav-slide-shift) * var(--dir-sign)));
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* ================================================================
+   VIEW TRANSITIONS — Page navigation animations
+   ================================================================
+   Uses the View Transitions API for smooth cross-fades between
+   route changes. The browser captures old/new page snapshots
+   and animates between them.
+   ================================================================ */
+
+/* The sidebar collapse (`.sidebar-surface`) is a live CSS transition running
+   across the same navigation. The root snapshot would freeze the old 260px
+   sidebar and cross-fade it over that motion, so inside the sidebar shell the
+   root group is held still and `main-content` carries the whole transition; the
+   rail, the impersonation banner, and the mobile header keep animating in the
+   live document.
+
+   Scoped to `html[data-app-shell]`, which `Layout` sets while it is mounted,
+   because `main-content` is named in `Layout` and nowhere else. Un-naming the
+   root outright would leave the routes that render outside it — /watch,
+   /reader/*, /admin/*, /login — with no captured element at all, so their
+   navigations would have nothing to animate rather than one thing too many. */
+html[data-app-shell]::view-transition-old(root),
+html[data-app-shell]::view-transition-new(root) {
+  animation: none;
+}
+
+/* main-content's own box moves with the rail (`lg:ml-[260px]` to `lg:ml-16`),
+   so the captured group has to travel on the rail's clock rather than the UA's
+   250ms default, or the two edges separate near the end of the collapse.     */
+::view-transition-group(main-content) {
+  animation-duration: var(--duration-sidebar-collapse);
+  animation-timing-function: var(--ease-sidebar-collapse);
+}
+
+::view-transition-old(main-content) {
+  animation: 200ms cubic-bezier(0, 0, 0.2, 1) both fade-out;
+}
+
+::view-transition-new(main-content) {
+  animation: 300ms cubic-bezier(0, 0, 0.2, 1) both slide-up;
+}
+
+/* Nested detail navigation moves sideways instead, on the sidebar's own tokens,
+   so following a breadcrumb up reads as the reverse of the push that made it.
+   Navigations whose direction is unknowable — a POP whose entry predates this
+   page load, an external pushState — leave the attribute off and fall through
+   to the neutral rules above. Both halves share one duration and easing: the
+   pseudo-elements default to `mix-blend-mode: plus-lighter`, which only
+   cross-fades cleanly while the two opacities sum to 1.                       */
+html[data-navigation-direction="forward"] {
+  --nav-slide-shift: -24px;
+}
+html[data-navigation-direction="back"] {
+  --nav-slide-shift: 24px;
+}
+
+/* Cold Home entry and return share one perceived speed. Cached entries leave
+   this marker off so their ready detail tree is never held behind this beat. */
+html[data-home-item-entry="true"] {
+  --duration-sidebar-collapse: var(--duration-sidebar-entry);
+}
+html[data-navigation-direction="back"][data-home-item-return="true"] {
+  --duration-sidebar-collapse: var(--duration-sidebar-return);
+}
+
+@keyframes home-item-detail-reveal {
+  from {
+    opacity: 0.35;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* A cold Home item entry uses fixed, solid boxes while the sidebar moves.
+   They never pulse or request artwork, and disappear before the real hero's
+   bounded poster/copy group settles. The page surface itself stays opaque. */
+.home-item-transition-block {
+  background: var(--surface);
+  border-color: var(--border);
+}
+
+html[data-home-item-entry="true"] .detail-hero-primary-content {
+  animation: var(--duration-normal) var(--ease-out) both home-item-detail-reveal;
+}
+html[data-navigation-direction]::view-transition-old(main-content) {
+  animation: var(--duration-sidebar-collapse) var(--ease-sidebar-collapse) both nav-slide-out;
+}
+html[data-navigation-direction]::view-transition-new(main-content) {
+  animation: var(--duration-sidebar-collapse) var(--ease-sidebar-collapse) both nav-slide-in;
+}
+
+/* Entering or leaving personal settings swaps what the app's sidebar column
+   holds (useSidebarSwap). The column's background and border never move; only
+   its contents slide in, from the side the reader is heading toward.
+   `backwards` rather than `both`: once it ends the entrance lets go of
+   transform, which the app sidebar's own collapse motion drives on some of
+   these same children.                                                       */
+@keyframes sidebar-entrance {
+  from {
+    opacity: 0;
+    transform: translateX(calc(var(--sidebar-entrance-shift) * var(--dir-sign)));
+  }
+}
+[data-sidebar-entrance="forward"] {
+  --sidebar-entrance-shift: 16px;
+}
+[data-sidebar-entrance="back"] {
+  --sidebar-entrance-shift: -16px;
+}
+[data-sidebar-entrance] > * {
+  animation: var(--duration-normal) var(--ease-out) backwards sidebar-entrance;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The directional selectors carry their own specificity — (0,1,2) against the
+     bare pseudo-elements' (0,0,1) — so they have to be suppressed by name here
+     or they would keep animating for someone who asked for no motion.        */
+  ::view-transition-old(main-content),
+  ::view-transition-new(main-content),
+  ::view-transition-group(main-content),
+  html[data-navigation-direction]::view-transition-old(main-content),
+  html[data-navigation-direction]::view-transition-new(main-content) {
+    animation: none;
+  }
+  :root {
+    --duration-fast: 0ms;
+    --duration-normal: 0ms;
+    --duration-cinematic: 0ms;
+    --duration-drift: 0ms;
+    --duration-glacial: 0ms;
+    --duration-slow: 150ms;
+    --duration-sidebar-collapse: 0ms;
+    --duration-sidebar-entry: 0ms;
+    --duration-sidebar-return: 0ms;
+    --animate-ken-burns-a: none;
+    /* Overlays (dialogs, sheets, menus, popovers, tooltips) keep their fade
+       but stop sliding and zooming; see the enter/exit keyframes in @theme.
+       The exit animation still runs, so radix unmounts once the fade ends. */
+    --overlay-motion: none;
+  }
+  .ambient-glow {
+    transition: none;
+  }
+  .detail-hero-primary-content {
+    animation: none !important;
+  }
+  /* Collapsing the sidebar becomes an instant state change: the frame, the
+     content under it, and everything cross-fading inside all stop animating. */
+  .sidebar-surface,
+  .sidebar-inner,
+  .sidebar-fade,
+  .sidebar-main-stage,
+  .impersonation-banner {
+    transition: none;
+  }
+  .player-breathe {
+    animation: none !important;
+  }
+}
+
+/* Forced colors (Windows High Contrast) drops box-shadows and background
+   images and replaces author colours with the user's palette, but keeps the
+   system colours an author sets. These rules are unlayered so they beat the
+   Tailwind utilities. */
+@media (forced-colors: active) {
+  /* The shared controls draw focus as a box-shadow ring under `outline-none`,
+     which leaves nothing in forced colors. */
+  :focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  /* These controls show their value only with a background colour, which
+     forced colors paints over. */
+  [data-slot="switch"] {
+    border-color: CanvasText;
+  }
+  [data-slot="switch-thumb"],
+  [data-slot="radio-group-indicator"] {
+    background-color: CanvasText;
+  }
+  [data-slot="switch"][data-state="checked"],
+  [data-slot="slider-range"],
+  [data-slot="progress-indicator"] {
+    border-color: Highlight;
+    background-color: Highlight;
+  }
+  [data-slot="switch"][data-state="checked"] [data-slot="switch-thumb"] {
+    background-color: HighlightText;
+  }
+  [data-slot="switch"]:disabled {
+    border-color: GrayText;
+  }
+  [data-slot="switch"]:disabled [data-slot="switch-thumb"] {
+    background-color: GrayText;
+  }
+
+  /* The current page in a navigation list, the selected tab, and the chosen
+     option in a row of radio buttons are marked only by a background colour.
+     Give them the system selection pair. Forced colors draws a Canvas backplate
+     behind text, which would hide HighlightText, so these opt out of forcing
+     and set a system colour on everything inside them. */
+  nav :is(a, button):is([aria-current="page"], [aria-current="true"]),
+  [role="tab"][aria-selected="true"],
+  [role="radio"][aria-checked="true"]:not([data-slot^="radio"]) {
+    forced-color-adjust: none;
+    border-color: Highlight;
+    background-color: Highlight;
+    color: HighlightText;
+  }
+  nav :is(a, button):is([aria-current="page"], [aria-current="true"]) *,
+  [role="tab"][aria-selected="true"] *,
+  [role="radio"][aria-checked="true"]:not([data-slot^="radio"]) * {
+    border-color: currentColor;
+    background-color: transparent;
+    color: inherit;
+  }
+}
+
+/* ================================================================
+   § 3  THEME DEFINITIONS
+   ================================================================
+   Silo ships one theme, Cinema Dark, which sets ALL semantic
+   tokens. It is activated by the static data-theme attribute on
+   <html> (index.html).
+
+   Token naming conventions:
+     --background       Page background (darkest main surface)
+     --foreground       Primary text color
+     --surface          Default card/panel surface
+     --surface-hover    Surface on hover
+     --surface-raised   Elevated surface (modals, floating panels)
+     --card             Card background (usually = surface)
+     --primary          Primary accent/action color
+     --secondary        Secondary element backgrounds
+     --muted            Muted backgrounds
+     --accent           Active/highlighted element backgrounds
+     --destructive      Danger/error color
+     --border           Default border color
+     --sidebar          Sidebar background (often darkest surface)
+   ================================================================ */
+
+@layer base {
+  /* ── Global Status Tokens ──────────────────────────────────
+     Semantic status colors used across all themes. Individual
+     themes may override these if needed.
+     ───────────────────────────────────────────────────────── */
+  :root {
+    --success: oklch(0.75 0.18 145);
+    --success-foreground: oklch(0.98 0.01 145);
+    --warning: oklch(0.8 0.15 85);
+    --warning-foreground: oklch(0.98 0.01 85);
+    --info: oklch(0.7 0.15 250);
+    --info-foreground: oklch(0.98 0.01 250);
+  }
+
+  /* ── Contrast-adjustable tokens ─────────────────────────────
+     These seven tokens are the ones high contrast mode lightens.
+     Themes define the literal under `--<token>-base`; the semantic
+     token is an alias. The indirection is required, not stylistic:
+     a custom property whose value references itself is a dependency
+     cycle and is invalid at computed-value time, so the high-contrast
+     block cannot write `--border: color-mix(..., var(--border))`.
+     It reads `--border-base` instead.
+     ───────────────────────────────────────────────────────── */
+  :root {
+    /* The direction high contrast pushes toward: away from the page. White on
+       a dark page; admin CSS that lightens the page should set it to black. */
+    --contrast-boost: #ffffff;
+
+    --muted-foreground: var(--muted-foreground-base);
+    --border: var(--border-base);
+    --input: var(--input-base);
+    --surface: var(--surface-base);
+    --surface-hover: var(--surface-hover-base);
+    --surface-raised: var(--surface-raised-base);
+    --accent: var(--accent-base);
+  }
+
+  /* ── Midnight Cinema ────────────────────────────────────── */
+  /* Inspired by premium streaming UIs: monochromatic, cinematic,
+     content-focused. White primary creates an elegant, theater-like
+     atmosphere where media artwork is the star.                    */
+  [data-theme="midnight-cinema"] {
+    /* Browser-drawn UI (page scrollbar, date pickers, select popups, unchecked
+       checkboxes, autofill) follows this, not the tokens below. index.html
+       declares the same scheme so the canvas is dark before CSS loads. */
+    color-scheme: dark;
+    --radius: 0.75rem;
+    --font-body: "Plus Jakarta Sans", sans-serif;
+    --font-display: "Plus Jakarta Sans", sans-serif;
+
+    /* Surfaces: near-black with subtle cool undertone */
+    --contrast-boost: #ffffff;
+    --background: #141417;
+    --foreground: #e8e8ec;
+    --card: #1c1c20;
+    --card-foreground: #e8e8ec;
+    --popover: #18181c;
+    --popover-foreground: #e8e8ec;
+
+    /* Primary: white — for play buttons, key CTAs, active indicators */
+    --primary: #e8e8ec;
+    --primary-foreground: #141417;
+
+    /* Secondary & Muted: subtle surface variations */
+    --secondary: #232328;
+    --secondary-foreground: #d0d0d6;
+    --muted: #1c1c20;
+    /* Lightened from #6e6e78 (~3.4:1), then from #9696a0 (~6.3:1) for small
+       secondary text: ~7.4:1 on --background (WCAG AAA) and ~5.9:1 on the
+       raised panel surface (#28282e). */
+    --muted-foreground-base: #a4a4ae;
+    --accent-base: #232328;
+    --accent-foreground: #e8e8ec;
+
+    /* Destructive: warm red for danger actions */
+    --destructive: #ef4444;
+    --destructive-foreground: #ffffff;
+
+    /* Borders: barely visible, just enough structure */
+    --border-base: #28282e;
+    /* Form-control boundary (text fields, selects, unchecked switch track and
+       checkbox). It is the only edge a field has, so it holds 3:1 (WCAG 1.4.11)
+       against the page, popover and card surfaces; --border stays a hairline. */
+    --input-base: #6a6a74;
+    --ring: #e8e8ec;
+
+    /* Charts: categorical set validated on this theme's card surface —
+       lightness band, chroma floor, adjacent-pair CVD separation, and
+       contrast all pass. Assigned in fixed entity order, never cycled. */
+    --chart-1: #5f74ee;
+    --chart-2: #169e88;
+    --chart-3: #bf7f22;
+    --chart-4: #c2578f;
+    --chart-5: #3f97cf;
+
+    /* Sidebar: darkest surface, creating depth */
+    --sidebar: #0f0f12;
+    --sidebar-foreground: #e8e8ec;
+    --sidebar-primary: #e8e8ec;
+    --sidebar-primary-foreground: #0f0f12;
+    --sidebar-accent: #1c1c20;
+    --sidebar-accent-foreground: #e8e8ec;
+    --sidebar-border: #232328;
+    --sidebar-section-divider: #2e2e35;
+    --sidebar-ring: #e8e8ec;
+
+    /* Surfaces: layered depth */
+    --surface-base: #1c1c20;
+    --surface-hover-base: #232328;
+    --surface-raised-base: #28282e;
+    --ambient: #e8e8ec;
+    --ambient-glow-opacity: 0.08;
+  }
+}
+
+/* ================================================================
+   § 4  BASE STYLES
+   ================================================================ */
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  /* Icons that point along the reading direction (back, forward, next, open
+     a submenu, sign out) mirror right to left. Media, time and brand icons
+     (play, skip, rewind, rotate, clock, external link) never do. `no-mirror`
+     keeps one that points at a physical side. A caret that also rotates needs
+     its own `rtl:` rotation, because `scale` applies before `rotate`. */
+  :is(
+      .lucide-chevron-left,
+      .lucide-chevron-right,
+      .lucide-chevrons-left,
+      .lucide-chevrons-right,
+      .lucide-arrow-left,
+      .lucide-arrow-right,
+      .lucide-corner-down-right,
+      .lucide-undo-2,
+      .lucide-log-in,
+      .lucide-log-out,
+      .lucide-send,
+      .lucide-panel-right-close,
+      .lucide-panel-right-open
+    ):where([dir="rtl"], [dir="rtl"] *):not(:where([dir="ltr"], [dir="ltr"] *), .no-mirror) {
+    scale: -1 1;
+  }
+  /* Code, paths, JSON and log text read left to right inside any page. Inline
+     code takes its direction from its own text and keeps the page's direction
+     for its margins (a logical margin resolves against the element's own
+     direction). */
+  pre {
+    direction: ltr;
+    unicode-bidi: isolate;
+  }
+  :is(code, kbd, samp) {
+    unicode-bidi: plaintext;
+  }
+  /* Titles, names, taglines and overviews from metadata take their direction
+     from their own text, so "56 Days" doesn't read "Days 56" in Arabic and an
+     English sentence keeps its full stop and its ellipsis at the end. They
+     still line up with the page. Chromium knows only the prefixed keyword. */
+  .bidi-text {
+    unicode-bidi: plaintext;
+    text-align: -webkit-match-parent;
+  }
+  @supports (text-align: match-parent) {
+    .bidi-text {
+      text-align: match-parent;
+    }
+  }
+  /* Root size is relative to the browser's default font size (16px unless the
+     user changed it), so rem-based text follows the browser text-size setting.
+     The in-app text scale multiplies on top of it. */
+  html {
+    font-size: 100%;
+    font-weight: 400;
+    --ui-text-scale-factor: 1;
+    /* Unitless root font size over 16px, for text whose size is not rem-based
+       (card overlay badges scale with the card in container units). Browsers
+       without CSS trigonometry fall back to the in-app scale factor. */
+    --ui-root-text-ratio: var(--ui-text-scale-factor);
+    /* Japanese and Chinese lines never start with "ー" or a small kana. This
+       only changes where CJK text may break. */
+    line-break: strict;
+  }
+  @supports (width: calc(1px * tan(atan2(1rem, 16px)))) {
+    html {
+      --ui-root-text-ratio: tan(atan2(1rem, 16px));
+    }
+  }
+  html[data-text-scale="large"] {
+    font-size: 112.5%;
+    --ui-text-scale-factor: 1.12;
+  }
+  html[data-text-scale="x-large"] {
+    font-size: 125%;
+    --ui-text-scale-factor: 1.24;
+  }
+  html[data-text-weight="strong"] {
+    --font-weight-ui: 520;
+    --font-weight-medium-ui: 600;
+    --font-weight-semibold-ui: 700;
+    --font-weight-bold-ui: 800;
+  }
+  html[data-text-weight="default"] {
+    --font-weight-ui: 400;
+    --font-weight-medium-ui: 500;
+    --font-weight-semibold-ui: 600;
+    --font-weight-bold-ui: 700;
+  }
+  /* Every token here pushes toward --contrast-boost, never toward white
+     directly. Hard-coded white raises contrast on a dark page and destroys it
+     on a light one; mixing toward the boost keeps high contrast readable
+     either way. The brand accent restores this --ring after its own
+     (contexts/BrandingProvider.tsx). */
+  html[data-high-contrast="true"] {
+    --foreground: var(--contrast-boost);
+    --ring: var(--contrast-boost);
+    --muted-foreground: color-mix(in srgb, var(--contrast-boost) 72%, var(--muted-foreground-base));
+    --border: color-mix(in srgb, var(--contrast-boost) 34%, var(--border-base));
+    --input: color-mix(in srgb, var(--contrast-boost) 16%, var(--input-base));
+    --surface: color-mix(in srgb, var(--contrast-boost) 10%, var(--surface-base));
+    --surface-hover: color-mix(in srgb, var(--contrast-boost) 16%, var(--surface-hover-base));
+    --surface-raised: color-mix(in srgb, var(--contrast-boost) 20%, var(--surface-raised-base));
+    --accent: color-mix(in srgb, var(--contrast-boost) 14%, var(--accent-base));
+    --ambient-glow-opacity: 0.04;
+  }
+  html[data-high-contrast="true"] .surface-panel-subtle,
+  html[data-high-contrast="true"] .surface-panel,
+  html[data-high-contrast="true"] .surface-panel-raised,
+  html[data-high-contrast="true"] .glass,
+  html[data-high-contrast="true"] .glass-subtle {
+    border-color: color-mix(in srgb, var(--border) 88%, white 12%);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.08),
+      0 12px 36px -24px rgb(0 0 0 / 0.75);
+  }
+  html[data-high-contrast="true"] .text-muted-foreground {
+    color: var(--muted-foreground) !important;
+  }
+  html[data-high-contrast="true"] .border-border,
+  html[data-high-contrast="true"] .border-border\/50,
+  html[data-high-contrast="true"] .border-border\/60,
+  html[data-high-contrast="true"] .border-border\/70,
+  html[data-high-contrast="true"] .border-border\/80 {
+    border-color: var(--border) !important;
+  }
+  html[data-text-weight="strong"] .font-medium {
+    font-weight: var(--font-weight-medium-ui, 600) !important;
+  }
+  html[data-text-weight="strong"] .font-semibold {
+    font-weight: var(--font-weight-semibold-ui, 700) !important;
+  }
+  html[data-text-weight="strong"] .font-bold {
+    font-weight: var(--font-weight-bold-ui, 800) !important;
+  }
+  html[data-text-scale="large"] .text-\[8px\],
+  html[data-text-scale="x-large"] .text-\[8px\] {
+    font-size: calc(8px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[9px\],
+  html[data-text-scale="x-large"] .text-\[9px\] {
+    font-size: calc(9px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[10px\],
+  html[data-text-scale="x-large"] .text-\[10px\] {
+    font-size: calc(10px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[11px\],
+  html[data-text-scale="x-large"] .text-\[11px\] {
+    font-size: calc(11px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[12px\],
+  html[data-text-scale="x-large"] .text-\[12px\] {
+    font-size: calc(12px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[13px\],
+  html[data-text-scale="x-large"] .text-\[13px\] {
+    font-size: calc(13px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[14px\],
+  html[data-text-scale="x-large"] .text-\[14px\] {
+    font-size: calc(14px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[15px\],
+  html[data-text-scale="x-large"] .text-\[15px\] {
+    font-size: calc(15px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[17px\],
+  html[data-text-scale="x-large"] .text-\[17px\] {
+    font-size: calc(17px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[20px\],
+  html[data-text-scale="x-large"] .text-\[20px\] {
+    font-size: calc(20px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[28px\],
+  html[data-text-scale="x-large"] .text-\[28px\] {
+    font-size: calc(28px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[32px\],
+  html[data-text-scale="x-large"] .text-\[32px\] {
+    font-size: calc(32px * var(--ui-text-scale-factor)) !important;
+  }
+  html[data-text-scale="large"] .text-\[38px\],
+  html[data-text-scale="x-large"] .text-\[38px\] {
+    font-size: calc(38px * var(--ui-text-scale-factor)) !important;
+  }
+  /* Buttons are activatable, so they get the activatable cursor. Declared in
+     `base` rather than as a utility, so an explicit `cursor-*` class — a
+     disabled player control, a non-interactive tooltip target — still wins. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+  button:disabled,
+  [role="button"][aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-body);
+    font-weight: var(--font-weight-ui, 400);
+    background-image:
+      radial-gradient(
+        circle at top,
+        color-mix(in srgb, var(--ambient) 10%, transparent),
+        transparent 32%
+      ),
+      linear-gradient(
+        to bottom,
+        color-mix(in srgb, var(--background) 92%, transparent),
+        var(--background)
+      );
+    min-height: 100dvh;
+  }
+}
+
+/* ================================================================
+   § 5  COMPONENT UTILITY CLASSES
+   ================================================================
+   Reusable patterns extracted from the design system.
+   See ../docs/design-system.md for pattern documentation.
+   ================================================================ */
+
+@layer components {
+  /* ── Hero Gradient ───────────────────────────────────────── */
+  /* Place over a hero/backdrop image to create a cinematic
+     bottom-to-top gradient fade into the page background.
+     Usage:
+       <div class="relative">
+         <img ... />
+         <div class="hero-gradient" />
+         <div class="hero-gradient-radial" />  // optional vignette
+       </div>                                                    */
+  /* The fade is anchored to the bottom third where the copy sits; the upper
+     two thirds stay clear so the artwork reads as artwork rather than a tint. */
+  .hero-gradient {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      to top,
+      var(--background) 0%,
+      color-mix(in srgb, var(--background) 88%, transparent) 12%,
+      color-mix(in srgb, var(--background) 48%, transparent) 30%,
+      color-mix(in srgb, var(--background) 12%, transparent) 50%,
+      transparent 66%
+    );
+    pointer-events: none;
+  }
+
+  .hero-gradient-radial {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+      ellipse at center,
+      transparent 0%,
+      color-mix(in srgb, var(--background) 30%, transparent) 70%,
+      var(--background) 100%
+    );
+    pointer-events: none;
+  }
+
+  /* Side gradient — fades from the start edge for sidebar overlap */
+  .hero-gradient-left {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      calc(90deg * var(--dir-sign)),
+      color-mix(in srgb, var(--background) 88%, transparent) 0%,
+      color-mix(in srgb, var(--background) 58%, transparent) 16%,
+      color-mix(in srgb, var(--background) 22%, transparent) 34%,
+      transparent 50%
+    );
+    pointer-events: none;
+  }
+
+  /* Soft edge darkening only. It used to repeat the bottom and left fades,
+     which stacked with them and washed out the middle of the frame. */
+  .hero-vignette {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+      ellipse 120% 100% at 60% 45%,
+      transparent 55%,
+      rgb(0 0 0 / 18%) 100%
+    );
+    pointer-events: none;
+  }
+
+  /* Stronger bottom fade for edge-to-edge marquee heroes. The hero
+     should melt into the page background rather than stop against a
+     border — background reaches full opacity by ~35% up the frame.   */
+  .hero-gradient-strong {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      to top,
+      var(--background) 0%,
+      var(--background) 10%,
+      color-mix(in srgb, var(--background) 86%, transparent) 26%,
+      color-mix(in srgb, var(--background) 45%, transparent) 48%,
+      color-mix(in srgb, var(--background) 12%, transparent) 70%,
+      transparent 88%
+    );
+    pointer-events: none;
+  }
+
+  /* Top scrim for the overlay marquee header — keeps eyebrow / tabs
+     legible over bright backdrops without a hard bar.                */
+  .hero-top-scrim {
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 180px;
+    background: linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--background) 70%, transparent) 0%,
+      color-mix(in srgb, var(--background) 30%, transparent) 55%,
+      transparent 100%
+    );
+    pointer-events: none;
+  }
+
+  /* ── Ambient Glow ──────────────────────────────────────────── */
+  /* Radial gradient overlay tinted by --ambient color. Applied to
+     hero sections for atmospheric color bleed from featured content.
+     Usage: <div class="ambient-glow" />  (sibling to hero-gradient) */
+  .ambient-glow {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+      ellipse at 50% 80%,
+      var(--ambient, var(--primary)) 0%,
+      transparent 70%
+    );
+    opacity: var(--ambient-glow-opacity, 0.12);
+    pointer-events: none;
+    transition:
+      background var(--duration-cinematic) var(--ease-gentle),
+      opacity var(--duration-cinematic) var(--ease-gentle);
+  }
+
+  /* Keep the detail hero as one contained layout/paint boundary. Browser UI
+     that animates the content viewport can then resize this surface without
+     invalidating every supporting rail below it. */
+  .item-detail-hero {
+    contain: layout paint style;
+  }
+
+  /* Keep the text and controls on a stable compositor surface while the
+     browser changes the viewport (for example, Brave's hover sidebar). The
+     hero copy itself does not move at desktop widths, so repainting it for
+     every intermediate viewport size only stalls the browser UI animation. */
+  .detail-hero-copy {
+    transform: translateZ(0);
+    backface-visibility: hidden;
+  }
+
+  /* Item artwork stays on the browser's inexpensive image/composite path. */
+  .hero-backdrop-artwork {
+    contain: strict;
+  }
+
+  /* Detail pages previously stacked a tint, two separate bottom fades, two
+     separate side fades, and a vignette as five full-hero elements. Group the
+     static treatment into two contained surfaces around the ambient glow so
+     resize does less paint work without changing the artwork's layer order. */
+  .detail-hero-scrim {
+    position: absolute;
+    inset: 0;
+    contain: paint;
+    pointer-events: none;
+  }
+
+  /* These layers sat below the ambient artwork glow in the original hero. */
+  .detail-hero-scrim-under {
+    background:
+      linear-gradient(
+        calc(90deg * var(--dir-sign)),
+        color-mix(in srgb, var(--background) 92%, transparent) 0%,
+        color-mix(in srgb, var(--background) 62%, transparent) 18%,
+        color-mix(in srgb, var(--background) 24%, transparent) 36%,
+        transparent 52%
+      ),
+      linear-gradient(
+        color-mix(in srgb, var(--background) var(--hero-backdrop-scrim, 25%), transparent),
+        color-mix(in srgb, var(--background) var(--hero-backdrop-scrim, 25%), transparent)
+      );
+  }
+
+  /* These layers sat above the ambient artwork glow in the original hero. */
+  /* One bottom fade anchored to the copy block plus a soft edge vignette.
+     Three stacked bottom fades and a second left fade used to multiply into
+     a near-solid wash by mid-frame. */
+  .detail-hero-scrim-over {
+    background:
+      linear-gradient(
+        to top,
+        var(--background) 0%,
+        color-mix(in srgb, var(--background) 86%, transparent) 14%,
+        color-mix(in srgb, var(--background) 46%, transparent) 34%,
+        color-mix(in srgb, var(--background) 12%, transparent) 54%,
+        transparent 70%
+      ),
+      radial-gradient(ellipse 120% 100% at 62% 40%, transparent 55%, rgb(0 0 0 / 18%) 100%);
+  }
+
+  .detail-hero-ambient {
+    contain: paint;
+    transition: none;
+  }
+
+  /* ── Sidebar Immersion ─────────────────────────────────────── */
+  /* The desktop sidebar is physically 260px wide in EVERY state. Entering a
+     detail page snaps the real layout — main's margin, the impersonation
+     banner, `--app-sidebar-offset` — from 260px to 64px in one pass, and the
+     sidebar and main content are held at their old visual positions for one
+     frame, then travel together to the 64px rail. The item route commits its
+     lightweight shell first; metadata and artwork stay gated until this
+     compositor motion has completed.
+     Nothing here touches width, margin, or any other layout property, so the
+     document is laid out once per navigation instead of once per frame. Holding
+     the surface at a constant size also means its 40px backdrop blur is
+     rasterized against unchanging geometry rather than re-blurred each frame. */
+  /* Two transforms that cancel out. `.sidebar-surface` is a 260px frame with
+     `overflow: hidden` that slides 196px left, so its right edge — and the
+     border drawn on it — sweeps from x=260 down to x=64. `.sidebar-inner`
+     slides the same distance the other way, so its content stays pinned to the
+     viewport and is progressively cut off by the frame's edge.
+
+     Why not animate the clip directly: Chrome runs `clip-path` transitions on
+     the main thread. Entering a detail page blocks that thread for longer than
+     the animation lasts (267ms and 209ms frozen frames measured on a real
+     navigation), which swallowed the collapse whole. `transform` is composited
+     and keeps advancing through exactly the same block. */
+  .sidebar-surface {
+    overflow: hidden;
+    transform: translateX(0);
+    transition: transform var(--duration-sidebar-collapse) var(--ease-sidebar-collapse);
+  }
+  .sidebar-surface[data-collapsed="true"] {
+    transform: translateX(calc(-196px * var(--dir-sign)));
+  }
+  .sidebar-inner {
+    transform: translateX(0);
+    transition: transform var(--duration-sidebar-collapse) var(--ease-sidebar-collapse);
+  }
+  .sidebar-surface[data-collapsed="true"] .sidebar-inner {
+    transform: translateX(calc(196px * var(--dir-sign)));
+  }
+
+  /* Main's margin snaps directly to the destination so the document lays out
+     once. Until the route is ready to animate, an inverse transform places the
+     new layout at the old visual offset. Removing that compensation on the
+     same state change that moves the sidebar keeps their edges locked together. */
+  @media (min-width: 64rem) {
+    .sidebar-main-stage {
+      transform: none;
+      transition: transform var(--duration-sidebar-collapse) var(--ease-sidebar-collapse);
+    }
+    .sidebar-main-stage[data-sidebar-target-collapsed="true"]:not(
+        [data-sidebar-visual-collapsed="true"]
+      ) {
+      transform: translateX(calc(196px * var(--dir-sign)));
+      transition: none;
+    }
+    .sidebar-main-stage:not(
+        [data-sidebar-target-collapsed="true"]
+      )[data-sidebar-visual-collapsed="true"] {
+      transform: translateX(calc(-196px * var(--dir-sign)));
+      transition: none;
+    }
+  }
+
+  /* Sidebar contents keep their expanded layout in both states — only opacity
+     and transform change, so the nav never reflows mid-animation. Labels that
+     used to animate `max-width` now just fade; the frame does the hiding. */
+  .sidebar-fade {
+    transition: opacity var(--duration-sidebar-collapse) var(--ease-sidebar-collapse);
+  }
+
+  /* ── Sidebar Scrollbar ────────────────────────────────────── */
+  /* Thin, auto-hiding scrollbar that blends with the sidebar.  */
+  .sidebar-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+    transition: scrollbar-color 0.2s ease;
+  }
+  .sidebar-scroll:hover {
+    scrollbar-color: color-mix(in srgb, var(--sidebar-foreground) 20%, transparent) transparent;
+  }
+  /* WebKit (Chrome, Safari, Edge) */
+  .sidebar-scroll::-webkit-scrollbar {
+    width: 6px;
+  }
+  .sidebar-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .sidebar-scroll::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 3px;
+    transition: background 0.2s ease;
+  }
+  .sidebar-scroll:hover::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--sidebar-foreground) 20%, transparent);
+  }
+  .sidebar-scroll:hover::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--sidebar-foreground) 35%, transparent);
+  }
+
+  /* ── Overlay Scrollbar ─────────────────────────────────── */
+  /* Thin, subtle scrollbar for dialogs and overlay panels.   */
+  .overlay-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--foreground) 15%, transparent) transparent;
+  }
+  .overlay-scroll::-webkit-scrollbar {
+    width: 6px;
+  }
+  .overlay-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .overlay-scroll::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--foreground) 15%, transparent);
+    border-radius: 3px;
+  }
+  .overlay-scroll::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--foreground) 30%, transparent);
+  }
+
+  /* ── Glass Surfaces ──────────────────────────────────────── */
+  /* Frosted glass effect for floating controls, overlay panels.
+     Usage: <div class="glass">...</div>                        */
+  .glass {
+    background: color-mix(in srgb, var(--surface) 70%, transparent);
+    backdrop-filter: blur(20px) saturate(1.2);
+    -webkit-backdrop-filter: blur(20px) saturate(1.2);
+    border: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.06),
+      0 20px 50px -28px rgb(0 0 0 / 0.65);
+  }
+
+  .glass-subtle {
+    background: color-mix(in srgb, var(--surface) 40%, transparent);
+    backdrop-filter: blur(12px) saturate(1.1);
+    -webkit-backdrop-filter: blur(12px) saturate(1.1);
+    border: 1px solid color-mix(in srgb, var(--border) 30%, transparent);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
+  }
+
+  /* Preserve glass hover color while fading a composited overlay
+     instead of repainting the backdrop-filtered element on every frame. */
+  .glass-hover {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+  }
+  .glass-hover::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: var(--glass-hover-color);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--duration-fast) var(--ease-default);
+    will-change: opacity;
+  }
+  .glass-hover:hover::before {
+    opacity: 1;
+  }
+  .glass-hover-surface {
+    /* 25% surface over the existing 40% glass equals the previous 55% hover. */
+    --glass-hover-color: color-mix(in srgb, var(--surface) 25%, transparent);
+  }
+  .glass-hover-accent {
+    --glass-hover-color: var(--accent);
+  }
+
+  /* Detail actions sit directly over large hero artwork. Repainting several
+     live backdrop filters after every button or popover state change blocks
+     scroll compositing on this surface, so retain the glass appearance with
+     an opaque color blend instead of sampling and blurring the backdrop. */
+  .detail-action-bar .glass-subtle {
+    background: color-mix(in srgb, var(--surface) 82%, var(--background));
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  /* The detail overflow menu opens without an entrance transition so it is
+     immediately interactive. Pointer hover is CSS-only. */
+  .detail-overflow-menu {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  /* Rating hover stays entirely in CSS so moving across stars does not
+     schedule React renders or recomposite a live backdrop-filter surface. */
+  .star-rating {
+    contain: layout paint;
+    background: color-mix(in srgb, var(--surface) 82%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 30%, transparent);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
+  }
+
+  .star-rating-star {
+    color: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+  }
+
+  /* The stored rating is the resting state, so it survives a pointer that is
+     inside the pill but not over a star (its padding, the gaps between stars)
+     and it still renders where :has() is unsupported. */
+  .star-rating-star[data-filled="true"] {
+    color: rgb(250 204 21);
+  }
+
+  .star-rating-star[data-filled="true"] svg {
+    fill: currentcolor;
+  }
+
+  /* Hovering a star previews that value instead: clear the stored fill first,
+     then fill up to the hovered position. The preview is gated on a fine
+     pointer, so a tap's emulated :hover cannot hold it on touch screens, and
+     it is held back after a click until the pointer leaves the clicked star
+     (StarRating sets data-suppress-preview), so the click's result shows
+     straight away instead of the preview of the value it just replaced. */
+  :where(:root[data-fine-pointer="true"])
+    .star-rating:not([data-suppress-preview]):has(.star-rating-star:hover)
+    .star-rating-star {
+    color: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+  }
+
+  :where(:root[data-fine-pointer="true"])
+    .star-rating:not([data-suppress-preview]):has(.star-rating-star:hover)
+    .star-rating-star
+    svg {
+    fill: none;
+  }
+
+  /* A click fills the whole star, so fill up to the end of the hovered star:
+     the hovered half, every half before it, and the right half after a
+     hovered left half. */
+  :where(:root[data-fine-pointer="true"])
+    .star-rating:not([data-suppress-preview])
+    .star-rating-star:is(
+      :hover,
+      :has(~ .star-rating-star:hover),
+      .star-rating-star[data-half="left"]:hover + *
+    ) {
+    color: rgb(250 204 21);
+  }
+
+  :where(:root[data-fine-pointer="true"])
+    .star-rating:not([data-suppress-preview])
+    .star-rating-star:is(
+      :hover,
+      :has(~ .star-rating-star:hover),
+      .star-rating-star[data-half="left"]:hover + *
+    )
+    svg {
+    fill: currentcolor;
+  }
+
+  /* Hovering the star that is already set previews removal: clicking it
+     clears the rating, so dim the stars rather than show the same fill. */
+  :where(:root[data-fine-pointer="true"])
+    .star-rating:not([data-suppress-preview]):has(.star-rating-star[data-clears]:hover)
+    .star-rating-star {
+    opacity: 0.45;
+  }
+
+  /* Less-transparent glass for small chips that sit over busy cover art
+     (manga count/status pills) so the label stays legible. */
+  .glass-chip {
+    background: color-mix(in srgb, var(--surface) 78%, transparent);
+    backdrop-filter: blur(12px) saturate(1.1);
+    -webkit-backdrop-filter: blur(12px) saturate(1.1);
+    border: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.06);
+  }
+
+  /* ── Terminal Surface ──────────────────────────────────────── */
+  /* Scoped terminal aesthetic for ffmpeg console and similar.
+     Usage: <div class="terminal-surface">...</div>              */
+  .terminal-surface {
+    --terminal-bg: oklch(0.15 0.01 260);
+    --terminal-fg: oklch(0.85 0.15 155);
+    --terminal-muted: oklch(0.65 0.1 155);
+    --terminal-border: oklch(0.3 0.05 155);
+  }
+
+  .glass-dark {
+    background: color-mix(in srgb, var(--background) 80%, transparent);
+    backdrop-filter: blur(24px) saturate(1.3);
+    -webkit-backdrop-filter: blur(24px) saturate(1.3);
+    border: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.04),
+      0 24px 60px -30px rgb(0 0 0 / 0.72);
+  }
+
+  /* ── Video Player — Cinema Glass ─────────────────────────────
+     Bespoke surfaces for the floating player HUD. Lives on a
+     black void (always on top of a video) so tokens here are
+     hard-coded monochrome — independent of the app's theme.     */
+
+  /* Primary play/pause disc — sits at the center of the frame. */
+  .player-disc-primary {
+    background: linear-gradient(180deg, #ffffff 0%, #f3f3f5 100%);
+    color: #0a0a0b;
+    box-shadow:
+      0 20px 60px -18px rgb(0 0 0 / 0.7),
+      inset 0 1px 0 rgb(255 255 255 / 0.7);
+    transition:
+      transform var(--duration-fast) var(--ease-spring),
+      box-shadow var(--duration-normal) var(--ease-default),
+      background var(--duration-fast) var(--ease-default);
+  }
+  .player-disc-primary:hover {
+    transform: scale(1.04);
+  }
+  .player-disc-primary:active {
+    transform: scale(0.97);
+  }
+
+  /* Secondary floating control (skip ±, prev/next episode). A
+     barely-there glass disc that gains opacity on hover so the
+     frame stays clear during playback.                          */
+  .player-disc-secondary {
+    background: rgb(255 255 255 / 0.06);
+    color: rgb(255 255 255 / 0.92);
+    border: 1px solid rgb(255 255 255 / 0.1);
+    backdrop-filter: blur(14px) saturate(1.1);
+    -webkit-backdrop-filter: blur(14px) saturate(1.1);
+    box-shadow:
+      0 10px 30px -14px rgb(0 0 0 / 0.6),
+      inset 0 1px 0 rgb(255 255 255 / 0.08);
+    transition:
+      background var(--duration-fast) var(--ease-default),
+      transform var(--duration-fast) var(--ease-spring),
+      border-color var(--duration-fast) var(--ease-default);
+  }
+  .player-disc-secondary:hover {
+    background: rgb(255 255 255 / 0.14);
+    border-color: rgb(255 255 255 / 0.22);
+    transform: scale(1.06);
+  }
+  .player-disc-secondary:active {
+    transform: scale(0.95);
+  }
+
+  /* Breathing halo behind the primary disc when paused. */
+  .player-disc-primary[data-paused="true"] {
+    animation: player-breathe 2.6s ease-in-out infinite;
+  }
+
+  .player-controls {
+    container-type: size;
+    container-name: player-controls;
+    contain: layout;
+  }
+
+  /* JASSUB writes contain-mode geometry directly onto its canvas. Override
+     that geometry when the video uses Fill so styled subtitles follow the
+     same crop instead of remaining letterboxed over the zoomed picture.
+     useASSSubtitles keeps regular dialogue inside the visible area. */
+  .player-ass-fill {
+    top: 0 !important;
+    left: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    object-fit: cover;
+  }
+
+  /* Subtle utility-icon button used in the bottom HUD rail. Relies on
+     opacity to recede during playback; a thin active underline signals
+     which secondary control is currently on.                          */
+  .player-utility-btn {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.5rem;
+    height: 2.5rem;
+    flex-shrink: 0;
+    border-radius: 9999px;
+    color: rgb(255 255 255 / 0.78);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    transition:
+      color var(--duration-fast) var(--ease-default),
+      background-color var(--duration-fast) var(--ease-default);
+  }
+  .player-utility-btn:hover {
+    color: #fff;
+    background: rgb(255 255 255 / 0.08);
+  }
+  .player-utility-btn:focus-visible {
+    outline: 2px solid rgb(255 255 255 / 0.7);
+    outline-offset: 2px;
+  }
+  .player-utility-btn[data-active="true"] {
+    color: #fff;
+  }
+  .player-utility-btn[data-active="true"]::after {
+    content: "";
+    position: absolute;
+    bottom: 0.22rem;
+    left: 50%;
+    width: 0.28rem;
+    height: 0.28rem;
+    border-radius: 9999px;
+    background: #e8b86e; /* warm projector-lamp amber */
+    transform: translateX(-50%);
+    box-shadow: 0 0 8px rgb(232 184 110 / 0.7);
+  }
+
+  /* ── Media Card ──────────────────────────────────────────── */
+  /* Hover effect for poster/backdrop cards.
+     Scale is applied to the image inside the overflow-hidden
+     .media-card-image container so it stays visually contained
+     and doesn't overlap adjacent carousels.
+     Usage: <div class="media-card">
+              <div class="media-card-image"><img … /></div>
+              <div>Title</div>
+            </div>                                              */
+  .media-card {
+    transition:
+      transform var(--duration-normal) var(--ease-gentle),
+      filter var(--duration-fast) var(--ease-default);
+  }
+  .media-card:hover {
+    filter: brightness(1.1);
+    transform: translateY(-4px);
+  }
+
+  /* Home/library pages can contain hundreds of cards across off-screen rows.
+     Let supporting engines skip layout and paint for those rows until they
+     approach the viewport. Browsers without content-visibility ignore this
+     and keep the existing rendering path. MediaCarousel sets the placeholder
+     height from carouselIntrinsicHeight(), which owns the per-card-size
+     values alongside the card widths they derive from. */
+  .media-carousel {
+    content-visibility: auto;
+    contain-intrinsic-size: auto var(--carousel-intrinsic-h, 23rem);
+  }
+
+  /* Detail pages can contain several image-heavy rails below the fold. Match
+     the home carousel strategy so a viewport resize only lays out and paints
+     the supporting sections near the user. The remembered intrinsic size
+     prevents already-visited sections from shifting the scroll position. */
+  .detail-supporting-content > * {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 24rem;
+  }
+
+  /* A detail page may mount several Embla rails close enough to the viewport
+     that the browser keeps all of them render-relevant. Isolate each clipped
+     viewport so a browser-chrome resize or vertical page scroll cannot make
+     an episode/cast rail invalidate neighbouring detail sections. */
+  .detail-supporting-content .embla__viewport {
+    contain: layout paint style;
+  }
+
+  /* Card actions stay hidden at rest so touch devices get clean artwork; a
+     long press opens the action sheet instead. Keyboard focus and an open
+     menu reveal them on every device so keyboard and assistive-tech users
+     always have a visible, hittable target. */
+  .media-card-action-trigger,
+  .media-card-play-trigger {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .media-card-action-trigger[data-state="open"],
+  .media-card-action-trigger:focus-visible,
+  .media-card-play-trigger:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  /* Hover reveal is for precise pointers only, so a tap-emulated :hover on a
+     phone cannot uncover the controls. These are bespoke rules rather than
+     group-hover utilities because they span two named groups (card and media)
+     and share one reveal across every card surface.
+
+     Card actions sit at z-20 in the card wrapper's stacking context while the
+     overlay-badge layer sits at z-10 inside the artwork box, so a visible
+     action always covers the badges in that corner. Badges anchor flush in the
+     corners and never reserve room for the actions; the overlay layer is
+     pointer-events-none, so covered badges cannot steal an action's clicks. */
+  .media-card-hover-dim {
+    background: rgb(0 0 0 / 0.3);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--duration-fast) var(--ease-default);
+  }
+  .group\/media:focus-within .media-card-hover-dim {
+    opacity: 1;
+  }
+  /* Gated on an attribute set from observed pointer events
+     (lib/pointerCapability.ts), not on a media query. Chromium on some Windows
+     hybrid machines reports `any-hover: none` and `any-pointer: coarse` even
+     while a mouse is actively hovering the card, so this block never matched
+     and the controls stayed at `opacity: 0` permanently. The attribute is
+     seeded from that same media query at boot, so behaviour is unchanged
+     wherever it was already right.
+
+     Deliberately no `[data-fine-pointer="false"]` counterpart forcing opacity
+     back to 0: at this specificity it would out-weigh the `[data-state="open"]`
+     and `:focus-visible` rules above and hide the trigger while its own menu is
+     open on a touch device. Rest state is the base rule's job. */
+  :where(:root[data-fine-pointer="true"]) .group\/media:hover .media-card-hover-dim {
+    opacity: 1;
+  }
+  :where(:root[data-fine-pointer="true"]) .group\/card:hover .media-card-action-trigger,
+  :where(:root[data-fine-pointer="true"]) .group\/media:hover .media-card-play-trigger {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  /* Row actions that appear on hover. On a touch screen there is no hover, so
+     the action stays visible; a fine pointer hides it until the row is hovered
+     or the control is focused. Gated on the observed pointer like the card
+     reveals above. Usage: a `group/row` wrapper and `.pointer-reveal` on the
+     control. */
+  :where(:root[data-fine-pointer="true"]) .pointer-reveal {
+    opacity: 0;
+    transition: opacity var(--duration-fast) var(--ease-default);
+  }
+  :where(:root[data-fine-pointer="true"]) .group\/row:hover .pointer-reveal,
+  :where(:root[data-fine-pointer="true"]) .group\/row:focus-within .pointer-reveal,
+  :where(:root[data-fine-pointer="true"]) .pointer-reveal:focus-visible {
+    opacity: 1;
+  }
+
+  /* A long press on a card opens the action sheet, so the browser's own image
+     and link callout has to stay out of the way. Text selection is only
+     disabled for coarse primary pointers: a mouse user can still select a
+     card's caption. */
+  .media-card-longpress {
+    -webkit-touch-callout: none;
+  }
+  @media (pointer: coarse) {
+    .media-card-longpress {
+      user-select: none;
+    }
+  }
+
+  /* Card image container with consistent rounded corners */
+  .media-card-image {
+    overflow: hidden;
+    border-radius: var(--radius-xl);
+    background-color: var(--surface);
+    border: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.05),
+      0 24px 40px -26px rgb(0 0 0 / 0.8);
+  }
+  .media-card-image img {
+    transition:
+      transform var(--duration-normal) var(--ease-gentle),
+      opacity var(--duration-normal) var(--ease-default);
+  }
+  .media-card:hover .media-card-image img {
+    transform: scale(1.06);
+  }
+
+  /* Default artwork for a poster, cover or still with no image (DefaultArtwork):
+     a faint glow with a small type mark in the centre. The glows are sized from
+     the box's longer side, so a poster and a still get the same glow, only
+     cropped. Keep in step with the Apple and Android clients. Without container
+     units only the base colour and a 24px mark show. */
+  .default-artwork {
+    container-type: size;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: #16171c;
+  }
+  .default-artwork::before {
+    --side: max(100cqw, 100cqh);
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+      radial-gradient(
+        circle calc(var(--side) * 0.5) at 70% 30%,
+        rgb(245 11 79 / 0.112),
+        rgb(245 11 79 / 0)
+      ),
+      radial-gradient(
+        circle calc(var(--side) * 0.6) at 100% 100%,
+        rgb(253 116 3 / 0.144),
+        rgb(253 116 3 / 0)
+      ),
+      radial-gradient(
+        circle calc(var(--side) * 0.75) at 0% 0%,
+        rgb(0 52 251 / 0.176),
+        rgb(0 52 251 / 0)
+      );
+  }
+  /* Positioned after ::before in tree order, so it paints above the glow. */
+  .default-artwork-mark {
+    position: relative;
+    width: clamp(14px, 24cqw, 40px);
+    height: clamp(14px, 24cqw, 40px);
+    color: #fff;
+    opacity: 0.13;
+  }
+
+  /* ── Episode Row ─────────────────────────────────────────── */
+  /* Horizontal episode list item with hover highlight.
+     Usage: <div class="episode-row">
+              <img ... />
+              <div>E1 Title ...</div>
+            </div>                                              */
+  .episode-row {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+    transition: background-color var(--duration-fast) var(--ease-default);
+    cursor: pointer;
+  }
+  .episode-row:hover {
+    background-color: var(--surface-hover);
+  }
+  .episode-row:last-child {
+    border-bottom: none;
+  }
+
+  /* ── Metadata Badge ──────────────────────────────────────── */
+  /* Small inline badge for metadata (year, rating, duration).
+     Usage: <span class="metadata-badge">PG-13</span>          */
+  .metadata-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.25rem 0.6rem;
+    border-radius: 9999px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    line-height: 1rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    background-color: color-mix(in srgb, var(--foreground) 8%, transparent);
+    color: color-mix(in srgb, var(--foreground) 72%, var(--muted-foreground));
+    border: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
+
+  /* ── Pill Button ─────────────────────────────────────────── */
+  /* Fully-rounded button shape for primary actions.
+     Usage: <button class="pill">▶ Play</button>                */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.78rem 1.4rem;
+    border-radius: 9999px;
+    font-size: 0.84rem;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    transition: all var(--duration-fast) var(--ease-default);
+  }
+  .pill-primary {
+    background-color: var(--primary);
+    color: var(--primary-foreground);
+    box-shadow: 0 16px 36px -20px color-mix(in srgb, var(--primary) 60%, transparent);
+  }
+  .pill-primary:hover {
+    filter: brightness(0.96);
+    transform: translateY(-1px);
+  }
+  .pill-secondary {
+    background-color: var(--secondary);
+    color: var(--secondary-foreground);
+  }
+  .pill-secondary:hover {
+    background-color: var(--surface-hover);
+  }
+  .pill-glass {
+    background: color-mix(in srgb, var(--foreground) 12%, transparent);
+    color: var(--foreground);
+    border: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+  .pill-glass:hover {
+    background: color-mix(in srgb, var(--foreground) 18%, transparent);
+  }
+
+  /* ── Action Circle ───────────────────────────────────────── */
+  /* Circular icon button for secondary actions (shuffle, download, etc).
+     Usage: <button class="action-circle"><Icon /></button>     */
+  .action-circle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: 9999px;
+    background-color: color-mix(in srgb, var(--foreground) 10%, transparent);
+    color: var(--foreground);
+    transition: background-color var(--duration-fast) var(--ease-default);
+    cursor: pointer;
+    border: none;
+  }
+  .action-circle:hover {
+    background-color: color-mix(in srgb, var(--foreground) 18%, transparent);
+  }
+
+  /* ── Tab Bar ─────────────────────────────────────────────── */
+  /* Pill-style tab navigation (Recommended | Browse | etc).
+     Usage: <div class="tab-bar">
+              <button class="tab-item tab-active">Browse</button>
+              <button class="tab-item">Collections</button>
+            </div>                                              */
+  .tab-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.25rem;
+    border-radius: var(--radius-lg);
+  }
+  .tab-item {
+    padding: 0.375rem 1rem;
+    border-radius: var(--radius-md);
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--muted-foreground);
+    transition: all var(--duration-fast) var(--ease-default);
+    cursor: pointer;
+    background: transparent;
+    border: none;
+  }
+  .tab-item:hover {
+    color: var(--foreground);
+    background-color: var(--surface-hover);
+  }
+  .tab-active {
+    color: var(--foreground);
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+  }
+
+  /* ── Carousel Dots ───────────────────────────────────────── */
+  /* Indicator dots for hero carousels.
+     Usage: <div class="carousel-dots">
+              <button class="dot dot-active" />
+              <button class="dot" />
+            </div>                                              */
+  .carousel-dots {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45rem;
+  }
+  .dot {
+    width: 0.42rem;
+    height: 0.42rem;
+    border-radius: 9999px;
+    background-color: color-mix(in srgb, var(--foreground) 26%, transparent);
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    transition: all var(--duration-normal) var(--ease-default);
+  }
+  .dot-active {
+    width: 1.5rem;
+    background-color: var(--primary);
+  }
+
+  /* ── Library Marquee Header ───────────────────────────────── */
+  /* Shared sticky header for the Library page. Sits transparently
+     over the hero on the Recommended tab, and switches to a glass
+     surface on scroll or when no hero backdrop is behind it.        */
+  .library-marquee-header {
+    /* Mobile: non-sticky so the tabs scroll with the hero instead of hovering
+       over it — stacking a sticky tab bar under the sticky top nav eats too
+       much vertical space on narrow viewports. At lg+ the mobile top nav is
+       hidden, so we promote this header to sticky at top:0 there. */
+    position: relative;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    /* On mobile the eyebrow is hidden, so the tab pill bar is the only child —
+       center it. sm+ overrides back to space-between once the eyebrow shows. */
+    justify-content: center;
+    gap: 1.5rem;
+    padding: 0.9rem 1rem;
+    border-bottom: 1px solid transparent;
+    background: color-mix(in srgb, var(--background) 82%, transparent);
+    backdrop-filter: blur(18px) saturate(1.15);
+    -webkit-backdrop-filter: blur(18px) saturate(1.15);
+    border-bottom-color: color-mix(in srgb, var(--border) 55%, transparent);
+    transition:
+      background var(--duration-normal) var(--ease-default),
+      backdrop-filter var(--duration-normal) var(--ease-default),
+      border-color var(--duration-normal) var(--ease-default);
+  }
+  @media (min-width: 1024px) {
+    .library-marquee-header {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+    }
+  }
+  .library-marquee-header.is-overlay {
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    border-bottom-color: transparent;
+  }
+  .library-marquee-header.is-overlay[data-scrolled="true"] {
+    background: color-mix(in srgb, var(--background) 72%, transparent);
+    backdrop-filter: blur(18px) saturate(1.15);
+    -webkit-backdrop-filter: blur(18px) saturate(1.15);
+    border-bottom-color: color-mix(in srgb, var(--border) 50%, transparent);
+  }
+  @media (min-width: 640px) {
+    .library-marquee-header {
+      justify-content: space-between;
+      padding: 1rem 1.5rem;
+    }
+  }
+  @media (min-width: 1024px) {
+    .library-marquee-header {
+      padding: 1.1rem 2.5rem;
+    }
+  }
+  @media (min-width: 1280px) {
+    .library-marquee-header {
+      padding: 1.1rem 3rem;
+    }
+  }
+
+  /* Small-caps tracked eyebrow label used above hero content
+     and in the marquee header as the page identifier.              */
+  .hero-eyebrow {
+    font-family: var(--font-body);
+    font-size: 0.72rem;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: color-mix(in srgb, var(--foreground) 62%, transparent);
+    white-space: nowrap;
+  }
+  .hero-eyebrow .hero-eyebrow-divider {
+    display: inline-block;
+    margin: 0 0.55em;
+    opacity: 0.45;
+  }
+  .hero-eyebrow .hero-eyebrow-strong {
+    color: color-mix(in srgb, var(--foreground) 92%, transparent);
+  }
+  .is-overlay .hero-eyebrow {
+    color: color-mix(in srgb, #fff 70%, transparent);
+    text-shadow: 0 2px 12px rgb(0 0 0 / 0.5);
+  }
+  .is-overlay .hero-eyebrow .hero-eyebrow-strong {
+    color: #fff;
+  }
+
+  /* Middot-separated metadata track for hero content. Replaces
+     chip-style badges with editorial cover-copy feel.              */
+  .hero-meta-track {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0 0.1rem;
+    font-family: var(--font-body);
+    font-size: 0.82rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    color: color-mix(in srgb, var(--foreground) 78%, transparent);
+  }
+  .hero-meta-track > span {
+    display: inline-block;
+  }
+  .hero-meta-track > span + span::before {
+    content: "·";
+    display: inline-block;
+    margin: 0 0.6rem;
+    opacity: 0.55;
+    color: color-mix(in srgb, var(--foreground) 55%, transparent);
+  }
+
+  /* Editorial slide indicator (counter + rail).                   */
+  .hero-slide-counter {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.75rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    color: color-mix(in srgb, #fff 68%, transparent);
+    text-shadow: 0 2px 10px rgb(0 0 0 / 0.45);
+  }
+  .hero-slide-counter .num {
+    color: #fff;
+  }
+  .hero-slide-counter .sep {
+    width: 2.5rem;
+    height: 1px;
+    background: color-mix(in srgb, #fff 35%, transparent);
+  }
+  .hero-progress-rail {
+    position: relative;
+    width: 9rem;
+    height: 2px;
+    background: color-mix(in srgb, #fff 18%, transparent);
+    overflow: hidden;
+    border-radius: 9999px;
+  }
+  .hero-progress-rail > span {
+    position: absolute;
+    inset: 0;
+    background: color-mix(in srgb, #fff 88%, transparent);
+    transform-origin: left center;
+    transform: scaleX(0);
+    animation: hero-progress 8s linear forwards;
+  }
+  :root[dir="rtl"] .hero-progress-rail > span {
+    transform-origin: right center;
+  }
+  .hero-progress-rail[data-paused="true"] > span {
+    animation-play-state: paused;
+  }
+  @keyframes hero-progress {
+    from {
+      transform: scaleX(0);
+    }
+    to {
+      transform: scaleX(1);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    /* No growing bar: full while the slideshow runs, empty while it is stopped. */
+    .hero-progress-rail > span {
+      animation: none;
+      transform: scaleX(1);
+    }
+    .hero-progress-rail[data-paused="true"] > span {
+      transform: scaleX(0);
+    }
+  }
+
+  /* Pill-style tab bar used inside the marquee header.            */
+  .marquee-tab-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15rem;
+    padding: 0.25rem;
+    border-radius: 9999px;
+    background: color-mix(in srgb, #fff 8%, transparent);
+    border: 1px solid color-mix(in srgb, #fff 10%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+  .library-marquee-header:not(.is-overlay) .marquee-tab-bar {
+    background: color-mix(in srgb, var(--foreground) 6%, transparent);
+    border-color: color-mix(in srgb, var(--border) 60%, transparent);
+  }
+  .marquee-tab-trigger {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.5rem 1rem;
+    border-radius: 9999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    color: color-mix(in srgb, var(--foreground) 62%, transparent);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color var(--duration-fast) var(--ease-default);
+  }
+  .library-marquee-header.is-overlay .marquee-tab-trigger {
+    color: color-mix(in srgb, #fff 68%, transparent);
+  }
+  .marquee-tab-trigger:hover {
+    color: var(--foreground);
+  }
+  .library-marquee-header.is-overlay .marquee-tab-trigger:hover {
+    color: #fff;
+  }
+  .marquee-tab-trigger[data-state="active"] {
+    color: var(--foreground);
+    background: color-mix(in srgb, var(--foreground) 12%, transparent);
+  }
+  .library-marquee-header.is-overlay .marquee-tab-trigger[data-state="active"] {
+    color: #0a0a0b;
+    background: color-mix(in srgb, #fff 92%, transparent);
+  }
+  .marquee-tab-trigger:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  .panel-border {
+    border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.04),
+      0 18px 45px -30px rgb(0 0 0 / 0.55);
+  }
+
+  .page-shell {
+    width: 100%;
+    max-width: 1400px;
+    margin-inline: auto;
+    padding-inline: 1rem;
+  }
+
+  .page-shell-wide {
+    width: 100%;
+    max-width: 1520px;
+    margin-inline: auto;
+    padding-inline: 1rem;
+  }
+
+  @media (min-width: 640px) {
+    .page-shell,
+    .page-shell-wide {
+      padding-inline: 1.5rem;
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .page-shell,
+    .page-shell-wide {
+      padding-inline: 2.5rem;
+    }
+  }
+
+  @media (min-width: 1280px) {
+    .page-shell-wide {
+      padding-inline: 3rem;
+    }
+  }
+
+  .page-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .page-title {
+    font-size: clamp(2rem, 4vw, 3.75rem);
+    line-height: 0.95;
+    font-weight: 800;
+    letter-spacing: -0.05em;
+  }
+
+  .page-subtitle {
+    max-width: 60ch;
+    color: color-mix(in srgb, var(--foreground) 68%, var(--muted-foreground));
+    line-height: 1.7;
+  }
+
+  .surface-panel {
+    background: color-mix(in srgb, var(--surface) 90%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    border-radius: calc(var(--radius-2xl) + 0.35rem);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.04),
+      0 24px 50px -34px rgb(0 0 0 / 0.65);
+  }
+
+  .surface-panel-subtle {
+    background: color-mix(in srgb, var(--surface) 72%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+    border-radius: calc(var(--radius-xl) + 0.25rem);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.04);
+  }
+
+  /* One surface step above a surface-panel shell. Settings groups sit on
+     this so they read as defined panels inside the shell — in light themes
+     the shell and --surface are near-identical, so the raised fill plus the
+     hairline are what keep group boundaries visible. */
+  .surface-panel-raised {
+    background: color-mix(in srgb, var(--surface-raised) 65%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    border-radius: 1.7rem;
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.04);
+  }
+
+  /* Search controls repaint on the hottest route in the app. Keep them on the
+     same opaque paint surface as the page: no backdrop sampling, alpha blend,
+     or blur layer needs to be recomposited while results replace underneath. */
+  .search-paint-surface {
+    background: var(--background);
+    border-color: color-mix(in srgb, var(--border) 72%, transparent);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  /* Panel chrome only once there is a sidebar to enclose. Below this the
+     settings detail view is already a stack of surface-panel groups, and a
+     panel around them would nest a card in a card. */
+  @media (min-width: 1024px) {
+    .surface-panel-lg {
+      background: color-mix(in srgb, var(--surface) 90%, transparent);
+      border-radius: calc(var(--radius-2xl) + 0.35rem);
+      box-shadow:
+        inset 0 1px 0 rgb(255 255 255 / 0.04),
+        0 24px 50px -34px rgb(0 0 0 / 0.65);
+    }
+  }
+
+  .caption-empty-state span {
+    display: block;
+    height: 0.35rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--foreground) 18%, transparent);
+  }
+
+  .caption-empty-state span:nth-child(1) {
+    width: 72%;
+    margin-inline: auto;
+  }
+
+  .caption-empty-state span:nth-child(2) {
+    width: 54%;
+    margin-inline: auto;
+  }
+
+  .caption-empty-state span:nth-child(3) {
+    width: 38%;
+    margin-inline: auto;
+  }
+
+  /* ── Scan Queue Accent ──────────────────────────────────── */
+  /* Animated gradient sweep across the top of the scan queue
+     to signal live activity. Only visible when scans are active. */
+  .scan-queue-accent {
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      color-mix(in srgb, var(--primary) 50%, transparent) 45%,
+      var(--primary) 50%,
+      color-mix(in srgb, var(--primary) 50%, transparent) 55%,
+      transparent 100%
+    );
+    background-size: 200% 100%;
+    animation: scan-accent-sweep 4s ease-in-out infinite;
+    opacity: 0.6;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .scan-queue-accent {
+      animation: none;
+    }
+  }
+  @keyframes scan-accent-sweep {
+    0% {
+      background-position: 200% 0;
+    }
+    100% {
+      background-position: -200% 0;
+    }
+  }
+
+  .auth-shell {
+    min-height: 100dvh;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+  }
+
+  .auth-shell::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(
+        circle at 18% 18%,
+        color-mix(in srgb, var(--primary) 18%, transparent),
+        transparent 28%
+      ),
+      radial-gradient(
+        circle at 82% 12%,
+        color-mix(in srgb, var(--ambient) 15%, transparent),
+        transparent 26%
+      ),
+      linear-gradient(
+        135deg,
+        color-mix(in srgb, var(--background) 96%, transparent),
+        var(--background)
+      );
+    pointer-events: none;
+  }
+
+  .auth-card {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    max-width: 28rem;
+    border-radius: 2rem;
+    padding: 1.75rem;
+  }
+
+  /* .admin-shell marks AdminLayout's PageFrame, which sets the width. Shared
+     components that also render in the app (the collection editor) carry
+     page-shell, so drop its own gutter, cap, and centering here. */
+  .admin-shell > .page-shell,
+  .admin-shell > .page-shell-wide {
+    max-width: none;
+    margin-inline: 0;
+    padding-inline: 0;
+  }
+
+  /* Admin dashboard widget grid: single column on small screens, two columns
+     on tablets (where .admin-widget-wide keeps the full row), and a 12-column
+     grid from lg up where each widget spans var(--widget-span) columns and
+     var(--widget-rows) fixed-height rows.
+
+     Rows are only fixed from lg up. Below that the grid is one or two
+     content-sized columns, so a widget is already as narrow as it gets and a
+     row span picked for the wide layout would clip it — the same reason column
+     spans stop applying there. */
+  .admin-widget-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.875rem;
+    /* Height of one widget row. Declared here rather than in the media query so
+       DashboardGrid can read it back for a drag; it only takes effect at lg. */
+    --admin-row-h: 6.25rem;
+  }
+
+  .admin-widget {
+    grid-column: 1 / -1;
+    position: relative;
+    min-width: 0;
+  }
+
+  /* Plot area of a dashboard chart drawn with `fill`. From lg up it takes the
+     height the widget's fixed rows leave it. Below lg the rows are
+     content-sized, so there is no height to take and the plot would measure
+     0px; it keeps the 10rem a fixed-height chart gets instead. */
+  .admin-chart-fill {
+    flex: 1 1 0%;
+    min-height: 10rem;
+  }
+
+  /* ── Dashboard Widget Scrollbars ──────────────────────────── */
+  /* Widget bodies scroll inside their row, so the default OS bar
+     sits right on top of the theme. One rule covers every widget:
+     `scrollbar-width`/`scrollbar-color` inherit, so Firefox picks
+     them up from the grid, and WebKit gets a descendant rule.
+     Matches .overlay-scroll so the dashboard and its Add-widget
+     sheet look the same.                                        */
+  .admin-widget-grid {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--foreground) 15%, transparent) transparent;
+  }
+  .admin-widget-grid ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .admin-widget-grid ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .admin-widget-grid ::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--foreground) 15%, transparent);
+    border-radius: 3px;
+  }
+  .admin-widget-grid ::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--foreground) 30%, transparent);
+  }
+  .admin-widget-grid ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  @media (min-width: 640px) and (max-width: 1023px) {
+    .admin-widget-grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+
+    .admin-widget {
+      grid-column: span 1;
+    }
+
+    .admin-widget-wide {
+      grid-column: 1 / -1;
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .admin-widget-grid {
+      grid-template-columns: repeat(12, 1fr);
+      grid-auto-rows: var(--admin-row-h);
+    }
+
+    .admin-widget {
+      grid-column: span var(--widget-span) / span var(--widget-span);
+      grid-row: span var(--widget-rows) / span var(--widget-rows);
+    }
+
+    .admin-chart-fill {
+      min-height: 0;
+    }
+  }
+
+  @media (max-width: 639px) {
+    .admin-shell .page-header {
+      align-items: stretch;
+    }
+
+    .admin-shell .page-header > * {
+      width: 100%;
+      min-width: 0;
+    }
+
+    .admin-shell .page-header > :not(:first-child) {
+      flex-wrap: wrap;
+      justify-content: flex-start;
+      text-align: start;
+    }
+
+    .admin-shell .page-header [data-slot="button"] {
+      min-height: 2.75rem;
+    }
+  }
+
+  /* ── Section Header ──────────────────────────────────────── */
+  /* Consistent section heading with optional icon.
+     Usage: <div class="section-header">
+              <PlayCircle /> Continue Watching
+            </div>                                              */
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--foreground);
+    padding-bottom: 0.75rem;
+  }
+
+  /* ── Live Badge ──────────────────────────────────────────── */
+  .live-badge {
+    margin-inline-start: auto;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 10px;
+    font-weight: 700;
+    background: rgba(255, 60, 60, 0.12);
+    color: #f87171;
+    border: 1px solid rgba(255, 60, 60, 0.2);
+    animation: pulse-opacity 2s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .live-badge {
+      animation: none;
+    }
+  }
+
+  /* ── Progress Bar ────────────────────────────────────────── */
+  /* Thin progress indicator for watch progress on cards/heroes.
+     Usage: <div class="progress-bar">
+              <div class="progress-fill" style="width: 65%" />
+            </div>                                              */
+  .progress-bar {
+    width: 100%;
+    height: 3px;
+    background-color: color-mix(in srgb, var(--foreground) 15%, transparent);
+    border-radius: 9999px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background-color: var(--primary);
+    border-radius: 9999px;
+    transition: width var(--duration-normal) var(--ease-default);
+  }
+
+  /* ── Play Overlay ────────────────────────────────────────── */
+  /* Semi-transparent play button centered on thumbnails.
+     Usage: <div class="relative group">
+              <img ... />
+              <div class="play-overlay"><Play /></div>
+            </div>                                              */
+  .play-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--background) 40%, transparent);
+    border-radius: inherit;
+    opacity: 0;
+    transition: opacity var(--duration-normal) var(--ease-default);
+  }
+  .group:hover .play-overlay,
+  .play-overlay:hover {
+    opacity: 1;
+  }
+
+  /* ── Impersonation Banner ────────────────────────────────── */
+  /* Override strip shown while an admin is viewing the app as
+     another user. Warm-gold accents on a glass-dark surface —
+     unmistakable without being alarming. Pinned to the viewport
+     top via Tailwind's `sticky top-0 z-50` utilities on the
+     outer element.                                              */
+  /* Global sidebar offset used by out-of-tree chrome that needs to
+     align with the current sidebar width. Layout sets `data-app-shell`
+     on the root element for exactly as long as the sidebar exists, and
+     `data-sidebar-collapsed` while it is the 64px rail; this media-query
+     block resolves the correct px value per breakpoint/state.
+
+     Gated on a shell attribute because this chrome also renders above the
+     routes that live outside Layout — /profiles, /login, /watch — where
+     there is no sidebar to align with. Without the gate those pages got
+     a 260px blank strip on the banner's left (issue #1290). The admin
+     area is its own shell: AdminLayout publishes `data-admin-shell` and
+     draws a fixed 240px sidebar (`w-[240px]` / `lg:ml-[240px]`), and the
+     audiobook MiniBar can be open there.
+
+     The breakpoint is Tailwind's `lg` (64rem), where both shells show their
+     sidebar. A rem media query follows the browser's default font size, so
+     a fixed 1024px here kept the offset while a larger browser font had
+     already hidden the sidebar (#1816).                               */
+  :root {
+    --app-sidebar-offset: 0px;
+    /* How far fixed page chrome (the collection editor's save bar) rises to
+       clear whichever background playback bar shows. usePlaybackBarHeight
+       measures each bar, bottom inset included, on the root while it shows. */
+    --playback-bar-clearance: max(var(--watch-bar-height, 0px), var(--audiobook-bar-height, 0px));
+  }
+  @media (min-width: 64rem) {
+    :root[data-app-shell] {
+      --app-sidebar-offset: 260px;
+    }
+    :root[data-app-shell][data-sidebar-collapsed="true"] {
+      --app-sidebar-offset: 64px;
+    }
+    :root[data-admin-shell] {
+      --app-sidebar-offset: 240px;
+    }
+  }
+
+  .impersonation-banner {
+    --impersonation-accent: oklch(0.82 0.14 78);
+    --impersonation-accent-glow: oklch(0.82 0.14 78 / 0.55);
+    --impersonation-accent-soft: oklch(0.82 0.14 78 / 0.12);
+    --impersonation-accent-line: oklch(0.82 0.14 78 / 0.32);
+
+    /* Snaps straight to the destination so the document lays out once; the
+       compensation transform below carries the edge across. Animating this
+       margin instead would re-run layout on every frame. */
+    margin-inline-start: var(--app-sidebar-offset);
+    position: sticky;
+    background: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--background) 94%, transparent),
+      color-mix(in srgb, var(--background) 88%, transparent)
+    );
+    backdrop-filter: blur(20px) saturate(1.3);
+    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+    border-bottom: 1px solid color-mix(in srgb, var(--impersonation-accent) 16%, var(--border));
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--impersonation-accent) 22%, transparent),
+      0 10px 32px -20px rgb(0 0 0 / 0.65);
+  }
+
+  /* The banner renders above the routes, outside Layout, so it tracks the
+     sidebar through root attributes rather than the props `.sidebar-main-stage`
+     reads in-tree. The mechanism is identical: the margin above snaps to the
+     destination, and an inverse transform holds the previous visual offset for
+     one frame before releasing to zero on the same state change that moves the
+     sidebar — so both edges travel together on the compositor.
+
+     Without this the banner jumped instantly while the sidebar took 300ms, and
+     since it is `z-50` against the sidebar's `z-40`/`45` it painted over the
+     logo on the way in and left a gap on the way out.
+
+     Breakpoint deliberately matches `--app-sidebar-offset` (64rem): the
+     compensation must follow whichever query actually changes the margin it is
+     compensating for. `html[data-text-scale]` does not move it; rem in a media
+     query resolves against the browser's default font size, not the root
+     element's. */
+  /* While the banner holds its previous offset it is translated right, so its
+     right edge sits briefly past the viewport. Layout already clips its own
+     subtree this way; the banner is mounted above it, so the app root needs the
+     same treatment or that overhang becomes a document-level horizontal scroll
+     for the length of the transition. `clip` rather than `hidden` so this never
+     becomes a scroll container and the banner's `position: sticky` keeps
+     resolving against the viewport. */
+  #root {
+    overflow-x: clip;
+  }
+
+  @media (min-width: 64rem) {
+    .impersonation-banner {
+      transition: transform var(--duration-sidebar-collapse) var(--ease-sidebar-collapse);
+    }
+    :root[data-sidebar-collapsed="true"]:not([data-sidebar-visual-collapsed="true"])
+      .impersonation-banner {
+      transform: translateX(calc(196px * var(--dir-sign)));
+      transition: none;
+    }
+    :root:not([data-sidebar-collapsed="true"])[data-sidebar-visual-collapsed="true"]
+      .impersonation-banner {
+      transform: translateX(calc(-196px * var(--dir-sign)));
+      transition: none;
+    }
+  }
+
+  /* Luminous top accent line — fades in from both edges so the
+     banner reads as a deliberate strip rather than a hard bar. */
+  .impersonation-banner::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      var(--impersonation-accent-line) 18%,
+      var(--impersonation-accent-line) 82%,
+      transparent
+    );
+    pointer-events: none;
+  }
+
+  /* Soft warm wash on the start edge so the eye lands on the
+     status dot first. Fades out before the button column. */
+  .impersonation-banner::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      calc(90deg * var(--dir-sign)),
+      color-mix(in srgb, var(--impersonation-accent) 10%, transparent),
+      transparent 38%
+    );
+    pointer-events: none;
+  }
+
+  .impersonation-banner-inner {
+    position: relative;
+    z-index: 1;
+  }
+
+  .impersonation-dot {
+    background: var(--impersonation-accent);
+    box-shadow: 0 0 10px 1px var(--impersonation-accent-glow);
+  }
+
+  .impersonation-pulse {
+    background: var(--impersonation-accent);
+    opacity: 0.55;
+  }
+
+  .impersonation-label {
+    letter-spacing: 0.22em;
+    color: color-mix(in srgb, var(--impersonation-accent) 85%, var(--foreground));
+  }
+
+  .impersonation-chip {
+    background: var(--impersonation-accent-soft);
+    color: color-mix(in srgb, var(--impersonation-accent) 85%, var(--foreground));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--impersonation-accent) 32%, transparent);
+  }
+
+  .impersonation-end-btn {
+    color: var(--foreground);
+    background: color-mix(in srgb, var(--foreground) 5%, transparent);
+    border: 1px solid color-mix(in srgb, var(--impersonation-accent) 24%, var(--border));
+  }
+
+  .impersonation-end-btn:hover {
+    background: color-mix(in srgb, var(--impersonation-accent) 14%, transparent);
+    border-color: color-mix(in srgb, var(--impersonation-accent) 55%, var(--border));
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--impersonation-accent) 8%, transparent);
+  }
+
+  .impersonation-end-btn:focus-visible {
+    border-color: var(--impersonation-accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--impersonation-accent) 28%, transparent);
+  }
+}
+
+/* A settings section: no surface of its own, a hairline above it. Outside any
+   layer on purpose, so it also wins over a page's `space-y-*` margin and every
+   section is spaced the same on every page. A section nested in another keeps
+   to its parent's rule. */
+.settings-section {
+  margin-block: 0;
+  border-top: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+  padding-block: 1.5rem;
+}
+
+.settings-section .settings-section {
+  border-top: 0;
+  padding-block: 0.75rem 0;
+}
+
+@media (min-width: 64rem) {
+  .settings-section {
+    padding-block: 1.75rem;
+  }
+}

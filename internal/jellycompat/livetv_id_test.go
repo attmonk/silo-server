@@ -1,0 +1,116 @@
+// attmonk fork: tests for restart-safe Live TV channel IDs.
+
+package jellycompat
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+)
+
+func TestLiveChannelIDRoundTrip(t *testing.T) {
+	raw := encodeLiveChannelID(17, "xtream:42")
+	key, ok := decodeLiveChannelID(raw)
+	if !ok || key.InstallationID != 17 || key.Hash != liveChannelHash("xtream:42") {
+		t.Fatalf("round trip: ok=%v key=%+v", ok, key)
+	}
+	if dashed := uuid.MustParse(raw).String(); !isLiveChannelID(dashed) {
+		t.Fatalf("dashed form %q not recognized", dashed)
+	}
+	if undashed := strings.ReplaceAll(raw, "-", ""); !isLiveChannelID(undashed) {
+		t.Fatalf("32-hex form %q not recognized", undashed)
+	}
+}
+
+func TestLiveChannelIDIsStableAndDistinct(t *testing.T) {
+	if a, b := encodeLiveChannelID(17, "xtream:42"), encodeLiveChannelID(17, "xtream:42"); a != b {
+		t.Fatalf("encoding is not deterministic: %q != %q", a, b)
+	}
+	if encodeLiveChannelID(17, "xtream:42") == encodeLiveChannelID(18, "xtream:42") {
+		t.Fatal("installation id not part of the encoded id")
+	}
+	if encodeLiveChannelID(17, "xtream:42") == encodeLiveChannelID(17, "xtream:43") {
+		t.Fatal("channel id not part of the encoded id")
+	}
+}
+
+func TestLiveChannelIDDoesNotCollideWithUpstreamIDs(t *testing.T) {
+	codec := NewResourceIDCodec()
+	if EncodedIDLiveChannel <= EncodedIDThemeSong {
+		t.Fatalf("EncodedIDLiveChannel = %d reuses an upstream kind (last is %d)", EncodedIDLiveChannel, EncodedIDThemeSong)
+	}
+	for kind := EncodedIDLibrary; kind <= EncodedIDThemeSong; kind++ {
+		for _, v := range []int64{0, 1, 42, 1 << 40} {
+			if isLiveChannelID(codec.EncodeIntID(kind, v)) {
+				t.Fatalf("kind %d value %d decoded as live channel", kind, v)
+			}
+		}
+	}
+	for i := 0; i < 2000; i++ {
+		hashed := codec.EncodeStringID(EncodedIDItem, fmt.Sprintf("unmatched/path/%d.mkv", i))
+		if isLiveChannelID(hashed) {
+			t.Fatalf("hashed item id %q decoded as live channel", hashed)
+		}
+	}
+	if isLiveChannelID(collectionsViewID) {
+		t.Fatal("collections view id decoded as live channel")
+	}
+}
+
+func TestLiveChannelIDRejectsGarbage(t *testing.T) {
+	for _, raw := range []string{"", "nope", "f14c0000000050000000000000000000"} {
+		if isLiveChannelID(raw) {
+			t.Fatalf("%q accepted", raw)
+		}
+	}
+}
+
+func TestCompatPathNormalizesLiveTVSegments(t *testing.T) {
+	for in, want := range map[string]string{
+		"/livetv/channels":   "/LiveTv/Channels",
+		"/emby/LIVETV/INFO":  "/LiveTv/Info",
+		"/LiveTv/Channels":   "/LiveTv/Channels",
+		"/jellyfin/livetv/x": "/LiveTv/x",
+	} {
+		if got := canonicalizeCompatPath(in); got != want {
+			t.Errorf("canonicalizeCompatPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestLiveProgramIDRoundTrip(t *testing.T) {
+	start := int64(1791900030) // 30s past a minute
+	id := encodeLiveProgramID(7, "m3u:news.hd", start)
+	key, ok := decodeLiveProgramID(id)
+	if !ok {
+		t.Fatalf("decode %q failed", id)
+	}
+	if key.InstallationID != 7 || key.Channel != liveChannelPrefixOf("m3u:news.hd") || key.StartMinute != start/60 {
+		t.Errorf("key = %+v", key)
+	}
+	if _, ok := decodeLiveProgramID(strings.ReplaceAll(id, "-", "")); !ok {
+		t.Error("compact form did not decode")
+	}
+	if isLiveChannelID(id) || isLiveProgramID(encodeLiveChannelID(7, "m3u:news.hd")) || isLiveProgramID(liveTVViewID) {
+		t.Error("program, channel and view ids must not decode as each other")
+	}
+	if encodeLiveProgramID(7, "x", liveProgramEpoch-60) != "" {
+		t.Error("a start before the epoch should not encode")
+	}
+}
+
+func TestLiveIDsRejectInstallationOverflow(t *testing.T) {
+	for _, id := range []int{-1, 0, 1 << 32, 1<<32 + 17} {
+		for name, encoded := range map[string]string{
+			"channel": encodeLiveChannelID(id, "news"),
+			"folder":  encodeLiveFolderID(id, "News"),
+			"program": encodeLiveProgramID(id, "news", liveProgramEpoch),
+		} {
+			if encoded != "" {
+				t.Errorf("%s encoded invalid installation %d as %s", name, id, encoded)
+			}
+		}
+	}
+}

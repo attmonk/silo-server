@@ -1,0 +1,264 @@
+package sections
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"slices"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/recommendations"
+)
+
+// poolReader answers every section read with fixed rows and records the
+// library scope Because You Watched was asked for. The For You and taste
+// match rows have rowType and rowLabel when set. The For You fill is fill,
+// read fillReads times, failing with fillError when set.
+type poolReader struct {
+	pool              []recommendations.ScoredItem
+	anchor            string
+	scopes            [][]int
+	readError         error
+	rowType, rowLabel string
+	fill              []recommendations.ScoredItem
+	fillReads         int
+	fillError         error
+}
+
+func (p *poolReader) row(label string) *recommendations.ForYouRow {
+	if p.rowLabel != "" {
+		label = p.rowLabel
+	}
+	return &recommendations.ForYouRow{Type: p.rowType, Label: label, Items: p.pool}
+}
+
+func (p *poolReader) SectionForYouMain(context.Context, int, string, catalog.AccessFilter) (*recommendations.ForYouRow, error) {
+	if p.readError != nil {
+		return nil, p.readError
+	}
+	return p.row(recommendations.ForYouLabel), nil
+}
+
+func (p *poolReader) SectionForYouFill(context.Context, int, string, catalog.AccessFilter) ([]recommendations.ScoredItem, error) {
+	p.fillReads++
+	return p.fill, p.fillError
+}
+
+func (p *poolReader) SectionBecauseYouWatched(_ context.Context, _ int, _, _ string, libraryIDs []int, _ catalog.AccessFilter) ([]recommendations.ScoredItem, string, error) {
+	p.scopes = append(p.scopes, libraryIDs)
+	return p.pool, p.anchor, p.readError
+}
+
+func (p *poolReader) SectionSimilarUsersLiked(context.Context, int, string, catalog.AccessFilter) ([]recommendations.ScoredItem, error) {
+	return p.pool, p.readError
+}
+
+func (p *poolReader) SectionTasteMatchRow(context.Context, int, string, string, catalog.AccessFilter) (*recommendations.ForYouRow, error) {
+	if p.readError != nil {
+		return nil, p.readError
+	}
+	return p.row(""), nil
+}
+
+// A library's recommendation sections fill from the row's whole cached pool:
+// with the profile's 40 strongest picks in one movie library, the other
+// library's row still gets its own 20, and a widened home fetch gets them all.
+func TestRecommendationSectionsFillFromTheWholePoolPostgres(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	prefix := "recs-pool-" + uuid.NewString()[:8] + "-"
+	var libraries [2]int
+	for i := range libraries {
+		if err := pool.QueryRow(ctx, `INSERT INTO media_folders (type, name, enabled) VALUES ('movies', $1, true) RETURNING id`, fmt.Sprintf("%slib-%d", prefix, i)).Scan(&libraries[i]); err != nil {
+			t.Fatalf("seed library: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM media_items WHERE content_id LIKE $1`, prefix+"%")
+		_, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id = ANY($1)`, libraries[:])
+	})
+
+	scored := make([]recommendations.ScoredItem, recommendations.CacheCandidateLimit)
+	var firstLibrary, secondLibrary []string
+	for i := range scored {
+		id := fmt.Sprintf("%smovie-%02d", prefix, i)
+		scored[i] = recommendations.ScoredItem{MediaItemID: id, Score: float64(len(scored) - i)}
+		library := libraries[0]
+		if i >= 40 {
+			library = libraries[1]
+			secondLibrary = append(secondLibrary, id)
+		} else {
+			firstLibrary = append(firstLibrary, id)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO media_items (content_id, type, title, status, genres) VALUES ($1, 'movie', $1, 'matched', '{}'::text[])`, id); err != nil {
+			t.Fatalf("seed item: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO media_item_libraries (content_id, media_folder_id, first_seen_at) VALUES ($1, $2, $3)`, id, library, time.Now()); err != nil {
+			t.Fatalf("seed membership: %v", err)
+		}
+	}
+	reader := &poolReader{pool: scored, anchor: firstLibrary[0]}
+	fetcher := NewFetcher(pool)
+	fetcher.RecommendationReader = reader
+
+	fetch := func(sectionType SectionType, itemLimit int, libraryID *int) []string {
+		t.Helper()
+		got, err := fetcher.FetchOne(ctx, ResolvedSection{ID: "recs", SectionType: sectionType, Title: "Recommended", ItemLimit: itemLimit}, libraryID, nil, 7, "p1", catalog.AccessFilter{})
+		if err != nil {
+			t.Fatalf("FetchOne(%s): %v", sectionType, err)
+		}
+		if got.TotalCount != len(got.Items) {
+			t.Fatalf("FetchOne(%s) total %d for %d items", sectionType, got.TotalCount, len(got.Items))
+		}
+		return contentIDs(got.Items)
+	}
+
+	for _, sectionType := range []SectionType{SectionRecommendedForYou, SectionSimilarUsersLiked, SectionTasteMatch, SectionBecauseYouWatched} {
+		if got := fetch(sectionType, 20, &libraries[1]); !slices.Equal(got, secondLibrary) {
+			t.Fatalf("%s in the second library = %v, want its 20 picks %v", sectionType, got, secondLibrary)
+		}
+		if got := fetch(sectionType, 20, &libraries[0]); !slices.Equal(got, firstLibrary[:20]) {
+			t.Fatalf("%s in the first library = %v, want its 20 strongest picks", sectionType, got)
+		}
+		// Home with hide-watched widens the fetch window past the row size.
+		if got := fetch(sectionType, 100, nil); len(got) != recommendations.CacheCandidateLimit {
+			t.Fatalf("%s on a widened home fetch = %d items, want %d", sectionType, len(got), recommendations.CacheCandidateLimit)
+		}
+	}
+
+	// Because You Watched picks its anchor within the section's scope.
+	reader.scopes = nil
+	fetch(SectionBecauseYouWatched, 20, &libraries[1])
+	fetch(SectionBecauseYouWatched, 20, nil)
+	if len(reader.scopes) != 2 || !slices.Equal(reader.scopes[0], []int{libraries[1]}) || reader.scopes[1] != nil {
+		t.Fatalf("anchor scopes = %v, want [[%d] []]", reader.scopes, libraries[1])
+	}
+}
+
+// watchedSetReader reads the profile's watched set before answering a For You
+// or Because You Watched row, as the Reader does to filter them.
+type watchedSetReader struct {
+	poolReader
+	signals *recommendations.SignalReader
+}
+
+func (r *watchedSetReader) SectionForYouMain(ctx context.Context, userID int, profileID string, filter catalog.AccessFilter) (*recommendations.ForYouRow, error) {
+	if _, err := r.signals.WatchedItemIDSet(ctx, userID, profileID); err != nil {
+		return nil, err
+	}
+	return r.poolReader.SectionForYouMain(ctx, userID, profileID, filter)
+}
+
+func (r *watchedSetReader) SectionBecauseYouWatched(ctx context.Context, userID int, profileID, sourceItemID string, libraryIDs []int, filter catalog.AccessFilter) ([]recommendations.ScoredItem, string, error) {
+	if _, err := r.signals.WatchedItemIDSet(ctx, userID, profileID); err != nil {
+		return nil, "", err
+	}
+	return r.poolReader.SectionBecauseYouWatched(ctx, userID, profileID, sourceItemID, libraryIDs, filter)
+}
+
+// countingWatchedRepo counts watched set reads. No other repo read is reached.
+type countingWatchedRepo struct {
+	*recommendations.Repo
+	reads atomic.Int32
+}
+
+func (r *countingWatchedRepo) GetWatchedItemIDSet(context.Context, int, string) (map[string]struct{}, error) {
+	r.reads.Add(1)
+	return map[string]struct{}{}, nil
+}
+
+// One FetchAll reads the profile's watched set once for its For You and
+// Because You Watched sections, which run in parallel.
+func TestFetchAllReadsTheWatchedSetOnce(t *testing.T) {
+	repo := &countingWatchedRepo{}
+	fetcher := &Fetcher{RecommendationReader: &watchedSetReader{signals: recommendations.NewSignalReader(repo, nil)}}
+	fetcher.FetchAll(t.Context(), []ResolvedSection{
+		{ID: "for-you", SectionType: SectionRecommendedForYou, ItemLimit: 20},
+		{ID: "because", SectionType: SectionBecauseYouWatched, ItemLimit: 20},
+	}, nil, nil, 7, "p1", catalog.AccessFilter{})
+	if got := repo.reads.Load(); got != 1 {
+		t.Fatalf("watched set reads = %d, want 1", got)
+	}
+}
+
+// FetchOne titles a For You or taste-match section after the row it serves
+// when that row is not the profile's own, and keeps an admin's heading; a
+// row filtered empty leaves the heading alone.
+func TestRecommendationSectionsTakeTheServedRowTitlePostgres(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	id := "recs-title-" + uuid.NewString()[:8]
+	var library int
+	if err := pool.QueryRow(ctx, `INSERT INTO media_folders (type, name, enabled) VALUES ('movies', $1, true) RETURNING id`, id+"-lib").Scan(&library); err != nil {
+		t.Fatalf("seed library: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM media_items WHERE content_id = $1`, id)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id = $1`, library)
+	})
+	if _, err := pool.Exec(ctx, `INSERT INTO media_items (content_id, type, title, status, genres) VALUES ($1, 'movie', $1, 'matched', '{}'::text[])`, id); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_item_libraries (content_id, media_folder_id, first_seen_at) VALUES ($1, $2, $3)`, id, library, time.Now()); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+	fetcher := NewFetcher(pool)
+	for _, tc := range []struct {
+		name              string
+		sectionType       SectionType
+		title             string
+		rowType, rowLabel string
+		pool              []recommendations.ScoredItem
+		want, wantKey     string
+	}{
+		{"new profile", SectionRecommendedForYou, "Recommended for You", recommendations.RecTypePopular, "Popular on This Server", []recommendations.ScoredItem{{MediaItemID: id}}, "Popular on This Server", "home.section.popularOnServer"},
+		{"warm profile", SectionRecommendedForYou, "Recommended for You", "cluster", recommendations.ForYouLabel, []recommendations.ScoredItem{{MediaItemID: id}}, "Recommended for You", titleKeyRecommendedForYou},
+		{"taste match fallback", SectionTasteMatch, "Top Picks Today", "genre_sampler", "Top Drama", []recommendations.ScoredItem{{MediaItemID: id}}, "Top Drama", "home.section.topGenre"},
+		{"admin title", SectionRecommendedForYou, "Movie Night", recommendations.RecTypePopular, "Popular on This Server", []recommendations.ScoredItem{{MediaItemID: id}}, "Movie Night", ""},
+		{"row filtered empty", SectionRecommendedForYou, "Recommended for You", recommendations.RecTypePopular, "Popular on This Server", []recommendations.ScoredItem{{MediaItemID: id + "-missing"}}, "Recommended for You", titleKeyRecommendedForYou},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher.RecommendationReader = &poolReader{pool: tc.pool, rowType: tc.rowType, rowLabel: tc.rowLabel}
+			// A section the server titled carries its key; the admin's
+			// "Movie Night" carries none.
+			section := ResolvedSection{ID: "recs", SectionType: tc.sectionType, Title: tc.title, ItemLimit: 20}
+			if tc.title == "Recommended for You" {
+				section.TitleKey = titleKeyRecommendedForYou
+			}
+			got, err := fetcher.FetchOne(ctx, section, nil, nil, 7, "p1", catalog.AccessFilter{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Title != tc.want || got.TitleKey != tc.wantKey {
+				t.Fatalf("title = %q key %q, want %q key %q", got.Title, got.TitleKey, tc.want, tc.wantKey)
+			}
+			if tc.wantKey == "home.section.topGenre" && got.TitleArgs["genre"] != "Drama" {
+				t.Fatalf("title args = %v, want genre Drama", got.TitleArgs)
+			}
+		})
+	}
+}

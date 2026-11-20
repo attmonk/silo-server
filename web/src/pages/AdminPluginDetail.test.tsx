@@ -1,0 +1,366 @@
+import { render, screen } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { PluginCatalogEntry, PluginInstallation } from "@/api/types";
+
+import AdminPluginDetail from "./AdminPluginDetail";
+
+type QueryState<T> = {
+  data?: T;
+  isLoading: boolean;
+  isSuccess: boolean;
+  isError: boolean;
+  isFetching: boolean;
+  refetch: () => void;
+};
+
+function query<T>(data: T | undefined, overrides: Partial<QueryState<T>> = {}): QueryState<T> {
+  return {
+    data,
+    isLoading: false,
+    isSuccess: data !== undefined,
+    isError: false,
+    isFetching: false,
+    refetch: vi.fn(),
+    ...overrides,
+  };
+}
+
+let installationsQuery: QueryState<PluginInstallation[]> = query<PluginInstallation[]>([]);
+let catalogQuery: QueryState<PluginCatalogEntry[]> = query<PluginCatalogEntry[]>([]);
+const restartMock = vi.fn();
+const deleteMock = vi.fn();
+const installMock = vi.fn();
+const saveAuthBindingMock = vi.fn();
+const saveTaskBindingMock = vi.fn();
+const capturedSwitches: Array<Record<string, unknown>> = [];
+
+vi.mock("@/hooks/queries/admin/plugins", () => ({
+  useAdminPluginInstallations: () => installationsQuery,
+  useAdminPluginCatalog: () => catalogQuery,
+  useUpdatePluginInstallation: () => ({ mutate: vi.fn(), isPending: false }),
+  useApplyPluginUpdate: () => ({ mutate: vi.fn(), isPending: false }),
+  useRestartPluginInstallation: () => ({ mutate: restartMock, isPending: false }),
+  useDeletePluginInstallation: () => ({ mutate: deleteMock, isPending: false }),
+  useInstallPlugin: () => ({ mutate: installMock, isPending: false }),
+  useSavePluginConfig: () => ({ mutate: vi.fn(), isPending: false }),
+  useTestPluginConfig: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useSavePluginAuthBinding: () => ({ mutate: saveAuthBindingMock, isPending: false }),
+  useSavePluginTaskBinding: () => ({ mutate: saveTaskBindingMock, isPending: false }),
+}));
+
+vi.mock("@/lib/buildPluginHref", () => ({
+  navigateToPluginRoute: vi.fn(),
+}));
+
+vi.mock("@/components/admin/plugins/PluginConfigForm", () => ({
+  PluginConfigForm: (props: Record<string, unknown>) => (
+    <div data-testid="config-form">{(props.schema as { key: string }).key}</div>
+  ),
+}));
+
+vi.mock("@/components/ui/select", () => ({
+  Select: () => <div data-testid="select" />,
+  SelectContent: () => null,
+  SelectItem: () => null,
+  SelectTrigger: () => null,
+  SelectValue: () => null,
+}));
+
+vi.mock("@/components/ui/switch", () => ({
+  Switch: (props: Record<string, unknown>) => {
+    capturedSwitches.push(props);
+    return null;
+  },
+}));
+
+vi.mock("@/components/ui/dropdown-menu", () => ({
+  DropdownMenu: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  DropdownMenuTrigger: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  DropdownMenuContent: ({ children }: { children: ReactNode }) => <div role="menu">{children}</div>,
+  DropdownMenuItem: ({
+    children,
+    onSelect,
+    disabled,
+  }: {
+    children: ReactNode;
+    onSelect?: () => void;
+    disabled?: boolean;
+  }) => (
+    <button type="button" role="menuitem" disabled={disabled} onClick={() => onSelect?.()}>
+      {children}
+    </button>
+  ),
+  DropdownMenuSeparator: () => <hr />,
+}));
+
+vi.mock("@/components/ui/alert-dialog", () => ({
+  AlertDialog: ({ open, children }: { open: boolean; children: ReactNode }) =>
+    open ? <div role="alertdialog">{children}</div> : null,
+  AlertDialogContent: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  AlertDialogHeader: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  AlertDialogFooter: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  AlertDialogTitle: ({ children }: { children: ReactNode }) => <h2>{children}</h2>,
+  AlertDialogDescription: ({ children }: { children: ReactNode }) => <p>{children}</p>,
+  AlertDialogCancel: ({ children }: { children: ReactNode }) => (
+    <button type="button">{children}</button>
+  ),
+  AlertDialogAction: ({ children, onClick }: { children: ReactNode; onClick?: () => void }) => (
+    <button type="button" onClick={onClick}>
+      {children}
+    </button>
+  ),
+}));
+
+const PRESENTATION = {
+  display_name: "MDBList Ratings",
+  summary: "Aggregated star ratings and age ratings from MDBList.",
+  description_markdown: "Fills in ratings other providers leave empty.",
+  setup_markdown: "Create a **free API key**, then add it below. <script>alert(1)</script>",
+  homepage_url: "",
+  source_url: "https://github.com/Silo-Server/silo-plugin-metadata-mdblist",
+  support_url: "",
+  changelog_url: "https://github.com/Silo-Server/silo-plugin-metadata-mdblist/releases",
+  publisher_name: "Silo",
+  publisher_url: "",
+  license_spdx: "AGPL-3.0-only",
+};
+
+function makeInstallation(overrides: Partial<PluginInstallation> = {}): PluginInstallation {
+  return {
+    id: 7,
+    repository_id: 1,
+    plugin_id: "silo.mdblist",
+    version: "0.1.0",
+    install_path: "/plugins/mdblist",
+    enabled: true,
+    runtime: { resident: false, state: "stopped", restart_count: 0 },
+    source_kind: "silo",
+    repository_name: "Silo plugins",
+    updates_paused: false,
+    presentation: PRESENTATION,
+    capabilities: [{ type: "metadata_provider.v1", id: "mdblist", display_name: "MDBList" }],
+    global_config_schema: [
+      {
+        key: "account",
+        title: "MDBList Account",
+        description: "MDBList API key.",
+        json_schema: "{}",
+        required: true,
+      },
+    ],
+    user_config_schema: [],
+    routes: [],
+    assets: [],
+    global_configs: [],
+    auth_bindings: [],
+    task_bindings: [],
+    update_policy: "auto",
+    signature: { state: "unknown" },
+    created_at: "2026-09-14T10:00:00Z",
+    ...overrides,
+  };
+}
+
+function makeCatalogEntry(overrides: Partial<PluginCatalogEntry> = {}): PluginCatalogEntry {
+  return {
+    repository_id: 1,
+    plugin_id: "silo.manga-metadata",
+    version: "0.1.1",
+    archive_url: "https://example.com/manga",
+    source_kind: "silo",
+    repository_name: "Silo plugins",
+    presentation: { ...PRESENTATION, display_name: "Manga Metadata", setup_markdown: "" },
+    capabilities: [{ type: "metadata_provider.v1", id: "manga", display_name: "Manga" }],
+    global_config_schema: [
+      {
+        key: "dump_path",
+        title: "Dump storage path",
+        description: "Where the dump is stored.",
+        json_schema: "{}",
+        required: false,
+      },
+    ],
+    user_config_schema: [],
+    routes: [],
+    assets: [],
+    ...overrides,
+  };
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return <p data-testid="location">{`${location.pathname}${location.search}`}</p>;
+}
+
+function renderPage(pluginID = "silo.mdblist", search = "") {
+  return render(
+    <MemoryRouter initialEntries={[`/admin/plugins/${encodeURIComponent(pluginID)}${search}`]}>
+      <Routes>
+        <Route path="/admin/plugins/:pluginId" element={<AdminPluginDetail />} />
+        <Route path="/admin/plugins" element={<LocationProbe />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+describe("AdminPluginDetail", () => {
+  beforeEach(() => {
+    installationsQuery = query([makeInstallation()]);
+    catalogQuery = query<PluginCatalogEntry[]>([]);
+    capturedSwitches.length = 0;
+    for (const mock of [
+      restartMock,
+      deleteMock,
+      installMock,
+      saveAuthBindingMock,
+      saveTaskBindingMock,
+    ])
+      mock.mockReset();
+  });
+
+  it("asks for missing required settings, but not for optional ones", () => {
+    const { unmount } = renderPage();
+    expect(screen.getByText("Finish setting up MDBList Ratings.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "MDBList Account" })).toHaveAttribute(
+      "href",
+      "#config-account",
+    );
+    expect(screen.getAllByText("Needs setup").length).toBeGreaterThan(0);
+    unmount();
+
+    installationsQuery = query([
+      makeInstallation({
+        global_config_schema: [
+          { key: "sources", title: "Search sources", json_schema: "{}", required: false },
+        ],
+      }),
+    ]);
+    renderPage();
+    expect(screen.queryByText(/Finish setting up/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Needs setup")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { enabled: false, resident: true, state: "running", visible: false, disabled: false },
+    { enabled: true, resident: false, state: "stopped", visible: false, disabled: false },
+    { enabled: true, resident: true, state: "starting", visible: true, disabled: true },
+    { enabled: true, resident: true, state: "running", visible: true, disabled: false },
+  ] as const)("only offers Restart to enabled resident plugins: %j", (testCase) => {
+    installationsQuery = query([
+      makeInstallation({
+        enabled: testCase.enabled,
+        runtime: { resident: testCase.resident, state: testCase.state, restart_count: 0 },
+      }),
+    ]);
+    renderPage();
+    const restart = screen.queryByRole("menuitem", { name: "Restart" });
+    expect(Boolean(restart)).toBe(testCase.visible);
+    if (restart) expect(restart).toHaveProperty("disabled", testCase.disabled);
+  });
+
+  it("marks a plugin installed without a catalog Unverified and offers no update policy", () => {
+    installationsQuery = query([
+      makeInstallation({
+        repository_id: null,
+        source_kind: "external",
+        repository_name: undefined,
+      }),
+    ]);
+    renderPage();
+
+    expect(screen.getAllByText("Unverified").length).toBeGreaterThan(0);
+    expect(screen.getByText(/isn't linked to any of your catalogs/)).toBeInTheDocument();
+    expect(screen.getByText("Updated by upload")).toBeInTheDocument();
+    expect(screen.queryByTestId("select")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { name: "unverified", overrides: { repository_id: null, source_kind: "external" as const } },
+    {
+      name: "paused",
+      overrides: { source_kind: "approved_community" as const, updates_paused: true },
+    },
+  ])("does not offer an update recorded before updates stopped: $name", ({ overrides }) => {
+    installationsQuery = query([makeInstallation({ ...overrides, available_version: "0.2.0" })]);
+    renderPage();
+    expect(screen.queryByRole("menuitem", { name: "Update to 0.2.0" })).not.toBeInTheDocument();
+  });
+
+  it("does not show a catalog's repository on an Unverified plugin with the same ID", () => {
+    installationsQuery = query([
+      makeInstallation({
+        repository_id: null,
+        source_kind: "external",
+        repository_name: undefined,
+        presentation: undefined,
+      }),
+    ]);
+    catalogQuery = query([
+      makeCatalogEntry({ plugin_id: "silo.mdblist", repository_name: "Silo plugins" }),
+    ]);
+    renderPage();
+    expect(screen.queryByText("Silo plugins")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Unverified").length).toBeGreaterThan(0);
+  });
+
+  it("preserves the existing schedule when disabling a plugin task", () => {
+    installationsQuery = query([
+      makeInstallation({
+        global_config_schema: [],
+        capabilities: [{ type: "scheduled_task.v1", id: "refresh", display_name: "Refresh lists" }],
+        task_bindings: [
+          {
+            capability_id: "refresh",
+            enabled: true,
+            trigger: { type: "daily", time_of_day: "03:00" },
+            created_at: "",
+            updated_at: "",
+          },
+        ],
+      }),
+    ]);
+    renderPage();
+
+    const run = capturedSwitches.find((props) => props["aria-label"] === "Run Refresh lists");
+    (run?.onCheckedChange as (checked: boolean) => void)(false);
+    expect(saveTaskBindingMock).toHaveBeenCalledWith({
+      id: 7,
+      capabilityId: "refresh",
+      body: { enabled: false, trigger: { type: "daily", time_of_day: "03:00" } },
+    });
+  });
+
+  it("saves a sign-in binding with its existing order", () => {
+    installationsQuery = query([
+      makeInstallation({
+        global_config_schema: [],
+        capabilities: [{ type: "auth_provider.v1", id: "oidc", display_name: "Company SSO" }],
+      }),
+    ]);
+    renderPage();
+    const toggle = capturedSwitches.find(
+      (props) => props["aria-label"] === "Offer Company SSO on the sign-in screen",
+    );
+    (toggle?.onCheckedChange as (checked: boolean) => void)(true);
+    expect(saveAuthBindingMock).toHaveBeenCalledWith({
+      id: 7,
+      body: {
+        capability_id: "oidc",
+        enabled: true,
+        display_order: 1,
+        auto_provision: true,
+        default_login: false,
+      },
+    });
+  });
+
+  it("renders setup Markdown as text, never as HTML", () => {
+    const { container } = renderPage();
+    expect(screen.getByText("free API key").tagName).toBe("STRONG");
+    expect(container.querySelector("script")).toBeNull();
+    expect(screen.getByText(/<script>alert\(1\)<\/script>/)).toBeInTheDocument();
+  });
+});

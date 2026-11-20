@@ -1,0 +1,231 @@
+# History import execution
+
+History imports persist a versioned dispatch intent in `history_import_runs`
+before reporting acceptance. Administrative intent references source and mapping revisions,
+the external user locator, the original Silo account/profile target, and an optional
+lookback cutoff (`played_since`, Jellyfin only) fixed at admission; only a full
+import updates the mapping's `last_imported_at`. Admin tokens
+remain in the source's encrypted storage. Personal intent retains the original target,
+optional predefined-source revision, and a run-scoped encrypted credential envelope.
+Tokens are decrypted only for the exact running claim generation. A queued run does
+not depend on an in-memory provider or wake signal: each node polls for work as well as accepting local wake signals.
+Construction does not start recovery or dispatch. Production installs the stable
+identity resolver and run observers, then calls `StartBackgroundWork`; activation
+is idempotent. Configuration must finish before any persisted run can execute.
+
+Movies and series match the local catalog only through TMDB, IMDb, or TVDB identifiers.
+Episodes match through their own identifier or through a series identifier plus season and
+episode number. Records without one of these identities remain unmatched; title and year do not
+establish media identity. Watch provider sync and webhook sync use the same matching rule.
+
+## Source coverage
+
+- Jellyfin: played and resumable movies and episodes, plus favorite movies, shows, and
+  episodes. Requests use `GET /Items?UserId=` and `GET /UserItems/Resume` with only the
+  `Authorization: MediaBrowser` header; Jellyfin 12 rejects the legacy `X-Emby-*` headers
+  and no longer serves the `/emby` route prefix, so Jellyfin sign-in is attempted once at
+  the entered address. Jellyfin stores a whole-show or whole-season "mark played" on each
+  episode, so those markers arrive as episode records. Season favorites are skipped because
+  Silo has no season favorite.
+- Emby: played and resumable movies and episodes, plus favorite movies, shows, and episodes.
+  Hiding an item from Emby's Continue Watching leaves its user data unchanged; only
+  `GET /Users/{id}/Items/Resume` leaves it out. That list shows at most one episode per show,
+  and hiding an episode hides its show, so a resumable movie the list leaves out, and every
+  resumable episode of a show the list leaves out, keeps its imported position and gets a
+  Continue Watching dismissal tied to that position. A show between episodes has no such
+  episode; see [Continue Watching row](#continue-watching-row).
+- Plex: watched movies and episodes and On Deck progress; personal imports also add the
+  account watchlist, and administrator imports read the account's play history.
+
+### Continue Watching row
+
+A provider that reports its source's own Continue Watching row
+(`ContinueWatchingRowReporter`, Emby today) gets a final pass after the run's records,
+before the run completes. Since Emby 4.6 merged Next Up into Continue Watching, the row
+lists one episode per show: the one in progress, or the next unstarted one. The pass drops,
+for the profile, each show the run imported episodes of that Silo would surface in Continue
+Watching or Next Up (a series-scoped `ListNextUp` with resumable episodes) but that the row
+leaves out, as Silo's own Next Up dismissal drops a series.
+
+- A show missing from the row is taken as hidden only with evidence the row would
+  otherwise list it: its most recently played episode was imported in progress, or the row lists at
+  least one unstarted episode (so Emby includes shows between episodes) and the series'
+  `UnplayedItemCount` says episodes remain. A show finished at the source is left alone,
+  even when Silo has episodes the source lacks.
+- A show counts as listed when any copy of it at the source is in the row: by the source
+  series of the imported episodes, or by the listed series' provider IDs, which mark every
+  Silo series with that ID. A listed show the run imported nothing of and that has no
+  provider ID stops the pass, since it could be a copy of any of them.
+- The drop is dated at the run, taken before Silo activity is read, so the next playback,
+  in Silo or at the source followed by another import, ends it. A show with Silo activity
+  newer than its last imported play is skipped, as is one with an active drop or one the
+  profile dropped and watched again after that play. After writing, the pass reads activity
+  again and takes back, fenced on its `dropped_at`, any drop that playback saved in the
+  meantime would otherwise keep. An ended drop older than that play is replaced, fenced on
+  its `dropped_at`. A show whose last play at the source is stamped after Silo's clock is
+  left for a later import. Re-running an import drops nothing new.
+- Listed shows are matched by provider ID in the matcher's order (TVDB, then TMDB, then
+  IMDb, or TMDB first when the record prefers TMDB), and every Silo series with the first
+  ID that matches counts as listed.
+  Imported episodes are resolved to their series in batches.
+- Drops sync to watch providers that support dropped shows, like any other drop.
+- Without the row, or when it lists an episode without a series, or when series metadata
+  could not be read, nothing is dropped; the per-episode dismissals above still apply. A
+  failed pass leaves a run warning and the run completes. `ListNextUp` reads Postgres
+  progress, so profiles in the SQLite user store get the per-episode dismissals only.
+- Each run logs one `continue watching pass` line with its counts.
+
+Emby list queries omit the production year, play count, and last-played date unless
+`Fields` names `ProductionYear`, `UserDataPlayCount`, and `UserDataLastPlayedDate`. The
+last-played date is what creates history rows and orders imported progress against local
+activity, so a missing date would leave re-imports unable to update anything. Emby lists
+are read in pages and item lookups in batches. Movie, series, and episode favorites are
+imported; Silo has no season favorites, so those are counted in a run warning. A played
+multi-episode file (S01E01-E02) marks each episode in its range watched, up to ten; a
+partly watched one stays on its first episode because its position cannot be split.
+
+A Jellyfin or Emby record without a last-played time carries an unknown timestamp, which
+sorts before any local activity: it can create missing progress but never replaces newer
+Silo progress. Favorite-only records add the favorite without creating progress.
+
+## Streaming and resume
+
+Providers stream: each page is matched and written before the next is requested, so a
+slow database slows the source instead of growing memory, and memory does not grow with
+history size. Only short lists are held across pages: the in-progress (resume) lists, merged
+into the watched pages as they pass, and the Plex watchlist. Series lookups use a
+fixed-size cache, and every per-run aggregate (Continue Watching shows and the source
+series that name them, the Plex admin seen-set) has a fixed entry cap. A failed run is
+partial: pages applied before the failure stay applied.
+
+Each applied page saves a checkpoint on the run: the position of that page and the totals
+from before it. A resumed run reads that page again, because offsets shift when the source
+changes during the import. Re-applying is safe: progress writes require a newer time, and
+history adds nothing for the same item at the same time. A stage that restarts from its
+first page on resume (a Jellyfin or Emby lookback, an in-progress remainder) reports one
+position for all its pages, so only its first page writes a checkpoint. After a resume the
+totals can be slightly off, because already merged items count again; no rows are
+duplicated. A resumed run skips the Continue Watching pass with its warning, because it
+did not see every show in this process; the next import reconciles them.
+
+A run goes back to the queue, keeping its checkpoint, when its process shuts down, when
+the database fails to answer a match query, or when its heartbeat expires (see below).
+`resume_attempts` counts restarts without getting past the checkpointed page; at five the
+run fails as before. A match error the database answers (a data exception or program
+limit) would repeat on every resume, so that page is matched one record at a time instead,
+and each record's failure becomes a warning. A re-claim keeps the run's first `started_at`.
+
+One run past 50,000 items holds the cluster-wide large-import slot, a partial unique
+index on `large_import` among running rows. Others that grow past it wait for the slot,
+keeping their heartbeat and their worker slot, so smaller imports can queue behind them.
+A run that lost its claim or was canceled while waiting stops instead of taking the slot.
+
+Source servers are user-supplied, so what an import reads from one is bounded
+(`internal/historyimport/upstream_limits.go`): each successful response is decoded only up
+to 16 MiB and 250,000 JSON values. Those per-response limits are the memory protection.
+Each paged listing stops at 200,000 pages, 5,000,000 items, or 32 GiB in total, and one
+budget covers the whole run, across every listing, Plex section, ID lookup, and metadata
+sweep: 64 GiB read. These stop a runaway source that keeps reporting more rows than it
+delivers; they do not protect memory. What a run holds across pages is capped at an
+estimated 64 MiB. Lookups by ID keep only the items they asked for, one per ID.
+Going over a limit fails the run with its own message, and the failure log names the
+limit. That includes lists whose other failures only add a warning (resume positions,
+favorites, the watchlist, Plex sections, and metadata lookups), so an import never
+completes without a list the source sent. Plex metadata lookups stop for the rest of the
+run after three consecutive failed batches, so a broken metadata endpoint does not cost a
+timeout on every page.
+
+## Durable queue
+
+
+A node reserves local capacity before atomically claiming a queued row. Claims use
+`FOR UPDATE SKIP LOCKED` and an incremented generation. Heartbeat, progress, and
+terminal writes require the running status and exact generation. New personal runs
+use dispatch kind `personal` and version 2; admin runs retain version 1. Older admin claimers selecting only version 1 cannot execute personal
+intent. Historical personal rows with no dispatch version retain their legacy
+meaning and are not recovered or swept merely because of migration. Generation-zero
+legacy execution entrypoints cannot modify durable claims or terminal runs.
+
+Personal authentication finishes before opening the admission transaction. Passwords
+are discarded after exchange. The transaction locks and revalidates the account/profile,
+the captured predefined source when present, and the account-owned login session when
+used. Session consumption, queued intent, and its credential row commit together.
+Credentials are stored in `history_import_run_credentials`, keyed only by run ID, with
+strict encryption and `secret.RowAAD` binding the payload to that row. Plex account and
+server tokens remain separate. Workers never reconstruct authorization from a consumed
+session, current source token, or saved password.
+
+Deferred constraints require every active personal run to have its immutable credential.
+All terminal transitions erase that credential atomically, including legacy maintenance
+and administrative cancellation. Missing or unsupported queued envelopes are quarantined
+as safe terminal failures so they cannot block later work. Invalid ciphertext, missing
+credentials, or changed execution authority fails closed after claim. A queued job survives
+a process exit. A running job continues from its checkpoint (see Streaming and resume); one
+without a checkpoint is never automatically replayed.
+
+A failed COMMIT response can be ambiguous. The API advises checking existing imports
+before another submission and does not report an uncertain admission as proven rollback.
+Submissions have no durable request identity and remain non-retryable automatically.
+
+Source, token, and mapping edits remain available during an import. Workers retain
+the original target, validate current configuration revisions before provider
+execution and before each page they apply, and repeat validation on their 15-second
+heartbeat, which stops the run between records. A changed or missing configuration stops the run with a review message;
+it never redirects work to the new target. Updating a mapping's import timestamp
+does not change its configuration revision. A completed claim updates that timestamp
+only if the mapping still matches the captured revision and target.
+
+Mapping targets use `silo_user_id` and `silo_profile_id`. Databases created by the
+project's earlier name kept `continuum_*` column names and bootstrap past the
+converted migration through their existing `schema_versions` rows; a repair
+migration renames those columns in place, preserving row IDs, configuration
+revisions, indexes and foreign keys. A database containing both names for either
+target column must reconcile the ambiguity before migration; the repair never
+chooses a target or merges values. Rolling back the repair keeps the canonical
+names because the preceding application version also requires them.
+
+Queued cancellation is immediately terminal. Running cancellation persists a request
+and signals a local worker when present. A remote worker observes the request through
+validation or heartbeat, stops, and acknowledges the terminal cancellation. An expired
+worker with a pending cancellation is reconciled as cancelled. Cancellation does not
+undo completed effects or guarantee that an operation already in flight stops before
+committing: PostgreSQL queue state and the per-user store are not one transaction.
+Configuration changes have the same in-flight limit.
+
+A running job with an expired heartbeat goes back to the queue when it has a checkpoint
+and fewer than five restarts without progress; otherwise it becomes a terminal failure.
+Target writes from before the crash stay committed; an administrator can review the
+outcome and explicitly create a new run. Legacy queued admin jobs without
+reconstructible dispatch metadata fail with an operator-visible explanation. The
+continuous legacy orphan sweep applies only to admin-token runs. The unchanged stale-running
+heartbeat policy applies to both kinds; its conditional update rechecks freshness after
+waiting for a concurrent heartbeat and erases personal credentials only upon terminalization.
+
+Administrative admission serializes on the mapping row and checks all active runs. A database trigger
+covers legacy insert paths as well as new admissions; a partial unique index additionally
+protects new durable jobs. Existing duplicate active rows remain unchanged and block
+new admissions until they reach terminal states. The migration does not delete or select
+a winner among historical duplicates. Run targets and dispatch metadata are immutable;
+foreign-key deletion may detach a mapping while the retained dispatch locator preserves
+source-filtered audit history. Terminal execution state cannot be overwritten.
+
+The admin enqueue lock order is source, then mapping. Personal enqueue locks its
+optional source, account/profile pair, a per-account advisory lock, and login session in
+that order. Under the advisory lock it refuses a new personal run while the account already
+has one queued or running: a personal run can name any server, and the worker slots are
+shared by every account, so one account holds at most one of them. Claims and ordinary progress or
+terminal transitions lock the run without acquiring a mapping admission lock. Mapping
+configuration edits use the same source-before-mapping order. The admission trigger
+performs its active-run lookup after the mapping lock wait; a PostgreSQL regression test
+verifies that a waiting READ COMMITTED transaction sees the preceding committed run.
+
+Bulk admission reads at most 201 mapping IDs in stable name/ID order and rejects sources
+with more than 200 before creating any runs. Supported batches report every mapping as
+accepted, active, or failed. Partial success is explicit; transport failures are not an
+invitation to automatically replay the batch.
+
+Canonical source responses redact credentials, query strings, and fragments from
+legacy addresses and identify configurations that need review. They do not rewrite
+the stored address or redirect a queued worker. An administrator must explicitly
+review and save a valid address; new writes reject credential-bearing URLs, queries,
+and fragments. The original stored configuration revision still guards that edit.

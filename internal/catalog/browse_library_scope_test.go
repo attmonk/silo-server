@@ -1,0 +1,106 @@
+package catalog
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestBuildBrowsePlanSingleLibraryKeepsFastPathWithDisabledLibraries(t *testing.T) {
+	plan, earlyEmpty, err := (&BrowseRepository{}).buildBrowsePlan(BrowseFilters{
+		LibraryID:          7,
+		DisabledLibraryIDs: []int{9},
+		Sort:               "recently_added",
+		Limit:              20,
+	})
+	if err != nil {
+		t.Fatalf("buildBrowsePlan: %v", err)
+	}
+	if earlyEmpty {
+		t.Fatal("single enabled library plus a deny list must not be treated as empty")
+	}
+
+	sql, _ := plan.pagedSQL(false)
+	if !strings.Contains(sql, "JOIN media_item_libraries mil") || !strings.Contains(sql, "mil.media_folder_id = $1") {
+		t.Fatalf("single-library browse must retain its direct indexed membership path; got:\n%s", sql)
+	}
+	if !strings.Contains(sql, "NOT EXISTS (SELECT 1 FROM media_item_libraries mil_scope_out") {
+		t.Fatalf("single-library browse must independently reject disabled membership; got:\n%s", sql)
+	}
+	if plan.groupByClause != "" {
+		t.Fatalf("single-library browse must not add a GROUP BY for the independent deny check; got %q", plan.groupByClause)
+	}
+}
+
+func TestBuildBrowsePlanSingleLibraryWithAllowedLibraries(t *testing.T) {
+	plan, earlyEmpty, err := (&BrowseRepository{}).buildBrowsePlan(BrowseFilters{
+		LibraryID:  7,
+		LibraryIDs: []int{3, 7},
+		Sort:       "recently_added",
+		Limit:      20,
+	})
+	if err != nil {
+		t.Fatalf("buildBrowsePlan: %v", err)
+	}
+	if earlyEmpty {
+		t.Fatal("an allowed library must not be treated as empty")
+	}
+	sql, _ := plan.pagedSQL(false)
+	if plan.groupByClause != "" || strings.Contains(sql, "ANY(") || !strings.Contains(sql, "mil.media_folder_id = $1") {
+		t.Fatalf("a library inside the allowed list must browse as a single library; got:\n%s", sql)
+	}
+
+	// Audio and subtitle language matches must still only count files in the
+	// allowed libraries.
+	langPlan, _, err := (&BrowseRepository{}).buildBrowsePlan(BrowseFilters{LibraryID: 7, LibraryIDs: []int{3, 7}, AudioLanguages: []string{"ger"}, Limit: 20})
+	if err != nil {
+		t.Fatalf("buildBrowsePlan: %v", err)
+	}
+	if langSQL, _ := langPlan.pagedSQL(false); !strings.Contains(langSQL, "mf.media_folder_id = ANY") {
+		t.Fatalf("audio language matches must stay limited to allowed libraries; got:\n%s", langSQL)
+	}
+
+	_, earlyEmpty, err = (&BrowseRepository{}).buildBrowsePlan(BrowseFilters{LibraryID: 7, LibraryIDs: []int{3}, Sort: "recently_added"})
+	if err != nil {
+		t.Fatalf("buildBrowsePlan: %v", err)
+	}
+	if !earlyEmpty {
+		t.Fatal("a library outside the allowed list must return nothing")
+	}
+}
+
+func TestFilterWhereClauseDisabledLibrariesUseScopeMembershipTable(t *testing.T) {
+	fromClause, whereClause, _, earlyEmpty := filterWhereClauseForSource(
+		BrowseFilters{DisabledLibraryIDs: []int{9}},
+		"episodes e JOIN media_items mi ON mi.content_id = e.content_id",
+		"episode",
+	)
+	if earlyEmpty {
+		t.Fatal("disabled-library scope must not be treated as empty")
+	}
+
+	assertDisabledLibraryItemScope(t, whereClause, "episode_libraries", "episode_id", "mi.content_id")
+	assertEpisodeParentDisabledAccess(t, whereClause, episodeParentSeriesIDExpr("mi.content_id"))
+	if strings.Contains(fromClause, "JOIN episode_libraries") {
+		t.Fatalf("disabled-only episode facet query must not fan out through a membership JOIN; got FROM %s %s", fromClause, whereClause)
+	}
+}
+
+func assertDisabledLibraryItemScope(t *testing.T, sql, table, keyColumn, itemExpr string) {
+	t.Helper()
+	positive := "EXISTS (SELECT 1 FROM " + table
+	negative := "NOT EXISTS (SELECT 1 FROM " + table
+	correlation := "." + keyColumn + " = " + itemExpr
+
+	if !strings.Contains(sql, positive) {
+		t.Fatalf("disabled-only scope must still require positive membership; got:\n%s", sql)
+	}
+	if !strings.Contains(sql, negative) {
+		t.Fatalf("disabled membership must be rejected with NOT EXISTS; got:\n%s", sql)
+	}
+	if !strings.Contains(sql, correlation) {
+		t.Fatalf("library predicates must correlate %s to %s; got:\n%s", keyColumn, itemExpr, sql)
+	}
+	if strings.Contains(sql, "NOT (mil.media_folder_id = ANY(") {
+		t.Fatalf("row-local disabled-library predicate leaks dual-membership items; got:\n%s", sql)
+	}
+}

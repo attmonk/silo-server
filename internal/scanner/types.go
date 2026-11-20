@@ -1,0 +1,255 @@
+package scanner
+
+import (
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/markers"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+// ScanResult contains the outcome of scanning a media folder. Missing counts the
+// files this scan marked missing that were not yet marked when it loaded the
+// folder's files; files an earlier scan already marked, still inside the
+// removal grace period, are not counted again. Two scans of the same folder
+// that overlap in time can both count the same file.
+type ScanResult struct {
+	New       int
+	Updated   int
+	Unchanged int
+	// NoVideo counts files in a movie, series or mixed library that hold no
+	// video stream and were left out of the catalog.
+	NoVideo            int
+	Missing            int
+	FilesDeleted       int
+	MembershipsRemoved int
+	ItemsDeleted       int
+	Errors             int
+	EmptyRootGuarded   bool
+	// MissingSkippedProtected counts files the scan did not find on disk but
+	// left alone because they sit under an unreachable or suspect-empty root.
+	// A non-zero value means the library is partly offline, not partly gone.
+	MissingSkippedProtected int
+	// UnreachableRoots lists configured library roots that failed the
+	// reachability probe at scan start. Files under them are left untouched:
+	// not marked missing, not trashed, and not purged. A root that does not
+	// answer tells us nothing about whether its files still exist, and
+	// marking them missing would hide working titles from every catalog read
+	// until the next successful scan.
+	UnreachableRoots []string
+	// SuspectEmptyRoots lists roots that probed reachable but were literally
+	// empty directories while the library still holds cataloged files under
+	// them — the signature of a lost mount exposing its bare mountpoint
+	// directory. They receive the same exemptions as UnreachableRoots until
+	// the operator confirms cleanup or the files return.
+	SuspectEmptyRoots []string
+	RootObservations  []RootObservation
+	// Sidecars lists the local metadata sidecars (.nfo, artwork) in every
+	// directory a video scan read. It is nil for other library types.
+	Sidecars SidecarListing
+}
+
+// FileHints contains the OSHash gathered during scanning.
+type FileHints struct {
+	FileHash string // OSHash from xattr or computed
+}
+
+// ProbeData contains media file technical information from ffprobe.
+type ProbeData struct {
+	CodecVideo     string
+	CodecAudio     string
+	Resolution     string // 1080p, 2160p, etc.
+	AudioChannels  int
+	HDR            bool
+	Container      string
+	Duration       int // seconds
+	Bitrate        int // kbps
+	VideoTracks    []VideoTrackInfo
+	AudioTracks    []AudioTrackInfo
+	SubtitleTracks []SubtitleTrackInfo
+	Chapters       []ChapterInfo
+	FormatTags     map[string]string // format-level tags from ffprobe (title, artist, album, date, etc.)
+}
+
+// VideoTrackInfo describes a probed video track.
+type VideoTrackInfo struct {
+	Title               string
+	Codec               string
+	DolbyVision         string
+	DVProfile           int
+	DVLevel             int
+	DVBLCompatID        int
+	DVConfigPresent     bool
+	DVBLCompatIDPresent bool
+	DVBLPresent         bool
+	DVRPUPresent        bool
+	DVELPresent         bool
+	DVEnhancementLayer  string
+	HDR10Plus           bool
+	Profile             string
+	Level               int
+	Width               int
+	Height              int
+	AspectRatio         string
+	Interlaced          bool
+	FrameRate           string
+	Bitrate             int
+	VideoRange          string
+	VideoRangeType      string
+	ColorRange          string
+	// FrameColorRange is the first decoded frame's range; see
+	// models.VideoTrack.FrameColorRange.
+	FrameColorRange string
+	ColorPrimaries  string
+	ColorSpace      string
+	ColorTransfer   string
+	BitDepth        int
+	PixelFormat     string
+	ReferenceFrames int
+	// HDR10PlusUnchecked marks a PQ track whose first frame was not read;
+	// see models.VideoTrack.HDR10PlusUnchecked.
+	HDR10PlusUnchecked bool
+}
+
+// AudioTrackInfo describes a probed audio track.
+type AudioTrackInfo struct {
+	Title         string
+	EmbeddedTitle string
+	Language      string
+	Codec         string
+	Profile       string
+	Layout        string
+	Channels      int
+	Bitrate       int
+	SampleRate    int
+	BitDepth      int
+	Default       bool
+}
+
+// SubtitleTrackInfo describes an embedded subtitle track from probing.
+type SubtitleTrackInfo struct {
+	ContainerTrackID string
+	Index            int
+	Language         string
+	Codec            string
+	Title            string
+	EmbeddedTitle    string
+	Resolution       string
+	Forced           bool
+	Default          bool
+	HearingImpaired  bool
+	// IndexOnly is models.SubtitleTrack.IndexOnly.
+	IndexOnly bool
+}
+
+// ExternalSubtitleInfo describes a discovered sidecar subtitle file.
+type ExternalSubtitleInfo struct {
+	Path            string
+	Language        string
+	Format          string // srt, vtt, ass, ssa, sub
+	Title           string
+	Forced          bool
+	HearingImpaired bool
+}
+
+// ChapterInfo describes an embedded chapter extracted from ffprobe.
+type ChapterInfo struct {
+	Index        int
+	Title        string
+	StartSeconds float64
+	EndSeconds   float64
+	Source       string
+}
+
+// IntroCreditsMarkers contains intro/credits timing from S3 markers.
+type IntroCreditsMarkers struct {
+	IntroStart   *float64
+	IntroEnd     *float64
+	CreditsStart *float64
+	CreditsEnd   *float64
+}
+
+// MarkerUpdate is the narrow marker-only update payload shared by scanner and analyzers.
+type MarkerUpdate struct {
+	Segments           []models.MarkerSegment
+	ExpectedFile       *models.MediaFile
+	DetectedAt         time.Time
+	RefreshedProviders []string
+	IntroStart         *float64
+	IntroEnd           *float64
+	CreditsStart       *float64
+	CreditsEnd         *float64
+	RecapStart         *float64
+	RecapEnd           *float64
+	PreviewStart       *float64
+	PreviewEnd         *float64
+	MarkersSource      string
+	MarkersProvider    *string
+	MarkersConfidence  *float64
+	MarkersAlgorithm   string
+
+	// Optional per-segment provenance overrides. When set for a segment,
+	// UpsertMarkers writes these source/provider/confidence/algorithm values
+	// for that segment instead of the shared Markers* fields above. Used by
+	// merged multi-provider results where each segment may come from a
+	// different provider/source class; left nil for single-source writes
+	// (scanner/s3/local).
+	IntroProvenance   *SegmentProvenance
+	CreditsProvenance *SegmentProvenance
+	RecapProvenance   *SegmentProvenance
+	PreviewProvenance *SegmentProvenance
+}
+
+// SegmentProvenance is a per-segment attribution override for MarkerUpdate.
+// When Source is empty, the shared MarkerUpdate.MarkersSource applies.
+type SegmentProvenance struct {
+	Source     string
+	Provider   *string
+	Confidence *float64
+	Algorithm  string
+	// Absent writes a tombstone for the segment: this provenance without
+	// bounds, saying the file has none of the kind.
+	Absent bool
+}
+
+// HasAnySegment reports whether the update supplies ranges or absent answers,
+// or refreshes a provider whose withdrawn ranges may need removal.
+func (u MarkerUpdate) HasAnySegment() bool {
+	for _, provenance := range []*SegmentProvenance{u.IntroProvenance, u.CreditsProvenance, u.RecapProvenance, u.PreviewProvenance} {
+		if provenance != nil && provenance.Absent {
+			return true
+		}
+	}
+	return len(u.Segments) > 0 || len(u.RefreshedProviders) > 0 || u.IntroStart != nil || u.IntroEnd != nil ||
+		u.CreditsStart != nil || u.CreditsEnd != nil ||
+		u.RecapStart != nil || u.RecapEnd != nil ||
+		u.PreviewStart != nil || u.PreviewEnd != nil
+}
+
+// MarkerUpdateFromPayload adapts provider results to the repository writer.
+func MarkerUpdateFromPayload(p markers.MarkerUpdatePayload) MarkerUpdate {
+	u := MarkerUpdate{
+		IntroStart: p.Intro.Start, IntroEnd: p.Intro.End,
+		CreditsStart: p.Credits.Start, CreditsEnd: p.Credits.End,
+		RecapStart: p.Recap.Start, RecapEnd: p.Recap.End,
+		PreviewStart: p.Preview.Start, PreviewEnd: p.Preview.End,
+		MarkersSource: p.SummarySource(), MarkersConfidence: p.SummaryConfidence(),
+		RefreshedProviders: p.RefreshedProviders,
+	}
+	for _, segment := range []struct {
+		payload markers.SegmentPayload
+		target  **SegmentProvenance
+	}{
+		{p.Intro, &u.IntroProvenance}, {p.Credits, &u.CreditsProvenance},
+		{p.Recap, &u.RecapProvenance}, {p.Preview, &u.PreviewProvenance},
+	} {
+		u.Segments = append(u.Segments, segment.payload.Ranges...)
+		if segment.payload.Present() || segment.payload.Absent() {
+			*segment.target = &SegmentProvenance{
+				Source: segment.payload.Source, Provider: segment.payload.Provider,
+				Confidence: segment.payload.Confidence, Algorithm: segment.payload.Algorithm,
+				Absent: segment.payload.Absent(),
+			}
+		}
+	}
+	return u
+}

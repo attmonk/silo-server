@@ -1,0 +1,3533 @@
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, useEffect, type ReactNode } from "react";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
+
+import { forgetBandwidthEstimate } from "../bandwidth-probe";
+import { PlayerConfigProvider, type PlayerConfig } from "../context/PlayerConfigContext";
+import { markPlaybackIntent } from "../first-frame";
+import {
+  buildReplanRequestV3,
+  buildStartRequestV3,
+  routeEventPlanIdentityV3,
+  VIDEO_CLIENT_FEATURES_V3,
+} from "../playback-session-wire-v3";
+import {
+  fixtureClientCapabilitiesV3,
+  fixtureClientPlaybackContextV3,
+  fixturePlanV3,
+  fixtureSubtitleInventoryItemV3,
+} from "../protocol-v3.fixtures";
+import { resetSessionMutations } from "../session-mutations";
+import { resetCodecDetectionForTests } from "./useCodecDetection";
+import {
+  RECONNECT_BASE_DELAY_MS,
+  RECONNECT_MAX_ATTEMPTS,
+  RECONNECT_MAX_DELAY_MS,
+  reconnectDelayMs,
+  usePlaybackSession,
+} from "./usePlaybackSession";
+
+// These hook tests exercise plan adoption and replacement against a transport
+// boundary. The v2 start/replan helpers are covered by their own tests; here
+// they forward to the same fetch stubs under the v2 base.
+// The stored speed-test reading a start would send; tests set it.
+const speedReading = vi.hoisted(() => ({ kbps: undefined as number | undefined }));
+vi.mock("../client-context-v3", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../client-context-v3")>()),
+  detectBandwidthEstimateKbpsV3: () => speedReading.kbps,
+}));
+
+const startEnded = vi.hoisted(() => vi.fn());
+vi.mock("../bandwidth-probe", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../bandwidth-probe")>()),
+  playbackStartEnded: startEnded,
+}));
+
+vi.mock("../start-v2", () => ({
+  startPlaybackV2: async (config: PlayerConfig, body: unknown) => {
+    const { playerFetch } = await import("../player-fetch");
+    const { registerSessionMutations } = await import("../session-mutations");
+    const decision = await playerFetch<import("../protocol-v3").DecisionResponseV3>(
+      { ...config, apiBaseUrl: "/api/v2" },
+      "/playback/start",
+      { method: "POST", body: JSON.stringify(body) },
+    );
+    const sessionId = decision.playback_plan?.session_id ?? decision.session_id;
+    if (decision.playback_plan && sessionId) registerSessionMutations(sessionId, "installation");
+    return decision;
+  },
+}));
+vi.mock("../lifecycle-v2", () => ({
+  replanV2: async (config: PlayerConfig, sessionId: string, body: unknown) => {
+    const { playerFetch } = await import("../player-fetch");
+    return playerFetch({ ...config, apiBaseUrl: "/api/v2" }, `/playback/${sessionId}/replan`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+}));
+
+const playerConfig: PlayerConfig = {
+  apiBaseUrl: "/api/v1",
+  getAccessToken: () => "token",
+  getProfileId: () => "profile-1",
+  getDeviceId: () => "test-device",
+  getProfileToken: () => null,
+};
+
+function wrapper({ children }: { children: ReactNode }) {
+  return createElement(PlayerConfigProvider, { config: playerConfig, children });
+}
+
+function jsonResponse(body: unknown, init: ResponseInit = {}) {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+}
+
+const OUTPUT_CHANGE = ["playback_plan_v3", "output_change_v1"];
+
+/** A playable start reply; `serverFeatures` defaults to plain plan v3. */
+function playable(
+  sessionId: string,
+  plan = fixturePlanV3({ session_id: sessionId }),
+  serverFeatures = ["playback_plan_v3"],
+) {
+  return {
+    protocol_version: 3,
+    server_features: serverFeatures,
+    outcome: "playable",
+    session_id: sessionId,
+    playback_plan: plan,
+  };
+}
+
+/** Renders the hook for request-1 on file 7 at Auto quality. */
+function renderSession() {
+  return renderHook(() => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"), {
+    wrapper,
+  });
+}
+
+/**
+ * Serves a playable start for session-1, answers its replans with `replan`,
+ * and accepts route events and stops.
+ */
+function sessionFetch(
+  replan: (init?: RequestInit) => Response | Promise<Response>,
+  startPlan = fixturePlanV3(),
+) {
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/playback/start")) {
+      return jsonResponse(playable("session-1", startPlan), { status: 201 });
+    }
+    if (url.endsWith("/playback/session-1/replan")) return replan(init);
+    if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+    if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+    throw new Error(`Unexpected request: ${url}`);
+  });
+}
+
+afterEach(() => {
+  speedReading.kbps = undefined;
+  resetCodecDetectionForTests();
+  resetSessionMutations();
+  forgetBandwidthEstimate();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+const startBase = {
+  fileId: 42,
+  profileId: "profile-1",
+  playbackAttemptId: "attempt-0123456789",
+  qualityPreference: "auto",
+  position: 0,
+  forceStartPosition: false,
+  clientCapabilities: fixtureClientCapabilitiesV3(),
+  clientPlaybackContext: fixtureClientPlaybackContextV3(),
+};
+
+const replanBase = {
+  plan: fixturePlanV3(),
+  playbackAttemptId: "attempt-0123456789",
+  replanRequestId: "replan-0123456789",
+  planAttemptId: "plan-attempt-0123456789",
+  qualityPreference: "auto",
+  positionSeconds: 120,
+  attemptedPlanKeys: [],
+  attemptCount: 1,
+  clientCapabilities: fixtureClientCapabilitiesV3(),
+  clientPlaybackContext: fixtureClientPlaybackContextV3(),
+};
+
+describe("buildStartRequestV3", () => {
+  it("pins the room source without changing the requested streaming quality", () => {
+    expect(
+      buildStartRequestV3({
+        ...startBase,
+        allowAlternateVersions: false,
+        qualityPreference: "720p",
+      }),
+    ).toMatchObject({ allow_alternate_versions: false, quality_preference: "720p" });
+    expect(buildStartRequestV3(startBase)).not.toHaveProperty("allow_alternate_versions");
+  });
+
+  // Feature tokens are promises the server enforces, so a surface advertises
+  // only what it implements: the base set alone unless the caller names more.
+  it("advertises only the surface's own features", () => {
+    expect(
+      buildStartRequestV3({ ...startBase, extraClientFeatures: VIDEO_CLIENT_FEATURES_V3 })
+        .client_features,
+    ).toEqual(["playback_plan_v3", "plan_invalidated_v1", "marker_thumbnails_v1"]);
+    expect(buildStartRequestV3(startBase).client_features).toEqual(["playback_plan_v3"]);
+  });
+
+  it("declares the protocol version and the plan feature", () => {
+    expect(buildStartRequestV3(startBase)).toMatchObject({
+      protocol_version: 3,
+      client_features: ["playback_plan_v3"],
+      file_id: 42,
+      profile_id: "profile-1",
+      playback_attempt_id: "attempt-0123456789",
+      subtitle_fidelity_preference: "preserve",
+    });
+  });
+
+  it("declares client-owned progress with an explicit zero anchor", () => {
+    expect(
+      buildStartRequestV3({
+        ...startBase,
+        position: 0,
+        forceStartPosition: true,
+        progressPersistence: "client",
+      }),
+    ).toMatchObject({ start_position: 0, progress_persistence: "client" });
+  });
+
+  it("clamps an absurd start position to the contract bound", () => {
+    expect(buildStartRequestV3({ ...startBase, position: 1e12 })).toMatchObject({
+      start_position: 31_536_000,
+    });
+  });
+
+  it("omits the bandwidth estimate when the browser reports none", () => {
+    expect(buildStartRequestV3({ ...startBase, bandwidthEstimateKbps: null })).not.toHaveProperty(
+      "bandwidth_estimate_kbps",
+    );
+  });
+
+  it("sends the user bandwidth ceiling separately from the network estimate", () => {
+    expect(
+      buildStartRequestV3({
+        ...startBase,
+        bandwidthEstimateKbps: 25_000,
+        bandwidthCapKbps: 6_000,
+      }),
+    ).toMatchObject({ bandwidth_estimate_kbps: 25_000, bandwidth_cap_kbps: 6_000 });
+  });
+
+  // The server ignores `metered`; a metered link only stops a measurement.
+});
+
+describe("buildReplanRequestV3", () => {
+  it("echoes the plan's identity so the server can detect a stale plan", () => {
+    expect(buildReplanRequestV3({ ...replanBase, operation: "track_change" })).toMatchObject({
+      protocol_version: 3,
+      operation: "track_change",
+      failed_plan_id: "plan:0123456789abcdef",
+      plan_attempt_key: "v3:0123456789abcdef",
+      position_seconds: 120,
+    });
+  });
+
+  // A replan that sends `client_features` replaces the negotiated list, so a
+  // replan which advertised less than the start did would silently withdraw the
+  // promise the server gates the invalidation command on.
+  it("re-advertises the same features a start negotiated", () => {
+    expect(
+      buildReplanRequestV3({
+        ...replanBase,
+        operation: "failure_recovery",
+        extraClientFeatures: VIDEO_CLIENT_FEATURES_V3,
+      }).client_features,
+    ).toEqual(["playback_plan_v3", "plan_invalidated_v1", "marker_thumbnails_v1"]);
+  });
+
+  it("names a new audio track by index alone", () => {
+    // An empty id makes the server resolve the ordinal against the *effective*
+    // file, which the client cannot name: it changes on a version fallback.
+    const body = buildReplanRequestV3({
+      ...replanBase,
+      operation: "track_change",
+      audio: { id: "", index: 3 },
+    });
+
+    expect(body.selected_tracks.audio).toEqual({ id: "", index: 3 });
+  });
+
+  it("resends the untouched subtitle track on an audio-only change", () => {
+    const plan = fixturePlanV3({
+      selected_tracks: {
+        audio: { id: "file:7:audio:0", index: 0 },
+        subtitle: { id: "file:7:subtitle:2", index: 2 },
+      },
+    });
+
+    // Omitting the subtitle would read as "subtitles off", not "unchanged".
+    const body = buildReplanRequestV3({
+      ...replanBase,
+      plan,
+      operation: "track_change",
+      audio: { id: "", index: 1 },
+    });
+
+    expect(body.selected_tracks.subtitle).toEqual({ id: "file:7:subtitle:2", index: 2 });
+  });
+
+  it("clears the subtitle selection when the subtitle override is null", () => {
+    const plan = fixturePlanV3({
+      selected_tracks: {
+        audio: { id: "file:7:audio:0", index: 0 },
+        subtitle: { id: "file:7:subtitle:2", index: 2 },
+      },
+    });
+
+    const body = buildReplanRequestV3({
+      ...replanBase,
+      plan,
+      operation: "track_change",
+      subtitle: null,
+    });
+
+    expect(body.selected_tracks).not.toHaveProperty("subtitle");
+    expect(body.selected_tracks.audio).toEqual({ id: "file:7:audio:0", index: 0 });
+  });
+
+  it("echoes the plan's tracks byte-for-byte on a seek reanchor", () => {
+    const plan = fixturePlanV3({
+      selected_tracks: {
+        audio: { id: "file:7:audio:1", index: 1 },
+        subtitle: { id: "file:7:subtitle:0", index: 0 },
+      },
+    });
+
+    // Seek recovery is validated against the current plan's tracks exactly, so
+    // the shorthand identity used for a track change would be rejected here.
+    const body = buildReplanRequestV3({
+      ...replanBase,
+      plan,
+      operation: "seek_reanchor",
+      positionSeconds: 900,
+    });
+
+    expect(body.selected_tracks).toEqual(plan.selected_tracks);
+    expect(body).not.toHaveProperty("failure");
+  });
+
+  it("carries the loop guard and the failure classification on a recovery", () => {
+    const body = buildReplanRequestV3({
+      ...replanBase,
+      operation: "failure_recovery",
+      attemptedPlanKeys: ["v3:aaaaaaaaaaaaaaaa"],
+      attemptCount: 2,
+      failure: { classification: "decoder_error", message: "no decoder" },
+    });
+
+    expect(body).toMatchObject({
+      operation: "failure_recovery",
+      attempted_plan_keys: ["v3:aaaaaaaaaaaaaaaa"],
+      attempt_count: 2,
+      failure: { classification: "decoder_error", message: "no decoder" },
+    });
+  });
+
+  it("omits failure when nothing failed", () => {
+    const body = buildReplanRequestV3({ ...replanBase, operation: "quality_change" });
+
+    expect(body).not.toHaveProperty("failure");
+    expect(body.attempted_plan_keys).toEqual([]);
+    expect(body.attempt_count).toBe(1);
+  });
+
+  it("sends the quality preference on a track change so it is not reset", () => {
+    // On a track change an absent preference *keeps* the current quality, but
+    // sending the current value is behaviourally identical and unambiguous.
+    const body = buildReplanRequestV3({
+      ...replanBase,
+      operation: "track_change",
+      qualityPreference: "original",
+    });
+
+    expect(body.quality_preference).toBe("original");
+  });
+
+  it("preserves the user bandwidth ceiling across replans", () => {
+    const body = buildReplanRequestV3({
+      ...replanBase,
+      operation: "failure_recovery",
+      bandwidthCapKbps: 4_000,
+      failure: { classification: "playback_error" },
+    });
+
+    expect(body.bandwidth_cap_kbps).toBe(4_000);
+  });
+});
+
+describe("routeEventPlanIdentityV3", () => {
+  it("omits every plan-scoped field for a terminal start", () => {
+    expect(routeEventPlanIdentityV3(null, null, "plan-attempt-client-only")).toEqual({});
+  });
+
+  it("includes the complete identity after a plan is adopted", () => {
+    const plan = fixturePlanV3();
+    expect(routeEventPlanIdentityV3(plan, "session-1", "plan-attempt-1")).toEqual({
+      sessionId: "session-1",
+      planId: plan.plan_id,
+      planAttemptId: "plan-attempt-1",
+      planAttemptKey: plan.plan_attempt_key,
+    });
+  });
+});
+
+describe("usePlaybackSession quality changes", () => {
+  it("rolls back a rejected quality and keeps it out of later replans", async () => {
+    const plan = fixturePlanV3();
+    let replanCount = 0;
+    const fetchMock = sessionFetch(() => {
+      replanCount += 1;
+      if (replanCount === 1) {
+        return jsonResponse({ message: "temporary failure" }, { status: 500 });
+      }
+      return jsonResponse(
+        playable(
+          "session-1",
+          fixturePlanV3({
+            plan_id: "plan:fedcba9876543210",
+            plan_attempt_key: "v3:fedcba9876543210",
+          }),
+        ),
+      );
+    }, plan);
+    vi.stubGlobal("fetch", fetchMock);
+    // Only the browser's rounded downlink hint is available, which is a guess:
+    // no request may carry it as an estimate.
+    Object.defineProperty(navigator, "connection", {
+      configurable: true,
+      value: { downlink: 4.5 },
+    });
+    onTestFinished(() => {
+      delete (navigator as Navigator & { connection?: unknown }).connection;
+    });
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "original"),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    // A stored "original" is the legacy spelling of Auto.
+    expect(result.current.qualityPreference).toBe("auto");
+
+    act(() => result.current.changeQuality("720p", 120));
+    await waitFor(() => {
+      expect(result.current.replanning).toBe(false);
+      expect(result.current.qualityPreference).toBe("auto");
+      expect(result.current.error).toBeTruthy();
+    });
+
+    act(() => result.current.refreshSubtitles(120));
+    await waitFor(() => expect(replanCount).toBe(2));
+
+    const replanBodies = fetchMock.mock.calls
+      .filter(([url]) => String(url).endsWith("/playback/session-1/replan"))
+      .map(([, init]) => JSON.parse(String(init?.body)) as { quality_preference: string });
+    expect(replanBodies.map((body) => body.quality_preference)).toEqual(["720p", "auto"]);
+
+    const startBody = JSON.parse(
+      String(
+        fetchMock.mock.calls.find(([url]) => String(url).endsWith("/playback/start"))?.[1]?.body,
+      ),
+    ) as Record<string, unknown>;
+    expect(startBody.quality_preference).toBe("auto");
+    for (const body of [startBody, ...replanBodies]) {
+      expect(body).not.toHaveProperty("bandwidth_estimate_kbps");
+      expect(body).not.toHaveProperty("metered");
+    }
+
+    unmount();
+  });
+
+  it("replans Auto with the lower estimate a stall step-down recorded", async () => {
+    const plan = fixturePlanV3();
+    const fetchMock = sessionFetch(() => {
+      return jsonResponse(
+        playable(
+          "session-1",
+          fixturePlanV3({
+            plan_id: "plan:fedcba9876543210",
+            plan_attempt_key: "v3:fedcba9876543210",
+          }),
+        ),
+      );
+    }, plan);
+    vi.stubGlobal("fetch", fetchMock);
+    const bodiesTo = (suffix: string) =>
+      fetchMock.mock.calls
+        .filter(([url]) => String(url).endsWith(suffix))
+        .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
+
+    // The viewer's saved maximum is 8 Mbps.
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto", 8_000),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    // Nothing was measured yet, so Auto starts without an estimate.
+    expect(bodiesTo("/playback/start")[0]).not.toHaveProperty("bandwidth_estimate_kbps");
+    expect(bodiesTo("/playback/start")[0]?.bandwidth_cap_kbps).toBe(8_000);
+
+    // What the buffering controller sends when Auto keeps stalling.
+    act(() =>
+      result.current.changeQuality("auto", 120, {
+        operation: "quality_change",
+        quality_preference: "auto",
+        bandwidth_estimate_kbps: 4200,
+        bandwidth_estimate_source: "observed_rebuffer",
+      }),
+    );
+    await waitFor(() => expect(bodiesTo("/playback/session-1/replan")).toHaveLength(1));
+    expect(bodiesTo("/playback/session-1/replan")[0]).toMatchObject({
+      operation: "quality_change",
+      quality_preference: "auto",
+      bandwidth_estimate_kbps: 4_200,
+      bandwidth_cap_kbps: 8_000,
+    });
+    await waitFor(() => expect(result.current.replanning).toBe(false));
+
+    // The cap stays the viewer's own saved maximum on a fixed quality too.
+    act(() => result.current.changeQuality("720p", 130));
+    await waitFor(() => expect(bodiesTo("/playback/session-1/replan")).toHaveLength(2));
+    expect(bodiesTo("/playback/session-1/replan")[1]).toMatchObject({
+      quality_preference: "720p",
+      bandwidth_cap_kbps: 8_000,
+    });
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession initial bitmap subtitles", () => {
+  it("adopts a successful bitmap subtitle start without replanning", async () => {
+    const subtitlePlan = fixturePlanV3({
+      session_id: "session-1",
+      plan_id: "plan:bitmap-subtitle",
+      plan_attempt_key: "v3:bitmap-subtitle",
+      selected_tracks: {
+        audio: { id: "file:7:audio:0", index: 0 },
+        subtitle: { id: "file:7:subtitle:0", index: 0 },
+      },
+    });
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse(playable("session-1", subtitlePlan), { status: 201 });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () =>
+        usePlaybackSession(
+          "request-1",
+          [],
+          [],
+          7,
+          0,
+          false,
+          "auto",
+          null,
+          undefined,
+          null,
+          { 7: 0 },
+          { 7: 0 },
+        ),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:bitmap-subtitle"));
+    expect(startBodies).toHaveLength(1);
+    expect(startBodies[0]).toMatchObject({ subtitle_track_index: 0 });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/replan"))).toBe(false);
+    expect(result.current.planRevision).toBe(1);
+    expect(result.current.initialSubtitleError).toBeNull();
+    unmount();
+  });
+
+  it("retries a refused bitmap subtitle start without subtitles", async () => {
+    const fallbackPlan = fixturePlanV3({ session_id: "session-2" });
+    const startBodies: Array<Record<string, unknown>> = [];
+    let replanCount = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (startBodies.length === 1) {
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "terminal",
+            session_id: "session-1",
+            terminal: {
+              reason: "hdr_transcode_unsupported",
+              message: "Enable HDR transcoding to use this subtitle.",
+            },
+          });
+        }
+        return jsonResponse(playable("session-2", fallbackPlan), { status: 201 });
+      }
+      if (url.endsWith("/playback/session-2/replan")) {
+        replanCount += 1;
+        return jsonResponse(
+          playable(
+            "session-2",
+            fixturePlanV3({
+              session_id: "session-2",
+              plan_id: `plan:replan-${replanCount}`,
+            }),
+          ),
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () =>
+        usePlaybackSession(
+          "request-1",
+          [],
+          [],
+          7,
+          0,
+          false,
+          "auto",
+          null,
+          undefined,
+          null,
+          { 7: 0 },
+          { 7: 0 },
+        ),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe(fallbackPlan.plan_id));
+    expect(startBodies).toHaveLength(2);
+    expect(startBodies[0]).toMatchObject({ subtitle_track_index: 0 });
+    expect(startBodies[1]).not.toHaveProperty("subtitle_track_index");
+    expect(startBodies[0]?.playback_attempt_id).not.toBe(startBodies[1]?.playback_attempt_id);
+    expect(result.current.planRevision).toBe(1);
+    expect(result.current.error).toBeNull();
+    expect(result.current.initialSubtitleErrorTitle).toBe("This HDR format can't be converted");
+    expect(result.current.initialSubtitleError).toContain("dynamic range can't be converted");
+
+    act(() => result.current.changeQuality("1080p", 30));
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:replan-1"));
+    expect(result.current.initialSubtitleError).toContain("dynamic range can't be converted");
+
+    act(() => result.current.changeSubtitleTrack(0, 45));
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:replan-2"));
+    expect(result.current.initialSubtitleErrorTitle).toBeNull();
+    expect(result.current.initialSubtitleError).toBeNull();
+    unmount();
+  });
+});
+
+describe("usePlaybackSession output capability changes", () => {
+  /**
+   * Serves a playable session-hdr start, answers its replans with `replan`,
+   * accepts route events, and records the sessions it stops.
+   */
+  function hdrFetch(
+    replan: (init?: RequestInit) => Response | Promise<Response>,
+    stoppedSessions: string[] = [],
+    stop: () => Response | Promise<Response> = () => jsonResponse({ outcome: "stopped" }),
+  ) {
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(playable("session-hdr", undefined, OUTPUT_CHANGE));
+      }
+      if (url.endsWith("/playback/session-hdr/replan")) return replan(init);
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") {
+        stoppedSessions.push(url);
+        return stop();
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+  }
+
+  function outputProbe(initialHDR: boolean) {
+    let hdr = initialHDR;
+    const listeners = new Set<() => void>();
+    const query = {
+      get matches() {
+        return hdr;
+      },
+      addEventListener: (_: string, listener: () => void) => listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) => listeners.delete(listener),
+    };
+    vi.stubGlobal("matchMedia", () => query);
+    // Decode answers are probed independently of the media query, so move the
+    // simulated decoder along with the output this fixture switches between.
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
+      hdr && mime === 'video/mp4; codecs="dvh1.08.06"' ? "probably" : "",
+    );
+    return (nextHDR: boolean) => {
+      hdr = nextHDR;
+      for (const listener of listeners) listener();
+    };
+  }
+
+  it("waits for the initial HDR10 probe before starting playback", async () => {
+    outputProbe(false);
+    let resolveProbe!: (value: MediaCapabilitiesDecodingInfo) => void;
+    const probeResult = new Promise<MediaCapabilitiesDecodingInfo>((resolve) => {
+      resolveProbe = resolve;
+    });
+    vi.stubGlobal("navigator", {
+      userAgent: "test-browser",
+      mediaCapabilities: { decodingInfo: vi.fn(() => probeResult) },
+    });
+
+    const startBodies: Array<{
+      client_playback_context: { output: { hdr_details: { hdr10: boolean } } };
+    }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startBodies.push(JSON.parse(String(init?.body)) as (typeof startBodies)[number]);
+        return jsonResponse(playable("session-hdr", undefined, OUTPUT_CHANGE), { status: 201 });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "1080p"),
+      { wrapper },
+    );
+    await act(async () => Promise.resolve());
+    expect(startBodies).toHaveLength(0);
+
+    await act(async () => {
+      resolveProbe({
+        supported: true,
+        smooth: true,
+        powerEfficient: true,
+        keySystemAccess: null,
+      });
+      await probeResult;
+    });
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+    expect(startBodies).toHaveLength(1);
+    expect(startBodies[0]?.client_playback_context.output.hdr_details.hdr10).toBe(true);
+    unmount();
+  });
+
+  it("retries a terminal start when the window moves onto an HDR output", async () => {
+    const setHDR = outputProbe(false);
+    const startBodies: Array<{
+      start_position?: number;
+      client_capabilities: { hdr_details?: { dolby_vision_profiles: number[] } };
+    }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as (typeof startBodies)[number];
+        startBodies.push(body);
+        if (startBodies.length === 1) {
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3", "output_change_v1"],
+            outcome: "terminal",
+            terminal: { reason: "hdr_transcode_unsupported", message: "HDR unsupported" },
+          });
+        }
+        return jsonResponse(playable("session-hdr", undefined, OUTPUT_CHANGE));
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+
+    act(() => setHDR(true));
+
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+    expect(startBodies).toHaveLength(2);
+    expect(startBodies[0]).not.toHaveProperty("start_position");
+    expect(startBodies[1]).not.toHaveProperty("start_position");
+    expect(startBodies[0]?.client_capabilities.hdr_details?.dolby_vision_profiles).toEqual([]);
+    expect(startBodies[1]?.client_capabilities.hdr_details?.dolby_vision_profiles).toEqual([8]);
+    unmount();
+  });
+
+  it("replans an active HDR route with its tracks and paused state after moving to SDR", async () => {
+    const setHDR = outputProbe(true);
+    const audio = { id: "file:7:audio:1", index: 1 };
+    const subtitle = { id: "file:7:subtitle:2", index: 2 };
+    const initialPlan = fixturePlanV3({
+      session_id: "session-hdr",
+      selected_tracks: { audio, subtitle },
+    });
+    const replanBodies: Array<{
+      operation: string;
+      position_seconds: number;
+      selected_tracks: { audio?: typeof audio; subtitle?: typeof subtitle };
+      client_capabilities: { hdr: boolean };
+    }> = [];
+    let startCount = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startCount += 1;
+        return jsonResponse(playable("session-hdr", initialPlan, OUTPUT_CHANGE));
+      }
+      if (url.endsWith("/playback/session-hdr/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as (typeof replanBodies)[number]);
+        return jsonResponse(
+          playable(
+            "session-hdr",
+            fixturePlanV3({
+              session_id: "session-hdr",
+              plan_id: "plan:outputchanged001",
+              plan_attempt_key: "v3:outputchanged001",
+              selected_tracks: { audio, subtitle },
+            }),
+            OUTPUT_CHANGE,
+          ),
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+    act(() => {
+      result.current.updatePlaybackState(300, true);
+      result.current.updatePlaybackState(321, false);
+    });
+
+    act(() => setHDR(false));
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:outputchanged001"));
+    expect(startCount).toBe(1);
+    expect(replanBodies).toHaveLength(1);
+    expect(replanBodies[0]).toMatchObject({
+      operation: "output_change",
+      position_seconds: 321,
+      selected_tracks: { audio, subtitle },
+      client_capabilities: { hdr: false },
+    });
+    expect(result.current.sessionId).toBe("session-hdr");
+    expect(result.current.shouldAutoPlay).toBe(false);
+    unmount();
+  });
+
+  it("seeds an early output replan from the server-resolved source position", async () => {
+    const setHDR = outputProbe(true);
+    const resumedPlan = fixturePlanV3({ session_id: "session-hdr" });
+    resumedPlan.timeline = {
+      ...resumedPlan.timeline,
+      source_start_seconds: 275,
+      player_start_seconds: 5,
+      timeline_offset_seconds: 270,
+    };
+    const replanBodies: Array<{ position_seconds: number }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(playable("session-hdr", resumedPlan, OUTPUT_CHANGE));
+      }
+      if (url.endsWith("/playback/session-hdr/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as { position_seconds: number });
+        return jsonResponse(
+          playable(
+            "session-hdr",
+            fixturePlanV3({
+              session_id: "session-hdr",
+              plan_id: "plan:resumedoutput001",
+              plan_attempt_key: "v3:resumedoutput001",
+            }),
+            OUTPUT_CHANGE,
+          ),
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+
+    act(() => result.current.updatePlaybackState(0, false));
+    act(() => setHDR(false));
+
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]?.position_seconds).toBe(275);
+    unmount();
+  });
+
+  it("retires an active plan when the refreshed output has no playable route", async () => {
+    const setHDR = outputProbe(true);
+    const stoppedSessions: string[] = [];
+    let answerStop: (response: Response) => void = () => {};
+    const fetchMock = hdrFetch(
+      () => {
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3", "output_change_v1"],
+          outcome: "terminal",
+          terminal: { reason: "hdr_transcode_unsupported", message: "HDR unsupported" },
+        });
+      },
+      stoppedSessions,
+      () => new Promise<Response>((resolve) => (answerStop = resolve)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const onSessionStopped = vi.fn();
+    const config: PlayerConfig = { ...playerConfig, onSessionStopped };
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      {
+        wrapper: ({ children }: { children: ReactNode }) =>
+          createElement(PlayerConfigProvider, { config, children }),
+      },
+    );
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+
+    act(() => setHDR(false));
+
+    await waitFor(() => expect(result.current.plan).toBeNull());
+    expect(result.current.sessionId).toBeNull();
+    expect(result.current.error).not.toBeNull();
+    await waitFor(() => expect(stoppedSessions).toEqual(["/api/v2/playback/session-hdr"]));
+
+    // The viewer goes back from the error before the retired session's stop
+    // lands, so the page it returns to reads ahead of that stop and is told
+    // to read again once the stop lands.
+    unmount();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(onSessionStopped).not.toHaveBeenCalled();
+
+    answerStop(jsonResponse({ outcome: "stopped" }));
+    await waitFor(() => expect(onSessionStopped).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps a queued output change when a subtitle refresh follows it", async () => {
+    const setHDR = outputProbe(true);
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const operations: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      hdrFetch((init) => {
+        operations.push((JSON.parse(String(init?.body)) as { operation: string }).operation);
+        if (operations.length === 1) return firstReplanResponse;
+        return new Promise<Response>(() => {});
+      }),
+    );
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+
+    act(() => result.current.refreshSubtitles(120));
+    await waitFor(() => expect(operations).toHaveLength(1));
+    act(() => setHDR(false));
+    // The output change re-probes decode support before it queues.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    act(() => result.current.refreshSubtitles(121));
+    await act(async () => {
+      resolveFirstReplan?.(jsonResponse(playable("session-hdr", undefined, OUTPUT_CHANGE)));
+      await firstReplanResponse;
+    });
+
+    await waitFor(() => expect(operations).toEqual(["track_change", "output_change"]));
+    unmount();
+  });
+
+  it("uses the latest capabilities when an output change queues behind another replan", async () => {
+    const setHDR = outputProbe(true);
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const replanBodies: Array<{
+      operation: string;
+      position_seconds: number;
+      client_capabilities: { hdr: boolean };
+    }> = [];
+    const fetchMock = hdrFetch((init) => {
+      replanBodies.push(JSON.parse(String(init?.body)) as (typeof replanBodies)[number]);
+      if (replanBodies.length === 1) return firstReplanResponse;
+      return jsonResponse(
+        playable(
+          "session-hdr",
+          fixturePlanV3({
+            session_id: "session-hdr",
+            plan_id: "plan:queuedoutput0001",
+            plan_attempt_key: "v3:queuedoutput0001",
+          }),
+          OUTPUT_CHANGE,
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+
+    act(() => result.current.refreshSubtitles(120));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    act(() => setHDR(false));
+    act(() => {
+      void result.current.reanchorSeek(555);
+    });
+    expect(replanBodies).toHaveLength(1);
+
+    await act(async () => {
+      resolveFirstReplan?.(
+        jsonResponse(
+          playable(
+            "session-hdr",
+            fixturePlanV3({
+              session_id: "session-hdr",
+              plan_id: "plan:trackrefresh0001",
+              plan_attempt_key: "v3:trackrefresh0001",
+            }),
+            OUTPUT_CHANGE,
+          ),
+        ),
+      );
+      await firstReplanResponse;
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({
+      operation: "output_change",
+      position_seconds: 555,
+      client_capabilities: { hdr: false },
+    });
+    unmount();
+  });
+
+  it("runs the latest output refresh before retiring a terminal replan", async () => {
+    const setHDR = outputProbe(true);
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const replanBodies: Array<{ client_capabilities: { hdr: boolean } }> = [];
+    const stoppedSessions: string[] = [];
+    const fetchMock = hdrFetch((init) => {
+      replanBodies.push(
+        JSON.parse(String(init?.body)) as { client_capabilities: { hdr: boolean } },
+      );
+      if (replanBodies.length === 1) return firstReplanResponse;
+      return jsonResponse(
+        playable(
+          "session-hdr",
+          fixturePlanV3({
+            session_id: "session-hdr",
+            plan_id: "plan:latestoutput0001",
+            plan_attempt_key: "v3:latestoutput0001",
+          }),
+          OUTPUT_CHANGE,
+        ),
+      );
+    }, stoppedSessions);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+
+    act(() => setHDR(false));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    act(() => setHDR(true));
+
+    await act(async () => {
+      resolveFirstReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3", "output_change_v1"],
+          outcome: "terminal",
+          terminal: { reason: "hdr_transcode_unsupported", message: "HDR unsupported" },
+        }),
+      );
+      await firstReplanResponse;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:latestoutput0001"));
+    expect(replanBodies).toHaveLength(2);
+    expect(replanBodies[1]).toMatchObject({ client_capabilities: { hdr: true } });
+    expect(stoppedSessions).toEqual([]);
+    unmount();
+  });
+
+  it("retires after a queued user intent also refuses refreshed output", async () => {
+    const setHDR = outputProbe(true);
+    let resolveOutputReplan: ((response: Response) => void) | undefined;
+    const outputReplanResponse = new Promise<Response>((resolve) => {
+      resolveOutputReplan = resolve;
+    });
+    const replanOperations: string[] = [];
+    const stoppedSessions: string[] = [];
+    const fetchMock = hdrFetch((init) => {
+      replanOperations.push((JSON.parse(String(init?.body)) as { operation: string }).operation);
+      if (replanOperations.length === 1) return outputReplanResponse;
+      return jsonResponse({
+        protocol_version: 3,
+        server_features: ["playback_plan_v3", "output_change_v1"],
+        outcome: "terminal",
+        terminal: { reason: "hdr_transcode_unsupported", message: "HDR unsupported" },
+      });
+    }, stoppedSessions);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+
+    act(() => setHDR(false));
+    await waitFor(() => expect(replanOperations).toEqual(["output_change"]));
+    act(() => result.current.changeQuality("1080p", 91));
+    expect(replanOperations).toEqual(["output_change"]);
+
+    await act(async () => {
+      resolveOutputReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3", "output_change_v1"],
+          outcome: "terminal",
+          terminal: { reason: "hdr_transcode_unsupported", message: "HDR unsupported" },
+        }),
+      );
+      await outputReplanResponse;
+    });
+
+    await waitFor(() => expect(replanOperations).toEqual(["output_change", "quality_change"]));
+    await waitFor(() => expect(result.current.plan).toBeNull());
+    expect(stoppedSessions).toContain("/api/v2/playback/session-hdr");
+    unmount();
+  });
+
+  it("keeps the active plan when an output refresh request fails", async () => {
+    const setHDR = outputProbe(true);
+    const stoppedSessions: string[] = [];
+    const fetchMock = hdrFetch(() => {
+      return jsonResponse({ error: "temporary failure" }, { status: 503 });
+    }, stoppedSessions);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+    const activePlan = result.current.plan;
+
+    act(() => setHDR(false));
+
+    await waitFor(() => expect(result.current.replanning).toBe(false));
+    expect(result.current.plan).toBe(activePlan);
+    expect(result.current.sessionId).toBe("session-hdr");
+    expect(result.current.error).toBeNull();
+    expect(stoppedSessions).toEqual([]);
+    unmount();
+  });
+
+  it("queues the latest user intent behind an output refresh", async () => {
+    const setHDR = outputProbe(true);
+    let resolveOutputReplan: ((response: Response) => void) | undefined;
+    const outputReplanResponse = new Promise<Response>((resolve) => {
+      resolveOutputReplan = resolve;
+    });
+    const replanBodies: Array<{
+      operation: string;
+      quality_preference: string;
+      selected_tracks: { audio?: { index?: number } };
+    }> = [];
+    const fetchMock = hdrFetch((init) => {
+      replanBodies.push(JSON.parse(String(init?.body)) as (typeof replanBodies)[number]);
+      if (replanBodies.length === 1) return outputReplanResponse;
+      return jsonResponse(
+        playable(
+          "session-hdr",
+          fixturePlanV3({
+            session_id: "session-hdr",
+            plan_id: "plan:userintent00001",
+            plan_attempt_key: "v3:userintent00001",
+          }),
+          OUTPUT_CHANGE,
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+
+    act(() => setHDR(false));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    act(() => result.current.switchAudioTrack(2, 90));
+    act(() => result.current.changeQuality("1080p", 91));
+    expect(replanBodies).toHaveLength(1);
+
+    await act(async () => {
+      resolveOutputReplan?.(jsonResponse(playable("session-hdr", undefined, OUTPUT_CHANGE)));
+      await outputReplanResponse;
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({
+      operation: "quality_change",
+      quality_preference: "1080p",
+    });
+    expect(result.current.qualityPreference).toBe("1080p");
+    unmount();
+  });
+
+  it.each([
+    ["replays a queued audio pick when the quality change keeps the file", "audio", 7, true],
+    ["drops a queued audio pick once the quality change moves to another file", "audio", 8, false],
+    [
+      "drops a queued subtitle pick once the quality change moves to another file",
+      "subtitle",
+      8,
+      false,
+    ],
+    ["replays queued subtitles off on another file", "off", 8, true],
+  ] as const)("%s", async (_name, pick, nextFileId, replayed) => {
+    let resolveQualityReplan: ((response: Response) => void) | undefined;
+    const qualityReplanResponse = new Promise<Response>((resolve) => {
+      resolveQualityReplan = resolve;
+    });
+    const operations: string[] = [];
+    const fetchMock = sessionFetch((init) => {
+      const body = JSON.parse(String(init?.body)) as { operation: string };
+      operations.push(body.operation);
+      if (operations.length === 1) return qualityReplanResponse;
+      return jsonResponse(
+        playable(
+          "session-1",
+          fixturePlanV3({
+            session_id: "session-1",
+            plan_id: "plan:replayedpick0001",
+            plan_attempt_key: "v3:replayedpick0001",
+            effective_media_file_id: nextFileId,
+          }),
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-1"));
+
+    act(() => result.current.changeQuality("1080p", 30));
+    await waitFor(() => expect(operations).toEqual(["quality_change"]));
+    // Index 2 of file 7's tracks (or subtitles off), picked while the quality
+    // change runs.
+    act(() => {
+      if (pick === "audio") result.current.switchAudioTrack(2, 31);
+      else result.current.changeSubtitleTrack(pick === "subtitle" ? 2 : null, 31);
+    });
+    await act(async () => {
+      resolveQualityReplan?.(
+        jsonResponse(
+          playable(
+            "session-1",
+            fixturePlanV3({
+              session_id: "session-1",
+              plan_id: "plan:otherversion0001",
+              plan_attempt_key: "v3:otherversion0001",
+              effective_media_file_id: nextFileId,
+            }),
+          ),
+        ),
+      );
+      await qualityReplanResponse;
+    });
+
+    await waitFor(() => expect(result.current.replanning).toBe(false));
+    expect(result.current.mediaFileId).toBe(nextFileId);
+    expect(operations).toEqual(replayed ? ["quality_change", "track_change"] : ["quality_change"]);
+    unmount();
+  });
+
+  it("resumes a queued quality change at a seek made while it waited", async () => {
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const replanBodies: Array<{ quality_preference: string; position_seconds: number }> = [];
+    const fetchMock = sessionFetch((init) => {
+      replanBodies.push(JSON.parse(String(init?.body)) as (typeof replanBodies)[number]);
+      if (replanBodies.length === 1) return firstReplanResponse;
+      return jsonResponse(playable("session-1"));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-1"));
+
+    act(() => result.current.changeQuality("720p", 120));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    act(() => result.current.changeQuality("480p", 121));
+    act(() => result.current.reportSeek(30));
+
+    await act(async () => {
+      resolveFirstReplan?.(jsonResponse(playable("session-1")));
+      await firstReplanResponse;
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({ quality_preference: "480p", position_seconds: 30 });
+    unmount();
+  });
+
+  it("drops a predecessor failure after an output refresh adopts a new plan", async () => {
+    const setHDR = outputProbe(true);
+    let resolveOutputReplan: ((response: Response) => void) | undefined;
+    const outputReplanResponse = new Promise<Response>((resolve) => {
+      resolveOutputReplan = resolve;
+    });
+    const replanOperations: string[] = [];
+    const fetchMock = hdrFetch((init) => {
+      replanOperations.push((JSON.parse(String(init?.body)) as { operation: string }).operation);
+      return outputReplanResponse;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+
+    act(() => setHDR(false));
+    await waitFor(() => expect(replanOperations).toEqual(["output_change"]));
+    act(() => result.current.recoverFromFailure({ classification: "decoder_failure" }, 120));
+
+    await act(async () => {
+      resolveOutputReplan?.(
+        jsonResponse(
+          playable(
+            "session-hdr",
+            fixturePlanV3({
+              session_id: "session-hdr",
+              plan_id: "plan:replacement0001",
+              plan_attempt_key: "v3:replacement0001",
+            }),
+            OUTPUT_CHANGE,
+          ),
+        ),
+      );
+      await outputReplanResponse;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:replacement0001"));
+    expect(replanOperations).toEqual(["output_change"]);
+    unmount();
+  });
+
+  it("keeps playback unchanged when the server lacks output-change support", async () => {
+    const setHDR = outputProbe(true);
+    const replanOperations: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(playable("session-hdr"));
+      }
+      if (url.endsWith("/playback/session-hdr/replan")) {
+        replanOperations.push((JSON.parse(String(init?.body)) as { operation: string }).operation);
+        return jsonResponse({ error: "unsupported operation" }, { status: 400 });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+
+    await act(async () => {
+      setHDR(false);
+      await Promise.resolve();
+    });
+
+    expect(replanOperations).toEqual([]);
+    expect(result.current.sessionId).toBe("session-hdr");
+    expect(result.current.plan).not.toBeNull();
+    unmount();
+  });
+});
+
+describe("usePlaybackSession version switches", () => {
+  it("clears and stops the previous session when a new request ends terminally", async () => {
+    let startCount = 0;
+    const stoppedSessions: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startCount += 1;
+        if (startCount === 2) {
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "terminal",
+            terminal: {
+              reason: "no_playable_route",
+              message: "The next item has no playable route.",
+              retryable: false,
+            },
+          });
+        }
+        return jsonResponse(playable("session-1"), { status: 201 });
+      }
+      if (url.endsWith("/playback/route-events")) {
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") {
+        stoppedSessions.push(url);
+        return jsonResponse({ outcome: "stopped" });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, rerender, unmount } = renderHook(
+      ({ requestKey, fileId }: { requestKey: string; fileId: number }) =>
+        usePlaybackSession(requestKey, [], [], fileId, 0, false, "auto"),
+      { wrapper, initialProps: { requestKey: "episode-1", fileId: 7 } },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    rerender({ requestKey: "episode-2", fileId: 8 });
+
+    await waitFor(() => {
+      expect(result.current.plan).toBeNull();
+      expect(result.current.error).toBe("The next item has no playable route.");
+      expect(result.current.errorReason).toBe("no_playable_route");
+    });
+    expect(result.current.streamUrl).toBeNull();
+    expect(result.current.sessionId).toBeNull();
+    expect(stoppedSessions).toEqual(["/api/v2/playback/session-1"]);
+
+    unmount();
+  });
+
+  it("clears and stops the previous session when a replacement start request fails", async () => {
+    const startBodies: Array<{ playback_attempt_id: string; start_position?: number }> = [];
+    const stoppedSessions: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as {
+          playback_attempt_id: string;
+          start_position?: number;
+        };
+        startBodies.push(body);
+        if (startBodies.length === 2) {
+          return jsonResponse(
+            { error: "internal_error", message: "replacement failed" },
+            { status: 500 },
+          );
+        }
+        return jsonResponse(playable("session-1"), { status: 201 });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") {
+        stoppedSessions.push(url);
+        return jsonResponse({ outcome: "stopped" });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(99, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    await waitFor(() => expect(result.current.sessionId).toBeNull());
+    const originalStart = startBodies[0];
+    const replacementStart = startBodies[1];
+    if (!originalStart || !replacementStart) throw new Error("expected two start requests");
+    expect(replacementStart.start_position).toBe(0);
+    expect(replacementStart.playback_attempt_id).not.toBe(originalStart.playback_attempt_id);
+    expect(result.current.plan).toBeNull();
+    expect(result.current.streamUrl).toBeNull();
+    expect(result.current.sessionId).toBeNull();
+    expect(result.current.error).toContain("could not start playback");
+    expect(stoppedSessions).toEqual(["/api/v2/playback/session-1"]);
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession replans", () => {
+  it("drops a queued predecessor failure after the in-flight replan adopts a new plan", async () => {
+    const initialPlan = fixturePlanV3();
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const replanBodies: Array<{ operation: string; position_seconds: number }> = [];
+    const fetchMock = sessionFetch((init) => {
+      replanBodies.push(
+        JSON.parse(String(init?.body)) as { operation: string; position_seconds: number },
+      );
+      return firstReplanResponse;
+    }, initialPlan);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.refreshSubtitles(120));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    act(() => {
+      void result.current.reanchorSeek(300);
+      result.current.recoverFromFailure({ classification: "decoder_error" }, 450);
+      void result.current.reanchorSeek(600);
+    });
+    expect(replanBodies).toHaveLength(1);
+
+    await act(async () => {
+      resolveFirstReplan?.(
+        jsonResponse(
+          playable(
+            "session-1",
+            fixturePlanV3({
+              plan_id: "plan:1111111111111111",
+              plan_attempt_key: "v3:1111111111111111",
+            }),
+          ),
+        ),
+      );
+      await firstReplanResponse;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:1111111111111111"));
+    expect(
+      replanBodies.map(({ operation, position_seconds }) => ({ operation, position_seconds })),
+    ).toEqual([{ operation: "track_change", position_seconds: 120 }]);
+
+    unmount();
+  });
+
+  it("coalesces reanchor seeks behind an in-flight replan and keeps the latest position", async () => {
+    const initialPlan = fixturePlanV3();
+    const firstReplannedPlan = fixturePlanV3({
+      plan_id: "plan:1111111111111111",
+      plan_attempt_key: "v3:1111111111111111",
+    });
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const replanBodies: Array<{ operation: string; position_seconds: number }> = [];
+    const fetchMock = sessionFetch((init) => {
+      replanBodies.push(
+        JSON.parse(String(init?.body)) as { operation: string; position_seconds: number },
+      );
+      if (replanBodies.length === 1) return firstReplanResponse;
+      return jsonResponse(
+        playable(
+          "session-1",
+          fixturePlanV3({
+            plan_id: "plan:2222222222222222",
+            plan_attempt_key: "v3:2222222222222222",
+          }),
+        ),
+      );
+    }, initialPlan);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.refreshSubtitles(120));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    act(() => {
+      void result.current.reanchorSeek(300);
+      void result.current.reanchorSeek(450);
+    });
+    expect(replanBodies).toHaveLength(1);
+
+    await act(async () => {
+      resolveFirstReplan?.(jsonResponse(playable("session-1", firstReplannedPlan)));
+      await firstReplanResponse;
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(
+      replanBodies.map(({ operation, position_seconds }) => ({ operation, position_seconds })),
+    ).toEqual([
+      { operation: "track_change", position_seconds: 120 },
+      { operation: "seek_reanchor", position_seconds: 450 },
+    ]);
+
+    unmount();
+  });
+
+  it("surfaces an error after the failure-recovery cap is exhausted", async () => {
+    let replanCount = 0;
+    const fetchMock = sessionFetch(() => {
+      replanCount += 1;
+      return jsonResponse(playable("session-1"));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.planRevision).toBe(1));
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      act(() => {
+        result.current.recoverFromFailure({ classification: "decoder_error" }, 120 + attempt);
+      });
+      await waitFor(() => expect(result.current.planRevision).toBe(attempt + 2));
+    }
+
+    act(() => {
+      result.current.recoverFromFailure({ classification: "decoder_error" }, 200);
+    });
+    await waitFor(() => {
+      expect(result.current.errorTitle).toBe("Playback failed");
+      expect(result.current.error).toBe("Playback failed after repeated recovery attempts.");
+    });
+    expect(replanCount).toBe(8);
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession server-invalidated plans", () => {
+  function invalidationFetchMock(replanBodies: Array<Record<string, unknown>>, replan: unknown) {
+    return sessionFetch((init) => {
+      replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return jsonResponse(replan);
+    });
+  }
+
+  it("recovers off the invalidated plan and excludes its attempt key", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      invalidationFetchMock(
+        replanBodies,
+        playable(
+          "session-1",
+          fixturePlanV3({
+            plan_id: "plan:2222222222222222",
+            plan_attempt_key: "v3:2222222222222222",
+            delivery: "server_transcode_hls",
+          }),
+        ),
+      ),
+    );
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+
+    let outcome: boolean | undefined;
+    await act(async () => {
+      outcome = await result.current.invalidatePlan(
+        "plan:0123456789abcdef",
+        "video_copy_unsafe",
+        450,
+      );
+    });
+
+    // The server only pushes the command to a session that promised to handle
+    // it, so the promise has to be on the wire for any of this to be reachable.
+    const startCall = vi
+      .mocked(fetch)
+      .mock.calls.find(([url]) => String(url).endsWith("/playback/start"));
+    const startBody = JSON.parse(String(startCall?.[1]?.body)) as { client_features: string[] };
+    expect(startBody.client_features).toContain("plan_invalidated_v1");
+
+    expect(outcome).toBe(true);
+    expect(replanBodies).toHaveLength(1);
+    expect(replanBodies[0]).toMatchObject({
+      operation: "failure_recovery",
+      failed_plan_id: "plan:0123456789abcdef",
+      position_seconds: 450,
+      // The invalidated route is excluded by key, so the replacement plan
+      // cannot be the same copy route the server just disqualified.
+      attempted_plan_keys: ["v3:0123456789abcdef"],
+      failure: { classification: "video_copy_unsafe" },
+    });
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
+
+    unmount();
+  });
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((settle) => {
+      resolve = settle;
+    });
+    return { promise, resolve };
+  }
+
+  /**
+   * A start and a replan whose response is held open, so a test can act while
+   * the client has a decision in flight — the state the server is always in
+   * when it pushes an invalidation: it commits the replacement plan and starts
+   * the copy-safety scan behind it before the response is on the wire.
+   */
+  function gatedReplanFetchMock(
+    replanBodies: Array<Record<string, unknown>>,
+    replans: unknown[],
+    gate: Promise<void>,
+  ) {
+    return sessionFetch(async (init) => {
+      replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (replanBodies.length === 1) await gate;
+      return jsonResponse(replans.shift());
+    });
+  }
+
+  // The server commits the replacement plan and starts the scan behind it
+  // before the client can read the response, so the invalidation can name a
+  // plan this client has not adopted yet. Deciding against the plan on screen
+  // would complete the command as a no-op and then let the pending response
+  // install the very route the server withdrew.
+  it("waits out an in-flight replan and recovers off the plan it adopts", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const gate = deferred<void>();
+    vi.stubGlobal(
+      "fetch",
+      gatedReplanFetchMock(
+        replanBodies,
+        [
+          playable(
+            "session-1",
+            fixturePlanV3({
+              plan_id: "plan:2222222222222222",
+              plan_attempt_key: "v3:2222222222222222",
+            }),
+          ),
+          playable(
+            "session-1",
+            fixturePlanV3({
+              plan_id: "plan:3333333333333333",
+              plan_attempt_key: "v3:3333333333333333",
+              delivery: "server_transcode_hls",
+            }),
+          ),
+        ],
+        gate.promise,
+      ),
+    );
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+
+    act(() => {
+      result.current.changeQuality("720p", 100);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    let invalidation: Promise<boolean> | undefined;
+    act(() => {
+      invalidation = result.current.invalidatePlan(
+        "plan:2222222222222222",
+        "video_copy_unsafe",
+        100,
+      );
+    });
+    // Nothing may be decided yet: the plan the command names is still in the
+    // response the client has not read.
+    expect(replanBodies).toHaveLength(1);
+
+    let outcome: boolean | undefined;
+    await act(async () => {
+      gate.resolve();
+      outcome = await invalidation;
+    });
+
+    expect(outcome).toBe(true);
+    expect(replanBodies).toHaveLength(2);
+    expect(replanBodies[1]).toMatchObject({
+      operation: "failure_recovery",
+      failed_plan_id: "plan:2222222222222222",
+      // The plan that was invalidated mid-adoption is the one excluded, not the
+      // one that was on screen when the command arrived.
+      attempted_plan_keys: ["v3:2222222222222222"],
+      failure: { classification: "video_copy_unsafe" },
+    });
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:3333333333333333"));
+
+    unmount();
+  });
+
+  // The mirror image: the client really did move past the invalidated plan
+  // while the command was in flight. Waiting must not turn that into a replan —
+  // it would evict a route the server never complained about.
+  it("stays a no-op for a plan the in-flight replan replaced", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const gate = deferred<void>();
+    vi.stubGlobal(
+      "fetch",
+      gatedReplanFetchMock(
+        replanBodies,
+        [
+          playable(
+            "session-1",
+            fixturePlanV3({
+              plan_id: "plan:2222222222222222",
+              plan_attempt_key: "v3:2222222222222222",
+            }),
+          ),
+        ],
+        gate.promise,
+      ),
+    );
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+
+    act(() => {
+      result.current.changeQuality("720p", 100);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    let invalidation: Promise<boolean> | undefined;
+    act(() => {
+      invalidation = result.current.invalidatePlan(
+        "plan:0123456789abcdef",
+        "video_copy_unsafe",
+        100,
+      );
+    });
+
+    let outcome: boolean | undefined;
+    await act(async () => {
+      gate.resolve();
+      outcome = await invalidation;
+    });
+
+    // Reported as handled, with no second replan: the invalidated route is gone.
+    expect(outcome).toBe(true);
+    expect(replanBodies).toHaveLength(1);
+    expect(result.current.plan?.plan_id).toBe("plan:2222222222222222");
+
+    unmount();
+  });
+
+  it("reports failure when the replan produces no replacement plan", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      invalidationFetchMock(replanBodies, {
+        protocol_version: 3,
+        server_features: ["playback_plan_v3"],
+        outcome: "adaptation_unavailable",
+        terminal: {
+          reason: "video_conversion_unsupported",
+          message: "No executor can transcode this source.",
+          retryable: false,
+        },
+      }),
+    );
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef"));
+
+    let outcome: boolean | undefined;
+    await act(async () => {
+      outcome = await result.current.invalidatePlan(
+        "plan:0123456789abcdef",
+        "video_copy_unsafe",
+        30,
+      );
+    });
+
+    // The caller rejects the realtime command on false, which is what makes the
+    // server stop the session instead of leaving the copy route playing.
+    expect(outcome).toBe(false);
+    expect(replanBodies).toHaveLength(1);
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession server-invalidated plans", () => {
+  // An invalidation waits out whatever is still being adopted, so it decides
+  // against the plan that actually won rather than the one on screen. The wait
+  // has to be scoped to the request that can still own the session: a start
+  // abandoned by a version switch cannot install anything any more, and a hung
+  // one would otherwise hold the invalidation past the server's 8s deadline —
+  // which stops the very session that is playing fine.
+  it("does not wait on a superseded start that never settles", async () => {
+    let startCount = 0;
+    const replanBodies: Array<{ operation: string }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startCount += 1;
+        if (startCount === 1) {
+          // The abandoned request: it never settles, and nothing will ever
+          // count it out.
+          return new Promise<Response>(() => {});
+        }
+        return jsonResponse(playable("session-2", fixturePlanV3({ session_id: "session-2" })), {
+          status: 201,
+        });
+      }
+      if (url.endsWith("/playback/session-2/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as { operation: string });
+        return jsonResponse(
+          playable(
+            "session-2",
+            fixturePlanV3({
+              session_id: "session-2",
+              plan_id: "plan:2222222222222222",
+              plan_attempt_key: "v3:2222222222222222",
+            }),
+          ),
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, rerender, unmount } = renderHook(
+      ({ requestKey, fileId }: { requestKey: string; fileId: number }) =>
+        usePlaybackSession(requestKey, [], [], fileId, 0, false, "auto"),
+      { wrapper, initialProps: { requestKey: "episode-1", fileId: 7 } },
+    );
+    await waitFor(() => expect(startCount).toBe(1));
+
+    rerender({ requestKey: "episode-2", fileId: 8 });
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    const planId = result.current.plan?.plan_id;
+    if (!planId) throw new Error("expected an adopted plan");
+
+    const outcome = await act(async () =>
+      Promise.race([
+        result.current.invalidatePlan(planId, "video_copy_unsafe", 120),
+        new Promise<"blocked">((resolve) => {
+          setTimeout(() => resolve("blocked"), 500);
+        }),
+      ]),
+    );
+
+    expect(outcome).toBe(true);
+    expect(replanBodies.map(({ operation }) => operation)).toEqual(["failure_recovery"]);
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
+
+    unmount();
+  });
+
+  // The scoping must not weaken the guarantee it was built for: an invalidation
+  // that arrives while the *current* start is still in flight still waits, so
+  // it decides against the plan that response installs rather than no-opping
+  // against the one already on screen.
+  it("still waits for the start that currently owns the session", async () => {
+    let releaseStart: ((response: Response) => void) | undefined;
+    const pendingStart = new Promise<Response>((resolve) => {
+      releaseStart = resolve;
+    });
+    let startCount = 0;
+    const replanBodies: Array<{ operation: string }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startCount += 1;
+        return pendingStart;
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as { operation: string });
+        return jsonResponse(
+          playable(
+            "session-1",
+            fixturePlanV3({
+              session_id: "session-1",
+              plan_id: "plan:3333333333333333",
+              plan_attempt_key: "v3:3333333333333333",
+            }),
+          ),
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(startCount).toBe(1));
+
+    // The verdict names a plan this client has not read the response for yet.
+    let settled = false;
+    const invalidation = result.current
+      .invalidatePlan("plan:0123456789abcdef", "video_copy_unsafe", 120)
+      .then((adopted) => {
+        settled = true;
+        return adopted;
+      });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(settled).toBe(false);
+    expect(replanBodies).toHaveLength(0);
+
+    await act(async () => {
+      releaseStart?.(jsonResponse(playable("session-1"), { status: 201 }));
+      await expect(invalidation).resolves.toBe(true);
+    });
+    expect(replanBodies.map(({ operation }) => operation)).toEqual(["failure_recovery"]);
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession first frame", () => {
+  it("reports first_frame once per playback attempt, timed from the play tap", async () => {
+    const startBodies: Array<{ playback_attempt_id: string }> = [];
+    const routeEvents: Array<{
+      event: string;
+      playback_attempt_id: string;
+      diagnostics: Record<string, string>;
+    }> = [];
+    let releaseSwitchStart: (() => void) | undefined;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startBodies.push(JSON.parse(String(init?.body)) as { playback_attempt_id: string });
+        const sessionId = `session-${startBodies.length}`;
+        if (startBodies.length === 2) {
+          await new Promise<void>((resolve) => {
+            releaseSwitchStart = resolve;
+          });
+        }
+        return jsonResponse(playable(sessionId), { status: 201 });
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        return jsonResponse(
+          playable(
+            "session-1",
+            fixturePlanV3({
+              session_id: "session-1",
+              plan_id: "plan:fedcba9876543210",
+              plan_attempt_key: "v3:fedcba9876543210",
+            }),
+          ),
+        );
+      }
+      if (url.endsWith("/playback/route-events")) {
+        routeEvents.push(JSON.parse(String(init?.body)) as (typeof routeEvents)[number]);
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const firstFrames = () => routeEvents.filter((event) => event.event === "first_frame");
+    // The clock is pinned only around the synchronous calls that read it, so
+    // React's scheduler keeps a real clock everywhere else.
+    const at = (now: number, run: () => void) => {
+      const clock = vi.spyOn(performance, "now").mockReturnValue(now);
+      try {
+        act(run);
+      } finally {
+        clock.mockRestore();
+      }
+    };
+
+    const tap = performance.now();
+    markPlaybackIntent("request-1", tap);
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    at(tap + 2_450, () => {
+      result.current.reportFirstFrame();
+      result.current.reportFirstFrame();
+    });
+    await waitFor(() => expect(firstFrames()).toHaveLength(1));
+    expect(firstFrames()[0]).toMatchObject({
+      playback_attempt_id: startBodies[0]?.playback_attempt_id,
+      diagnostics: { first_frame_ms: "2450" },
+    });
+
+    // A replan keeps the attempt, so its first frame is not the attempt's.
+    act(() => result.current.changeQuality("720p", 30));
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:fedcba9876543210"));
+    at(tap + 9_000, () => result.current.reportFirstFrame());
+
+    // A version switch starts a new attempt, timed from the switch. Until its
+    // plan is adopted, the frame on screen belongs to the previous attempt.
+    at(tap + 10_000, () => result.current.switchVersion(99, 30));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    at(tap + 10_100, () => result.current.reportFirstFrame());
+    act(() => releaseSwitchStart?.());
+    await waitFor(() => expect(result.current.sessionId).toBe("session-2"));
+    at(tap + 10_800, () => result.current.reportFirstFrame());
+
+    await waitFor(() => expect(firstFrames()).toHaveLength(2));
+    expect(firstFrames()[1]).toMatchObject({
+      playback_attempt_id: startBodies[1]?.playback_attempt_id,
+      diagnostics: { first_frame_ms: "800" },
+    });
+
+    unmount();
+  });
+
+  it("reports first_frame without a duration when no play tap started the attempt", async () => {
+    const routeEvents: Array<{ event: string; diagnostics: Record<string, string> }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(playable("session-1"), { status: 201 });
+      }
+      if (url.endsWith("/playback/route-events")) {
+        routeEvents.push(JSON.parse(String(init?.body)) as (typeof routeEvents)[number]);
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    // A tap for another request, then a deep link to this one: the stale mark
+    // must not time this attempt.
+    markPlaybackIntent("request-other");
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-deep-link", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    act(() => result.current.reportFirstFrame());
+
+    await waitFor(() =>
+      expect(routeEvents.filter((event) => event.event === "first_frame")).toHaveLength(1),
+    );
+    expect(routeEvents.find((event) => event.event === "first_frame")?.diagnostics).toEqual({});
+
+    unmount();
+  });
+});
+
+describe("usePlaybackSession mid-stream reconnect", () => {
+  type Body = Record<string, unknown>;
+
+  /**
+   * Serves the first start, then hands every replan (and any later start) to
+   * the test. A reply that throws stands in for a server that cannot be
+   * reached: `fetch` rejects with a TypeError.
+   */
+  function reconnectHarness(options: {
+    replan: () => Response | Promise<Response>;
+    restart?: (body: Body) => Response | Promise<Response>;
+    initialPlan?: ReturnType<typeof fixturePlanV3>;
+  }) {
+    const startBodies: Body[] = [];
+    const replanBodies: Body[] = [];
+    const stopped: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          const body = JSON.parse(String(init?.body)) as Body;
+          startBodies.push(body);
+          if (startBodies.length > 1 && options.restart) return options.restart(body);
+          return jsonResponse(playable("session-1", options.initialPlan), { status: 201 });
+        }
+        if (url.endsWith("/replan")) {
+          replanBodies.push(JSON.parse(String(init?.body)) as Body);
+          return options.replan();
+        }
+        if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+        if (init?.method === "DELETE") {
+          stopped.push(url);
+          return jsonResponse({ outcome: "stopped" });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    return { startBodies, replanBodies, stopped };
+  }
+
+  const unreachable = (): Response => {
+    throw new TypeError("Failed to fetch");
+  };
+
+  async function startPlaying() {
+    const rendered = renderSession();
+    await waitFor(() => expect(rendered.result.current.planRevision).toBe(1));
+    // The stream played: a network failure from here on is a lost connection.
+    act(() => rendered.result.current.updatePlaybackState(100, true));
+    // RTL's waitFor polls on real timers; from here the test drives time.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    return rendered;
+  }
+
+  async function advance(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("waits for the server and resumes the same route at the saved position", async () => {
+    let serverUp = false;
+    const harness = reconnectHarness({
+      replan: () =>
+        serverUp
+          ? jsonResponse(
+              playable(
+                "session-1",
+                fixturePlanV3({
+                  plan_id: "plan:1111111111111111",
+                  timeline: { ...fixturePlanV3().timeline, player_start_seconds: 120 },
+                }),
+              ),
+            )
+          : unreachable(),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(120, true));
+    expect(result.current.connectionStatus).toBe("reconnecting");
+    // The player pauses while the server is away; the adopted plan must not
+    // inherit that pause.
+    act(() => result.current.updatePlaybackState(120, false));
+
+    await advance(RECONNECT_BASE_DELAY_MS);
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(result.current.connectionStatus).toBe("reconnecting");
+    expect(result.current.error).toBeNull();
+    expect(result.current.planRevision).toBe(1);
+
+    serverUp = true;
+    await advance(reconnectDelayMs(1));
+    expect(harness.replanBodies).toHaveLength(2);
+    expect(result.current.connectionStatus).toBe("connected");
+    expect(result.current.planRevision).toBe(2);
+    expect(result.current.plan?.plan_id).toBe("plan:1111111111111111");
+    expect(result.current.initialPosition).toBe(120);
+    expect(result.current.shouldAutoPlay).toBe(true);
+    expect(result.current.sessionId).toBe("session-1");
+
+    // The connection failed, not the route: the request keeps it eligible.
+    const body = harness.replanBodies[1];
+    expect(body?.operation).toBe("track_change");
+    expect(body?.position_seconds).toBe(120);
+    expect(body?.attempted_plan_keys).toEqual([]);
+    expect(body?.failure).toBeUndefined();
+    expect(harness.startBodies).toHaveLength(1);
+    expect(harness.stopped).toEqual([]);
+
+    // Nothing else is scheduled once playback is back.
+    await advance(RECONNECT_MAX_DELAY_MS * 2);
+    expect(harness.replanBodies).toHaveLength(2);
+
+    unmount();
+  });
+
+  it("reopens a progressive remux on the same route and keeps the routes that failed", async () => {
+    const enginePlan = fixturePlanV3({
+      delivery: "original_http",
+      plan_attempt_key: "v3:engine000000000",
+    });
+    const remuxPlan = fixturePlanV3({
+      plan_id: "plan:2222222222222222",
+      delivery: "server_remux_progressive",
+      plan_attempt_key: "v3:remux0000000000",
+      stream: { ...fixturePlanV3().stream, url: "/stream/session-1/remux?seek=100" },
+    });
+    const harness = reconnectHarness({
+      initialPlan: enginePlan,
+      // Recovery moves to the remux; the server answers a reanchor with the
+      // same plan, reopened at the position.
+      replan: () => jsonResponse(playable("session-1", remuxPlan)),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() =>
+      result.current.recoverFromFailure({ classification: "browser_engine_startup_timeout" }, 100),
+    );
+    await advance(0);
+    expect(result.current.plan?.delivery).toBe("server_remux_progressive");
+
+    act(() => result.current.recoverConnection(120, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+
+    // A no-op track_change would replan the route and could return the
+    // engine plan that already failed.
+    expect(harness.replanBodies[1]?.operation).toBe("seek_reanchor");
+    expect(harness.replanBodies[1]?.position_seconds).toBe(120);
+    expect(result.current.connectionStatus).toBe("connected");
+    expect(result.current.plan?.plan_id).toBe(remuxPlan.plan_id);
+
+    // The reconnect kept the attempt's history: a later recovery still
+    // excludes the engine plan.
+    act(() => result.current.recoverFromFailure({ classification: "decoder_error" }, 125));
+    await advance(0);
+    expect(harness.replanBodies[2]?.operation).toBe("failure_recovery");
+    expect(harness.replanBodies[2]?.attempted_plan_keys).toEqual([
+      "v3:engine000000000",
+      "v3:remux0000000000",
+    ]);
+
+    unmount();
+  });
+
+  it("starts a new session at the saved position when the old one did not survive a restart", async () => {
+    const harness = reconnectHarness({
+      replan: () =>
+        jsonResponse(
+          { error: "playback_session_not_found", message: "Playback session not found" },
+          { status: 404 },
+        ),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(240, false));
+    await advance(RECONNECT_BASE_DELAY_MS);
+
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(2);
+    const restart = harness.startBodies[1];
+    expect(restart?.start_position).toBe(240);
+    expect(restart?.file_id).toBe(7);
+    expect(restart?.audio_track_index).toBe(0);
+    expect(restart?.playback_attempt_id).not.toBe(harness.startBodies[0]?.playback_attempt_id);
+    expect(result.current.sessionId).toBe("session-2");
+    expect(result.current.connectionStatus).toBe("connected");
+    // The viewer had paused before the drop, so playback stays paused.
+    expect(result.current.shouldAutoPlay).toBe(false);
+    expect(harness.stopped).toEqual(["/api/v2/playback/session-1"]);
+
+    unmount();
+  });
+
+  it("ends instead of starting a new session when an administrator ended the session", async () => {
+    const harness = reconnectHarness({
+      replan: () =>
+        jsonResponse(
+          {
+            type: "https://siloserver.org/docs/api/v2/problems/playback_session_ended",
+            title: "Playback session ended",
+            status: 410,
+            detail: "An administrator ended this playback session",
+          },
+          { status: 410 },
+        ),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(240, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(1);
+    expect(result.current.connectionStatus).toBe("ended");
+    expect(result.current.sessionId).toBe("session-1");
+
+    // Nothing retries an ended session.
+    await advance(RECONNECT_MAX_DELAY_MS * 2);
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(1);
+
+    unmount();
+  });
+
+  it("ends when a recovery replan learns an administrator ended the session", async () => {
+    const harness = reconnectHarness({
+      replan: () =>
+        jsonResponse(
+          {
+            type: "https://siloserver.org/docs/api/v2/problems/playback_session_ended",
+            title: "Playback session ended",
+            status: 410,
+            detail: "An administrator ended this playback session",
+          },
+          { status: 410 },
+        ),
+    });
+    const { result, unmount } = await startPlaying();
+
+    await act(async () => {
+      result.current.changeQuality("720p", 100);
+    });
+
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(1);
+    expect(result.current.connectionStatus).toBe("ended");
+    expect(result.current.error).toBeNull();
+
+    unmount();
+  });
+
+  it("does not reconnect a session a reanchor found ended before that state renders", async () => {
+    const harness = reconnectHarness({
+      replan: () =>
+        jsonResponse(
+          {
+            type: "https://siloserver.org/docs/api/v2/problems/playback_session_ended",
+            title: "Playback session ended",
+            status: 410,
+            detail: "An administrator ended this playback session",
+          },
+          { status: 410 },
+        ),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const { result, unmount } = await startPlaying();
+    const session = result.current;
+
+    // The player's reopen fallback runs as soon as the reanchor settles, from a
+    // render that still says connected.
+    await act(async () => {
+      expect(await session.reanchorSeek(240)).toBe(false);
+      session.recoverConnection(240, true);
+    });
+    await advance(RECONNECT_MAX_DELAY_MS * 2);
+
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(1);
+    expect(result.current.connectionStatus).toBe("ended");
+
+    unmount();
+  });
+
+  it("starts a new session when the server's installation changed", async () => {
+    let restarts = 0;
+    const harness = reconnectHarness({
+      // A replan always carries the old session's installation, so the
+      // server refuses it every time.
+      replan: () =>
+        jsonResponse(
+          { error: "installation_changed", message: "Playback installation changed" },
+          { status: 409 },
+        ),
+      // The first start still used cached capabilities; the start helper
+      // drops them on this refusal, so the next start succeeds.
+      restart: () => {
+        restarts += 1;
+        return restarts === 1
+          ? jsonResponse(
+              { error: "installation_changed", message: "Playback installation changed" },
+              { status: 409 },
+            )
+          : jsonResponse(playable("session-2"), { status: 201 });
+      },
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(150, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+    expect(harness.replanBodies).toHaveLength(1);
+    expect(harness.startBodies).toHaveLength(2);
+    expect(result.current.connectionStatus).toBe("reconnecting");
+
+    await advance(reconnectDelayMs(1));
+    expect(harness.startBodies).toHaveLength(3);
+    expect(harness.startBodies[2]?.start_position).toBe(150);
+    expect(result.current.sessionId).toBe("session-2");
+    expect(result.current.connectionStatus).toBe("connected");
+
+    unmount();
+  });
+
+  it("restarts with subtitles off when the viewer had them off", async () => {
+    const harness = reconnectHarness({
+      // A sidecar track is on offer, but the lost plan had none selected.
+      initialPlan: fixturePlanV3({
+        subtitle: { mode: "off", inventory: [fixtureSubtitleInventoryItemV3()] },
+      }),
+      replan: () => jsonResponse({ error: "playback_session_not_found" }, { status: 404 }),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(90, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+
+    expect(result.current.sessionId).toBe("session-2");
+    const restart = harness.startBodies[1];
+    // A start that names no subtitle track plays without one; the protocol
+    // has no other spelling of "off" and rejects a negative index.
+    expect(restart).not.toHaveProperty("subtitle_track_index");
+    expect(restart).not.toHaveProperty("subtitle_track_id");
+    expect(restart?.audio_track_index).toBe(0);
+
+    unmount();
+  });
+
+  it("restarts with the subtitle the viewer had on", async () => {
+    const harness = reconnectHarness({
+      initialPlan: fixturePlanV3({
+        selected_tracks: {
+          audio: { id: "file:7:audio:1", index: 1 },
+          subtitle: { id: "file:7:subtitle:0", index: 0 },
+        },
+        subtitle: { mode: "render", inventory: [fixtureSubtitleInventoryItemV3()] },
+      }),
+      replan: () => jsonResponse({ error: "playback_session_not_found" }, { status: 404 }),
+      restart: () => jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(90, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+
+    expect(result.current.sessionId).toBe("session-2");
+    expect(harness.startBodies[1]?.subtitle_track_index).toBe(0);
+    expect(harness.startBodies[1]?.audio_track_index).toBe(1);
+
+    unmount();
+  });
+
+  it("retries a refused burn-in subtitle restart without subtitles, like a normal start", async () => {
+    const harness = reconnectHarness({
+      initialPlan: fixturePlanV3({
+        selected_tracks: {
+          audio: { id: "file:7:audio:1", index: 1 },
+          subtitle: { id: "file:7:subtitle:3", index: 3 },
+        },
+        subtitle: {
+          mode: "burn_in",
+          inventory: [
+            fixtureSubtitleInventoryItemV3({
+              combined_index: 3,
+              codec: "hdmv_pgs_subtitle",
+              delivery: "burn_in_only",
+              url: undefined,
+            }),
+          ],
+        },
+      }),
+      replan: () => jsonResponse({ error: "playback_session_not_found" }, { status: 404 }),
+      restart: (body) =>
+        body.subtitle_track_index === 3
+          ? jsonResponse(
+              {
+                protocol_version: 3,
+                server_features: ["playback_plan_v3"],
+                outcome: "terminal",
+                session_id: "session-refused",
+                terminal: {
+                  reason: "subtitle_burn_in_source_unsupported",
+                  message: "The selected subtitle can't be burned into this source.",
+                  retryable: false,
+                },
+              },
+              { status: 201 },
+            )
+          : jsonResponse(playable("session-2"), { status: 201 }),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(500, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+
+    expect(harness.startBodies).toHaveLength(3);
+    const [, refused, fallback] = harness.startBodies;
+    expect(refused?.subtitle_track_index).toBe(3);
+    expect(fallback).not.toHaveProperty("subtitle_track_index");
+    expect(fallback?.start_position).toBe(500);
+    expect(fallback?.audio_track_index).toBe(1);
+    expect(fallback?.playback_attempt_id).not.toBe(refused?.playback_attempt_id);
+
+    expect(result.current.connectionStatus).toBe("connected");
+    expect(result.current.sessionId).toBe("session-2");
+    expect(result.current.shouldAutoPlay).toBe(true);
+    // The same notice a refused bitmap subtitle at the initial start raises.
+    expect(result.current.initialSubtitleErrorTitle).toBe("That subtitle track can't be used");
+    expect(result.current.initialSubtitleError).toBe(
+      "The selected subtitle can't be burned into this source.",
+    );
+    expect(harness.stopped).toEqual(["/api/v2/playback/session-1"]);
+
+    unmount();
+  });
+
+  it("backs off, gives up with a retry, and recovers when the viewer tries again", async () => {
+    let serverUp = false;
+    const harness = reconnectHarness({
+      replan: () => (serverUp ? jsonResponse(playable("session-1")) : unreachable()),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(300, true));
+    // Reporting again while a cycle runs does not start a second one.
+    act(() => result.current.recoverConnection(310, true));
+
+    let elapsed = 0;
+    for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS; attempt += 1) {
+      await advance(reconnectDelayMs(attempt) - 1);
+      expect(harness.replanBodies).toHaveLength(attempt);
+      await advance(1);
+      expect(harness.replanBodies).toHaveLength(attempt + 1);
+      elapsed += reconnectDelayMs(attempt);
+    }
+    expect(elapsed).toBeLessThanOrEqual(150_000);
+    expect(harness.replanBodies.every((body) => body.position_seconds === 300)).toBe(true);
+
+    expect(result.current.connectionStatus).toBe("lost");
+    expect(result.current.connectionErrorTitle).toBe("Connection lost");
+    expect(result.current.connectionError).toContain("try again");
+    expect(result.current.connectionError).not.toContain("start playback");
+    // The stream that played is kept so the viewer can retry from it.
+    expect(result.current.plan).not.toBeNull();
+    expect(result.current.error).toBeNull();
+
+    await advance(RECONNECT_MAX_DELAY_MS * 4);
+    expect(harness.replanBodies).toHaveLength(RECONNECT_MAX_ATTEMPTS);
+
+    serverUp = true;
+    act(() => result.current.retryConnection());
+    expect(result.current.connectionStatus).toBe("reconnecting");
+    await advance(0);
+    expect(harness.replanBodies).toHaveLength(RECONNECT_MAX_ATTEMPTS + 1);
+    expect(harness.replanBodies.at(-1)?.position_seconds).toBe(300);
+    expect(result.current.connectionStatus).toBe("connected");
+    expect(result.current.planRevision).toBe(2);
+
+    unmount();
+  });
+
+  it("shows the server's refusal when the restarted session is refused", async () => {
+    reconnectHarness({
+      replan: () => jsonResponse({ error: "not_found" }, { status: 404 }),
+      restart: () =>
+        jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "terminal",
+            terminal: { reason: "source_unavailable", retryable: false },
+          },
+          { status: 201 },
+        ),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(60, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+
+    expect(result.current.connectionStatus).toBe("lost");
+    expect(result.current.connectionErrorTitle).toBe("This video is no longer available");
+    expect(result.current.plan).not.toBeNull();
+
+    unmount();
+  });
+
+  it("stops retrying when the viewer leaves", async () => {
+    const harness = reconnectHarness({ replan: unreachable });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(30, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+    expect(harness.replanBodies).toHaveLength(1);
+
+    unmount();
+    await advance(RECONNECT_MAX_DELAY_MS * 4);
+    expect(harness.replanBodies).toHaveLength(1);
+  });
+
+  it("reconnects when recovering a broken stream cannot reach the server", async () => {
+    let serverUp = false;
+    const harness = reconnectHarness({
+      replan: () => (serverUp ? jsonResponse(playable("session-1")) : unreachable()),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverFromFailure({ classification: "decoder_error" }, 75));
+    await advance(0);
+    expect(harness.replanBodies[0]?.operation).toBe("failure_recovery");
+    expect(result.current.connectionStatus).toBe("reconnecting");
+    expect(result.current.error).toBeNull();
+
+    // Transport failures while reconnecting do not start route recovery.
+    act(() => result.current.recoverFromFailure({ classification: "decoder_error" }, 75));
+    await advance(0);
+    expect(harness.replanBodies).toHaveLength(1);
+
+    serverUp = true;
+    await advance(RECONNECT_BASE_DELAY_MS);
+    expect(harness.replanBodies[1]?.operation).toBe("track_change");
+    expect(harness.replanBodies[1]?.position_seconds).toBe(75);
+    expect(result.current.connectionStatus).toBe("connected");
+
+    unmount();
+  });
+
+  it("keeps one budget when the reconnected transport fails before its first frame", async () => {
+    let serverUp = true;
+    const harness = reconnectHarness({
+      replan: () => (serverUp ? jsonResponse(playable("session-1")) : unreachable()),
+    });
+    const { result, unmount } = await startPlaying();
+
+    act(() => result.current.recoverConnection(40, true));
+    await advance(RECONNECT_BASE_DELAY_MS);
+    expect(result.current.connectionStatus).toBe("connected");
+    expect(harness.replanBodies).toHaveLength(1);
+
+    // The new transport fails on the network before its first frame, so the
+    // player reports a route failure; the server is gone again.
+    serverUp = false;
+    act(() => result.current.recoverFromFailure({ classification: "decoder_error" }, 40));
+    await advance(0);
+    expect(harness.replanBodies[1]?.operation).toBe("failure_recovery");
+    expect(result.current.connectionStatus).toBe("reconnecting");
+
+    // The cycle continues where the last one stopped instead of starting
+    // over, so a server that keeps dropping new streams still runs out.
+    await advance(reconnectDelayMs(1) - 1);
+    expect(harness.replanBodies).toHaveLength(2);
+    await advance(1);
+    expect(harness.replanBodies).toHaveLength(3);
+    for (let attempt = 2; attempt < RECONNECT_MAX_ATTEMPTS; attempt += 1) {
+      await advance(reconnectDelayMs(attempt));
+    }
+    expect(result.current.connectionStatus).toBe("lost");
+    expect(harness.replanBodies).toHaveLength(RECONNECT_MAX_ATTEMPTS + 1);
+
+    unmount();
+  });
+
+  it("keeps the error for a recovery that fails before the stream ever played", async () => {
+    const harness = reconnectHarness({ replan: unreachable });
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.planRevision).toBe(1));
+
+    act(() => result.current.recoverFromFailure({ classification: "startup_timeout" }, 0));
+    await waitFor(() =>
+      expect(result.current.error).toBe(
+        "Silo couldn't reach the server. Check your connection, then try again.",
+      ),
+    );
+    expect(result.current.connectionStatus).toBe("connected");
+    expect(harness.replanBodies).toHaveLength(1);
+
+    unmount();
+  });
+
+  it("does not reconnect a session that never started", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          return jsonResponse({ error: "internal_error" }, { status: 500 });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.error).toContain("could not start playback"));
+
+    act(() => result.current.recoverConnection(10, true));
+    expect(result.current.connectionStatus).toBe("connected");
+
+    unmount();
+  });
+});
+
+async function startSession() {
+  const hook = renderHook(() => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"), {
+    wrapper,
+  });
+  await waitFor(() => expect(hook.result.current.planRevision).toBe(1));
+  return hook;
+}
+
+it("reports each adoption's summary once, with the estimate it was requested with", async () => {
+  const plan = fixturePlanV3({ session_id: "session-1" });
+  const summaries: Record<string, unknown>[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start") || url.endsWith("/replan")) {
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3", "playback_plan_summary_v1"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: plan,
+        });
+      }
+      if (url.endsWith("/playback/route-events")) {
+        const body = JSON.parse(String(init?.body));
+        if (body.event === "plan_summary") summaries.push(body);
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    }),
+  );
+  const { result, unmount } = await startSession();
+  const adopted = vi.fn();
+  act(() =>
+    result.current.changeQuality(
+      "auto",
+      120,
+      {
+        operation: "quality_change",
+        quality_preference: "auto",
+        bandwidth_estimate_kbps: 44100,
+        bandwidth_estimate_source: "observed_rebuffer",
+      },
+      adopted,
+    ),
+  );
+  // The server plan ID repeats; the adoptions stay apart.
+  await waitFor(() => expect(adopted).toHaveBeenCalledWith(2));
+  act(() => {
+    result.current.reportEvent("plan_summary", {
+      adoptionId: "1",
+      diagnostics: { buffering_action: "lowered" },
+    });
+    result.current.reportEvent("plan_summary", {
+      adoptionId: "2",
+      diagnostics: { buffering_action: "cant_lower" },
+    });
+    // A second summary for an adoption is dropped, not sent as the live plan's.
+    result.current.reportEvent("plan_summary", {
+      adoptionId: "1",
+      diagnostics: { buffering_action: "none" },
+    });
+    // The plan adopted again after the back-forward cache reports on its own,
+    // against the plan it adopted again.
+    result.current.reportEvent("plan_summary", {
+      adoptionId: "2.1",
+      diagnostics: { buffering_action: "none" },
+    });
+  });
+  await waitFor(() => expect(summaries).toHaveLength(3));
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+  expect(summaries).toHaveLength(3);
+  expect(summaries.map((s) => s.plan_id)).toEqual([plan.plan_id, plan.plan_id, plan.plan_id]);
+  expect(summaries[0]?.plan_attempt_id).not.toBe(summaries[1]?.plan_attempt_id);
+  expect(summaries[2]?.plan_attempt_id).toBe(summaries[1]?.plan_attempt_id);
+  expect(summaries.map((s) => s.diagnostics)).toEqual([
+    { buffering_action: "lowered" },
+    { buffering_action: "cant_lower", bandwidth_estimate_kbps: "44100" },
+    { buffering_action: "none", bandwidth_estimate_kbps: "44100" },
+  ]);
+  expect(summaries[0]).not.toHaveProperty("adoptionId");
+  unmount();
+});
+
+it.each([
+  ["never", "ignore"],
+  ["always", undefined],
+  // An omitted mode uses the default and does not exclude learned limits.
+  [undefined, undefined],
+] as const)("in %s mode sends learned_limit %s", async (mode, expected) => {
+  const { bodiesTo } = recordingServer();
+  const { result, unmount } = renderHook(
+    () =>
+      usePlaybackSession(
+        "request-1",
+        [],
+        [],
+        7,
+        0,
+        false,
+        "auto",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        mode,
+      ),
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.planRevision).toBe(1));
+  act(() => result.current.changeQuality("auto", 120));
+  await waitFor(() => expect(bodiesTo("/replan")).toHaveLength(1));
+  expect(bodiesTo("/playback/start")[0]?.learned_limit).toBe(expected);
+  expect(bodiesTo("/replan")[0]?.learned_limit).toBe(expected);
+  unmount();
+});
+
+it("repeats the kept step-down estimate, without a source, on later Auto replans", async () => {
+  const server = recordingServer();
+  const replans = () => server.bodiesTo("/replan");
+  const { result, unmount } = await startSession();
+
+  // The controller lowered Auto and reported its step-down estimate.
+  act(() => result.current.setKeptEstimate(44100));
+  act(() => result.current.recoverFromFailure({ classification: "decoder_failure" }, 120));
+  await waitFor(() => expect(replans()).toHaveLength(1));
+  expect(replans()[0]).toMatchObject({
+    operation: "failure_recovery",
+    quality_preference: "auto",
+    bandwidth_estimate_kbps: 44100,
+  });
+  expect(replans()[0]).not.toHaveProperty("bandwidth_estimate_source");
+  await waitFor(() => expect(result.current.replanning).toBe(false));
+
+  // A fixed quality the viewer picked does not carry it.
+  act(() => result.current.changeQuality("720p", 130));
+  await waitFor(() => expect(replans()).toHaveLength(2));
+  expect(replans()[1]).not.toHaveProperty("bandwidth_estimate_kbps");
+  unmount();
+});
+
+/** Records every request body, optionally holding the first replan until release. */
+function recordingServer({ holdFirstReplan = false, holdSecondStart = false } = {}) {
+  const plan = fixturePlanV3({ session_id: "session-1" });
+  const decision = (planId: string) =>
+    jsonResponse({
+      protocol_version: 3,
+      server_features: ["playback_plan_v3", "buffering_quality_v1"],
+      outcome: "playable",
+      session_id: "session-1",
+      playback_plan: { ...plan, plan_id: planId, plan_attempt_key: `v3:${planId}` },
+    });
+  let release: (() => void) | undefined;
+  const held = new Promise<Response>((resolve) => {
+    release = () => resolve(decision("plan:held0001"));
+  });
+  let releaseStart: ((refused?: boolean) => void) | undefined;
+  const heldStart = new Promise<Response>((resolve) => {
+    releaseStart = (refused) =>
+      resolve(
+        refused
+          ? jsonResponse({
+              protocol_version: 3,
+              server_features: ["playback_plan_v3", "buffering_quality_v1"],
+              outcome: "adaptation_unavailable",
+              session_id: "session-1",
+            })
+          : decision("plan:start0002"),
+      );
+  });
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/playback/start")) {
+      const count = fetchMock.mock.calls.filter(([u]) =>
+        String(u).endsWith("/playback/start"),
+      ).length;
+      return holdSecondStart && count === 2 ? heldStart : decision(plan.plan_id);
+    }
+    if (url.endsWith("/replan")) {
+      const count = fetchMock.mock.calls.filter(([u]) => String(u).endsWith("/replan")).length;
+      return holdFirstReplan && count === 1 ? held : decision(`plan:next000${count}`);
+    }
+    if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+    if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+    throw new Error(`Unexpected request: ${url}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const bodiesTo = (suffix: string) =>
+    fetchMock.mock.calls
+      .filter(([url]) => String(url).endsWith(suffix))
+      .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
+  return {
+    bodiesTo,
+    release: () => release?.(),
+    releaseStart: (refused?: boolean) => releaseStart?.(refused),
+  };
+}
+
+const lowering = {
+  operation: "quality_change",
+  quality_preference: "auto",
+  bandwidth_estimate_kbps: 44100,
+  bandwidth_estimate_source: "observed_rebuffer",
+} as const;
+const restore = {
+  operation: "quality_change",
+  quality_preference: "auto",
+  learned_limit: "clear",
+} as const;
+
+// A start the player leaves still loading must not hold off speed tests.
+it("ends its start's hold on speed tests when the player goes away", async () => {
+  recordingServer();
+  const { unmount } = await startSession();
+  startEnded.mockClear();
+  unmount();
+  expect(startEnded).toHaveBeenCalledTimes(1);
+});
+
+it("sends the speed-test reading on a start but never on a replan", async () => {
+  speedReading.kbps = 48000;
+  const server = recordingServer();
+  const { result, unmount } = await startSession();
+  expect(server.bodiesTo("/playback/start")[0]).toMatchObject({
+    bandwidth_estimate_kbps: 48000,
+    bandwidth_estimate_source: "probe",
+  });
+  act(() => result.current.changeSubtitleTrack(null, 120));
+  await waitFor(() => expect(server.bodiesTo("/replan")).toHaveLength(1));
+  expect(server.bodiesTo("/replan")[0]).not.toHaveProperty("bandwidth_estimate_kbps");
+  expect(server.bodiesTo("/replan")[0]).not.toHaveProperty("bandwidth_estimate_source");
+  unmount();
+});
+
+// C3: the server plans with the lower of the estimate and what the stalled
+// plan's media arrived at.
+it("sends a lowering's observed throughput with its estimate", async () => {
+  const server = recordingServer();
+  const { result, unmount } = await startSession();
+  act(() =>
+    result.current.changeQuality("auto", 120, { ...lowering, observed_throughput_kbps: 11_800 }),
+  );
+  await waitFor(() => expect(server.bodiesTo("/replan")).toHaveLength(1));
+  expect(server.bodiesTo("/replan")[0]).toMatchObject({
+    bandwidth_estimate_kbps: 44100,
+    bandwidth_estimate_source: "observed_rebuffer",
+    observed_throughput_kbps: 11_800,
+  });
+  unmount();
+});
+
+// The player counts a quality pick once the session adopts its plan, and the
+// controller must hear of the pick before that plan's adoption.
+it("tells a quality change it was adopted before the new plan renders", async () => {
+  recordingServer();
+  const events: string[] = [];
+  const { result, unmount } = renderHook(
+    () => {
+      const session = usePlaybackSession("request-1", [], [], 7, 0, false, "auto");
+      const revision = session.planRevision;
+      useEffect(() => {
+        events.push(`rendered ${revision}`);
+      }, [revision]);
+      return session;
+    },
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.planRevision).toBe(1));
+  // A discrete-priority update renders, effects included, before the promise
+  // continuations that follow it, so no later callback can come first.
+  const click = vi.spyOn(window, "event", "get").mockReturnValue(new MouseEvent("click"));
+  onTestFinished(() => click.mockRestore());
+  act(() =>
+    result.current.changeQuality("720p", 120, undefined, (revision) => {
+      events.push(`adopted ${revision}`);
+    }),
+  );
+  await waitFor(() => expect(result.current.planRevision).toBe(2));
+  expect(events.filter((event) => event.endsWith(" 2"))).toEqual(["adopted 2", "rendered 2"]);
+  unmount();
+});
+
+it("refuses a lowering while another replan is in flight, and sends a Restore after it", async () => {
+  const server = recordingServer({ holdFirstReplan: true });
+  const { result, unmount } = await startSession();
+  act(() => result.current.changeSubtitleTrack(null, 120));
+  await waitFor(() => expect(server.bodiesTo("/replan")).toHaveLength(1));
+
+  // The lowering is not queued: the controller hears it was never sent.
+  const lowered = vi.fn();
+  act(() => result.current.changeQuality("auto", 121, lowering, lowered));
+  expect(lowered).toHaveBeenCalledWith(undefined, false);
+
+  const restored = vi.fn();
+  act(() => result.current.changeQuality("auto", 122, restore, restored));
+  await act(async () => server.release());
+  await waitFor(() => expect(server.bodiesTo("/replan")).toHaveLength(2));
+  expect(server.bodiesTo("/replan")[1]).toMatchObject({
+    operation: "quality_change",
+    learned_limit: "clear",
+  });
+  expect(server.bodiesTo("/replan")[1]).not.toHaveProperty("bandwidth_estimate_kbps");
+  await waitFor(() => expect(restored).toHaveBeenCalledWith(3));
+  unmount();
+});
+
+it("sends a Restore answered during a start once that start's plan is adopted", async () => {
+  const server = recordingServer({ holdSecondStart: true });
+  const { result, unmount } = await startSession();
+  act(() => result.current.switchVersion(99, 120));
+  await waitFor(() => expect(server.bodiesTo("/playback/start")).toHaveLength(2));
+  const restored = vi.fn();
+  await act(async () => {
+    result.current.changeQuality("auto", 121, restore, restored);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(server.bodiesTo("/replan")).toHaveLength(0);
+  await act(async () => server.releaseStart());
+  await waitFor(() => expect(server.bodiesTo("/replan")).toHaveLength(1));
+  expect(server.bodiesTo("/replan")[0]).toMatchObject({
+    operation: "quality_change",
+    learned_limit: "clear",
+    plan_attempt_key: "v3:plan:start0002",
+  });
+  await waitFor(() => expect(restored).toHaveBeenCalledWith(3));
+  unmount();
+});
+
+it("owes a Restore answered during a start that plays nothing to the next start", async () => {
+  const server = recordingServer({ holdSecondStart: true });
+  const { result, unmount } = await startSession();
+  act(() => result.current.switchVersion(99, 120));
+  await waitFor(() => expect(server.bodiesTo("/playback/start")).toHaveLength(2));
+  const restored = vi.fn();
+  act(() => result.current.changeQuality("auto", 121, restore, restored));
+  await act(async () => server.releaseStart(true));
+  await waitFor(() => expect(restored).toHaveBeenCalledWith(undefined));
+  act(() => result.current.switchVersion(100, 130));
+  await waitFor(() => expect(server.bodiesTo("/playback/start")).toHaveLength(3));
+  expect(server.bodiesTo("/playback/start")[2]).toMatchObject({ learned_limit: "clear" });
+  expect(server.bodiesTo("/replan")).toHaveLength(0);
+  unmount();
+});
+
+// S3: Auto under any budget may swap in a lower-bitrate sibling version, so a
+// file the viewer chose, or a Watch Party's, starts with alternates refused.
+it.each([
+  { name: "a default play", party: false, picked: false, switchTo: null, sent: [undefined] },
+  { name: "a Watch Party", party: true, picked: false, switchTo: null, sent: [false] },
+  {
+    name: "a version picked before Play",
+    party: false,
+    picked: true,
+    switchTo: null,
+    sent: [false],
+  },
+  { name: "a version switch", party: false, picked: false, switchTo: 99, sent: [undefined, false] },
+])("pins the file of $name", async ({ party, picked, switchTo, sent }) => {
+  const server = recordingServer();
+  const { result, unmount } = renderHook(
+    () =>
+      usePlaybackSession(
+        "request-1",
+        [],
+        [],
+        7,
+        0,
+        false,
+        "auto",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        !party,
+        "always",
+        picked,
+      ),
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.planRevision).toBe(1));
+  if (switchTo !== null) act(() => result.current.switchVersion(switchTo, 120));
+  await waitFor(() => expect(server.bodiesTo("/playback/start")).toHaveLength(sent.length));
+  expect(server.bodiesTo("/playback/start").map((body) => body.allow_alternate_versions)).toEqual(
+    sent,
+  );
+  unmount();
+});
+
+// D12/D16: a version switch tells its caller whether it adopted a plan.
+it("tells a version switch's caller the adopted revision, or none", async () => {
+  recordingServer();
+  const { result, unmount } = await startSession();
+  const sameFile = vi.fn();
+  act(() => result.current.switchVersion(result.current.mediaFileId ?? 7, 10, sameFile));
+  expect(sameFile).toHaveBeenCalledWith(undefined);
+  const switched = vi.fn();
+  act(() => result.current.switchVersion(99, 10, switched));
+  await waitFor(() => expect(switched).toHaveBeenCalledWith(2));
+  expect(switched).toHaveBeenCalledTimes(1);
+  unmount();
+});
+
+it("sends a displaced Restore's clear on one start only", async () => {
+  const server = recordingServer({ holdFirstReplan: true });
+  const { result, unmount } = await startSession();
+  act(() => result.current.changeSubtitleTrack(null, 120));
+  await waitFor(() => expect(server.bodiesTo("/replan")).toHaveLength(1));
+  act(() => result.current.changeQuality("auto", 121, restore));
+  // A version switch starts over and takes the queued Restore's place.
+  act(() => result.current.switchVersion(99, 122));
+  await waitFor(() => expect(server.bodiesTo("/playback/start")).toHaveLength(2));
+  expect(server.bodiesTo("/playback/start")[1]).toMatchObject({ learned_limit: "clear" });
+  await act(async () => server.release());
+  await waitFor(() => expect(result.current.planRevision).toBe(2));
+
+  // A later start must not clear a limit learned since.
+  act(() => result.current.switchVersion(100, 130));
+  await waitFor(() => expect(server.bodiesTo("/playback/start")).toHaveLength(3));
+  expect(server.bodiesTo("/playback/start")[2]).not.toHaveProperty("learned_limit");
+  unmount();
+});
+
+it("carries a displaced Restore's clear on the request that replaced it", async () => {
+  const server = recordingServer({ holdFirstReplan: true });
+  const { result, unmount } = await startSession();
+  act(() => result.current.changeSubtitleTrack(null, 120));
+  await waitFor(() => expect(server.bodiesTo("/replan")).toHaveLength(1));
+  act(() => result.current.changeQuality("auto", 121, restore));
+  // The viewer's track change takes the queued Restore's place.
+  act(() => result.current.switchAudioTrack(1, 122));
+  await act(async () => server.release());
+  await waitFor(() => expect(server.bodiesTo("/replan")).toHaveLength(2));
+  expect(server.bodiesTo("/replan")[1]).toMatchObject({
+    operation: "track_change",
+    learned_limit: "clear",
+  });
+  unmount();
+});
+
+describe("usePlaybackSession announced subtitle tracks", () => {
+  const stored = (index: number, id: number, language: string) =>
+    fixtureSubtitleInventoryItemV3({
+      track_id: `file:7:subtitle:${index}`,
+      combined_index: index,
+      source: "downloaded",
+      language,
+      label: language,
+      stored_subtitle_id: id,
+      url: `/stream/session-1/subtitles/${index}.vtt?file_id=7&downloaded_subtitle_id=${id}`,
+    });
+
+  // The plan lists stored subtitles 1 (en) and 2 (es) at ordinals 0 and 1.
+  // When a stored subtitle is deleted the server's later ordinals shift down,
+  // so an announced track can land on an ordinal this plan gives another
+  // stored subtitle. Only an append or a re-announcement of the same stored
+  // subtitle may be folded in; anything else means the plan is stale.
+  it.each([
+    { name: "appends a new track", track: stored(2, 3, "fr"), folds: true },
+    { name: "replaces a re-announced track", track: stored(1, 2, "es"), folds: true },
+    {
+      name: "refetches when a different stored track holds the ordinal",
+      track: stored(1, 3, "fr"),
+      folds: false,
+    },
+    {
+      name: "refetches when the announced track would leave a gap",
+      track: stored(3, 3, "fr"),
+      folds: false,
+    },
+  ])("$name", async ({ track, folds }) => {
+    const initial = [stored(0, 1, "en"), stored(1, 2, "es")];
+    const selected = { id: "file:7:subtitle:1", index: 1 };
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      sessionFetch(
+        (init) => {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Promise<Response>(() => {});
+        },
+        fixturePlanV3({
+          subtitle: { mode: "render", inventory: initial },
+          selected_tracks: { ...fixturePlanV3().selected_tracks, subtitle: selected },
+        }),
+      ),
+    );
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.applySubtitleTrack(track));
+
+    const inventory = result.current.plan?.subtitle.inventory ?? [];
+    if (folds) {
+      expect(inventory.find((item) => item.combined_index === track.combined_index)).toEqual(track);
+      expect(replanBodies).toEqual([]);
+    } else {
+      expect(inventory).toEqual(initial);
+      await waitFor(() => expect(replanBodies).toHaveLength(1));
+      // The refetch carries the viewer's subtitle over; the server keeps it
+      // on the same stored subtitle.
+      expect(replanBodies[0]).toMatchObject({
+        operation: "track_change",
+        selected_tracks: { subtitle: selected },
+      });
+    }
+    unmount();
+  });
+
+  // A conflicting announcement refetches the plan, and the viewer picks from
+  // the menu before it lands. The menu still lists en (stored 1) at 0 and es
+  // (stored 2) at 1; the refetch shows en deleted, es at 0 and fr (stored 3)
+  // at 1. A finished translation is picked at its server ordinal instead, and
+  // names its stored subtitle.
+  it.each([
+    {
+      name: "moves a menu pick made during a refetch to its ordinal",
+      storedId: undefined,
+      want: 0,
+    },
+    { name: "keeps a pick that names its stored subtitle", storedId: 3, want: 1 },
+  ])("$name", async ({ storedId, want }) => {
+    const initial = [stored(0, 1, "en"), stored(1, 2, "es")];
+    const refreshed = fixturePlanV3({
+      plan_id: "plan:refreshedinv0002",
+      plan_attempt_key: "v3:refreshedinv0002",
+      subtitle: { mode: "render", inventory: [stored(0, 2, "es"), stored(1, 3, "fr")] },
+    });
+    let resolveRefresh: ((response: Response) => void) | undefined;
+    const refreshResponse = new Promise<Response>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      sessionFetch(
+        (init) => {
+          replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return replanBodies.length === 1 ? refreshResponse : new Promise<Response>(() => {});
+        },
+        fixturePlanV3({ subtitle: { mode: "render", inventory: initial } }),
+      ),
+    );
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.applySubtitleTrack(stored(1, 3, "fr")));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    act(() => result.current.changeSubtitleTrack(1, 31, storedId));
+    await act(async () => {
+      resolveRefresh?.(jsonResponse(playable("session-1", refreshed)));
+      await refreshResponse;
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { subtitle: { index: want } },
+    });
+    unmount();
+  });
+
+  // The plan lists en (stored 1) at 0 and es (stored 2) at 1. While a quality
+  // change runs, the server deletes 1, so es moves to 0 and fr (stored 3) is
+  // added at 1, and the viewer picks es at 1 from the stale menu. The
+  // conflicting announcement shows the pick's ordinal is stale: the plan is
+  // refetched first, and the pick then goes out at es's new ordinal.
+  it.each([
+    {
+      name: "replays a queued stored-subtitle pick at its ordinal after a refetch",
+      next: "none",
+      trackless: false,
+    },
+    {
+      name: "replays the pick over a seek made while the refetch runs",
+      next: "seek",
+      trackless: false,
+    },
+    {
+      name: "replays the pick at an in-stream seek made while the refetch runs",
+      next: "reported",
+      trackless: false,
+    },
+    {
+      name: "keeps a newer pick made while the refetch runs, at its ordinal",
+      next: "pick",
+      trackless: false,
+    },
+    {
+      name: "turns subtitles off for a newer pick the refetch no longer lists",
+      next: "deleted",
+      trackless: false,
+    },
+    {
+      name: "turns subtitles off for a queued pick the refetch no longer lists",
+      next: "gone",
+      trackless: false,
+    },
+    // An announcement the server could not resolve carries no track, and the
+    // player refetches without knowing which ordinals moved.
+    { name: "replays the pick after a trackless announcement", next: "none", trackless: true },
+  ] as const)("$name", async ({ next, trackless }) => {
+    // de (stored 4) sits at 2 in this plan and moves to 1 once en is deleted.
+    const initial = [stored(0, 1, "en"), stored(1, 2, "es"), stored(2, 4, "de")];
+    const plan = fixturePlanV3({ subtitle: { mode: "render", inventory: initial } });
+    const refreshed = fixturePlanV3({
+      plan_id: "plan:refreshedinv0001",
+      plan_attempt_key: "v3:refreshedinv0001",
+      subtitle: {
+        mode: "render",
+        inventory: [stored(0, 2, "es"), stored(1, 4, "de"), stored(2, 3, "fr")],
+      },
+    });
+    let resolveQualityReplan: ((response: Response) => void) | undefined;
+    const qualityReplanResponse = new Promise<Response>((resolve) => {
+      resolveQualityReplan = resolve;
+    });
+    let resolveRefresh: ((response: Response) => void) | undefined;
+    const refreshResponse = new Promise<Response>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      sessionFetch((init) => {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (replanBodies.length === 1) return qualityReplanResponse;
+        if (replanBodies.length === 2) return refreshResponse;
+        return new Promise<Response>(() => {});
+      }, plan),
+    );
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.changeQuality("1080p", 30));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    // es, or en (stored 1), which the refetch shows was deleted.
+    act(() => result.current.changeSubtitleTrack(next === "gone" ? 0 : 1, 31));
+    act(() => {
+      if (trackless) result.current.refreshSubtitles(31);
+      else result.current.applySubtitleTrack(stored(2, 3, "fr"));
+    });
+    await act(async () => {
+      // The quality change's plan still lists the stale inventory.
+      resolveQualityReplan?.(
+        jsonResponse(
+          playable("session-1", {
+            ...plan,
+            plan_id: "plan:qualityplan00001",
+            plan_attempt_key: "v3:qualityplan00001",
+          }),
+        ),
+      );
+      await qualityReplanResponse;
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(2));
+    expect(replanBodies[1]).toMatchObject({ operation: "track_change" });
+    expect(replanBodies[1]?.selected_tracks).not.toHaveProperty("subtitle.index", 1);
+    // The menu still lists this plan's inventory, so a pick made now names
+    // de by its stale ordinal.
+    act(() => {
+      if (next === "pick") result.current.changeSubtitleTrack(2, 32);
+      if (next === "deleted") result.current.changeSubtitleTrack(0, 32);
+      if (next === "seek") void result.current.reanchorSeek(200);
+      if (next === "reported") result.current.reportSeek(200);
+    });
+    await act(async () => {
+      resolveRefresh?.(jsonResponse(playable("session-1", refreshed)));
+      await refreshResponse;
+    });
+
+    await waitFor(() => expect(replanBodies).toHaveLength(3));
+    expect(replanBodies[2]).toMatchObject({ operation: "track_change" });
+    if (next === "deleted" || next === "gone") {
+      expect(replanBodies[2]?.selected_tracks).not.toHaveProperty("subtitle.index");
+    } else {
+      expect(replanBodies[2]).toMatchObject({
+        selected_tracks: { subtitle: { index: next === "pick" ? 1 : 0 } },
+      });
+    }
+    if (next === "seek" || next === "reported") {
+      expect(replanBodies[2]).toMatchObject({ position_seconds: 200 });
+    }
+    unmount();
+  });
+});
+
+describe("usePlaybackSession page unload", () => {
+  function pagehide(persisted: boolean) {
+    const event = new Event("pagehide");
+    Object.defineProperty(event, "persisted", { value: persisted });
+    window.dispatchEvent(event);
+  }
+
+  it("stops on a real unload but keeps a page entering the back-forward cache", async () => {
+    const fetchMock = sessionFetch(() => {
+      throw new Error("unexpected replan");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const stopCalls = () =>
+      fetchMock.mock.calls.filter(([, init]) => init?.method === "DELETE").map(([, init]) => init);
+
+    const { result, unmount } = renderSession();
+    await waitFor(() => expect(result.current.sessionId).toBe("session-1"));
+
+    act(() => pagehide(true));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(stopCalls()).toHaveLength(0);
+
+    act(() => pagehide(false));
+    await waitFor(() => expect(stopCalls()).toHaveLength(1));
+    expect(stopCalls()[0]?.keepalive).toBe(true);
+    unmount();
+  });
+});
+
+describe("usePlaybackSession leaving the player", () => {
+  it("tells the host once the unmount stop lands, not when the player unmounts", async () => {
+    let answerStop: (response: Response) => void = () => {};
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(playable("session-1"), { status: 201 });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Promise<Response>((r) => (answerStop = r));
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onSessionStopped = vi.fn();
+    const config: PlayerConfig = { ...playerConfig, onSessionStopped };
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      {
+        wrapper: ({ children }: { children: ReactNode }) =>
+          createElement(PlayerConfigProvider, { config, children }),
+      },
+    );
+    await waitFor(() => expect(result.current.sessionId).toBe("session-1"));
+
+    unmount();
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(true),
+    );
+    // The page the viewer returned to has already read its watch state; the
+    // stop has not written its part yet.
+    expect(onSessionStopped).not.toHaveBeenCalled();
+
+    answerStop(jsonResponse({ outcome: "stopped" }));
+    await waitFor(() => expect(onSessionStopped).toHaveBeenCalledTimes(1));
+  });
+});

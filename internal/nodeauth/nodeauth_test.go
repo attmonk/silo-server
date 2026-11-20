@@ -1,0 +1,318 @@
+package nodeauth
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+const testSecret = "shared-secret-for-tests"
+
+var testNow = time.Unix(1_760_000_000, 0)
+
+// signedServerRequest signs a client request, then rebuilds it the way a
+// server receives it: from the request line and body bytes on the wire.
+func signedServerRequest(t *testing.T, method, target string, body []byte, signedAt time.Time) *http.Request {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	client, err := http.NewRequest(method, target, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sign(client, "http://node.test", testSecret, signedAt); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	server := httptest.NewRequest(method, client.URL.RequestURI(), bytes.NewReader(body))
+	server.Header.Set("Authorization", client.Header.Get("Authorization"))
+	return server
+}
+
+func TestVerifyRejectsAlteredRequests(t *testing.T) {
+	body := []byte(`{"session_id":"abc"}`)
+	for _, tc := range []struct {
+		name  string
+		alter func(r *http.Request)
+	}{
+		{"method", func(r *http.Request) { r.Method = http.MethodPut }},
+		{"path", func(r *http.Request) { r.URL.Path = "/transcode/other" }},
+		{"query", func(r *http.Request) { r.URL.RawQuery = "x=1" }},
+		{"body", func(r *http.Request) { r.Body = io.NopCloser(strings.NewReader(`{"session_id":"xyz"}`)) }},
+		{"signature", func(r *http.Request) {
+			r.Header.Set("Authorization", strings.Replace(r.Header.Get("Authorization"), "sig=", "sig=00", 1))
+		}},
+		{"timestamp", func(r *http.Request) {
+			r.Header.Set("Authorization", strings.Replace(r.Header.Get("Authorization"), "t=1760000000", "t=1760000001", 1))
+		}},
+		{"claimed body hash", func(r *http.Request) {
+			// A correct hash of a different body, with the original signature.
+			other := sha256.Sum256([]byte(`{"session_id":"xyz"}`))
+			auth := r.Header.Get("Authorization")
+			start := strings.Index(auth, "b=") + len("b=")
+			r.Header.Set("Authorization", auth[:start]+hex.EncodeToString(other[:])+auth[start+64:])
+			r.Body = io.NopCloser(strings.NewReader(`{"session_id":"xyz"}`))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := signedServerRequest(t, http.MethodPost, "http://node.test/transcode/start", body, testNow)
+			tc.alter(r)
+			if err := verify(r, testSecret, testNow); !errors.Is(err, ErrUnauthorized) {
+				t.Fatalf("verify = %v, want ErrUnauthorized", err)
+			}
+		})
+	}
+}
+
+func TestVerifyEnforcesTheValidityWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		offset time.Duration
+		ok     bool
+	}{
+		{"within past", -maxSkew, true},
+		{"within future", maxSkew, true},
+		{"too old", -maxSkew - time.Second, false},
+		{"too far ahead", maxSkew + time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := signedServerRequest(t, http.MethodGet, "http://node.test/status", nil, testNow.Add(tc.offset))
+			err := verify(r, testSecret, testNow)
+			if tc.ok && err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+			if !tc.ok && !errors.Is(err, ErrUnauthorized) {
+				t.Fatalf("verify = %v, want ErrUnauthorized", err)
+			}
+		})
+	}
+}
+
+func TestVerifyRejectsAnotherSecret(t *testing.T) {
+	r := signedServerRequest(t, http.MethodGet, "http://node.test/status", nil, testNow)
+	if err := verify(r, "a-different-secret", testNow); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("verify = %v, want ErrUnauthorized", err)
+	}
+}
+
+func TestVerifyRejectsOversizedBodies(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), maxBodyBytes+1)
+	r := signedServerRequest(t, http.MethodPost, "http://node.test/transcode/start", body, testNow)
+	if err := verify(r, testSecret, testNow); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("verify = %v, want ErrUnauthorized", err)
+	}
+}
+
+// A caller without the secret must not be able to make the worker read, let
+// alone buffer, a request body.
+func TestVerifyChecksTheSignatureBeforeReadingTheBody(t *testing.T) {
+	body := &countingReader{}
+	r := httptest.NewRequest(http.MethodPost, "/admin/reload-config", body)
+	r.Header.Set("Authorization", Scheme+" t=1760000000,b="+hex.EncodeToString(emptyBodyHash[:])+",sig="+strings.Repeat("00", 32))
+	if err := verify(r, testSecret, testNow); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("verify = %v, want ErrUnauthorized", err)
+	}
+	if body.read != 0 {
+		t.Fatalf("read %d body bytes before the signature was checked", body.read)
+	}
+}
+
+type countingReader struct{ read int }
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n := min(len(p), 1<<10)
+	c.read += n
+	return n, nil
+}
+
+func TestVerifyRequiresACredential(t *testing.T) {
+	for _, auth := range []string{
+		"",
+		"Bearer",
+		"Bearer ",
+		"Bearer wrong",
+		Scheme,
+		Scheme + " t=1760000000",
+		Scheme + " sig=00",
+		Scheme + " t=1760000000,sig=" + strings.Repeat("00", 32),
+		Scheme + " t=now,b=" + hex.EncodeToString(emptyBodyHash[:]) + ",sig=" + strings.Repeat("00", 32),
+		Scheme + " t=1760000000,b=" + hex.EncodeToString(emptyBodyHash[:]) + ",sig=zz",
+		Scheme + " t=1760000000,b=00,sig=" + strings.Repeat("00", 32),
+		"Basic " + testSecret,
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/status", nil)
+		if auth != "" {
+			r.Header.Set("Authorization", auth)
+		}
+		if err := verify(r, testSecret, testNow); !errors.Is(err, ErrUnauthorized) {
+			t.Errorf("Authorization %q: verify = %v, want ErrUnauthorized", auth, err)
+		}
+	}
+}
+
+func TestNoSecretVerifiesNothing(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.Header.Set("Authorization", "Bearer ")
+	if err := Verify(req, ""); !errors.Is(err, ErrNoSecret) {
+		t.Fatalf("Verify = %v, want ErrNoSecret", err)
+	}
+}
+
+// The legacy bearer keeps older API servers and proxies working during a
+// rolling upgrade. Remove with the legacy bearer in Verify.
+func TestVerifyAcceptsTheLegacyBearerForOneRelease(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/status", nil)
+	r.Header.Set("Authorization", "Bearer "+testSecret)
+	if err := verify(r, testSecret, testNow); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}
+
+func TestSignKeepsUnrewindableBodiesReadable(t *testing.T) {
+	body := `{"artifact_id":"a"}`
+	req, err := http.NewRequest(http.MethodPost, "http://node.test/downloads/prepare", io.NopCloser(strings.NewReader(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.GetBody != nil {
+		t.Fatal("test needs a body without GetBody")
+	}
+	if err := sign(req, "http://node.test", testSecret, testNow); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body || req.ContentLength != int64(len(body)) {
+		t.Fatalf("body = %q (length %d), want %q", got, req.ContentLength, body)
+	}
+}
+
+// TestSignedRequestRoundTrip sends a signed request over a real connection, so
+// the path, query, and body are the bytes a server actually receives.
+func TestSignedRequestRoundTrip(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := Verify(r, testSecret); err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/transcode/a%20b/segment/1.ts/downloaded?generation=x%2By", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sign(req, server.URL, testSecret, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	got, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(got) != "payload" {
+		t.Fatalf("status %d body %q, want 200 payload", resp.StatusCode, got)
+	}
+}
+
+// A worker registered under a path prefix that its reverse proxy strips
+// serves, and verifies, the path without the prefix.
+func TestSignedPathIsRelativeToTheNodeURL(t *testing.T) {
+	for _, tc := range []struct {
+		name, nodeURL, target, workerSees string
+	}{
+		{"no prefix", "http://gateway.test", "http://gateway.test/transcode/abc/master.m3u8?x=1", "/transcode/abc/master.m3u8?x=1"},
+		{"prefix", "http://gateway.test/node1", "http://gateway.test/node1/transcode/abc/master.m3u8?x=1", "/transcode/abc/master.m3u8?x=1"},
+		{"prefix with trailing slash", "http://gateway.test/node1/", "http://gateway.test/node1/status", "/status"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := http.NewRequest(http.MethodGet, tc.target, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sign(client, tc.nodeURL, testSecret, testNow); err != nil {
+				t.Fatal(err)
+			}
+			worker := httptest.NewRequest(http.MethodGet, tc.workerSees, nil)
+			worker.Header.Set("Authorization", client.Header.Get("Authorization"))
+			if err := verify(worker, testSecret, testNow); err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+		})
+	}
+	// The prefix is not a wildcard: a different route still fails.
+	client, err := http.NewRequest(http.MethodGet, "http://gateway.test/node1/status", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sign(client, "http://gateway.test/node1", testSecret, testNow); err != nil {
+		t.Fatal(err)
+	}
+	worker := httptest.NewRequest(http.MethodGet, "/hw-capabilities", nil)
+	worker.Header.Set("Authorization", client.Header.Get("Authorization"))
+	if err := verify(worker, testSecret, testNow); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("verify = %v, want ErrUnauthorized", err)
+	}
+}
+
+// A worker behind a reverse proxy that strips the path prefix of its
+// registered URL still verifies the request, over a real connection.
+func TestSignedRequestThroughAPrefixStrippingProxy(t *testing.T) {
+	worker := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := Verify(r, testSecret); err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, r.URL.Path)
+	})
+	server := httptest.NewServer(http.StripPrefix("/node1", worker))
+	defer server.Close()
+
+	nodeURL := server.URL + "/node1"
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, nodeURL+"/transcode/start", strings.NewReader(`{"session_id":"abc"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sign(req, nodeURL, testSecret, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	got, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(got) != "/transcode/start" {
+		t.Fatalf("status %d body %q, want 200 /transcode/start", resp.StatusCode, got)
+	}
+}
+
+func TestSignNeverSendsTheSecret(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "http://node.test/hw-capabilities", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sign(req, "http://node.test", testSecret, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	auth := req.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, Scheme+" ") {
+		t.Fatalf("Authorization = %q, want %s scheme", auth, Scheme)
+	}
+	if strings.Contains(auth, testSecret) {
+		t.Fatal("Authorization carries the shared secret")
+	}
+}

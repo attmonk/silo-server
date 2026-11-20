@@ -1,0 +1,1839 @@
+package intromarkers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/markers"
+	"github.com/Silo-Server/silo-server/internal/mediaartifact"
+	"github.com/Silo-Server/silo-server/internal/mediasample"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+type Analyzer struct {
+	repo      introRepository
+	extractor fingerprintExtractor
+	refiner   boundaryRefiner
+	config    Config
+	logger    *slog.Logger
+	// tailSampler runs credits tail passes. Nil leaves credits to chapters
+	// and audio.
+	tailSampler creditsTailSampler
+	// movieSampler runs movie tail passes. Nil leaves movie credits to
+	// chapters.
+	movieSampler movieTailSampler
+	// hardware is where the tail samplers decode keyframes; SetHardwareDecode
+	// updates it. Nil when the samplers are replaced.
+	hardware *mediasample.HardwareResolver
+	// movieBudget bounds how long a scheduled run starts new movies; zero
+	// means movieCreditsRunBudget. now, when set, replaces time.Now for it.
+	movieBudget time.Duration
+	now         func() time.Time
+	// moviePageSize is how many movies a scheduled run lists at a time;
+	// zero means movieCandidatePageSize.
+	moviePageSize int
+	// episodeSeasonsPerPage is how many seasons a scheduled run loads at a
+	// time; zero means episodeCandidateSeasonsPerPage.
+	episodeSeasonsPerPage int
+	// node names this server in recorded silence refinement failures, which
+	// only defer retries on the server that recorded them.
+	node string
+	// slotsMu guards workers and the ffmpegSlots pointer, which SetWorkers
+	// sets when the markers.detection_workers setting changes.
+	slotsMu sync.Mutex
+	// workers is how many season groups, and silence backfill shares, run at
+	// once. Zero falls back to config.MaxParallelFFmpeg.
+	workers int
+	// ffmpegSlots bounds the ffmpeg processes this analyzer runs at once across
+	// the nightly run and its season workers, with a slot reserved for
+	// analysis started from playback (see WithPlaybackPriority). Nil means no
+	// shared bound.
+	ffmpegSlots *mediasample.Limiter
+	// lookupSlots bounds concurrent fingerprint cache reads across every group
+	// being analyzed; see fingerprintLookupSlots.
+	lookupOnce  sync.Once
+	lookupSlots chan struct{}
+	// tailWarnOnce logs once that ffmpeg cannot run the credits tail pass.
+	tailWarnOnce sync.Once
+	// movieWarnOnce logs once that ffmpeg cannot run the movie tail pass.
+	movieWarnOnce sync.Once
+}
+
+// maxConcurrentFingerprintLookups caps the database connections fingerprint
+// cache reads hold at once. Each candidate in a season looks up its cache
+// entry concurrently, and several seasons run at once, so without a cap the
+// nightly run could take the whole pool and starve API requests.
+const maxConcurrentFingerprintLookups = 4
+
+// WithPlaybackPriority marks analysis a viewer is waiting on, letting it use
+// the ffmpeg slot reserved for playback and run ffmpeg at normal process
+// priority. Background callers, such as admin refreshes, must not use it or
+// they would queue ahead of playback.
+func WithPlaybackPriority(ctx context.Context) context.Context {
+	return mediasample.WithInteractive(ctx)
+}
+
+type introRepository interface {
+	CountEnabledLibraries(ctx context.Context) (int, error)
+	CountEligibleCandidates(ctx context.Context) (int, error)
+	ListEligibleCandidatePage(ctx context.Context, after *episodeCandidateCursor, seasons int) ([]Candidate, *episodeCandidateCursor, error)
+	ListCandidatesForEpisode(ctx context.Context, episodeID string) ([]Candidate, error)
+	ListCandidatesForGroup(ctx context.Context, mediaFolderID int, seasonID, analysisGroupKey string) ([]Candidate, error)
+	ListChapterSilenceBackfillCandidates(ctx context.Context, limit int, cfg Config, node string) ([]Candidate, error)
+	ListMovieCandidates(ctx context.Context, node string, after *movieCandidateCursor, limit int) ([]Candidate, *movieCandidateCursor, error)
+	ListMovieCandidatesForItem(ctx context.Context, contentID string) ([]Candidate, error)
+	ListMovieCandidatesForFile(ctx context.Context, fileID int) ([]Candidate, error)
+	LoadSilenceRefinementAttempt(ctx context.Context, fileID int) (*SilenceRefinementAttempt, error)
+	UpsertSilenceRefinementAttempt(ctx context.Context, attempt SilenceRefinementAttempt) error
+	PatchMarker(ctx context.Context, patch MarkerPatch) (bool, error)
+	WithdrawMarker(ctx context.Context, withdrawal MarkerWithdrawal) (bool, error)
+	LoadSeasonState(ctx context.Context, state SeasonState, analysisHash string) (*SeasonState, error)
+	UpsertSeasonState(ctx context.Context, state SeasonState, analysisHash string) error
+	LoadFingerprint(ctx context.Context, candidate Candidate, cfg Config) (*Fingerprint, error)
+	UpsertFingerprint(ctx context.Context, fp Fingerprint) error
+	LoadArtifacts(ctx context.Context, fileIDs []int, key mediaartifact.Key) (map[int]mediaartifact.Artifact, error)
+	UpsertArtifact(ctx context.Context, a mediaartifact.Artifact) error
+	RecordArtifactFailure(ctx context.Context, failure mediaartifact.Failure) error
+}
+
+type fingerprintExtractor interface {
+	Preflight(ctx context.Context) error
+	// Extract fingerprints a candidate's opening audio for intros.
+	Extract(ctx context.Context, candidate Candidate) (Fingerprint, bool, error)
+	// ExtractCredits fingerprints a candidate's tail audio for credits.
+	ExtractCredits(ctx context.Context, candidate Candidate) (Fingerprint, bool, error)
+}
+
+func NewAnalyzer(repo *Repository, config Config, logger *slog.Logger) *Analyzer {
+	config = config.normalized()
+	if logger == nil {
+		logger = slog.Default()
+	}
+	node, _ := os.Hostname()
+	if node == "" {
+		node = "silo"
+	}
+	extractor := NewChromaprintExtractor(config)
+	extractor.logger = logger
+	return &Analyzer{
+		repo:         repo,
+		extractor:    extractor,
+		tailSampler:  extractor,
+		movieSampler: extractor,
+		hardware:     extractor.hardware,
+		refiner:      NewSilenceBoundaryRefiner(config),
+		config:       config,
+		logger:       logger,
+		node:         node,
+		workers:      config.MaxParallelFFmpeg,
+		ffmpegSlots:  mediasample.NewLimiter(config.MaxParallelFFmpeg),
+	}
+}
+
+// SetHardwareDecode applies the playback.hw_accel and playback.hw_device
+// settings to the next credits tail pass without a restart.
+func (a *Analyzer) SetHardwareDecode(accel, device string) {
+	if a.hardware != nil {
+		a.hardware.Set(accel, device)
+	}
+}
+
+// SetWorkers applies the markers.detection_workers setting: how many season
+// groups are analyzed at once and how many ffmpeg processes they may run. Less
+// than one means DefaultDetectionWorkers. The change applies to new work
+// without waiting for a run to finish; after a decrease, extractions already
+// running finish before new ones start.
+func (a *Analyzer) SetWorkers(n int) {
+	if n <= 0 {
+		n = DefaultDetectionWorkers
+	}
+	a.slotsMu.Lock()
+	defer a.slotsMu.Unlock()
+	if a.workers == n && a.ffmpegSlots != nil {
+		return
+	}
+	a.workers = n
+	if a.ffmpegSlots == nil {
+		a.ffmpegSlots = mediasample.NewLimiter(n)
+		return
+	}
+	a.ffmpegSlots.Resize(n)
+}
+
+// nodeName names this server in recorded analysis failures.
+func (a *Analyzer) nodeName() string {
+	if a.node != "" {
+		return a.node
+	}
+	return "silo"
+}
+
+// workerCount is the current number of season workers.
+func (a *Analyzer) workerCount() int {
+	a.slotsMu.Lock()
+	defer a.slotsMu.Unlock()
+	if a.workers > 0 {
+		return a.workers
+	}
+	return max(1, a.config.normalized().MaxParallelFFmpeg)
+}
+
+func (a *Analyzer) sharedSlots() *mediasample.Limiter {
+	a.slotsMu.Lock()
+	defer a.slotsMu.Unlock()
+	return a.ffmpegSlots
+}
+
+// acquireFFmpeg waits for an ffmpeg slot and returns its release. Interactive
+// analysis may also take the reserved slot, so it never waits behind the
+// nightly queue for more than one extraction.
+func (a *Analyzer) acquireFFmpeg(ctx context.Context) (func(), error) {
+	slots := a.sharedSlots()
+	if slots == nil {
+		return func() {}, ctx.Err()
+	}
+	return slots.Acquire(ctx)
+}
+
+// fingerprintLookupSlots returns the analyzer-wide bound on concurrent
+// fingerprint cache reads, created on first use so analyzers built without
+// NewAnalyzer share one too.
+func (a *Analyzer) fingerprintLookupSlots() chan struct{} {
+	a.lookupOnce.Do(func() {
+		a.lookupSlots = make(chan struct{}, maxConcurrentFingerprintLookups)
+	})
+	return a.lookupSlots
+}
+
+// fingerprintLookup is what the cache holds for a candidate's fingerprint.
+type fingerprintLookup int
+
+const (
+	// fingerprintMissing means the fingerprint has to be extracted.
+	fingerprintMissing fingerprintLookup = iota
+	// fingerprintCached means a cached fingerprint was returned.
+	fingerprintCached
+	// fingerprintUnusable means the file has no audio to fingerprint.
+	fingerprintUnusable
+	// fingerprintDeferred means this server's last extraction failed and is
+	// backing off.
+	fingerprintDeferred
+)
+
+// withLookupSlot runs a fingerprint cache read within the lookup bound. The
+// slot covers only the read, not the wait for ffmpeg that may follow a miss.
+func (a *Analyzer) withLookupSlot(ctx context.Context, read func() error) error {
+	slots := a.fingerprintLookupSlots()
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-slots }()
+	return read()
+}
+
+// fingerprintLookupFunc returns how ensureFingerprints reads a candidate's
+// cached intro fingerprint.
+func (a *Analyzer) fingerprintLookupFunc() func(context.Context, Candidate) (*Fingerprint, fingerprintLookup, error) {
+	return func(ctx context.Context, candidate Candidate) (*Fingerprint, fingerprintLookup, error) {
+		var fp *Fingerprint
+		err := a.withLookupSlot(ctx, func() error {
+			var err error
+			fp, err = a.repo.LoadFingerprint(ctx, candidate, a.config)
+			return err
+		})
+		if err != nil || fp == nil {
+			return nil, fingerprintMissing, err
+		}
+		return fp, fingerprintCached, nil
+	}
+}
+
+// ffmpegAcquirer returns how one analysis waits for an ffmpeg slot.
+// Analyzers built without NewAnalyzer have no shared limiter; each analysis
+// then bounds its own ffmpeg processes.
+func (a *Analyzer) ffmpegAcquirer() func(context.Context) (func(), error) {
+	if a.sharedSlots() == nil {
+		local := &Analyzer{ffmpegSlots: mediasample.NewLimiter(a.workerCount())}
+		return local.acquireFFmpeg
+	}
+	return a.acquireFFmpeg
+}
+
+type ProgressFunc func(percent float64, message string)
+
+// Preflight reports what this server's ffmpeg lacks for Chromaprint
+// comparison. Without it, Run still reads chapters and refines them with
+// silence, but compares no season groups. The error matches
+// mediasample.ErrUnsupported only when ffmpeg's capability listing succeeded
+// and lacks Chromaprint.
+func (a *Analyzer) Preflight(ctx context.Context) error {
+	return a.extractor.Preflight(ctx)
+}
+
+// Run analyzes every library with marker detection enabled for the kinds
+// selected: episodes for intros, credits, or both, then movies for credits
+// within the movie budget. Movies are skipped when credits are not
+// selected.
+func (a *Analyzer) Run(ctx context.Context, kinds EpisodeMarkerKinds, progress ProgressFunc) (RunSummary, error) {
+	return a.run(ctx, kinds, progress, runPasses{episodes: true, movies: true})
+}
+
+// RunEpisodes analyzes the episodes of every library with marker detection
+// enabled for the kinds selected, as Run does, and leaves movies alone. A
+// server without Chromaprint runs it outside the cluster lock, then
+// RunMovies under it, so the movie pass stays on one server.
+func (a *Analyzer) RunEpisodes(ctx context.Context, kinds EpisodeMarkerKinds, progress ProgressFunc) (RunSummary, error) {
+	return a.run(ctx, kinds, progress, runPasses{episodes: true})
+}
+
+// RunMovies analyzes the movies of every library with marker detection
+// enabled for credits within the movie budget, as Run does after the
+// episodes, and leaves episodes alone. It does nothing when kinds leaves
+// credits out.
+func (a *Analyzer) RunMovies(ctx context.Context, kinds EpisodeMarkerKinds, progress ProgressFunc) (RunSummary, error) {
+	return a.run(ctx, kinds, progress, runPasses{movies: true})
+}
+
+// runPasses selects the passes of a scheduled run.
+type runPasses struct {
+	episodes, movies bool
+}
+
+func (a *Analyzer) run(ctx context.Context, kinds EpisodeMarkerKinds, progress ProgressFunc, passes runPasses) (RunSummary, error) {
+	report := func(percent float64, message string) {
+		if progress != nil {
+			progress(percent, message)
+		}
+	}
+
+	summary := RunSummary{}
+	// Movies are checked for credits only.
+	movies := passes.movies && kinds.Credits
+	if !passes.episodes && !movies {
+		report(100, "Credits detection is turned off")
+		return summary, nil
+	}
+	// With credits on, movies follow the episodes: in this run, or in the
+	// RunMovies pass a server without Chromaprint runs after RunEpisodes.
+	// Their share of the time limit is reserved now, so the library lookup
+	// comes out of the episodes' share.
+	episodeCtx, stopEpisodes := ctx, context.CancelFunc(func() {})
+	if passes.episodes && kinds.Credits {
+		episodeCtx, stopEpisodes = a.episodeContext(ctx)
+	}
+	defer stopEpisodes()
+	libraries, err := a.repo.CountEnabledLibraries(ctx)
+	if err != nil {
+		return summary, err
+	}
+	summary.LibrariesScanned = libraries
+	if libraries == 0 {
+		report(100, "No libraries with marker detection enabled")
+		return summary, nil
+	}
+	if !kinds.Any() {
+		report(100, "Intro and credits detection are turned off")
+		return summary, nil
+	}
+
+	if !movies {
+		if err := a.runEpisodeShare(episodeCtx, kinds, report, &summary); err != nil {
+			return summary, err
+		}
+		// The episodes' share ending is not an error, but the run's own end
+		// still is, when it comes at the same time.
+		if err := ctx.Err(); err != nil {
+			return summary, err
+		}
+		if passes.movies {
+			report(100, "Intro detection completed; credits detection is turned off")
+		}
+		return summary, nil
+	}
+
+	// With both passes, episodes take the first 85 percent of the progress
+	// bar and movies the rest.
+	moviesFrom := 0.0
+	if passes.episodes {
+		moviesFrom = 85
+		err := a.runEpisodeShare(episodeCtx, kinds, func(percent float64, message string) {
+			report(percent*moviesFrom/100, message)
+		}, &summary)
+		if err != nil {
+			return summary, err
+		}
+	}
+
+	report(moviesFrom, "Checking movies for credits")
+	movieSummary, err := a.runMovies(ctx, func(done int, budgetUsed float64) {
+		report(moviesFrom+budgetUsed*(100-moviesFrom), fmt.Sprintf("Checked %d movies for credits", done))
+	})
+	mergeRunSummary(&summary, movieSummary)
+	if err != nil {
+		return summary, err
+	}
+	switch {
+	case summary.EpisodeBudgetExhausted && summary.MovieBudgetExhausted:
+		report(100, "Marker detection completed; remaining episodes and movies wait for the next run")
+	case summary.EpisodeBudgetExhausted:
+		report(100, "Marker detection completed; remaining episodes wait for the next run")
+	case summary.MovieBudgetExhausted:
+		report(100, "Marker detection completed; remaining movies wait for the next run")
+	default:
+		report(100, "Marker detection completed")
+	}
+	return summary, nil
+}
+
+// errEpisodeBudgetSpent is the cause of an episode pass stopped to leave the
+// movies their share of the run's time.
+var errEpisodeBudgetSpent = errors.New("episode share of the run's time limit spent")
+
+// episodeContext bounds the episode pass of a run that has a deadline, such
+// as a scheduled run with a max runtime, so the episodes cannot use the whole
+// run and leave none for the movies after them. It reserves the movie budget
+// before the deadline, or half the time left when that is shorter. A run
+// without a deadline, or with no movie to analyze, gets ctx unchanged.
+func (a *Analyzer) episodeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || !a.moviesPending(ctx) {
+		return ctx, func() {}
+	}
+	reserve := min(a.movieRunBudget(), time.Until(deadline)/2)
+	return context.WithDeadlineCause(ctx, deadline.Add(-reserve), errEpisodeBudgetSpent)
+}
+
+// moviesPending reports whether the movie pass would list a movie, so a
+// server whose movies need no analysis, such as one with only TV libraries,
+// gives its episodes the whole run. A failed lookup counts as pending; the
+// movie pass then reports the error.
+func (a *Analyzer) moviesPending(ctx context.Context) bool {
+	candidates, _, err := a.repo.ListMovieCandidates(ctx, a.nodeName(), nil, 1)
+	return err != nil || len(candidates) > 0
+}
+
+// runEpisodeShare runs the episodes under episodeCtx, from episodeContext,
+// and merges them into summary. Episodes stopped at the end of their share
+// are not an error: they stopped where a cancel stops them, the season groups
+// they finished are saved, and the next run resumes there. Any other error,
+// such as a repository failure, is returned.
+func (a *Analyzer) runEpisodeShare(episodeCtx context.Context, kinds EpisodeMarkerKinds, report ProgressFunc, summary *RunSummary) error {
+	episodeSummary, err := a.runEpisodes(episodeCtx, kinds, report)
+	mergeRunSummary(summary, episodeSummary)
+	if errors.Is(context.Cause(episodeCtx), errEpisodeBudgetSpent) && (err == nil || errors.Is(err, context.DeadlineExceeded)) {
+		summary.EpisodeBudgetExhausted = true
+		return nil
+	}
+	return err
+}
+
+// episodeCandidateSeasonsPerPage is how many seasons the library-wide run
+// loads at a time. A page holds every eligible file of its seasons, so the
+// run's memory follows the page size rather than the library size.
+const episodeCandidateSeasonsPerPage = 500
+
+// runEpisodes analyzes the episodes of every enabled library for kinds,
+// reporting progress from 0 to 100. It loads the episodes a page of seasons
+// at a time: each page gets its chapter passes, then its season groups go to
+// the workers, and the next page loads once the workers have taken them all.
+func (a *Analyzer) runEpisodes(ctx context.Context, kinds EpisodeMarkerKinds, report ProgressFunc) (RunSummary, error) {
+	summary := RunSummary{}
+	total, err := a.repo.CountEligibleCandidates(ctx)
+	if err != nil {
+		return summary, err
+	}
+	if total == 0 {
+		report(100, "No eligible episode files")
+		return summary, nil
+	}
+	seasonsPerPage := a.episodeSeasonsPerPage
+	if seasonsPerPage <= 0 {
+		seasonsPerPage = episodeCandidateSeasonsPerPage
+	}
+
+	// Pages and workers both report, so progress is serialized and follows
+	// the files checked so far.
+	var progressMu sync.Mutex
+	checked := 0
+	progress := func(message string) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		report(5+90*float64(min(checked, total))/float64(total), message)
+	}
+	progress(fmt.Sprintf("Checking %d episode files", total))
+
+	creditsTail := kinds.Credits && a.creditsTailReady(ctx)
+	var (
+		loadErr     error
+		sawJobs     bool
+		unsupported bool
+	)
+	// The feed runs on this goroutine, so it alone writes summary until
+	// analyzeGroups returns.
+	groupSummary := a.analyzeGroups(ctx, analyzeGroupOptions{persistState: true, creditsTail: creditsTail}, func(done int) {
+		progress(fmt.Sprintf("Analyzed %d season groups", done))
+	}, func(send func(groupJob) bool) {
+		var after *episodeCandidateCursor
+		for {
+			candidates, next, err := a.repo.ListEligibleCandidatePage(ctx, after, seasonsPerPage)
+			if err != nil {
+				loadErr = err
+				return
+			}
+			pageSummary, jobs := a.checkEpisodePage(ctx, kinds, creditsTail, candidates)
+			mergeRunSummary(&summary, pageSummary)
+			progressMu.Lock()
+			checked += len(candidates)
+			progressMu.Unlock()
+			progress(fmt.Sprintf("Checked %d/%d files", min(checked, total), total))
+			if ctx.Err() != nil {
+				return
+			}
+			if len(jobs) > 0 && !sawJobs {
+				sawJobs = true
+				progress("Checking FFmpeg Chromaprint support")
+				if err := a.extractor.Preflight(ctx); err != nil {
+					unsupported = true
+					summary.ChromaprintSupportMessage = err.Error()
+				}
+			}
+			countGroupJobs(&summary, jobs)
+			if !unsupported {
+				for _, job := range jobs {
+					if !send(job) {
+						return
+					}
+				}
+			}
+			if next == nil {
+				return
+			}
+			after = next
+		}
+	})
+	mergeRunSummary(&summary, groupSummary)
+	summary.ChromaprintSupported = sawJobs && !unsupported
+	if loadErr != nil {
+		return summary, loadErr
+	}
+	if err := ctx.Err(); err != nil {
+		return summary, err
+	}
+
+	backfillSummary, err := a.runSilenceBackfill(ctx, kinds)
+	mergeRunSummary(&summary, backfillSummary)
+	if err != nil {
+		return summary, err
+	}
+	switch {
+	case !sawJobs:
+		report(100, "No season groups eligible for Chromaprint")
+	case unsupported:
+		report(100, "Chromaprint unsupported; chapter detection completed")
+	default:
+		report(100, "Episode marker detection completed")
+	}
+	return summary, nil
+}
+
+// checkEpisodePage runs the chapter passes over one page of episode files and
+// returns the season group jobs for the kinds local analysis owns. A page
+// holds whole seasons, so every version of an episode and every file of a
+// season group is in it.
+func (a *Analyzer) checkEpisodePage(ctx context.Context, kinds EpisodeMarkerKinds, creditsTail bool, candidates []Candidate) (RunSummary, []groupJob) {
+	summary := RunSummary{FilesConsidered: len(candidates)}
+	if len(candidates) == 0 {
+		return summary, nil
+	}
+	var withdrawnIntros map[int]struct{}
+	if kinds.Intro {
+		var chapterSummary RunSummary
+		_, chapterSummary, withdrawnIntros = a.processChapterCandidates(ctx, candidates, chapterProcessingOptions{
+			allowEpisodeCopy: true,
+			openingNamed:     openingNamedGroups(candidates),
+			withdrawStale:    true,
+		})
+		mergeRunSummary(&summary, chapterSummary)
+		if ctx.Err() != nil {
+			return summary, nil
+		}
+	}
+	var withdrawnCredits map[int]struct{}
+	if kinds.Credits {
+		var chapterSummary RunSummary
+		chapterSummary, withdrawnCredits = a.processCreditsChapters(ctx, candidates)
+		mergeRunSummary(&summary, chapterSummary)
+		if ctx.Err() != nil {
+			return summary, nil
+		}
+	}
+
+	// Each kind compares the files whose marker of that kind local analysis
+	// may write, so an online intro does not keep a file out of the credits
+	// comparison.
+	var jobs []groupJob
+	for _, kind := range kinds.markerKinds() {
+		unsettled := withdrawnCredits
+		if kind == kindIntro {
+			unsettled = withdrawnIntros
+		}
+		for _, group := range groupCandidates(candidates, kind, minimumGroupEpisodes(kind, creditsTail)) {
+			jobs = append(jobs, groupJob{kind: kind, group: group, unsettledFileIDs: unsettled})
+		}
+	}
+	return summary, jobs
+}
+
+// EpisodeMarkerKinds selects the marker kinds an episode analysis looks for.
+type EpisodeMarkerKinds struct {
+	Intro   bool
+	Credits bool
+}
+
+// Any reports whether k selects at least one kind.
+func (k EpisodeMarkerKinds) Any() bool { return k.Intro || k.Credits }
+
+// And returns the kinds both k and other select.
+func (k EpisodeMarkerKinds) And(other EpisodeMarkerKinds) EpisodeMarkerKinds {
+	return EpisodeMarkerKinds{Intro: k.Intro && other.Intro, Credits: k.Credits && other.Credits}
+}
+
+// Or returns the kinds either k or other selects.
+func (k EpisodeMarkerKinds) Or(other EpisodeMarkerKinds) EpisodeMarkerKinds {
+	return EpisodeMarkerKinds{Intro: k.Intro || other.Intro, Credits: k.Credits || other.Credits}
+}
+
+// Without returns the kinds k selects that other does not.
+func (k EpisodeMarkerKinds) Without(other EpisodeMarkerKinds) EpisodeMarkerKinds {
+	return EpisodeMarkerKinds{Intro: k.Intro && !other.Intro, Credits: k.Credits && !other.Credits}
+}
+
+// markerKinds lists the kinds k selects, intro first.
+func (k EpisodeMarkerKinds) markerKinds() []markerKind {
+	var out []markerKind
+	if k.Intro {
+		out = append(out, kindIntro)
+	}
+	if k.Credits {
+		out = append(out, kindCredits)
+	}
+	return out
+}
+
+// allMarkerKinds selects every kind local analysis finds.
+var allMarkerKinds = EpisodeMarkerKinds{Intro: true, Credits: true}
+
+// SettingsReader reads server settings.
+type SettingsReader interface {
+	Get(ctx context.Context, key string) (string, error)
+}
+
+// snapshotSettingsReader reads several settings in one snapshot; keys without
+// a value are absent from the map. *catalog.EncryptedSettingsRepo implements
+// it.
+type snapshotSettingsReader interface {
+	GetMany(ctx context.Context, keys ...string) (map[string]string, error)
+}
+
+// EnabledMarkerKinds reads markers.detect_intros and markers.detect_credits:
+// the kinds local detection finds server-wide. A nil reader enables both.
+// The settings are read on every call, so a change applies to the next
+// analysis without a restart. Both are read in one snapshot, so a save that
+// changes them together is never seen half-applied.
+func EnabledMarkerKinds(ctx context.Context, settings SettingsReader) (EpisodeMarkerKinds, error) {
+	if settings == nil {
+		return allMarkerKinds, nil
+	}
+	// Separate reads could straddle a save that changes both settings
+	// together, so a store without snapshot reads is an error.
+	snapshot, ok := settings.(snapshotSettingsReader)
+	if !ok {
+		return EpisodeMarkerKinds{}, fmt.Errorf("loading %s and %s: settings store does not support snapshot reads", markers.SettingDetectIntros, markers.SettingDetectCredits)
+	}
+	values, err := snapshot.GetMany(ctx, markers.SettingDetectIntros, markers.SettingDetectCredits)
+	if err != nil {
+		return EpisodeMarkerKinds{}, fmt.Errorf("loading %s and %s: %w", markers.SettingDetectIntros, markers.SettingDetectCredits, err)
+	}
+	return EpisodeMarkerKinds{
+		Intro:   markers.DetectionToggleEnabled(values[markers.SettingDetectIntros]),
+		Credits: markers.DetectionToggleEnabled(values[markers.SettingDetectCredits]),
+	}, nil
+}
+
+// AnalyzeEpisode analyzes the season groups of an episode's files for every
+// marker kind, as AnalyzeEpisodeKinds does. It is the all-kinds shorthand.
+func (a *Analyzer) AnalyzeEpisode(ctx context.Context, episodeID string) (RunSummary, error) {
+	return a.AnalyzeEpisodeKinds(ctx, episodeID, allMarkerKinds)
+}
+
+// AnalyzeEpisodeKinds analyzes the season groups of an episode's files for
+// the kinds selected, comparing each group again even when its stored
+// analysis still stands. Admin refresh and re-detection use it.
+func (a *Analyzer) AnalyzeEpisodeKinds(ctx context.Context, episodeID string, kinds EpisodeMarkerKinds) (RunSummary, error) {
+	return a.analyzeEpisode(ctx, episodeID, kinds, true)
+}
+
+// AnalyzeEpisodeForPlayback analyzes only the marker kinds a played file
+// lacks. Intro groups are compared again as in AnalyzeEpisode. A credits
+// group whose stored analysis still stands is skipped: most episodes have no
+// credits local analysis can find, and playback would otherwise repeat the
+// season comparison on every start.
+func (a *Analyzer) AnalyzeEpisodeForPlayback(ctx context.Context, episodeID string, kinds EpisodeMarkerKinds) (RunSummary, error) {
+	return a.analyzeEpisode(ctx, episodeID, kinds, false)
+}
+
+func (a *Analyzer) analyzeEpisode(ctx context.Context, episodeID string, kinds EpisodeMarkerKinds, forceCredits bool) (RunSummary, error) {
+	summary := RunSummary{}
+	if !kinds.Any() {
+		return summary, nil
+	}
+	candidates, err := a.repo.ListCandidatesForEpisode(ctx, episodeID)
+	if err != nil {
+		return summary, err
+	}
+	summary.FilesConsidered = len(candidates)
+	if len(candidates) == 0 {
+		return summary, nil
+	}
+
+	var jobKinds []markerKind
+	seasonCandidates := map[string][]Candidate{}
+	if kinds.Intro {
+		openingNamed, err := a.loadOpeningNamedGroups(ctx, candidates, seasonCandidates)
+		if err != nil {
+			return summary, err
+		}
+		_, chapterSummary, _ := a.processChapterCandidates(ctx, candidates, chapterProcessingOptions{
+			forceExistingScanner: true,
+			allowEpisodeCopy:     true,
+			openingNamed:         openingNamed,
+			withdrawStale:        true,
+		})
+		mergeRunSummary(&summary, chapterSummary)
+		if err := ctx.Err(); err != nil {
+			return summary, err
+		}
+		jobKinds = append(jobKinds, kindIntro)
+	}
+	var withdrawnCredits map[int]struct{}
+	if kinds.Credits {
+		var chapterSummary RunSummary
+		chapterSummary, withdrawnCredits = a.processCreditsChapters(ctx, candidates)
+		mergeRunSummary(&summary, chapterSummary)
+		if err := ctx.Err(); err != nil {
+			return summary, err
+		}
+		jobKinds = append(jobKinds, kindCredits)
+	}
+
+	creditsTail := kinds.Credits && a.creditsTailReady(ctx)
+	var jobs []groupJob
+	for _, kind := range jobKinds {
+		remaining := ownCandidates(candidates, kind)
+		if len(remaining) == 0 {
+			continue
+		}
+		groups, err := a.episodeGroups(ctx, kind, remaining, seasonCandidates, minimumGroupEpisodes(kind, creditsTail))
+		if err != nil {
+			return summary, err
+		}
+		targetFileIDs := candidateFileIDs(remaining)
+		for _, group := range groups {
+			jobs = append(jobs, groupJob{kind: kind, group: group, patchFileIDs: targetFileIDs})
+		}
+	}
+	if len(jobs) == 0 {
+		return summary, nil
+	}
+
+	if err := a.extractor.Preflight(ctx); err != nil {
+		summary.ChromaprintSupported = false
+		summary.ChromaprintSupportMessage = err.Error()
+		return summary, nil //nolint:nilerr // missing Chromaprint support is reported in the summary, as the library-wide run does
+	}
+	summary.ChromaprintSupported = true
+
+	countGroupJobs(&summary, jobs)
+	for _, job := range jobs {
+		if err := ctx.Err(); err != nil {
+			return summary, err
+		}
+		groupSummary, err := a.analyzeJob(ctx, job, analyzeGroupOptions{
+			force:            job.kind == kindIntro || forceCredits,
+			patchFileIDs:     job.patchFileIDs,
+			creditsTail:      creditsTail,
+			unsettledFileIDs: withdrawnCredits,
+		})
+		mergeRunSummary(&summary, groupSummary)
+		if err != nil {
+			a.logger.WarnContext(ctx, "marker episode group analysis failed",
+				"kind", job.kind.String(),
+				"episode_id", episodeID,
+				"season_id", job.group.SeasonID,
+				"media_folder_id", job.group.MediaFolderID,
+				"group_key", job.group.AnalysisGroupKey,
+				"error", err)
+		}
+	}
+
+	return summary, nil
+}
+
+// episodeGroups returns the season groups an episode's remaining files of
+// kind belong to, each holding every file of the group whose marker of kind
+// local analysis may write, so a file's result and confidence do not depend
+// on how its analysis started. Groups with fewer than minEpisodes episodes
+// are left out. seasonCandidates caches each group's files by key across
+// kinds.
+func (a *Analyzer) episodeGroups(ctx context.Context, kind markerKind, remaining []Candidate, seasonCandidates map[string][]Candidate, minEpisodes int) ([]candidateGroup, error) {
+	groupsByKey := map[string]candidateGroup{}
+	for _, candidate := range remaining {
+		key := seasonGroupKey(candidate)
+		if _, ok := groupsByKey[key]; ok {
+			continue
+		}
+		groupCandidates, loaded := seasonCandidates[key]
+		if !loaded {
+			var err error
+			groupCandidates, err = a.repo.ListCandidatesForGroup(ctx, candidate.MediaFolderID, candidate.SeasonID, candidate.AnalysisGroupKey())
+			if err != nil {
+				return nil, err
+			}
+			seasonCandidates[key] = groupCandidates
+		}
+		owned := ownCandidates(groupCandidates, kind)
+		if distinctEpisodeCount(owned) < minEpisodes {
+			continue
+		}
+		groupsByKey[key] = candidateGroup{
+			SeasonID:         candidate.SeasonID,
+			MediaFolderID:    candidate.MediaFolderID,
+			AnalysisGroupKey: candidate.AnalysisGroupKey(),
+			Candidates:       owned,
+			HeldOut:          len(owned) < len(groupCandidates),
+		}
+	}
+	groups := make([]candidateGroup, 0, len(groupsByKey))
+	for _, group := range groupsByKey {
+		groups = append(groups, group)
+	}
+	sortCandidateGroups(groups)
+	return groups, nil
+}
+
+type chapterProcessingOptions struct {
+	forceExistingScanner bool
+	allowEpisodeCopy     bool
+	deadline             time.Time
+	// openingNamed holds the season group keys whose files name an opening
+	// song chapter (openingNamedGroups), where an Intro chapter is a cold
+	// open. Every caller passes the whole season groups of its candidates,
+	// so a file's chapters read the same in every pass.
+	openingNamed map[string]bool
+	// withdrawStale withdraws intros placed from chapters that no longer
+	// produce one (staleChapterIntro). Only the episode passes set it: they
+	// read chapters against the whole season group and compare the groups of
+	// the files they withdraw again.
+	withdrawStale bool
+}
+
+type chapterSourceMarker struct {
+	candidate Candidate
+	segment   Segment
+}
+
+const episodeVersionCopyDurationToleranceSeconds = 3.0
+
+// processChapterCandidates writes intros from authored chapters and copies
+// them to other versions of the same episode, and returns the files it could
+// not place an intro on. It also withdraws intros placed from chapters that no
+// longer produce one, and returns the IDs of those files, whose season groups
+// must be compared again to replace them.
+func (a *Analyzer) processChapterCandidates(ctx context.Context, candidates []Candidate, opts chapterProcessingOptions) ([]Candidate, RunSummary, map[int]struct{}) {
+	summary := RunSummary{}
+	remaining := make([]Candidate, 0, len(candidates))
+	directByEpisode := map[string]chapterSourceMarker{}
+	directFileIDs := map[int]struct{}{}
+	withdrawn := map[int]struct{}{}
+	detected, found, chapterSources := detectChapterIntros(candidates, opts.openingNamed)
+
+	for i, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			summary.Errors = append(summary.Errors, err.Error())
+			return remaining, summary, withdrawn
+		}
+		if !opts.deadline.IsZero() && time.Now().After(opts.deadline) {
+			return remaining, summary, withdrawn
+		}
+		segment, ok := detected[i], found[i]
+		if !a.chapterMayPlaceIntro(ctx, candidate, segment, ok, chapterSources[candidate.EpisodeID], opts, &summary, withdrawn) {
+			continue
+		}
+		if !ok {
+			remaining = append(remaining, candidate)
+			continue
+		}
+
+		segment, refined := a.refineChapterSegment(ctx, candidate, segment, opts.deadline, &summary)
+		if !refined {
+			// The run's time budget ran out while waiting for an ffmpeg slot.
+			remaining = append(remaining, candidate)
+			continue
+		}
+		applied, patchErr := a.repo.PatchMarker(ctx, MarkerPatch{
+			Kind:         kindIntro,
+			ExpectedFile: candidate.expectedFile(),
+			FileID:       candidate.FileID,
+			Start:        segment.Start,
+			End:          segment.End,
+			Source:       models.MarkerSourceScanner,
+			Confidence:   segment.Confidence,
+			Algorithm:    segment.Algorithm,
+			DetectedAt:   time.Now().UTC(),
+		})
+		if patchErr != nil {
+			summary.Errors = append(summary.Errors, patchErr.Error())
+			a.logger.WarnContext(ctx, "intro marker chapter patch failed", "file_id", candidate.FileID, "error", patchErr)
+			remaining = append(remaining, candidate)
+			continue
+		}
+		if applied {
+			summary.ChapterMarkersWritten++
+		}
+		directFileIDs[candidate.FileID] = struct{}{}
+		setBestChapterSource(directByEpisode, candidate, segment)
+	}
+
+	if !opts.allowEpisodeCopy || len(directByEpisode) == 0 || len(remaining) == 0 {
+		return remaining, summary, withdrawn
+	}
+	unresolved := a.copyChapterIntrosToVersions(ctx, remaining, directByEpisode, directFileIDs, opts, &summary)
+	return unresolved, summary, withdrawn
+}
+
+// detectChapterIntros runs DetectChapterIntro over candidates, each read
+// against its season group's openingNamed entry, and returns by episode the
+// files whose chapters produce an intro, with that intro.
+func detectChapterIntros(candidates []Candidate, openingNamed map[string]bool) ([]Segment, []bool, map[string][]chapterSourceMarker) {
+	detected := make([]Segment, len(candidates))
+	found := make([]bool, len(candidates))
+	sources := map[string][]chapterSourceMarker{}
+	for i, candidate := range candidates {
+		detected[i], found[i] = DetectChapterIntro(candidate.Chapters, openingNamed[seasonGroupKey(candidate)])
+		if found[i] {
+			sources[candidate.EpisodeID] = append(sources[candidate.EpisodeID], chapterSourceMarker{candidate: candidate, segment: detected[i]})
+		}
+	}
+	return detected, found, sources
+}
+
+// chapterMayPlaceIntro reports whether the chapter pass may go on with
+// candidate: place its chapter intro when ok, or hand it on when not. A
+// stored intro its chapters no longer produce is withdrawn first (see
+// staleChapterIntro) when opts.withdrawStale is set, and its file added to
+// withdrawn. sources are the files of candidate's episode whose chapters
+// produce an intro (detectChapterIntros).
+func (a *Analyzer) chapterMayPlaceIntro(ctx context.Context, candidate Candidate, segment Segment, ok bool, sources []chapterSourceMarker, opts chapterProcessingOptions, summary *RunSummary, withdrawn map[int]struct{}) bool {
+	if candidate.hasHigherPriority(kindIntro, models.MarkerSourceScanner) {
+		// Only an online intro rated below the file's own chapter gives
+		// way to it. Refinement can only raise the chapter's confidence.
+		return ok && candidate.yieldsToChapter(kindIntro, segment)
+	}
+	hasIntro := candidate.marker(kindIntro).present()
+	effectiveSource := candidate.effectiveSource(kindIntro)
+	if hasIntro && effectiveSource != "" && effectiveSource != models.MarkerSourceScanner {
+		return false
+	}
+	if opts.withdrawStale && hasIntro && staleChapterIntro(candidate, segment, ok, sources) && a.withdrawChapterIntro(ctx, candidate, summary) {
+		withdrawn[candidate.FileID] = struct{}{}
+		hasIntro = false
+	}
+	return !hasIntro || opts.forceExistingScanner
+}
+
+// copyChapterIntrosToVersions copies the chapter intros placed on an episode
+// to its other versions of a matching duration, and returns the files still
+// without an intro.
+func (a *Analyzer) copyChapterIntrosToVersions(ctx context.Context, remaining []Candidate, directByEpisode map[string]chapterSourceMarker, directFileIDs map[int]struct{}, opts chapterProcessingOptions, summary *RunSummary) []Candidate {
+	unresolved := remaining[:0]
+	for _, candidate := range remaining {
+		if err := ctx.Err(); err != nil {
+			summary.Errors = append(summary.Errors, err.Error())
+			unresolved = append(unresolved, candidate)
+			continue
+		}
+		if !opts.deadline.IsZero() && time.Now().After(opts.deadline) {
+			unresolved = append(unresolved, candidate)
+			continue
+		}
+		if _, ok := directFileIDs[candidate.FileID]; ok {
+			continue
+		}
+		source, ok := directByEpisode[candidate.EpisodeID]
+		if !ok {
+			unresolved = append(unresolved, candidate)
+			continue
+		}
+		if candidate.hasHigherPriority(kindIntro, models.MarkerSourceScanner) || !compatibleEpisodeVersionDuration(source.candidate, candidate) {
+			unresolved = append(unresolved, candidate)
+			continue
+		}
+		if candidate.marker(kindIntro).present() && candidate.effectiveSource(kindIntro) != models.MarkerSourceScanner {
+			continue
+		}
+
+		confidence := 0.85
+		if source.segment.Algorithm == ChapterSilenceAlgorithm {
+			confidence = 0.90
+		}
+		applied, patchErr := a.repo.PatchMarker(ctx, MarkerPatch{
+			Kind:         kindIntro,
+			ExpectedFile: candidate.expectedFile(),
+			FileID:       candidate.FileID,
+			Start:        source.segment.Start,
+			End:          source.segment.End,
+			Source:       models.MarkerSourceScanner,
+			Confidence:   confidence,
+			Algorithm:    EpisodeVersionCopyAlgorithm,
+			DetectedAt:   time.Now().UTC(),
+		})
+		if patchErr != nil {
+			msg := fmt.Sprintf("file %d: %v", candidate.FileID, patchErr)
+			summary.Errors = append(summary.Errors, msg)
+			a.logger.WarnContext(ctx, "intro marker episode version copy failed", "file_id", candidate.FileID, "source_file_id", source.candidate.FileID, "error", patchErr)
+			unresolved = append(unresolved, candidate)
+			continue
+		}
+		if applied {
+			summary.EpisodeVersionMarkersCopied++
+		}
+	}
+	return unresolved
+}
+
+// loadOpeningNamedGroups returns openingNamedGroups over the whole season
+// groups of the candidates that have a chapter a release may give its cold
+// open, loading each group once; the rule changes nothing for the other
+// files. seasonCandidates caches the groups by seasonGroupKey, as
+// episodeGroups does.
+func (a *Analyzer) loadOpeningNamedGroups(ctx context.Context, candidates []Candidate, seasonCandidates map[string][]Candidate) (map[string]bool, error) {
+	var groupFiles []Candidate
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		if !hasColdOpenChapter(candidate.Chapters) {
+			continue
+		}
+		key := seasonGroupKey(candidate)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		group, loaded := seasonCandidates[key]
+		if !loaded {
+			var err error
+			group, err = a.repo.ListCandidatesForGroup(ctx, candidate.MediaFolderID, candidate.SeasonID, candidate.AnalysisGroupKey())
+			if err != nil {
+				return nil, err
+			}
+			seasonCandidates[key] = group
+		}
+		groupFiles = append(groupFiles, group...)
+	}
+	// The candidates themselves count even if the group listing missed them.
+	return openingNamedGroups(append(groupFiles, candidates...)), nil
+}
+
+// seasonGroupKey identifies the season group a candidate is compared in.
+func seasonGroupKey(candidate Candidate) string {
+	return fmt.Sprintf("%d:%s:%s", candidate.MediaFolderID, candidate.SeasonID, candidate.AnalysisGroupKey())
+}
+
+// refineChapterSegment runs silence refinement on a chapter intro. It returns
+// false, leaving the file untouched, when deadline passed while it waited for
+// an ffmpeg slot.
+func (a *Analyzer) refineChapterSegment(ctx context.Context, candidate Candidate, segment Segment, deadline time.Time, summary *RunSummary) (Segment, bool) {
+	if a.refiner == nil || !a.config.normalized().SilenceRefinementEnabled {
+		return segment, true
+	}
+	release, err := a.acquireFFmpeg(ctx)
+	if err != nil {
+		summary.SilenceRefinementsAttempted++
+		summary.SilenceRefinementErrors++
+		return segment, true
+	}
+	if !deadline.IsZero() && time.Now().After(deadline) {
+		release()
+		return segment, false
+	}
+	summary.SilenceRefinementsAttempted++
+	refined, ok, err := a.refiner.RefineChapterEnd(ctx, candidate, segment)
+	release()
+	if err != nil {
+		summary.SilenceRefinementErrors++
+		a.logger.WarnContext(ctx, "intro marker silence refinement failed", "file_id", candidate.FileID, "path", candidate.FilePath, "error", err)
+		if ctx.Err() == nil {
+			a.recordSilenceAttempt(ctx, candidate, segment, err, summary)
+		}
+		return segment, true
+	}
+	if ok {
+		summary.SilenceRefinementsApplied++
+		return refined, true
+	}
+	a.recordSilenceAttempt(ctx, candidate, segment, nil, summary)
+	return segment, true
+}
+
+// recordSilenceAttempt persists a refinement that kept the chapter boundary so
+// the backfill stops spending its budget on the same unchanged file every run.
+// A clean no-improvement result stands until the inputs change; a failure is
+// retried with exponential backoff.
+func (a *Analyzer) recordSilenceAttempt(ctx context.Context, candidate Candidate, segment Segment, refineErr error, summary *RunSummary) {
+	attempt := SilenceRefinementAttempt{
+		MediaFileID:     candidate.FileID,
+		ConfigHash:      a.config.SilenceConfigHash(),
+		FileHash:        candidate.FileHash,
+		FileSize:        candidate.FileSize,
+		DurationSeconds: candidate.DurationSeconds,
+		ChaptersHash:    candidate.ChaptersHash,
+		IntroStart:      segment.Start,
+		IntroEnd:        segment.End,
+		Status:          silenceAttemptNoImprovement,
+		RecordedBy:      a.node,
+		AttemptedAt:     time.Now().UTC(),
+	}
+	if refineErr != nil {
+		previous, err := a.repo.LoadSilenceRefinementAttempt(ctx, candidate.FileID)
+		if err != nil {
+			summary.Errors = append(summary.Errors, fmt.Sprintf("file %d: %v", candidate.FileID, err))
+			a.logger.WarnContext(ctx, "intro marker silence attempt load failed", "file_id", candidate.FileID, "error", err)
+			return
+		}
+		attempt.Status = silenceAttemptFailed
+		attempt.LastError = refineErr.Error()
+		attempt.FailureCount = 1
+		retryAfter := attempt.AttemptedAt.Add(mediaartifact.RetryDelay(1))
+		// Backoff escalates only for this server's own consecutive failures; a
+		// failure recorded elsewhere may come from that server's environment.
+		if previous != nil && previous.Status == silenceAttemptFailed && previous.RecordedBy == attempt.RecordedBy &&
+			previous.sameInputs(attempt) {
+			if previous.RetryAfter != nil && attempt.AttemptedAt.Before(*previous.RetryAfter) {
+				// A forced episode analysis failed inside the backoff window. That
+				// is not a retry, so it must not escalate the backoff.
+				attempt.FailureCount = previous.FailureCount
+				retryAfter = *previous.RetryAfter
+			} else {
+				attempt.FailureCount = previous.FailureCount + 1
+				retryAfter = attempt.AttemptedAt.Add(mediaartifact.RetryDelay(attempt.FailureCount))
+			}
+		}
+		attempt.RetryAfter = &retryAfter
+	}
+	if err := a.repo.UpsertSilenceRefinementAttempt(ctx, attempt); err != nil {
+		summary.Errors = append(summary.Errors, fmt.Sprintf("file %d: %v", candidate.FileID, err))
+		a.logger.WarnContext(ctx, "intro marker silence attempt record failed", "file_id", candidate.FileID, "error", err)
+	}
+}
+
+func setBestChapterSource(sources map[string]chapterSourceMarker, candidate Candidate, segment Segment) {
+	existing, ok := sources[candidate.EpisodeID]
+	if !ok || chapterSourceRank(segment) > chapterSourceRank(existing.segment) {
+		sources[candidate.EpisodeID] = chapterSourceMarker{candidate: candidate, segment: segment}
+	}
+}
+
+func chapterSourceRank(segment Segment) int {
+	if segment.Algorithm == ChapterSilenceAlgorithm {
+		return 2
+	}
+	if segment.Algorithm == ChapterAlgorithm {
+		return 1
+	}
+	return 0
+}
+
+func compatibleEpisodeVersionDuration(source, target Candidate) bool {
+	if source.DurationSeconds <= 0 || target.DurationSeconds <= 0 {
+		return false
+	}
+	diff := source.DurationSeconds - target.DurationSeconds
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff <= episodeVersionCopyDurationToleranceSeconds
+}
+
+// runSilenceBackfill refines chapter intros that were written before silence
+// refinement ran. It is intro work, so it waits while kinds leaves intros out.
+func (a *Analyzer) runSilenceBackfill(ctx context.Context, kinds EpisodeMarkerKinds) (RunSummary, error) {
+	summary := RunSummary{}
+	cfg := a.config.normalized()
+	if !kinds.Intro || !cfg.SilenceRefinementEnabled || cfg.SilenceBackfillLimit <= 0 {
+		return summary, nil
+	}
+	candidates, err := a.repo.ListChapterSilenceBackfillCandidates(ctx, cfg.SilenceBackfillLimit, cfg, a.node)
+	if err != nil {
+		return summary, err
+	}
+	summary.SilenceBackfillConsidered = len(candidates)
+	if len(candidates) == 0 {
+		return summary, nil
+	}
+	// Chapters are read against their season groups here too, so a file
+	// whose chapters changed since the episode pass is not refined into a
+	// cold open. The backfill withdraws nothing: it does not compare season
+	// groups again, and the episode pass that runs just before it has
+	// already withdrawn the chapter intros chapters no longer produce.
+	openingNamed, err := a.loadOpeningNamedGroups(ctx, candidates, map[string][]Candidate{})
+	if err != nil {
+		return summary, err
+	}
+	// Backfill files are independent: no episode-version copies are made, so
+	// the candidates split across workers.
+	opts := chapterProcessingOptions{
+		forceExistingScanner: true,
+		deadline:             time.Now().Add(cfg.SilenceBackfillMaxDuration),
+		openingNamed:         openingNamed,
+	}
+	workers := min(len(candidates), a.workerCount())
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+	for w := range workers {
+		share := make([]Candidate, 0, len(candidates)/workers+1)
+		for i := w; i < len(candidates); i += workers {
+			share = append(share, candidates[i])
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, shareSummary, _ := a.processChapterCandidates(ctx, share, opts)
+			mu.Lock()
+			mergeRunSummary(&summary, shareSummary)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return summary, nil
+}
+
+// groupJob is one marker kind's analysis of one season group.
+type groupJob struct {
+	kind  markerKind
+	group candidateGroup
+	// patchFileIDs limits which files the analysis may write; nil allows
+	// every file in the group.
+	patchFileIDs map[int]struct{}
+	// unsettledFileIDs are the files of the job's page whose chapter marker
+	// of the job's kind was just withdrawn; analyzeGroups passes them as the
+	// job's analyzeGroupOptions.unsettledFileIDs.
+	unsettledFileIDs map[int]struct{}
+}
+
+// countGroupJobs counts the season groups each marker kind considers.
+func countGroupJobs(summary *RunSummary, jobs []groupJob) {
+	for _, job := range jobs {
+		if job.kind == kindCredits {
+			summary.CreditsSeasonGroupsConsidered++
+		} else {
+			summary.SeasonGroupsConsidered++
+		}
+	}
+}
+
+// analyzeJob analyzes a season group for the job's marker kind.
+func (a *Analyzer) analyzeJob(ctx context.Context, job groupJob, opts analyzeGroupOptions) (RunSummary, error) {
+	if job.kind == kindCredits {
+		return a.analyzeCreditsGroup(ctx, job.group, opts)
+	}
+	return a.analyzeGroup(ctx, job.group, opts)
+}
+
+// analyzeGroups runs the season group jobs feed sends on workerCount workers
+// with opts. Most jobs are skipped or served from cached fingerprints, so
+// workers keep the ffmpeg slots busy while other jobs compare or wait on the
+// database. feed runs on the calling goroutine; send blocks until a worker
+// takes the job and reports false once ctx is done, so feed can load more
+// jobs only as the workers free up. progress is called with the number of
+// jobs finished.
+func (a *Analyzer) analyzeGroups(ctx context.Context, opts analyzeGroupOptions, progress func(done int), feed func(send func(groupJob) bool)) RunSummary {
+	var (
+		mu      sync.Mutex
+		summary RunSummary
+		done    int
+		wg      sync.WaitGroup
+	)
+	work := make(chan groupJob)
+	for range a.workerCount() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range work {
+				jobOpts := opts
+				jobOpts.unsettledFileIDs = job.unsettledFileIDs
+				groupSummary, err := a.analyzeJob(ctx, job, jobOpts)
+				if err != nil {
+					a.logger.WarnContext(ctx, "marker group analysis failed",
+						"kind", job.kind.String(),
+						"season_id", job.group.SeasonID,
+						"media_folder_id", job.group.MediaFolderID,
+						"group_key", job.group.AnalysisGroupKey,
+						"error", err)
+				}
+				mu.Lock()
+				mergeRunSummary(&summary, groupSummary)
+				done++
+				if progress != nil {
+					progress(done)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	feed(func(job groupJob) bool {
+		select {
+		case work <- job:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	})
+	close(work)
+	wg.Wait()
+	return summary
+}
+
+type candidateGroup struct {
+	SeasonID         string
+	MediaFolderID    int
+	AnalysisGroupKey string
+	// Candidates are the group's files whose marker of the analyzed kind
+	// local analysis may write.
+	Candidates []Candidate
+	// HeldOut reports that some file of the group was left out of
+	// Candidates because a higher-priority source holds its marker, so the
+	// comparison may lack partners that confirmed an earlier result.
+	HeldOut bool
+}
+
+type analyzeGroupOptions struct {
+	force        bool
+	patchFileIDs map[int]struct{}
+	persistState bool
+	// creditsTail runs the credits tail pass; see Analyzer.creditsTailReady.
+	creditsTail bool
+	// unsettledFileIDs are files whose chapter marker of the job's kind was
+	// just withdrawn. A group holding one is analyzed again even when its
+	// stored analysis still stands, so Chromaprint, audio, or video can
+	// replace it.
+	unsettledFileIDs map[int]struct{}
+}
+
+// anyCandidateIn reports whether any candidate's file is in fileIDs.
+func anyCandidateIn(candidates []Candidate, fileIDs map[int]struct{}) bool {
+	for _, candidate := range candidates {
+		if _, ok := fileIDs[candidate.FileID]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// minimumGroupEpisodes is how many episodes a season group of kind needs to
+// be analyzed. Intros and credits audio compare episodes, so they need two;
+// with the credits tail pass, a lone episode can still get credits from
+// video.
+func minimumGroupEpisodes(kind markerKind, creditsTail bool) int {
+	if kind == kindCredits && creditsTail {
+		return 1
+	}
+	return 2
+}
+
+// creditsTailReady reports whether credits analysis can run tail passes: the
+// analyzer has a sampler and ffmpeg offers what the pass needs. Without it,
+// credits come from chapters and audio alone.
+func (a *Analyzer) creditsTailReady(ctx context.Context) bool {
+	if a.tailSampler == nil {
+		return false
+	}
+	if err := a.tailSampler.PreflightCreditsTail(ctx); err != nil {
+		if ctx.Err() == nil {
+			a.tailWarnOnce.Do(func() {
+				a.logger.WarnContext(ctx, "credits visuals unavailable; credits use chapters and audio only", "error", err)
+			})
+		}
+		return false
+	}
+	return true
+}
+
+// groupCandidates groups the candidates whose marker of kind local analysis
+// may write by season group, leaving out groups with fewer than minEpisodes
+// such episodes. candidates must hold whole season groups, so a group knows
+// whether any of its files was held out.
+func groupCandidates(candidates []Candidate, kind markerKind, minEpisodes int) []candidateGroup {
+	byKey := map[string]*candidateGroup{}
+	for _, candidate := range candidates {
+		key := seasonGroupKey(candidate)
+		group := byKey[key]
+		if group == nil {
+			group = &candidateGroup{
+				SeasonID:         candidate.SeasonID,
+				MediaFolderID:    candidate.MediaFolderID,
+				AnalysisGroupKey: candidate.AnalysisGroupKey(),
+			}
+			byKey[key] = group
+		}
+		if !candidate.ownsMarker(kind) {
+			group.HeldOut = true
+			continue
+		}
+		group.Candidates = append(group.Candidates, candidate)
+	}
+
+	groups := make([]candidateGroup, 0, len(byKey))
+	for _, group := range byKey {
+		episodeIDs := map[string]struct{}{}
+		for _, candidate := range group.Candidates {
+			episodeIDs[candidate.EpisodeID] = struct{}{}
+		}
+		if len(episodeIDs) < minEpisodes {
+			continue
+		}
+		groups = append(groups, *group)
+	}
+	sortCandidateGroups(groups)
+	return groups
+}
+
+func sortCandidateGroups(groups []candidateGroup) {
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].MediaFolderID != groups[j].MediaFolderID {
+			return groups[i].MediaFolderID < groups[j].MediaFolderID
+		}
+		if groups[i].SeasonID != groups[j].SeasonID {
+			return groups[i].SeasonID < groups[j].SeasonID
+		}
+		return groups[i].AnalysisGroupKey < groups[j].AnalysisGroupKey
+	})
+}
+
+func (a *Analyzer) analyzeGroup(ctx context.Context, group candidateGroup, opts analyzeGroupOptions) (RunSummary, error) {
+	summary := RunSummary{}
+	state := SeasonState{
+		SeasonID:         group.SeasonID,
+		MediaFolderID:    group.MediaFolderID,
+		AnalysisGroupKey: group.AnalysisGroupKey,
+		InputSignature:   groupInputSignature(group),
+		EpisodeCount:     distinctEpisodeCount(group.Candidates),
+		FileCount:        len(group.Candidates),
+	}
+	analysisHash := a.config.AnalysisConfigHash()
+	existing, err := a.repo.LoadSeasonState(ctx, state, analysisHash)
+	if err != nil {
+		return summary, err
+	}
+	if !opts.force && !anyCandidateIn(group.Candidates, opts.unsettledFileIDs) && existing != nil &&
+		existing.InputSignature == state.InputSignature && existing.settled(time.Now()) {
+		summary.GroupsSkipped++
+		return summary, nil
+	}
+
+	inputs, counts, err := a.ensureFingerprints(ctx, group.Candidates)
+	summary.FingerprintCacheHits += counts.hits
+	summary.FingerprintsComputed += counts.computed
+	summary.FingerprintExtractionErrors += counts.failed
+	settle := func(status string) { settleSeasonState(&state, status, counts) }
+	if err != nil {
+		state.Status = seasonStatusFailed
+		state.LastError = err.Error()
+		if opts.persistState {
+			_ = a.repo.UpsertSeasonState(ctx, state, analysisHash)
+		}
+		summary.Errors = append(summary.Errors, err.Error())
+		return summary, err
+	}
+	if distinctFingerprintEpisodeCount(inputs) < 2 {
+		state.LastError = "too few fingerprints"
+		settle(seasonStatusNotFound)
+		if opts.persistState {
+			if err := a.repo.UpsertSeasonState(ctx, state, analysisHash); err != nil {
+				return summary, err
+			}
+		}
+		summary.GroupsNotFound++
+		return summary, nil
+	}
+
+	segments := CompareFingerprints(inputs, a.config)
+	// Only a comparison over every file of the season group may withdraw an
+	// intro: a file whose extraction failed, or one held out because another
+	// source marked it, could be the partner that confirms it.
+	complete := counts.failed == 0 && counts.deferred == 0 && !group.HeldOut
+	writeFailures := 0
+	for _, input := range inputs {
+		candidate := input.Candidate
+		if !shouldPatchGroupFile(candidate.FileID, opts.patchFileIDs) {
+			continue
+		}
+		segment, found := segments[candidate.FileID]
+		if !found {
+			if complete && a.withdrawChromaprintIntro(ctx, candidate, &summary) != nil {
+				writeFailures++
+			}
+			continue
+		}
+		applied, patchErr := a.repo.PatchMarker(ctx, MarkerPatch{
+			Kind:         kindIntro,
+			ExpectedFile: candidate.expectedFile(),
+			FileID:       candidate.FileID,
+			Start:        segment.Start,
+			End:          segment.End,
+			Source:       models.MarkerSourceScanner,
+			Confidence:   segment.Confidence,
+			Algorithm:    segment.Algorithm,
+			DetectedAt:   time.Now().UTC(),
+		})
+		if patchErr != nil {
+			writeFailures++
+			msg := fmt.Sprintf("file %d: %v", candidate.FileID, patchErr)
+			summary.Errors = append(summary.Errors, msg)
+			a.logger.WarnContext(ctx, "intro marker chromaprint patch failed", "file_id", candidate.FileID, "path", candidate.FilePath, "error", patchErr)
+			continue
+		}
+		if applied {
+			summary.ChromaprintMarkersWritten++
+		}
+	}
+
+	status := seasonStatusComplete
+	if len(segments) == 0 {
+		status = seasonStatusNotFound
+		summary.GroupsNotFound++
+	}
+	if opts.persistState {
+		settle(status)
+		// A settled group is skipped until its inputs change, so a failed
+		// write leaves it failed, to be analyzed again by the next run.
+		if writeFailures > 0 {
+			state.Status = seasonStatusFailed
+			state.LastError = fmt.Sprintf("%d intro marker write(s) failed", writeFailures)
+		}
+		state.MarkersWritten = summary.ChromaprintMarkersWritten
+		if err := a.repo.UpsertSeasonState(ctx, state, analysisHash); err != nil {
+			return summary, err
+		}
+	}
+	return summary, nil
+}
+
+// groupInputSignature is the signature of what an intro analysis of group
+// reads. A group with held-out files withdraws nothing, so its signature
+// differs from the same files' signature without them: once none is held out,
+// as after the held-out file is deleted, the group is compared again in full.
+func groupInputSignature(group candidateGroup) string {
+	signature := InputSignature(group.Candidates)
+	if group.HeldOut {
+		signature += ":held-out"
+	}
+	return signature
+}
+
+// withdrawChromaprintIntro clears a file's intro when an earlier Chromaprint
+// comparison wrote it and the season's complete comparison no longer finds
+// one, as after a stricter matching rule or a change to the season's files.
+// Intros from any other source or detector stay. A failure is logged and
+// added to summary before it is returned.
+func (a *Analyzer) withdrawChromaprintIntro(ctx context.Context, candidate Candidate, summary *RunSummary) error {
+	stored := candidate.marker(kindIntro)
+	if !stored.present() || stored.Algorithm == nil || !strings.HasPrefix(*stored.Algorithm, chromaprintAlgorithmFamily) ||
+		candidate.effectiveSource(kindIntro) != models.MarkerSourceScanner {
+		return nil
+	}
+	withdrawn, err := a.repo.WithdrawMarker(ctx, MarkerWithdrawal{
+		Kind:         kindIntro,
+		ExpectedFile: candidate.expectedFile(),
+		FileID:       candidate.FileID,
+		Algorithm:    *stored.Algorithm,
+	})
+	if err != nil {
+		summary.Errors = append(summary.Errors, fmt.Sprintf("file %d: %v", candidate.FileID, err))
+		a.logger.WarnContext(ctx, "intro marker chromaprint withdrawal failed", "file_id", candidate.FileID, "algorithm", *stored.Algorithm, "error", err)
+		return err
+	}
+	if withdrawn {
+		summary.ChromaprintMarkersWithdrawn++
+	}
+	return nil
+}
+
+// fileChapterIntroAlgorithms are the intro results placed from a file's own
+// chapters.
+var fileChapterIntroAlgorithms = []string{ChapterAlgorithm, ChapterSilenceAlgorithm, legacyChapterSilenceAlgorithm}
+
+// staleChapterIntro reports whether a file holds an intro local analysis
+// placed from chapters that the chapters no longer produce. For its own
+// chapter result, that is when its chapters (segment, ok) give no intro or one
+// that does not overlap it, as when an Intro chapter read as the intro before
+// an OP chapter later in the file is now a cold open. For a copy from another
+// version, it is when no version of sources it could be copied from gives an
+// intro that overlaps it.
+func staleChapterIntro(candidate Candidate, segment Segment, ok bool, sources []chapterSourceMarker) bool {
+	stored := candidate.marker(kindIntro)
+	if !stored.present() || stored.Algorithm == nil || candidate.effectiveSource(kindIntro) != models.MarkerSourceScanner {
+		return false
+	}
+	switch {
+	case slices.Contains(fileChapterIntroAlgorithms, *stored.Algorithm):
+		return !ok || !stored.overlaps(segment)
+	case *stored.Algorithm == EpisodeVersionCopyAlgorithm:
+		for _, source := range sources {
+			if source.candidate.FileID != candidate.FileID && compatibleEpisodeVersionDuration(source.candidate, candidate) &&
+				stored.overlaps(source.segment) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// withdrawChapterIntro clears a file's chapter intro once staleChapterIntro
+// holds, as after a change to the chapter title rules or a remux, and reports
+// whether it did. A chapter result outranks every Chromaprint result, so left
+// in place it would keep its stale range for good.
+func (a *Analyzer) withdrawChapterIntro(ctx context.Context, candidate Candidate, summary *RunSummary) bool {
+	algorithm := *candidate.marker(kindIntro).Algorithm
+	withdrawn, err := a.repo.WithdrawMarker(ctx, MarkerWithdrawal{
+		Kind:         kindIntro,
+		ExpectedFile: candidate.expectedFile(),
+		FileID:       candidate.FileID,
+		Algorithm:    algorithm,
+	})
+	if err != nil {
+		summary.Errors = append(summary.Errors, fmt.Sprintf("file %d: %v", candidate.FileID, err))
+		a.logger.WarnContext(ctx, "intro chapter marker withdrawal failed", "file_id", candidate.FileID, "algorithm", algorithm, "error", err)
+		return false
+	}
+	if withdrawn {
+		summary.ChapterMarkersWithdrawn++
+	}
+	return withdrawn
+}
+
+func candidateFileIDs(candidates []Candidate) map[int]struct{} {
+	fileIDs := make(map[int]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		fileIDs[candidate.FileID] = struct{}{}
+	}
+	return fileIDs
+}
+
+func shouldPatchGroupFile(fileID int, allowed map[int]struct{}) bool {
+	if allowed == nil {
+		return true
+	}
+	_, ok := allowed[fileID]
+	return ok
+}
+
+// fingerprintCounts tallies how a group's fingerprints were obtained.
+type fingerprintCounts struct {
+	hits     int
+	computed int
+	// failed counts extractions that failed in this analysis.
+	failed int
+	// deferred counts files skipped while an earlier failure backs off.
+	deferred int
+}
+
+// ensureFingerprints loads cached intro fingerprints and extracts missing
+// ones. It returns the inputs with how they were obtained; a database error
+// or cancellation is returned as err. Credits inputs come from
+// ensureCreditsInputs.
+func (a *Analyzer) ensureFingerprints(ctx context.Context, candidates []Candidate) ([]fingerprintInput, fingerprintCounts, error) {
+	var (
+		mu       sync.Mutex
+		inputs   []fingerprintInput
+		counts   fingerprintCounts
+		firstErr error
+	)
+	setErr := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+	}
+	count := func(field *int, input *fingerprintInput) {
+		mu.Lock()
+		*field++
+		if input != nil {
+			inputs = append(inputs, *input)
+		}
+		mu.Unlock()
+	}
+	lookupFingerprint := a.fingerprintLookupFunc()
+	acquire := a.ffmpegAcquirer()
+	var wg sync.WaitGroup
+	for _, candidate := range candidates {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := ctx.Err(); err != nil {
+				setErr(err)
+				return
+			}
+			cached, lookup, err := lookupFingerprint(ctx, candidate)
+			if err != nil {
+				setErr(err)
+				return
+			}
+			switch lookup {
+			case fingerprintCached:
+				count(&counts.hits, &fingerprintInput{Candidate: candidate, Points: cached.Points, WindowStart: cached.WindowStartSeconds})
+				return
+			case fingerprintUnusable:
+				return
+			case fingerprintDeferred:
+				count(&counts.deferred, nil)
+				return
+			}
+
+			release, err := acquire(ctx)
+			if err != nil {
+				setErr(err)
+				return
+			}
+			fp, ok, err := a.extractor.Extract(ctx, candidate)
+			release()
+			if err != nil {
+				if ctx.Err() != nil {
+					setErr(ctx.Err())
+					return
+				}
+				a.logger.WarnContext(ctx, "marker fingerprint extraction failed", "kind", kindIntro.String(), "file_id", candidate.FileID, "path", candidate.FilePath, "error", err)
+				count(&counts.failed, nil)
+				return
+			}
+			if !ok {
+				return
+			}
+			if err := a.repo.UpsertFingerprint(ctx, fp); err != nil {
+				setErr(err)
+				return
+			}
+			count(&counts.computed, &fingerprintInput{Candidate: candidate, Points: fp.Points, WindowStart: fp.WindowStartSeconds})
+		}()
+	}
+	wg.Wait()
+	sort.Slice(inputs, func(i, j int) bool {
+		return inputs[i].Candidate.FileID < inputs[j].Candidate.FileID
+	})
+	return inputs, counts, firstErr
+}
+
+// settleSeasonState records a group's analysis status. A failed extraction
+// (unlike a file with no audio to fingerprint) may succeed later, so the
+// group stays partial and is retried even though its inputs have not
+// changed. A failed status stands, since partial would settle it for a while.
+func settleSeasonState(state *SeasonState, status string, counts fingerprintCounts) {
+	state.Status = status
+	if status == seasonStatusFailed {
+		return
+	}
+	if failed := counts.failed + counts.deferred; failed > 0 {
+		state.Status = seasonStatusPartial
+		state.LastError = fmt.Sprintf("%d fingerprint extraction(s) failed", failed)
+	}
+}
+
+func distinctEpisodeCount(candidates []Candidate) int {
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		seen[candidate.EpisodeID] = struct{}{}
+	}
+	return len(seen)
+}
+
+func distinctFingerprintEpisodeCount(inputs []fingerprintInput) int {
+	seen := map[string]struct{}{}
+	for _, input := range inputs {
+		seen[input.Candidate.EpisodeID] = struct{}{}
+	}
+	return len(seen)
+}
+
+// Merge adds src's counts to s, as when one task runs RunEpisodes and
+// RunMovies. Both passes count the same libraries, so s keeps the larger
+// library count rather than their sum.
+func (s *RunSummary) Merge(src RunSummary) {
+	libraries := max(s.LibrariesScanned, src.LibrariesScanned)
+	mergeRunSummary(s, src)
+	s.LibrariesScanned = libraries
+}
+
+func mergeRunSummary(dst *RunSummary, src RunSummary) {
+	dst.LibrariesScanned += src.LibrariesScanned
+	dst.FilesConsidered += src.FilesConsidered
+	dst.SeasonGroupsConsidered += src.SeasonGroupsConsidered
+	dst.FingerprintsComputed += src.FingerprintsComputed
+	dst.FingerprintCacheHits += src.FingerprintCacheHits
+	dst.ChapterMarkersWritten += src.ChapterMarkersWritten
+	dst.ChromaprintMarkersWritten += src.ChromaprintMarkersWritten
+	dst.ChromaprintMarkersWithdrawn += src.ChromaprintMarkersWithdrawn
+	dst.ChapterMarkersWithdrawn += src.ChapterMarkersWithdrawn
+	dst.GroupsNotFound += src.GroupsNotFound
+	dst.GroupsSkipped += src.GroupsSkipped
+	dst.FingerprintExtractionErrors += src.FingerprintExtractionErrors
+	dst.Errors = append(dst.Errors, src.Errors...)
+	if src.ChromaprintSupported {
+		dst.ChromaprintSupported = true
+	}
+	if src.ChromaprintSupportMessage != "" {
+		dst.ChromaprintSupportMessage = src.ChromaprintSupportMessage
+	}
+	dst.SilenceRefinementsAttempted += src.SilenceRefinementsAttempted
+	dst.SilenceRefinementsApplied += src.SilenceRefinementsApplied
+	dst.SilenceRefinementErrors += src.SilenceRefinementErrors
+	dst.EpisodeVersionMarkersCopied += src.EpisodeVersionMarkersCopied
+	dst.SilenceBackfillConsidered += src.SilenceBackfillConsidered
+	dst.CreditsSeasonGroupsConsidered += src.CreditsSeasonGroupsConsidered
+	dst.CreditsGroupsNotFound += src.CreditsGroupsNotFound
+	dst.CreditsGroupsSkipped += src.CreditsGroupsSkipped
+	dst.CreditsChapterMarkersWritten += src.CreditsChapterMarkersWritten
+	dst.CreditsVersionMarkersCopied += src.CreditsVersionMarkersCopied
+	dst.CreditsChapterMarkersWithdrawn += src.CreditsChapterMarkersWithdrawn
+	dst.CreditsFingerprintsComputed += src.CreditsFingerprintsComputed
+	dst.CreditsFingerprintCacheHits += src.CreditsFingerprintCacheHits
+	dst.CreditsFingerprintErrors += src.CreditsFingerprintErrors
+	dst.CreditsAudioMarkersWritten += src.CreditsAudioMarkersWritten
+	dst.CreditsRejected += src.CreditsRejected
+	dst.CreditsTailScansComputed += src.CreditsTailScansComputed
+	dst.CreditsTailCacheHits += src.CreditsTailCacheHits
+	dst.CreditsTailScanErrors += src.CreditsTailScanErrors
+	dst.CreditsTailUnusable += src.CreditsTailUnusable
+	dst.CreditsAudioVideoMarkersWritten += src.CreditsAudioVideoMarkersWritten
+	dst.CreditsVideoMarkersWritten += src.CreditsVideoMarkersWritten
+	dst.MoviesConsidered += src.MoviesConsidered
+	dst.MovieCreditsMarkersWritten += src.MovieCreditsMarkersWritten
+	if src.MovieBudgetExhausted {
+		dst.MovieBudgetExhausted = true
+	}
+	if src.EpisodeBudgetExhausted {
+		dst.EpisodeBudgetExhausted = true
+	}
+}

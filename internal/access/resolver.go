@@ -1,0 +1,368 @@
+package access
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/settingsresolve"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// UserRepository loads account-level access settings.
+type UserRepository interface {
+	GetByID(ctx context.Context, id int) (*models.User, error)
+}
+
+// ProfileTokenValidator validates short-lived profile verification tokens.
+type ProfileTokenValidator interface {
+	Validate(tokenStr string) (*ProfileTokenClaims, error)
+}
+
+// UnratedContentPolicy reports the server-wide decision for titles whose
+// rating is empty or explicitly unrated (server setting access.unrated_content).
+// Implemented by *config.UnratedContentPolicy.
+type UnratedContentPolicy interface {
+	AllowUnratedContent(ctx context.Context) bool
+}
+
+// Resolver resolves a viewer request into an effective access scope.
+type Resolver struct {
+	users        UserRepository
+	storeFactory userstore.UserStoreProvider
+	tokens       ProfileTokenValidator
+	groups       GroupPolicyProvider
+	unrated      UnratedContentPolicy
+	defaults     settingsresolve.ServerSettings
+}
+
+// WithUnratedContentPolicy installs the reader for access.unrated_content and
+// returns the resolver, so wiring can add it without every caller passing one.
+// Without it a resolved scope hides unrated titles from ceilinged profiles,
+// which is the setting's default.
+func (r *Resolver) WithUnratedContentPolicy(policy UnratedContentPolicy) *Resolver {
+	if r != nil {
+		r.unrated = policy
+	}
+	return r
+}
+
+// WithAdminDefaults installs the administrator's setting defaults (the node's
+// shared *config.AdminDefaults) and returns the resolver. Without it a profile
+// with no Next Up choice of its own gets the contract default instead of the
+// administrator's.
+func (r *Resolver) WithAdminDefaults(defaults settingsresolve.ServerSettings) *Resolver {
+	if r != nil {
+		r.defaults = defaults
+	}
+	return r
+}
+
+// NewResolver creates a new scope resolver.
+func NewResolver(users UserRepository, storeFactory userstore.UserStoreProvider, tokens ProfileTokenValidator, groups ...GroupPolicyProvider) *Resolver {
+	var groupProvider GroupPolicyProvider
+	if len(groups) > 0 {
+		groupProvider = groups[0]
+	}
+	return &Resolver{
+		users:        users,
+		storeFactory: storeFactory,
+		tokens:       tokens,
+		groups:       groupProvider,
+	}
+}
+
+// Resolve computes the effective viewer scope for the request.
+func (r *Resolver) Resolve(ctx context.Context, input ResolveInput) (Scope, error) {
+	user, err := r.users.GetByID(ctx, input.UserID)
+	if err != nil {
+		return Scope{}, fmt.Errorf("loading user %d: %w", input.UserID, err)
+	}
+	effective, err := EffectivePolicyForUser(ctx, user, r.groups)
+	if err != nil {
+		return Scope{}, fmt.Errorf("loading access group policy for user %d: %w", input.UserID, err)
+	}
+
+	scope := Scope{
+		UserID:                     user.ID,
+		ProfileID:                  input.ProfileID,
+		AllowedLibraryIDs:          cloneInts(effective.LibraryIDs),
+		LibrariesRestricted:        effective.LibraryIDs != nil,
+		MaxPlaybackQuality:         NormalizePlaybackQuality(effective.MaxPlaybackQuality),
+		MaxRemoteStreamBitrateKbps: effective.MaxRemoteStreamBitrateKbps,
+		MaxLocalStreamBitrateKbps:  effective.MaxLocalStreamBitrateKbps,
+		PolicyRevision:             user.AccessPolicyRevision,
+		ProfileVerified:            input.ProfileID == "",
+	}
+	if r.unrated != nil {
+		scope.AllowUnratedContent = r.unrated.AllowUnratedContent(ctx)
+	}
+
+	store, err := r.storeFactory.ForUser(ctx, input.UserID)
+	if err != nil {
+		return Scope{}, fmt.Errorf("opening user store for %d: %w", input.UserID, err)
+	}
+
+	preferences := ResolveViewerPreferences(ctx, store, r.defaults, input.ProfileID)
+	var profile *userstore.Profile
+	if input.ProfileID != "" {
+		profile, err = store.GetProfile(ctx, input.ProfileID)
+		if err != nil {
+			return Scope{}, fmt.Errorf("loading profile %s: %w", input.ProfileID, err)
+		}
+		if profile == nil {
+			return Scope{}, ErrProfileNotFound
+		}
+
+		scope.MaturityLimits = ProfileMaturity(profile, scope.AllowUnratedContent)
+		scope.MaxPlaybackQuality = MinQuality(scope.MaxPlaybackQuality, NormalizePlaybackQuality(profile.MaxPlaybackQuality))
+		scope.PreferredMetadataLanguage = preferences.PreferredMetadataLanguage
+		scope.MetadataLanguageOverrides = preferences.MetadataLanguageOverrides
+		scope.NextUpMode = preferences.NextUpMode
+		scope.NextUpNewReleasesFirst = preferences.NextUpNewReleasesFirst
+		scope.HideWatchedItemsOnHome = preferences.HideWatchedItemsOnHome
+		scope.CardAvailability = preferences.CardAvailability
+		scope.AllowedLibraryIDs, scope.LibrariesRestricted = ProfileLibraries(effective.LibraryIDs, profile)
+		verified, pinSkipped, err := VerifyProfileForRequest(profile, input, user.ID, r.tokens)
+		if err != nil {
+			return Scope{}, err
+		}
+		scope.ProfileVerified = verified
+		scope.PINVerificationSkipped = pinSkipped
+		scope.ProfilePINRevision = profile.PINRevision
+	}
+
+	scope.PreferencesDegraded = preferences.Degraded
+
+	// Apply the profile's disabled library IDs setting.
+	disabled := preferences.DisabledLibraryIDs
+	if len(disabled) > 0 && !input.ContentAccessOnly {
+		if scope.AllowedLibraryIDs != nil {
+			// Restricted user: subtract disabled IDs from the allowed set,
+			// remembering which allowed ones the profile hid.
+			if hidden := intersectInts(scope.AllowedLibraryIDs, disabled); len(hidden) > 0 {
+				scope.HiddenLibraryIDs = hidden
+			}
+			scope.AllowedLibraryIDs = subtractInts(scope.AllowedLibraryIDs, disabled)
+		} else {
+			// Unrestricted user: pass disabled IDs through so query layer
+			// can apply a NOT IN filter.
+			scope.DisabledLibraryIDs = disabled
+		}
+	}
+
+	return scope, nil
+}
+
+// VerifyProfileForRequest applies the profile PIN/token verification checks
+// for a resolved profile. It reports whether the profile is verified for the
+// request and whether that verification was only skipped: a PIN-locked
+// profile accepted through input.SkipPINVerification without a valid profile
+// token. A valid token bound to a login session counts as a real proof even
+// when the PIN could be skipped, so a view-as session that did enter the PIN
+// can still manage the household. A sessionless credential (an API key) stays
+// skipped whatever token it sends: its token is bound to no login session and
+// outlives the key.
+func VerifyProfileForRequest(
+	profile *userstore.Profile,
+	input ResolveInput,
+	userID int,
+	tokens ProfileTokenValidator,
+) (verified, pinSkipped bool, err error) {
+	if profile == nil {
+		return input.ProfileID == "", false, nil
+	}
+	if profile.PINHash == "" {
+		return true, false, nil
+	}
+	if input.SkipPINVerification && (input.ProfileToken == "" || input.SessionID == "") {
+		return true, true, nil
+	}
+	if err := CheckProfileToken(tokens, input.ProfileToken, userID, input.SessionID, profile); err != nil {
+		if input.SkipPINVerification {
+			return true, true, nil
+		}
+		return false, false, err
+	}
+	return true, false, nil
+}
+
+// CheckProfileToken reports whether token proves the caller entered profile's
+// current PIN in this login session. The proof is bound to the account, the
+// login session, the profile and the profile's PIN revision: revoking the
+// session, deleting the profile or changing its PIN ends it. Edits to the
+// profile's limits, to other profiles and to the account's access policy do
+// not, because every request re-resolves those limits; the token proves only
+// knowledge of the PIN. A nil validator never verifies.
+func CheckProfileToken(
+	tokens ProfileTokenValidator,
+	token string,
+	userID int,
+	sessionID string,
+	profile *userstore.Profile,
+) error {
+	if tokens == nil || profile == nil {
+		return ErrProfileUnverified
+	}
+	claims, err := tokens.Validate(token)
+	if err != nil {
+		return err
+	}
+	if claims.UserID != userID ||
+		claims.SessionID != sessionID ||
+		claims.ProfileID != profile.ID ||
+		claims.PINRevision != profile.PINRevision {
+		return ErrProfileUnverified
+	}
+	return nil
+}
+
+// DisabledLibraryIDs resolves the libraries the acting profile has hidden from
+// its own browsing: the canonical profile-scoped ui.disabled_library_ids row.
+//
+// The legacy account-wide disabled_library_ids setting is no longer read. The
+// Postgres migration materialize_retired_settings_fallbacks and SQLite schema
+// v26 copied it onto every profile that had no canonical row, so each profile
+// keeps the value the fallback used to supply; a store restored from a
+// pre-cutover snapshot runs both the backfill and that migration before it
+// serves a request.
+func DisabledLibraryIDs(ctx context.Context, store userstore.UserStore, profileID string) []int {
+	// ui.disabled_library_ids declares no admin_default.
+	return ResolveViewerPreferences(ctx, store, nil, profileID).DisabledLibraryIDs
+}
+
+// parseLibraryIDList decodes a JSON library-id array, dropping anything that
+// is not a positive id. Malformed JSON reads as an empty list.
+func parseLibraryIDList(raw json.RawMessage) []int {
+	var ids []int
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		return nil
+	}
+	n := 0
+	for _, id := range ids {
+		if id > 0 {
+			ids[n] = id
+			n++
+		}
+	}
+	return ids[:n]
+}
+
+// subtractInts removes all values in exclude from src, preserving order.
+func subtractInts(src, exclude []int) []int {
+	if len(exclude) == 0 {
+		return src
+	}
+	set := make(map[int]struct{}, len(exclude))
+	for _, id := range exclude {
+		set[id] = struct{}{}
+	}
+	out := make([]int, 0, len(src))
+	for _, id := range src {
+		if _, ok := set[id]; !ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// ProfileMaturity is the profile's maturity limits under the server's
+// unrated-content decision, with its allowed titles, as Resolve applies them.
+func ProfileMaturity(profile *userstore.Profile, allowUnrated bool) MaturityLimits {
+	return MaturityLimits{
+		MaxContentRating:    profile.MaxContentRating,
+		AllowUnratedContent: allowUnrated,
+		MaxAdvisoryAge:      profile.MaxAdvisoryAge,
+		RequireAdvisoryAge:  profile.RequireAdvisoryAge && profile.MaxAdvisoryAge > 0,
+	}.WithAllowedTitles(profile.AllowedTitleIDs)
+}
+
+// ProfileLibraries is the libraries a profile may see under its account's
+// effective library list, and whether that is a restriction, as Resolve
+// computes them. Libraries the profile hid itself are not subtracted: hiding
+// is not access.
+func ProfileLibraries(accountLibraryIDs []int, profile *userstore.Profile) ([]int, bool) {
+	return effectiveLibraries(accountLibraryIDs, profile)
+}
+
+// ProfileLibraryLimit is the profile's own library limit: the libraries it is
+// limited to, and whether it has a limit. The primary profile never has one:
+// it inherits its account's libraries and narrows what it browses only by
+// hiding libraries (ui.disabled_library_ids), which it can undo. A limit
+// stored on a primary profile, by an older server or a restored backup, is
+// ignored.
+func ProfileLibraryLimit(profile *userstore.Profile) ([]int, bool) {
+	if profile == nil || profile.IsPrimary || !profile.LibraryRestrictionsEnabled {
+		return nil, false
+	}
+	return profile.AllowedLibraryIDs, true
+}
+
+func effectiveLibraries(accountLibraryIDs []int, profile *userstore.Profile) ([]int, bool) {
+	accountRestricted := accountLibraryIDs != nil
+	profileLibraryIDs, profileRestricted := ProfileLibraryLimit(profile)
+
+	switch {
+	case accountRestricted && profileRestricted:
+		return intersectInts(accountLibraryIDs, profileLibraryIDs), true
+	case accountRestricted:
+		return cloneInts(accountLibraryIDs), true
+	case profileRestricted:
+		return sortedUniqueInts(profileLibraryIDs), true
+	default:
+		return nil, false
+	}
+}
+
+func intersectInts(left, right []int) []int {
+	if len(left) == 0 || len(right) == 0 {
+		return []int{}
+	}
+	set := make(map[int]struct{}, len(left))
+	for _, id := range left {
+		set[id] = struct{}{}
+	}
+	var out []int
+	for _, id := range right {
+		if _, ok := set[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return sortedUniqueInts(out)
+}
+
+func sortedUniqueInts(values []int) []int {
+	if len(values) == 0 {
+		return []int{}
+	}
+	out := cloneInts(values)
+	sort.Ints(out)
+	n := 1
+	for i := 1; i < len(out); i++ {
+		if out[i] != out[i-1] {
+			out[n] = out[i]
+			n++
+		}
+	}
+	return out[:n]
+}
+
+func cloneInts(values []int) []int {
+	if values == nil {
+		return nil
+	}
+	out := make([]int, len(values))
+	copy(out, values)
+	return out
+}
+
+// CheckProfileVerification checks request proof against a freshly loaded profile.
+// PIN exemptions cannot authorize household management of a locked profile.
+func (s Scope) CheckProfileVerification(profile *userstore.Profile) error {
+	if profile == nil || s.ProfileID != profile.ID || !s.ProfileVerified || s.PINVerificationSkipped || s.ProfilePINRevision != profile.PINRevision {
+		return ErrProfileUnverified
+	}
+	return nil
+}

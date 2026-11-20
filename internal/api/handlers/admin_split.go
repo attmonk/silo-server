@@ -1,0 +1,703 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/catalog/filesplit"
+	"github.com/Silo-Server/silo-server/internal/catalog/reattribute"
+	"github.com/Silo-Server/silo-server/internal/contentid"
+	"github.com/Silo-Server/silo-server/internal/metadata"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/scanner"
+)
+
+// ItemMerger merges one catalog item into another, moving files and user
+// state (implemented by metadata.MetadataService.MergeItems).
+type ItemMerger interface {
+	MergeItems(ctx context.Context, fromContentID, toContentID string) error
+}
+
+// AdminSplitHandler implements the split/merge repair endpoints:
+//
+//	POST /admin/items/{id}/split — move a subset of an item's files to another
+//	  (possibly new) item, persist path-scoped identity overrides so rescans
+//	  converge, and reattribute per-user watch state.
+//	POST /admin/items/{id}/merge — fold a duplicate item into another.
+type AdminSplitHandler struct {
+	pool         *pgxpool.Pool
+	items        MatchItemLookup
+	metadata     MatchMetadataService // post-commit identify of the target; may be nil
+	merger       ItemMerger           // may be nil (merge endpoint disabled)
+	refresher    AdminMetadataRefresher
+	scanner      *scanner.Scanner
+	folderRepo   *catalog.FolderRepository
+	overrideRepo *scanner.MediaIdentityOverrideRepository
+	recsStaler   metadata.RecommendationStaler // may be nil
+}
+
+// SetRecommendationStaler installs what marks recommendations stale after a
+// split moves user state onto its target.
+func (h *AdminSplitHandler) SetRecommendationStaler(staler metadata.RecommendationStaler) {
+	if h != nil {
+		h.recsStaler = staler
+	}
+}
+
+// NewAdminSplitHandler wires the split/merge endpoints. metadataSvc, merger,
+// refresher and scannerInstance are optional; nil disables the corresponding
+// follow-up behavior (or the merge endpoint).
+func NewAdminSplitHandler(
+	pool *pgxpool.Pool,
+	items MatchItemLookup,
+	metadataSvc MatchMetadataService,
+	merger ItemMerger,
+	refresher AdminMetadataRefresher,
+	scannerInstance *scanner.Scanner,
+	folderRepo *catalog.FolderRepository,
+) *AdminSplitHandler {
+	return &AdminSplitHandler{
+		pool:         pool,
+		items:        items,
+		metadata:     metadataSvc,
+		merger:       merger,
+		refresher:    refresher,
+		scanner:      scannerInstance,
+		folderRepo:   folderRepo,
+		overrideRepo: scanner.NewMediaIdentityOverrideRepository(pool),
+	}
+}
+
+type splitTargetRequest struct {
+	ProviderIDs map[string]string `json:"provider_ids,omitempty"`
+	ContentID   string            `json:"content_id,omitempty"`
+	Unmatched   bool              `json:"unmatched,omitempty"`
+	// Title/Year seed the skeleton row when the target does not exist yet
+	// (the post-commit identify replaces them with provider metadata).
+	Title string `json:"title,omitempty"`
+	Year  int    `json:"year,omitempty"`
+}
+
+type splitItemRequest struct {
+	FileIDs         []int              `json:"file_ids"`
+	Target          splitTargetRequest `json:"target"`
+	HistoryMode     string             `json:"history_mode,omitempty"`
+	PersistOverride *bool              `json:"persist_override,omitempty"`
+	DryRun          bool               `json:"dry_run,omitempty"`
+}
+
+type splitItemResponse struct {
+	DryRun          bool                `json:"dry_run"`
+	SourceContentID string              `json:"source_content_id"`
+	TargetContentID string              `json:"target_content_id"`
+	TargetCreated   bool                `json:"target_created"`
+	FilesMoved      int                 `json:"files_moved"`
+	RootOverrides   []string            `json:"root_overrides"`
+	FileOverrides   []string            `json:"file_overrides"`
+	EpisodePairs    int                 `json:"episode_pairs"`
+	Reattribution   *reattribute.Report `json:"reattribution"`
+}
+
+// splitFile remains a local alias so the HTTP layer and the automatic repair
+// path share the same transactional file-move primitive.
+type splitFile = filesplit.File
+
+type itemFileResponse struct {
+	ID               int    `json:"id"`
+	LibraryID        int    `json:"library_id"`
+	FilePath         string `json:"file_path"`
+	ObservedRootPath string `json:"observed_root_path"`
+	SeasonNumber     int    `json:"season_number,omitempty"`
+	EpisodeNumber    int    `json:"episode_number,omitempty"`
+}
+
+type AdminSplitRequest = splitItemRequest
+type AdminSplitTarget = splitTargetRequest
+type AdminSplitResult = splitItemResponse
+
+func (h *AdminSplitHandler) SplitAdminItem(ctx context.Context, sourceID string, req AdminSplitRequest) (AdminSplitResult, error) {
+	if h == nil || h.pool == nil || h.items == nil {
+		return AdminSplitResult{}, apiError(http.StatusServiceUnavailable, "unavailable", "Item splitting is not configured")
+	}
+	mode := reattribute.HistoryMode(strings.TrimSpace(req.HistoryMode))
+	if mode == "" {
+		mode = reattribute.HistoryModeEvidence
+	}
+	if !reattribute.ValidHistoryMode(mode) {
+		return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request", "history_mode must be evidence, keep, or move_all")
+	}
+	if len(req.FileIDs) == 0 {
+		return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request", "file_ids is required")
+	}
+
+	sourceItem, err := h.items.GetByID(ctx, sourceID)
+	if err != nil {
+		return AdminSplitResult{}, apiError(http.StatusNotFound, "not_found", "Item not found")
+	}
+	if sourceItem.Type != "movie" && sourceItem.Type != "series" {
+		return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request", "Split is only supported for movie and series items")
+	}
+
+	files, err := h.loadItemFiles(ctx, sourceID)
+	if err != nil {
+		slog.ErrorContext(ctx, "admin split: loading item files", "component", "api", "content_id", sourceID, "error", err)
+		return AdminSplitResult{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to load item files")
+	}
+	byID := make(map[int]splitFile, len(files))
+	for _, f := range files {
+		byID[f.ID] = f
+	}
+	moved := make([]splitFile, 0, len(req.FileIDs))
+	seen := map[int]bool{}
+	for _, id := range req.FileIDs {
+		f, ok := byID[id]
+		if !ok {
+			return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request", fmt.Sprintf("File %d does not belong to this item", id))
+		}
+		if !seen[id] {
+			seen[id] = true
+			moved = append(moved, f)
+		}
+	}
+	if len(moved) == len(files) {
+		return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request",
+			"Selection covers every file; use match/apply to re-identify the whole item instead of splitting it")
+	}
+
+	target, err := h.resolveSplitTarget(ctx, sourceItem, moved, req.Target)
+	if err != nil {
+		return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+
+	// Everything transactional happens here; a dry run rolls back at the end.
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		slog.ErrorContext(ctx, "admin split: begin transaction", "component", "api", "error", err)
+		return AdminSplitResult{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to start split")
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Reload under file locks: scanner upserts may change folders without
+	// changing content_id. Every later scope decision and write uses these rows.
+	// Files lock before their parent items, the order scanner writers use
+	// (episode linking updates a series' files, then the series row); the
+	// reverse order deadlocks with them.
+	moved, err = loadSelectedSplitFiles(ctx, tx, sourceID, req.FileIDs)
+	if err != nil {
+		return AdminSplitResult{}, splitTransactionError(ctx, err)
+	}
+	itemTypes, err := catalog.LockMetadataCurationItems(ctx, tx, sourceID, target.contentID)
+	if err != nil {
+		return AdminSplitResult{}, splitTransactionError(ctx, err)
+	}
+	if itemTypes[sourceID] != sourceItem.Type {
+		return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request", "Source item changed; retry the split")
+	}
+	// A new target keeps the chosen provider IDs, and later refreshes merge it
+	// onto any item already holding them, so those items must be in scope too.
+	if target.created {
+		ids := contentid.ProviderIDs{Tmdb: target.providerIDs["tmdb"], Imdb: target.providerIDs["imdb"], Tvdb: target.providerIDs["tvdb"]}
+		if err := catalog.LockMetadataCurationIdentity(ctx, tx, sourceItem.Type, "", ids, sourceID, target.contentID); err != nil {
+			return AdminSplitResult{}, splitTransactionError(ctx, err)
+		}
+	}
+	if len(moved) != len(seen) {
+		return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request", "Selected files changed; retry the split")
+	}
+	var total int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id = $1`, sourceID).Scan(&total); err != nil {
+		return AdminSplitResult{}, splitTransactionError(ctx, err)
+	}
+	if len(moved) == total {
+		return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request",
+			"Selection covers every file; use match/apply to re-identify the whole item instead of splitting it")
+	}
+	if err := access.AuthorizeMetadataCurationLibraries(ctx, distinctFolderIDs(moved)); err != nil {
+		return AdminSplitResult{}, splitTransactionError(ctx, err)
+	}
+	if req.Target.Unmatched && strings.TrimSpace(req.Target.ContentID) == "" && len(normalizeMatchProviderIDs(req.Target.ProviderIDs)) == 0 && target.contentID != contentid.ForLocal(moved[0].FilePath) {
+		return AdminSplitResult{}, apiError(http.StatusBadRequest, "bad_request", "Selected file path changed; retry the split")
+	}
+	target.created, err = ensureSplitTarget(ctx, tx, target, sourceItem, itemTypes)
+	if err != nil {
+		return AdminSplitResult{}, splitTransactionError(ctx, err)
+	}
+	moveResult, err := filesplit.Move(ctx, tx, filesplit.Options{
+		FromContentID: sourceID,
+		ToContentID:   target.contentID,
+		ItemType:      sourceItem.Type,
+		Files:         moved,
+		HistoryMode:   mode,
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "admin split: moving files", "component", "api", "target", target.contentID, "error", err)
+		return AdminSplitResult{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to move files")
+	}
+
+	rootOverrides, fileOverrides := []string{}, []string{}
+	persistOverride := req.PersistOverride == nil || *req.PersistOverride
+	if persistOverride && target.hasForcedIdentity() {
+		rootOverrides, fileOverrides, err = h.persistOverrides(ctx, tx, moved, target, middleware.GetUserID(ctx))
+		if err != nil {
+			slog.ErrorContext(ctx, "admin split: persisting overrides", "component", "api", "error", err)
+			return AdminSplitResult{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to persist identity overrides")
+		}
+	}
+
+	report := moveResult.Reattribution
+	episodePairs := moveResult.EpisodePairs
+
+	if !req.DryRun {
+		if err := tx.Commit(ctx); err != nil {
+			slog.ErrorContext(ctx, "admin split: commit", "component", "api", "error", err)
+			return AdminSplitResult{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to commit split")
+		}
+		slog.InfoContext(ctx, "admin split: item split", "component", "api",
+			"actor_user_id", middleware.GetUserID(ctx),
+			"source_content_id", sourceID,
+			"target_content_id", target.contentID,
+			"target_created", target.created,
+			"files_moved", len(moved),
+			"history_mode", mode,
+			"history_moved", report.HistoryMoved,
+			"history_ambiguous", report.HistoryAmbiguous,
+			"progress_moved", report.ProgressMoved,
+		)
+		metadata.MarkRecommendationsStale(ctx, h.recsStaler, metadata.MovedStateTargets(report, target.contentID, episodePairs)...)
+		h.runPostSplitFollowUps(ctx, sourceID, target, moved)
+	}
+
+	return AdminSplitResult{
+		DryRun:          req.DryRun,
+		SourceContentID: sourceID,
+		TargetContentID: target.contentID,
+		TargetCreated:   target.created,
+		FilesMoved:      len(moved),
+		RootOverrides:   rootOverrides,
+		FileOverrides:   fileOverrides,
+		EpisodePairs:    len(episodePairs),
+		Reattribution:   report,
+	}, nil
+}
+
+func (h *AdminSplitHandler) MergeAdminItem(ctx context.Context, sourceID, into string) (string, error) {
+	if h == nil || h.merger == nil {
+		return "", apiError(http.StatusInternalServerError, "internal_error", "Merge is not available")
+	}
+	into = strings.TrimSpace(into)
+	if into == "" {
+		return "", apiError(http.StatusBadRequest, "bad_request", "into is required")
+	}
+
+	if err := h.merger.MergeItems(ctx, sourceID, into); err != nil {
+		if errors.Is(err, access.ErrMetadataCurationScope) {
+			return "", metadataCurationForbidden()
+		}
+		if errors.Is(err, catalog.ErrItemNotFound) {
+			return "", apiError(http.StatusNotFound, "not_found", "Item not found")
+		}
+		slog.WarnContext(ctx, "admin merge: failed", "component", "api", "source", sourceID, "target", into, "error", err)
+		return "", apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+	slog.InfoContext(ctx, "admin merge: item merged", "component", "api",
+		"actor_user_id", middleware.GetUserID(ctx),
+		"source_content_id", sourceID,
+		"target_content_id", into,
+	)
+	if h.refresher != nil {
+		if err := h.refresher.RefreshItem(context.WithoutCancel(ctx), into); err != nil {
+			slog.WarnContext(ctx, "admin merge: target refresh failed", "component", "api", "content_id", into, "error", err)
+		}
+	}
+	return into, nil
+}
+
+// splitTarget is the resolved destination of a split.
+type splitTarget struct {
+	contentID   string
+	created     bool
+	itemType    string
+	title       string
+	year        int
+	providerIDs map[string]string // normalized; empty for unmatched targets
+}
+
+func (t splitTarget) hasForcedIdentity() bool {
+	return len(t.providerIDs) > 0 || strings.TrimSpace(t.title) != ""
+}
+
+func (h *AdminSplitHandler) resolveSplitTarget(
+	ctx context.Context,
+	sourceItem *models.MediaItem,
+	moved []splitFile,
+	req splitTargetRequest,
+) (splitTarget, error) {
+	target := splitTarget{
+		itemType:    sourceItem.Type,
+		title:       strings.TrimSpace(req.Title),
+		year:        req.Year,
+		providerIDs: normalizeMatchProviderIDs(req.ProviderIDs),
+	}
+
+	switch {
+	case strings.TrimSpace(req.ContentID) != "":
+		target.contentID = strings.TrimSpace(req.ContentID)
+		existing, err := h.items.GetByID(ctx, target.contentID)
+		if err != nil {
+			return target, fmt.Errorf("target item %s not found", target.contentID)
+		}
+		if existing.Type != sourceItem.Type {
+			return target, fmt.Errorf("target item is a %s, source is a %s", existing.Type, sourceItem.Type)
+		}
+		target.title = existing.Title
+		// Reuse the target's provider ids for override persistence so rescans
+		// route the moved files straight back to it.
+		if len(target.providerIDs) == 0 {
+			target.providerIDs = map[string]string{}
+			setMatchProviderID(target.providerIDs, "tmdb", existing.TmdbID)
+			setMatchProviderID(target.providerIDs, "imdb", existing.ImdbID)
+			setMatchProviderID(target.providerIDs, "tvdb", existing.TvdbID)
+		}
+	case len(target.providerIDs) > 0:
+		ids := contentid.ProviderIDs{
+			Tmdb: target.providerIDs["tmdb"],
+			Imdb: target.providerIDs["imdb"],
+			Tvdb: target.providerIDs["tvdb"],
+		}
+		var derived string
+		var ok bool
+		if sourceItem.Type == "series" {
+			derived, ok = contentid.ForSeries(ids)
+		} else {
+			derived, ok = contentid.ForMovie(ids)
+		}
+		if !ok {
+			return target, fmt.Errorf("provider_ids must include a usable tmdb, imdb, or tvdb id")
+		}
+		target.contentID = derived
+		if existing, err := h.items.GetByID(ctx, derived); err == nil && existing != nil {
+			target.title = existing.Title
+		} else {
+			target.created = true
+		}
+	case req.Unmatched:
+		// Path-derived local id, matching scanner behavior for untagged items.
+		target.contentID = contentid.ForLocal(moved[0].FilePath)
+		target.providerIDs = nil
+		if _, err := h.items.GetByID(ctx, target.contentID); err != nil {
+			target.created = true
+		}
+	default:
+		return target, fmt.Errorf("target requires provider_ids, content_id, or unmatched")
+	}
+
+	if target.contentID == sourceItem.ContentID {
+		return target, fmt.Errorf("target resolves to the source item; nothing to split")
+	}
+	if target.title == "" {
+		target.title = sourceItem.Title
+	}
+	return target, nil
+}
+
+func (h *AdminSplitHandler) loadItemFiles(ctx context.Context, contentID string) ([]splitFile, error) {
+	rows, err := h.pool.Query(ctx, `
+		SELECT id, COALESCE(content_id, ''), media_folder_id, file_path,
+		       COALESCE(canonical_root_path, ''),
+		       COALESCE(observed_root_path, ''),
+		       COALESCE(group_key_version, 1),
+		       COALESCE(content_group_key, ''),
+		       COALESCE(base_type, ''),
+		       COALESCE(season_number, 0),
+		       COALESCE(episode_number, 0),
+		       COALESCE(episode_id, '')
+		FROM media_files
+		WHERE content_id = $1
+		ORDER BY file_path ASC
+	`, contentID)
+	if err != nil {
+		return nil, err
+	}
+	return scanSplitFiles(rows)
+}
+
+func loadSelectedSplitFiles(ctx context.Context, tx pgx.Tx, sourceID string, ids []int) ([]splitFile, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT id, COALESCE(content_id, ''), media_folder_id, file_path,
+		       COALESCE(canonical_root_path, ''), COALESCE(observed_root_path, ''),
+		       COALESCE(group_key_version, 1), COALESCE(content_group_key, ''),
+		       COALESCE(base_type, ''), COALESCE(season_number, 0),
+		       COALESCE(episode_number, 0), COALESCE(episode_id, '')
+		FROM media_files WHERE content_id = $1 AND id = ANY($2::bigint[])
+		ORDER BY id FOR UPDATE`, sourceID, ids)
+	if err != nil {
+		return nil, err
+	}
+	files, err := scanSplitFiles(rows)
+	if err != nil {
+		return nil, err
+	}
+	// Lock order is independent of the caller's selection order, which picks
+	// the path anchor for an unmatched target.
+	order := make(map[int]int, len(ids))
+	for i, id := range ids {
+		if _, seen := order[id]; !seen {
+			order[id] = i
+		}
+	}
+	sort.Slice(files, func(i, j int) bool { return order[files[i].ID] < order[files[j].ID] })
+	return files, nil
+}
+
+func scanSplitFiles(rows pgx.Rows) ([]splitFile, error) {
+	defer rows.Close()
+	var files []splitFile
+	for rows.Next() {
+		var f splitFile
+		if err := rows.Scan(
+			&f.ID,
+			&f.ContentID,
+			&f.MediaFolderID,
+			&f.FilePath,
+			&f.CanonicalRootPath,
+			&f.ObservedRootPath,
+			&f.GroupKeyVersion,
+			&f.ContentGroupKey,
+			&f.BaseType,
+			&f.SeasonNumber,
+			&f.EpisodeNumber,
+			&f.EpisodeID,
+		); err != nil {
+			return nil, err
+		}
+		if f.ObservedRootPath == "" {
+			f.ObservedRootPath = filepath.Dir(f.FilePath)
+		}
+		files = append(files, f)
+	}
+	return files, rows.Err()
+}
+
+// ensureSplitTarget distinguishes this transaction's insert from an existing
+// destination, including one inserted after the initial parent-lock statement.
+func ensureSplitTarget(ctx context.Context, tx pgx.Tx, target splitTarget, source *models.MediaItem, itemTypes map[string]string) (bool, error) {
+	if itemType, exists := itemTypes[target.contentID]; exists {
+		if itemType != source.Type {
+			return false, apiError(http.StatusBadRequest, "bad_request", "Source and target item types must match")
+		}
+		return false, nil
+	}
+	if !target.created {
+		return false, apiError(http.StatusNotFound, "not_found", "Target item not found")
+	}
+	created, err := insertSkeletonItem(ctx, tx, target, source)
+	if err != nil || created {
+		return created, err
+	}
+	// INSERT lost to a concurrent creator. Authorize the actual existing row
+	// before adding libraries or moving any state onto it.
+	itemTypes, err = catalog.LockMetadataCurationItems(ctx, tx, target.contentID)
+	if err != nil {
+		return false, err
+	}
+	if itemTypes[target.contentID] != source.Type {
+		return false, apiError(http.StatusBadRequest, "bad_request", "Source and target item types must match")
+	}
+	return false, nil
+}
+
+func insertSkeletonItem(ctx context.Context, tx pgx.Tx, target splitTarget, sourceItem *models.MediaItem) (bool, error) {
+	year := target.year
+	if year == 0 && target.providerIDs == nil {
+		// Unmatched local target: keep the source year so the shell is legible.
+		year = sourceItem.Year
+	}
+	status := "pending"
+	if target.providerIDs == nil {
+		status = "unmatched"
+	}
+	result, err := tx.Exec(ctx, `
+		INSERT INTO media_items (content_id, type, title, year, status, tmdb_id, imdb_id, tvdb_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (content_id) DO NOTHING
+	`, target.contentID, target.itemType, target.title, year, status,
+		target.providerIDs["tmdb"], target.providerIDs["imdb"], target.providerIDs["tvdb"])
+	if err != nil {
+		return false, err
+	}
+	return result.RowsAffected() == 1, nil
+}
+
+// persistOverrides writes the durable path-scoped identity overrides: one
+// root-scope override per observed root whose files ALL moved, file-scope
+// overrides for partially-moved roots.
+func (h *AdminSplitHandler) persistOverrides(
+	ctx context.Context,
+	tx pgx.Tx,
+	moved []splitFile,
+	target splitTarget,
+	actorUserID int,
+) (rootPaths []string, filePaths []string, err error) {
+	// Non-nil so the JSON response carries [] instead of null.
+	rootPaths, filePaths = []string{}, []string{}
+	movedByRoot := map[string][]splitFile{}
+	folderByRoot := map[string]int{}
+	for _, f := range moved {
+		movedByRoot[f.ObservedRootPath] = append(movedByRoot[f.ObservedRootPath], f)
+		folderByRoot[f.ObservedRootPath] = f.MediaFolderID
+	}
+
+	roots := make([]string, 0, len(movedByRoot))
+	for root := range movedByRoot {
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+
+	base := models.MediaIdentityOverride{
+		ForcedType:   target.itemType,
+		ForcedTitle:  target.title,
+		ForcedYear:   target.year,
+		ForcedTmdbID: target.providerIDs["tmdb"],
+		ForcedImdbID: target.providerIDs["imdb"],
+		ForcedTvdbID: target.providerIDs["tvdb"],
+		Note:         fmt.Sprintf("split to %s", target.contentID),
+	}
+	if actorUserID > 0 {
+		base.CreatedByUserID = &actorUserID
+		base.UpdatedByUserID = &actorUserID
+	}
+
+	for _, root := range roots {
+		movedHere := movedByRoot[root]
+		folderID := folderByRoot[root]
+
+		// Root scope only when the moved selection covers every file under the
+		// root (any item): otherwise the override would drag neighbors along.
+		var totalAtRoot int
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM media_files
+			WHERE media_folder_id = $1 AND observed_root_path = $2
+		`, folderID, root).Scan(&totalAtRoot); err != nil {
+			return nil, nil, err
+		}
+
+		override := base
+		override.MediaFolderID = folderID
+		if totalAtRoot == len(movedHere) {
+			override.Scope = models.IdentityOverrideScopeRoot
+			override.RootPath = root
+			if err := h.overrideRepo.UpsertTx(ctx, tx, override); err != nil {
+				return nil, nil, err
+			}
+			rootPaths = append(rootPaths, root)
+			continue
+		}
+		for _, f := range movedHere {
+			fileOverride := override
+			fileOverride.Scope = models.IdentityOverrideScopeFile
+			fileOverride.FilePath = f.FilePath
+			if err := h.overrideRepo.UpsertTx(ctx, tx, fileOverride); err != nil {
+				return nil, nil, err
+			}
+			filePaths = append(filePaths, f.FilePath)
+		}
+	}
+	return rootPaths, filePaths, nil
+}
+
+// runPostSplitFollowUps performs the self-healing, non-transactional steps:
+// identify the target against its providers, refresh the source's aggregates,
+// and rescan the affected subtrees so scanner snapshots converge now instead
+// of at the next scheduled scan.
+func (h *AdminSplitHandler) runPostSplitFollowUps(origin context.Context, sourceID string, target splitTarget, moved []splitFile) {
+	folderIDs := distinctFolderIDs(moved)
+	roots := map[int]map[string]bool{}
+	for _, f := range moved {
+		if roots[f.MediaFolderID] == nil {
+			roots[f.MediaFolderID] = map[string]bool{}
+		}
+		roots[f.MediaFolderID][f.ObservedRootPath] = true
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(origin), 10*time.Minute)
+		defer cancel()
+
+		if h.metadata != nil && len(target.providerIDs) > 0 {
+			folderIDStr := ""
+			if len(folderIDs) == 1 {
+				folderIDStr = fmt.Sprintf("%d", folderIDs[0])
+			}
+			if _, err := h.metadata.Process(ctx, metadata.ProcessRequest{
+				ContentID:   target.contentID,
+				ProviderIDs: target.providerIDs,
+				FolderID:    folderIDStr,
+				Mode:        metadata.ModeIdentify,
+			}); err != nil {
+				slog.Warn("admin split: target identify failed (will retry via refresh debt)",
+					"content_id", target.contentID, "error", err)
+			}
+		}
+		if h.refresher != nil {
+			if err := h.refresher.RefreshItem(ctx, sourceID); err != nil {
+				slog.Warn("admin split: source refresh failed", "content_id", sourceID, "error", err)
+			}
+		}
+		if h.scanner != nil && h.folderRepo != nil {
+			for folderID, folderRoots := range roots {
+				folder, err := h.folderRepo.GetByID(ctx, folderID)
+				if err != nil {
+					slog.Warn("admin split: folder lookup for rescan failed", "folder_id", folderID, "error", err)
+					continue
+				}
+				for root := range folderRoots {
+					if _, err := h.scanner.ScanSubtree(ctx, folder, root); err != nil {
+						slog.Warn("admin split: subtree rescan failed",
+							"folder_id", folderID, "root", root, "error", err)
+					}
+				}
+			}
+		}
+	}()
+}
+
+func distinctFolderIDs(files []splitFile) []int {
+	seen := map[int]bool{}
+	var ids []int
+	for _, f := range files {
+		if !seen[f.MediaFolderID] {
+			seen[f.MediaFolderID] = true
+			ids = append(ids, f.MediaFolderID)
+		}
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+func metadataCurationForbidden() error {
+	return apiError(http.StatusForbidden, "forbidden", "Item is outside your assigned libraries")
+}
+
+func splitTransactionError(ctx context.Context, err error) error {
+	if api, ok := errors.AsType[*APIError](err); ok {
+		return api
+	}
+	if errors.Is(err, access.ErrMetadataCurationScope) {
+		return metadataCurationForbidden()
+	}
+	slog.ErrorContext(ctx, "admin split: preparing split", "component", "api", "error", err)
+	return apiError(http.StatusInternalServerError, "internal_error", "Failed to prepare split")
+}

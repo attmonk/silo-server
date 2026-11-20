@@ -1,0 +1,875 @@
+package notifications
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/discord"
+	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/mail"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/secret"
+	"github.com/Silo-Server/silo-server/internal/serveridentity"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// UserLister enumerates login accounts for the interest backfill. Satisfied
+// by *auth.UserRepository.
+type UserLister interface {
+	List(ctx context.Context) ([]*models.User, error)
+}
+
+// ImageURLResolver presigns stored image paths into client-fetchable URLs.
+// Satisfied by *catalog.DetailService.
+type ImageURLResolver interface {
+	PresignImageURL(ctx context.Context, path, imageType, size string) string
+}
+
+// System bundles the user-facing release-notification services: availability
+// detection, interest maintenance, fanout, inbox repositories, and websocket
+// tickets. It is distinct from the operational Hub in hub.go.
+type System struct {
+	Settings    *Settings
+	Releases    *ReleaseRepository
+	Interests   *InterestRepository
+	Deliveries  *DeliveryRepository
+	Preferences *PreferencesRepository
+	Detector    *AvailabilityDetector
+	Interest    *InterestUpdater
+	Fanout      *FanoutWorker
+	Tickets     TicketStore
+	// Webhooks is nil when no at-rest cipher is configured (webhook URLs are
+	// credentials and must not be stored in plaintext).
+	Webhooks *WebhookService
+	// PluginDestinations is nil when no at-rest cipher is configured:
+	// destination settings hold credentials. It delivers nothing until
+	// SetPluginChannelHost wires the plugin runtime.
+	PluginDestinations *PluginDestinationService
+	// ServerChannels is nil when no at-rest cipher is configured (channel
+	// URLs are credentials, same rule as webhooks).
+	ServerChannels *ServerChannelService
+	// WebPush is nil when the settings store is not writable (VAPID keys
+	// could not be provisioned).
+	WebPush *WebPushService
+	// PushDevices is nil when no at-rest cipher is configured; APNs tokens are
+	// credentials and must not be stored in plaintext.
+	PushDevices *PushDeviceService
+	// EmailPrefs is nil when no mail sender was provided.
+	EmailPrefs *EmailPrefsRepository
+	// DiscordPrefs holds Discord DM link + mode state; the channel only
+	// delivers once an admin configures bot credentials in settings.
+	DiscordPrefs *DiscordPrefsRepository
+
+	// EmailVerification admits durable requests and reports whether the
+	// dispatcher below can hand them to the provider.
+	EmailVerification *EmailVerificationService
+
+	mailSender                mail.Sender
+	emailBrand                *mail.BrandLoader
+	emailVerificationDispatch *emailVerificationDispatcher
+	emailWorker               *accountChannelWorker[profileKey]
+	discordWorker             *accountChannelWorker[int]
+	discordClient             *discord.Client
+	// publicURL is the server's externally reachable base URL, used as the
+	// fallback for tokenized email links (see SetPublicURL).
+	publicURL string
+
+	webhookRepo       *WebhookRepository
+	webhookDispatcher *WebhookDispatcher
+	webhookRetry      *WebhookRetryWorker
+
+	pluginDestinationSender     *pluginDestinationSender
+	pluginDestinationDispatcher *PluginDestinationDispatcher
+	webPushRepo                 *WebPushRepository
+	webPushDispatcher           *WebPushDispatcher
+	pushDeviceRepo              *PushDeviceRepository
+	pushDispatcher              *PushDispatcher
+	pushSender                  *pushSender
+	// serverChannelWorker sweeps release_events into admin broadcast posts;
+	// nil without the at-rest cipher.
+	serverChannelWorker *serverChannelWorker
+	// dispatcher is the same MultiDispatcher the fanout worker uses; the
+	// operational dispatch path shares it so every delivery reaches every
+	// configured channel the same way.
+	dispatcher Dispatcher
+
+	pool   *pgxpool.Pool
+	stores userstore.UserStoreProvider
+	// scopes resolves a recipient's current access before a delivery that
+	// names a catalog item is created.
+	scopes ScopeResolver
+	users  UserLister
+	images ImageURLResolver
+	logger *slog.Logger
+	wg     sync.WaitGroup
+}
+
+// NewSystem wires the notification system. hub may be nil (no realtime
+// publishing); redisClient may be nil (in-memory websocket tickets);
+// mailSender may be nil (no email channel); emailBrand may be nil (emails
+// carry Silo's default branding).
+func NewSystem(
+	pool *pgxpool.Pool,
+	settingsReader SettingReader,
+	stores userstore.UserStoreProvider,
+	scopes ScopeResolver,
+	users UserLister,
+	hub *evt.Hub,
+	redisClient *redis.Client,
+	cipher *secret.Cipher,
+	mailSender mail.Sender,
+	emailBrand *mail.BrandLoader,
+) *System {
+	settings := NewSettings(settingsReader)
+	releases := NewReleaseRepository(pool)
+	interests := NewInterestRepository(pool)
+	deliveries := NewDeliveryRepository(pool)
+	preferences := NewPreferencesRepository(pool)
+
+	wsDispatcher := NewWebsocketDispatcher(hub)
+	dispatchers := []Dispatcher{wsDispatcher}
+
+	// Outbound webhooks require the at-rest cipher: destination URLs are
+	// bearer credentials (Discord) and must never be stored in plaintext.
+	var webhookRepo *WebhookRepository
+	var webhookService *WebhookService
+	var webhookDispatcher *WebhookDispatcher
+	var webhookRetry *WebhookRetryWorker
+	var sender *webhookSender
+	var pushDeviceService *PushDeviceService
+	var pushDeviceRepo *PushDeviceRepository
+	var pushSenderInst *pushSender
+	var pushDispatcher *PushDispatcher
+	if cipher != nil {
+		webhookRepo = NewWebhookRepository(pool)
+		sender = newWebhookSender(webhookRepo, deliveries, cipher, settings)
+		webhookService = newWebhookService(webhookRepo, cipher, settings, sender)
+		webhookDispatcher = newWebhookDispatcher(sender)
+		webhookRetry = newWebhookRetryWorker(sender)
+		dispatchers = append(dispatchers, webhookDispatcher)
+		pushDeviceRepo = NewPushDeviceRepository(pool)
+		pushDeviceService = NewPushDeviceService(pushDeviceRepo, cipher)
+		pushSenderInst = newPushSender(pushDeviceRepo, deliveries, cipher, settings)
+		// Pushes name the identity getServerIdentity reports, read through the
+		// raw settings repo as it is: a SECRET_KEY rotation must not change
+		// who the server is.
+		pushSenderInst.serverID = serveridentity.New(catalog.NewServerSettingsRepo(pool)).ServerID
+		pushDispatcher = newPushDispatcher(pushSenderInst)
+		dispatchers = append(dispatchers, pushDispatcher)
+	}
+
+	// Admin server channels (broadcast destinations) share the cipher
+	// requirement: their URLs are credentials too.
+	pluginDestinationService, pluginDestinationSenderInst, pluginDestinationDispatcher := newPluginDestinationParts(pool, deliveries, cipher, stores)
+	if pluginDestinationDispatcher != nil {
+		dispatchers = append(dispatchers, pluginDestinationDispatcher)
+	}
+
+	var serverChannelService *ServerChannelService
+	var serverChannelSweep *serverChannelWorker
+	if cipher != nil {
+		serverChannelRepo := NewServerChannelRepository(pool)
+		serverChannelSenderInst := newServerChannelSender(cipher, settings)
+		serverChannelService = newServerChannelService(serverChannelRepo, cipher, settings, serverChannelSenderInst)
+		serverChannelSweep = newServerChannelWorker(pool, serverChannelRepo, releases, serverChannelSenderInst, settings)
+	}
+
+	// Web push needs a writable settings store to self-provision its VAPID
+	// keypair. The reader main passes is the encrypted settings repo, which
+	// also writes; tests may pass a read-only stub.
+	var webPushRepo *WebPushRepository
+	var webPushService *WebPushService
+	var webPushDispatcher *WebPushDispatcher
+	var webPushSenderInst *webPushSender
+	if writer, ok := settingsReader.(SettingWriter); ok && writer != nil {
+		webPushRepo = NewWebPushRepository(pool)
+		webPushService = newWebPushService(webPushRepo, settings, writer)
+		webPushSenderInst = newWebPushSender(webPushRepo, deliveries, webPushService, settings)
+		webPushDispatcher = newWebPushDispatcher(webPushSenderInst)
+		dispatchers = append(dispatchers, webPushDispatcher)
+	}
+
+	// Email rides the shared SMTP core. Unlike the per-target channels it
+	// keeps no outbox: its dispatcher only nudges the watermark sweep.
+	var emailPrefs *EmailPrefsRepository
+	var emailChannelInst *emailChannel
+	var emailWorker *accountChannelWorker[profileKey]
+	if mailSender != nil {
+		emailPrefs = NewEmailPrefsRepository(pool)
+		emailChannelInst = &emailChannel{
+			prefs:      emailPrefs,
+			deliveries: deliveries,
+			settings:   settings,
+			sender:     mailSender,
+			brand:      emailBrand,
+		}
+		emailWorker = newAccountChannelWorker(pool, emailChannelInst)
+		dispatchers = append(dispatchers, newNudgeDispatcher(emailWorker))
+	}
+
+	// Discord DMs ride the same account-watermark engine as email. The
+	// channel is always wired (its credentials live in settings and may be
+	// configured at runtime); enabled() gates each pass on the bot token.
+	discordPrefs := NewDiscordPrefsRepository(pool)
+	discordClient := discord.NewClient()
+	discordWorker, discordChannelInst := newDiscordWorker(pool, deliveries, discordPrefs, settings, discordClient)
+	dispatchers = append(dispatchers, newNudgeDispatcher(discordWorker))
+
+	multiDispatcher := NewMultiDispatcher(dispatchers...)
+	fanout := NewFanoutWorker(pool, releases, interests, deliveries, preferences, settings, scopes, multiDispatcher)
+	if webhookRepo != nil {
+		fanout.SetWebhookOutbox(webhookRepo, newProfileRateLimiter())
+	}
+	if pluginDestinationSenderInst != nil {
+		fanout.setPluginDestinationOutbox(pluginDestinationSenderInst, newProfileRateLimiter())
+	}
+	if webPushRepo != nil {
+		fanout.SetWebPushOutbox(webPushRepo)
+	}
+	if pushDeviceRepo != nil {
+		fanout.SetPushOutbox(pushDeviceRepo)
+	}
+	detector := NewAvailabilityDetector(releases, settings)
+	detector.SetFanoutNudge(func() {
+		fanout.Nudge()
+		serverChannelSweep.Nudge() // nil-safe
+	})
+	interest := NewInterestUpdater(pool, interests, stores, scopes)
+	var system *System
+	interest.rebuildProfile = func(ctx context.Context, userID int, profileID string) error {
+		store, err := stores.ForUser(ctx, userID)
+		if err != nil {
+			return err
+		}
+		return system.rebuildProfileInterest(ctx, store, userID, profileID)
+	}
+
+	system = &System{
+		Settings:                    settings,
+		Releases:                    releases,
+		Interests:                   interests,
+		Deliveries:                  deliveries,
+		Preferences:                 preferences,
+		Detector:                    detector,
+		Interest:                    interest,
+		Fanout:                      fanout,
+		Tickets:                     NewTicketStore(redisClient),
+		Webhooks:                    webhookService,
+		PluginDestinations:          pluginDestinationService,
+		ServerChannels:              serverChannelService,
+		WebPush:                     webPushService,
+		PushDevices:                 pushDeviceService,
+		EmailPrefs:                  emailPrefs,
+		DiscordPrefs:                discordPrefs,
+		mailSender:                  mailSender,
+		emailBrand:                  emailBrand,
+		emailWorker:                 emailWorker,
+		discordWorker:               discordWorker,
+		discordClient:               discordClient,
+		webhookRepo:                 webhookRepo,
+		webhookDispatcher:           webhookDispatcher,
+		webhookRetry:                webhookRetry,
+		pluginDestinationSender:     pluginDestinationSenderInst,
+		pluginDestinationDispatcher: pluginDestinationDispatcher,
+		webPushRepo:                 webPushRepo,
+		webPushDispatcher:           webPushDispatcher,
+		pushDeviceRepo:              pushDeviceRepo,
+		pushDispatcher:              pushDispatcher,
+		pushSender:                  pushSenderInst,
+		serverChannelWorker:         serverChannelSweep,
+		dispatcher:                  multiDispatcher,
+		pool:                        pool,
+		stores:                      stores,
+		scopes:                      scopes,
+		users:                       users,
+		logger:                      slog.Default().With("component", "notifications.system"),
+	}
+	if emailPrefs != nil && cipher != nil {
+		// emailPrefs is only built with a mail sender, so the dispatcher
+		// always accompanies the admission service.
+		system.emailVerificationDispatch = newEmailVerificationDispatcher(emailPrefs, cipher, mailSender)
+		system.EmailVerification = &EmailVerificationService{store: emailPrefs, cipher: cipher, profile: system.lookupProfile, linkBase: system.emailLinkBase, brand: emailBrand, dispatch: system.emailVerificationDispatch}
+	}
+	wsDispatcher.payload = system.PayloadForRow
+	if emailChannelInst != nil {
+		emailChannelInst.profileName = system.lookupProfileName
+	}
+	if sender != nil {
+		sender.operational = system.DispatchOperational
+		sender.posterURL = system.discordPosterURL
+	}
+	system.wirePluginDestinationSender()
+	discordChannelInst.posterURL = system.discordPosterURL
+	if serverChannelSweep != nil {
+		serverChannelSweep.posterURL = system.discordPosterURL
+		serverChannelSweep.requesterDiscordID = system.requesterDiscordID
+	}
+	if webPushSenderInst != nil {
+		webPushSenderInst.payload = system.PayloadForRow
+	}
+	return system
+}
+
+// SetImageResolver wires presigned poster URLs into notification payloads.
+// Optional; without it clients fall back to thumbhash placeholders.
+func (s *System) SetImageResolver(resolver ImageURLResolver) {
+	if s != nil {
+		s.images = resolver
+	}
+}
+
+// discordPosterURL resolves a delivery's poster to a URL a Discord embed may
+// carry, honoring the admin's poster mode: nothing when posters are off,
+// public provider CDN URLs when derivable, and — only on the explicit
+// "server" opt-in — a presigned URL from this server's own image storage.
+// Wired into the Discord send paths as their posterURL hook.
+func (s *System) discordPosterURL(ctx context.Context, posterPath, posterSourcePath string) string {
+	mode := s.Settings.DiscordPosterMode(ctx)
+	if mode == DiscordPostersOff {
+		return ""
+	}
+	if url := embedPosterURL(posterPath, posterSourcePath); url != "" {
+		return url
+	}
+	if mode != DiscordPostersServer || s.images == nil || posterPath == "" {
+		return ""
+	}
+	return s.absoluteArtworkURL(ctx, s.images.PresignImageURL(ctx, posterPath, "poster", ""))
+}
+
+// absoluteArtworkURL makes a resolved artwork URL usable outside this server.
+// S3 delivery already presigns absolute URLs; local artwork storage signs
+// root-relative /api/v2/artwork paths that only a client of this server can
+// follow, so they are anchored to server.public_url. Without a public URL the
+// embed carries no image rather than a link Discord cannot fetch.
+func (s *System) absoluteArtworkURL(ctx context.Context, url string) string {
+	if url == "" || !strings.HasPrefix(url, "/") {
+		return url
+	}
+	base := s.emailLinkBase(ctx)
+	if base == "" {
+		return ""
+	}
+	return base + url
+}
+
+// PayloadForRow converts a row to its wire shape, attaching a presigned
+// poster URL when an image resolver is configured.
+func (s *System) PayloadForRow(ctx context.Context, row DeliveryRow) DeliveryRowPayload {
+	payload := PayloadForRow(row)
+	if payload.PosterPath != "" {
+		payload.PosterURL = publicArtworkURL(payload.PosterPath)
+		if payload.PosterURL == "" && s != nil && s.images != nil {
+			payload.PosterURL = s.images.PresignImageURL(ctx, payload.PosterPath, "poster", "")
+		}
+	}
+	return payload
+}
+
+// PayloadsForRows converts rows to their wire shape with poster URLs.
+func (s *System) PayloadsForRows(ctx context.Context, rows []DeliveryRow) []DeliveryRowPayload {
+	payloads := make([]DeliveryRowPayload, 0, len(rows))
+	for _, row := range rows {
+		payloads = append(payloads, s.PayloadForRow(ctx, row))
+	}
+	return payloads
+}
+
+// Start launches the fanout worker, interest updater, and (when configured)
+// the webhook dispatch pool and retry worker under ctx.
+func (s *System) Start(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	s.wg.Add(2)
+	go func() {
+		defer s.wg.Done()
+		s.Fanout.Run(ctx)
+	}()
+	go func() {
+		defer s.wg.Done()
+		s.Interest.Run(ctx)
+	}()
+	if s.webhookDispatcher != nil {
+		s.wg.Add(2)
+		go func() {
+			defer s.wg.Done()
+			s.webhookDispatcher.Run(ctx)
+		}()
+		go func() {
+			defer s.wg.Done()
+			s.webhookRetry.Run(ctx)
+		}()
+	}
+	s.startPluginDestinations(ctx)
+	if s.serverChannelWorker != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.serverChannelWorker.Run(ctx)
+		}()
+	}
+	if s.emailWorker != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.emailWorker.Run(ctx)
+		}()
+	}
+	if s.emailVerificationDispatch != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.emailVerificationDispatch.Run(ctx)
+		}()
+	}
+	if s.discordWorker != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.discordWorker.Run(ctx)
+		}()
+	}
+	if s.webPushDispatcher != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.webPushDispatcher.Run(ctx)
+		}()
+		// Provision the VAPID keypair eagerly so a broken settings store
+		// surfaces at startup instead of on the first subscribe, and the
+		// capability endpoint never pays the generation latency.
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			if _, err := s.WebPush.PublicKey(ctx); err != nil && ctx.Err() == nil {
+				s.logger.ErrorContext(ctx, "web push VAPID provisioning failed", "error", err)
+			}
+		}()
+	}
+	if s.pushDispatcher != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.pushDispatcher.Run(ctx)
+		}()
+	}
+}
+
+// Wait blocks until the background loops exit (after their context is
+// canceled), so shutdown can drain in-flight work.
+func (s *System) Wait() {
+	if s != nil {
+		s.wg.Wait()
+	}
+}
+
+// PurgeProfile removes all notification state for a deleted profile.
+// Profiles may live in per-user SQLite stores, so Postgres cascades cannot
+// cover this. Interest rows, series mutes, deliveries, preferences,
+// destinations, and email prefs are removed for the profile on userID's
+// account only.
+func (s *System) PurgeProfile(ctx context.Context, userID int, profileID string) error {
+	if s == nil || profileID == "" {
+		return nil
+	}
+	if err := s.Interests.DeleteAllForProfile(ctx, userID, profileID); err != nil {
+		return fmt.Errorf("purge interest rows: %w", err)
+	}
+	if err := s.Interests.deleteMutesForProfile(ctx, userID, profileID); err != nil {
+		return fmt.Errorf("purge series mutes: %w", err)
+	}
+	if err := s.Deliveries.DeleteAllForProfile(ctx, userID, profileID); err != nil {
+		return fmt.Errorf("purge deliveries: %w", err)
+	}
+	if err := s.Preferences.DeleteForProfile(ctx, userID, profileID); err != nil {
+		return fmt.Errorf("purge preferences: %w", err)
+	}
+	if s.webhookRepo != nil {
+		if err := s.webhookRepo.DeleteAllForProfile(ctx, userID, profileID); err != nil {
+			return fmt.Errorf("purge webhooks: %w", err)
+		}
+	}
+	if err := s.purgePluginDestinations(ctx, userID, profileID); err != nil {
+		return err
+	}
+	if s.webPushRepo != nil {
+		if err := s.webPushRepo.DeleteAllForProfile(ctx, userID, profileID); err != nil {
+			return fmt.Errorf("purge web push subscriptions: %w", err)
+		}
+	}
+	if s.pushDeviceRepo != nil {
+		if err := s.pushDeviceRepo.DeleteAllForProfile(ctx, userID, profileID); err != nil {
+			return fmt.Errorf("purge push devices: %w", err)
+		}
+	}
+	if s.EmailPrefs != nil {
+		if err := s.EmailPrefs.DeleteForProfile(ctx, userID, profileID); err != nil {
+			return fmt.Errorf("purge email prefs: %w", err)
+		}
+	}
+	return nil
+}
+
+// SeedAvailability inserts episode_availability and movie_availability for
+// every currently playable episode and movie without creating release events,
+// then writes the per-library, per-kind seed markers. Idempotent and
+// rerunnable; it exists for libraries that predate the notifications feature.
+//
+// Library selection is load-bearing for flood and loss safety:
+//   - already-seeded libraries are skipped: availability there is owned by
+//     the scan-end detector, and a silent (emitEvents=false) insert racing an
+//     in-flight scan would permanently suppress the claimed episode's release
+//     event;
+//   - never-fully-scanned libraries are skipped: their catalog is empty or
+//     partial, so seed-marking them now would make the first real scan emit
+//     release events for the entire back catalog. The detector writes their
+//     marker when that first full scan completes.
+func (s *System) SeedAvailability(ctx context.Context, progress func(percent int, message string)) error {
+	report := func(percent int, message string) {
+		if progress != nil {
+			progress(percent, message)
+		}
+	}
+	// Each kind seeds independently with its own seed markers, because the
+	// episode pass historically marked every scanned library (movie libraries
+	// included) with zero movie rows. The flat item kinds come from the
+	// registry so a new kind cannot be forgotten here.
+	type seedPass struct {
+		kind          string
+		seedCondition string
+		record        func(ctx context.Context, libraryID int, emitEvents bool) (int, int, error)
+	}
+	passes := []seedPass{{
+		kind:          EventKindEpisode,
+		seedCondition: `SELECT 1 FROM notification_library_seed_state seed WHERE seed.library_id = mf.id`,
+		record:        s.Releases.RecordAvailabilityForLibrary,
+	}}
+	for _, k := range flatItemKinds {
+		passes = append(passes, seedPass{
+			kind: k.Kind,
+			seedCondition: `SELECT 1 FROM notification_content_seed_state seed
+				WHERE seed.library_id = mf.id AND seed.kind = '` + k.Kind + `'`,
+			record: func(ctx context.Context, libraryID int, emitEvents bool) (int, int, error) {
+				return s.Releases.RecordItemAvailabilityForLibrary(ctx, k, libraryID, emitEvents)
+			},
+		})
+	}
+	for passIdx, pass := range passes {
+		rows, err := s.pool.Query(ctx, `
+			SELECT mf.id
+			FROM media_folders mf
+			WHERE mf.last_scanned_at IS NOT NULL
+			  AND NOT EXISTS (`+pass.seedCondition+`)
+			ORDER BY mf.id`)
+		if err != nil {
+			return fmt.Errorf("list libraries: %w", err)
+		}
+		libraryIDs := make([]int, 0, 8)
+		for rows.Next() {
+			var id int
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan library id: %w", err)
+			}
+			libraryIDs = append(libraryIDs, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		totalSeeded := 0
+		for i, libraryID := range libraryIDs {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			inserted, _, err := pass.record(ctx, libraryID, false)
+			if err != nil {
+				return fmt.Errorf("seed library %d (%s): %w", libraryID, pass.kind, err)
+			}
+			if err := s.Releases.MarkContentSeeded(ctx, libraryID, pass.kind); err != nil {
+				return fmt.Errorf("mark library %d seeded (%s): %w", libraryID, pass.kind, err)
+			}
+			totalSeeded += inserted
+			// Each pass owns an equal slice of the progress range.
+			passSpan := 100 / len(passes)
+			passBase := passIdx * passSpan
+			report(passBase+(i+1)*passSpan/max(len(libraryIDs), 1),
+				fmt.Sprintf("Seeded library %d %s availability (%d new rows)", libraryID, pass.kind, inserted))
+		}
+		s.logger.InfoContext(ctx, "availability seeding completed",
+			"kind", pass.kind, "libraries", len(libraryIDs), "availability_rows", totalSeeded)
+	}
+	report(100, "Availability seeding completed")
+	return nil
+}
+
+const interestRebuildTask = "interest_rebuild"
+
+// RebuildInterest incrementally rebuilds profile_series_interest from watch
+// progress and watch history for every profile. Checkpointed
+// per profile so a crash resumes with at most one profile of repeated work;
+// recomputes are idempotent upserts. Completed runs reset and start over
+// (the task doubles as periodic drift repair). One server rebuilds at a time:
+// a call made while another server's rebuild holds the cluster lock returns
+// ErrInterestRebuildRunning without doing any work.
+func (s *System) RebuildInterest(ctx context.Context, progress func(percent int, message string)) error {
+	report := func(percent int, message string) {
+		if progress != nil {
+			progress(percent, message)
+		}
+	}
+	if s.users == nil {
+		return fmt.Errorf("interest rebuild requires a user lister")
+	}
+	claim, err := s.claimInterestRebuild(ctx)
+	if err != nil {
+		return err
+	}
+	defer claim.release()
+
+	checkpoint, completedAt, err := loadBackfillCheckpoint(ctx, claim.conn, interestRebuildTask)
+	if err != nil {
+		return err
+	}
+	if completedAt != nil {
+		// Start a fresh repair pass.
+		checkpoint = ""
+		if err := resetBackfillCheckpoint(ctx, claim.conn, interestRebuildTask); err != nil {
+			return err
+		}
+	}
+
+	users, err := s.users.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list users: %w", err)
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i].ID < users[j].ID })
+
+	processed := 0
+	for userIdx, user := range users {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		store, err := s.stores.ForUser(ctx, user.ID)
+		if err != nil {
+			s.logger.WarnContext(ctx, "interest rebuild: open user store failed", "user_id", user.ID, "error", err)
+			continue
+		}
+		profiles, err := store.ListProfiles(ctx)
+		if err != nil {
+			s.logger.WarnContext(ctx, "interest rebuild: list profiles failed", "user_id", user.ID, "error", err)
+			continue
+		}
+		sort.Slice(profiles, func(i, j int) bool { return profiles[i].ID < profiles[j].ID })
+
+		for _, profile := range profiles {
+			key := backfillKey(user.ID, profile.ID)
+			if checkpoint != "" && key <= checkpoint {
+				continue
+			}
+			if err := s.rebuildProfileInterest(ctx, store, user.ID, profile.ID); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				s.logger.WarnContext(ctx, "interest rebuild: profile failed",
+					"user_id", user.ID, "profile_id", profile.ID, "error", err)
+			}
+			if err := saveBackfillCheckpoint(ctx, claim.conn, interestRebuildTask, key); err != nil {
+				return err
+			}
+			processed++
+		}
+		report((userIdx+1)*100/max(len(users), 1),
+			fmt.Sprintf("Rebuilt interest for %d profiles", processed))
+	}
+
+	if err := completeBackfillCheckpoint(ctx, claim.conn, interestRebuildTask); err != nil {
+		return err
+	}
+	s.logger.InfoContext(ctx, "interest rebuild completed", "profiles", processed)
+	return nil
+}
+
+// rebuildProfileInterest recomputes every series the profile has watched
+// (progress, completed watch history), plus every series that already has
+// interest rows in Postgres — rows whose sources were all removed must be
+// recomputed too, or the drift-repair pass would keep them forever. Favorites
+// and the watchlist give no interest of their own: only Next Up notifies.
+func (s *System) rebuildProfileInterest(ctx context.Context, store userstore.UserStore, userID int, profileID string) error {
+	itemIDs := make(map[string]struct{}, 64)
+
+	progress, err := store.ListProgressItemIDs(ctx, profileID)
+	if err != nil {
+		return fmt.Errorf("list progress: %w", err)
+	}
+	for _, id := range progress {
+		itemIDs[id] = struct{}{}
+	}
+	// History imports (watch providers, history import runs) may record
+	// watched episodes without any progress row; they are watch relationships
+	// all the same.
+	history, err := store.ListCompletedHistoryItems(ctx, userstore.CompletedHistoryItemQuery{ProfileID: profileID})
+	if err != nil {
+		return fmt.Errorf("list completed history: %w", err)
+	}
+	for _, item := range history {
+		itemIDs[item.MediaItemID] = struct{}{}
+	}
+
+	seriesIDs, err := s.batchResolveSeries(ctx, itemIDs)
+	if err != nil {
+		return err
+	}
+	existing, err := s.Interests.ListSeriesForProfile(ctx, userID, profileID)
+	if err != nil {
+		return err
+	}
+	for _, seriesID := range existing {
+		seriesIDs[seriesID] = struct{}{}
+	}
+	for seriesID := range seriesIDs {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := s.Interest.RecomputeSeries(ctx, userID, profileID, seriesID); err != nil {
+			s.logger.WarnContext(ctx, "interest rebuild: series recompute failed",
+				"user_id", userID, "profile_id", profileID, "series_id", seriesID, "error", err)
+		}
+	}
+	return nil
+}
+
+// batchResolveSeries maps item IDs (episodes, seasons, series) to their
+// series IDs; movies resolve to nothing.
+func (s *System) batchResolveSeries(ctx context.Context, itemIDs map[string]struct{}) (map[string]struct{}, error) {
+	ids := make([]string, 0, len(itemIDs))
+	for id := range itemIDs {
+		ids = append(ids, id)
+	}
+	seriesIDs := make(map[string]struct{}, len(ids))
+	const chunkSize = 500
+	for start := 0; start < len(ids); start += chunkSize {
+		end := min(start+chunkSize, len(ids))
+		rows, err := s.pool.Query(ctx, `
+			SELECT series_id FROM episodes WHERE content_id = ANY($1)
+			UNION
+			SELECT series_id FROM seasons WHERE content_id = ANY($1)
+			UNION
+			SELECT content_id FROM media_items WHERE content_id = ANY($1) AND type = 'series'`,
+			ids[start:end])
+		if err != nil {
+			return nil, fmt.Errorf("resolve series ids: %w", err)
+		}
+		for rows.Next() {
+			var seriesID string
+			if err := rows.Scan(&seriesID); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan series id: %w", err)
+			}
+			if seriesID != "" {
+				seriesIDs[seriesID] = struct{}{}
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return seriesIDs, nil
+}
+
+func backfillKey(userID int, profileID string) string {
+	return fmt.Sprintf("%010d|%s", userID, profileID)
+}
+
+// backfillStateDB runs the notification_backfill_state statements.
+type backfillStateDB interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// backfillStateTimeout bounds each checkpoint statement, so a lock session
+// that stopped answering fails the rebuild instead of stalling it.
+const backfillStateTimeout = 10 * time.Second
+
+func loadBackfillCheckpoint(ctx context.Context, db backfillStateDB, task string) (string, *time.Time, error) {
+	ctx, cancel := context.WithTimeout(ctx, backfillStateTimeout)
+	defer cancel()
+	var key *string
+	var completedAt *time.Time
+	err := db.QueryRow(ctx,
+		`SELECT last_processed_key, completed_at FROM notification_backfill_state WHERE task = $1`,
+		task,
+	).Scan(&key, &completedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("load backfill checkpoint: %w", err)
+	}
+	checkpoint := ""
+	if key != nil {
+		checkpoint = *key
+	}
+	return checkpoint, completedAt, nil
+}
+
+func saveBackfillCheckpoint(ctx context.Context, db backfillStateDB, task, key string) error {
+	ctx, cancel := context.WithTimeout(ctx, backfillStateTimeout)
+	defer cancel()
+	_, err := db.Exec(ctx, `
+		INSERT INTO notification_backfill_state (task, last_processed_key, started_at, updated_at)
+		VALUES ($1, $2, now(), now())
+		ON CONFLICT (task) DO UPDATE SET
+			last_processed_key = EXCLUDED.last_processed_key,
+			updated_at = now()`,
+		task, key)
+	if err != nil {
+		return fmt.Errorf("save backfill checkpoint: %w", err)
+	}
+	return nil
+}
+
+func resetBackfillCheckpoint(ctx context.Context, db backfillStateDB, task string) error {
+	ctx, cancel := context.WithTimeout(ctx, backfillStateTimeout)
+	defer cancel()
+	_, err := db.Exec(ctx, `
+		INSERT INTO notification_backfill_state (task, last_processed_key, started_at, updated_at, completed_at)
+		VALUES ($1, NULL, now(), now(), NULL)
+		ON CONFLICT (task) DO UPDATE SET
+			last_processed_key = NULL,
+			started_at = now(),
+			updated_at = now(),
+			completed_at = NULL`,
+		task)
+	if err != nil {
+		return fmt.Errorf("reset backfill checkpoint: %w", err)
+	}
+	return nil
+}
+
+func completeBackfillCheckpoint(ctx context.Context, db backfillStateDB, task string) error {
+	ctx, cancel := context.WithTimeout(ctx, backfillStateTimeout)
+	defer cancel()
+	_, err := db.Exec(ctx, `
+		UPDATE notification_backfill_state SET completed_at = now(), updated_at = now() WHERE task = $1`,
+		task)
+	if err != nil {
+		return fmt.Errorf("complete backfill checkpoint: %w", err)
+	}
+	return nil
+}

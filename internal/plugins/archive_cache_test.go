@@ -1,0 +1,613 @@
+package plugins
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"google.golang.org/protobuf/encoding/protojson"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+)
+
+// binaryRelease returns a silo.metadb manifest checksummed for binary, its
+// JSON, and a binary plugin archive holding both.
+func binaryRelease(t *testing.T, version string, binary []byte) (*pluginv1.PluginManifest, []byte, []byte) {
+	t.Helper()
+	manifest := testPluginManifest(t, "silo.metadb", version)
+	manifest.Checksum = sha256Hex(binary)
+	manifestBytes, err := protojson.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveBytes, err := buildBinaryPluginArchive(manifestBytes, binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest, manifestBytes, archiveBytes
+}
+
+func TestArchiveCacheRejectsForeignBinaryOnCacheHit(t *testing.T) {
+	// Use an ELF architecture different from the running test so the cache
+	// represents a volume moved from another proxy platform.
+	binaryData := make([]byte, 64)
+	copy(binaryData, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	binaryData[16], binaryData[18], binaryData[20], binaryData[52] = 2, 0xB7, 1, 64
+	if runtime.GOARCH == "arm64" {
+		binaryData[18] = 0x3E // EM_X86_64
+	}
+	manifest, manifestBytes, _ := binaryRelease(t, "0.0.19", binaryData)
+	installation := &Installation{ID: 42, PluginID: manifest.PluginId, Version: manifest.Version, InstallPath: "/api/plugins/install-cached/plugin"}
+	cache := NewArchiveCacheAt(&legacyArchiveStore{}, t.TempDir())
+	path := requireLocalInstallPath(t, cache, installation)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, binaryData, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(InstalledManifestPath(path), manifestBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Ensure(context.Background(), installation); err == nil || !strings.Contains(err.Error(), "plugin binary is built for") {
+		t.Fatalf("cached foreign binary was not rejected: %v", err)
+	}
+}
+
+func TestArchiveCacheRepairsCorruptedBinaryOnCacheHit(t *testing.T) {
+	for _, proxy := range []bool{false, true} {
+		name := "local"
+		if proxy {
+			name = "proxy"
+		}
+		t.Run(name, func(t *testing.T) {
+			binaryData := []byte("#!/bin/sh\nexit 0\n")
+			manifest, manifestBytes, archiveBytes := binaryRelease(t, "0.0.19", binaryData)
+			store := &legacyArchiveStore{archive: &InstallationArchive{
+				InstallationID: 42, ManifestJSON: manifestBytes, Checksum: manifest.GetChecksum(), Bytes: archiveBytes,
+			}}
+			installation := &Installation{
+				ID: 42, PluginID: manifest.GetPluginId(), Version: manifest.GetVersion(),
+				InstallPath: filepath.Join(t.TempDir(), "install-cached", "plugin"),
+			}
+			cache := NewArchiveCache(store)
+			if proxy {
+				cache = NewArchiveCacheAt(store, t.TempDir())
+			}
+			if _, err := cache.Ensure(t.Context(), installation); err != nil {
+				t.Fatalf("populate cache: %v", err)
+			}
+			path := requireLocalInstallPath(t, cache, installation)
+			// Keep the file executable and the same size, but change its contents.
+			if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cache.Ensure(t.Context(), installation); err != nil {
+				t.Fatalf("repair cache: %v", err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, binaryData) {
+				t.Fatalf("cached binary = %q, want stored binary %q", got, binaryData)
+			}
+		})
+	}
+}
+
+// A legacy archive holding only the binary is rehydrated and repaired into a
+// plugin archive; a failure to persist the repair does not fail the launch.
+func TestArchiveCacheEnsureRecoversLegacyBinaryArchive(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		saveErr error
+	}{
+		{name: "repair persisted"},
+		{name: "persist failure tolerated", saveErr: errors.New("db unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			binaryData := []byte("#!/bin/sh\nexit 0\n")
+			manifest, manifestBytes, _ := binaryRelease(t, "0.0.19", binaryData)
+
+			store := &legacyArchiveStore{
+				archive: &InstallationArchive{
+					InstallationID: 42,
+					ManifestJSON:   manifestBytes,
+					Checksum:       manifest.GetChecksum(),
+					Bytes:          binaryData,
+				},
+				saveErr: tc.saveErr,
+			}
+
+			installDir := filepath.Join(t.TempDir(), "plugins", "silo.metadb", "0.0.19")
+			installation := &Installation{
+				ID:          42,
+				PluginID:    manifest.GetPluginId(),
+				Version:     manifest.GetVersion(),
+				InstallPath: filepath.Join(installDir, "plugin"),
+			}
+
+			got, err := NewArchiveCache(store).Ensure(ctx, installation)
+			if err != nil {
+				t.Fatalf("Ensure() returned error: %v", err)
+			}
+
+			installedBinary, err := os.ReadFile(installation.InstallPath)
+			if err != nil {
+				t.Fatalf("read rehydrated plugin binary: %v", err)
+			}
+			if !bytes.Equal(installedBinary, binaryData) {
+				t.Fatal("rehydrated plugin binary does not match legacy binary bytes")
+			}
+			if tc.saveErr != nil {
+				return
+			}
+
+			if got.GetPluginId() != manifest.GetPluginId() {
+				t.Fatalf("manifest plugin_id = %q, want %q", got.GetPluginId(), manifest.GetPluginId())
+			}
+			if store.savedInstallationID != installation.ID {
+				t.Fatalf("repaired archive installation id = %d, want %d", store.savedInstallationID, installation.ID)
+			}
+			if !bytes.Equal(store.savedManifestJSON, manifestBytes) {
+				t.Fatal("repaired archive manifest does not match stored manifest")
+			}
+			if _, _, savedManifest, err := openPluginArchive(store.savedArchiveBytes); err != nil {
+				t.Fatalf("repaired archive is not a valid plugin archive: %v", err)
+			} else if savedManifest.GetChecksum() != manifest.GetChecksum() {
+				t.Fatalf("repaired archive checksum = %q, want %q", savedManifest.GetChecksum(), manifest.GetChecksum())
+			}
+			if _, err := os.Stat(InstalledManifestPath(installation.InstallPath)); err != nil {
+				t.Fatalf("expected rehydrated manifest file: %v", err)
+			}
+		})
+	}
+}
+
+// Only a failure of the stored archive's own contents is
+// ErrArchiveUnreadable. A store failure is not, so a caller that tolerates one
+// damaged plugin still fails on a database fault.
+func TestArchiveCacheEnsureMarksOnlyDamagedArchivesUnreadable(t *testing.T) {
+	// The manifest and binary check out, but an extra entry, which only
+	// extraction reads, fails its CRC.
+	binary := []byte("#!/bin/sh\nexit 0\n")
+	manifest, manifestBytes, _ := binaryRelease(t, "0.0.19", binary)
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	if err := writeArchiveEntry(writer, "manifest.json", manifestBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeArchiveEntry(writer, "plugin", binary); err != nil {
+		t.Fatal(err)
+	}
+	extra, err := writer.CreateHeader(&zip.FileHeader{Name: "assets/extra.txt", Method: zip.Store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := extra.Write([]byte("extra entry data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	corruptEntry := buffer.Bytes()
+	corruptEntry[bytes.Index(corruptEntry, []byte("extra entry data"))] ^= 0xff
+
+	// The binary entry is marked as a directory. The archive opens and its
+	// checksums match, but extraction writes a directory where the binary goes.
+	dirManifest, dirManifestBytes, _ := binaryRelease(t, "0.0.19", nil)
+	var dirBuffer bytes.Buffer
+	dirWriter := zip.NewWriter(&dirBuffer)
+	if err := writeArchiveEntry(dirWriter, "manifest.json", dirManifestBytes); err != nil {
+		t.Fatal(err)
+	}
+	dirHeader := &zip.FileHeader{Name: "plugin", Method: zip.Store}
+	dirHeader.SetMode(fs.ModeDir | 0o755)
+	if _, err := dirWriter.CreateHeader(dirHeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := dirWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		store *legacyArchiveStore
+		want  bool
+	}{
+		{name: "archive is not a zip", want: true, store: &legacyArchiveStore{archive: &InstallationArchive{
+			InstallationID: 42, ManifestJSON: []byte("{}"), Checksum: "0", Bytes: []byte("not a zip"),
+		}}},
+		{name: "entry fails its CRC", want: true, store: &legacyArchiveStore{archive: &InstallationArchive{
+			InstallationID: 42, ManifestJSON: manifestBytes, Checksum: manifest.GetChecksum(), Bytes: corruptEntry,
+		}}},
+		{name: "binary is a directory entry", want: true, store: &legacyArchiveStore{archive: &InstallationArchive{
+			InstallationID: 42, ManifestJSON: dirManifestBytes, Checksum: dirManifest.GetChecksum(), Bytes: dirBuffer.Bytes(),
+		}}},
+		{name: "store fails", store: &legacyArchiveStore{getErr: errors.New("db unavailable")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installation := &Installation{ID: 42, PluginID: "silo.metadb", Version: "0.0.19",
+				InstallPath: filepath.Join(t.TempDir(), "plugin")}
+
+			_, err := NewArchiveCache(tc.store).Ensure(t.Context(), installation)
+			if err == nil {
+				t.Fatal("Ensure() succeeded without a usable archive")
+			}
+			if got := errors.Is(err, ErrArchiveUnreadable); got != tc.want {
+				t.Fatalf("errors.Is(%v, ErrArchiveUnreadable) = %v, want %v", err, got, tc.want)
+			}
+		})
+	}
+}
+
+type legacyArchiveStore struct {
+	archive             *InstallationArchive
+	getErr              error
+	saveErr             error
+	savedInstallationID int
+	savedManifestJSON   []byte
+	savedChecksum       string
+	savedArchiveBytes   []byte
+}
+
+func (s *legacyArchiveStore) GetArchive(context.Context, int) (*InstallationArchive, error) {
+	return s.archive, s.getErr
+}
+
+func (s *legacyArchiveStore) SaveArchive(
+	_ context.Context,
+	installationID int,
+	manifestJSON []byte,
+	checksum string,
+	archiveBytes []byte,
+) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+	s.savedInstallationID = installationID
+	s.savedManifestJSON = append([]byte(nil), manifestJSON...)
+	s.savedChecksum = checksum
+	s.savedArchiveBytes = append([]byte(nil), archiveBytes...)
+	return nil
+}
+
+// A cache with its own root (a proxy node's) never touches the install path
+// the API server recorded: it rehydrates under <root>/<plugin>/<version>/
+// <release>/plugin, reuses that copy on the next Ensure, and drops the
+// previous release once a replacement is in place.
+func TestArchiveCacheAtOwnRootRehydratesUnderItAndPrunesOldReleases(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "proxy-cache")
+	apiInstallRoot := filepath.Join(t.TempDir(), "api-machine", "plugins", "silo.metadb")
+
+	release := func(version, dir, script string) (*Installation, *legacyArchiveStore) {
+		t.Helper()
+		manifest, manifestBytes, archiveBytes := binaryRelease(t, version, []byte(script))
+		store := &legacyArchiveStore{archive: &InstallationArchive{
+			InstallationID: 42, ManifestJSON: manifestBytes, Checksum: manifest.GetChecksum(), Bytes: archiveBytes,
+		}}
+		return &Installation{
+			ID:          42,
+			PluginID:    "silo.metadb",
+			Version:     version,
+			InstallPath: filepath.Join(apiInstallRoot, version, dir, "plugin"),
+		}, store
+	}
+
+	first, firstStore := release("0.0.19", "install-aaaa", "#!/bin/sh\nexit 0\n")
+	cache := NewArchiveCacheAt(firstStore, root)
+	wantFirst := filepath.Join(root, "silo.metadb", "0.0.19", "install-aaaa", "plugin")
+	if got := requireLocalInstallPath(t, cache, first); got != wantFirst {
+		t.Fatalf("LocalInstallPath = %q, want %q", got, wantFirst)
+	}
+	if got := requireLocalInstallPath(t, NewArchiveCache(firstStore), first); got != first.InstallPath {
+		t.Fatalf("LocalInstallPath without a root = %q, want the recorded path %q", got, first.InstallPath)
+	}
+
+	manifest, err := cache.Ensure(ctx, first)
+	if err != nil {
+		t.Fatalf("Ensure(first) returned error: %v", err)
+	}
+	if manifest.GetVersion() != "0.0.19" {
+		t.Fatalf("manifest version = %q", manifest.GetVersion())
+	}
+	if _, err := os.Stat(wantFirst); err != nil {
+		t.Fatalf("binary was not rehydrated under the cache root: %v", err)
+	}
+	if _, err := os.Stat(apiInstallRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the API server's install root was touched: %v", err)
+	}
+
+	// The second Ensure finds the copy and does not read the archive again.
+	firstStore.archive = nil
+	if _, err := cache.Ensure(ctx, first); err != nil {
+		t.Fatalf("Ensure(first) again returned error: %v", err)
+	}
+
+	second, secondStore := release("0.0.20", "install-bbbb", "#!/bin/sh\nexit 1\n")
+	cache = NewArchiveCacheAt(secondStore, root)
+	if _, err := cache.Ensure(ctx, second); err != nil {
+		t.Fatalf("Ensure(second) returned error: %v", err)
+	}
+	wantSecond := filepath.Join(root, "silo.metadb", "0.0.20", "install-bbbb", "plugin")
+	if _, err := os.Stat(wantSecond); err != nil {
+		t.Fatalf("second release was not rehydrated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(wantFirst)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("previous release still present after the replacement: %v", err)
+	}
+}
+
+// Plugin IDs the installer's mapping would merge get their own cache
+// directories, so rehydrating one leaves the others' files in place (#2800).
+func TestArchiveCacheKeepsPluginsWhoseIDsDifferOnlyInSeparators(t *testing.T) {
+	ctx := t.Context()
+	root := filepath.Join(t.TempDir(), "proxy-cache")
+	ids := []string{"acme/x", "acme_x", "acme:x", "acme@x", "acme\\x", "acme%2Fx"}
+	installations := make([]*Installation, len(ids))
+	stores := make([]*legacyArchiveStore, len(ids))
+	for i, id := range ids {
+		binary := []byte("#!/bin/sh\nexit " + string(rune('0'+i)) + "\n")
+		manifest := testPluginManifest(t, id, "1.0.0")
+		manifest.Checksum = sha256Hex(binary)
+		manifestBytes, err := protojson.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		archiveBytes, err := buildBinaryPluginArchive(manifestBytes, binary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = &legacyArchiveStore{archive: &InstallationArchive{
+			InstallationID: 100 + i, ManifestJSON: manifestBytes, Checksum: manifest.GetChecksum(), Bytes: archiveBytes,
+		}}
+		installations[i] = &Installation{ID: 100 + i, PluginID: id, Version: "1.0.0",
+			InstallPath: filepath.Join(t.TempDir(), "api", "1.0.0", "install-"+string(rune('a'+i)), "plugin")}
+	}
+	if got, want := requireLocalInstallPath(t, NewArchiveCacheAt(stores[0], root), installations[0]),
+		filepath.Join(root, "acme%2Fx", "1.0.0", "install-a", "plugin"); got != want {
+		t.Fatalf("LocalInstallPath(acme/x) = %q, want %q", got, want)
+	}
+	if got, want := requireLocalInstallPath(t, NewArchiveCacheAt(stores[1], root), installations[1]),
+		filepath.Join(root, "acme_x", "1.0.0", "install-b", "plugin"); got != want {
+		t.Fatalf("LocalInstallPath(acme_x) = %q, want %q (an ID without escaped characters keeps its directory)", got, want)
+	}
+
+	paths := make([]string, len(ids))
+	for i := range ids {
+		if _, err := NewArchiveCacheAt(stores[i], root).Ensure(ctx, installations[i]); err != nil {
+			t.Fatalf("Ensure(%s): %v", ids[i], err)
+		}
+		paths[i] = requireLocalInstallPath(t, NewArchiveCacheAt(stores[i], root), installations[i])
+	}
+	for i, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s binary after every rehydration: %v", ids[i], err)
+		}
+	}
+}
+
+// An identity whose escaped name would pass the component limit gets a
+// bounded, distinct name, so a proxy node can still rehydrate it.
+func TestCachePathSegmentStaysWithinTheComponentLimit(t *testing.T) {
+	long := strings.Repeat("a/", 100)
+	other := strings.Repeat("a:", 100)
+	names := map[string]string{}
+	for _, value := range []string{long, other, strings.Repeat("a", 255), "acme/x"} {
+		got, err := cachePathSegment(value, "plugin id")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) > maxCacheSegmentBytes {
+			t.Errorf("segment for a %d-byte identity is %d bytes, want at most %d", len(value), len(got), maxCacheSegmentBytes)
+		}
+		if previous, ok := names[got]; ok {
+			t.Errorf("%q and %q share segment %q", previous, value, got)
+		}
+		names[got] = value
+	}
+	if got, _ := cachePathSegment(strings.Repeat("a", 255), "plugin id"); got != strings.Repeat("a", 255) {
+		t.Errorf("a 255-byte identity without escapes = %q, want it unchanged", got)
+	}
+	if got, _ := cachePathSegment(long, "plugin id"); !strings.HasPrefix(got, "%h") {
+		t.Errorf("an over-long escaped identity = %q, want its hashed name", got)
+	}
+}
+
+type blockedArchiveStore struct {
+	*legacyArchiveStore
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (s *blockedArchiveStore) GetArchive(ctx context.Context, id int) (*InstallationArchive, error) {
+	s.calls.Add(1)
+	select {
+	case <-s.release:
+		return s.legacyArchiveStore.GetArchive(ctx, id)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestArchiveCacheSerializesRehydration(t *testing.T) {
+	manifest, raw, archive := binaryRelease(t, "0.0.19", []byte("#!/bin/sh\nexit 0\n"))
+	store := &blockedArchiveStore{legacyArchiveStore: &legacyArchiveStore{archive: &InstallationArchive{InstallationID: 42, ManifestJSON: raw, Checksum: manifest.Checksum, Bytes: archive}}, release: make(chan struct{})}
+	cache := NewArchiveCacheAt(store, t.TempDir())
+	installation := &Installation{ID: 42, PluginID: manifest.PluginId, Version: manifest.Version, InstallPath: "/api/plugins/install-release/plugin"}
+	var wg sync.WaitGroup
+	ready := make(chan struct{}, 32)
+	for range 32 {
+		wg.Go(func() {
+			ready <- struct{}{}
+			if _, err := cache.Ensure(t.Context(), installation); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	for range 32 {
+		<-ready
+	}
+	close(store.release)
+	wg.Wait()
+	if got := store.calls.Load(); got != 1 {
+		t.Errorf("archive loads=%d, want 1", got)
+	}
+
+	if _, err := cache.validateInstalledFiles(requireLocalInstallPath(t, cache, installation), manifest); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Manifest reuses a verification only while the binary is the same file with
+// the same size and mtime. Ensure, which every launch goes through, hashes the
+// binary every time and so catches what Manifest's file check cannot.
+func TestArchiveCacheManifestTrustsOnlyAnUnchangedVerifiedBinary(t *testing.T) {
+	ctx := t.Context()
+	binaryData := []byte("#!/bin/sh\nexit 0\n")
+	size := int64(len(binaryData))
+	manifest, manifestBytes, archiveBytes := binaryRelease(t, "0.0.19", binaryData)
+	archive := &InstallationArchive{InstallationID: 42, ManifestJSON: manifestBytes, Checksum: manifest.GetChecksum(), Bytes: archiveBytes}
+	installation := &Installation{
+		ID: 42, PluginID: manifest.GetPluginId(), Version: manifest.GetVersion(),
+		InstallPath: filepath.Join(t.TempDir(), "install-aaaa", "plugin"),
+	}
+	store := newFakeServiceInstallationStore(installation)
+	store.archives = map[int]*InstallationArchive{42: archive}
+	cache := NewArchiveCache(store)
+	hashed := countHashedBytes(cache)
+	path := requireLocalInstallPath(t, cache, installation)
+
+	expectHashed := func(step string, want int64) {
+		t.Helper()
+		if got := hashed.Swap(0); got != want {
+			t.Fatalf("%s hashed %d bytes, want %d", step, got, want)
+		}
+	}
+	expectRestored := func(step string) {
+		t.Helper()
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, binaryData) {
+			t.Fatalf("%s: binary = %q, want the stored binary", step, got)
+		}
+	}
+	// rewrite changes the binary in place without changing its size, then
+	// sets its mtime: the verified one when keepMtime, a later one otherwise.
+	rewrite := func(keepMtime bool) {
+		t.Helper()
+		before, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mtime := before.ModTime().Add(time.Second)
+		if keepMtime {
+			mtime = before.ModTime()
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := cache.Manifest(ctx, installation); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	expectHashed("rehydrating Manifest", size)
+	if _, err := cache.Manifest(ctx, installation); err != nil {
+		t.Fatal(err)
+	}
+	expectHashed("warm Manifest", 0)
+	if _, err := cache.Ensure(ctx, installation); err != nil {
+		t.Fatal(err)
+	}
+	expectHashed("warm Ensure", size)
+
+	rewrite(false)
+	if _, err := cache.Manifest(ctx, installation); err != nil {
+		t.Fatalf("repair after a visible change: %v", err)
+	}
+	expectRestored("Manifest after a visible change")
+
+	rewrite(true)
+	hashed.Store(0)
+	if _, err := cache.Manifest(ctx, installation); err != nil {
+		t.Fatal(err)
+	}
+	expectHashed("Manifest after a stat-preserving rewrite", 0)
+	if _, err := cache.Ensure(ctx, installation); err != nil {
+		t.Fatalf("repair before launch: %v", err)
+	}
+	expectRestored("Ensure after a stat-preserving rewrite")
+
+	// A different file renamed over the binary is a new file, even with the
+	// verified size and mtime, so Manifest hashes it and restores the binary.
+	verified, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(filepath.Dir(path), "plugin.replacement")
+	if err := os.WriteFile(replacement, []byte("#!/bin/sh\nexit 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(replacement, verified.ModTime(), verified.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	hashed.Store(0)
+	if _, err := cache.Manifest(ctx, installation); err != nil {
+		t.Fatalf("repair after a replaced file: %v", err)
+	}
+	// Once to reject the replacement, once to check the restored binary.
+	expectHashed("Manifest after a replaced file", 2*size)
+	expectRestored("Manifest after a replaced file")
+
+	// A failed check forgets the verification, even when repair fails too.
+	rewrite(true)
+	delete(store.archives, 42)
+	if _, err := cache.Ensure(ctx, installation); err == nil {
+		t.Fatal("Ensure accepted a rewritten binary with no archive to restore")
+	}
+	if _, err := cache.Manifest(ctx, installation); err == nil {
+		t.Fatal("Manifest served a binary that failed its last check")
+	}
+	store.archives[42] = archive
+
+	// A new release lands at a new path and is hashed before it is trusted.
+	upgraded := *installation
+	upgraded.InstallPath = filepath.Join(t.TempDir(), "install-bbbb", "plugin")
+	hashed.Store(0)
+	if _, err := cache.Manifest(ctx, &upgraded); err != nil {
+		t.Fatal(err)
+	}
+	expectHashed("Manifest of a new release", size)
+}
+
+func requireLocalInstallPath(t *testing.T, cache *ArchiveCache, installation *Installation) string {
+	t.Helper()
+	path, err := cache.LocalInstallPath(installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

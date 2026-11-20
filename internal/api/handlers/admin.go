@@ -1,0 +1,2335 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"math"
+	"net/http"
+	"net/url"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/adminjob"
+	"github.com/Silo-Server/silo-server/internal/ai/chatgpt"
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/cache"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/diagnostics"
+	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/markers"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/policy"
+	"github.com/Silo-Server/silo-server/internal/s3client"
+	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	"github.com/Silo-Server/silo-server/internal/settingsmigrate"
+	subtitleai "github.com/Silo-Server/silo-server/internal/subtitles/ai"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/userstore/pgstore"
+)
+
+// AdminMetadataRefresher can refresh metadata for individual items.
+type AdminMetadataRefresher interface {
+	RefreshItem(ctx context.Context, contentID string) error
+}
+
+// UserRepository defines the operations the AdminHandler needs on users.
+type UserRepository interface {
+	List(ctx context.Context) ([]*models.User, error)
+	// ListPage returns up to limit users with id above afterID, in id order.
+	ListPage(ctx context.Context, afterID, limit int, identity string) ([]*models.User, error)
+	Create(ctx context.Context, input models.CreateUserInput) (*models.User, error)
+	Update(ctx context.Context, id int, input models.UpdateUserInput) error
+	Delete(ctx context.Context, id int) error
+	GetByID(ctx context.Context, id int) (*models.User, error)
+}
+
+type AccessGroupValidator interface {
+	Get(ctx context.Context, id int64) (*access.Group, error)
+	List(ctx context.Context) ([]access.Group, error)
+	GetPolicyForUser(ctx context.Context, userID int) (*access.GroupPolicy, error)
+}
+
+// ServerSettingsStore provides access to server-wide admin settings.
+type ServerSettingsStore interface {
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key, value string) error
+	GetAll(ctx context.Context) (map[string]string, error)
+}
+
+type serverSettingsAtomicUpdater interface {
+	UpdateAtomic(
+		ctx context.Context,
+		update func(current map[string]string) (map[string]string, error),
+	) error
+}
+
+func updateServerSettingsAtomically(
+	ctx context.Context,
+	store ServerSettingsStore,
+	update func(current map[string]string) (map[string]string, error),
+) error {
+	return updateServerSettingsInTransaction(ctx, store, func(current map[string]string, _ pgx.Tx) (map[string]string, error) {
+		return update(current)
+	})
+}
+
+// updateServerSettingsWithTx runs update in tx when it is set, under the
+// settings lock taken there, and in a transaction of its own otherwise.
+func updateServerSettingsWithTx(
+	ctx context.Context,
+	store ServerSettingsStore,
+	tx pgx.Tx,
+	update func(current map[string]string, tx pgx.Tx) (map[string]string, error),
+) error {
+	if tx == nil {
+		return updateServerSettingsInTransaction(ctx, store, update)
+	}
+	updater, ok := store.(interface {
+		UpdateAtomicWithTx(context.Context, pgx.Tx, func(map[string]string, pgx.Tx) (map[string]string, error)) error
+	})
+	if !ok {
+		return errors.New("settings store does not support caller transactions")
+	}
+	return updater.UpdateAtomicWithTx(ctx, tx, update)
+}
+
+func updateServerSettingsInTransaction(
+	ctx context.Context,
+	store ServerSettingsStore,
+	update func(current map[string]string, tx pgx.Tx) (map[string]string, error),
+) error {
+	if updater, ok := store.(interface {
+		UpdateAtomicInTransaction(context.Context, func(map[string]string, pgx.Tx) (map[string]string, error)) error
+	}); ok {
+		return updater.UpdateAtomicInTransaction(ctx, update)
+	}
+	if updater, ok := store.(serverSettingsAtomicUpdater); ok {
+		return updater.UpdateAtomic(ctx, func(current map[string]string) (map[string]string, error) {
+			return update(current, nil)
+		})
+	}
+	return errors.New("settings store does not support atomic updates")
+}
+
+type DiagnosticsEnablementStore interface {
+	PutStream(ctx context.Context, bucket, key string, r io.Reader, contentType string) error
+	DeleteObject(ctx context.Context, bucket, key string) error
+	Bucket() string
+}
+
+type AdminJobCreator interface {
+	Create(ctx context.Context, input adminjob.CreateJobInput) (*models.AdminJob, error)
+	CreateLibraryRefresh(
+		ctx context.Context,
+		createdByUserID int,
+		req adminjob.LibraryRefreshRequest,
+		message string,
+	) (*models.AdminJob, error)
+}
+
+type ItemRefreshScopeResolver interface {
+	Resolve(ctx context.Context, contentID string) (*adminjob.ItemRefreshRequest, error)
+	ResolveWithMode(ctx context.Context, contentID string, mode adminjob.ItemRefreshMode) (*adminjob.ItemRefreshRequest, error)
+}
+
+type ImpersonationService interface {
+	StartImpersonation(ctx context.Context, adminUserID, targetUserID int, deviceName, ip string) (*auth.TokenPair, *models.User, *models.User, error)
+}
+
+// AdminHandler handles admin-only HTTP endpoints for user management,
+// session listing, unmatched files, and system stats.
+type AdminHandler struct {
+	ChatGPT            *chatgpt.Service
+	userRepo           UserRepository
+	pool               *pgxpool.Pool
+	loginSessions      adminLoginSessionStore
+	SessionsLoader     *PlaybackSessionsLoader
+	storeProv          userstore.UserStoreProvider
+	accountProvisioner *auth.AccountProvisioner
+	DetailSvc          *catalog.DetailService
+	StatsSource        AdminStatsSource
+	// WatchProviders lists the registered watch providers for the uncached
+	// stats path. Nil on a deployment without the watchsync registry, which
+	// degrades to "only providers with stored activity".
+	WatchProviders               WatchProviderLister
+	PlaybackActivitySource       AdminPlaybackActivitySource
+	TopActivitySource            AdminTopActivitySource
+	TimeseriesSource             AdminTimeseriesSource
+	DownloadsStatsSource         AdminDownloadsStatsSource
+	RedisClient                  *redis.Client // health reporting only; nil means this deployment runs without Redis
+	Config                       *config.Config
+	ArtworkBackend               string          // resolved artwork backend for the settings status; empty when unopened
+	ArtworkStore                 blobstore.Store // personal collection artwork, removed with a deleted account's collections
+	EventBus                     cache.EventBus
+	EventsHub                    *evt.Hub
+	SettingsRepo                 ServerSettingsStore
+	DiagnosticsStore             DiagnosticsEnablementStore
+	JobRepo                      AdminJobCreator
+	ItemRefreshResolver          ItemRefreshScopeResolver
+	ImpersonationService         ImpersonationService
+	RealtimeHub                  *notifications.Hub
+	AccessGroups                 AccessGroupValidator
+	BootstrapSensitiveConfigured map[string]bool
+	BootstrapSensitiveValues     map[string]string
+	// BootstrapEnvVars names the environment variable that sets each key in
+	// BootstrapSensitiveConfigured, for the admin UI to show.
+	BootstrapEnvVars        map[string]string
+	RedisBootstrapAvailable bool
+	OnUserSessionsRevoked   func(ctx context.Context, userID int)
+	OnServerSettingUpdated  func(ctx context.Context, key, value string)
+	RestartStatus           *ServerRestartStatusTracker
+	CatalogSearchStatus     catalog.CatalogSearchStatusProvider
+	// BeforeServerSettingCommit runs inside the settings transaction for each
+	// setting whose effective value changes. An error rolls the save back. tx
+	// is nil when the settings store has no transactional update.
+	BeforeServerSettingCommit func(ctx context.Context, tx pgx.Tx, key, value string) error
+	// BackupKeyCheck is this server's SECRET_KEY check value. A save that
+	// switches backup.destination to s3 needs backup.s3.key_acknowledged to
+	// hold it; empty refuses that switch.
+	BackupKeyCheck string
+	// WatchlistTitlesSweeper deletes watchlist titles no entry references.
+	// Deleting an account drops its entries through the users foreign key,
+	// which can leave such titles behind. Nil skips the sweep.
+	WatchlistTitlesSweeper interface {
+		SweepOrphanTitles(ctx context.Context) error
+	}
+	// RecWorker is told when an account update changes its profiles' access
+	// scope, so their recommendations are rebuilt. Optional.
+	RecWorker AccountsScopeNotifier
+	// ProfileAvatars resolves the avatar on admin profile listings the way
+	// the profile endpoints do. Nil leaves uploaded avatars without a URL.
+	ProfileAvatars interface {
+		ResolveAvatar(ctx context.Context, ref string) (source, url string)
+	}
+	// logLevelCounts caches the 24h error/warning tallies served on
+	// /admin/server/status. The dashboard polls that route every 15s, and the
+	// counts are only ever read as a rough signal, so re-counting per request
+	// would be pure waste. Nil when the handler was built without the
+	// constructor (tests): the counts are then simply uncached.
+	logLevelCounts *cache.TTLCache[adminLogLevelCounts]
+}
+
+// NewAdminHandler creates a new AdminHandler backed by the given
+// user repository and database pool.
+func NewAdminHandler(
+	userRepo UserRepository,
+	pool *pgxpool.Pool,
+	storeProv userstore.UserStoreProvider,
+) *AdminHandler {
+	h := &AdminHandler{
+		userRepo:           userRepo,
+		pool:               pool,
+		storeProv:          storeProv,
+		accountProvisioner: auth.NewAccountProvisioner(userRepo, storeProv),
+		logLevelCounts:     cache.NewTTLCache[adminLogLevelCounts](),
+	}
+	if pool != nil {
+		h.loginSessions = auth.NewSessionRepository(pool)
+	}
+	return h
+}
+
+// --- Request/Response types ---
+
+// AdminUserView represents a user in admin JSON responses.
+//
+// The policy fields carry the account's stored overrides: null means the
+// field is inherited from the access group. EffectivePolicy is the resolved
+// value the server enforces (override when set, otherwise the group's value,
+// otherwise the permissive no-group default). MaxProfiles is the exception:
+// the frozen v1 body has no inherit state for it, so it carries the limit that
+// applies, and the v2-only MaxProfilesOverride carries the stored override.
+type AdminUserView struct {
+	ID                         int                 `json:"id"`
+	Username                   string              `json:"username"`
+	Email                      string              `json:"email"`
+	Role                       string              `json:"role"`
+	Permissions                []string            `json:"permissions"`
+	Enabled                    bool                `json:"enabled"`
+	LibraryIDs                 []int               `json:"library_ids"`
+	MaxPlaybackQuality         *string             `json:"max_playback_quality"`
+	MaxStreams                 *int                `json:"max_streams"`
+	MaxTranscodes              *int                `json:"max_transcodes"`
+	MaxRemoteStreamBitrateKbps *int                `json:"-"`
+	MaxLocalStreamBitrateKbps  *int                `json:"-"`
+	TranscodeAllowed           *bool               `json:"transcode_allowed"`
+	AudioTranscodeAllowed      *bool               `json:"audio_transcode_allowed"`
+	MaxProfiles                int                 `json:"max_profiles"`
+	MaxProfilesOverride        *int                `json:"-"`
+	DownloadAllowed            *bool               `json:"download_allowed"`
+	DownloadTranscodeAllowed   *bool               `json:"download_transcode_allowed"`
+	RequestsAllowed            *bool               `json:"requests_allowed"`
+	AccessGroupID              *int64              `json:"access_group_id"`
+	EffectivePolicy            EffectivePolicyView `json:"effective_policy"`
+	CreatedAt                  time.Time           `json:"created_at"`
+	UpdatedAt                  time.Time           `json:"updated_at"`
+	LastActiveAt               *time.Time          `json:"last_active_at,omitempty"`
+	// PasswordLogin, PasswordChangeRequired and IsOwner are v2-only: the
+	// frozen v1 body does not carry them.
+	PasswordLogin          bool `json:"-"`
+	PasswordChangeRequired bool `json:"-"`
+	IsOwner                bool `json:"-"`
+	// BreakGlass is v2-only: the account keeps local password sign-in when
+	// the server turns it off.
+	BreakGlass bool `json:"-"`
+}
+
+// EffectivePolicyView is the resolved policy block on admin user responses.
+type EffectivePolicyView struct {
+	LibraryIDs                 []int    `json:"library_ids"`
+	MaxPlaybackQuality         string   `json:"max_playback_quality"`
+	MaxStreams                 int      `json:"max_streams"`
+	MaxTranscodes              int      `json:"max_transcodes"`
+	MaxRemoteStreamBitrateKbps int      `json:"-"`
+	MaxLocalStreamBitrateKbps  int      `json:"-"`
+	MaxProfiles                int      `json:"-"`
+	TranscodeAllowed           bool     `json:"transcode_allowed"`
+	AudioTranscodeAllowed      bool     `json:"audio_transcode_allowed"`
+	DownloadAllowed            bool     `json:"download_allowed"`
+	DownloadTranscodeAllowed   bool     `json:"download_transcode_allowed"`
+	RequestsAllowed            bool     `json:"requests_allowed"`
+	Permissions                []string `json:"permissions"`
+}
+
+// unmatchedFileRow represents a media file with no content_id.
+type unmatchedFileRow struct {
+	ID            int    `json:"id"`
+	MediaFolderID int    `json:"media_folder_id"`
+	FilePath      string `json:"file_path"`
+	FileSize      int64  `json:"file_size"`
+	Container     string `json:"container"`
+}
+
+// --- Helper ---
+
+// toAdminUserResponse converts a User model to an admin API response. group
+// is the user's access-group policy (nil when ungrouped or unknown).
+func toAdminUserResponse(u *models.User, group *access.GroupPolicy) AdminUserView {
+	effective := access.ApplyGroupPolicy(u, group)
+	resp := AdminUserView{
+		ID:                         u.ID,
+		Username:                   u.Username,
+		Email:                      u.Email,
+		Role:                       u.Role,
+		Permissions:                append([]string{}, u.Permissions...),
+		Enabled:                    u.Enabled,
+		LibraryIDs:                 cloneIntSlice(u.LibraryIDs),
+		MaxPlaybackQuality:         normalizedQualityPtr(u.MaxPlaybackQuality),
+		MaxStreams:                 clonePtr(u.MaxStreams),
+		MaxTranscodes:              clonePtr(u.MaxTranscodes),
+		MaxRemoteStreamBitrateKbps: clonePtr(u.MaxRemoteStreamBitrateKbps),
+		MaxLocalStreamBitrateKbps:  clonePtr(u.MaxLocalStreamBitrateKbps),
+		TranscodeAllowed:           clonePtr(u.TranscodeAllowed),
+		AudioTranscodeAllowed:      clonePtr(u.AudioTranscodeAllowed),
+		MaxProfiles:                effective.MaxProfiles,
+		MaxProfilesOverride:        clonePtr(u.MaxProfiles),
+		DownloadAllowed:            clonePtr(u.DownloadAllowed),
+		DownloadTranscodeAllowed:   clonePtr(u.DownloadTranscodeAllowed),
+		RequestsAllowed:            clonePtr(u.RequestsAllowed),
+		AccessGroupID:              clonePtr(u.AccessGroupID),
+		PasswordLogin:              u.LocalPasswordLoginEnabled && u.PasswordHash != "",
+		PasswordChangeRequired:     u.PasswordChangeRequired,
+		IsOwner:                    u.IsOwner,
+		BreakGlass:                 u.BreakGlass,
+		EffectivePolicy: EffectivePolicyView{
+			LibraryIDs:                 effective.LibraryIDs,
+			MaxPlaybackQuality:         effective.MaxPlaybackQuality,
+			MaxStreams:                 effective.MaxStreams,
+			MaxTranscodes:              effective.MaxTranscodes,
+			MaxRemoteStreamBitrateKbps: effective.MaxRemoteStreamBitrateKbps,
+			MaxLocalStreamBitrateKbps:  effective.MaxLocalStreamBitrateKbps,
+			MaxProfiles:                effective.MaxProfiles,
+			TranscodeAllowed:           effective.TranscodeAllowed,
+			AudioTranscodeAllowed:      effective.AudioTranscodeAllowed,
+			DownloadAllowed:            effective.DownloadAllowed,
+			DownloadTranscodeAllowed:   effective.DownloadTranscodeAllowed,
+			RequestsAllowed:            effective.RequestsAllowed,
+			Permissions:                auth.PolicyPermissions(effective),
+		},
+		CreatedAt: u.CreatedAt,
+		UpdatedAt: u.UpdatedAt,
+	}
+	return resp
+}
+
+func normalizedQualityPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	normalized := access.NormalizePlaybackQuality(*value)
+	return &normalized
+}
+
+// cloneIntSlice preserves the nil/empty distinction: nil stays nil (JSON
+// null = inherit) and an empty override stays an empty array.
+func cloneIntSlice(values []int) []int {
+	if values == nil {
+		return nil
+	}
+	out := make([]int, len(values))
+	copy(out, values)
+	return out
+}
+
+// roleAdmin is the server-wide admin account role.
+const roleAdmin = models.RoleAdmin
+
+// validateStreamLimits rejects negative concurrency caps. nil means "inherit
+// from the access group" and 0 means an explicit "unlimited" override, so only
+// a negative value is meaningless.
+func validateStreamLimits(maxStreams, maxTranscodes *int) error {
+	if (maxStreams != nil && *maxStreams < 0) || (maxTranscodes != nil && *maxTranscodes < 0) {
+		return errors.New("max_streams and max_transcodes must be 0 (unlimited) or positive")
+	}
+	return nil
+}
+
+// checkScopedAPIKeyUpdate is the mutation policy shared by both API versions.
+// Recovery email is a credential: replacing it lets the key's holder reset
+// the administrator's password and obtain an unrestricted login session.
+// Callers check the account locked by the mutation transaction.
+func checkScopedAPIKeyUpdate(ctx context.Context, target *models.User, input models.UpdateUserInput) error {
+	if !apimw.IsScopedAPIKey(ctx) {
+		return nil
+	}
+	grantsAdmin := input.Role != nil && *input.Role == roleAdmin
+	changesAdminCredentials := target.Role == roleAdmin &&
+		(input.Password != nil || input.Email != nil || input.Role != nil || input.BreakGlass != nil)
+	if grantsAdmin || changesAdminCredentials {
+		return apiError(http.StatusForbidden, "insufficient_scope", "A scoped API key may not change admin credentials or grant admin")
+	}
+	return nil
+}
+
+// clonePtr copies a policy override pointer so a response never aliases the
+// stored model. A nil pointer stays nil (JSON null = inherit).
+func clonePtr[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	return &out
+}
+
+// groupPolicyProvider exposes the access-group store as a policy provider,
+// preserving a nil interface when access groups are not configured.
+func (h *AdminHandler) groupPolicyProvider() access.GroupPolicyProvider {
+	if h == nil || h.AccessGroups == nil {
+		return nil
+	}
+	return h.AccessGroups
+}
+
+// groupPolicies loads every access group's policy keyed by ID so a list of
+// users can be resolved without a query per user. A lookup failure is an
+// error, not an empty map: rendering a group-restricted user against
+// NoGroupPolicy would report a fully permissive effective_policy.
+func (h *AdminHandler) groupPolicies(ctx context.Context) (map[int64]access.GroupPolicy, error) {
+	policies := map[int64]access.GroupPolicy{}
+	if h == nil || h.AccessGroups == nil {
+		return policies, nil
+	}
+	groups, err := h.AccessGroups.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("loading access groups for effective policy: %w", err)
+	}
+	for _, group := range groups {
+		policies[group.ID] = group.Policy()
+	}
+	return policies, nil
+}
+
+func lookupGroupPolicy(policies map[int64]access.GroupPolicy, u *models.User) *access.GroupPolicy {
+	if !access.GroupApplies(u) {
+		return nil
+	}
+	policy, ok := policies[*u.AccessGroupID]
+	if !ok {
+		return nil
+	}
+	return &policy
+}
+
+func (h *AdminHandler) loadUserLastActiveAt(ctx context.Context, userIDs []int) (map[int]time.Time, error) {
+	lastActive := make(map[int]time.Time)
+	if h == nil || h.pool == nil || len(userIDs) == 0 {
+		return lastActive, nil
+	}
+
+	rows, err := h.pool.Query(ctx, `
+		SELECT user_id, last_active_at
+		FROM user_last_activity
+		WHERE user_id = ANY($1::bigint[])`, userIDs)
+	if err != nil {
+		return lastActive, fmt.Errorf("loading user last activity: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var userID int
+		var timestamp time.Time
+		if err := rows.Scan(&userID, &timestamp); err != nil {
+			return lastActive, fmt.Errorf("scanning user last activity: %w", err)
+		}
+		lastActive[userID] = timestamp
+	}
+	if err := rows.Err(); err != nil {
+		return lastActive, fmt.Errorf("iterating user last activity: %w", err)
+	}
+
+	return lastActive, nil
+}
+
+func applyLastActiveAt(resp *AdminUserView, lastActive map[int]time.Time) {
+	if resp == nil {
+		return
+	}
+	if timestamp, ok := lastActive[resp.ID]; ok {
+		resp.LastActiveAt = &timestamp
+	}
+}
+
+// --- Handler methods ---
+
+// ListAdminUsersPage is the keyset page v2 listAdminUsers uses: up to limit
+// accounts with id above afterID, in id order, enriched the same way as
+// ListAdminUsers, plus whether more accounts follow.
+func (h *AdminHandler) ListAdminUsersPage(ctx context.Context, afterID, limit int, identity string) ([]AdminUserView, bool, error) {
+	users, err := h.userRepo.ListPage(ctx, afterID, limit+1, identity)
+	if err != nil {
+		return nil, false, apiError(http.StatusInternalServerError, "internal_error", "Failed to list users")
+	}
+	hasMore := len(users) > limit
+	if hasMore {
+		users = users[:limit]
+	}
+	views, err := h.adminUserViews(ctx, users)
+	if err != nil {
+		return nil, false, err
+	}
+	return views, hasMore, nil
+}
+
+// adminUserViews resolves the effective policy and last activity for a batch
+// of accounts, in the batch's order.
+func (h *AdminHandler) adminUserViews(ctx context.Context, users []*models.User) ([]AdminUserView, error) {
+	policies, err := h.groupPolicies(ctx)
+	if err != nil {
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to resolve effective policy")
+	}
+	resp := make([]AdminUserView, 0, len(users))
+	userIDs := make([]int, 0, len(users))
+	for _, u := range users {
+		userIDs = append(userIDs, u.ID)
+		resp = append(resp, toAdminUserResponse(u, lookupGroupPolicy(policies, u)))
+	}
+	lastActive, err := h.loadUserLastActiveAt(ctx, userIDs)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to load admin user last activity", "component", "api", "error", err)
+	}
+	for i := range resp {
+		applyLastActiveAt(&resp[i], lastActive)
+	}
+	return resp, nil
+}
+
+// deletedAccountCollections lists, in the delete's transaction, the personal
+// collections the account delete removes through the users foreign key. A
+// handler without an artwork store, or a test repository without a
+// transaction, has nothing to clean up.
+func (h *AdminHandler) deletedAccountCollections(ctx context.Context, tx pgx.Tx, userID int) ([]string, error) {
+	if h.ArtworkStore == nil || tx == nil {
+		return nil, nil
+	}
+	return pgstore.AccountCollectionIDs(ctx, tx, userID)
+}
+
+// sweepWatchlistTitles removes the watchlist titles a deleted account's
+// entries were the last to reference. The account is already gone, so a
+// failure is logged and the next delete's sweep picks the titles up.
+func (h *AdminHandler) sweepWatchlistTitles(ctx context.Context, userID int) {
+	if h.WatchlistTitlesSweeper == nil {
+		return
+	}
+	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if err := h.WatchlistTitlesSweeper.SweepOrphanTitles(sweepCtx); err != nil {
+		slog.WarnContext(ctx, "watchlist title sweep failed after account delete", "component", "api", "user_id", userID, "error", err)
+	}
+}
+
+func (h *AdminHandler) loadPlaybackSessions(ctx context.Context, r *http.Request) ([]playbackSessionRow, error) {
+	loader, err := resolvePlaybackSessionsLoader(h.SessionsLoader, h.pool, h.storeProv, h.DetailSvc)
+	if err != nil {
+		return nil, err
+	}
+	return loader.Load(ctx, PlaybackSessionsQuery{})
+}
+
+// updateMayRequireSessionRevocation is updateRequiresSessionRevocation without
+// the current account to compare against: any credential or enabled change
+// might sign the user out.
+func updateMayRequireSessionRevocation(input models.UpdateUserInput) bool {
+	return input.Password != nil ||
+		input.Enabled != nil
+}
+
+// updateRequiresSessionRevocation reports whether an account update signs the
+// user out everywhere: a new password or an enabled change.
+//
+// Policy changes (permissions, playback-quality override, access group) do
+// not; they bump access_policy_revision, every request resolves the current
+// policy, and connected realtime sockets tell their clients to refresh. A role
+// change does not either: RequireAuth refuses access tokens minted under the
+// old role with token_refresh_required, and a refresh issues the new role.
+// The impersonation sessions a demoted admin started end in the same
+// transaction (auth.UserRepository.MutateAdminAccount).
+func updateRequiresSessionRevocation(current *models.User, input models.UpdateUserInput) bool {
+	if input.Password != nil {
+		return true
+	}
+	if current == nil {
+		return updateMayRequireSessionRevocation(input)
+	}
+	if input.Enabled != nil && *input.Enabled != current.Enabled {
+		return true
+	}
+	return false
+}
+
+type AdminUnmatchedFileView = unmatchedFileRow
+
+// ListAdminUnmatchedFiles returns a live ID-ordered SQL page, excluding extras.
+func (h *AdminHandler) ListAdminUnmatchedFiles(ctx context.Context, limit, after int) ([]AdminUnmatchedFileView, bool, error) {
+	if h == nil || h.pool == nil {
+		return nil, false, apiError(http.StatusServiceUnavailable, "unavailable", "Database not configured")
+	}
+	if limit < 1 || limit > 200 || after < 0 {
+		return nil, false, apiError(http.StatusBadRequest, "bad_request", "Invalid unmatched file page")
+	}
+	rows, err := h.listUnmatchedFiles(ctx, limit+1, 0, new(after))
+	if err != nil {
+		return nil, false, err
+	}
+	more := len(rows) > limit
+	return rows[:min(len(rows), limit)], more, nil
+}
+
+func (h *AdminHandler) listUnmatchedFiles(ctx context.Context, limit, offset int, after *int) ([]unmatchedFileRow, error) {
+	rows, err := h.pool.Query(ctx,
+		`SELECT id, media_folder_id, file_path, file_size, container
+		 FROM media_files
+		 WHERE content_id IS NULL AND extra_id IS NULL AND ($3::bigint IS NULL OR id > $3)
+		 ORDER BY id ASC
+		 LIMIT $1 OFFSET $2`, limit, offset, after)
+	if err != nil {
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to list unmatched files")
+	}
+	defer rows.Close()
+
+	files := make([]unmatchedFileRow, 0)
+	for rows.Next() {
+		var f unmatchedFileRow
+		if err := rows.Scan(&f.ID, &f.MediaFolderID, &f.FilePath, &f.FileSize, &f.Container); err != nil {
+			return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to scan file")
+		}
+		files = append(files, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to iterate files")
+	}
+
+	return files, nil
+}
+
+var (
+	errAdminStatsRead       = errors.New("failed to get stats")
+	errAdminStatsCountUsers = errors.New("failed to count users")
+)
+
+// ReadAdminStats shares the existing cache, PostgreSQL and account-repository fallback.
+func (h *AdminHandler) ReadAdminStats(ctx context.Context, refresh bool) (AdminStats, error) {
+	if h.StatsSource != nil {
+		if refresh {
+			h.StatsSource.Invalidate()
+		}
+		stats, err := h.StatsSource.Get(ctx)
+		if err != nil {
+			return AdminStats{}, errAdminStatsRead
+		}
+		return stats, nil
+	}
+	if h.pool != nil {
+		stats, err := queryAdminStats(ctx, h.pool, h.WatchProviders)
+		if err != nil {
+			return AdminStats{}, errAdminStatsRead
+		}
+		return stats, nil
+	}
+	if h.userRepo == nil {
+		return AdminStats{}, errAdminStatsCountUsers
+	}
+	users, err := h.userRepo.List(ctx)
+	if err != nil {
+		return AdminStats{}, errAdminStatsCountUsers
+	}
+	return AdminStats{TotalUsers: len(users)}, nil
+}
+
+func (h *AdminHandler) invalidateStats(ctx context.Context, channel, eventType, payload string) {
+	if h.StatsSource != nil {
+		h.StatsSource.Invalidate()
+	}
+	h.publishStatsEvent(ctx, channel, eventType, payload)
+}
+
+func (h *AdminHandler) publishStatsEvent(ctx context.Context, channel, eventType, payload string) {
+	if h.EventBus == nil {
+		return
+	}
+	if err := h.EventBus.Publish(ctx, channel, cache.Event{Type: eventType, Payload: payload}); err != nil {
+		slog.WarnContext(ctx, "admin: failed to publish stats invalidation event", "component", "api",
+			"channel", channel,
+			"type", eventType,
+			"error", err,
+		)
+	}
+}
+
+// UpdateItemMetadataRequest contains the fields that can be updated via
+// PATCH /admin/items/{id}/metadata.
+type UpdateItemMetadataRequest struct {
+	Title            *string   `json:"title"`
+	SortTitle        *string   `json:"sort_title"`
+	OriginalTitle    *string   `json:"original_title"`
+	Overview         *string   `json:"overview"`
+	Tagline          *string   `json:"tagline"`
+	ContentRating    *string   `json:"content_rating"`
+	Year             *int      `json:"year"`
+	Runtime          *int      `json:"runtime"`
+	Genres           *[]string `json:"genres"`
+	Studios          *[]string `json:"studios"`
+	Networks         *[]string `json:"networks"`
+	Countries        *[]string `json:"countries"`
+	ReleaseDate      *string   `json:"release_date"`
+	FirstAirDate     *string   `json:"first_air_date"`
+	LastAirDate      *string   `json:"last_air_date"`
+	AirTime          *string   `json:"air_time"`
+	AirTimezone      *string   `json:"air_timezone"`
+	AirDate          *string   `json:"air_date"`
+	Status           *string   `json:"status"`
+	RatingIMDB       *float64  `json:"rating_imdb"`
+	RatingTMDB       *float64  `json:"rating_tmdb"`
+	RatingRTCritic   *int      `json:"rating_rt_critic"`
+	RatingRTAudience *int      `json:"rating_rt_audience"`
+	ImdbID           *string   `json:"imdb_id"`
+	TmdbID           *string   `json:"tmdb_id"`
+	TvdbID           *string   `json:"tvdb_id"`
+	SeasonNumber     *int      `json:"season_number"`
+	EpisodeNumber    *int      `json:"episode_number"`
+	LockedFields     *[]int    `json:"locked_fields"`
+}
+
+// --- Server Settings endpoints ---
+
+// sensitiveSettingKeys is the audited allowlist of secret-bearing settings
+// keys, shared with the at-rest encryption decorator so redaction and
+// encryption can never drift apart. See catalog.SensitiveSettingKeys.
+var sensitiveSettingKeys = catalog.SensitiveSettingKeys
+
+// machineManagedSettingKeys contains durable internal state that shares the
+// server_settings store but is not part of the administrator settings API.
+// The server generates the signing keys itself. An administrator who could set
+// one could mint tokens for any account, the Owner included, after a restart.
+var machineManagedSettingKeys = map[string]bool{
+	"auth.jwt_secret":                           true,
+	"audiobooks.abs.jwt_secret":                 true,
+	chatgpt.CredentialsKey:                      true,
+	config.AIProvidersSettingKey:                true,
+	config.ArtworkStorageReconcileCheckpointKey: true,
+	config.ArtworkStorageSweepCheckpointKey:     true,
+	config.MediaImageSweepCheckpointKey:         true,
+	config.ChapterThumbnailOriginalsCleanupKey:  true,
+	blobstore.IdentitySettingKey:                true,
+	blobstore.OperationalIdentitySettingKey:     true,
+	config.StorageTransitionTargetKey:           true,
+	// Written only by POST /api/v2/admin/backups/s3/acknowledge-key, which
+	// records this server's check value.
+	config.BackupS3KeyAcknowledgedSettingKey: true,
+}
+
+// Setting keys that decide where artwork lives. The s3 keys are the canonical
+// names; the effective settings map already applies the operational aliases.
+const (
+	artworkStorageBackendKey = "artwork.storage_backend"
+	artworkLocalPathKey      = "artwork.local_path"
+	s3PublicEndpointKey      = "s3.public_endpoint"
+	s3PublicBucketKey        = "s3.public_bucket"
+	s3PublicKeyPrefixKey     = "s3.public_key_prefix"
+	s3OperationalBucketKey   = "s3.operational_bucket"
+	s3PrivateEndpointKey     = "s3.private_endpoint"
+	s3PrivateBucketKey       = "s3.private_bucket"
+	s3PrivateKeyPrefixKey    = "s3.private_key_prefix"
+)
+
+// artworkStorageLocked reports whether a stored location can no longer be
+// written directly. The first artwork write records the assets identity, and
+// startup records any configured private bucket. After either, the settings
+// that select that place change only through a managed transition.
+func artworkStorageLocked(stored map[string]string) bool {
+	return assetsStorageLocked(stored) || strings.TrimSpace(stored[blobstore.OperationalIdentitySettingKey]) != ""
+}
+
+// assetsStorageLocked reports whether the artwork location itself is recorded.
+func assetsStorageLocked(stored map[string]string) bool {
+	return strings.TrimSpace(stored[blobstore.IdentitySettingKey]) != ""
+}
+
+var errArtworkStorageLocked = &APIError{
+	Status:  http.StatusConflict,
+	Code:    "artwork_storage_locked",
+	Message: "recorded storage locations cannot be changed directly; use a managed storage transition",
+}
+
+// checkArtworkLocalPath refuses a local artwork root that startup could not
+// open (a file, a symbolic link, or a path inside a file). Startup exits on
+// such a root before the admin UI can fix it. The check runs on the node that
+// takes the save and creates nothing. field names the rejected request member.
+func checkArtworkLocalPath(path, field string) error {
+	if err := blobstore.CheckLocalRoot(path); err != nil {
+		slog.Warn("refused unusable artwork.local_path", "error", err)
+		return fieldError(field, artworkLocalPathKey+" must be a folder Silo can open, not a file, a symbolic link, or a path inside a file")
+	}
+	return nil
+}
+
+// artworkIdentityInputs names the effective settings that decide where public
+// artwork and private operational objects live. The S3 keys are canonical; the
+// effective map already applies the legacy operational aliases. A private
+// bucket owns diagnostics, job artifacts, and avatars on either backend, so its
+// location is locked on a local backend too: adding one would otherwise strand
+// what the local root already holds.
+func artworkIdentityInputs(effective map[string]string) (backend string, inputs map[string]string) {
+	backend = strings.ToLower(strings.TrimSpace(effective[artworkStorageBackendKey]))
+	if backend == "" || backend == config.ArtworkBackendAuto {
+		backend = blobstore.BackendLocal
+		if strings.TrimSpace(effective[s3PublicBucketKey]) != "" {
+			backend = blobstore.BackendS3
+		}
+	}
+	// Compare locations the way the stores name them: endpoint scheme and host
+	// and the bucket are case-insensitive, and a key prefix ignores its
+	// slashes. An edit that only restyles a value is then a plain save.
+	inputs = map[string]string{}
+	switch backend {
+	case blobstore.BackendS3:
+		inputs[s3PublicEndpointKey] = blobstore.NormalizeEndpoint(effective[s3PublicEndpointKey])
+		inputs[s3PublicBucketKey] = strings.ToLower(strings.TrimSpace(effective[s3PublicBucketKey]))
+		inputs[s3PublicKeyPrefixKey] = s3client.NormalizeKeyPrefix(effective[s3PublicKeyPrefixKey])
+	default:
+		inputs[artworkLocalPathKey] = strings.TrimSpace(effective[artworkLocalPathKey])
+	}
+	// Without a bucket there is no private location, so a leftover endpoint or
+	// prefix can change freely.
+	privateBucket := strings.ToLower(strings.TrimSpace(effective[s3PrivateBucketKey]))
+	inputs[s3PrivateBucketKey] = privateBucket
+	if privateBucket != "" {
+		inputs[s3PrivateEndpointKey] = blobstore.NormalizeEndpoint(effective[s3PrivateEndpointKey])
+		inputs[s3PrivateKeyPrefixKey] = s3client.NormalizeKeyPrefix(effective[s3PrivateKeyPrefixKey])
+	}
+	return backend, inputs
+}
+
+// rejectArtworkIdentityChange refuses a write that would move artwork storage
+// after it has been recorded. A write that leaves the location settings as they
+// are saves, including re-saving the same values or adding a bucket an explicit
+// local backend ignores, so a settings form that includes the keys can still
+// submit. That holds even when the saved settings already name another
+// location: one saved before the first write recorded the running store, while
+// a restart was pending. A write that changes them must name the recorded
+// location, which is how such a pending change is put back. The assets and
+// private locations are judged separately against their own recorded rows.
+func rejectArtworkIdentityChange(recordedAssets, recordedPrivate string, before, after map[string]string) error {
+	beforeBackend, beforeInputs := artworkIdentityInputs(before)
+	afterBackend, afterInputs := artworkIdentityInputs(after)
+	privateUnchanged := true
+	assetsUnchanged := afterBackend == beforeBackend
+	for key, value := range beforeInputs {
+		if afterInputs[key] == value {
+			continue
+		}
+		if strings.HasPrefix(key, "s3.private_") {
+			privateUnchanged = false
+		} else {
+			assetsUnchanged = false
+		}
+	}
+	// Startup accepts only these exact forms: it rewrites a legacy assets row
+	// before serving, and binds the private row by exact match.
+	if !privateUnchanged && (privateIdentity(afterInputs) != recordedPrivate ||
+		ambiguousS3Location(afterInputs[s3PrivateEndpointKey], afterInputs[s3PrivateBucketKey])) {
+		return errArtworkStorageLocked
+	}
+	// Without a recorded assets row only the private bucket is locked; the
+	// assets location can still be chosen until the first artwork write.
+	if strings.TrimSpace(recordedAssets) == "" || assetsUnchanged {
+		return nil
+	}
+	if afterBackend == blobstore.BackendS3 && ambiguousS3Location(afterInputs[s3PublicEndpointKey], afterInputs[s3PublicBucketKey]) {
+		return errArtworkStorageLocked
+	}
+	if identity := assetsIdentity(afterBackend, afterInputs); identity != recordedAssets && !blobstore.SameLocalRoot(recordedAssets, identity) {
+		return errArtworkStorageLocked
+	}
+	return nil
+}
+
+// ambiguousS3Location reports whether an S3 endpoint or bucket contains the
+// "|" that separates identity parts. Only then can another location spell the
+// same identity, such as bucket "a|b" with prefix "c" for bucket "a" with
+// prefix "b|c", so a changed location with one never counts as the recorded
+// one.
+func ambiguousS3Location(endpoint, bucket string) bool {
+	return strings.Contains(endpoint, "|") || strings.Contains(bucket, "|")
+}
+
+// assetsIdentity is the identity the assets store would report for the
+// normalized inputs artworkIdentityInputs returns.
+func assetsIdentity(backend string, inputs map[string]string) string {
+	if backend == blobstore.BackendS3 {
+		return blobstore.S3Identity(inputs[s3PublicEndpointKey], inputs[s3PublicBucketKey], inputs[s3PublicKeyPrefixKey])
+	}
+	return blobstore.BackendLocal + "|" + inputs[artworkLocalPathKey]
+}
+
+// privateIdentity is the identity startup records for the private bucket the
+// inputs name: empty without one, as storage.operational_identity is.
+func privateIdentity(inputs map[string]string) string {
+	if inputs[s3PrivateBucketKey] == "" {
+		return ""
+	}
+	return blobstore.S3Identity(inputs[s3PrivateEndpointKey], inputs[s3PrivateBucketKey], inputs[s3PrivateKeyPrefixKey])
+}
+
+func redactAdminSettings(values map[string]string) {
+	for key := range sensitiveSettingKeys {
+		delete(values, key)
+	}
+	for key := range machineManagedSettingKeys {
+		delete(values, key)
+	}
+}
+
+type adminSettingResponse = AdminSettingValue
+
+type AdminSettingValue struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	// RestartRequired reports whether the value only takes effect after a
+	// server restart. It is populated from the compiled restart-key registry
+	// on read responses as well as on updates, so the admin UI never has to
+	// hand-copy the list into hint text.
+	RestartRequired bool `json:"restart_required,omitempty"`
+}
+
+type adminDeviceSettingResponse struct {
+	UserID         int    `json:"user_id"`
+	ProfileID      string `json:"profile_id"`
+	ProfileName    string `json:"profile_name,omitempty"`
+	DeviceID       string `json:"device_id"`
+	DeviceName     string `json:"device_name"`
+	DevicePlatform string `json:"device_platform"`
+	Key            string `json:"key"`
+	Value          string `json:"value"`
+	UpdatedAt      string `json:"updated_at"`
+}
+
+type adminDeviceSettingsListResponse struct {
+	Settings []adminDeviceSettingResponse `json:"settings"`
+}
+
+type adminDeviceProfileSummary struct {
+	ProfileID     string `json:"profile_id"`
+	ProfileName   string `json:"profile_name"`
+	OverrideCount int    `json:"override_count"`
+	LastUpdated   string `json:"last_updated"`
+}
+
+type adminDeviceSummaryResponse = AdminDeviceSummaryView
+
+type AdminDeviceSummaryView struct {
+	UserID         int                         `json:"user_id"`
+	Username       string                      `json:"username"`
+	Email          string                      `json:"email"`
+	DeviceID       string                      `json:"device_id"`
+	DeviceName     string                      `json:"device_name"`
+	DevicePlatform string                      `json:"device_platform"`
+	OverrideCount  int                         `json:"override_count"`
+	ProfileCount   int                         `json:"profile_count"`
+	Profiles       []adminDeviceProfileSummary `json:"profiles"`
+	LastUpdated    string                      `json:"last_updated"`
+}
+
+type AdminDeviceDetailView struct {
+	UserID         int                          `json:"user_id"`
+	Username       string                       `json:"username"`
+	Email          string                       `json:"email"`
+	DeviceID       string                       `json:"device_id"`
+	DeviceName     string                       `json:"device_name"`
+	DevicePlatform string                       `json:"device_platform"`
+	OverrideCount  int                          `json:"override_count"`
+	ProfileCount   int                          `json:"profile_count"`
+	Profiles       []adminDeviceProfileSummary  `json:"profiles"`
+	LastUpdated    string                       `json:"last_updated"`
+	Settings       []adminDeviceSettingResponse `json:"settings"`
+}
+
+func listRegisteredDevices(ctx context.Context, store userstore.UserStore) ([]userstore.DeviceEntry, error) {
+	registry, ok := store.(userstore.DeviceRegistry)
+	if !ok {
+		return nil, nil
+	}
+	return registry.ListDevices(ctx)
+}
+
+func buildAdminDeviceSettingsResponse(userID int, profileNames map[string]string, entries []userstore.DeviceSettingEntry) adminDeviceSettingsListResponse {
+	resp := adminDeviceSettingsListResponse{
+		Settings: make([]adminDeviceSettingResponse, 0, len(entries)),
+	}
+	for _, entry := range entries {
+		resp.Settings = append(resp.Settings, adminDeviceSettingResponse{
+			UserID:         userID,
+			ProfileID:      entry.ProfileID,
+			ProfileName:    profileNames[entry.ProfileID],
+			DeviceID:       entry.DeviceID,
+			DeviceName:     entry.DeviceName,
+			DevicePlatform: entry.DevicePlatform,
+			Key:            entry.Key,
+			Value:          entry.Value,
+			UpdatedAt:      entry.UpdatedAt,
+		})
+	}
+	return resp
+}
+
+func buildAdminDeviceSummaries(
+	userID int,
+	username string,
+	email string,
+	entries []userstore.DeviceSettingEntry,
+	canonicalValues []userstore.SettingValue,
+	registeredDevices []userstore.DeviceEntry,
+	profileNames map[string]string,
+) []adminDeviceSummaryResponse {
+	type profileAccumulator struct {
+		summary adminDeviceProfileSummary
+		keys    map[string]struct{}
+	}
+	type summary struct {
+		device   adminDeviceSummaryResponse
+		keys     map[string]struct{}
+		profiles map[string]*profileAccumulator
+	}
+
+	byDevice := make(map[string]*summary)
+
+	ensureDevice := func(deviceID, deviceName, devicePlatform, lastUpdated string) *summary {
+		if deviceID == "" {
+			return nil
+		}
+		current, ok := byDevice[deviceID]
+		if !ok {
+			current = &summary{
+				device: adminDeviceSummaryResponse{
+					UserID:         userID,
+					Username:       username,
+					Email:          email,
+					DeviceID:       deviceID,
+					DeviceName:     deviceName,
+					DevicePlatform: devicePlatform,
+					LastUpdated:    lastUpdated,
+				},
+				keys:     make(map[string]struct{}),
+				profiles: make(map[string]*profileAccumulator),
+			}
+			byDevice[deviceID] = current
+		}
+		if current.device.DeviceName == "" && deviceName != "" {
+			current.device.DeviceName = deviceName
+		}
+		if current.device.DevicePlatform == "" && devicePlatform != "" {
+			current.device.DevicePlatform = devicePlatform
+		}
+		if lastUpdated > current.device.LastUpdated {
+			current.device.LastUpdated = lastUpdated
+			if deviceName != "" {
+				current.device.DeviceName = deviceName
+			}
+			if devicePlatform != "" {
+				current.device.DevicePlatform = devicePlatform
+			}
+		}
+		return current
+	}
+
+	ensureProfile := func(current *summary, profileID, lastUpdated string) *profileAccumulator {
+		if current == nil || profileID == "" {
+			return nil
+		}
+		profile, exists := current.profiles[profileID]
+		if !exists {
+			profile = &profileAccumulator{
+				summary: adminDeviceProfileSummary{
+					ProfileID:   profileID,
+					ProfileName: profileNames[profileID],
+					LastUpdated: lastUpdated,
+				},
+				keys: make(map[string]struct{}),
+			}
+			current.profiles[profileID] = profile
+			return profile
+		}
+		if lastUpdated > profile.summary.LastUpdated {
+			profile.summary.LastUpdated = lastUpdated
+		}
+		return profile
+	}
+
+	for _, device := range registeredDevices {
+		deviceID := strings.TrimSpace(device.DeviceID)
+		profileID := strings.TrimSpace(device.ProfileID)
+		current := ensureDevice(
+			deviceID,
+			device.DeviceName,
+			device.DevicePlatform,
+			device.LastSeenAt,
+		)
+		ensureProfile(current, profileID, device.LastSeenAt)
+	}
+
+	for _, entry := range entries {
+		deviceID := strings.TrimSpace(entry.DeviceID)
+		profileID := strings.TrimSpace(entry.ProfileID)
+		current := ensureDevice(
+			deviceID,
+			entry.DeviceName,
+			entry.DevicePlatform,
+			entry.UpdatedAt,
+		)
+		if current == nil {
+			continue
+		}
+		key := canonicalAdminDeviceSettingKey(entry.Key)
+		if profileID != "" && key != "" {
+			current.keys[profileID+":"+key] = struct{}{}
+		}
+		profile := ensureProfile(current, profileID, entry.UpdatedAt)
+		if profile != nil && key != "" {
+			profile.keys[key] = struct{}{}
+		}
+	}
+
+	// Canonical profile_device rows are the authoritative overrides after the
+	// settings cutover. Merge them by (profile,key) with the still-mounted
+	// legacy rows so a mirrored value counts once while a canonical-only write
+	// remains visible to fleet management.
+	for _, value := range canonicalValues {
+		if value.Scope != settingscontract.ScopeProfileDevice {
+			continue
+		}
+		deviceID := strings.TrimSpace(value.DeviceID)
+		profileID := strings.TrimSpace(value.ProfileID)
+		current := ensureDevice(deviceID, "", "", value.UpdatedAt)
+		if current == nil {
+			continue
+		}
+		key := canonicalAdminDeviceSettingKey(value.Key)
+		if profileID != "" && key != "" {
+			current.keys[profileID+":"+key] = struct{}{}
+		}
+		profile := ensureProfile(current, profileID, value.UpdatedAt)
+		if profile != nil && key != "" {
+			profile.keys[key] = struct{}{}
+		}
+	}
+
+	devices := make([]adminDeviceSummaryResponse, 0, len(byDevice))
+	for _, current := range byDevice {
+		current.device.OverrideCount = len(current.keys)
+		current.device.ProfileCount = len(current.profiles)
+		profiles := make([]adminDeviceProfileSummary, 0, len(current.profiles))
+		for _, profile := range current.profiles {
+			profile.summary.OverrideCount = len(profile.keys)
+			profiles = append(profiles, profile.summary)
+		}
+		sort.Slice(profiles, func(i, j int) bool {
+			if profiles[i].LastUpdated != profiles[j].LastUpdated {
+				return profiles[i].LastUpdated > profiles[j].LastUpdated
+			}
+			a := profiles[i].ProfileName
+			b := profiles[j].ProfileName
+			if a == "" {
+				a = profiles[i].ProfileID
+			}
+			if b == "" {
+				b = profiles[j].ProfileID
+			}
+			return a < b
+		})
+		current.device.Profiles = profiles
+		devices = append(devices, current.device)
+	}
+	return devices
+}
+
+// canonicalAdminDeviceSettingKey reduces a stored key to the preference it
+// expresses, so fleet counts describe overrides rather than rows.
+//
+// Two reductions, because a key can be spelled twice for two different reasons.
+// The migration's rename table folds a pre-cutover spelling onto its contract
+// name, which is what makes an appearance row left in the legacy table count
+// once. The mirror then folds a deprecated key onto its replacement, which is
+// what keeps a household's single intro-skip choice from raising this device's
+// override count — and the anomaly thresholds and count filters built on it —
+// by two for the length of the overlap window.
+func canonicalAdminDeviceSettingKey(key string) string {
+	return settingscontract.LogicalKey(settingsmigrate.CanonicalKey(strings.TrimSpace(key)))
+}
+
+func listProfileNamesByID(ctx context.Context, store userstore.UserStore) (map[string]string, error) {
+	profiles, err := store.ListProfiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	profileNames := make(map[string]string, len(profiles))
+	for _, profile := range profiles {
+		profileNames[profile.ID] = strings.TrimSpace(profile.Name)
+	}
+	return profileNames, nil
+}
+
+type updateSettingRequest struct {
+	Value string `json:"value"`
+}
+
+type updateSettingsRequest struct {
+	Values map[string]string `json:"values"`
+}
+
+type updateSettingsResponse struct {
+	// CommittedSnapshot is captured under the settings write lock and never serialized.
+	CommittedSnapshot *AdminSettingsSnapshot `json:"-"`
+
+	Values              map[string]string `json:"values"`
+	RestartRequired     bool              `json:"restart_required"`
+	RestartRequiredKeys []string          `json:"restart_required_keys,omitempty"`
+}
+
+const errCodeStorageUnavailable = "storage_unavailable"
+
+func (h *AdminHandler) normalizeBatchSetting(
+	ctx context.Context,
+	key, value string,
+) (string, string, error) {
+	if strings.HasPrefix(key, "ratelimit.") {
+		return "", "bad_request", fmt.Errorf("%s is managed by /admin/rate-limits/config", key)
+	}
+	normalized, err := config.NormalizeAdminSetting(key, value)
+	if err != nil {
+		return "", "bad_request", err
+	}
+
+	switch key {
+	case markers.SettingMode, markers.SettingLazyPlayback, markers.SettingOnlineStorage,
+		markers.SettingDetectIntros, markers.SettingDetectCredits, markers.SettingShareByDefault:
+		normalized, err = markers.NormalizeSetting(key, normalized)
+	case clientip.SettingTrustedProxies:
+		normalized, err = clientip.NormalizeCIDRList(normalized)
+		if err != nil {
+			err = fmt.Errorf("clientip.trusted_proxies must be a comma-separated list of CIDRs: %w", err)
+		}
+	case diagnostics.KeyUploadsEnabled:
+		if normalized == "true" {
+			if err = h.validateDiagnosticsUploadsEnabled(ctx); err != nil {
+				return "", errCodeStorageUnavailable, err
+			}
+		}
+	case diagnostics.KeyMaxBundleBytes,
+		diagnostics.KeyMaxUncompressedBytes,
+		diagnostics.KeyMaxReportsPerUserDay,
+		diagnostics.KeyRetentionDays,
+		diagnostics.KeyMaxBytesPerUser:
+		var numericValue int64
+		numericValue, err = normalizeDiagnosticsNumericSettingValue(key, normalized)
+		if err == nil {
+			normalized = strconv.FormatInt(numericValue, 10)
+		}
+	case diagnostics.KeyConsentNoticeVersion:
+		var n int
+		n, err = strconv.Atoi(normalized)
+		if err == nil && n < 1 {
+			err = fmt.Errorf("%s must be an integer greater than 0", key)
+		}
+		if err == nil {
+			normalized = strconv.Itoa(n)
+		}
+	case notifications.SettingPushRelayURL,
+		notifications.SettingPushRelayDeploymentID,
+		notifications.SettingPushRelayAPIKey,
+		notifications.SettingPushRelayExpiresAt,
+		notifications.SettingPushRelayKeyPrefix,
+		notifications.SettingPushRelayReregister:
+		err = fmt.Errorf("%s is managed by the push relay registration flow", key)
+	case catalog.SearchSettingMeilisearchIndex:
+		if normalized == "" {
+			err = fmt.Errorf("%s is required", key)
+		}
+	case catalog.SearchSettingMeilisearchIndexTypes:
+		var itemTypes []string
+		itemTypes, err = catalog.NormalizeCatalogSearchIndexTypesValue(normalized)
+		if err == nil {
+			normalized = catalog.FormatCatalogSearchIndexTypesValue(itemTypes)
+		}
+	case catalog.SearchSettingMeilisearchEmbedder:
+		normalized, err = catalog.NormalizeCatalogSearchEmbedderName(normalized)
+	}
+	if err != nil {
+		return "", "bad_request", err
+	}
+	return normalized, "", nil
+}
+
+func validateProspectiveAdminSettings(values map[string]string, redisBootstrapAvailable bool) error {
+	if err := config.ValidateAdminSettingsWithCapabilities(values, config.AdminSettingsCapabilities{
+		RedisBootstrapAvailable: redisBootstrapAvailable,
+	}); err != nil {
+		return err
+	}
+	if _, err := catalog.CatalogSearchSettingsFromMap(values); err != nil {
+		return err
+	}
+	return validateProspectiveDiagnosticsSettings(values)
+}
+
+var adminSettingDependencyGroups = [][]string{
+	{"auth.access_token_expiry", "auth.refresh_token_expiry"},
+	{"playback.watched_threshold", "playback.min_resume_threshold"},
+	{config.PlaybackRoutingRemuxExecutionSettingKey, config.PlaybackRoutingRemuxEgressSettingKey},
+	{config.PlaybackRoutingVideoTranscodeExecutionSettingKey, config.PlaybackRoutingVideoTranscodeEgressSettingKey},
+	{"s3.public_endpoint", "s3.public_bucket"},
+	{artworkStorageBackendKey, s3PublicEndpointKey, s3PublicBucketKey},
+	{"s3.public_access_key", "s3.public_secret_key"},
+	{"s3.private_endpoint", "s3.private_bucket"},
+	{"s3.private_access_key", "s3.private_secret_key"},
+	{"s3.public_url_auth", "s3.public_read_endpoint", "s3.public_token_secret"},
+	{"email.enabled", "email.smtp_host", "email.from_address"},
+	{"watchsync.simkl.client_id", "watchsync.simkl.client_secret"},
+	{"ratelimit.backend", "redis.url"},
+	{"download.max_per_period", "download.period_duration"},
+	{"matcher.enable_tv_series_root_queue", "matcher.enable_tv_series_group_queue"},
+	{"ai.max_concurrent_jobs", "subtitle_ai.max_concurrent_jobs"},
+	{"ai.chat_model", "subtitle_ai.chat_model", "ai.reasoning_effort"}, //nolint:goconst // Keep the complete setting dependency explicit.
+	// A provider binding is checked against the registry it names.
+	append([]string{config.AIProvidersSettingKey}, config.AIProviderBindingKeys()...),
+	{
+		diagnostics.KeyMaxBundleBytes,
+		diagnostics.KeyMaxUncompressedBytes,
+		diagnostics.KeyMaxReportsPerUserDay,
+		diagnostics.KeyRetentionDays,
+		diagnostics.KeyMaxBytesPerUser,
+	},
+}
+
+func isPlaybackRoutingPairSetting(key string) bool {
+	switch key {
+	case config.PlaybackRoutingRemuxExecutionSettingKey,
+		config.PlaybackRoutingRemuxEgressSettingKey,
+		config.PlaybackRoutingVideoTranscodeExecutionSettingKey,
+		config.PlaybackRoutingVideoTranscodeEgressSettingKey:
+		return true
+	default:
+		return false
+	}
+}
+
+// adminSettingsValidationSnapshot validates exactly the requested changes and
+// the current values they depend on. The legacy single-key endpoint predates
+// cross-field validation, so any relationship (or catalog value) can already
+// be invalid in storage. Untouched legacy state must not poison an unrelated
+// batch or the routing-pair checks that protect restartable configuration,
+// while touching any member pulls the complete dependency group into the
+// snapshot so a new or still-invalid relationship is rejected.
+func adminSettingsValidationSnapshot(
+	prospective map[string]string,
+	changed map[string]string,
+) map[string]string {
+	snapshot := config.EffectiveAdminSettings(nil)
+	effectiveProspective := config.EffectiveAdminSettings(prospective)
+	for key, value := range changed {
+		snapshot[key] = value
+	}
+	for _, group := range adminSettingDependencyGroups {
+		touched := false
+		for _, key := range group {
+			if _, ok := changed[key]; ok {
+				touched = true
+				break
+			}
+		}
+		if !touched {
+			continue
+		}
+		for _, key := range group {
+			snapshot[key] = effectiveProspective[key]
+		}
+	}
+
+	// Operational S3 values are legacy fallbacks shared by the public and
+	// private configurations. When one changes, validate the canonical values
+	// that LoadFromDB will actually consume, including unchanged legacy peers.
+	legacyS3Changed := false
+	for key := range changed {
+		if strings.HasPrefix(key, "s3.operational_") {
+			legacyS3Changed = true
+			break
+		}
+	}
+	if legacyS3Changed {
+		//nolint:goconst // Keep the complete canonical validation set readable as a contract.
+		for _, key := range []string{
+			"s3.public_endpoint",
+			"s3.public_read_endpoint",
+			"s3.public_region",
+			"s3.public_path_style",
+			"s3.public_bucket",
+			"s3.public_key_prefix",
+			"s3.public_access_key",
+			"s3.public_secret_key",
+			"s3.public_url_auth",
+			"s3.public_token_secret",
+			"s3.public_token_param",
+			"s3.public_token_ttl",
+			"s3.private_endpoint",
+			"s3.private_region",
+			"s3.private_path_style",
+			"s3.private_bucket",
+			"s3.private_key_prefix",
+			"s3.private_access_key",
+			"s3.private_secret_key",
+		} {
+			snapshot[key] = effectiveProspective[key]
+		}
+	}
+	return snapshot
+}
+
+// activeAdminSettings overlays values owned by the process environment onto a
+// stored snapshot. Updates never persist these values, but cross-field
+// validation and effective-value comparisons must use the same configuration
+// the runtime is actually consuming.
+func (h *AdminHandler) activeAdminSettings(stored map[string]string) map[string]string {
+	active := make(map[string]string, len(stored)+len(h.BootstrapSensitiveValues))
+	for key, value := range stored {
+		active[key] = value
+	}
+	for key, value := range h.BootstrapSensitiveValues {
+		if h.BootstrapSensitiveConfigured[key] && value != "" {
+			active[key] = value
+		}
+	}
+	return active
+}
+
+func (h *AdminHandler) effectiveAdminSettings(stored map[string]string) map[string]string {
+	effective := config.EffectiveAdminSettings(h.activeAdminSettings(stored))
+	// An empty redis.db leaves the database number to redis.url, so the value
+	// in effect is the number in that URL.
+	if effective[config.RedisDBSettingKey] == "" {
+		if db, ok := redisURLDatabase(effective); ok {
+			effective[config.RedisDBSettingKey] = db
+		}
+	}
+	return effective
+}
+
+// redisURLDatabase returns the database number in the redis.url of values. It
+// reports false when there is no URL or the URL cannot be parsed.
+func redisURLDatabase(values map[string]string) (string, bool) {
+	db, ok := config.RedisConfig{URL: values["redis.url"]}.Database()
+	if !ok {
+		return "", false
+	}
+	return strconv.Itoa(db), true
+}
+
+// redisDBRow returns what a save of redis.db stores, given the settings the
+// save leaves in effect. The row holds a number only while it differs from
+// the one redis.url names: nothing without a URL, and nothing for the number
+// the URL already names. What is stored then never depends on earlier saves.
+func redisDBRow(active map[string]string, value string) string {
+	if strings.TrimSpace(active["redis.url"]) == "" {
+		return ""
+	}
+	if urlDB, _ := redisURLDatabase(active); urlDB == value {
+		return ""
+	}
+	return value
+}
+
+// environmentRefusesSave reports whether the process environment supplies key,
+// so a save of it would have no effect here. Clearing redis.db is the
+// exception: REDIS_URL keeps a server up whose saved number it cannot start
+// with, and the clear is how that number is removed.
+func (h *AdminHandler) environmentRefusesSave(key, value string) bool {
+	if !h.BootstrapSensitiveConfigured[key] {
+		return false
+	}
+	return key != config.RedisDBSettingKey || strings.TrimSpace(value) != ""
+}
+
+func shouldPersistAdminSetting(stored map[string]string, key, normalized string, effectiveChanged bool) bool {
+	current, exists := stored[key]
+	if exists {
+		return current != normalized
+	}
+	// Do not create a row merely because a client resubmitted an untouched
+	// runtime default. Non-default values still need a row, while clearing an
+	// already-absent override is a storage no-op.
+	return normalized != "" && effectiveChanged
+}
+
+// checkLocalLoginSetting refuses turning local password sign-in off while no
+// break-glass admin could still sign in with a password. It runs inside the
+// settings mutation, which holds the settings lock that break-glass changes
+// also take.
+func (h *AdminHandler) checkLocalLoginSetting(ctx context.Context, tx pgx.Tx, before, after map[string]string) error {
+	key := config.AuthLocalPasswordLoginSettingKey
+	if before[key] == after[key] {
+		return nil
+	}
+	if tx != nil {
+		return breakGlassError(auth.CheckLocalLoginSettingChange(ctx, tx, before[key], after[key]))
+	}
+	if h.pool == nil {
+		return ErrAdminSettingsUnavailable
+	}
+	return breakGlassError(auth.CheckLocalLoginSettingChange(ctx, h.pool, before[key], after[key]))
+}
+
+// errBackupKeyNotConfirmed refuses switching backups to S3 before the admin
+// confirmed keeping a copy of this server's SECRET_KEY.
+var errBackupKeyNotConfirmed = &APIError{
+	Status:  http.StatusConflict,
+	Code:    "backup_key_not_confirmed",
+	Message: "Confirm that you keep a copy of this server's SECRET_KEY before keeping backups in S3 (POST /api/v2/admin/backups/s3/acknowledge-key)",
+}
+
+// checkBackupDestination refuses a save that switches backup.destination to
+// s3 unless the confirmed key check value is this server's, and one that
+// leaves the S3 destination without a bucket. A destination already on s3
+// stays saveable after SECRET_KEY changes; the backups pause instead.
+func (h *AdminHandler) checkBackupDestination(changed, before, after map[string]string) error {
+	if after[config.BackupDestinationSettingKey] != config.BackupDestinationS3 {
+		return nil
+	}
+	_, destination := changed[config.BackupDestinationSettingKey]
+	_, bucket := changed[config.BackupS3BucketSettingKey]
+	_, endpoint := changed[config.BackupS3EndpointSettingKey]
+	if (destination || bucket || endpoint) &&
+		(strings.TrimSpace(after[config.BackupS3BucketSettingKey]) == "" || strings.TrimSpace(after[config.BackupS3EndpointSettingKey]) == "") {
+		return &APIError{Status: http.StatusBadRequest, Code: adminInvalidSettingsCode, Message: "backups in S3 need backup.s3.endpoint and backup.s3.bucket"}
+	}
+	if before[config.BackupDestinationSettingKey] == config.BackupDestinationS3 {
+		return nil
+	}
+	if h.BackupKeyCheck == "" || strings.TrimSpace(after[config.BackupS3KeyAcknowledgedSettingKey]) != h.BackupKeyCheck {
+		return errBackupKeyNotConfirmed
+	}
+	return nil
+}
+
+func (h *AdminHandler) beforeServerSettingCommit(ctx context.Context, tx pgx.Tx, key, value string) error {
+	if h.BeforeServerSettingCommit == nil {
+		return nil
+	}
+	return h.BeforeServerSettingCommit(ctx, tx, key, value)
+}
+
+func (h *AdminHandler) UpdateAdminSettings(ctx context.Context, values map[string]string, guard func(AdminSettingsSnapshot) error) (AdminSettingsUpdateResult, error) {
+	result, publish, err := h.updateAdminSettings(ctx, nil, values, guard)
+	if err != nil {
+		return AdminSettingsUpdateResult{}, err
+	}
+	publish(ctx)
+	return result, nil
+}
+
+// codeInternalError is the API error code of a server-side failure.
+const codeInternalError = "internal_error"
+
+// ApplyAdminSettingsInTx writes values through the admin settings write path
+// (the same normalization, validation, and settings lock) inside the caller's
+// transaction. Nothing is published until the caller runs publish after its
+// transaction commits; a rollback leaves nothing to announce. A non-nil
+// guard runs only under the settings lock, with the stored values read
+// there: a read outside the caller's transaction could wait on it.
+func (h *AdminHandler) ApplyAdminSettingsInTx(ctx context.Context, tx pgx.Tx, values map[string]string, guard func(AdminSettingsSnapshot) error) (AdminSettingsUpdateResult, func(context.Context), error) {
+	if tx == nil {
+		return AdminSettingsUpdateResult{}, nil, errors.New("a transaction is required")
+	}
+	return h.updateAdminSettings(ctx, tx, values, guard)
+}
+
+// updateAdminSettings validates and writes values, in tx when it is set and
+// in a transaction of its own otherwise. publish announces the committed
+// changes: events, the settings hook, and restart flags.
+//
+//nolint:funlen,gocyclo // UpdateAdminSettings' body, moved as is behind the caller-transaction entry points
+func (h *AdminHandler) updateAdminSettings(ctx context.Context, tx pgx.Tx, values map[string]string, guard func(AdminSettingsSnapshot) error) (AdminSettingsUpdateResult, func(context.Context), error) {
+	fail := func(err error) (AdminSettingsUpdateResult, func(context.Context), error) {
+		return AdminSettingsUpdateResult{}, nil, err
+	}
+	if h.SettingsRepo == nil {
+		return fail(&APIError{Status: 500, Code: codeInternalError, Message: "Settings store not configured"})
+	}
+	req := updateSettingsRequest{Values: values}
+
+	if len(req.Values) == 0 {
+		return fail(&APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "At least one setting is required"})
+	}
+	if len(req.Values) > 250 {
+		return fail(&APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "A settings update may contain at most 250 values"})
+	}
+
+	if guard != nil && tx == nil {
+		stored, err := h.SettingsRepo.GetAll(ctx)
+		if err != nil {
+			return fail(err)
+		}
+		if err := guard(h.adminSettingsSnapshot(stored)); err != nil {
+			return fail(err)
+		}
+	}
+
+	keys := make([]string, 0, len(req.Values))
+	for key := range req.Values {
+		if strings.TrimSpace(key) == "" {
+			return fail(&APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "Setting key is required"})
+		}
+		if machineManagedSettingKeys[key] {
+			return fail(&APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: key + " is managed internally"})
+		}
+		if h.environmentRefusesSave(key, req.Values[key]) {
+			return fail(&APIError{Status: http.StatusBadRequest, Code: "managed_by_environment", Message: key + " is managed by an environment variable"})
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	normalized := make(map[string]string, len(req.Values))
+	for _, key := range keys {
+		value, code, err := h.normalizeBatchSetting(ctx, key, req.Values[key])
+		if err != nil {
+			return fail(&APIError{Status: http.StatusBadRequest, Code: code, Message: err.Error()})
+		}
+		if key == artworkLocalPathKey {
+			if err := checkArtworkLocalPath(value, "values."+key); err != nil {
+				return fail(err)
+			}
+		}
+		normalized[key] = value
+	}
+	checkedRedis, err := h.checkRedisSave(ctx, normalized)
+	if err != nil {
+		return fail(err)
+	}
+
+	modelValidation, err := h.prepareAIModelValidation(ctx, normalized)
+	if err != nil {
+		return fail(err)
+	}
+
+	var (
+		after            map[string]string
+		effectiveChanges map[string]bool
+		validationErr    error
+		validationCode   string
+	)
+	var preconditionErr error
+	var committedSnapshot *AdminSettingsSnapshot
+	err = updateServerSettingsWithTx(ctx, h.SettingsRepo, tx,
+		func(stored map[string]string, tx pgx.Tx) (map[string]string, error) {
+			if guard != nil {
+				if err := guard(h.adminSettingsSnapshot(stored)); err != nil {
+					preconditionErr = err
+					return nil, err
+				}
+			}
+
+			prospective, rows := h.prospectiveSettings(stored, normalized)
+			if err := h.confirmRedisSave(stored, prospective, checkedRedis); err != nil {
+				preconditionErr = err
+				return nil, err
+			}
+			if modelValidation != nil {
+				if err := modelValidation.Check(stored, prospective); err != nil {
+					validationErr, validationCode = err, adminInvalidSettingsCode
+					return nil, err
+				}
+			}
+			if artworkStorageLocked(stored) {
+				if err := rejectArtworkIdentityChange(stored[blobstore.IdentitySettingKey], stored[blobstore.OperationalIdentitySettingKey], h.effectiveAdminSettings(stored), h.effectiveAdminSettings(prospective)); err != nil {
+					preconditionErr = err
+					return nil, err
+				}
+			}
+			activeProspective := h.activeAdminSettings(prospective)
+			before := h.effectiveAdminSettings(stored)
+			after = h.effectiveAdminSettings(prospective)
+			if err := h.checkLocalLoginSetting(ctx, tx, before, after); err != nil {
+				preconditionErr = err
+				return nil, err
+			}
+			if err := h.checkBackupDestination(normalized, before, after); err != nil {
+				preconditionErr = err
+				return nil, err
+			}
+			// Cross-field checks run against the complete prospective state, so a
+			// value the batch clears is gone even when the store still has it and
+			// the current process is still running on it.
+			validationSnapshot := adminSettingsValidationSnapshot(activeProspective, normalized)
+			if err := validateProspectiveAdminSettings(validationSnapshot, h.RedisBootstrapAvailable); err != nil {
+				validationErr = err
+				validationCode = adminInvalidSettingsCode
+				return nil, err
+			}
+			writes := make(map[string]string, len(normalized))
+			effectiveChanges = make(map[string]bool, len(normalized))
+			for key, value := range rows {
+				effectiveChanged := before[key] != after[key]
+				// redisDBRow has decided what the redis.db row holds, so a number
+				// is stored even when the number in effect stays the same.
+				needsRow := effectiveChanged || key == config.RedisDBSettingKey
+				if shouldPersistAdminSetting(stored, key, value, needsRow) {
+					writes[key] = value
+				}
+				if effectiveChanged {
+					effectiveChanges[key] = true
+				}
+			}
+			for _, key := range keys {
+				if !effectiveChanges[key] {
+					continue
+				}
+				if err := h.beforeServerSettingCommit(ctx, tx, key, after[key]); err != nil {
+					return nil, err
+				}
+			}
+			if guard != nil {
+				committed := maps.Clone(stored)
+				maps.Copy(committed, writes)
+				committedSnapshot = new(h.adminSettingsSnapshot(committed))
+			}
+			return writes, nil
+		})
+	if preconditionErr != nil {
+		return fail(preconditionErr)
+	}
+	if validationErr != nil {
+		return fail(&APIError{Status: http.StatusBadRequest, Code: validationCode, Message: validationErr.Error()})
+	}
+	if err != nil {
+		return fail(&APIError{Status: http.StatusInternalServerError, Code: codeInternalError, Message: "Failed to update settings"})
+	}
+
+	responseValues := make(map[string]string, len(normalized))
+	restartKeys := make([]string, 0, len(normalized))
+	var changed []string
+	for _, key := range keys {
+		if !sensitiveSettingKeys[key] {
+			responseValues[key] = after[key]
+		}
+		if !effectiveChanges[key] {
+			continue
+		}
+		changed = append(changed, key)
+		if config.RestartRequired(key) {
+			restartKeys = append(restartKeys, key)
+		}
+	}
+	publish := func(ctx context.Context) {
+		for _, key := range changed {
+			if h.EventBus != nil {
+				_ = h.EventBus.Publish(ctx, cache.ChannelAdmin,
+					cache.Event{Type: cache.EventSettingsChanged, Payload: key})
+			}
+			if h.OnServerSettingUpdated != nil {
+				h.OnServerSettingUpdated(ctx, key, after[key])
+			}
+			publishAdminDefaultEvent(ctx, h.EventsHub, key)
+		}
+		// Per-key reasons ("setting:<key>") so the admin UI can scope a
+		// pending restart to the subsystem the key belongs to instead of
+		// warning on every tile for any settings save.
+		for _, restartKey := range restartKeys {
+			h.markServerRestartRequired("setting:" + restartKey)
+		}
+	}
+	return updateSettingsResponse{
+		CommittedSnapshot:   committedSnapshot,
+		Values:              responseValues,
+		RestartRequired:     len(restartKeys) > 0,
+		RestartRequiredKeys: restartKeys,
+	}, publish, nil
+}
+
+func (h *AdminHandler) UpdateAdminSetting(ctx context.Context, key, value string, guard func(AdminSettingsSnapshot) error) (AdminSettingUpdateResult, error) {
+	req := updateSettingRequest{Value: value}
+
+	if h.SettingsRepo == nil {
+		return AdminSettingUpdateResult{}, &APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "Settings store not configured"}
+	}
+
+	if key == "" {
+		return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "Setting key is required"}
+	}
+	if machineManagedSettingKeys[key] {
+		return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: key + " is managed internally"}
+	}
+	if h.environmentRefusesSave(key, value) {
+		return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "managed_by_environment", Message: key + " is managed by an environment variable"}
+	}
+	if strings.HasPrefix(key, "ratelimit.") {
+		return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: key + " is managed by /admin/rate-limits/config"}
+	}
+
+	if guard != nil {
+		stored, err := h.SettingsRepo.GetAll(ctx)
+		if err != nil {
+			return AdminSettingUpdateResult{}, err
+		}
+		if err := guard(h.adminSettingsSnapshot(stored)); err != nil {
+			return AdminSettingUpdateResult{}, err
+		}
+	}
+
+	if normalized, err := config.NormalizeAdminSetting(key, req.Value); err != nil {
+		return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+	} else {
+		req.Value = normalized
+	}
+	if key == artworkLocalPathKey {
+		if err := checkArtworkLocalPath(req.Value, "value"); err != nil {
+			return AdminSettingUpdateResult{}, err
+		}
+	}
+
+	switch key {
+	case markers.SettingMode, markers.SettingLazyPlayback, markers.SettingOnlineStorage,
+		markers.SettingDetectIntros, markers.SettingDetectCredits, markers.SettingShareByDefault:
+		if normalized, err := markers.NormalizeSetting(key, req.Value); err != nil {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+		} else {
+			req.Value = normalized
+		}
+	case clientip.SettingTrustedProxies:
+		normalized, err := clientip.NormalizeCIDRList(req.Value)
+		if err != nil {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "clientip.trusted_proxies must be a comma-separated list of CIDRs: " + err.Error()}
+		}
+		req.Value = normalized
+	case "ai.base_url", "ai.asr_base_url", "ai.chat_model", "ai.asr_model":
+		req.Value = strings.TrimSpace(req.Value)
+	case "metadata_ai.on_view":
+		switch req.Value {
+		case "off", "button", "auto":
+		default:
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "metadata_ai.on_view must be off, button, or auto"}
+		}
+	case policy.SettingDecisionLogVerbosity:
+		switch strings.TrimSpace(strings.ToLower(req.Value)) {
+		case policy.DecisionLogVerbosityDigest, policy.DecisionLogVerbosityVerbose:
+			req.Value = strings.TrimSpace(strings.ToLower(req.Value))
+		default:
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "policy.decision_log_verbosity must be digest or verbose"}
+		}
+	case "policy.editor_enabled":
+		enabled, err := strconv.ParseBool(strings.TrimSpace(req.Value))
+		if err != nil {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "policy.editor_enabled must be true or false"}
+		}
+		req.Value = strconv.FormatBool(enabled)
+	case diagnostics.KeyUploadsEnabled:
+		enabled, err := strconv.ParseBool(strings.TrimSpace(req.Value))
+		if err != nil {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: diagnostics.KeyUploadsEnabled + " must be true or false"}
+		}
+		req.Value = strconv.FormatBool(enabled)
+		if enabled {
+			if err := h.validateDiagnosticsUploadsEnabled(ctx); err != nil {
+				return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: errCodeStorageUnavailable, Message: err.Error()}
+			}
+		}
+	case diagnostics.KeyMaxBundleBytes,
+		diagnostics.KeyMaxUncompressedBytes,
+		diagnostics.KeyMaxReportsPerUserDay,
+		diagnostics.KeyRetentionDays,
+		diagnostics.KeyMaxBytesPerUser:
+		normalized, err := h.normalizeDiagnosticsNumericSetting(ctx, key, req.Value)
+		if err != nil {
+			if _, readFailed := errors.AsType[*adminSettingsReadError](err); guard != nil && readFailed {
+				return AdminSettingUpdateResult{}, err
+			}
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+		}
+		req.Value = normalized
+	case diagnostics.KeyConsentNoticeVersion:
+		n, err := strconv.Atoi(strings.TrimSpace(req.Value))
+		if err != nil || n < 1 {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: diagnostics.KeyConsentNoticeVersion + " must be an integer greater than 0"}
+		}
+		req.Value = strconv.Itoa(n)
+	case policy.SettingDecisionLogScopeSampleRate:
+		n, err := strconv.Atoi(strings.TrimSpace(req.Value))
+		if err != nil || n <= 0 {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "policy.decision_log_scope_sample_rate must be an integer greater than 0"}
+		}
+		req.Value = strconv.Itoa(n)
+	case policy.SettingDecisionLogRetentionDays:
+		n, err := strconv.Atoi(strings.TrimSpace(req.Value))
+		if err != nil || n <= 0 {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "policy.decision_log_retention_days must be an integer greater than 0"}
+		}
+		req.Value = strconv.Itoa(n)
+	case "subtitle_ai.transcribe_quota_jobs":
+		if n, err := strconv.Atoi(req.Value); err != nil || n < 0 {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "subtitle_ai.transcribe_quota_jobs must be an integer >= 0 (0 = unlimited)"}
+		}
+	case "subtitle_ai.transcribe_quota_period":
+		if !subtitleai.ValidQuotaPeriod(req.Value) {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "subtitle_ai.transcribe_quota_period must be day, week, or month"}
+		}
+	case notifications.SettingApplePushDeliveryEnabled,
+		notifications.SettingAndroidPushDeliveryEnabled:
+		enabled, err := strconv.ParseBool(strings.TrimSpace(req.Value))
+		if err != nil {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: key + " must be true or false"}
+		}
+		req.Value = strconv.FormatBool(enabled)
+	case notifications.SettingPushRelayURL,
+		notifications.SettingPushRelayDeploymentID,
+		notifications.SettingPushRelayAPIKey,
+		notifications.SettingPushRelayExpiresAt,
+		notifications.SettingPushRelayKeyPrefix,
+		notifications.SettingPushRelayReregister:
+		// The registration flow persists the relay URL, deployment id, and API
+		// key together; a direct write to any of them desyncs the stored URL
+		// from the credentials the relay minted for it (and feeds an arbitrary
+		// id into the next rotation request).
+		return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: key + " is managed by the push relay registration flow; use POST /admin/notifications/push/relay/register"}
+	case catalog.SearchSettingProvider:
+		switch strings.TrimSpace(strings.ToLower(req.Value)) {
+		case catalog.SearchProviderPostgres, catalog.SearchProviderMeilisearch:
+			req.Value = strings.TrimSpace(strings.ToLower(req.Value))
+		default:
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.provider must be postgres or meilisearch"}
+		}
+	case catalog.SearchSettingMeilisearchURL:
+		value := strings.TrimSpace(req.Value)
+		if value != "" {
+			parsed, err := url.Parse(value)
+			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+				return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.url must include scheme and host"}
+			}
+		}
+		req.Value = value
+	case catalog.SearchSettingMeilisearchIndex:
+		req.Value = strings.TrimSpace(req.Value)
+		if req.Value == "" {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.index is required"}
+		}
+	case catalog.SearchSettingMeilisearchTimeoutMS:
+		n, err := strconv.Atoi(strings.TrimSpace(req.Value))
+		if err != nil || n <= 0 {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.timeout_ms must be an integer greater than 0"}
+		}
+		req.Value = strconv.Itoa(n)
+	case catalog.SearchSettingMeilisearchMatchingStrategy:
+		switch strings.TrimSpace(strings.ToLower(req.Value)) {
+		case "last", "all":
+			req.Value = strings.TrimSpace(strings.ToLower(req.Value))
+		default:
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.matching_strategy must be last or all"}
+		}
+	case catalog.SearchSettingMeilisearchSyncBatchSize:
+		n, err := strconv.Atoi(strings.TrimSpace(req.Value))
+		if err != nil || n < 1 || n > catalog.MaxMeilisearchSyncBatchSize {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.sync_batch_size must be an integer between 1 and 10000"}
+		}
+		req.Value = strconv.Itoa(n)
+	case catalog.SearchSettingMeilisearchRebuildBatchSize:
+		n, err := strconv.Atoi(strings.TrimSpace(req.Value))
+		if err != nil || n < 1 || n > catalog.MaxMeilisearchRebuildBatchSize {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.rebuild_batch_size must be an integer between 1 and 25000"}
+		}
+		req.Value = strconv.Itoa(n)
+	case catalog.SearchSettingMeilisearchRebuildQueue:
+		n, err := strconv.Atoi(strings.TrimSpace(req.Value))
+		if err != nil || n < 1 || n > catalog.MaxMeilisearchRebuildQueueDepth {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.rebuild_task_queue_depth must be an integer between 1 and 16"}
+		}
+		req.Value = strconv.Itoa(n)
+	case catalog.SearchSettingMeilisearchIndexTypes:
+		itemTypes, err := catalog.NormalizeCatalogSearchIndexTypesValue(req.Value)
+		if err != nil {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+		}
+		req.Value = catalog.FormatCatalogSearchIndexTypesValue(itemTypes)
+	case catalog.SearchSettingMeilisearchSemanticEnabled:
+		enabled, err := strconv.ParseBool(strings.TrimSpace(req.Value))
+		if err != nil {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.semantic_enabled must be true or false"}
+		}
+		req.Value = strconv.FormatBool(enabled)
+	case catalog.SearchSettingMeilisearchSemanticRatio:
+		ratio, err := strconv.ParseFloat(strings.TrimSpace(req.Value), 64)
+		if err != nil || math.IsNaN(ratio) || ratio < 0 || ratio > 1 {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.semantic_ratio must be a number between 0 and 1"}
+		}
+		req.Value = strconv.FormatFloat(ratio, 'f', -1, 64)
+	case catalog.SearchSettingMeilisearchEmbedder:
+		embedder, err := catalog.NormalizeCatalogSearchEmbedderName(req.Value)
+		if err != nil {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: err.Error()}
+		}
+		req.Value = embedder
+	case catalog.SearchSettingMeilisearchBinaryQuantized:
+		enabled, err := strconv.ParseBool(strings.TrimSpace(req.Value))
+		if err != nil {
+			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "catalog.search.meilisearch.binary_quantized must be true or false"}
+		}
+		req.Value = strconv.FormatBool(enabled)
+	}
+	change := map[string]string{key: req.Value}
+	checkedRedis, err := h.checkRedisSave(ctx, change)
+	if err != nil {
+		return AdminSettingUpdateResult{}, err
+	}
+
+	modelValidation, err := h.prepareAIModelValidation(ctx, map[string]string{key: req.Value})
+	if err != nil {
+		return AdminSettingUpdateResult{}, err
+	}
+
+	var (
+		after            map[string]string
+		effectiveChanged bool
+		validationErr    error
+		validationCode   string
+	)
+	var preconditionErr error
+	err = updateServerSettingsInTransaction(ctx, h.SettingsRepo,
+		func(stored map[string]string, tx pgx.Tx) (map[string]string, error) {
+			if guard != nil {
+				if err := guard(h.adminSettingsSnapshot(stored)); err != nil {
+					preconditionErr = err
+					return nil, err
+				}
+			}
+
+			prospective, rows := h.prospectiveSettings(stored, change)
+			row := rows[key]
+			if err := h.confirmRedisSave(stored, prospective, checkedRedis); err != nil {
+				preconditionErr = err
+				return nil, err
+			}
+			if modelValidation != nil {
+				if err := modelValidation.Check(stored, prospective); err != nil {
+					validationErr, validationCode = err, adminInvalidSettingsCode
+					return nil, err
+				}
+			}
+			if artworkStorageLocked(stored) {
+				if err := rejectArtworkIdentityChange(stored[blobstore.IdentitySettingKey], stored[blobstore.OperationalIdentitySettingKey], h.effectiveAdminSettings(stored), h.effectiveAdminSettings(prospective)); err != nil {
+					preconditionErr = err
+					return nil, err
+				}
+			}
+			// A provider binding is checked against the registry the dependency
+			// group pulls in, as the batch write does.
+			if isPlaybackRoutingPairSetting(key) || key == adminAIChatModelKey || key == adminAILegacyChatModelKey || key == adminAIReasoningEffortKey ||
+				slices.Contains(config.AIProviderBindingKeys(), key) {
+				changed := map[string]string{key: req.Value}
+				validationSnapshot := adminSettingsValidationSnapshot(h.activeAdminSettings(prospective), changed)
+				if err := validateProspectiveAdminSettings(validationSnapshot, h.RedisBootstrapAvailable); err != nil {
+					validationErr = err
+					validationCode = adminInvalidSettingsCode
+					return nil, err
+				}
+			}
+			// This legacy route can only change one key, so enforcing every
+			// cross-field invariant would make paired settings impossible to
+			// establish or clear one write at a time. Per-key validation above
+			// remains strict; restart-fatal routing pairs and durable prerequisites
+			// are the exceptions — a single-key write may not break them.
+			if key == "redis.url" {
+				if err := config.ValidateRedisRateLimitTransport(
+					h.activeAdminSettings(prospective),
+					h.RedisBootstrapAvailable,
+				); err != nil {
+					validationErr = err
+					validationCode = adminInvalidSettingsCode
+					return nil, err
+				}
+			}
+			// The artwork backend is the other durable prerequisite: an explicit
+			// S3 backend without a public bucket cannot open after restart, whether
+			// this write selects the backend or clears the bucket under it.
+			if key == artworkStorageBackendKey || key == s3PublicBucketKey || key == s3OperationalBucketKey {
+				if err := config.ValidateArtworkStorageSettings(h.effectiveAdminSettings(prospective)); err != nil {
+					validationErr = err
+					validationCode = adminInvalidSettingsCode
+					return nil, err
+				}
+			}
+
+			before := h.effectiveAdminSettings(stored)
+			after = h.effectiveAdminSettings(prospective)
+			if err := h.checkLocalLoginSetting(ctx, tx, before, after); err != nil {
+				preconditionErr = err
+				return nil, err
+			}
+			if err := h.checkBackupDestination(change, before, after); err != nil {
+				preconditionErr = err
+				return nil, err
+			}
+			effectiveChanged = before[key] != after[key]
+			if effectiveChanged {
+				if err := h.beforeServerSettingCommit(ctx, tx, key, after[key]); err != nil {
+					return nil, err
+				}
+			}
+			if shouldPersistAdminSetting(stored, key, row, effectiveChanged) {
+				return map[string]string{key: row}, nil
+			}
+			return nil, nil
+		})
+	if preconditionErr != nil {
+		return AdminSettingUpdateResult{}, preconditionErr
+	}
+	if validationErr != nil {
+		return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: validationCode, Message: validationErr.Error()}
+	}
+	if err != nil {
+		return AdminSettingUpdateResult{}, &APIError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "Failed to update setting"}
+	}
+	if effectiveChanged {
+		if h.EventBus != nil {
+			_ = h.EventBus.Publish(ctx, cache.ChannelAdmin,
+				cache.Event{Type: cache.EventSettingsChanged, Payload: key})
+		}
+		if h.OnServerSettingUpdated != nil {
+			h.OnServerSettingUpdated(ctx, key, after[key])
+		}
+		publishAdminDefaultEvent(ctx, h.EventsHub, key)
+	}
+	restartRequired := effectiveChanged && config.RestartRequired(key)
+	if restartRequired {
+		h.markServerRestartRequired("setting:" + key)
+	}
+	if sensitiveSettingKeys[key] {
+		return adminSettingResponse{Key: key, RestartRequired: restartRequired}, nil
+	}
+	return adminSettingResponse{Key: key, Value: after[key], RestartRequired: restartRequired}, nil
+}
+
+func (h *AdminHandler) validateDiagnosticsUploadsEnabled(ctx context.Context) error {
+	if h.DiagnosticsStore == nil || strings.TrimSpace(h.DiagnosticsStore.Bucket()) == "" {
+		return errors.New("diagnostics uploads require configured private object storage")
+	}
+	const probeKey = "diagnostics/.probe"
+	if err := h.DiagnosticsStore.PutStream(
+		ctx,
+		h.DiagnosticsStore.Bucket(),
+		probeKey,
+		strings.NewReader("ok"),
+		"application/octet-stream",
+	); err != nil {
+		return fmt.Errorf("diagnostics storage probe write failed: %w", err)
+	}
+	if err := h.DiagnosticsStore.DeleteObject(ctx, h.DiagnosticsStore.Bucket(), probeKey); err != nil {
+		return fmt.Errorf("diagnostics storage probe delete failed: %w", err)
+	}
+	return nil
+}
+
+// Keep the frozen bridge's diagnostic text while allowing guarded writes to
+// distinguish a storage failure from invalid caller input.
+type adminSettingsReadError struct{ cause error }
+
+func (e *adminSettingsReadError) Error() string {
+	return "load diagnostics settings: " + e.cause.Error()
+}
+func (e *adminSettingsReadError) Unwrap() error { return e.cause }
+
+func (h *AdminHandler) normalizeDiagnosticsNumericSetting(ctx context.Context, key, raw string) (string, error) {
+	value, err := normalizeDiagnosticsNumericSettingValue(key, raw)
+	if err != nil {
+		return "", err
+	}
+
+	settings := diagnostics.DefaultSettings()
+	if h.SettingsRepo != nil {
+		loaded, loadErr := diagnostics.LoadSettings(ctx, h.SettingsRepo)
+		if loadErr != nil {
+			return "", &adminSettingsReadError{cause: loadErr}
+		}
+		settings = loaded
+	}
+
+	switch key {
+	case diagnostics.KeyMaxBundleBytes:
+		if value > settings.MaxUncompressedBytes {
+			return "", fmt.Errorf("%s must not exceed %s (%d bytes)", key, diagnostics.KeyMaxUncompressedBytes, settings.MaxUncompressedBytes)
+		}
+		// A single bundle can never exceed the per-user byte cap, or every upload
+		// at this size would fail quota; keep the two bounds consistent.
+		if value > settings.MaxBytesPerUser {
+			return "", fmt.Errorf("%s must not exceed %s (%d bytes)", key, diagnostics.KeyMaxBytesPerUser, settings.MaxBytesPerUser)
+		}
+	case diagnostics.KeyMaxUncompressedBytes:
+		if value < settings.MaxBundleBytes {
+			return "", fmt.Errorf("%s must be at least %s (%d bytes)", key, diagnostics.KeyMaxBundleBytes, settings.MaxBundleBytes)
+		}
+	case diagnostics.KeyMaxReportsPerUserDay, diagnostics.KeyRetentionDays:
+		// These settings have only independent bounds, which were checked above.
+	case diagnostics.KeyMaxBytesPerUser:
+		// The per-user cap must leave room for at least one max-size bundle, or
+		// /diagnostics/status would advertise a bundle size InsertReceiving always
+		// rejects as quota_exceeded.
+		if value < settings.MaxBundleBytes {
+			return "", fmt.Errorf("%s must be at least %s (%d bytes)", key, diagnostics.KeyMaxBundleBytes, settings.MaxBundleBytes)
+		}
+	default:
+		return "", fmt.Errorf("unsupported diagnostics numeric setting %s", key)
+	}
+
+	return strconv.FormatInt(value, 10), nil
+}
+
+const (
+	diagnosticsMiB = int64(1024 * 1024)
+	diagnosticsGiB = 1024 * diagnosticsMiB
+)
+
+func normalizeDiagnosticsNumericSettingValue(key, raw string) (int64, error) {
+	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer", key)
+	}
+
+	switch key {
+	case diagnostics.KeyMaxBundleBytes:
+		if value < diagnosticsMiB || value > 256*diagnosticsMiB {
+			return 0, fmt.Errorf(
+				"%s must be between 1 MiB (%d bytes) and 256 MiB (%d bytes)",
+				key,
+				diagnosticsMiB,
+				256*diagnosticsMiB,
+			)
+		}
+	case diagnostics.KeyMaxUncompressedBytes:
+		if value < diagnosticsMiB || value > diagnosticsGiB {
+			return 0, fmt.Errorf(
+				"%s must be between 1 MiB (%d bytes) and 1 GiB (%d bytes)",
+				key,
+				diagnosticsMiB,
+				diagnosticsGiB,
+			)
+		}
+	case diagnostics.KeyMaxReportsPerUserDay:
+		if value < 1 || value > 1000 {
+			return 0, fmt.Errorf("%s must be between 1 and 1000", key)
+		}
+	case diagnostics.KeyRetentionDays:
+		if value < 1 || value > 365 {
+			return 0, fmt.Errorf("%s must be between 1 and 365", key)
+		}
+	case diagnostics.KeyMaxBytesPerUser:
+		if value < 10*diagnosticsMiB || value > 10*diagnosticsGiB {
+			return 0, fmt.Errorf(
+				"%s must be between 10 MiB (%d bytes) and 10 GiB (%d bytes)",
+				key,
+				10*diagnosticsMiB,
+				10*diagnosticsGiB,
+			)
+		}
+	default:
+		return 0, fmt.Errorf("unsupported diagnostics numeric setting %s", key)
+	}
+	return value, nil
+}
+
+func validateProspectiveDiagnosticsSettings(values map[string]string) error {
+	settings := diagnostics.DefaultSettings()
+	targets := []struct {
+		key    string
+		assign func(int64)
+	}{
+		{diagnostics.KeyMaxBundleBytes, func(value int64) { settings.MaxBundleBytes = value }},
+		{diagnostics.KeyMaxUncompressedBytes, func(value int64) { settings.MaxUncompressedBytes = value }},
+		{diagnostics.KeyMaxReportsPerUserDay, func(value int64) { settings.MaxReportsPerUserDay = int(value) }},
+		{diagnostics.KeyRetentionDays, func(value int64) { settings.RetentionDays = int(value) }},
+		{diagnostics.KeyMaxBytesPerUser, func(value int64) { settings.MaxBytesPerUser = value }},
+	}
+	for _, target := range targets {
+		raw := values[target.key]
+		if raw == "" {
+			continue
+		}
+		value, err := normalizeDiagnosticsNumericSettingValue(target.key, raw)
+		if err != nil {
+			return err
+		}
+		target.assign(value)
+	}
+
+	if settings.MaxBundleBytes > settings.MaxUncompressedBytes {
+		return fmt.Errorf(
+			"%s must not exceed %s (%d bytes)",
+			diagnostics.KeyMaxBundleBytes,
+			diagnostics.KeyMaxUncompressedBytes,
+			settings.MaxUncompressedBytes,
+		)
+	}
+	if settings.MaxBundleBytes > settings.MaxBytesPerUser {
+		return fmt.Errorf(
+			"%s must not exceed %s (%d bytes)",
+			diagnostics.KeyMaxBundleBytes,
+			diagnostics.KeyMaxBytesPerUser,
+			settings.MaxBytesPerUser,
+		)
+	}
+	return nil
+}
+
+// These aliases expose the established receipts without changing bridge JSON.
+type AdminSettingsUpdateResult = updateSettingsResponse
+type AdminSettingUpdateResult = adminSettingResponse

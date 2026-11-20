@@ -1,0 +1,361 @@
+# DB-backed pins. CI runs them against a freshly migrated Postgres; locally,
+# `make test-db-pins` runs them against the database named by
+# SILO_TEST_DATABASE_URL.
+#
+# One test per line: the package directory, then the top-level test name.
+# Each test asserts how many statements, rows or resolver calls an operation
+# costs, that a query plan uses its index, the result parity that such a
+# budget relies on, or behavior that only a migrated schema can show. The
+# runner (scripts/ci/dbpins) fails when a listed test is missing, skipped or
+# failing, so a pin cannot switch itself off by skipping on an unset database
+# URL or an unmigrated schema.
+#
+# Add a pin in the same change that sets its budget or adds the test. It must
+# pass on a freshly migrated database without skipping.
+
+# Seek preview jobs preserve bigint IDs, fence attempts, and protect issued URLs.
+./internal/trickplay TestTrickplayQueuesBigintMediaFileIDsDB
+./internal/trickplay TestExpiredLeaseRejectsCompletionBeforeReconcileDB
+./internal/trickplay TestSameOwnerReclaimRejectsPriorAttemptDB
+./internal/trickplay TestRegenerateFencesOlderWorkersDB
+./internal/trickplay TestRevisionProtectionIsMonotonicAndFollowsTheRevisionDB
+./internal/trickplay TestRevisionProtectionReusesCoveredExpiryDB
+./internal/trickplay TestServiceRecordsFailureWithClaimTokenDB
+./internal/trickplay TestRetiredTrickplayOutlivesIssuedURLsDB
+./internal/trickplay TestReaderProtectsLatestSheetExpiryDB
+./internal/trickplay TestReaderWithholdsRevisionDisplacedWhileSigningDB
+./internal/trickplay TestDisabledLibraryStopsServingAndRemovesPublishedWorkDB
+
+# Media image sweeps resume bounded listings without losing partial prefixes.
+./internal/blobgc TestCollectorDeletesSingleImagesS3DB
+./internal/blobgc TestCollectorRetriesSingleObjectAfterPartialDeleteDB
+./internal/blobgc TestCollectorUsesOneConnectionDB
+./internal/blobgc TestSweeperUsesOneConnectionDB
+./internal/blobgc TestSweeperResumesAfterBoundedRunDB
+./internal/blobgc TestSweeperDefersPrefixSpanningBoundedRunsDB
+./internal/blobgc TestSweeperRestartsAfterStorageMoveDB
+
+# Deleting a media file seeks its queued chapter images instead of walking the queue.
+./internal/blobgc TestDeletedFileQueueLookupSeeksChapterFileIndexDB
+
+# Chapter width replacement has one extraction and upload across API replicas.
+./internal/chapterthumbs TestWidthBackfillSerializesReplicasPostgres
+./internal/chapterthumbs TestWidthChangeDuringFirstChapterExtractionDB
+./internal/chapterthumbs TestTerminatedChapterWorkerCannotReplaceCurrentBlobDB
+
+# Chapter image URLs retain exact issued expiry in one batched transaction.
+./internal/chapterthumbs TestRetiredChapterImagesOutliveIssuedURLsDB
+./internal/chapterthumbs TestChapterURLWithholdsImageRetiredWhileSigningDB
+./internal/chapterthumbs TestChapterURLProtectionSerializesFileDeletionDB
+./internal/chapterthumbs TestChapterURLProtectionBatchesFilesDB
+./internal/chapterthumbs TestChapterImageReusePreservesIssuedURLProtectionDB
+./internal/chapterthumbs TestChapterImageReuseWaitsForCollectorDB
+./internal/catalog TestGetItemVersionsBatchesChapterImages
+
+# Schema: every content_id-family foreign key cascades on update, so the online
+# re-id can rename an item whatever child rows it has (#933).
+./migrations TestContentIDFamilyFKsCascadeOnUpdatePostgres
+
+# Schema: every content_id-family reference is COLLATE "C", so a join on it can
+# use the referencing table's index, as the bulk enrichment state check does.
+./migrations TestContentIDFamilyReferencesUseCCollationPostgres
+
+# Watch detail artwork: movies, episodes and extras carry the poster and
+# backdrop clients publish to system media controls (#803).
+./internal/catalog TestGetWatchDetailArtwork
+./internal/catalog TestGetWatchDetailOmitsArtworkResolution
+
+# Detail and versions: localization and folder reads per detail build, and the
+# versions endpoint issuing fewer queries than full detail with no image work.
+./internal/catalog TestBuildMediaItemDetailSharesLocalization
+./internal/catalog TestGetItemVersionsSkipsPresentationAndPlaybackSafety
+./internal/catalog TestGetItemVersionsKeepsChapterImagesAndEmptyFiles
+./internal/catalog TestGetItemVersionsMatchesDetail
+./internal/catalog TestGetItemVersionsAccessAndMissing
+
+# Episode batches: the viewer's preference lookups, the episode reads, and the
+# library membership check run once per series, not once per episode, on the
+# Jellyfin season page path.
+./internal/catalog TestGetEpisodeDetailsForSeriesResolvesPreferencesOncePerSeries
+./internal/catalog TestGetEpisodeDetailsForSeriesChecksLibraryMembershipOnce
+
+# Seek previews: one availability lookup per item or episode page, and none
+# for a detail that leaves previews out.
+./internal/catalog TestTrickplayAvailabilityBatchesItemDetails
+./internal/catalog TestItemDetailSkipsPlaybackPreviewsOnlyWhenAsked
+./internal/catalog TestTrickplayAvailabilityBatchesEpisodeDetails
+./internal/catalog TestEpisodeDetailsFallBackAfterBatchFileFailureDB
+./internal/jellycompat TestTrickplayNegotiatedSourceSurvivesAPIReplicaDB
+
+# Jellyfin Items/Latest with MediaSources: a fixed number of statements per
+# page, and every card identical to its single-item detail rendering.
+./internal/jellycompat TestLatestStatementBudgetDB
+./internal/jellycompat TestLatestMatchesDetailRenderingDB
+./internal/jellycompat TestIdsListKeepsSubtitleDefaultsDB
+./internal/userstore/pgstore TestListAudioPreferencesMatchesGet
+
+# Listings: COUNT queries only when a total is requested and cannot be derived
+# from the page.
+./internal/catalog TestQueryExecutorTerminalPageTotals
+./internal/catalog TestJellycompatPredicatesPostgres
+
+# PostgreSQL search: stored documents preserve ranking and cursor tuples;
+# sparse first pages reuse one FTS probe, and trigger work stays bounded.
+./migrations TestMediaSearchDocumentsMigrationPostgres
+./migrations TestEpisodeSearchRefreshMigrationPostgres
+./migrations TestSkipUnchangedEpisodeCatalogRefreshMigrationPostgres
+./migrations TestEpisodeExactSearchIndexMigrationPostgres
+./internal/catalog TestMediaSearchDocumentsPostgres
+./internal/catalog TestSearchOptimizedAccuracyPostgres
+./internal/catalog TestSearchSparseProbeReusePostgres
+./internal/catalog TestSearchUsesCustomPlansPostgres
+./internal/catalog TestSearchCursorPostgres
+./internal/catalog TestSearchCursorMixedAndGroupsPostgres
+./internal/catalog TestEpisodeSearchPostgresAndDocumentSource
+./internal/catalog TestEpisodeSearchOverviewVectorRefreshesOnOverviewUpdate
+./internal/catalog TestEpisodeSearchRefreshWorkPostgres
+./internal/catalog TestEpisodeExactTierCursorAndPlanPostgres
+./internal/catalog TestSearchYearSuffixedTitleIsExactPostgres
+
+# People search: each query is planned for its own words, exact names rank
+# first, and viewer access applies before the limit.
+./internal/catalog TestPersonSearchRanksExactNamesFirstWithCustomPlansPostgres
+
+# Card play targets: leaf cards and a validated anchor hint resolve without a
+# watch-progress query, a page of cards reads the profile's resumable progress
+# once, and the PostgreSQL path picks what the general path picks.
+./internal/catalog TestPlayableTargetResolverProfileStateAvailabilityAndAccess
+./internal/catalog TestPlayableTargetResolverResumesDeepInsideLongSeries
+./internal/catalog TestPlayableTargetResolverStaleCompletedProgressPlan
+./internal/catalog TestCatalogOverlaySummariesPreserveLegacyWinners
+./internal/catalog TestPlayableTargetsPostgresMatchesGeneral
+
+# One series' watch rollup runs on a generic plan that looks up each episode's
+# completed history instead of hashing a heavy profile's whole history.
+./internal/userstore/pgstore TestOneSeriesWatchCountsLooksUpHistoryPerEpisode
+
+# Home Recently Added TV: the newest cards take one round trip for the cutoff
+# and one for the window, with the JIT guard in the same batches.
+./internal/catalog TestRecentTVListNewestRoundTrips
+
+# Continue Watching: only an in-progress episode sets how far back the
+# superseded walk reads the profile's completed rows.
+./internal/catalog TestSupersededCutoffIgnoresInProgressMoviesPostgres
+
+# Keyset pages: ratings and collection continuations read an index in page
+# order, with no Sort node.
+./internal/catalog TestRatingsPageIndexDB
+./internal/catalog TestLibraryCollectionContinuationDB
+
+# Collection artwork: tag reads refresh usage at most daily and keep active
+# variants out of retirement.
+./internal/catalog TestCollectionCollageReadsKeepActiveVariantsDB
+
+# Personal smart collection collages: a list read serves recorded collages
+# with one statement and never runs the collections' queries.
+./internal/catalog TestPersonalCollectionCollageListReadsSkipSmartQueriesDB
+
+# Server smart collection collages: built from the first matches each viewer
+# can access, ready once the collection is saved, and served by list reads
+# with one statement.
+./internal/catalog TestServerSmartCollectionCollagesDB
+
+# Shared personal collections: a listing resolves each other owner's access
+# once, and a profile's own collections resolve nobody.
+./internal/api/handlers TestPersonalCollectionOwnerLookupBudgetDB
+
+# Viewer access: the account, its access group, the profile and its viewer
+# preferences cost one batch, and answer what reading each on its own does.
+./internal/policy TestViewerResolverBatchedReadsMatchEachDB
+
+# Metadata refresh: season and episode writes cost the same number of
+# statements for 1 and 100 episodes; episode refresh debt the same for 1, 100
+# and 1000, with one DELETE per sync.
+./internal/metadata TestPersistSeasonsAndEpisodes_QueryCountIsBounded
+./internal/metadata TestRefreshSeriesEpisodeMetadataStateDebtQueries
+./internal/metadata TestRefreshSeriesEpisodeMetadataStateRetainsFailureDuringIncompleteSync
+
+# Item merges and orphan cleanup handle webhook sync state after the Plex sync
+# tables were dropped.
+./internal/metadata TestSyncMergeStepsAfterPlexTableDropPostgres
+./internal/catalog TestOrphanCleanupAfterPlexTableDropPostgres
+
+# Corrected matches preserve destination IDs and remove rejected source IDs.
+./internal/metadata TestManualRefresh_CorrectedNFOReanchorKeepsDestinationIDs
+
+# An initial match whose NFO ids replace the folder-tag ids moves the
+# tag-anchored skeleton to the NFO's anchor without the tag ids.
+./internal/metadata TestInitialMatch_NFOIDsReplaceTagAnchoredSkeleton
+./internal/metadata TestInitialMatch_NFOOnlyChainReplacesTagAnchoredSkeleton
+
+# A scan never merges a tagged movie into a title it shares only one provider
+# ID with, and copies of one movie still merge (#2263).
+./internal/metadata TestScanKeepsTaggedMovieFoldersApartDB
+./internal/metadata TestScanStillMergesCopiesOfOneMovieDB
+./internal/metadata TestRescanAfterSplitKeepsTaggedMovieApartDB
+./internal/metadata TestScanKeepsTaggedMovieApartFromTitleWithItsTaggedIDDB
+
+# A corrected Identify moves a series and its anchored children in one rename.
+./internal/metadata TestIdentify_CorrectedSeriesMovesWithItsChildren
+./internal/metadata TestIdentify_CorrectionOntoExistingSeriesMovesUnpairedEpisodeState
+./internal/metadata TestRenameContentIDsMergesLeftoverAvailability
+
+# Home sections: one overlay summary row read per card.
+./internal/sections TestOverlaySummariesOnlyDecodeWinner
+./internal/sections TestOverlaySummariesRankingMatchesGo
+./internal/sections TestNextUpModeStatementBudgetPostgres
+
+# Home sections: one statement for a content ID lookup of any length.
+./internal/sections TestContentIDLookupsKeepOneStatementPostgres
+
+# Server collection rows: a cached row costs one revision read, which shows an
+# edit on the next read, and lists what the collection's page lists.
+./internal/sections TestLibraryCollectionRailsMatchTheCollectionPageDB
+
+# Settings: one query per batched resolution, whatever its scopes and keys.
+./internal/userstore/pgstore TestPostgresResolutionIssuesOneQuery
+
+# Subtree file reads bound file_path on the folder path index under a generic
+# plan, and match the same literal paths as a prefix LIKE.
+./internal/scanner TestFolderPathPrefixQueryUsesPathRangeUnderGenericPlanDB
+
+# The empty-root check probes each root on the folder path index under a
+# generic plan instead of reading every file of the folder.
+./internal/scanner TestListRootsWithCatalogedFilesUsesPathRangeUnderGenericPlanDB
+
+# Subtree theme passes read the scanned subtree and probe canonical roots above
+# it on their indexes instead of reading every file in the library.
+./internal/themesongs TestDirectoriesReadsOnlyTheScannedSubtreeDB
+./internal/scanner TestScopedPathRangesMatchLiteralPathsWithGenericPlans
+
+# Book scans (beta): unchanged files skip without per-file or literary-works
+# queries.
+./internal/scanner TestUnchangedBooksDoNotQueryLiteraryWorks
+./internal/scanner TestEbookScanBatchesSkipQueries
+./internal/scanner TestEbookSkipPreloadPreservesEligibility
+
+# Variant finalization: one narrow scope load, one owner lookup, and one
+# batched write of the variant columns alone.
+./internal/scanner TestFinalizeVariantsBatchesQueriesDB
+./internal/scanner TestFinalizeVariantsLoadsMovieDiscsOutsideTheScopeDB
+
+# ID-less direct ranges reuse full session payloads while checking identities.
+./internal/jellycompat TestWebOSDurableRangeDoesNotReloadSnapshots
+
+# Artwork storage sweep: the GC-schedule lookup its anomaly guard consults must
+# count armed candidates only, never parked (live) ones.
+./internal/metadata TestArtworkSweepScheduledOriginalsPostgres
+
+# Artwork reference check (revision GC and storage sweep): every sweep surface
+# whose path column has an index uses it under a generic plan.
+./internal/metadata TestArtworkReferenceChecksUsePathIndexesDB
+
+./internal/trickplay TestStaleReconcileCannotDowngradeConcurrentUpgradeDB
+./internal/api/handlers TestLibraryExplicitTrickplayUpdateAlwaysReconcilesPostgres
+./internal/trickplay TestReaderRevalidatesServingWhileSigningDB
+./internal/trickplay TestAdminClassifiesIneligibleFilesDB
+./internal/trickplay TestAdminReclassifiesTrackedIneligibleFilesDB
+./internal/trickplay TestAdminRejectsUnsupportedLibraryTypesDB
+./internal/trickplay TestAdminRetryKeepsPublishedPreviewsDB
+./internal/trickplay TestAdminResolvesMultiEpisodeFileDB
+./migrations TestChapterReplacementAtomicallyQueuesImagesPostgres
+
+./internal/trickplay TestOptOutReconcilePreservesConcurrentClaimDB
+./internal/trickplay TestReconcileUsesOneConnectionDB
+
+./internal/chapterthumbs TestCompletedWidthScanRechecksLibraryEligibilityDB
+./internal/chapterthumbs TestPriorityChapterRequestSurvivesReplicaContentionDB
+./internal/scanner TestChapterLockSessionsRespectPoolBudgetDB
+./internal/scanner TestChapterLockFailedConnectReleasesBudgetDB
+./internal/scanner TestChapterLockSessionsSerializeDistinctPoolsDB
+./internal/chapterthumbs TestChapterBudgetRetainsQueuedUnprobedFileDB
+
+./internal/chapterthumbs TestWidthBackfillDefersCatalogScansUntilRetryDB
+./internal/scanner TestChapterLockReusesHealthySessionsDB
+# Discover's default rows read each media type from its own index, however
+# large the catalog.
+./internal/recommendations TestDefaultRowQueriesWalkTypeIndexesPostgres
+
+# Seek preview workers stop after a library or file becomes ineligible.
+./internal/trickplay TestLibraryTypeChangeFencesWorkerProgressDB
+./internal/trickplay TestLibraryTypeChangeRetiresFinishedAndExpiredWorkDB
+./internal/trickplay TestIneligibleFilesCannotProgressAndCanFinishDB
+./internal/trickplay TestTypeChangeReconcilePreservesConcurrentClaimDB
+
+# Seek preview discovery follows current eligibility and retains issued URLs.
+./internal/trickplay TestLibraryTypeChangeSuppressesAndRetiresTrickplayDB
+./internal/trickplay TestNormalizedVideoLibraryTypesRemainEligibleDB
+./internal/trickplay TestCurrentFileEligibilitySuppressesTrickplayDB
+./internal/scanner TestChapterLockDiscardsUndecodableAcquisitionDB
+
+# Profile PIN proofs are invalidated by every PIN writer, including older nodes.
+./internal/userstore/pgstore TestPostgresProfilePINRevision
+./internal/userstore/pgstore TestPostgresProfileEditsStillBumpAccountRevision
+./internal/userstore/pgstore TestPostgresRawPINWriteAdvancesPINRevision
+
+# Jellyfin password#PIN sign-ins share the per-profile PIN lockout.
+./internal/jellycompat TestLoginPINAttemptsShareProfileLimitDB
+
+# Log partitions: migration 028 and partman cut the same UTC periods on a
+# server whose TimeZone is not UTC, so no write falls into the default.
+./internal/database TestLogPartitionsMatchPartmanOnNonUTCServer
+
+# Search normalization: the number-token function keeps its output and stays
+# inlinable.
+./migrations TestSearchNumberTokenInlinesPostgres
+
+# Indexes left invalid by an interrupted concurrent build are rebuilt without
+# blocking reads or writes on their tables.
+./internal/database TestInvalidIndexRebuildKeepsTablesAvailablePostgres
+
+# Pool connections run with JIT off unless the server, database, role or
+# DATABASE_URL already chose jit.
+./internal/database TestNewPoolDisablesJITUnlessConfiguredPostgres
+
+# Pool connections move vectors in binary, report a NULL vector as an error
+# rather than a panic, still connect before the vector extension exists, and
+# switch to binary once the migrations create it.
+./internal/database TestNewPoolMovesVectorsInBinaryPostgres
+
+# Operational log pages: a cursor prunes the partitions newer than it.
+./internal/opslog TestListCursorPrunesNewerPartitionsDB
+
+# Local metadata runs ahead of remote providers, is on by default, and an
+# admin's Identify choice is recorded on the item.
+./migrations TestLocalMetadataDefaultOnMigrationPostgres
+./internal/metadata TestLocalTierIsStoredAndResolvedFirst
+./internal/catalog TestIdentityChoiceSurvivesUpsertAndRenameDB
+./internal/metadata TestCanonicalizeKeepsIdentityChoicePostgres
+./internal/metadata TestPersistMarksIdentityWithTheIdentityWritePostgres
+./internal/metadata TestIdentifyMoveMarksTheMovedItemPostgres
+./internal/metadata TestIdentifyRenameLeavesTheMarkToTheIdentityWritePostgres
+
+# Webhook deliveries are capped at 10 MiB on every receiver.
+./internal/webhooksync TestProcessWebhookBoundedAppliesDefaultLimitDB
+./internal/apiv2 TestWebhookReceiverRealDeliveryDB
+
+# A person write reindexes the person's titles only when it changes the name,
+# the only person field search documents carry.
+./internal/catalog TestPersonWriteReindexesTitlesOnlyOnRenamePostgres
+./internal/catalog TestPersonWriteWaitingOnARenameReindexesTitlesPostgres
+
+# Server collection counts for a restricted viewer: one statement for stored
+# members and at most four for smart collections, however many are listed.
+./internal/catalog TestViewerCollectionCountsStatementBudgetDB
+
+# Person lookups resolve their metadata providers with one statement and reuse
+# them: later lookups in the window issue none, and a plugin change drops them.
+./internal/metadata TestPersonRefreshReusesResolvedProvidersDB
+
+# A Jellyfin NextUp page that asks for detail fields, and an Ids list, fetch
+# their details as one batch and answer exactly what per-item lookups did.
+./internal/jellycompat TestCompatDetailBatchesMatchPerItemDB
+
+# A Jellyfin item request resolves the viewer access scope once, however many
+# catalog reads in the request need it.
+./internal/jellycompat TestCompatEpisodeItemResolvesScopeOnceDB
+
+# Administrator catalog listing: present movies, series and episodes only, per-library
+# versus earliest first-seen times, every present file with one track's facts, and two
+# statements for a page with files, whatever else it holds.
+./internal/catalog TestListAdminCatalogItemsDB

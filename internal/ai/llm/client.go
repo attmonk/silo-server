@@ -1,0 +1,433 @@
+// Package llm provides the shared OpenAI-compatible API client used by every
+// AI feature in Silo (subtitle translation, metadata translation, Whisper ASR).
+// One endpoint configuration, one retry/backoff implementation; the operator
+// can point it at OpenAI, Groq, a local Ollama/llama.cpp/faster-whisper
+// server, etc.
+package llm
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/ai/reasoning"
+)
+
+// Config holds the connection settings for the shared OpenAI-compatible
+// endpoints. Chat and transcription are configured independently, each from
+// the provider its job selects; transcription never falls back to the chat
+// endpoint.
+type Config struct {
+	AuthMode             string
+	ReasoningEffort      string
+	ServiceTier          string
+	ChatGPTTokenSource   func(context.Context) (func(context.Context) (string, error), error)
+	ChatGPTTokenRejected func(context.Context, string, bool) error
+	ChatGPTPlanRejected  func(context.Context, string) error
+	ChatGPTUsageLimited  func(context.Context, string) error
+	ChatGPTUsageVerified func(context.Context, string) error
+	// Production text requests resolve provider settings and the registration
+	// together. Draft checks and transcription retain their supplied config.
+	TextConfigSource func(context.Context) (Config, error)
+	BaseURL          string // e.g. "https://api.openai.com" (no trailing /v1)
+	APIKey           string // empty for keyless local servers
+	ChatModel        string // chat-completions model used for translation
+
+	ASRBaseURL string // empty when no speech-to-text provider is chosen
+	ASRAPIKey  string // empty for keyless local servers
+	ASRModel   string // audio-transcription model, e.g. "whisper-1"
+}
+
+const AuthModeChatGPT = "chatgpt"
+const chatJSONFormat = "json_object"
+const serviceTierUltrafast = "ultrafast"
+
+// ErrQuotaExhausted means the provider requires a billing or quota change;
+// waiting and retrying the same request cannot recover it.
+var ErrQuotaExhausted = errors.New("AI provider credit or spending limit is exhausted")
+
+// ChatConfigured reports whether chat completions are minimally configured.
+func (c Config) ChatConfigured() bool { return c.BaseURL != "" && c.ChatModel != "" }
+
+// ASRConfigured reports whether audio transcription is minimally configured.
+func (c Config) ASRConfigured() bool { return c.ASRBaseURL != "" && c.ASRModel != "" }
+
+// Client is a minimal OpenAI-compatible API client with shared retry/backoff
+// conventions (429 with Retry-After, 5xx, transport errors, and gateway "200
+// with embedded error object" responses are retried; other 4xx fail fast).
+// The config is held behind an atomic pointer so admin settings changes apply
+// to subsequent requests without rebuilding the client; each request snapshots
+// the config once so its URL, key, and model stay consistent.
+type Client struct {
+	cfg atomic.Pointer[Config]
+	// chatHTTP caps a single chat completion at 10 minutes. asrHTTP has no
+	// client-level timeout: a transcription upload's deadline is set per request
+	// (sized to the chunk duration), which a client timeout would silently cap.
+	chatHTTP *http.Client
+	asrHTTP  *http.Client
+}
+
+// NewClient builds a client from the endpoint config.
+func NewClient(cfg Config) *Client {
+	c := &Client{
+		chatHTTP: &http.Client{Timeout: 10 * time.Minute},
+		asrHTTP:  &http.Client{},
+	}
+	c.UpdateConfig(cfg)
+	return c
+}
+
+// UpdateConfig swaps the endpoint config. Safe for concurrent use; in-flight
+// requests finish with the config they started with.
+func (c *Client) UpdateConfig(cfg Config) {
+	c.cfg.Store(&cfg)
+}
+
+// Config returns a snapshot of the current endpoint config.
+func (c *Client) Config() Config {
+	return *c.cfg.Load()
+}
+
+// Message is one chat-completions message.
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type chatResponseFormat struct {
+	Type string `json:"type"`
+}
+
+type chatCompletionRequest struct {
+	Model           string              `json:"model"`
+	Messages        []Message           `json:"messages"`
+	Temperature     *float32            `json:"temperature,omitempty"`
+	ReasoningEffort string              `json:"reasoning_effort,omitempty"`
+	ServiceTier     string              `json:"service_tier,omitempty"`
+	ResponseFormat  *chatResponseFormat `json:"response_format,omitempty"`
+}
+
+type chatCompletionResponse struct {
+	Choices []struct {
+		Message Message `json:"message"`
+	} `json:"choices"`
+	// Some OpenAI-compatible gateways (e.g. OpenRouter) return a 200 with an
+	// error object instead of an HTTP error status when an upstream provider
+	// fails. We surface and retry on it.
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// Chat performs one chat completion and returns the first choice's content.
+// When jsonObject is true it requests response_format=json_object; providers
+// that ignore the field still work because the prompt itself demands JSON.
+func (c *Client) Chat(ctx context.Context, messages []Message, jsonObject bool) (string, error) {
+	cfg, err := c.TextConfig(ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := reasoning.Validate(cfg.ChatModel, cfg.ReasoningEffort); err != nil {
+		return "", err
+	}
+	if cfg.AuthMode == AuthModeChatGPT {
+		return c.chatGPT(ctx, cfg, messages, jsonObject)
+	}
+	if cfg.ServiceTier == serviceTierUltrafast {
+		return c.apiResponses(ctx, cfg, messages, jsonObject)
+	}
+	reqBody := chatCompletionRequest{
+		Model:           cfg.ChatModel,
+		Messages:        messages,
+		ReasoningEffort: cfg.ReasoningEffort,
+		ServiceTier:     cfg.ServiceTier,
+	}
+	if !reasoning.OmitTemperature(cfg.ChatModel, cfg.ReasoningEffort) {
+		reqBody.Temperature = new(float32(0.2))
+	}
+	if jsonObject {
+		reqBody.ResponseFormat = &chatResponseFormat{Type: chatJSONFormat}
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal chat request: %w", err)
+	}
+
+	url := endpointURL(cfg.BaseURL, "chat/completions")
+
+	var content string
+	err = c.doWithRetry(ctx, c.chatHTTP, "chat API",
+		func() (*http.Request, error) {
+			httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+			if reqErr != nil {
+				return nil, fmt.Errorf("create request: %w", reqErr)
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+			if cfg.APIKey != "" {
+				httpReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+			}
+			return httpReq, nil
+		},
+		func(respBody []byte) error {
+			var parsed chatCompletionResponse
+			if err := json.Unmarshal(respBody, &parsed); err != nil {
+				return fmt.Errorf("decode chat response: %w: %w", ErrUnusableResponse, err)
+			}
+			if parsed.Error != nil && parsed.Error.Message != "" {
+				// 200 with an upstream error object — transient on gateways,
+				// so it reads as an unavailable upstream once retries run out.
+				return &HTTPError{StatusCode: http.StatusBadGateway, message: "chat API error: " + parsed.Error.Message}
+			}
+			if len(parsed.Choices) == 0 || parsed.Choices[0].Message.Content == "" {
+				slog.WarnContext(ctx, "AI chat returned no choices, retrying", "component", "ai",
+					"model", cfg.ChatModel, "response_bytes", len(respBody))
+				return fmt.Errorf("chat API returned no choices: %w", ErrUnusableResponse)
+			}
+			content = parsed.Choices[0].Message.Content
+			return nil
+		})
+	if err != nil {
+		return "", err
+	}
+	return content, nil
+}
+
+// SystemUserChat performs one chat completion from a system + user prompt
+// pair, requesting a JSON object response. Its signature matches
+// aitranslate.ChatFn so a client method reference wires straight in.
+func (c *Client) SystemUserChat(ctx context.Context, system, user string) (string, error) {
+	return c.Chat(ctx, []Message{
+		{Role: "system", Content: system},
+		{Role: "user", Content: user},
+	}, true)
+}
+
+// permanentError marks a parse failure that retrying cannot fix (e.g. an
+// endpoint that structurally does not support the requested response format).
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+// HTTPError preserves the provider status for callers that need a safe diagnostic.
+// Error includes provider-controlled details and must not be sent to clients.
+type HTTPError struct {
+	StatusCode int
+	Code       string
+	// Param is the request field an OpenAI-style error names, if any.
+	Param   string
+	message string
+}
+
+func (e *HTTPError) Error() string { return e.message }
+
+// doWithRetry runs the shared request/retry loop: build constructs a fresh
+// request per attempt, parse consumes a 200 body. Transport errors, read
+// errors, 429 (honoring Retry-After), 5xx, and retryable parse errors back
+// off and retry; other 4xx and permanentError parse failures return at once.
+func (c *Client) doWithRetry(ctx context.Context, httpClient *http.Client, label string,
+	build func() (*http.Request, error), parse func(body []byte) error) error {
+	return c.doReaderWithRetry(ctx, httpClient, label, build, func(body io.Reader) error {
+		data, err := io.ReadAll(body)
+		if err != nil {
+			return fmt.Errorf("read %s response: %w", label, err)
+		}
+		return parse(data)
+	})
+}
+
+func (c *Client) doReaderWithRetry(ctx context.Context, httpClient *http.Client, label string,
+	build func() (*http.Request, error), parse func(io.Reader) error) error {
+	const maxAttempts = 6
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		httpReq, err := build()
+		if err != nil {
+			return err
+		}
+
+		resp, doErr := httpClient.Do(httpReq)
+		if doErr != nil {
+			lastErr = fmt.Errorf("%s request failed: %w", label, doErr)
+			if waitErr := sleepCtx(ctx, time.Duration(attempt+1)*time.Second); waitErr != nil {
+				return errors.Join(lastErr, waitErr)
+			}
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			parseErr := parse(resp.Body)
+			_ = resp.Body.Close()
+			if parseErr == nil {
+				return nil
+			}
+			if perm, ok := errors.AsType[*permanentError](parseErr); ok {
+				return perm.err
+			}
+			lastErr = parseErr
+			if waitErr := sleepCtx(ctx, time.Duration(attempt+1)*time.Second); waitErr != nil {
+				return errors.Join(lastErr, waitErr)
+			}
+			continue
+		}
+
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 128<<10))
+		resp.Body.Close()
+		if readErr != nil {
+			// A truncated/failed read could otherwise be misparsed as a valid
+			// (empty) response; treat it as a retryable transport error.
+			lastErr = fmt.Errorf("read %s response: %w", label, readErr)
+			if waitErr := sleepCtx(ctx, time.Duration(attempt+1)*time.Second); waitErr != nil {
+				return errors.Join(lastErr, waitErr)
+			}
+			continue
+		}
+
+		switch {
+		case resp.StatusCode == http.StatusTooManyRequests:
+			if isExhaustedQuota(respBody) {
+				return fmt.Errorf("%w: %s returned 429: %s", ErrQuotaExhausted, label, Truncate(string(respBody), 300))
+			}
+			wait := rateLimitBackoff(resp, attempt)
+			slog.WarnContext(ctx, "rate limited by AI API, waiting", "component", "ai", "api", label, "attempt", attempt+1, "wait", wait)
+			lastErr = &HTTPError{StatusCode: resp.StatusCode, message: fmt.Sprintf("%s returned 429: %s", label, Truncate(string(respBody), 300))}
+			if waitErr := sleepCtx(ctx, wait); waitErr != nil {
+				return errors.Join(lastErr, waitErr)
+			}
+			continue
+		case resp.StatusCode >= 500:
+			lastErr = &HTTPError{StatusCode: resp.StatusCode, message: fmt.Sprintf("%s returned %d: %s", label, resp.StatusCode, Truncate(string(respBody), 300))}
+			if waitErr := sleepCtx(ctx, time.Duration(attempt+1)*time.Second); waitErr != nil {
+				return errors.Join(lastErr, waitErr)
+			}
+			continue
+		case resp.StatusCode != http.StatusOK:
+			// 4xx other than 429: not retryable.
+			code, param := responseErrorFields(respBody)
+			return &HTTPError{StatusCode: resp.StatusCode, Code: code, Param: param, message: fmt.Sprintf("%s returned %d: %s", label, resp.StatusCode, Truncate(string(respBody), 300))}
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("%s: retries exhausted", label)
+	}
+	return lastErr
+}
+
+// responseErrorFields returns the code and param of an OpenAI-style error body.
+func responseErrorFields(body []byte) (code, param string) {
+	var response struct {
+		Error struct {
+			Code  string `json:"code"`
+			Param string `json:"param"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &response)
+	return response.Error.Code, response.Error.Param
+}
+
+func isExhaustedQuota(body []byte) bool {
+	var response struct {
+		Error struct {
+			Type string          `json:"type"`
+			Code json.RawMessage `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &response) != nil {
+		return false
+	}
+	var code string
+	_ = json.Unmarshal(response.Error.Code, &code)
+	if response.Error.Type == "insufficient_quota" {
+		return true
+	}
+	switch code {
+	case "insufficient_quota", "credit_balance_exhausted", "organization_spend_limit_exceeded", "billing_hard_limit_reached", subscriptionUsageLimitExceeded:
+		return true
+	default:
+		return false
+	}
+}
+
+// endpointURL joins a configured base URL with an OpenAI API path,
+// tolerating bases that already include the version segment (e.g.
+// DeepInfra's https://api.deepinfra.com/v1/openai) alongside bare hosts
+// (https://api.openai.com) and prefixed hosts (https://api.groq.com/openai).
+func endpointURL(base, path string) string {
+	base = strings.TrimRight(base, "/")
+	if HasAPIVersion(base) {
+		return base + "/" + path
+	}
+	return base + "/v1/" + path
+}
+
+// apiVersionSegment matches a path segment that names an API version: v1,
+// v2, v1beta.
+var apiVersionSegment = regexp.MustCompile(`^v[0-9]+(?:(?:alpha|beta)[0-9]*)?$`)
+
+// HasAPIVersion reports whether baseURL's path already names an API version,
+// as in https://host/v1 or https://host/v1beta/openai. AI clients add /v1 to
+// a base URL that has none. A host or segment that merely starts with v1,
+// such as v1-embed.internal or /v1-router, is not a version.
+func HasAPIVersion(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return false
+	}
+	for _, segment := range strings.Split(parsed.Path, "/") {
+		if apiVersionSegment.MatchString(segment) {
+			return true
+		}
+	}
+	return false
+}
+
+// Truncate caps a string for inclusion in an error or log line.
+func Truncate(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
+}
+
+// sleepCtx waits for d or until ctx is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
+// rateLimitBackoff returns how long to wait after a 429, honoring Retry-After
+// and otherwise backing off exponentially (capped at 60s).
+func rateLimitBackoff(resp *http.Response, attempt int) time.Duration {
+	if ra := resp.Header.Get("Retry-After"); ra != "" {
+		if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+		if deadline, err := http.ParseTime(ra); err == nil {
+			if wait := time.Until(deadline); wait > 0 {
+				return wait
+			}
+		}
+	}
+	wait := 10 * time.Second * (1 << attempt)
+	if wait > 60*time.Second {
+		wait = 60 * time.Second
+	}
+	return wait
+}

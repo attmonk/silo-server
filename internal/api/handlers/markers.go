@@ -1,0 +1,450 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"math"
+	"time"
+
+	chimw "github.com/go-chi/chi/v5/middleware"
+
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/artworkurl"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/markers"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/scanner"
+)
+
+// MarkerFileResolver loads a media file by id for the manual-marker API.
+type MarkerFileResolver interface {
+	GetByID(ctx context.Context, id int) (*models.MediaFile, error)
+	GetByContentID(ctx context.Context, contentID string) ([]*models.MediaFile, error)
+	GetByEpisodeID(ctx context.Context, episodeID string) ([]*models.MediaFile, error)
+}
+
+// ManualMarkerWriter persists/clears manual markers.
+type ManualMarkerWriter interface {
+	UpsertMarkers(ctx context.Context, fileID int, update scanner.MarkerUpdate) (bool, error)
+	UpsertAndClearMarkers(ctx context.Context, fileID int, update scanner.MarkerUpdate, clearSegments []string) (bool, error)
+}
+
+// MarkerContributor submits a file's eligible markers to enabled providers.
+type MarkerContributor interface {
+	ContributeFile(ctx context.Context, file *models.MediaFile, opts markers.ContributeOptions) ([]markers.ContributionOutcome, error)
+}
+
+// MarkerContributionLister reads contribution history for a file.
+type MarkerContributionLister interface {
+	ListByFile(ctx context.Context, fileID int) ([]markers.ContributionRow, error)
+}
+
+type MarkerAuditLister interface {
+	ListMarkerEditAudit(ctx context.Context, fileIDs []int, limit int) ([]scanner.MarkerEditAuditRow, error)
+	ListAllMarkerEditAudit(ctx context.Context, limit int) ([]scanner.MarkerEditAuditRow, error)
+}
+
+// MarkersHandler serves the manual-marker + contribution API. The marker
+// read/write/clear routes are mounted for any authenticated viewer (users fix
+// and create markers from the player); the contribution + history routes stay
+// admin-only. A successful manual write fires a background contribution run
+// (see maybeContribute) so corrected markers reach enabled providers.
+type MarkersHandler struct {
+	Files            MarkerFileResolver
+	Libraries        libraryLookup
+	Writer           ManualMarkerWriter
+	Contributor      MarkerContributor
+	Contributions    MarkerContributionLister
+	AuditHistory     MarkerAuditLister
+	Notifier         PlaybackMarkerUpdateNotifier
+	MarkerPopulation MarkerPopulationService
+	MarkerImageURLs  artworkurl.Resolver
+	ThumbnailQueuer  catalog.ChapterThumbnailQueuer
+	// Authorizer enforces per-item access on file lookups so a viewer can only
+	// edit markers for content they can actually watch. When nil (tests) the
+	// handler falls back to an unchecked lookup.
+	Authorizer *MediaFileAuthorizer
+	// BaseContext is the lifetime context for detached background work (set from
+	// the app context) so contribution goroutines cancel on shutdown.
+	BaseContext context.Context
+	logger      *slog.Logger
+}
+
+// NewMarkersHandler constructs the handler.
+func NewMarkersHandler(files MarkerFileResolver, writer ManualMarkerWriter, contributor MarkerContributor, contributions MarkerContributionLister, notifier PlaybackMarkerUpdateNotifier, logger *slog.Logger) *MarkersHandler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &MarkersHandler{Files: files, Writer: writer, Contributor: contributor, Contributions: contributions, Notifier: notifier, logger: logger}
+}
+
+var manualMarkerConfidence = 1.0
+
+// markerContributeTimeout bounds the detached contribution run kicked off after
+// a manual save so a slow or rate-limited provider can't leak goroutines.
+const markerContributeTimeout = 30 * time.Second
+
+var markerSegmentNames = []string{"intro", "credits", "recap", "preview"}
+
+type segmentInput struct {
+	Start *float64 `json:"start"`
+	End   *float64 `json:"end"`
+}
+
+type segmentMarker struct {
+	Start      *float64   `json:"start"`
+	End        *float64   `json:"end"`
+	Source     *string    `json:"source"`
+	Provider   *string    `json:"provider"`
+	Confidence *float64   `json:"confidence"`
+	Algorithm  *string    `json:"algorithm"`
+	DetectedAt *time.Time `json:"detected_at"`
+}
+
+// MarshalJSON writes the frozen /api/v1 shape, which reports a withheld manual
+// marker (markers.ManualWithheldAlgorithm) as "manual:v1". /api/v2 copies the
+// fields into its own types and reports the stored algorithm.
+func (m segmentMarker) MarshalJSON() ([]byte, error) {
+	type v1SegmentMarker segmentMarker
+	if m.Algorithm != nil && *m.Algorithm == markers.ManualWithheldAlgorithm {
+		m.Algorithm = new(markers.ManualAlgorithm)
+	}
+	return json.Marshal(v1SegmentMarker(m))
+}
+
+type fileMarkersResponse struct {
+	FileID         int                            `json:"file_id"`
+	Intro          segmentMarker                  `json:"intro"`
+	Credits        segmentMarker                  `json:"credits"`
+	Recap          segmentMarker                  `json:"recap"`
+	Preview        segmentMarker                  `json:"preview"`
+	MarkerSegments []models.MarkerSegment         `json:"-"`
+	MarkerPreviews []catalog.VersionMarkerPreview `json:"-"`
+}
+
+type contributionOutcomeResponse struct {
+	Provider          string `json:"provider"`
+	Segment           string `json:"segment"`
+	Status            string `json:"status"`
+	SubmissionID      string `json:"submission_id,omitempty"`
+	Reason            string `json:"reason,omitempty"`
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
+}
+
+type contributionRowResponse struct {
+	ID               string     `json:"id"`
+	MediaFileID      int        `json:"media_file_id"`
+	Provider         string     `json:"provider"`
+	Segment          string     `json:"segment"`
+	Source           string     `json:"source"`
+	SubmittedStartMS *int64     `json:"submitted_start_ms,omitempty"`
+	SubmittedEndMS   *int64     `json:"submitted_end_ms,omitempty"`
+	VideoDurationMS  *int64     `json:"video_duration_ms,omitempty"`
+	ContentHash      string     `json:"content_hash"`
+	SubmissionID     *string    `json:"submission_id,omitempty"`
+	Status           string     `json:"status"`
+	HTTPStatus       *int       `json:"http_status,omitempty"`
+	Error            *string    `json:"error,omitempty"`
+	SubmittedAt      *time.Time `json:"submitted_at,omitempty"`
+	UpdatedAt        *time.Time `json:"updated_at,omitempty"`
+}
+
+type markerEditAuditResponse struct {
+	ID                   int64          `json:"id"`
+	MediaFileID          int            `json:"media_file_id"`
+	ItemID               *string        `json:"item_id,omitempty"`
+	ItemType             *string        `json:"item_type,omitempty"`
+	MediaTitle           *string        `json:"media_title,omitempty"`
+	FilePath             *string        `json:"file_path,omitempty"`
+	Segment              string         `json:"segment"`
+	Action               string         `json:"action"`
+	Before               *segmentMarker `json:"before"`
+	After                *segmentMarker `json:"after"`
+	UserID               *int           `json:"user_id,omitempty"`
+	Username             *string        `json:"username,omitempty"`
+	ImpersonatorUserID   *int           `json:"impersonator_user_id,omitempty"`
+	ImpersonatorUsername *string        `json:"impersonator_username,omitempty"`
+	APIKeyID             *int64         `json:"api_key_id,omitempty"`
+	RequestID            *string        `json:"request_id,omitempty"`
+	ClientIP             *string        `json:"client_ip,omitempty"`
+	UserAgent            *string        `json:"user_agent,omitempty"`
+	CreatedAt            time.Time      `json:"created_at"`
+}
+
+func fileMarkers(file *models.MediaFile) fileMarkersResponse {
+	return fileMarkersResponse{
+		FileID:         file.ID,
+		MarkerSegments: models.EffectiveMarkerSegments(file),
+		Intro: segmentMarker{file.IntroStart, file.IntroEnd, file.IntroMarkersSource, file.IntroMarkersProvider,
+			file.IntroMarkersConfidence, file.IntroMarkersAlgorithm, file.IntroMarkersDetectedAt},
+		Credits: segmentMarker{file.CreditsStart, file.CreditsEnd, file.CreditsMarkersSource, file.CreditsMarkersProvider,
+			file.CreditsMarkersConfidence, file.CreditsMarkersAlgorithm, file.CreditsMarkersDetectedAt},
+		Recap: segmentMarker{file.RecapStart, file.RecapEnd, file.RecapMarkersSource, file.RecapMarkersProvider,
+			file.RecapMarkersConfidence, file.RecapMarkersAlgorithm, file.RecapMarkersDetectedAt},
+		Preview: segmentMarker{file.PreviewStart, file.PreviewEnd, file.PreviewMarkersSource, file.PreviewMarkersProvider,
+			file.PreviewMarkersConfidence, file.PreviewMarkersAlgorithm, file.PreviewMarkersDetectedAt},
+	}
+}
+
+// MarkerRequestAuditContext records the authenticated actor, never caller-supplied identity.
+func MarkerRequestAuditContext(ctx context.Context, userAgent string) context.Context {
+	claims := apimw.GetClaims(ctx)
+	if claims == nil {
+		return ctx
+	}
+	audit := scanner.MarkerAuditContext{
+		UserID:             &claims.UserID,
+		ImpersonatorUserID: claims.ImpersonatorUserID,
+		RequestID:          chimw.GetReqID(ctx),
+		ClientIP:           clientip.FromContext(ctx),
+		UserAgent:          userAgent,
+	}
+	if claims.APIKeyID > 0 {
+		apiKeyID := claims.APIKeyID
+		audit.APIKeyID = &apiKeyID
+	}
+	return scanner.WithMarkerAuditContext(ctx, audit)
+}
+
+func (h *MarkersHandler) reloadAndNotify(ctx context.Context, fileID int) (*models.MediaFile, error) {
+	refreshed, err := h.Files.GetByID(ctx, fileID)
+	if err != nil || refreshed == nil {
+		if err == nil {
+			err = scanner.ErrFileNotFound
+		}
+		return nil, err
+	}
+	if h.Notifier != nil {
+		h.Notifier.MarkersUpdated(ctx, refreshed)
+	}
+	return refreshed, nil
+}
+
+// maybeContribute fires a best-effort, detached contribution run for the
+// segments just set or cleared by a manual save. ContributeFile self-gates on
+// each provider's contribute_enabled flag, only submits scanner/manual-sourced
+// segments, never one the save withheld, sends a clear only to providers that
+// accept absent submissions, and is idempotent — so this is a no-op when
+// contribution is off or the marker was already submitted. It runs in the
+// background so the save responds immediately and is never blocked by
+// provider rate limits. It tries each provider once; at a provider that
+// supports amend, the daily task sends a correction this run did not.
+func (h *MarkersHandler) maybeContribute(file *models.MediaFile, segments []string) {
+	if h == nil || h.Contributor == nil || file == nil || len(segments) == 0 {
+		return
+	}
+	kinds := make([]markers.MarkerKind, 0, len(segments))
+	for _, seg := range segments {
+		if kind, ok := markerKindForName(seg); ok {
+			kinds = append(kinds, kind)
+		}
+	}
+	if len(kinds) == 0 {
+		return
+	}
+	base := h.BaseContext
+	if base == nil {
+		base = context.Background()
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(base, markerContributeTimeout)
+		defer cancel()
+		if _, err := h.Contributor.ContributeFile(ctx, file, markers.ContributeOptions{Segments: kinds}); err != nil {
+			h.logger.Warn("markers: background contribution failed", "file_id", file.ID, "error", err)
+		}
+	}()
+}
+
+func isMarkerSegment(seg string) bool {
+	_, ok := markerKindForName(seg)
+	return ok
+}
+
+func markerKindForName(name string) (markers.MarkerKind, bool) {
+	switch name {
+	case "intro":
+		return markers.MarkerKindIntro, true
+	case "credits":
+		return markers.MarkerKindCredits, true
+	case "recap":
+		return markers.MarkerKindRecap, true
+	case "preview":
+		return markers.MarkerKindPreview, true
+	default:
+		return 0, false
+	}
+}
+
+func markerNameForKind(kind markers.MarkerKind) string {
+	switch kind {
+	case markers.MarkerKindIntro:
+		return "intro"
+	case markers.MarkerKindCredits:
+		return "credits"
+	case markers.MarkerKindRecap:
+		return "recap"
+	case markers.MarkerKindPreview:
+		return "preview"
+	default:
+		return ""
+	}
+}
+
+func contributionOutcomeResponses(outcomes []markers.ContributionOutcome) []contributionOutcomeResponse {
+	resp := make([]contributionOutcomeResponse, 0, len(outcomes))
+	for _, o := range outcomes {
+		item := contributionOutcomeResponse{
+			Provider:     o.Provider,
+			Segment:      markerNameForKind(o.Segment),
+			Status:       o.Status,
+			SubmissionID: o.SubmissionID,
+			Reason:       o.Reason,
+		}
+		if o.RetryAfter > 0 {
+			item.RetryAfterSeconds = int(o.RetryAfter.Seconds())
+		}
+		resp = append(resp, item)
+	}
+	return resp
+}
+
+func contributionRowResponses(rows []markers.ContributionRow) []contributionRowResponse {
+	resp := make([]contributionRowResponse, 0, len(rows))
+	for _, row := range rows {
+		item := contributionRowResponse{
+			ID:               row.ID,
+			MediaFileID:      row.MediaFileID,
+			Provider:         row.Provider,
+			Segment:          row.SegmentKind,
+			Source:           row.Source,
+			SubmittedStartMS: row.SubmittedStartMs,
+			SubmittedEndMS:   row.SubmittedEndMs,
+			VideoDurationMS:  row.VideoDurationMs,
+			ContentHash:      row.ContentHash,
+			SubmissionID:     row.SubmissionID,
+			Status:           row.Status,
+			HTTPStatus:       row.HTTPStatus,
+			Error:            row.Error,
+		}
+		if !row.SubmittedAt.IsZero() {
+			submittedAt := row.SubmittedAt
+			item.SubmittedAt = &submittedAt
+		}
+		if !row.UpdatedAt.IsZero() {
+			updatedAt := row.UpdatedAt
+			item.UpdatedAt = &updatedAt
+		}
+		resp = append(resp, item)
+	}
+	return resp
+}
+
+func markerEditAuditResponses(rows []scanner.MarkerEditAuditRow) []markerEditAuditResponse {
+	resp := make([]markerEditAuditResponse, 0, len(rows))
+	for _, row := range rows {
+		resp = append(resp, markerEditAuditResponse{
+			ID:                   row.ID,
+			MediaFileID:          row.MediaFileID,
+			ItemID:               row.ItemID,
+			ItemType:             row.ItemType,
+			MediaTitle:           row.MediaTitle,
+			FilePath:             row.FilePath,
+			Segment:              row.SegmentKind,
+			Action:               row.Action,
+			Before:               markerAuditSegmentResponse(row.Before),
+			After:                markerAuditSegmentResponse(row.After),
+			UserID:               row.UserID,
+			Username:             row.Username,
+			ImpersonatorUserID:   row.ImpersonatorUserID,
+			ImpersonatorUsername: row.ImpersonatorUsername,
+			APIKeyID:             row.APIKeyID,
+			RequestID:            row.RequestID,
+			ClientIP:             row.ClientIP,
+			UserAgent:            row.UserAgent,
+			CreatedAt:            row.CreatedAt,
+		})
+	}
+	return resp
+}
+
+func markerAuditSegmentResponse(segment *scanner.MarkerAuditSegment) *segmentMarker {
+	if segment == nil {
+		return nil
+	}
+	return &segmentMarker{
+		Start:      segment.Start,
+		End:        segment.End,
+		Source:     segment.Source,
+		Provider:   segment.Provider,
+		Confidence: segment.Confidence,
+		Algorithm:  segment.Algorithm,
+		DetectedAt: segment.DetectedAt,
+	}
+}
+
+// normalizeManualSegment applies the start/end defaults and validation, mirroring
+// the contribution rules: intro/recap may omit start (=0); credits/preview may
+// omit end (=duration); end must exceed start and stay within the file.
+func normalizeManualSegment(seg string, in segmentInput, duration float64) (start, end float64, err error) {
+	for _, boundary := range []*float64{in.Start, in.End} {
+		if boundary != nil && (math.IsNaN(*boundary) || math.IsInf(*boundary, 0)) {
+			return 0, 0, errSegment(seg, "boundaries must be finite")
+		}
+	}
+	switch seg {
+	case "intro", "recap":
+		if in.Start != nil {
+			start = *in.Start
+		}
+		if in.End == nil {
+			return 0, 0, errSegment(seg, "end is required")
+		}
+		end = *in.End
+	default: // credits, preview
+		if in.Start == nil {
+			return 0, 0, errSegment(seg, "start is required")
+		}
+		start = *in.Start
+		if in.End != nil {
+			end = *in.End
+		} else if duration > 0 {
+			end = duration
+		} else {
+			return 0, 0, errSegment(seg, "end is required when duration is unknown")
+		}
+	}
+	if start < 0 || end <= start {
+		return 0, 0, errSegment(seg, "end must be greater than start")
+	}
+	if duration > 0 && end > duration+1 {
+		return 0, 0, errSegment(seg, "end exceeds the file duration")
+	}
+	return start, end, nil
+}
+
+func applyManualSegment(update *scanner.MarkerUpdate, seg string, start, end float64) {
+	s, e := start, end
+	switch seg {
+	case "intro":
+		update.IntroStart, update.IntroEnd = &s, &e
+	case "credits":
+		update.CreditsStart, update.CreditsEnd = &s, &e
+	case "recap":
+		update.RecapStart, update.RecapEnd = &s, &e
+	case "preview":
+		update.PreviewStart, update.PreviewEnd = &s, &e
+	}
+}
+
+func errSegment(seg, msg string) error {
+	return &markerValidationError{seg: seg, msg: msg}
+}
+
+type markerValidationError struct {
+	seg string
+	msg string
+}
+
+func (e *markerValidationError) Error() string { return e.seg + " marker: " + e.msg }

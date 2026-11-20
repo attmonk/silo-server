@@ -1,0 +1,568 @@
+package notifications
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/requests"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// scopeFunc adapts a function to ScopeResolver.
+type scopeFunc func(context.Context, access.ResolveInput) (access.Scope, error)
+
+func (f scopeFunc) Resolve(ctx context.Context, input access.ResolveInput) (access.Scope, error) {
+	return f(ctx, input)
+}
+
+// scopeByProfile resolves fixed scopes; an unknown profile does not exist.
+type scopeByProfile map[string]access.Scope
+
+func (s scopeByProfile) Resolve(_ context.Context, input access.ResolveInput) (access.Scope, error) {
+	scope, ok := s[input.ProfileID]
+	if !ok {
+		return access.Scope{}, access.ErrProfileNotFound
+	}
+	return scope, nil
+}
+
+// accessCatalog is a mature-rated series that belongs to two libraries, with
+// one episode, in the shared catalog tables.
+type accessCatalog struct {
+	library, otherLibrary int
+	series, episode       string
+}
+
+func seedAccessCatalog(t *testing.T, pool *pgxpool.Pool) accessCatalog {
+	t.Helper()
+	ctx := t.Context()
+	nonce := time.Now().UnixNano()
+	prefix := fmt.Sprintf("recipient-access-%d", nonce)
+	c := accessCatalog{
+		library:      700000 + int(nonce%50000),
+		otherLibrary: 750000 + int(nonce%50000),
+		series:       prefix + "-series",
+		episode:      prefix + "-e2",
+	}
+	t.Cleanup(func() {
+		cleanup := context.WithoutCancel(ctx)
+		_, _ = pool.Exec(cleanup, `DELETE FROM media_items WHERE content_id = $1`, c.series)
+		_, _ = pool.Exec(cleanup, `DELETE FROM media_folders WHERE id = ANY($1)`, []int{c.library, c.otherLibrary})
+	})
+	for _, stmt := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO media_folders (id, type, name) VALUES ($1, 'series', $3), ($2, 'series', $3 || '-other')`,
+			[]any{c.library, c.otherLibrary, prefix}},
+		{`INSERT INTO media_items (content_id, type, title, genres, content_rating, content_rating_age, advisory_age)
+			VALUES ($1, 'series', 'Series', '{}', 'TV-MA', 17, 14)`, []any{c.series}},
+		{`INSERT INTO media_item_libraries (content_id, media_folder_id) VALUES ($1, $2), ($1, $3)`,
+			[]any{c.series, c.library, c.otherLibrary}},
+		{`INSERT INTO seasons (content_id, series_id, season_number) VALUES ($1 || '-s1', $1, 1)`, []any{c.series}},
+		{`INSERT INTO episodes (content_id, series_id, season_id, season_number, episode_number, title)
+			VALUES ($1, $2, $2 || '-s1', 1, 2, 'E2')`, []any{c.episode, c.series}},
+	} {
+		if _, err := pool.Exec(ctx, stmt.sql, stmt.args...); err != nil {
+			t.Fatalf("seed catalog: %v", err)
+		}
+	}
+	return c
+}
+
+// TestFanoutSkipsRecipientsWithoutAccess covers interest rows that outlive a
+// profile's access to the series: a content-rating ceiling, an advisory-age
+// limit, or a library restriction set after the profile followed it. Fanout
+// runs after those changes, so only profiles that can open the episode now
+// get a delivery, and the others' notification cursors stay put.
+func TestFanoutSkipsRecipientsWithoutAccess(t *testing.T) {
+	pool := inboxPageDB(t)
+	ctx := t.Context()
+	c := seedAccessCatalog(t, pool)
+
+	scopes := scopeByProfile{
+		"open":    {},
+		"allowed": {AllowedLibraryIDs: []int{c.library}, MaturityLimits: access.MaturityLimits{MaxContentRating: "R"}},
+		"rated":   {MaturityLimits: access.MaturityLimits{MaxContentRating: "PG"}},
+		"advised": {MaturityLimits: access.MaturityLimits{MaxAdvisoryAge: 10}},
+		// Sees the series through the other library only; the episode
+		// arrived in a library outside its scope.
+		"other-library": {AllowedLibraryIDs: []int{c.otherLibrary}},
+		// "deleted" has an interest row but no profile.
+	}
+	profiles := []string{"open", "allowed", "rated", "advised", "other-library", "deleted"}
+	episodeKey := seedFanoutEvent(t, pool, c, profiles)
+
+	worker := newAccessFanoutWorker(pool, scopes)
+	processed, err := worker.processBatch(ctx)
+	if err != nil {
+		t.Fatalf("processBatch: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("processed %d events, want 1", processed)
+	}
+
+	delivered := map[string]bool{}
+	for _, profile := range deliveryRecipients(t, pool, `release_event_id = 'event-1'`) {
+		delivered[profile] = true
+	}
+	want := map[string]bool{"open": true, "allowed": true}
+	for _, profile := range profiles {
+		if delivered[profile] != want[profile] {
+			t.Errorf("profile %q delivered = %v, want %v", profile, delivered[profile], want[profile])
+		}
+		var advanced bool
+		if err := pool.QueryRow(ctx, `
+			SELECT last_notified_episode_key IS NOT DISTINCT FROM $2 FROM profile_series_interest WHERE profile_id = $1`,
+			profile, episodeKey).Scan(&advanced); err != nil {
+			t.Fatalf("read cursor for %q: %v", profile, err)
+		}
+		if advanced != want[profile] {
+			t.Errorf("profile %q notification cursor advanced = %v, want %v", profile, advanced, want[profile])
+		}
+	}
+}
+
+// TestFanoutSkipsSecondLibraryCopy adds an episode to one library, then to a
+// second library that holds the same series (a 4K library beside an HD one).
+// The copy is no news to a profile that can open the episode in the first
+// library, whether or not retention has since removed that delivery. Once the
+// first library's copy is gone, the second one is news again. A profile that
+// sees only the second library is told when the copy arrives.
+func TestFanoutSkipsSecondLibraryCopy(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		agedOut, gone   bool
+		secondRecipient []string
+	}{
+		{name: "first delivery kept", secondRecipient: []string{"copy-only"}},
+		{name: "first delivery aged out", agedOut: true, secondRecipient: []string{"copy-only"}},
+		{name: "first copy gone", agedOut: true, gone: true, secondRecipient: []string{"both", "copy-only"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := inboxPageDB(t)
+			ctx := t.Context()
+			c := seedAccessCatalog(t, pool)
+			if _, err := pool.Exec(ctx, `
+				CREATE TABLE release_events (LIKE public.release_events INCLUDING ALL);
+				CREATE TABLE profile_series_interest (LIKE public.profile_series_interest INCLUDING ALL);
+				CREATE TABLE profile_series_notification_mutes (LIKE public.profile_series_notification_mutes INCLUDING ALL);
+				CREATE TABLE episode_availability (LIKE public.episode_availability INCLUDING ALL);
+				CREATE TABLE episode_libraries (LIKE public.episode_libraries INCLUDING ALL);
+				CREATE TABLE notification_library_seed_state (LIKE public.notification_library_seed_state INCLUDING ALL)`); err != nil {
+				t.Fatalf("create fanout tables: %v", err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO notification_library_seed_state (library_id) VALUES ($1), ($2)`,
+				c.library, c.otherLibrary); err != nil {
+				t.Fatalf("seed libraries: %v", err)
+			}
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO profile_series_interest (user_id, profile_id, library_id, series_id, next_up_candidate, next_expected_episode_key)
+				VALUES (1, 'both', $1, $3, true, $4), (1, 'both', $2, $3, true, $4), (1, 'copy-only', $2, $3, true, $4)`,
+				c.library, c.otherLibrary, c.series, EpisodeKey(1, 2)); err != nil {
+				t.Fatalf("seed interest: %v", err)
+			}
+			releases := NewReleaseRepository(pool)
+			worker := newAccessFanoutWorker(pool, scopeByProfile{
+				"both":      {},
+				"copy-only": {AllowedLibraryIDs: []int{c.otherLibrary}},
+			})
+			arrive := func(libraryID int) {
+				t.Helper()
+				if _, err := pool.Exec(ctx, `INSERT INTO episode_libraries (episode_id, media_folder_id) VALUES ($1, $2)`,
+					c.episode, libraryID); err != nil {
+					t.Fatalf("link episode: %v", err)
+				}
+				if _, events, err := releases.RecordAvailabilityForLibrary(ctx, libraryID, true); err != nil || events != 1 {
+					t.Fatalf("RecordAvailabilityForLibrary(%d) = %d events, %v; want 1", libraryID, events, err)
+				}
+				if _, err := worker.processBatch(ctx); err != nil {
+					t.Fatalf("processBatch: %v", err)
+				}
+			}
+			recipients := func(libraryID int) []string {
+				t.Helper()
+				return deliveryRecipients(t, pool, fmt.Sprintf("library_id = %d", libraryID))
+			}
+
+			arrive(c.library)
+			if got := recipients(c.library); !slices.Equal(got, []string{"both"}) {
+				t.Fatalf("first library recipients = %v, want [both]", got)
+			}
+			if tc.agedOut {
+				later := time.Now().Add(time.Hour)
+				if _, err := NewDeliveryRepository(pool).DeleteOld(ctx, later, later, later); err != nil {
+					t.Fatalf("DeleteOld: %v", err)
+				}
+			}
+			if tc.gone {
+				if _, err := pool.Exec(ctx, `DELETE FROM episode_libraries WHERE media_folder_id = $1`, c.library); err != nil {
+					t.Fatalf("remove first copy: %v", err)
+				}
+			}
+			arrive(c.otherLibrary)
+			if got := recipients(c.otherLibrary); !slices.Equal(got, tc.secondRecipient) {
+				t.Fatalf("second library recipients = %v, want %v", got, tc.secondRecipient)
+			}
+		})
+	}
+}
+
+// TestFanoutNotifiesOnlyTheNextUpEpisode runs the Next Up rule through fanout
+// with real file availability. E01 to E05 are in the library when E06, E07
+// and E08 land in one batch: a profile caught up through E05 is told about
+// E06 only, a profile that stopped at E02 is told nothing, and a row with no
+// Next Up cursor is told nothing. S02E01 then lands: the profile that
+// finished the season is told, and the one that has not watched E06 is not.
+// The catalog then lists S02E02 before its file arrives: S02E03 landing first
+// tells nobody, and S02E02 tells the profile waiting for it when it lands.
+func TestFanoutNotifiesOnlyTheNextUpEpisode(t *testing.T) {
+	pool := inboxPageDB(t)
+	ctx := t.Context()
+	c := seedAccessCatalog(t, pool)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.WithoutCancel(ctx), `DELETE FROM media_files WHERE media_folder_id = $1`, c.library)
+	})
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE release_events (LIKE public.release_events INCLUDING ALL);
+		CREATE TABLE profile_series_interest (LIKE public.profile_series_interest INCLUDING ALL);
+		CREATE TABLE profile_series_notification_mutes (LIKE public.profile_series_notification_mutes INCLUDING ALL)`); err != nil {
+		t.Fatalf("create fanout tables: %v", err)
+	}
+	// seedAccessCatalog made S01E02 without a file.
+	episodeID := func(season, number int) string {
+		if season == 1 && number == 2 {
+			return c.episode
+		}
+		return fmt.Sprintf("%s-s%02de%02d", c.series, season, number)
+	}
+	// listEpisode adds the episode to the catalog without a file.
+	listEpisode := func(season, number int) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO episodes (content_id, series_id, season_number, episode_number, title)
+			VALUES ($1, $2, $3, $4, $1) ON CONFLICT (content_id) DO NOTHING`,
+			episodeID(season, number), c.series, season, number); err != nil {
+			t.Fatalf("seed episode: %v", err)
+		}
+	}
+	addEpisode := func(season, number int) {
+		t.Helper()
+		id := episodeID(season, number)
+		if id != c.episode {
+			listEpisode(season, number)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO media_files (media_folder_id, file_path, episode_id) VALUES ($1, '/' || $2, $2)`,
+			c.library, id); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+	}
+	land := func(season, number int) {
+		t.Helper()
+		addEpisode(season, number)
+		key := EpisodeKey(season, number)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO release_events (id, library_id, series_id, episode_id, season_number, episode_number,
+				episode_key, available_at, dedupe_key)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8)`,
+			fmt.Sprintf("event-%d-%d", season, number), c.library, c.series, episodeID(season, number),
+			season, number, key, EpisodeDedupeKey(c.library, c.series, key)); err != nil {
+			t.Fatalf("seed release event: %v", err)
+		}
+	}
+	for n := 1; n <= 5; n++ {
+		addEpisode(1, n)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO profile_series_interest (user_id, profile_id, library_id, series_id, next_up_candidate, next_expected_episode_key)
+		VALUES (1, 'caught-up', $1, $2, true, $3), (1, 'behind', $1, $2, true, $4),
+		       (1, 'no-cursor', $1, $2, false, NULL), (1, 'finished', $1, $2, true, $5),
+		       (1, 'ahead', $1, $2, true, $6)`,
+		c.library, c.series, EpisodeKey(1, 6), EpisodeKey(1, 3), EpisodeKey(1, 9), EpisodeKey(2, 2)); err != nil {
+		t.Fatalf("seed interest: %v", err)
+	}
+	worker := newAccessFanoutWorker(pool, scopeByProfile{"caught-up": {}, "behind": {}, "no-cursor": {}, "finished": {}, "ahead": {}})
+
+	for n := 6; n <= 8; n++ {
+		land(1, n)
+	}
+	if processed, err := worker.processBatch(ctx); err != nil || processed != 3 {
+		t.Fatalf("processBatch = %d, %v; want 3 events", processed, err)
+	}
+	if got := deliveryRecipients(t, pool, `release_event_id = 'event-1-6'`); !slices.Equal(got, []string{"caught-up"}) {
+		t.Errorf("E06 recipients = %v, want [caught-up]", got)
+	}
+	if got := deliveryRecipients(t, pool, `release_event_id IN ('event-1-7', 'event-1-8')`); len(got) != 0 {
+		t.Errorf("E07 and E08 recipients = %v, want none", got)
+	}
+
+	land(2, 1)
+	if processed, err := worker.processBatch(ctx); err != nil || processed != 1 {
+		t.Fatalf("processBatch = %d, %v; want 1 event", processed, err)
+	}
+	if got := deliveryRecipients(t, pool, `release_event_id = 'event-2-1'`); !slices.Equal(got, []string{"finished"}) {
+		t.Errorf("S02E01 recipients = %v, want [finished]", got)
+	}
+
+	listEpisode(2, 2)
+	land(2, 3)
+	if processed, err := worker.processBatch(ctx); err != nil || processed != 1 {
+		t.Fatalf("processBatch = %d, %v; want 1 event", processed, err)
+	}
+	if got := deliveryRecipients(t, pool, `release_event_id = 'event-2-3'`); len(got) != 0 {
+		t.Errorf("S02E03 recipients = %v, want none while S02E02 is listed without a file", got)
+	}
+	land(2, 2)
+	if processed, err := worker.processBatch(ctx); err != nil || processed != 1 {
+		t.Fatalf("processBatch = %d, %v; want 1 event", processed, err)
+	}
+	if got := deliveryRecipients(t, pool, `release_event_id = 'event-2-2'`); !slices.Equal(got, []string{"ahead"}) {
+		t.Errorf("S02E02 recipients = %v, want [ahead]", got)
+	}
+}
+
+// TestNotifyFulfilledSkipsRecipientWithoutAccess sends request.fulfilled for
+// a title the follower's content-rating ceiling hides. The requester is told;
+// the follower is not, and the request still counts as handled.
+func TestNotifyFulfilledSkipsRecipientWithoutAccess(t *testing.T) {
+	pool := inboxPageDB(t)
+	c := seedAccessCatalog(t, pool)
+	system := newAccessSystem(pool, scopeByProfile{
+		"requester": {},
+		"follower":  {MaturityLimits: access.MaturityLimits{MaxContentRating: "PG"}},
+	})
+	req := fulfilledRequest(requests.Follower{UserID: 2, ProfileID: "follower"})
+	if err := NewRequestFulfillmentNotifier(system).NotifyFulfilled(t.Context(), req, c.series); err != nil {
+		t.Fatalf("NotifyFulfilled: %v", err)
+	}
+
+	got := deliveryRecipients(t, pool, `type = '`+DeliveryTypeRequestFulfilled+`'`)
+	if len(got) != 1 || got[0] != "requester" {
+		t.Fatalf("request.fulfilled recipients = %v, want only the requester", got)
+	}
+}
+
+// TestFanoutRetriesWhenRecipientScopeFails covers a recipient whose scope
+// cannot be resolved right now: the resolver fails, or the profile's viewer
+// preferences could not be read. The batch rolls back and the event stays
+// unprocessed for the next run, rather than dropping that recipient's
+// notification or sending it on an incomplete scope.
+func TestFanoutRetriesWhenRecipientScopeFails(t *testing.T) {
+	for name, scopes := range map[string]ScopeResolver{
+		"resolver error": scopeFunc(func(_ context.Context, input access.ResolveInput) (access.Scope, error) {
+			if input.ProfileID == "broken" {
+				return access.Scope{}, errors.New("connection reset")
+			}
+			return access.Scope{}, nil
+		}),
+		"degraded preferences": scopeByProfile{"open": {}, "broken": {PreferencesDegraded: true}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pool := inboxPageDB(t)
+			c := seedAccessCatalog(t, pool)
+			seedFanoutEvent(t, pool, c, []string{"open", "broken"})
+
+			if _, err := newAccessFanoutWorker(pool, scopes).processBatch(t.Context()); err == nil {
+				t.Fatal("processBatch succeeded, want the scope error")
+			}
+			if got := deliveryRecipients(t, pool, `true`); len(got) != 0 {
+				t.Errorf("deliveries = %v, want none", got)
+			}
+			var unprocessed bool
+			if err := pool.QueryRow(t.Context(), `SELECT processed_at IS NULL FROM release_events WHERE id = 'event-1'`).Scan(&unprocessed); err != nil {
+				t.Fatalf("read event: %v", err)
+			}
+			if !unprocessed {
+				t.Error("event marked processed, want it left for the next batch")
+			}
+		})
+	}
+}
+
+// TestFanoutResolvesOnlyEligibleRecipients checks that fanout resolves a scope
+// only for candidates who would get a delivery: a profile with notifications
+// turned off is never resolved.
+func TestFanoutResolvesOnlyEligibleRecipients(t *testing.T) {
+	pool := inboxPageDB(t)
+	c := seedAccessCatalog(t, pool)
+	seedFanoutEvent(t, pool, c, []string{"open", "muted"})
+	muted := DefaultPreferences(1, "muted")
+	muted.Enabled = false
+	if err := NewPreferencesRepository(pool).Upsert(t.Context(), muted); err != nil {
+		t.Fatalf("mute profile: %v", err)
+	}
+
+	var resolved []string
+	scopes := scopeFunc(func(_ context.Context, input access.ResolveInput) (access.Scope, error) {
+		resolved = append(resolved, input.ProfileID)
+		return access.Scope{}, nil
+	})
+	if _, err := newAccessFanoutWorker(pool, scopes).processBatch(t.Context()); err != nil {
+		t.Fatalf("processBatch: %v", err)
+	}
+	if !slices.Equal(resolved, []string{"open"}) {
+		t.Errorf("resolved %v, want only the profile with notifications on", resolved)
+	}
+	if got := deliveryRecipients(t, pool, `true`); !slices.Equal(got, []string{"open"}) {
+		t.Errorf("deliveries = %v, want only open", got)
+	}
+}
+
+// TestNotifyFulfilledRetriesWhenRecipientScopeFails returns the scope error,
+// so the caller retries the request instead of stamping it notified.
+func TestNotifyFulfilledRetriesWhenRecipientScopeFails(t *testing.T) {
+	pool := inboxPageDB(t)
+	c := seedAccessCatalog(t, pool)
+	system := newAccessSystem(pool, scopeByProfile{
+		"requester": {},
+		"follower":  {PreferencesDegraded: true},
+	})
+	req := fulfilledRequest(requests.Follower{UserID: 2, ProfileID: "follower"})
+	if err := NewRequestFulfillmentNotifier(system).NotifyFulfilled(t.Context(), req, c.series); err == nil {
+		t.Fatal("NotifyFulfilled succeeded, want the scope error")
+	}
+	if got := deliveryRecipients(t, pool, `profile_id = 'follower'`); len(got) != 0 {
+		t.Errorf("follower deliveries = %v, want none", got)
+	}
+}
+
+// TestNotifyFulfilledRetryResolvesOnlyUntoldRecipients covers the retry of a
+// partly delivered request. A recipient whose scope fails does not stop the
+// ones after it, and the retry skips recipients an earlier pass told, so the
+// requester's scope failing later cannot hold the request back.
+func TestNotifyFulfilledRetryResolvesOnlyUntoldRecipients(t *testing.T) {
+	pool := inboxPageDB(t)
+	c := seedAccessCatalog(t, pool)
+	var failing map[string]bool
+	var resolved []string
+	system := newAccessSystem(pool, scopeFunc(func(_ context.Context, input access.ResolveInput) (access.Scope, error) {
+		resolved = append(resolved, input.ProfileID)
+		if failing[input.ProfileID] {
+			return access.Scope{}, errors.New("connection reset")
+		}
+		return access.Scope{}, nil
+	}))
+	notifier := NewRequestFulfillmentNotifier(system)
+	req := fulfilledRequest(requests.Follower{UserID: 2, ProfileID: "first"}, requests.Follower{UserID: 3, ProfileID: "second"})
+	fulfilled := `type = '` + DeliveryTypeRequestFulfilled + `'`
+
+	failing = map[string]bool{"first": true}
+	if err := notifier.NotifyFulfilled(t.Context(), req, c.series); err == nil {
+		t.Fatal("first pass succeeded, want the scope error")
+	}
+	if got := deliveryRecipients(t, pool, fulfilled); !slices.Equal(got, []string{"requester", "second"}) {
+		t.Fatalf("first pass told %v, want requester and second", got)
+	}
+
+	failing, resolved = map[string]bool{"requester": true}, nil
+	if err := notifier.NotifyFulfilled(t.Context(), req, c.series); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if !slices.Equal(resolved, []string{"first"}) {
+		t.Errorf("retry resolved %v, want only first", resolved)
+	}
+	if got := deliveryRecipients(t, pool, fulfilled); !slices.Equal(got, []string{"first", "requester", "second"}) {
+		t.Errorf("told %v after retry, want all three once", got)
+	}
+}
+
+// TestDispatchOperationalResolvesBeforeHoldingConnection runs request.fulfilled
+// on a one-connection pool with a resolver that reads through that pool, as
+// the production resolver does. Resolving inside the dispatch transaction
+// would wait for a second connection until the deadline.
+func TestDispatchOperationalResolvesBeforeHoldingConnection(t *testing.T) {
+	pool := inboxPageDB(t)
+	c := seedAccessCatalog(t, pool)
+	cfg := pool.Config()
+	cfg.MaxConns = 1
+	single, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(single.Close)
+	system := newAccessSystem(single, scopeFunc(func(ctx context.Context, _ access.ResolveInput) (access.Scope, error) {
+		var one int
+		return access.Scope{}, single.QueryRow(ctx, `SELECT 1`).Scan(&one)
+	}))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := NewRequestFulfillmentNotifier(system).NotifyFulfilled(ctx, fulfilledRequest(), c.series); err != nil {
+		t.Fatalf("NotifyFulfilled: %v", err)
+	}
+	if got := deliveryRecipients(t, single, `true`); !slices.Equal(got, []string{"requester"}) {
+		t.Errorf("deliveries = %v, want the requester", got)
+	}
+}
+
+// seedFanoutEvent creates the fanout tables in the test schema (series mutes
+// included, empty), an interest row on account 1 for each profile whose Next
+// Up in c's series is c's episode, and release event "event-1" for that
+// episode. It returns the episode key.
+func seedFanoutEvent(t *testing.T, pool *pgxpool.Pool, c accessCatalog, profiles []string) int {
+	t.Helper()
+	ctx := t.Context()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE release_events (LIKE public.release_events INCLUDING ALL);
+		CREATE TABLE profile_series_interest (LIKE public.profile_series_interest INCLUDING ALL);
+		CREATE TABLE profile_series_notification_mutes (LIKE public.profile_series_notification_mutes INCLUDING ALL)`); err != nil {
+		t.Fatalf("create fanout tables: %v", err)
+	}
+	episodeKey := EpisodeKey(1, 2)
+	for _, profile := range profiles {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profile_series_interest (user_id, profile_id, library_id, series_id, next_up_candidate, next_expected_episode_key)
+			VALUES (1, $1, $2, $3, true, $4)`, profile, c.library, c.series, episodeKey); err != nil {
+			t.Fatalf("seed interest: %v", err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO release_events (id, library_id, series_id, episode_id, season_number, episode_number,
+			episode_key, available_at, dedupe_key)
+		VALUES ('event-1', $1, $2, $3, 1, 2, $4, now(), $5)`,
+		c.library, c.series, c.episode, episodeKey, EpisodeDedupeKey(c.library, c.series, episodeKey)); err != nil {
+		t.Fatalf("seed release event: %v", err)
+	}
+	return episodeKey
+}
+
+func newAccessFanoutWorker(pool *pgxpool.Pool, scopes ScopeResolver) *FanoutWorker {
+	worker := NewFanoutWorker(pool, NewReleaseRepository(pool), NewInterestRepository(pool),
+		NewDeliveryRepository(pool), NewPreferencesRepository(pool),
+		NewSettings(mapSettingReader{SettingFanoutSettleSeconds: "0"}), scopes, NewMultiDispatcher())
+	worker.logger = slog.New(slog.DiscardHandler)
+	return worker
+}
+
+func newAccessSystem(pool *pgxpool.Pool, scopes ScopeResolver) *System {
+	return &System{
+		pool:        pool,
+		Settings:    NewSettings(mapSettingReader{}),
+		Deliveries:  NewDeliveryRepository(pool),
+		Preferences: NewPreferencesRepository(pool),
+		dispatcher:  NewMultiDispatcher(),
+		scopes:      scopes,
+		logger:      slog.New(slog.DiscardHandler),
+	}
+}
+
+// deliveryRecipients lists the profiles of the deliveries matching where.
+func deliveryRecipients(t *testing.T, pool *pgxpool.Pool, where string) []string {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), `SELECT profile_id FROM notification_deliveries WHERE `+where+` ORDER BY profile_id`)
+	if err != nil {
+		t.Fatalf("query deliveries: %v", err)
+	}
+	profiles, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatalf("read deliveries: %v", err)
+	}
+	return profiles
+}

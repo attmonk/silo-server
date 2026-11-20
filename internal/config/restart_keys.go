@@ -1,0 +1,160 @@
+package config
+
+import (
+	"sort"
+	"strings"
+)
+
+// restartRequiredKeys lists server_settings keys whose values are captured at
+// process startup (listeners, connection pools, HTTP clients, worker pools)
+// and cannot take effect until the server restarts.
+//
+// Keys absent from this map and from restartRequiredPrefixes apply without a
+// restart: they are either read live from the settings repo at request time
+// (overlays, branding, markers, download limits, ...) or hot-reloaded through the
+// nodeconfig watcher. When converting a frozen consumer to the live config,
+// remove its key here — the admin UI restart banner is driven by this
+// registry.
+var restartRequiredKeys = map[string]bool{
+	// Process & logging. log_level/log_quiet hot-reload via the config
+	// watcher (shared slog.LevelVar + logfilter.SetQuiet).
+	"server.listen":        true,
+	"server.mode":          true,
+	"server.log_format":    true,
+	"opslog.capture_level": true,
+
+	// Auth. The JWT secret is baked into token services and stream signers;
+	// the expiry durations hot-reload (new tokens only).
+	"auth.jwt_secret": true,
+
+	// Rate limiting gates middleware construction; tier/limit values inside
+	// the dedicated /admin/rate-limits endpoint hot-reload and report their
+	// own restart state.
+	"ratelimit.enabled": true,
+	"ratelimit.backend": true,
+
+	// Playback transcode infrastructure. The native playback/stream handlers,
+	// the transcode nodes, and the download artifact managers read ffmpeg path
+	// and hwaccel live (new transcode sessions), and chapter-thumbnail
+	// extraction and the playback probe ensurer now do too.
+	//
+	// What still freezes them is the jellycompat playback handler: it captures
+	// FFmpegPath/HWAccel and the boot *config.Config (for hw_device) when the
+	// compat router is built, so a Jellyfin-client transcode keeps the boot
+	// values until restart. ffmpeg_path has three more startup-frozen consumers
+	// in cmd/silo/main.go — the intro-marker analyzer, the scanner's own ffprobe
+	// path, and the audiobook enricher. Keep these restart-required until those
+	// convert; converting them is what lets the badge go away.
+	//
+	// transcode_dir is also captured by dedicated transcode nodes for session
+	// and prepared-download storage. A configured download.artifact_dir is
+	// likewise captured by both API and transcode-node artifact managers. The
+	// chapter-thumbnail worker pool is sized at construction.
+	"playback.ffmpeg_path":               true,
+	"playback.hw_accel":                  true,
+	"playback.hw_device":                 true,
+	playbackTranscodeDirSettingKey:       true,
+	downloadArtifactDirSettingKey:        true,
+	"playback.chapter_thumbnail_workers": true,
+
+	// Scanner / matcher toggles captured at construction. Worker counts,
+	// batch size, metadata.cache_images, and mdblist.api_key hot-reload via
+	// atomic setters wired to the config watcher.
+	"scanner.max_concurrent_libraries":     true,
+	"scanner.max_concurrent_scoped":        true,
+	"scanner.empty_trash_after_scan":       true,
+	"scanner.file_removal_grace":           true,
+	"matcher.enable_tv_series_root_queue":  true,
+	"matcher.enable_tv_series_group_queue": true,
+
+	// External API clients built once at startup. The watch-sync client
+	// credentials are deliberately absent: the OAuth flows read them live.
+	"tmdb.api_key": true,
+
+	// The LAN discovery responder starts once with the API listener.
+	ServerLANDiscoverySettingKey: true,
+
+	// Compat listeners and session stores.
+	"audiobookshelf_compat.enabled": true,
+	// public_url / server_name / emulated_server_version are read live per
+	// request, as is address_stream_grant_enabled (by each credential-less
+	// static stream request that reaches the address-only grant); Jellyfin
+	// Web settings are read from the settings repo by
+	// the dynamic web handler; server_id is generate-once and baked into
+	// the resource mapper; the session TTLs are baked into store constructors.
+	"jellyfin_compat.enabled":              true,
+	"jellyfin_compat.listen":               true,
+	"jellyfin_compat.server_id":            true,
+	"jellyfin_compat.session_ttl":          true,
+	"jellyfin_compat.playback_session_ttl": true,
+
+	// AI: connection settings, models, toggles, and quotas hot-reload via
+	// UpdateConfig/setters wired to the config watcher. Only the dispatch
+	// semaphore (ai.max_concurrent_jobs, plus its legacy alias) is a
+	// fixed-capacity channel sized at construction.
+	"ai.max_concurrent_jobs":          true,
+	"subtitle_ai.max_concurrent_jobs": true,
+
+	// Catalog search provider construction is intentionally startup-bound in v1.
+	"catalog.search.provider":                      true,
+	"catalog.search.meilisearch.url":               true,
+	"catalog.search.meilisearch.api_key":           true,
+	"catalog.search.meilisearch.index":             true,
+	"catalog.search.meilisearch.timeout_ms":        true,
+	"catalog.search.meilisearch.matching_strategy": true,
+	"catalog.search.meilisearch.index_types":       true,
+	"catalog.search.meilisearch.semantic_enabled":  true,
+	"catalog.search.meilisearch.semantic_ratio":    true,
+	"catalog.search.meilisearch.embedder":          true,
+	"catalog.search.meilisearch.binary_quantized":  true,
+}
+
+// restartRequiredPrefixes covers whole namespaces of infrastructure settings:
+// connection pools and storage clients that are constructed once at startup.
+var restartRequiredPrefixes = []string{
+	"database.",
+	"userdb.",
+	"s3.",
+	"artwork.",
+	"redis.",
+	"recommendations.",
+}
+
+// RestartRequired reports whether changing the given server_settings key
+// requires a server restart to take effect.
+func RestartRequired(key string) bool {
+	if restartRequiredKeys[key] {
+		return true
+	}
+	for _, prefix := range restartRequiredPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// RestartRequiredKeys returns the sorted list of exact server_settings keys
+// that require a restart. The admin UI reads this over
+// GET /admin/settings/restart-keys to render its restart badges, so it must
+// stay a copy: callers must not be able to mutate the registry.
+func RestartRequiredKeys() []string {
+	keys := make([]string, 0, len(restartRequiredKeys))
+	for key, required := range restartRequiredKeys {
+		if required {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// RestartRequiredPrefixes returns the sorted list of key prefixes whose whole
+// namespace requires a restart. Pair it with RestartRequiredKeys: a key needs a
+// restart when it is listed exactly or carries one of these prefixes.
+func RestartRequiredPrefixes() []string {
+	prefixes := make([]string, len(restartRequiredPrefixes))
+	copy(prefixes, restartRequiredPrefixes)
+	sort.Strings(prefixes)
+	return prefixes
+}

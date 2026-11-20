@@ -1,0 +1,993 @@
+package metadata
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"strconv"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/pluginhost"
+)
+
+type pluginMetadataResolver interface {
+	MetadataProviderClient(ctx context.Context, installationID int, capabilityID string) (pluginMetadataClient, error)
+}
+
+type pluginMetadataClient interface {
+	Search(ctx context.Context, req *pluginv1.SearchMetadataRequest) (*pluginv1.SearchMetadataResponse, error)
+	GetMetadata(ctx context.Context, req *pluginv1.GetMetadataRequest) (*pluginv1.GetMetadataResponse, error)
+	GetPersonDetail(ctx context.Context, req *pluginv1.GetPersonDetailRequest) (*pluginv1.GetPersonDetailResponse, error)
+	GetSeasons(ctx context.Context, req *pluginv1.GetSeasonsRequest) (*pluginv1.GetSeasonsResponse, error)
+	GetEpisodes(ctx context.Context, req *pluginv1.GetEpisodesRequest) (*pluginv1.GetEpisodesResponse, error)
+	GetImages(ctx context.Context, req *pluginv1.GetImagesRequest) (*pluginv1.GetImagesResponse, error)
+	ResolveImageURL(ctx context.Context, req *pluginv1.ResolveImageURLRequest) (*pluginv1.ResolveImageURLResponse, error)
+	ResolveImageURLs(ctx context.Context, req *pluginv1.ResolveImageURLsRequest) (*pluginv1.ResolveImageURLsResponse, error)
+}
+
+type pluginMetadataClientFactory func(ctx context.Context, installationID int, capabilityID string) (pluginMetadataClient, error)
+
+// PluginResolverAdapter wraps a concrete resolver (like *plugins.Service)
+// whose MetadataProviderClient returns *pluginhost.MetadataProviderClient,
+// adapting it to satisfy the pluginMetadataResolver interface.
+type PluginResolverAdapter struct {
+	inner interface {
+		MetadataProviderClient(ctx context.Context, installationID int, capabilityID string) (*pluginhost.MetadataProviderClient, error)
+	}
+}
+
+// NewPluginResolverAdapter creates an adapter from a concrete plugin service.
+func NewPluginResolverAdapter(svc interface {
+	MetadataProviderClient(ctx context.Context, installationID int, capabilityID string) (*pluginhost.MetadataProviderClient, error)
+}) *PluginResolverAdapter {
+	if svc == nil {
+		return nil
+	}
+	return &PluginResolverAdapter{inner: svc}
+}
+
+func (a *PluginResolverAdapter) MetadataProviderClient(ctx context.Context, installationID int, capabilityID string) (pluginMetadataClient, error) {
+	return a.inner.MetadataProviderClient(ctx, installationID, capabilityID)
+}
+
+type PluginProvider struct {
+	installationID int
+	capabilityID   string
+	displayName    string
+	// lookupProviderIDs are the provider-ID keys the capability declared it can
+	// look an item up by (lookup_provider_ids). GetMetadata runs when the item
+	// carries any of them, even without an ID of the provider's own.
+	lookupProviderIDs []string
+	// lookupImages opens GetImages to the same lookup keys (lookup_images), for
+	// an artwork source that has no IDs of its own.
+	lookupImages bool
+	// declaredRatingSources are the rating sources of its own the capability
+	// declared (rating_sources); GetMetadata keeps them alongside Silo's
+	// built-in sources.
+	declaredRatingSources map[string]struct{}
+	clientFactory         pluginMetadataClientFactory
+}
+
+func NewPluginProvider(settings map[string]string, resolver pluginMetadataResolver) (*PluginProvider, error) {
+	if resolver == nil {
+		return nil, fmt.Errorf("plugin metadata resolver is required")
+	}
+
+	return newPluginProvider(settings, resolver.MetadataProviderClient)
+}
+
+func newPluginProvider(
+	settings map[string]string,
+	clientFactory pluginMetadataClientFactory,
+) (*PluginProvider, error) {
+	if clientFactory == nil {
+		return nil, fmt.Errorf("plugin metadata client factory is required")
+	}
+
+	installationIDText := settings["plugin_installation_id"]
+	if installationIDText == "" {
+		return nil, fmt.Errorf("plugin_installation_id is required")
+	}
+	installationID, err := strconv.Atoi(installationIDText)
+	if err != nil {
+		return nil, fmt.Errorf("parse plugin_installation_id %q: %w", installationIDText, err)
+	}
+
+	capabilityID := settings["capability_id"]
+	if capabilityID == "" {
+		return nil, fmt.Errorf("capability_id is required")
+	}
+
+	displayName := settings["display_name"]
+	if displayName == "" {
+		displayName = capabilityID
+	}
+
+	return &PluginProvider{
+		installationID: installationID,
+		capabilityID:   capabilityID,
+		displayName:    displayName,
+		clientFactory:  clientFactory,
+	}, nil
+}
+
+func NewPluginProviderWithClientFactory(
+	settings map[string]string,
+	clientFactory pluginMetadataClientFactory,
+) (*PluginProvider, error) {
+	return newPluginProvider(settings, clientFactory)
+}
+
+// NewPluginProviderFromCapability constructs a PluginProvider directly from
+// plugin capability data, without going through a settings map or registry.
+// lookupProviderIDs is the capability's declared lookup_provider_ids, or nil;
+// lookupImages is its declared lookup_images.
+func NewPluginProviderFromCapability(
+	installationID int,
+	capabilityID string,
+	displayName string,
+	lookupProviderIDs []string,
+	lookupImages bool,
+	ratingSources []models.RatingSourceDefinition,
+	resolver pluginMetadataResolver,
+) (*PluginProvider, error) {
+	if resolver == nil {
+		return nil, fmt.Errorf("plugin metadata resolver is required")
+	}
+	if displayName == "" {
+		displayName = capabilityID
+	}
+	var declared map[string]struct{}
+	if len(ratingSources) > 0 {
+		declared = make(map[string]struct{}, len(ratingSources))
+		for _, source := range ratingSources {
+			declared[source.Source] = struct{}{}
+		}
+	}
+	return &PluginProvider{
+		installationID:        installationID,
+		capabilityID:          capabilityID,
+		displayName:           displayName,
+		lookupProviderIDs:     lookupProviderIDs,
+		lookupImages:          lookupImages,
+		declaredRatingSources: declared,
+		clientFactory:         resolver.MetadataProviderClient,
+	}, nil
+}
+
+func NewPluginProviderWithTypedResolver(
+	settings map[string]string,
+	resolver interface {
+		MetadataProviderClient(
+			ctx context.Context,
+			installationID int,
+			capabilityID string,
+		) (*pluginhost.MetadataProviderClient, error)
+	},
+) (*PluginProvider, error) {
+	if resolver == nil {
+		return nil, fmt.Errorf("plugin metadata resolver is required")
+	}
+
+	return newPluginProvider(settings, func(
+		ctx context.Context,
+		installationID int,
+		capabilityID string,
+	) (pluginMetadataClient, error) {
+		return resolver.MetadataProviderClient(ctx, installationID, capabilityID)
+	})
+}
+
+func (p *PluginProvider) Slug() string {
+	return p.capabilityID
+}
+
+func (p *PluginProvider) Name() string {
+	return p.displayName
+}
+
+func (p *PluginProvider) ForTypes() []string {
+	return []string{"movie", "series"}
+}
+
+func (p *PluginProvider) Search(ctx context.Context, query SearchQuery) ([]SearchResult, error) {
+	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
+	if err != nil {
+		return nil, err
+	}
+
+	providerIDs, err := structFromStringMap(query.ProviderIDs)
+	if err != nil {
+		return nil, fmt.Errorf("encode provider ids for plugin search: %w", err)
+	}
+
+	// The plugin search contract carries a single free-text Query. When the
+	// caller supplies an author hint (ebooks), fold it in so title-only matches
+	// that need disambiguation — or messy filename titles — can still resolve.
+	queryText := strings.TrimSpace(query.Title)
+	if author := strings.TrimSpace(query.Author); author != "" {
+		queryText = strings.TrimSpace(queryText + " " + author)
+	}
+
+	response, err := client.Search(ctx, &pluginv1.SearchMetadataRequest{
+		Query:       queryText,
+		ItemType:    query.ContentType,
+		Year:        int32(query.Year),
+		ProviderIds: providerIDs,
+		Language:    query.Language,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]SearchResult, 0, len(response.GetResults()))
+	for _, result := range response.GetResults() {
+		results = append(results, SearchResult{
+			Name:             result.GetTitle(),
+			OriginalTitle:    result.GetOriginalTitle(),
+			TitleAliases:     titleAliasesFromPlugin(result.GetTitleAliases(), p.Slug()),
+			TitleLanguage:    result.GetTitleLanguage(),
+			TitleIsFallback:  result.GetTitleIsFallback(),
+			OriginalLanguage: result.GetOriginalLanguage(),
+			Year:             int(result.GetYear()),
+			ProviderIDs:      mergePluginProviderIDs(p.capabilityID, result.GetProviderId(), result.GetProviderIds()),
+			ImageURL:         p.remoteArtwork(ctx, result.GetImageUrl()),
+			Overview:         result.GetOverview(),
+			Provider:         p.Slug(),
+		})
+	}
+	return results, nil
+}
+
+// GetMetadata fetches the item from the plugin. It runs when the item carries
+// the provider's own ID, or, for an enrichment-only provider that never assigns
+// one, any of the provider-ID keys it declared in lookup_provider_ids. In the
+// second case ProviderId is empty and the plugin reads the IDs it needs from
+// ProviderIds.
+func (p *PluginProvider) GetMetadata(ctx context.Context, req MetadataRequest) (*MetadataResult, error) {
+	providerID := req.ProviderIDs[p.capabilityID]
+	if providerID == "" && !p.hasLookupProviderID(req.ProviderIDs) {
+		return nil, nil
+	}
+
+	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
+	if err != nil {
+		return nil, err
+	}
+
+	providerIDs, err := structFromStringMap(req.ProviderIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := client.GetMetadata(ctx, &pluginv1.GetMetadataRequest{
+		ProviderId:  providerID,
+		ItemType:    req.ContentType,
+		ProviderIds: providerIDs,
+		Language:    req.Language,
+		FilePath:    req.FilePath,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response.GetItem() == nil {
+		return nil, nil
+	}
+
+	advisoryAge, advisorySource := advisoryFromPluginMetadata(response.GetItem().GetMetadata())
+	if !models.AdvisoryAgeApplies(req.ContentType) {
+		advisoryAge, advisorySource = 0, ""
+	}
+
+	return &MetadataResult{
+		HasMetadata:          true,
+		ProviderIDs:          mergePluginProviderIDs(p.capabilityID, response.GetItem().GetProviderId(), response.GetItem().GetProviderIds()),
+		Title:                response.GetItem().GetTitle(),
+		OriginalTitle:        response.GetItem().GetOriginalTitle(),
+		TitleAliases:         titleAliasesFromPlugin(response.GetItem().GetTitleAliases(), p.Slug()),
+		TitleAliasesComplete: response.GetItem().GetTitleAliasesComplete(),
+		TitleLanguage:        response.GetItem().GetTitleLanguage(),
+		TitleIsFallback:      response.GetItem().GetTitleIsFallback(),
+		SortTitle:            response.GetItem().GetSortTitle(),
+		Overview:             response.GetItem().GetOverview(),
+		OverviewLanguage:     response.GetItem().GetOverviewLanguage(),
+		Tagline:              response.GetItem().GetTagline(),
+		Year:                 int(response.GetItem().GetYear()),
+		Runtime:              int(response.GetItem().GetRuntime()),
+		Genres:               append([]string(nil), response.GetItem().GetGenres()...),
+		Keywords:             keywordsFromPluginMetadata(response.GetItem().GetMetadata()),
+		Studios:              append([]string(nil), response.GetItem().GetStudios()...),
+		Networks:             append([]string(nil), response.GetItem().GetNetworks()...),
+		Countries:            append([]string(nil), response.GetItem().GetCountries()...),
+		OriginalLanguage:     response.GetItem().GetOriginalLanguage(),
+		ContentRating:        response.GetItem().GetContentRating(),
+		AdvisoryAge:          advisoryAge,
+		AdvisorySource:       advisorySource,
+		Ratings:              ratingsFromStruct(response.GetItem().GetRatings(), p.declaredRatingSources),
+		RatingSources:        ratingSourcesFromStruct(response.GetItem().GetRatings(), p.Slug(), p.declaredRatingSources),
+		People:               p.peopleFromRecords(ctx, response.GetItem().GetPeople()),
+		Videos:               videosFromRecords(p.Slug(), response.GetItem().GetVideos()),
+		PosterPath:           p.remoteArtwork(ctx, response.GetItem().GetPosterPath()),
+		PosterThumbhash:      response.GetItem().GetPosterThumbhash(),
+		BackdropPath:         p.remoteArtwork(ctx, response.GetItem().GetBackdropPath()),
+		ShowStatus:           response.GetItem().GetStatus(),
+		BackdropThumbhash:    response.GetItem().GetBackdropThumbhash(),
+		LogoPath:             p.remoteArtwork(ctx, response.GetItem().GetLogoPath()),
+		SeasonCount:          int(response.GetItem().GetSeasonCount()),
+		FirstAirDate:         response.GetItem().GetFirstAirDate(),
+		LastAirDate:          response.GetItem().GetLastAirDate(),
+		AirTime:              response.GetItem().GetAirTime(),
+		ReleaseDate:          response.GetItem().GetReleaseDate(),
+		DigitalReleaseDate:   movieDateFromPluginMetadata(req.ContentType, response.GetItem().GetMetadata(), "digital_release_date"),
+		PhysicalReleaseDate:  movieDateFromPluginMetadata(req.ContentType, response.GetItem().GetMetadata(), "physical_release_date"),
+	}, nil
+}
+
+// hasLookupProviderID reports whether ids holds a non-empty value for any of
+// the provider's declared lookup keys.
+func (p *PluginProvider) hasLookupProviderID(ids map[string]string) bool {
+	for _, key := range p.lookupProviderIDs {
+		if ids[key] != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func titleAliasesFromPlugin(aliases []*pluginv1.TitleAlias, provider string) []TitleAlias {
+	out := make([]TitleAlias, 0, len(aliases))
+	for _, alias := range aliases {
+		if alias == nil || strings.TrimSpace(alias.GetTitle()) == "" {
+			continue
+		}
+		out = append(out, TitleAlias{
+			Title: alias.GetTitle(), Language: alias.GetLanguage(), Kind: alias.GetKind(), Provider: provider,
+		})
+	}
+	return out
+}
+
+// ErrPersonDetailUnsupported reports a metadata plugin that does not implement
+// person lookup. It says nothing about the person, unlike a plugin that looked
+// them up and found nothing.
+var ErrPersonDetailUnsupported = errors.New("provider does not support person lookup")
+
+func (p *PluginProvider) GetPersonDetail(ctx context.Context, req PersonDetailRequest) (*PersonDetailResult, error) {
+	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
+	if err != nil {
+		return nil, err
+	}
+
+	providerIDs, err := structFromStringMap(req.ProviderIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := client.GetPersonDetail(ctx, &pluginv1.GetPersonDetailRequest{
+		ProviderIds: providerIDs,
+		Language:    req.Language,
+	})
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return nil, ErrPersonDetailUnsupported
+		}
+		return nil, err
+	}
+	if response.GetPerson() == nil {
+		return nil, nil
+	}
+
+	return &PersonDetailResult{
+		Name:           response.GetPerson().GetName(),
+		SortName:       response.GetPerson().GetSortName(),
+		Bio:            response.GetPerson().GetBio(),
+		BirthDate:      response.GetPerson().GetBirthDate(),
+		DeathDate:      response.GetPerson().GetDeathDate(),
+		Birthplace:     response.GetPerson().GetBirthplace(),
+		Homepage:       response.GetPerson().GetHomepage(),
+		PhotoPath:      p.remoteArtwork(ctx, response.GetPerson().GetPhotoPath()),
+		PhotoThumbhash: response.GetPerson().GetPhotoThumbhash(),
+		ProviderIDs:    stringMapFromStruct(response.GetPerson().GetProviderIds()),
+	}, nil
+}
+
+// GetImages fetches the item's artwork from the plugin. Like GetMetadata it
+// runs on the provider's own ID, but declared lookup keys open it only when the
+// capability also declared lookup_images: an enrichment provider such as
+// MDBList has no artwork, so it is not asked.
+func (p *PluginProvider) GetImages(ctx context.Context, req ImageRequest) ([]RemoteImage, error) {
+	providerID := req.ProviderIDs[p.capabilityID]
+	if providerID == "" && (!p.lookupImages || !p.hasLookupProviderID(req.ProviderIDs)) {
+		return nil, nil
+	}
+
+	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
+	if err != nil {
+		return nil, err
+	}
+
+	providerIDs, err := structFromStringMap(req.ProviderIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	pluginRequest := &pluginv1.GetImagesRequest{
+		ProviderId:  providerID,
+		ItemType:    req.ContentType,
+		ProviderIds: providerIDs,
+		Language:    req.Language,
+	}
+	if req.SeasonNumber != nil {
+		seasonNumber := int32(*req.SeasonNumber)
+		pluginRequest.SeasonNumber = &seasonNumber
+	}
+
+	response, err := client.GetImages(ctx, pluginRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	images := make([]RemoteImage, 0, len(response.GetImages()))
+	for _, image := range response.GetImages() {
+		if url := image.GetUrl(); p.remoteArtwork(ctx, url) != url {
+			continue
+		}
+		ri := RemoteImage{
+			ProviderID: p.capabilityID,
+			URL:        image.GetUrl(),
+			Type:       imageTypeFromKind(image.GetKind()),
+			Language:   image.GetLanguage(),
+			Width:      int(image.GetWidth()),
+			Height:     int(image.GetHeight()),
+		}
+		if image.SeasonNumber != nil {
+			seasonNumber := int(image.GetSeasonNumber())
+			ri.SeasonNumber = &seasonNumber
+		}
+		// Extract rating from the metadata struct if the plugin provided it.
+		if md := image.GetMetadata(); md != nil {
+			if v, ok := md.GetFields()["rating"]; ok {
+				ri.Rating = v.GetNumberValue()
+			}
+			ri.IncludesText = imageMetadataBool(md, "includes_text")
+		}
+		images = append(images, ri)
+	}
+	return images, nil
+}
+
+// remoteArtwork returns an artwork path or URL a plugin returned, or "" when
+// it names a local source (a file:// sidecar or an nfo+http(s):// URL, see
+// isLocalImageSourcePath). Local sources take precedence over provider art and
+// a sidecar's path is looked up on this server's disk, so only the built-in
+// NFO provider, which runs in-process rather than as a plugin, may produce
+// them.
+func (p *PluginProvider) remoteArtwork(ctx context.Context, value string) string {
+	if !isLocalImageSourcePath(value) {
+		return value
+	}
+	slog.DebugContext(ctx, "metadata: ignoring local artwork source from a metadata plugin", "component", "metadata",
+		"installation_id", p.installationID, "capability_id", p.capabilityID)
+	return ""
+}
+
+func imageMetadataBool(md *structpb.Struct, key string) *bool {
+	if md == nil {
+		return nil
+	}
+	value, ok := md.GetFields()[key]
+	if !ok || value == nil {
+		return nil
+	}
+	if _, ok := value.GetKind().(*structpb.Value_BoolValue); !ok {
+		return nil
+	}
+	result := value.GetBoolValue()
+	return &result
+}
+
+func (p *PluginProvider) GetSeasons(ctx context.Context, req SeasonsRequest) ([]SeasonResult, error) {
+	providerID := req.ProviderIDs[p.capabilityID]
+	if providerID == "" {
+		return nil, nil
+	}
+
+	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
+	if err != nil {
+		return nil, err
+	}
+
+	providerIDs, err := structFromStringMap(req.ProviderIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := client.GetSeasons(ctx, &pluginv1.GetSeasonsRequest{
+		SeriesProviderId: providerID,
+		ProviderIds:      providerIDs,
+		Language:         req.Language,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	seasons := make([]SeasonResult, 0, len(response.GetSeasons()))
+	for _, season := range response.GetSeasons() {
+		ids := mergePluginProviderIDs(p.capabilityID, season.GetProviderId(), season.GetProviderIds())
+		seasons = append(seasons, SeasonResult{
+			ContentID:        ids[p.capabilityID],
+			SeasonNumber:     int(season.GetSeasonNumber()),
+			Title:            season.GetTitle(),
+			TitleLanguage:    season.GetTitleLanguage(),
+			Overview:         season.GetOverview(),
+			OverviewLanguage: season.GetOverviewLanguage(),
+			AirDate:          season.GetAirDate(),
+			PosterPath:       p.remoteArtwork(ctx, season.GetPosterPath()),
+			BackdropPath:     p.remoteArtwork(ctx, season.GetBackdropPath()),
+		})
+	}
+	return seasons, nil
+}
+
+func (p *PluginProvider) GetEpisodes(ctx context.Context, req EpisodesRequest) ([]EpisodeResult, error) {
+	providerID := req.ProviderIDs[p.capabilityID]
+	if providerID == "" {
+		return nil, nil
+	}
+
+	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
+	if err != nil {
+		return nil, err
+	}
+
+	providerIDs, err := structFromStringMap(req.ProviderIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := client.GetEpisodes(ctx, &pluginv1.GetEpisodesRequest{
+		SeriesProviderId: providerID,
+		SeasonNumber:     int32(req.SeasonNumber),
+		ProviderIds:      providerIDs,
+		Language:         req.Language,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	episodes := make([]EpisodeResult, 0, len(response.GetEpisodes()))
+	for _, episode := range response.GetEpisodes() {
+		ids := mergePluginProviderIDs(p.capabilityID, episode.GetProviderId(), episode.GetProviderIds())
+		episodes = append(episodes, EpisodeResult{
+			ContentID:        ids[p.capabilityID],
+			ProviderIDs:      ids,
+			SeasonNumber:     int(episode.GetSeasonNumber()),
+			EpisodeNumber:    int(episode.GetEpisodeNumber()),
+			Title:            episode.GetTitle(),
+			TitleLanguage:    episode.GetTitleLanguage(),
+			Overview:         episode.GetOverview(),
+			OverviewLanguage: episode.GetOverviewLanguage(),
+			AirDate:          episode.GetAirDate(),
+			Runtime:          int(episode.GetRuntime()),
+			Ratings:          ratingsFromStruct(episode.GetRatings(), p.declaredRatingSources),
+			StillPath:        p.remoteArtwork(ctx, episode.GetStillPath()),
+		})
+	}
+	return episodes, nil
+}
+
+// ResolveImageURL resolves a single image path via the plugin's gRPC call.
+// The path should be a bare path without the plugin prefix.
+func (p *PluginProvider) ResolveImageURL(ctx context.Context, path string, variant string) (string, error) {
+	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
+	if err != nil {
+		return "", err
+	}
+
+	response, err := client.ResolveImageURL(ctx, &pluginv1.ResolveImageURLRequest{
+		Path: path, Variant: variant,
+	})
+	if err != nil {
+		return "", err
+	}
+	return response.GetUrl(), nil
+}
+
+// ResolveImageURLs resolves multiple image paths via a single plugin gRPC call.
+// Paths should be bare paths without the plugin prefix.
+func (p *PluginProvider) ResolveImageURLs(ctx context.Context, paths []string, variant string) (map[string]string, error) {
+	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := client.ResolveImageURLs(ctx, &pluginv1.ResolveImageURLsRequest{
+		Paths: paths, Variant: variant,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return response.GetUrls(), nil
+}
+
+func mergePluginProviderIDs(capabilityID, providerID string, ids *structpb.Struct) map[string]string {
+	merged := stringMapFromStruct(ids)
+	if providerID != "" {
+		merged[capabilityID] = providerID
+	}
+	return merged
+}
+
+func stringMapFromStruct(value *structpb.Struct) map[string]string {
+	result := make(map[string]string)
+	if value == nil {
+		return result
+	}
+	for key, raw := range value.AsMap() {
+		text, ok := raw.(string)
+		if ok && text != "" {
+			result[key] = text
+		}
+	}
+	return result
+}
+
+// ratingsFromStruct reads the four flat ratings a plugin sends. IMDb and TMDB
+// are Silo's own and always kept. The Rotten Tomatoes scores are kept only
+// when the plugin declared rt_critic or rt_audience, the same rule
+// ratings.sources follows, so a plugin that does not declare them cannot fill
+// the columns another provider's declaration shows.
+func ratingsFromStruct(value *structpb.Struct, declared map[string]struct{}) Ratings {
+	var ratings Ratings
+	if value == nil {
+		return ratings
+	}
+	for key, raw := range value.AsMap() {
+		number, ok := raw.(float64)
+		if !ok {
+			continue
+		}
+		switch key {
+		case "imdb":
+			ratings.IMDB = number
+		case "tmdb":
+			ratings.TMDB = number
+		case models.RatingSourceRTCritic:
+			if _, ok := declared[models.RatingSourceRTCritic]; ok {
+				ratings.RTCritic = number
+			}
+		case models.RatingSourceRTAudience:
+			if _, ok := declared[models.RatingSourceRTAudience]; ok {
+				ratings.RTAudience = number
+			}
+		}
+	}
+	return ratings
+}
+
+// maxExactVotes is the largest vote count a structpb number (a float64) holds
+// exactly. Anything above it cannot be a count a provider really measured.
+const maxExactVotes = 1 << 53
+
+// ratingSourcesFromStruct reads the per-source ratings a plugin sends under
+// ratings.sources: {"imdb": {"score": 81, "votes": 673852}, ...}, with score on
+// a 0-100 scale and votes omitted when unknown.
+//
+// The Struct is the plugin's word, so each entry is validated on its own and a
+// bad one is dropped without affecting the rest: a source name that is neither
+// built in nor one the capability declared, a score that is missing,
+// non-finite or outside 0-100 drops the source, and a negative, fractional or
+// non-numeric vote count drops only the count.
+func ratingSourcesFromStruct(value *structpb.Struct, provider string, declared map[string]struct{}) map[string]RatingSource {
+	sources := value.GetFields()["sources"].GetStructValue()
+	if sources == nil {
+		return nil
+	}
+	result := make(map[string]RatingSource, len(sources.GetFields()))
+	for rawName, rawEntry := range sources.GetFields() {
+		name := strings.ToLower(strings.TrimSpace(rawName))
+		if _, ok := declared[name]; !ok && !models.IsBuiltinRatingSource(name) {
+			continue
+		}
+		entry := rawEntry.GetStructValue()
+		if entry == nil {
+			continue
+		}
+		scoreValue, ok := entry.GetFields()["score"].GetKind().(*structpb.Value_NumberValue)
+		if !ok {
+			continue
+		}
+		score := scoreValue.NumberValue
+		if math.IsNaN(score) || math.IsInf(score, 0) || score < 0 || score > 100 {
+			continue
+		}
+		result[name] = RatingSource{
+			Score:    score,
+			Votes:    ratingSourceVotes(entry.GetFields()["votes"]),
+			Provider: provider,
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// ratingSourceVotes returns a reported vote count, or 0 (unknown) when the
+// value is absent or is not a whole, non-negative number.
+func ratingSourceVotes(value *structpb.Value) int64 {
+	number, ok := value.GetKind().(*structpb.Value_NumberValue)
+	if !ok {
+		return 0
+	}
+	votes := number.NumberValue
+	if math.IsNaN(votes) || votes < 0 || votes > maxExactVotes || votes != math.Trunc(votes) {
+		return 0
+	}
+	return int64(votes)
+}
+
+// Advisory sources Silo stores, mirroring the names the MDBList plugin emits.
+const (
+	// AdvisorySourceCommonSense marks an age MDBList attributed to Common
+	// Sense Media via its "commonsense" flag.
+	AdvisorySourceCommonSense = "commonsense"
+	// AdvisorySourceMDBList marks an age MDBList derived itself.
+	AdvisorySourceMDBList = "mdblist"
+)
+
+// advisoryAgeSources are the only values accepted into MediaItem.AdvisorySource.
+//
+// A plugin controls this Struct completely, and the string ends up rendered on
+// item detail, so the host picks from a fixed vocabulary rather than storing
+// whatever arrived. Both values come from the MDBList plugin, which reports
+// "commonsense" when the response's commonsense flag marks the age as Common
+// Sense Media's and "mdblist" when MDBList derived it itself.
+var advisoryAgeSources = map[string]string{
+	AdvisorySourceCommonSense: AdvisorySourceCommonSense,
+	AdvisorySourceMDBList:     AdvisorySourceMDBList,
+}
+
+// maxAdvisoryAge bounds a reported advisory age. Advisory services top out at
+// 18; anything above 21 is junk, the same cutoff access.Normalize applies to a
+// bare numeric certification.
+const maxAdvisoryAge = 21
+
+// advisoryFromPluginMetadata reads an advisory age out of the
+// free-form plugin metadata Struct. MetadataItem has no typed advisory fields
+// yet, so plugins carry the pair under these two keys; typed proto fields
+// remain a later additive option.
+//
+// The input is a plugin's word, so it is treated as hostile: structpb numbers
+// arrive as float64 and a fractional, negative, or out-of-range age is dropped
+// rather than rounded. The age and the source are all-or-nothing, because an
+// age Silo cannot attribute is an anonymous number shown to a parent choosing
+// what a child may watch.
+func advisoryFromPluginMetadata(value *structpb.Struct) (int, string) {
+	if value == nil {
+		return 0, ""
+	}
+	fields := value.AsMap()
+
+	rawSource, ok := fields["advisory_source"].(string)
+	if !ok {
+		return 0, ""
+	}
+	source, ok := advisoryAgeSources[strings.ToLower(strings.TrimSpace(rawSource))]
+	if !ok {
+		return 0, ""
+	}
+
+	number, ok := fields["advisory_age"].(float64)
+	if !ok {
+		return 0, ""
+	}
+	age := int(number)
+	if float64(age) != number || age <= 0 || age > maxAdvisoryAge {
+		return 0, ""
+	}
+	return age, source
+}
+
+// movieDateFromPluginMetadata reads a movie's home release date from the
+// plugin metadata key ("digital_release_date" or "physical_release_date").
+// Anything that is not a real YYYY-MM-DD date is dropped: the value picks the
+// day the calendar lists the movie on, and the column is a DATE.
+func movieDateFromPluginMetadata(contentType string, value *structpb.Struct, key string) string {
+	if contentType != "movie" || value == nil {
+		return ""
+	}
+	raw, ok := value.GetFields()[key].GetKind().(*structpb.Value_StringValue)
+	if !ok {
+		return ""
+	}
+	date := strings.TrimSpace(raw.StringValue)
+	if _, err := time.Parse(time.DateOnly, date); err != nil {
+		return ""
+	}
+	return date
+}
+
+func keywordsFromPluginMetadata(value *structpb.Struct) []string {
+	if value == nil {
+		return nil
+	}
+
+	raw, ok := value.AsMap()["keywords"]
+	if !ok {
+		return nil
+	}
+
+	var entries []any
+	switch typed := raw.(type) {
+	case []any:
+		entries = typed
+	case []string:
+		entries = make([]any, 0, len(typed))
+		for _, entry := range typed {
+			entries = append(entries, entry)
+		}
+	default:
+		return nil
+	}
+
+	keywords := make([]string, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		text, ok := entry.(string)
+		if !ok {
+			continue
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		key := strings.ToLower(text)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keywords = append(keywords, text)
+	}
+	return keywords
+}
+
+func structFromStringMap(value map[string]string) (*structpb.Struct, error) {
+	if len(value) == 0 {
+		return nil, nil
+	}
+
+	converted := make(map[string]any, len(value))
+	for key, entry := range value {
+		if entry == "" {
+			continue
+		}
+		converted[key] = entry
+	}
+	if len(converted) == 0 {
+		return nil, nil
+	}
+	return structpb.NewStruct(converted)
+}
+
+// videosFromRecords maps SDK VideoRecords into domain RemoteVideos, stamping
+// the returning provider's slug and normalizing unknown kinds to "other".
+// Plugins built against an SDK without the videos field simply return an
+// empty list (proto3 zero value) — nil here, no error.
+func videosFromRecords(providerSlug string, records []*pluginv1.VideoRecord) []RemoteVideo {
+	if len(records) == 0 {
+		return nil
+	}
+
+	videos := make([]RemoteVideo, 0, len(records))
+	for _, record := range records {
+		if record == nil || record.GetSiteKey() == "" {
+			continue
+		}
+		// The provider key is the DB dedup key; fall back to the site key so a
+		// plugin omitting provider ids cannot collide on the empty string.
+		providerKey := record.GetProviderKey()
+		if providerKey == "" {
+			providerKey = record.GetSiteKey()
+		}
+		videos = append(videos, RemoteVideo{
+			Provider:    providerSlug,
+			ProviderKey: providerKey,
+			Kind:        models.NormalizeExtraKind(record.GetKind()),
+			Site:        strings.ToLower(record.GetSite()),
+			SiteKey:     record.GetSiteKey(),
+			Name:        record.GetName(),
+			Language:    record.GetLanguage(),
+			IsOfficial:  record.GetIsOfficial(),
+			SizeHint:    int(record.GetSizeHint()),
+			PublishedAt: record.GetPublishedAt(),
+		})
+	}
+	return videos
+}
+
+func (p *PluginProvider) peopleFromRecords(ctx context.Context, records []*pluginv1.PersonRecord) []models.ItemPerson {
+	if len(records) == 0 {
+		return nil
+	}
+
+	people := make([]models.ItemPerson, 0, len(records))
+	for _, record := range records {
+		if record == nil {
+			continue
+		}
+		people = append(people, models.ItemPerson{
+			Person: models.Person{
+				Name:           record.GetName(),
+				TmdbID:         record.GetTmdbId(),
+				TvdbID:         record.GetTvdbId(),
+				ImdbID:         record.GetImdbId(),
+				PlexGUID:       record.GetPlexGuid(),
+				PhotoPath:      p.remoteArtwork(ctx, record.GetPhotoPath()),
+				PhotoThumbhash: record.GetPhotoThumbhash(),
+			},
+			Kind:      personKindFromString(record.GetKind()),
+			Character: record.GetCharacter(),
+			SortOrder: int(record.GetSortOrder()),
+		})
+	}
+	return people
+}
+
+func personKindFromString(value string) models.PersonKind {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "actor":
+		return models.PersonKindActor
+	case "director":
+		return models.PersonKindDirector
+	case "writer":
+		return models.PersonKindWriter
+	case "producer":
+		return models.PersonKindProducer
+	case "gueststar", "guest_star", "guest star":
+		return models.PersonKindGuestStar
+	case "composer":
+		return models.PersonKindComposer
+	case "author":
+		return models.PersonKindAuthor
+	case "narrator":
+		return models.PersonKindNarrator
+	case "creator":
+		return models.PersonKindCreator
+	default:
+		return models.PersonKindFromJob(value)
+	}
+}
+
+func imageTypeFromKind(kind string) ImageType {
+	switch kind {
+	case "backdrop":
+		return ImageBackdrop
+	case "logo":
+		return ImageLogo
+	case "still":
+		return ImageStill
+	case "profile":
+		return ImageProfile
+	// The extra types use the image cache's names for them.
+	case ImageCacheImageBanner:
+		return ImageBanner
+	case ImageCacheImageThumb:
+		return ImageThumb
+	case ImageCacheImageClearArt:
+		return ImageClearArt
+	case ImageCacheImageDisc:
+		return ImageDisc
+	default:
+		return ImagePoster
+	}
+}

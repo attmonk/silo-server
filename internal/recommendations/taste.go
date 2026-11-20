@@ -1,0 +1,735 @@
+package recommendations
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"maps"
+	"math"
+	"slices"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// weightedAverage computes a weighted average of embedding vectors. Each entry
+// in vecs is scaled by the corresponding weight in weights. The result is
+// L2-normalised. Returns nil when no items contribute a non-zero weight or
+// when all embeddings are nil.
+func weightedAverage(vecs [][]float32, weights []float64) []float32 {
+	if len(vecs) == 0 {
+		return nil
+	}
+
+	var dims int
+	for _, v := range vecs {
+		if v != nil {
+			dims = len(v)
+			break
+		}
+	}
+	if dims == 0 {
+		return nil
+	}
+
+	sum := make([]float64, dims)
+	totalAbsWeight := 0.0
+
+	for i, v := range vecs {
+		if v == nil || i >= len(weights) {
+			continue
+		}
+		w := weights[i]
+		if w == 0 {
+			continue
+		}
+		totalAbsWeight += math.Abs(w)
+		for j, val := range v {
+			sum[j] += float64(val) * w
+		}
+	}
+
+	if totalAbsWeight == 0 {
+		return nil
+	}
+
+	// L2 normalise.
+	var norm float64
+	for _, v := range sum {
+		norm += v * v
+	}
+	norm = math.Sqrt(norm)
+	if norm == 0 {
+		return nil
+	}
+
+	result := make([]float32, dims)
+	for i, v := range sum {
+		result[i] = float32(v / norm)
+	}
+	return result
+}
+
+// timeDecay computes an exponential decay factor for a signal recorded at signalTime.
+// halfLifeDays controls how fast signals lose weight. Floor is 10% of original.
+func timeDecay(signalTime time.Time, now time.Time, halfLifeDays float64) float64 {
+	if halfLifeDays <= 0 {
+		return 1.0
+	}
+	lambda := math.Ln2 / halfLifeDays
+	daysSince := now.Sub(signalTime).Hours() / 24.0
+	if daysSince < 0 {
+		daysSince = 0
+	}
+	factor := math.Exp(-lambda * daysSince)
+	if factor < 0.1 {
+		factor = 0.1 // 10% floor
+	}
+	return factor
+}
+
+// contentRatingScore returns a numeric precedence for a content rating so
+// ratings can be compared by strictness. Higher score = more restrictive.
+func contentRatingScore(rating string) int {
+	scores := map[string]int{
+		"NC-17": 7,
+		"TV-MA": 6,
+		"R":     5,
+		"TV-14": 4,
+		"PG-13": 3,
+		"TV-PG": 2,
+		"PG":    2,
+		"G":     1,
+		"TV-G":  1,
+		"TV-Y":  0,
+	}
+	if s, ok := scores[rating]; ok {
+		return s
+	}
+	return 0
+}
+
+// maxContentRatingFromSets derives the highest content rating among
+// positively-signaled and completed canonical items.
+func maxContentRatingFromSets(ratedSet, completedSet, favSet map[string]struct{}, itemContentRatings map[string]string) string {
+	best := ""
+	bestScore := -1
+
+	check := func(id string) {
+		cr, ok := itemContentRatings[id]
+		if !ok || cr == "" {
+			return
+		}
+		s := contentRatingScore(cr)
+		if s > bestScore {
+			bestScore = s
+			best = cr
+		}
+	}
+
+	for id := range ratedSet {
+		check(id)
+	}
+	for id := range completedSet {
+		check(id)
+	}
+	for id := range favSet {
+		check(id)
+	}
+	return best
+}
+
+// RefreshTasteProfile rebuilds the taste profile embedding for the given user
+// and profile by aggregating signal weights from ratings, favorites, watchlist,
+// watch progress, and rewatches. Applies time decay and builds clustered
+// sub-profiles.
+func (e *Engine) RefreshTasteProfile(ctx context.Context, userID int, profileID string) error {
+	_, err := e.refreshTasteProfile(ctx, userID, profileID)
+	return err
+}
+
+// refreshTasteProfile is RefreshTasteProfile, also reporting whether it stored
+// a taste vector. A profile with no positive signal, or none whose title has
+// an embedding yet, gets none: its vector, clusters and cached personal rows
+// are cleared instead (see clearTasteProfile). A profile deleted since the
+// refresh was queued gets no vector and no taste row.
+func (e *Engine) refreshTasteProfile(ctx context.Context, userID int, profileID string) (bool, error) {
+	started, err := e.repo.Now(ctx)
+	if err != nil {
+		return false, err
+	}
+	stored, err := e.rebuildTasteProfile(ctx, userID, profileID, started)
+	if err != nil {
+		return stored, err
+	}
+	return stored, e.purgeIfProfileDeleted(ctx, userID, profileID)
+}
+
+// purgeIfProfileDeleted deletes the recommendation state of a profile deleted
+// while a rebuild wrote it. The rebuild checks that its profile exists before
+// writing, but a deletion can land between that check and the writes, after
+// the deletion's own purge ran. Profiles may live outside Postgres, so the
+// check cannot share the writes' transaction; run after the rebuild's last
+// write, either this check sees the deletion or the deletion's purge comes
+// after every write.
+func (e *Engine) purgeIfProfileDeleted(ctx context.Context, userID int, profileID string) error {
+	store, err := e.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("get user store for user %d: %w", userID, err)
+	}
+	profile, err := store.GetProfile(ctx, profileID)
+	if err != nil {
+		return fmt.Errorf("get profile %s: %w", profileID, err)
+	}
+	if profile != nil {
+		return nil
+	}
+	return e.repo.PurgeProfile(ctx, userID, profileID)
+}
+
+// rebuildTasteProfile is refreshTasteProfile for a refresh that started at
+// started, database time, before any of its signal reads. The profile is
+// stored as updated at started, so a stale mark set while it reads stays newer
+// than the profile and the stale sweep refreshes it again.
+func (e *Engine) rebuildTasteProfile(ctx context.Context, userID int, profileID string, started time.Time) (bool, error) {
+	store, err := e.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("get user store for user %d: %w", userID, err)
+	}
+
+	ratings, err := e.ratingsRepo.List(ctx, userID, profileID, 1000, 0)
+	if err != nil {
+		return false, fmt.Errorf("list ratings: %w", err)
+	}
+
+	favorites, err := store.ListFavorites(ctx, profileID, 1000, 0)
+	if err != nil {
+		return false, fmt.Errorf("list favorites: %w", err)
+	}
+
+	watchlist, err := store.ListWatchlist(ctx, profileID, 1000, 0)
+	if err != nil {
+		return false, fmt.Errorf("list watchlist: %w", err)
+	}
+
+	watchProgress, err := e.signalReader().WatchProgressForUser(ctx, userID, profileID)
+	if err != nil {
+		return false, fmt.Errorf("get watch progress: %w", err)
+	}
+
+	rewatchCounts, err := e.signalReader().RewatchCounts(ctx, userID, profileID)
+	if err != nil {
+		return false, fmt.Errorf("get rewatch counts: %w", err)
+	}
+
+	marks, err := e.signalReader().NotInterestedMarks(ctx, userID, profileID)
+	if err != nil {
+		return false, fmt.Errorf("get not interested marks: %w", err)
+	}
+
+	now := time.Now()
+	halfLife := e.cfg.TasteDecayHalfLifeDays
+	if halfLife == 0 {
+		halfLife = 180
+	}
+
+	rawIDSet := make(map[string]struct{})
+	for _, r := range ratings {
+		rawIDSet[r.MediaItemID] = struct{}{}
+	}
+	for _, f := range favorites {
+		rawIDSet[f.MediaItemID] = struct{}{}
+	}
+	for _, w := range watchlist {
+		rawIDSet[w.MediaItemID] = struct{}{}
+	}
+	for _, wp := range watchProgress {
+		rawIDSet[wp.MediaItemID] = struct{}{}
+	}
+	for _, rc := range rewatchCounts {
+		rawIDSet[rc.MediaItemID] = struct{}{}
+	}
+
+	rawIDs := make([]string, 0, len(rawIDSet))
+	for id := range rawIDSet {
+		rawIDs = append(rawIDs, id)
+	}
+
+	refs, err := e.repo.ResolveCanonicalContentRefs(ctx, rawIDs)
+	if err != nil {
+		return false, fmt.Errorf("resolve canonical content refs: %w", err)
+	}
+
+	signalCounts := make(map[string]int)
+	signals := make(map[string]*canonicalWeightComponents)
+	ensureSignal := func(id string) *canonicalWeightComponents {
+		if s, ok := signals[id]; ok {
+			return s
+		}
+		s := &canonicalWeightComponents{}
+		signals[id] = s
+		return s
+	}
+	ratedSet := make(map[string]struct{})
+
+	for _, r := range ratings {
+		ref, ok := refs[r.MediaItemID]
+		if !ok || !ref.isCanonicalTasteItem() {
+			continue
+		}
+
+		s := ensureSignal(ref.CanonicalID)
+		rating := r.Stars()
+		s.Rating = &rating
+		ratedSet[ref.CanonicalID] = struct{}{}
+
+		weight, kind := ratingSignal(rating)
+		s.ExplicitWeight += weight * timeDecay(r.RatedAt, now, halfLife)
+		signalCounts[kind]++
+	}
+
+	countWatchSignals(signalCounts, watchProgress, rewatchCounts, refs, now)
+
+	implicitSignals, completedSet := buildCanonicalImplicitSignals(watchProgress, rewatchCounts, refs, now, halfLife)
+	for canonicalID, weight := range implicitSignals {
+		ensureSignal(canonicalID).ImplicitWeight += weight
+	}
+
+	// Favorites and watchlist entries count once per canonical title, as
+	// watches do, so favorited episodes of one series are one favorite.
+	favSet := make(map[string]struct{}, len(favorites))
+	// Favorites and watchlist entries weigh once per canonical title, at
+	// their newest entry: several favorited episodes are one favorited series.
+	favDecay := newestDecayByTitle(favorites, refs, func(f userstore.Favorite) (string, time.Time) {
+		return f.MediaItemID, parseSignalTime(f.AddedAt, now)
+	}, now, halfLife)
+	for id, decay := range favDecay {
+		favSet[id] = struct{}{}
+		s := ensureSignal(id)
+		s.IntentWeight += WeightFavorited * decay
+		s.Favorited = true
+	}
+	if len(favSet) > 0 {
+		signalCounts["favorited"] = len(favSet)
+	}
+
+	// A marked title says the profile does not want more like it, whatever
+	// it watched, rated or favorited. Marks are kept to movies and series,
+	// which are canonical already.
+	for _, m := range marks {
+		ensureSignal(m.MediaItemID).NotInterested = true
+	}
+	if len(marks) > 0 {
+		signalCounts[signalKindNotInterested] = len(marks)
+	}
+
+	watchlistSet := make(map[string]struct{}, len(watchlist))
+	watchlistDecay := newestDecayByTitle(watchlist, refs, func(w userstore.WatchlistEntry) (string, time.Time) {
+		return w.MediaItemID, parseSignalTime(w.AddedAt, now)
+	}, now, halfLife)
+	for id, decay := range watchlistDecay {
+		watchlistSet[id] = struct{}{}
+		ensureSignal(id).IntentWeight += WeightWatchlist * decay
+	}
+	if len(watchlistSet) > 0 {
+		signalCounts["watchlist"] = len(watchlistSet)
+	}
+
+	// A refresh queued before its profile was deleted must not bring back the
+	// taste row the deletion purged, even from signals that outlive a profile
+	// such as watch history; it only clears a row left behind. Profiles may
+	// live outside Postgres, so the user store says whether it still exists.
+	userProfile, err := store.GetProfile(ctx, profileID)
+	if err != nil {
+		return false, fmt.Errorf("get profile %s: %w", profileID, err)
+	}
+	if userProfile == nil {
+		return false, e.clearTasteProfile(ctx, userID, profileID, signalCounts, "", started, false)
+	}
+
+	if len(signals) == 0 {
+		return false, e.clearTasteProfile(ctx, userID, profileID, signalCounts, "", started, true)
+	}
+
+	allIDs := make([]string, 0, len(signals))
+	for id := range signals {
+		allIDs = append(allIDs, id)
+	}
+
+	items, err := e.itemRepo.GetByIDs(ctx, allIDs)
+	if err != nil {
+		slog.ErrorContext(ctx, "taste: failed to fetch items for genre enrichment, cluster labels will be degraded", "component", "recommendations",
+			"user_id", userID, "profile_id", profileID,
+			"id_count", len(allIDs), "error", err)
+	} else {
+		itemMap := make(map[string]*models.MediaItem, len(items))
+		for _, item := range items {
+			itemMap[item.ContentID] = item
+		}
+		for id, s := range signals {
+			if item, ok := itemMap[id]; ok {
+				s.Genres = item.Genres
+			}
+		}
+	}
+
+	embMap, err := e.repo.GetBatchEmbeddings(ctx, allIDs)
+	if err != nil {
+		return false, fmt.Errorf("get batch embeddings: %w", err)
+	}
+
+	maxContentRating := ""
+	if len(allIDs) > 0 && items != nil {
+		crMap := make(map[string]string, len(items))
+		for _, item := range items {
+			crMap[item.ContentID] = item.ContentRating
+		}
+		maxContentRating = maxContentRatingFromSets(ratedSet, completedSet, favSet, crMap)
+	}
+
+	positiveItems, levelTitles := positiveTasteItems(signals, embMap)
+	profile := tasteVector(positiveItems)
+	if profile == nil {
+		return false, e.clearTasteProfile(ctx, userID, profileID, signalCounts, maxContentRating, started, true)
+	}
+	signalCounts[signalCountPositiveTitles] = levelTitles
+
+	if err := e.repo.UpsertTasteProfile(ctx, userID, profileID, profile, signalCounts, maxContentRating, started); err != nil {
+		return false, fmt.Errorf("upsert taste profile: %w", err)
+	}
+
+	clusters := buildTasteClusters(positiveItems)
+	for i := range clusters {
+		clusters[i].UserID = userID
+		clusters[i].ProfileID = profileID
+	}
+	if err := e.repo.UpsertTasteClusters(ctx, userID, profileID, clusters); err != nil {
+		return false, fmt.Errorf("upsert taste clusters: %w", err)
+	}
+
+	return true, nil
+}
+
+// ratingSignal returns a star rating's explicit weight and its signal_counts
+// kind. A 3-star rating adds no weight of its own; combineCanonicalWeight
+// halves the title's watch and intent weight instead.
+func ratingSignal(rating int) (float64, string) {
+	switch rating {
+	case 5:
+		return WeightRated5, signalKindRated5
+	case 4:
+		return WeightRated4, signalKindRated4
+	case 3:
+		return 0, signalKindRated3
+	default:
+		return WeightRatedLow, signalKindRatedLow
+	}
+}
+
+// positiveTasteItems returns the titles that shape the taste vector and its
+// clusters, in ID order: those with an embedding and a positive combined
+// weight, never one marked Not interested. Disliked, abandoned and marked
+// titles are left out rather than subtracted (the rows rank against them
+// instead; see aversion):
+// subtracting only nudges the vector off each disliked title's own direction,
+// and with nothing positive left it points at their opposites. It also
+// returns how many of the titles count toward the cold-start level
+// (countsTowardLevel).
+func positiveTasteItems(signals map[string]*canonicalWeightComponents, embeddings map[string][]float32) ([]clusterItem, int) {
+	var items []clusterItem
+	levelTitles := 0
+	for _, id := range slices.Sorted(maps.Keys(signals)) {
+		s := signals[id]
+		emb := embeddings[id]
+		if emb == nil {
+			continue
+		}
+		if s.NotInterested {
+			continue
+		}
+		weight := combineCanonicalWeight(s.Rating, s.ExplicitWeight, s.ImplicitWeight, s.IntentWeight)
+		if weight <= 0 {
+			continue
+		}
+		items = append(items, clusterItem{itemID: id, embedding: emb, weight: weight, genres: s.Genres})
+		if s.countsTowardLevel() {
+			levelTitles++
+		}
+	}
+	return items, levelTitles
+}
+
+// tasteVector is the weighted average of items' embeddings, or nil when
+// there are none.
+func tasteVector(items []clusterItem) []float32 {
+	vecs := make([][]float32, len(items))
+	weights := make([]float64, len(items))
+	for i, item := range items {
+		vecs[i] = item.embedding
+		weights[i] = item.weight
+	}
+	return weightedAverage(vecs, weights)
+}
+
+// newestDecayByTitle maps each canonical title among entries to the time
+// decay of its newest entry, so a title with several entries (episodes of one
+// series) counts once. Entries that resolve to no title are dropped.
+func newestDecayByTitle[E any](entries []E, refs map[string]canonicalContentRef, entry func(E) (string, time.Time), now time.Time, halfLife float64) map[string]float64 {
+	decays := make(map[string]float64, len(entries))
+	for _, e := range entries {
+		itemID, at := entry(e)
+		ref, ok := refs[itemID]
+		if !ok || ref.CanonicalID == "" {
+			continue
+		}
+		decays[ref.CanonicalID] = max(decays[ref.CanonicalID], timeDecay(at, now, halfLife))
+	}
+	return decays
+}
+
+// clearTasteProfile stores a profile that has no positive signal, or none
+// whose title has an embedding: its signal counts without a taste vector, and
+// none of the clusters or cached personal rows an earlier vector produced.
+// Readers then treat it as having no taste profile. No title shaped a
+// vector, so it records no positive titles and the profile is level 0.
+// Without create a missing row stays missing (see Repo.ClearTasteProfile).
+func (e *Engine) clearTasteProfile(ctx context.Context, userID int, profileID string, signalCounts map[string]int, maxContentRating string, started time.Time, create bool) error {
+	signalCounts[signalCountPositiveTitles] = 0
+	if err := e.repo.ClearTasteProfile(ctx, userID, profileID, signalCounts, maxContentRating, started, create); err != nil {
+		return fmt.Errorf("clear taste profile: %w", err)
+	}
+	return nil
+}
+
+// countWatchSignals adds the watch and rewatch signal counts to counts, once
+// per canonical title: a series counts as one title however many of its
+// episodes were watched, in the bucket of its strongest watch.
+func countWatchSignals(counts map[string]int, progress []WatchProgressRow, rewatches []RewatchCount, refs map[string]canonicalContentRef, now time.Time) {
+	strongest := make(map[string]float64)
+	for _, wp := range progress {
+		ref, ok := refs[wp.MediaItemID]
+		if !ok || ref.CanonicalID == "" {
+			continue
+		}
+		weight, ok := implicitWatchWeight(wp, now)
+		if !ok {
+			continue
+		}
+		if best, seen := strongest[ref.CanonicalID]; !seen || weight > best {
+			strongest[ref.CanonicalID] = weight
+		}
+	}
+	for _, weight := range strongest {
+		switch weight {
+		case WeightWatchHigh:
+			counts["watch_high"]++
+		case WeightWatchMed:
+			counts["watch_med"]++
+		case WeightWatchLow:
+			counts[signalKindWatchLow]++
+		}
+	}
+
+	rewatched := make(map[string]struct{})
+	for _, rc := range rewatches {
+		ref, ok := refs[rc.MediaItemID]
+		if !ok || ref.CanonicalID == "" || rc.Count < 2 {
+			continue
+		}
+		rewatched[ref.CanonicalID] = struct{}{}
+	}
+	if len(rewatched) > 0 {
+		counts["rewatch"] += len(rewatched)
+	}
+}
+
+// summaryTopGenres is how many genres the taste-profile summary names.
+const summaryTopGenres = 5
+
+// clusterTopGenres returns up to n genres of a profile's taste clusters, the
+// genres its personal rows are built from: the first dominant genre of each
+// cluster, heaviest cluster first, then the second of each, and so on,
+// skipping repeats. Taking turns lets a second interest show even when the
+// heaviest cluster has genres to fill every place. A profile without clusters
+// has none.
+func clusterTopGenres(clusters []TasteCluster, n int) []string {
+	sorted := clustersHeaviestFirst(clusters)
+	genres := []string{}
+	for rank := 0; len(genres) < n; rank++ {
+		more := false
+		for _, c := range sorted {
+			if rank >= len(c.DominantGenres) {
+				continue
+			}
+			more = true
+			if g := c.DominantGenres[rank]; g != "" && !slices.Contains(genres, g) && len(genres) < n {
+				genres = append(genres, g)
+			}
+		}
+		if !more {
+			break
+		}
+	}
+	return genres
+}
+
+// GetTasteProfileSummary returns a human-readable summary of the user's taste
+// profile. Its genres are those of the taste clusters the personal rows are
+// built from (see clusterTopGenres); its directors those of the titles the
+// profile rated 4 stars or more or favorited.
+func (e *Engine) GetTasteProfileSummary(ctx context.Context, userID int, profileID string) (*TasteProfileSummary, error) {
+	meta, err := e.repo.GetTasteProfileMeta(ctx, userID, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("get taste profile meta: %w", err)
+	}
+	if meta == nil {
+		return &TasteProfileSummary{
+			TopGenres:         []string{},
+			FavoriteDirectors: []string{},
+			SignalCounts:      map[string]int{},
+			UpdatedAt:         "",
+		}, nil
+	}
+
+	clusters, err := e.repo.GetTasteClusterMeta(ctx, userID, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("get taste clusters for summary: %w", err)
+	}
+	topGenres := clusterTopGenres(clusters, summaryTopGenres)
+
+	// Gather top-rated and favorited item IDs to derive director preferences.
+	ratings, err := e.ratingsRepo.List(ctx, userID, profileID, 1000, 0)
+	if err != nil {
+		return nil, fmt.Errorf("list ratings for summary: %w", err)
+	}
+
+	store, err := e.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("get user store for summary: %w", err)
+	}
+
+	favorites, err := store.ListFavorites(ctx, profileID, 1000, 0)
+	if err != nil {
+		return nil, fmt.Errorf("list favorites for summary: %w", err)
+	}
+
+	rawIDSet := make(map[string]struct{})
+	for _, r := range ratings {
+		if r.Stars() >= 4 {
+			rawIDSet[r.MediaItemID] = struct{}{}
+		}
+	}
+	for _, f := range favorites {
+		rawIDSet[f.MediaItemID] = struct{}{}
+	}
+
+	rawIDs := make([]string, 0, len(rawIDSet))
+	for id := range rawIDSet {
+		rawIDs = append(rawIDs, id)
+	}
+
+	refs, err := e.repo.ResolveCanonicalContentRefs(ctx, rawIDs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve canonical summary refs: %w", err)
+	}
+
+	idSet := make(map[string]struct{})
+	for _, r := range ratings {
+		if r.Stars() < 4 {
+			continue
+		}
+		ref, ok := refs[r.MediaItemID]
+		if !ok || !ref.isCanonicalTasteItem() {
+			continue
+		}
+		idSet[ref.CanonicalID] = struct{}{}
+	}
+	for _, f := range favorites {
+		ref, ok := refs[f.MediaItemID]
+		if !ok || ref.CanonicalID == "" {
+			continue
+		}
+		idSet[ref.CanonicalID] = struct{}{}
+	}
+
+	topDirectors := []string{}
+
+	if len(idSet) > 0 {
+		ids := make([]string, 0, len(idSet))
+		for id := range idSet {
+			ids = append(ids, id)
+		}
+
+		items, err := e.itemRepo.GetByIDs(ctx, ids)
+		if err != nil {
+			return nil, fmt.Errorf("get items for summary: %w", err)
+		}
+
+		directorCounts := make(map[string]int)
+		for _, item := range items {
+			for _, p := range item.People {
+				if p.Kind == models.PersonKindDirector {
+					directorCounts[p.Name]++
+				}
+			}
+		}
+		topDirectors = topN(directorCounts, 5)
+	}
+
+	return &TasteProfileSummary{
+		TopGenres:         topGenres,
+		FavoriteDirectors: topDirectors,
+		SignalCounts:      summarySignalCounts(meta.SignalCounts),
+		UpdatedAt:         meta.UpdatedAt,
+	}, nil
+}
+
+// summarySignalCounts returns the signal kinds of counts for the taste
+// profile summary, which reports how many signals of each kind fed the
+// profile. It leaves out signalCountPositiveTitles, a count of titles rather
+// than a kind of signal, so a client that totals the kinds is not misled.
+func summarySignalCounts(counts map[string]int) map[string]int {
+	out := make(map[string]int, len(counts))
+	for kind, count := range counts {
+		if kind != signalCountPositiveTitles {
+			out[kind] = count
+		}
+	}
+	return out
+}
+
+// topN returns up to n keys from counts, ordered by count descending.
+func topN(counts map[string]int, n int) []string {
+	type kv struct {
+		key   string
+		count int
+	}
+
+	pairs := make([]kv, 0, len(counts))
+	for k, v := range counts {
+		pairs = append(pairs, kv{k, v})
+	}
+
+	// Simple selection sort — n is always small (≤ 5).
+	for i := 0; i < len(pairs) && i < n; i++ {
+		maxIdx := i
+		for j := i + 1; j < len(pairs); j++ {
+			if pairs[j].count > pairs[maxIdx].count {
+				maxIdx = j
+			}
+		}
+		pairs[i], pairs[maxIdx] = pairs[maxIdx], pairs[i]
+	}
+
+	end := n
+	if end > len(pairs) {
+		end = len(pairs)
+	}
+
+	result := make([]string, end)
+	for i := 0; i < end; i++ {
+		result[i] = pairs[i].key
+	}
+	return result
+}

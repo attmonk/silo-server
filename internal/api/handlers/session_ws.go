@@ -1,0 +1,183 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"sync"
+
+	"github.com/gorilla/websocket"
+
+	"github.com/Silo-Server/silo-server/internal/playback"
+)
+
+type realtimeClientMessage struct {
+	Type playback.RealtimeMessageType `json:"type"`
+}
+
+type sessionRealtimeConn struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
+func (c *sessionRealtimeConn) WriteJSON(v any) error {
+	if c == nil || c.conn == nil {
+		return playback.ErrRealtimeConnectionNotFound
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return writeWebSocketJSON(c.conn, v)
+}
+
+func (c *sessionRealtimeConn) WritePing() error {
+	if c == nil || c.conn == nil {
+		return playback.ErrRealtimeConnectionNotFound
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return writeWebSocketControl(c.conn, websocket.PingMessage, nil)
+}
+
+func (h *PlaybackHandler) handleRealtimeClientMessage(sessionID string, data []byte) error {
+	var base realtimeClientMessage
+	if err := json.Unmarshal(data, &base); err != nil {
+		return err
+	}
+
+	switch base.Type {
+	case playback.RealtimeMessageTypeHello:
+		var hello playback.HelloEnvelope
+		if err := json.Unmarshal(data, &hello); err != nil {
+			return err
+		}
+		if err := hello.Validate(); err != nil {
+			return err
+		}
+		if hello.SessionID != sessionID {
+			return playback.ErrInvalidRealtimePayload
+		}
+		if h.setRealtimeConnectionState(sessionID, true) {
+			h.syncSessionsNow(context.Background(), "realtime_hello")
+		}
+		h.touchSessionActivity(sessionID)
+		return nil
+	case playback.RealtimeMessageTypeAck:
+		var ack playback.AckEnvelope
+		if err := json.Unmarshal(data, &ack); err != nil {
+			return err
+		}
+		if err := ack.Validate(); err != nil {
+			return err
+		}
+		if ack.SessionID != sessionID {
+			return playback.ErrInvalidRealtimePayload
+		}
+		h.touchSessionActivity(sessionID)
+		if h.CommandTracker != nil {
+			h.CommandTracker.Ack(ack.CommandID)
+		}
+		return nil
+	case playback.RealtimeMessageTypeResult:
+		var result playback.ResultEnvelope
+		if err := json.Unmarshal(data, &result); err != nil {
+			return err
+		}
+		if err := result.Validate(); err != nil {
+			return err
+		}
+		if result.SessionID != sessionID {
+			return playback.ErrInvalidRealtimePayload
+		}
+		h.touchSessionActivity(sessionID)
+		// Establish ownership before mutating anything: a result naming another
+		// session's command must be rejected without canceling that command's
+		// deadline or dropping its record. An unknown command_id is not an
+		// error — a duplicate or late result for an already-completed command
+		// is normal traffic.
+		record, ok := h.getRealtimeCommand(result.CommandID)
+		if ok && record.SessionID != sessionID {
+			return playback.ErrInvalidRealtimePayload
+		}
+		if h.CommandTracker != nil {
+			h.CommandTracker.Result(result.CommandID)
+		}
+		if !ok {
+			return nil
+		}
+		h.forgetRealtimeCommand(result.CommandID)
+		if result.Status != playback.RealtimeResultStatusCompleted {
+			// A rejected plan_invalidated leaves the client running a route the
+			// server has withdrawn, and the tracker's deadline was already
+			// canceled by the result. Fall back to the same session stop an
+			// unnegotiated client gets; its recovery replans against the
+			// persisted verdict.
+			if record.Name == playback.CommandPlanInvalidated {
+				slog.Warn("client rejected a plan invalidation; stopping the session",
+					"session", sessionID, "playback_session_id", sessionID, "error", result.Error)
+				if err := h.stopPlaybackSessionByID(context.Background(), sessionID, ""); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
+					slog.Error("failed to stop playback after a rejected plan invalidation", "session", sessionID, "playback_session_id", sessionID, "error", err)
+				}
+			}
+			return nil
+		}
+		switch record.Name {
+		case playback.CommandStop, playback.CommandTerminate:
+			ctx := context.Background()
+			session, err := func() (*playback.Session, error) {
+				unlock := h.tm.LockSessionLifecycle(sessionID)
+				defer unlock()
+				session, err := h.sessionMgr.GetSession(sessionID)
+				if err != nil {
+					return nil, err
+				}
+				session, err = h.endPlaybackSessionAuthority(ctx, session, true)
+				if err == nil {
+					h.cleanupStoppedSessionTransport(ctx, session)
+				}
+				return session, err
+			}()
+			if err != nil {
+				if !errors.Is(err, playback.ErrSessionNotFound) {
+					slog.Error("failed to stop playback after realtime completion", "session", sessionID, "playback_session_id", sessionID, "error", err)
+				}
+				return nil
+			}
+			// Stop authority and transport immediately. Only provider/history
+			// finalization waits for an in-flight pause or resume scrobble.
+			h.runRealtimeResult(sessionID, false, func() {
+				h.cancelPlaybackStartSideEffectsV3(ctx, session.ID)
+				h.recordRealtimeStoppedSession(ctx, session)
+				h.syncSessionsNow(ctx, "stop")
+			})
+		case playback.CommandPause, playback.CommandUnpause:
+			// The player confirmed the new state; show it now instead of after
+			// its next progress report, up to ten seconds later.
+			paused := record.Name == playback.CommandPause
+			// The sequence must be read at receipt, on this reader. Keep the
+			// read well inside the default command deadline so a stalled
+			// store cannot hold back the next command's result and trigger
+			// its fallback stop; the next progress report recovers state.
+			ctx, cancel := context.WithTimeout(context.Background(), realtimeReceiptReadBudget)
+			attempt, err := h.realtimeProgressAttempt(ctx, sessionID)
+			cancel()
+			if err != nil {
+				slog.Warn("failed to read progress sequence at realtime confirmation", "session", sessionID, "error", err)
+				return nil
+			}
+			var sequence int64
+			if attempt != nil {
+				sequence = attempt.LastSequence
+			}
+			h.runRealtimeResult(sessionID, true, func() { h.setConfirmedPauseState(sessionID, paused, sequence) })
+		case playback.CommandPlanInvalidated:
+			// Completion means the client replanned itself; the session stays
+			// alive on its replacement plan and nothing else is required here.
+		}
+		return nil
+	default:
+		return playback.ErrInvalidRealtimePayload
+	}
+}

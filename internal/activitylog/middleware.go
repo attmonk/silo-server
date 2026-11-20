@@ -1,0 +1,260 @@
+package activitylog
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/Silo-Server/silo-server/internal/auditmutation"
+	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/httpstream"
+	"github.com/Silo-Server/silo-server/internal/logstream"
+)
+
+// excludedPrefixes are paths that should not be logged: the retained
+// operational probes, and the admin log endpoints, which the log viewer
+// polls (logging a read of the activity log into the activity log feeds
+// itself). /api/v2/admin/logs covers the app, audit, ws, ws-ticket and
+// ws/capabilities operations under that prefix. Transcode nodes call
+// /api/internal/nodes/ every second to report and ship their logs: those calls
+// are machine traffic, not activity, and a logged log shipment would feed
+// itself too.
+var excludedPrefixes = []string{
+	"/api/v1/health",
+	"/api/v1/ready",
+	"/api/v2/admin/logs",
+	"/api/internal/nodes/",
+}
+
+// streamPrefixes are paths logged only at session-start (not per-chunk), so
+// a playback session does not write one activity row per chunk.
+var streamPrefixes = []string{
+	"/api/v2/stream/",
+	"/api/v2/playback/transcode/",
+}
+
+// LogContext is a mutable holder stored in context BEFORE auth middleware.
+// Auth middleware populates it, and the activity log middleware reads it
+// after the handler chain completes.
+type LogContext = auditmutation.LogContext
+
+var SetLogContext = auditmutation.SetLogContext
+var GetLogContext = auditmutation.GetLogContext
+
+// PlaybackLogContext is a mutable holder for playback-specific correlation.
+// Handlers update it once they know the playback session ID, and both the
+// request logger and activity logger read it after the handler returns.
+type PlaybackLogContext struct {
+	PlaybackSessionID string
+}
+
+type playbackLogContextKey struct{}
+
+func SetPlaybackLogContext(ctx context.Context, lc *PlaybackLogContext) context.Context {
+	return context.WithValue(ctx, playbackLogContextKey{}, lc)
+}
+
+func GetPlaybackLogContext(ctx context.Context) *PlaybackLogContext {
+	lc, _ := ctx.Value(playbackLogContextKey{}).(*PlaybackLogContext)
+	return lc
+}
+
+// NewMiddleware returns chi-compatible middleware that logs every request
+// to the given Writer. It wraps ResponseWriter to capture the status code.
+// It stores a mutable LogContext in the request context that downstream auth
+// middleware can populate with user info.
+func NewMiddleware(w Writer, nodeID string, hubs ...*logstream.Hub) func(http.Handler) http.Handler {
+	return NewFilteredMiddleware(w, nodeID, nil, hubs...)
+}
+
+// NewFilteredMiddleware is NewMiddleware for a router that also serves requests
+// the activity log should not record. skipRoute receives the matched chi route
+// pattern after the handler returns and drops the entry when it reports true;
+// matching the pattern rather than the raw path keeps the filter independent
+// of any path rewriting the router does. A nil skipRoute records every request
+// NewMiddleware would.
+func NewFilteredMiddleware(w Writer, nodeID string, skipRoute func(pattern string) bool, hubs ...*logstream.Hub) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+
+			// Skip excluded endpoints
+			for _, prefix := range excludedPrefixes {
+				if strings.HasPrefix(path, prefix) {
+					next.ServeHTTP(rw, r)
+					return
+				}
+			}
+
+			// Skip per-chunk stream requests (segments, manifests after start)
+			for _, prefix := range streamPrefixes {
+				if strings.HasPrefix(path, prefix) && isStreamChunk(path) {
+					next.ServeHTTP(rw, r)
+					return
+				}
+			}
+
+			start := time.Now()
+			wrapped := &statusWriter{ResponseWriter: rw, status: http.StatusOK}
+
+			// Reuse any existing LogContext so request logging and activity logging
+			// observe the same auth-populated values.
+			lc := GetLogContext(r.Context())
+			if lc == nil {
+				lc = &LogContext{}
+				ctx := SetLogContext(r.Context(), lc)
+				r = r.WithContext(ctx)
+			}
+			playbackLC := GetPlaybackLogContext(r.Context())
+			if playbackLC == nil {
+				playbackLC = &PlaybackLogContext{}
+				ctx := SetPlaybackLogContext(r.Context(), playbackLC)
+				r = r.WithContext(ctx)
+			}
+
+			lc.Request, lc.NodeID, lc.Started = r, nodeID, start
+			if len(hubs) > 0 {
+				lc.Publish = func(entry AuditEntry) {
+					_, _ = logstream.PublishAppends(hubs[0], logstream.StreamAudit, []AuditEntry{entry})
+				}
+			}
+			next.ServeHTTP(wrapped, r)
+
+			pathPattern := path
+			if routeCtx := chi.RouteContext(r.Context()); routeCtx != nil {
+				if route := routeCtx.RoutePattern(); route != "" {
+					pathPattern = route
+				}
+			}
+			if skipRoute != nil && skipRoute(pathPattern) {
+				return
+			}
+			path = RedactSecretPathParams(r, path)
+
+			// After handler chain completes, auth middleware has populated lc
+			entry := LogEntry{
+				Timestamp:          start,
+				ClientIP:           clientip.FromContext(r.Context()),
+				UserID:             lc.UserID,
+				ImpersonatorUserID: lc.ImpersonatorUserID,
+				SessionID:          lc.SessionID,
+				PlaybackSessionID:  playbackLC.PlaybackSessionID,
+				RequestID:          middleware.GetReqID(r.Context()),
+				NodeID:             nodeID,
+				Method:             r.Method,
+				Path:               path,
+				PathPattern:        pathPattern,
+				StatusCode:         RecordedStatus(r, wrapped.status, wrapped.wroteHeader),
+				UserAgent:          auditmutation.BoundUserAgent(r.UserAgent()),
+				DurationMs:         int(time.Since(start).Milliseconds()),
+			}
+
+			// Domain rows already persisted atomically; avoid a second success
+			// row for the same operation, but still count it as the account's
+			// activity. Preserve a later HTTP failure separately.
+			for _, committed := range lc.Committed {
+				if committed.StatusCode == wrapped.status {
+					entry.Persisted = true
+					break
+				}
+			}
+			w.Write(entry)
+		})
+	}
+}
+
+// StatusClientClosedRequest is the status recorded for a request its client
+// abandoned, as nginx records it.
+const StatusClientClosedRequest = 499
+
+// RecordedStatus is the status to record for a request that ended with
+// status, where wrote says whether a response was started. A request whose
+// client went away and that got no response, or a server error, is recorded
+// as StatusClientClosedRequest: the client never saw an answer, and the
+// failure is not one the server has to count.
+func RecordedStatus(r *http.Request, status int, wrote bool) int {
+	if errors.Is(r.Context().Err(), context.Canceled) && (!wrote || status >= 500) {
+		return StatusClientClosedRequest
+	}
+	return status
+}
+
+// RedactSecretPathParams strips bearer credentials from a request path before
+// it reaches any log sink (auditmutation.RedactSecretPath). Must be called
+// after the handler chain ran so the chi route context is populated.
+func RedactSecretPathParams(r *http.Request, path string) string {
+	return auditmutation.RedactSecretPath(chi.RouteContext(r.Context()), path)
+}
+
+// isStreamChunk returns true if the path looks like a stream segment/manifest
+// chunk rather than a session-start request. The match is on path shape, not
+// on the API major: /api/v{1,2}/stream/{session_id} is a session start, while
+// its /subtitles/{track}[/fonts] children and the
+// /playback/transcode/{session_id}/{master.m3u8,segment/{name}} routes are
+// per-chunk fetches.
+func isStreamChunk(path string) bool {
+	return strings.Contains(path, "/segment/") ||
+		strings.Contains(path, "/master.m3u8") ||
+		strings.Contains(path, "/subtitles/")
+}
+
+// statusWriter wraps http.ResponseWriter to capture the status code.
+type statusWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.status = code
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *statusWriter) ReadFrom(src io.Reader) (int64, error) {
+	if !w.wroteHeader {
+		w.status, w.wroteHeader = http.StatusOK, true
+	}
+	return httpstream.ForwardReadFrom(w.ResponseWriter, w, src, 0, nil)
+}
+
+// Hijack implements http.Hijacker, required for WebSocket upgrades.
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not implement http.Hijacker")
+}
+
+// Unwrap returns the underlying ResponseWriter, preserving http.Flusher,
+// http.Hijacker, etc. (Go 1.20+ ResponseController pattern).
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// Flush implements http.Flusher directly as well: callers (and middlewares
+// like chi's Compress) discover flushing via a plain type assertion, which
+// Unwrap alone does not satisfy.
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}

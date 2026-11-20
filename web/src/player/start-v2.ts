@@ -1,0 +1,262 @@
+/**
+ * Starting playback on the native `/api/v2` contract.
+ *
+ * The flow is deliberately small: read capabilities (memoized per origin for
+ * a minute), check the server offers protocol v3, POST the start with the
+ * capabilities' `installation_id`, and retry while the failure looks
+ * transient: the capabilities read, then the identical start body. Start is
+ * idempotent server-side on `playback_attempt_id` plus the body digest, so a
+ * retry after a lost reply returns the stored decision instead of a second
+ * session. A 4xx is final: nothing is retained and the caller decides what
+ * to do.
+ */
+
+import { problemDisplayText } from "@/api/v2/request";
+import type { components } from "@/api/v2/schema";
+import { t } from "@/i18n";
+import { cancelBandwidthProbe } from "./bandwidth-probe";
+import type { PlayerConfig } from "./context/PlayerConfigContext";
+import {
+  isTransientPlayerRequestError,
+  playerFetchResponse,
+  PlayerFetchError,
+} from "./player-fetch";
+import { playerV2Origin } from "./player-v2";
+import type { DecisionResponseV3, ReplanRequestV3, StartRequestV3 } from "./protocol-v3";
+import { registerSessionMutations } from "./session-mutations";
+
+export type PlaybackCapabilitiesV2 = components["schemas"]["PlaybackCapabilities"];
+
+const CAPABILITIES_TTL_MS = 60_000;
+const START_BUDGET_MS = 60_000;
+// Covers the worker manifest readiness budget plus API transport overhead.
+const START_TIMEOUT_MS = 45_000;
+const CAPABILITIES_TIMEOUT_MS = 5_000;
+
+const capabilitiesCache = new Map<string, { at: number; cap: PlaybackCapabilitiesV2 }>();
+
+/** Drops memoized capabilities; tests and a changed viewer call this. */
+export function resetPlaybackCapabilitiesV2() {
+  capabilitiesCache.clear();
+}
+
+/**
+ * Reads `GET /api/v2/playback/capabilities`, memoized per API origin. A read
+ * that times out or cannot reach the server answers with the last
+ * capabilities this origin returned, however old: a slow read must not fail
+ * playback, and a start on a changed installation is refused with
+ * `installation_changed`, which drops them.
+ */
+export async function playbackCapabilitiesV2(
+  config: PlayerConfig,
+  options: { force?: boolean } = {},
+): Promise<PlaybackCapabilitiesV2> {
+  const origin = playerV2Origin(config);
+  const cached = capabilitiesCache.get(origin);
+  if (!options.force && cached && Date.now() - cached.at < CAPABILITIES_TTL_MS) return cached.cap;
+  try {
+    const response = await playerFetchResponse(config, `${origin}/api/v2/playback/capabilities`, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(CAPABILITIES_TIMEOUT_MS),
+    });
+    if (response.status === 404) throw new Error(t("web.player.error.v2Unavailable"));
+    if (!response.ok)
+      throw new PlayerFetchError(response.status, t("web.player.error.capabilitiesUnavailable"));
+    const cap = (await response.json()) as PlaybackCapabilitiesV2;
+    if (!Array.isArray(cap.features) || !Array.isArray(cap.protocol_versions))
+      throw new Error(t("web.player.error.capabilitiesInvalid"));
+    capabilitiesCache.set(origin, { at: Date.now(), cap });
+    return cap;
+  } catch (error) {
+    if (cached && isTransientPlayerRequestError(error)) return cached.cap;
+    throw error;
+  }
+}
+
+function numericFileID(value: unknown): number {
+  if (typeof value !== "string" || !/^[1-9]\d*$/.test(value))
+    throw new Error("Invalid playback media file ID");
+  const n = Number(value);
+  if (!Number.isSafeInteger(n))
+    throw new Error("Playback media file ID exceeds this player's supported range");
+  return n;
+}
+
+/** Converts a v2 decision (string ids) into the player's v3 shape (numeric ids). */
+export function decisionFromWireV2(
+  wire: components["schemas"]["PlaybackDecision"],
+): DecisionResponseV3 {
+  const plan = wire.playback_plan;
+  const converted = plan
+    ? {
+        ...plan,
+        requested_media_file_id: numericFileID(plan.requested_media_file_id),
+        effective_media_file_id: numericFileID(plan.effective_media_file_id),
+        source: { ...plan.source, media_file_id: numericFileID(plan.source.media_file_id) },
+      }
+    : undefined;
+  return { ...wire, playback_plan: converted } as DecisionResponseV3;
+}
+
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Starts playback through `POST /api/v2/playback/start` and registers the
+ * session for sequenced progress and stop. Throws PlayerFetchError for a
+ * refused start (4xx, including `installation_changed`) and a plain Error
+ * when capabilities rule out v2 playback.
+ */
+export async function startPlaybackV2(
+  config: PlayerConfig,
+  body: StartRequestV3,
+  options: { signal?: AbortSignal } = {},
+): Promise<DecisionResponseV3> {
+  // A background bandwidth probe would compete with the media about to load.
+  const endStart = cancelBandwidthProbe();
+  // A start that fails or returns no plan loads no media, so speed tests need
+  // not wait for it.
+  try {
+    const decision = await requestPlaybackStartV2(config, body, options);
+    if (!decision.playback_plan) endStart();
+    return decision;
+  } catch (error) {
+    endStart();
+    throw error;
+  }
+}
+
+async function requestPlaybackStartV2(
+  config: PlayerConfig,
+  body: StartRequestV3,
+  options: { signal?: AbortSignal },
+): Promise<DecisionResponseV3> {
+  const url = `${playerV2Origin(config)}/api/v2/playback/start`;
+  const deadline = Date.now() + START_BUDGET_MS;
+  // Built once from the first capabilities read that succeeds, so every
+  // retry sends the identical body.
+  let start: { installationId: string; payload: string } | undefined;
+  for (let attempt = 0; ; attempt++) {
+    options.signal?.throwIfAborted();
+    try {
+      start ??= startBody(await playbackCapabilitiesV2(config), body);
+      const { installationId, payload } = start;
+      const controller = new AbortController();
+      const timer = setTimeout(
+        () => controller.abort(new DOMException("Playback start timed out", "TimeoutError")),
+        Math.max(1, Math.min(START_TIMEOUT_MS, deadline - Date.now())),
+      );
+      const onAbort = () => controller.abort(options.signal?.reason);
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      let response: Response;
+      try {
+        response = await playerFetchResponse(config, url, {
+          method: "POST",
+          headers: { Accept: "application/json" },
+          body: payload,
+          signal: controller.signal,
+        });
+        // Keep cancellation active through body consumption. Losing a successful
+        // body is an uncertain START and must retry the same attempt.
+        const text = response.ok ? await response.text() : await response.text().catch(() => "");
+        options.signal?.throwIfAborted();
+        if (!response.ok) {
+          let message = t("web.player.error.startRefused");
+          let code: string | undefined;
+          try {
+            const problem = JSON.parse(text) as {
+              detail?: string;
+              title?: string;
+              type?: string;
+              errors?: { code?: string }[];
+            };
+            message = problemDisplayText(
+              problem,
+              problem.detail?.trim() || problem.title?.trim() || message,
+            );
+            code = problem.type?.split("?")[0]?.split("/").pop()?.replace(/#.*$/, "") || undefined;
+          } catch {
+            // A non-problem body keeps the generic message.
+          }
+          if (code === "installation_changed") resetPlaybackCapabilitiesV2();
+          throw new PlayerFetchError(response.status, message, code, text);
+        }
+        const decision = decisionFromWireV2(
+          JSON.parse(text) as components["schemas"]["PlaybackDecision"],
+        );
+        const sessionId = decision.playback_plan?.session_id ?? decision.session_id;
+        if (decision.playback_plan && sessionId) {
+          registerSessionMutations(sessionId, installationId);
+        }
+        return decision;
+      } finally {
+        clearTimeout(timer);
+        options.signal?.removeEventListener("abort", onAbort);
+      }
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      if (!isTransientPlayerRequestError(error) || Date.now() >= deadline) throw error;
+      await pause(Math.min(5_000, 500 * 2 ** attempt, deadline - Date.now()), options.signal);
+      if (Date.now() >= deadline) throw error;
+    }
+  }
+}
+
+/** The start body for these capabilities, or a plain Error when they rule v2 playback out. */
+function startBody(cap: PlaybackCapabilitiesV2, body: StartRequestV3) {
+  if (cap.state === "not_configured") throw new Error(t("web.player.error.notConfigured"));
+  if (cap.state !== "available" || !cap.allowed || !cap.installation_id)
+    throw new Error(t("web.player.error.notAvailableForAccount"));
+  if (!cap.protocol_versions.includes(3))
+    throw new Error(t("web.player.error.protocolUnsupported"));
+  if (body.allow_alternate_versions === false && !cap.features.includes("fixed_media_file_v1"))
+    throw new Error(t("web.player.error.fixedVersionUnsupported"));
+  const installationId = cap.installation_id;
+  const payload = JSON.stringify({
+    ...bufferingQualityWire(body, cap.features),
+    file_id: String(body.file_id),
+    installation_id: installationId,
+  } satisfies components["schemas"]["PlaybackStartBody"]);
+  return { installationId, payload };
+}
+
+/**
+ * Adds what the server's `features` allow: `buffering_quality_v1` with the
+ * estimate's source and `learned_limit`, and `playback_plan_summary_v1`. A
+ * server without the feature rejects those fields, so they are dropped. An
+ * estimate without a source stays without one: a repeated step-down estimate
+ * is not a new observation.
+ */
+export function bufferingQualityWire<T extends StartRequestV3 | ReplanRequestV3>(
+  body: T,
+  features: readonly string[],
+): T {
+  const result = { ...body, client_features: [...(body.client_features ?? [])] };
+  if (features.includes("buffering_quality_v1")) {
+    if (!result.client_features.includes("buffering_quality_v1"))
+      result.client_features.push("buffering_quality_v1");
+  } else {
+    delete result.bandwidth_estimate_source;
+    delete result.observed_throughput_kbps;
+    delete result.learned_limit;
+    result.client_features = result.client_features.filter((f) => f !== "buffering_quality_v1");
+  }
+  if (
+    features.includes("playback_plan_summary_v1") &&
+    !result.client_features.includes("playback_plan_summary_v1")
+  )
+    result.client_features.push("playback_plan_summary_v1");
+  return result;
+}

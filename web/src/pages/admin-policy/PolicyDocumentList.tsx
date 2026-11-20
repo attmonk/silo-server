@@ -1,0 +1,234 @@
+import { ArrowLeft, Plus } from "lucide-react";
+import { useState } from "react";
+import { useSearchParams } from "react-router";
+
+import type { PolicyDocument } from "@/api/adminPolicy";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { useT } from "@/i18n";
+import { PolicyEnabledControl } from "./PolicyRevisionReview";
+import { useCreatePolicyDocument, usePolicyDocuments } from "@/hooks/queries/admin/policy";
+
+import { PolicyEditorPanel } from "./PolicyEditorPanel";
+import { formatPolicyDate, messageFromError } from "./policyPageUtils";
+import { PolicyStatusPill, policyDocumentStatus, policyDomainMeta } from "./policyPresentation";
+
+interface PolicyDocumentListProps {
+  domains: readonly string[];
+}
+
+function parseDocumentID(value: string | null) {
+  if (!value) return undefined;
+  return value;
+}
+
+export function PolicyDocumentList({ domains }: PolicyDocumentListProps) {
+  const t = useT();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const documents = usePolicyDocuments();
+  const selectedDocumentId = parseDocumentID(searchParams.get("document"));
+
+  function selectDocument(id: string | undefined) {
+    const next = new URLSearchParams(searchParams);
+    if (id === undefined) {
+      next.delete("document");
+    } else {
+      next.set("document", String(id));
+    }
+    setSearchParams(next, { replace: true });
+  }
+
+  if (selectedDocumentId) {
+    return (
+      <div className="space-y-5">
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="text-muted-foreground -ms-2"
+          onClick={() => selectDocument(undefined)}
+        >
+          <ArrowLeft className="size-4" />
+          {t("web.admin.access.policy.allOverrides")}
+        </Button>
+        <PolicyEditorPanel documentId={selectedDocumentId} domains={domains} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      {documents.error && (
+        <div role="alert">
+          <p>
+            {messageFromError(documents.error, t("web.admin.access.policy.overrides.loadFailed"))}
+          </p>
+          <Button onClick={() => void documents.restart()}>
+            {t("web.admin.access.policy.overrides.restart")}
+          </Button>
+        </div>
+      )}
+      {documents.isLoading && (
+        <p className="text-muted-foreground text-sm">
+          {t("web.admin.access.policy.overrides.loading")}
+        </p>
+      )}
+      {!documents.isLoading &&
+        domains.map((domain) => (
+          <PolicyDomainCard
+            key={domain}
+            domain={domain}
+            documents={(documents.data ?? []).filter((document) => document.domain === domain)}
+            onSelect={selectDocument}
+          />
+        ))}
+      {documents.hasNextPage && (
+        <Button
+          onClick={() => void documents.fetchNextPage()}
+          disabled={documents.isFetchingNextPage}
+        >
+          {t("web.admin.access.policy.overrides.loadMore")}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+interface PolicyDomainCardProps {
+  domain: string;
+  documents: PolicyDocument[];
+  onSelect: (id: string) => void;
+}
+
+function PolicyDomainCard({ domain, documents, onSelect }: PolicyDomainCardProps) {
+  const t = useT();
+  const meta = policyDomainMeta(domain, t);
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const createDocument = useCreatePolicyDocument();
+
+  async function create() {
+    setError("");
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError(t("web.admin.access.policy.overrides.nameRequired"));
+      return;
+    }
+    try {
+      const document = await createDocument.mutateAsync({ domain, name: trimmedName });
+      setName("");
+      setCreating(false);
+      onSelect(document.id);
+    } catch (err) {
+      setError(messageFromError(err, t("web.admin.access.policy.overrides.createFailed")));
+    }
+  }
+
+  return (
+    <section className="surface-panel rounded-2xl border-0 p-5">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="flex min-w-0 items-start gap-3">
+          <div className="bg-secondary text-secondary-foreground rounded-xl p-2.5">
+            <meta.icon aria-hidden className="size-5" />
+          </div>
+          <div className="min-w-0 space-y-1">
+            <h2 className="text-base font-semibold tracking-tight">{meta.title}</h2>
+            <p className="text-muted-foreground max-w-prose text-sm">{meta.governs}</p>
+          </div>
+        </div>
+        {!creating && (
+          <Button type="button" variant="outline" size="sm" onClick={() => setCreating(true)}>
+            <Plus className="size-4" />
+            {t("web.admin.access.policy.overrides.new")}
+          </Button>
+        )}
+      </div>
+
+      {creating && (
+        <form
+          className="border-border mt-4 flex flex-wrap items-center gap-2 border-t pt-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void create();
+          }}
+        >
+          <Input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder={
+              meta.example
+                ? t("web.admin.access.policy.overrides.namePlaceholderExample", {
+                    example: meta.example,
+                  })
+                : t("web.admin.access.policy.overrides.namePlaceholder")
+            }
+            aria-label={t("web.admin.access.policy.overrides.nameLabel", { domain: meta.title })}
+            className="max-w-sm"
+            autoFocus
+          />
+          <Button type="submit" size="sm" disabled={createDocument.isPending}>
+            {t("web.admin.access.policy.overrides.create")}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              setCreating(false);
+              setName("");
+              setError("");
+            }}
+          >
+            {t("common.cancel")}
+          </Button>
+        </form>
+      )}
+
+      {error && <p className="text-destructive mt-3 text-sm">{error}</p>}
+
+      {documents.length > 0 ? (
+        <ul className="border-border mt-4 divide-y divide-[color:var(--border)] border-t">
+          {documents.map((document) => (
+            <li key={document.id}>
+              <div
+                role="button"
+                tabIndex={0}
+                className="hover:bg-secondary/40 focus-visible:ring-ring/60 -mx-2 flex cursor-pointer flex-wrap items-center gap-3 rounded-lg px-2 py-3 outline-none focus-visible:ring-2"
+                onClick={() => onSelect(document.id)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") onSelect(document.id);
+                }}
+              >
+                <span className="min-w-0 flex-1 truncate text-sm font-medium">{document.name}</span>
+                <PolicyStatusPill status={policyDocumentStatus(document)} />
+                <span className="text-muted-foreground hidden text-xs sm:block">
+                  {t("web.admin.access.policy.overrides.updated", {
+                    date: formatPolicyDate(document.updated_at),
+                  })}
+                </span>
+                <span
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                >
+                  <PolicyEnabledControl document={document} />
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        !creating && (
+          <p className="text-muted-foreground border-border mt-4 border-t pt-4 text-sm">
+            {meta.example
+              ? t("web.admin.access.policy.overrides.emptyExample", {
+                  example: meta.example,
+                  hint: (chunks) => <span className="text-muted-foreground/80">{chunks}</span>,
+                })
+              : t("web.admin.access.policy.overrides.empty")}
+          </p>
+        )
+      )}
+    </section>
+  );
+}

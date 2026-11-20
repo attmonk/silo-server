@@ -1,0 +1,304 @@
+package jellycompat
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/watchstate"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+func viewerRequest(method, target, body, param, value string, session *Session) *http.Request {
+	r := httptest.NewRequest(method, target, strings.NewReader(body))
+	route := chi.NewRouteContext()
+	route.URLParams.Add(param, value)
+	ctx := context.WithValue(r.Context(), chi.RouteCtxKey, route)
+	return r.WithContext(context.WithValue(ctx, compatSessionKey, session))
+}
+
+func TestUserDataUpdatePersistsPartialFieldsAndProfileIsolation(t *testing.T) {
+	store := newJellycompatUserStore(t)
+	if err := store.CreateProfile(t.Context(), userstore.Profile{ID: "profile-2", Name: "Other"}); err != nil {
+		t.Fatal(err)
+	}
+	provider := notifications.WrapUserStoreProvider(compatTestUserStoreProvider{store: store}, &notifications.System{})
+	service := &directUserDataService{storeProvider: provider, watchState: watchstate.NewService(provider)}
+	codec := NewResourceIDCodec()
+	id := codec.EncodeStringID(EncodedIDItem, "movie-1")
+	h := NewUserDataHandler(&stubContentService{detail: &upstreamItemDetail{ContentID: "movie-1", Type: "movie", Runtime: 100}}, service, codec, &config.Config{})
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1", PseudoUserID: uuid.New()}
+	run := func(body string) itemUserDataDTO {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.HandleUpdateUserData(rec, viewerRequest("POST", "/", body, "itemId", id, session))
+		if rec.Code != 200 {
+			t.Fatalf("update %s: %d %s", body, rec.Code, rec.Body.String())
+		}
+		var dto itemUserDataDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
+			t.Fatal(err)
+		}
+		return dto
+	}
+	dto := run(`{"PlaybackPositionTicks":1230000000,"IsFavorite":true,"LastPlayedDate":"2025-01-02T03:04:05Z"}`)
+	if dto.PlaybackPositionTicks != 1230000000 || !dto.IsFavorite || dto.LastPlayedDate != "2025-01-02T03:04:05Z" {
+		t.Fatalf("lost values: %+v", dto)
+	}
+	dto = run(`{"IsFavorite":false}`)
+	if dto.IsFavorite || dto.PlaybackPositionTicks != 1230000000 {
+		t.Fatalf("partial update overwrote progress: %+v", dto)
+	}
+	dto = run(`{"Played":true,"UnplayedItemCount":0}`)
+	if !dto.Played || dto.PlaybackPositionTicks != 0 {
+		t.Fatalf("mark played retained resume position: %+v", dto)
+	}
+	dto = run(`{"Played":true,"PlaybackPositionTicks":70000000}`)
+	if dto.PlaybackPositionTicks != 70000000 {
+		t.Fatalf("explicit rewatch position lost: %+v", dto)
+	}
+
+	dto = run(`{"Played":true,"PlayedPercentage":25}`)
+	if !dto.Played || dto.PlaybackPositionTicks != 15000000000 {
+		t.Fatalf("percentage edit lost state: %+v", dto)
+	}
+	beforeDateEdit, err := store.ListHistory(t.Context(), "profile-1", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dto = run(`{"LastPlayedDate":"2023-01-01T00:00:00Z"}`)
+	afterDateEdit, err := store.ListHistory(t.Context(), "profile-1", 10, 0)
+	if err != nil || len(afterDateEdit) != len(beforeDateEdit) || dto.PlaybackPositionTicks != 15000000000 || dto.LastPlayedDate != "2023-01-01T00:00:00Z" {
+		t.Fatalf("date-only edit changed history/progress: %+v %v", dto, err)
+	}
+	// Jellyfin reads a LastPlayedDate without an offset as UTC (#3257).
+	dto = run(`{"Played":false,"PlaybackPositionTicks":50000000,"LastPlayedDate":"2024-01-01T00:00:00.0000000"}`)
+	if dto.Played || dto.PlaybackPositionTicks != 50000000 || dto.LastPlayedDate != "2024-01-01T00:00:00Z" {
+		t.Fatalf("historical edit suppressed: %+v", dto)
+	}
+	for _, body := range []string{`{"Rating":5,"IsFavorite":true}`, `{"Likes":true,"IsFavorite":true}`} {
+		rec := httptest.NewRecorder()
+		h.HandleUpdateUserData(rec, viewerRequest("POST", "/", body, "itemId", id, session))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("unsupported writable field: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	dto = run(`{"UnplayedItemCount":10,"Key":"echo","ItemId":"echo"}`)
+	if dto.IsFavorite || dto.PlaybackPositionTicks != 50000000 {
+		t.Fatalf("echoed read-only fields changed state: %+v", dto)
+	}
+	other, err := store.GetProgress(t.Context(), "profile-2", "movie-1")
+	if err != nil || other != nil {
+		t.Fatalf("cross-profile state: %+v %v", other, err)
+	}
+}
+
+type failingViewerStore struct{ userstore.UserStore }
+
+func (failingViewerStore) GetJellycompatDisplayPrefs(context.Context, string, string) (string, error) {
+	return "", errors.New("read unavailable")
+}
+func (failingViewerStore) SetJellycompatDisplayPrefs(context.Context, string, string, string) error {
+	return errors.New("write unavailable")
+}
+
+func TestDisplayPreferencesProfileIsolationAndFailures(t *testing.T) {
+	store := newJellycompatUserStore(t)
+	h := NewDisplayPreferencesHandler(compatTestUserStoreProvider{store: store})
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	rec := httptest.NewRecorder()
+	h.HandleUpdateDisplayPreferences(rec, viewerRequest("POST", "/?client=web", `{"ViewType":"List","IndexBy":"Genres"}`, "displayPreferencesId", "home", session))
+	if rec.Code != 204 {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.HandleGetDisplayPreferences(rec, viewerRequest("GET", "/?client=web", "", "displayPreferencesId", "home", session))
+	var dto displayPreferencesDTO
+	_ = json.Unmarshal(rec.Body.Bytes(), &dto)
+	if dto.ViewType != "List" || dto.IndexBy != "Genres" {
+		t.Fatalf("lost fields %+v", dto)
+	}
+	if err := store.CreateProfile(t.Context(), userstore.Profile{ID: "profile-2", Name: "Other"}); err != nil {
+		t.Fatal(err)
+	}
+	session.ProfileID = "profile-2"
+	rec = httptest.NewRecorder()
+	h.HandleGetDisplayPreferences(rec, viewerRequest("GET", "/?client=web", "", "displayPreferencesId", "home", session))
+	_ = json.Unmarshal(rec.Body.Bytes(), &dto)
+	if rec.Code != 200 || dto.ViewType == "List" {
+		t.Fatalf("profile leak %d %+v", rec.Code, dto)
+	}
+	h = NewDisplayPreferencesHandler(compatTestUserStoreProvider{store: failingViewerStore{store}})
+	for _, method := range []string{"GET", "POST"} {
+		rec = httptest.NewRecorder()
+		req := viewerRequest(method, "/", `{}`, "displayPreferencesId", "home", session)
+		if method == "GET" {
+			h.HandleGetDisplayPreferences(rec, req)
+		} else {
+			h.HandleUpdateDisplayPreferences(rec, req)
+		}
+		if rec.Code != 500 {
+			t.Fatalf("%s failure returned %d", method, rec.Code)
+		}
+	}
+}
+
+type failingProgressStore struct{ userstore.UserStore }
+
+func (failingProgressStore) ApplyJellycompatProgress(context.Context, string, userstore.JellycompatProgressEdit) error {
+	return errors.New("progress write unavailable")
+}
+
+type deniedViewerContent struct{ ContentService }
+
+func (deniedViewerContent) GetItemDetail(context.Context, *Session, string, *int) (*upstreamItemDetail, error) {
+	return nil, &HTTPError{StatusCode: 404, Message: "Item not found"}
+}
+
+func TestUserDataFailureAndInaccessibleItemDoNotReportSuccess(t *testing.T) {
+	store := newJellycompatUserStore(t)
+	codec := NewResourceIDCodec()
+	id := codec.EncodeStringID(EncodedIDItem, "movie-1")
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+	service := &directUserDataService{storeProvider: compatTestUserStoreProvider{store: failingProgressStore{store}}}
+	service.watchState = watchstate.NewService(service.storeProvider)
+	h := NewUserDataHandler(&stubContentService{detail: &upstreamItemDetail{ContentID: "movie-1", Type: "movie"}}, service, codec, &config.Config{})
+	rec := httptest.NewRecorder()
+	h.HandleUpdateUserData(rec, viewerRequest("POST", "/", `{"PlaybackPositionTicks":10000000}`, "itemId", id, session))
+	if rec.Code != 500 {
+		t.Fatalf("failed update returned %d %s", rec.Code, rec.Body.String())
+	}
+	h.content = deniedViewerContent{}
+	rec = httptest.NewRecorder()
+	h.HandleAddFavorite(rec, viewerRequest("POST", "/", "", "itemId", id, session))
+	if rec.Code != 404 {
+		t.Fatal(rec.Code)
+	}
+	favorite, err := store.IsFavorite(t.Context(), session.ProfileID, "movie-1")
+	if err != nil || favorite {
+		t.Fatalf("inaccessible favorite mutated %v %v", favorite, err)
+	}
+}
+
+type failingConfigurationStore struct{ userstore.UserStore }
+
+func (failingConfigurationStore) WithPreferenceSettingsTransaction(context.Context, func(userstore.PreferenceSettingsWriter) error) error {
+	return errors.New("transaction unavailable")
+}
+
+func TestConfigurationFailureAndForeignProfile(t *testing.T) {
+	store := newJellycompatUserStore(t)
+	h := NewAuthHandler(func() *config.Config { return &config.Config{} }, nil, nil).WithUserStore(compatTestUserStoreProvider{store: failingConfigurationStore{store}})
+	session := &Session{StreamAppUserID: 1, ProfileID: "profile-1", PseudoUserID: uuid.New()}
+	rec := httptest.NewRecorder()
+	h.HandleUpdateConfiguration(rec, viewerRequest("POST", "/", `{"SubtitleMode":"Always"}`, "", "", session))
+	if rec.Code != 500 {
+		t.Fatalf("failed config update returned %d %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.HandleUpdateConfiguration(rec, viewerRequest("POST", "/", `{"SubtitleMode":"Always"}`, "userId", uuid.NewString(), session))
+	if rec.Code != 404 {
+		t.Fatalf("foreign profile status %d", rec.Code)
+	}
+}
+
+// Expose only the existing atomic batch capability; a dated series mark must
+// not require a second pass through the individual progress-edit capability.
+type batchOnlyViewerStore struct {
+	userstore.UserStore
+	userstore.WatchedBatchWriter
+}
+
+var errIndividualViewerWrite = errors.New("individual viewer-state write forbidden")
+
+func (batchOnlyViewerStore) MarkWatched(context.Context, string, string, float64) error {
+	return errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) MarkProgressBatch(context.Context, string, []string, time.Time) error {
+	return errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) SetProgress(context.Context, string, string, float64, float64, userstore.ProgressThresholds) error {
+	return errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) SetProgressAt(context.Context, string, string, float64, float64, bool, time.Time) error {
+	return errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) UpdateProgress(context.Context, string, string, float64, float64, userstore.ProgressThresholds) error {
+	return errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) ApplyJellycompatProgress(context.Context, string, userstore.JellycompatProgressEdit) error {
+	return errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) AddHistory(context.Context, userstore.WatchHistoryEntry) error {
+	return errIndividualViewerWrite
+}
+
+func (batchOnlyViewerStore) SetProgressIfNewer(context.Context, string, string, float64, float64, bool, time.Time) (bool, error) {
+	return false, errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) ClearProgress(context.Context, string, string) error {
+	return errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) ClearProgressBatch(context.Context, string, []string, time.Time) error {
+	return errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) UpdateProgressHints(context.Context, string, string, userstore.VersionHints) error {
+	return errIndividualViewerWrite
+}
+func (batchOnlyViewerStore) AddHistoryIfMissing(context.Context, userstore.WatchHistoryEntry) (bool, error) {
+	return false, errIndividualViewerWrite
+}
+func TestUserDataDateBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name, supplied string
+		wantCurrent    bool
+	}{
+		{"zero", "0001-01-01T00:00:00Z", true},
+		{"future", time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339), true},
+		{"historical", "2024-01-02T03:04:05Z", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newJellycompatUserStore(t)
+			provider := compatTestUserStoreProvider{store: store}
+			service := &directUserDataService{storeProvider: provider, watchState: watchstate.NewService(provider)}
+			codec := NewResourceIDCodec()
+			h := NewUserDataHandler(&stubContentService{detail: &upstreamItemDetail{ContentID: "movie-1", Type: "movie"}}, service, codec, &config.Config{})
+			session := &Session{StreamAppUserID: 1, ProfileID: "profile-1"}
+			recorder := httptest.NewRecorder()
+			before := time.Now().UTC().Truncate(time.Millisecond)
+			h.HandleUpdateUserData(recorder, viewerRequest("POST", "/", `{"Played":true,"LastPlayedDate":"`+tc.supplied+`"}`, "itemId", codec.EncodeStringID(EncodedIDItem, "movie-1"), session))
+			after := time.Now().UTC()
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("update: %d %s", recorder.Code, recorder.Body.String())
+			}
+			var dto itemUserDataDTO
+			if err := json.Unmarshal(recorder.Body.Bytes(), &dto); err != nil {
+				t.Fatal(err)
+			}
+			actual, err := time.Parse(time.RFC3339Nano, dto.LastPlayedDate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantCurrent {
+				if actual.Before(before) || actual.After(after) {
+					t.Fatalf("date was not normalized to current time: %s", actual)
+				}
+			} else if dto.LastPlayedDate != tc.supplied {
+				t.Fatalf("historical date changed: %s", dto.LastPlayedDate)
+			}
+			history, err := store.ListHistory(t.Context(), "profile-1", 10, 0)
+			if err != nil || len(history) != 1 || history[0].WatchedAt != actual.UTC().Format(time.RFC3339) {
+				t.Fatalf("history and progress dates disagree: %+v %v", history, err)
+			}
+		})
+	}
+}

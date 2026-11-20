@@ -1,0 +1,848 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/Silo-Server/silo-server/internal/adminjob"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/collections/templates"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+const (
+	adminCollectionBackdrop = "backdrop"
+	adminCollectionVisible  = "visible"
+	adminCollectionHidden   = "hidden"
+)
+
+type AdminCollection = libraryCollectionResponse
+type AdminCollectionsList = libraryCollectionsListResponse
+type AdminCollectionCreate = createLibraryCollectionRequest
+type AdminCollectionUpdate = updateLibraryCollectionRequest
+type AdminCollectionPreview = previewLibraryCollectionResponse
+type AdminCollectionPreviewRequest = previewCollectionRequest
+type AdminCollectionImportMDBList = importMDBListRequest
+type AdminCollectionImportTMDB = importTMDBRequest
+type AdminCollectionImportTMDBList = importTMDBListRequest
+type AdminCollectionImportResult = importCollectionResponse
+type AdminCollectionTemplateApply = applyTemplateBundleRequest
+type AdminCollectionTemplateResult = applyTemplateBundleResponse
+
+type adminCollectionRevisionKey struct{}
+
+func WithAdminCollectionExpectedRevision(ctx context.Context, revision int64) context.Context {
+	return context.WithValue(ctx, adminCollectionRevisionKey{}, revision)
+}
+func adminCollectionExpectedRevision(ctx context.Context) *int64 {
+	if v, ok := ctx.Value(adminCollectionRevisionKey{}).(int64); ok {
+		return new(v)
+	}
+	return nil
+}
+
+type adminCollectionArtwork func(string, string, string) error
+
+func (h *LibraryCollectionHandler) adminArtworkSources(ctx context.Context) adminCollectionArtwork {
+	return func(id, poster, backdrop string) error {
+		for kind, url := range map[string]string{collectionImagePoster: poster, adminCollectionBackdrop: backdrop} {
+			if strings.TrimSpace(url) != "" {
+				if err := h.SetAdminCollectionArtworkSource(ctx, id, kind, url); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+}
+
+func (h *LibraryCollectionHandler) ListAdminCollections(ctx context.Context, libraryID *int) (AdminCollectionsList, error) {
+	var none AdminCollectionsList
+	collectionsCh := make(chan []*models.LibraryCollection, 1)
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		collections, err := h.repo.ListAll(egCtx, libraryID, catalog.ListLibraryCollectionsOptions{IncludeHidden: true})
+		if err != nil {
+			return err
+		}
+		collectionsCh <- collections
+		return nil
+	})
+	var groupsCh chan []models.LibraryCollectionGroup
+	if libraryID != nil && h.GroupRepo != nil {
+		scopedID := *libraryID
+		groupsCh = make(chan []models.LibraryCollectionGroup, 1)
+		eg.Go(func() error {
+			groups, err := h.GroupRepo.ListByLibrary(egCtx, scopedID)
+			if err != nil {
+				return err
+			}
+			groupsCh <- groups
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to load collections")
+	}
+	collections := h.withViewerPosters(ctx, <-collectionsCh, AccessFilterFromContext(ctx, ""))
+	var groups []models.LibraryCollectionGroup
+	if groupsCh != nil {
+		groups = <-groupsCh
+	}
+
+	resp := libraryCollectionsListResponse{
+		Collections: make([]libraryCollectionResponse, 0, len(collections)),
+	}
+	for _, collection := range collections {
+		resp.Collections = append(resp.Collections, h.libraryCollectionResponseOf(ctx, collection))
+	}
+	if libraryID != nil {
+		resp.Groups = toLibraryCollectionGroupResponses(groups)
+	}
+	return resp, nil
+}
+
+func (h *LibraryCollectionHandler) createAdminCollection(ctx context.Context, req AdminCollectionCreate, artwork adminCollectionArtwork) (AdminCollection, error) {
+	var none AdminCollection
+	if err := validateCollectionVisibility(req.Visibility); err != nil {
+		return none, err
+	}
+	if !hasLibrarySelection(req.LibraryID, req.LibraryIDs) || strings.TrimSpace(req.Title) == "" {
+		return none, apiError(http.StatusBadRequest, "bad_request", "library_id/library_ids and title are required")
+	}
+	if req.Slug == "" {
+		req.Slug = slugifyCollectionName(req.Title)
+	}
+	if req.CollectionType == "" {
+		req.CollectionType = collectionManagementModeManual
+	}
+	var syncSchedule *string
+	if s := strings.TrimSpace(req.SyncSchedule); s != "" {
+		syncSchedule = &s
+	}
+	input := catalog.CreateLibraryCollectionInput{
+		LibraryID:        req.LibraryID,
+		LibraryIDs:       req.LibraryIDs,
+		Slug:             req.Slug,
+		Title:            req.Title,
+		Description:      req.Description,
+		CollectionType:   req.CollectionType,
+		Visibility:       req.Visibility,
+		SortOrder:        req.SortOrder,
+		GroupID:          req.GroupID,
+		Featured:         req.Featured,
+		PosterURL:        req.PosterURL,
+		BackdropURL:      req.BackdropURL,
+		SourceURL:        req.SourceURL,
+		QueryDefinition:  req.QueryDefinition,
+		SortConfig:       req.SortConfig,
+		SourceConfig:     req.SourceConfig,
+		ManagementMode:   req.ManagementMode,
+		ManagementSource: req.ManagementSource,
+		ManagementKey:    req.ManagementKey,
+		SyncSchedule:     syncSchedule,
+		UniqueTitle:      true,
+	}
+	if err := normalizeAdminCollectionInput(&input); err != nil {
+		return none, err
+	}
+	if input.CollectionType == collectionTypeSmart {
+		if err := requireSmartCollectionRule(input.QueryDefinition); err != nil {
+			return none, err
+		}
+	}
+
+	collection, err := h.repo.Create(ctx, input)
+	if err != nil {
+		if fieldErr := collectionNameError(err); fieldErr != nil {
+			return none, fieldErr
+		}
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to create collection")
+	}
+
+	posterStored, _, _, err := h.storeBundledTemplatePoster(ctx, collection.ID, req.PosterURL, false)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to process template poster")
+	}
+	if err := artwork(collection.ID, req.PosterSourceURL, req.BackdropSourceURL); err != nil {
+		return none, collectionArtworkError(err, "Failed to process uploaded images")
+	}
+	if posterStored || artwork != nil || strings.TrimSpace(req.PosterSourceURL) != "" || strings.TrimSpace(req.BackdropSourceURL) != "" {
+		collection, err = h.repo.GetByID(ctx, collection.ID)
+		if err != nil {
+			return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to load collection")
+		}
+	}
+	h.refreshSmartCountAsync(collection.ID)
+
+	return h.libraryCollectionResponseOf(ctx, h.withViewerPoster(ctx, collection)), nil
+}
+func (h *LibraryCollectionHandler) CreateAdminCollection(ctx context.Context, req AdminCollectionCreate) (AdminCollection, error) {
+	return h.createAdminCollection(ctx, req, h.adminArtworkSources(ctx))
+}
+
+func (h *LibraryCollectionHandler) updateAdminCollection(ctx context.Context, collectionID string, req AdminCollectionUpdate, artwork adminCollectionArtwork) (AdminCollection, error) {
+	var none AdminCollection
+	if req.CollectionType != nil {
+		if err := validateCollectionType(*req.CollectionType); err != nil {
+			return none, err
+		}
+	}
+	visibility, err := normalizeCollectionVisibilityUpdate(req.Visibility)
+	if err != nil {
+		return none, err
+	}
+	req.Visibility = visibility
+	// A collection shows in at least one library; with none it would drop out
+	// of every library's list while the update reported success.
+	if req.LibraryIDs != nil && len(uniquePositiveInts(*req.LibraryIDs)) == 0 {
+		return none, fieldError("library_ids", "Choose at least one library")
+	}
+	existing, err := h.repo.GetByID(ctx, collectionID)
+	if err != nil {
+		return none, adminCollectionLookupAPIError(err)
+	}
+	if err := validateAdminCollectionSourceUpdate(existing, req); err != nil {
+		return none, err
+	}
+	queryDefinition := req.QueryDefinition
+	if len(req.QueryDefinition) > 0 {
+		var err error
+		if req.CollectionType == nil || *req.CollectionType == collectionTypeSmart {
+			queryDefinition, err = normalizeSmartCollectionQueryDefinitionJSON(req.QueryDefinition, false, false)
+		} else {
+			queryDefinition, err = normalizeQueryDefinitionJSON(req.QueryDefinition, false, false)
+		}
+		if err != nil {
+			return none, apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
+		}
+	}
+	if err := adminSmartRuleCheck(existing.CollectionType, existing.QueryDefinition, req, queryDefinition); err != nil {
+		return none, err
+	}
+
+	sortConfig := req.SortConfig
+	if len(req.SortConfig) > 0 {
+		normalized, err := NormalizeCollectionSortConfig(req.SortConfig, false)
+		if err != nil {
+			return none, apiError(http.StatusBadRequest, "bad_request", err.Error())
+		}
+		sortConfig = json.RawMessage(normalized)
+	}
+
+	// Validate sync_schedule if provided.
+	if req.SyncSchedule != nil && *req.SyncSchedule != "" {
+		if err := catalog.ParseCronExpression(*req.SyncSchedule); err != nil {
+			return none, apiError(http.StatusBadRequest, "bad_request", err.Error())
+		}
+	}
+
+	var setGroupID **string
+	if req.GroupID.Set() {
+		groupID := req.GroupID.Value()
+		if groupID != nil && strings.TrimSpace(*groupID) == "" {
+			groupID = nil
+		}
+		setGroupID = &groupID
+	}
+
+	if err := h.repo.Update(ctx, catalog.UpdateLibraryCollectionInput{
+		ID:               collectionID,
+		ExpectedRevision: adminCollectionExpectedRevision(ctx),
+		LibraryIDs:       req.LibraryIDs,
+		Slug:             req.Slug,
+		Title:            req.Title,
+		Description:      req.Description,
+		CollectionType:   req.CollectionType,
+		Visibility:       req.Visibility,
+		SortOrder:        req.SortOrder,
+		SetGroupID:       setGroupID,
+		Featured:         req.Featured,
+		PosterURL:        req.PosterURL,
+		BackdropURL:      req.BackdropURL,
+		SourceURL:        req.SourceURL,
+		QueryDefinition:  queryDefinition,
+		SortConfig:       sortConfig,
+		SourceConfig:     req.SourceConfig,
+		ManagementMode:   normalizeOptionalCollectionManagementMode(req.ManagementMode),
+		ManagementSource: req.ManagementSource,
+		ManagementKey:    req.ManagementKey,
+		SyncSchedule:     req.SyncSchedule,
+		UniqueTitle:      true,
+	}); err != nil {
+		if fieldErr := collectionNameError(err); fieldErr != nil {
+			return none, fieldErr
+		}
+		if errors.Is(err, catalog.ErrLibraryCollectionRevisionMismatch) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return none, err
+		}
+		if errors.Is(err, catalog.ErrLibraryCollectionNotFound) {
+			return none, apiError(http.StatusNotFound, "not_found", "Collection not found")
+		}
+		if errors.Is(err, catalog.ErrLibraryCollectionGroupNotFound) {
+			return none, apiError(http.StatusNotFound, "not_found", "Collection group not found")
+		}
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to update collection")
+	}
+	if req.Title != nil {
+		h.renameCollectionRows(ctx, collectionID, existing.Title, *req.Title)
+	}
+
+	if err := artwork(collectionID, pointerStringValue(req.PosterSourceURL), pointerStringValue(req.BackdropSourceURL)); err != nil {
+		return none, collectionArtworkError(err, "Failed to process uploaded images")
+	}
+
+	updated, err := h.repo.GetByID(ctx, collectionID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to load collection")
+	}
+	if len(queryDefinition) > 0 || req.CollectionType != nil {
+		h.refreshSmartCountAsync(collectionID)
+	}
+	return h.libraryCollectionResponseOf(ctx, h.withViewerPoster(ctx, updated)), nil
+}
+
+// collectionNameError answers a title another collection in one of the
+// collection's libraries already has, or a slug another collection of its
+// library already uses, as a validation error at that field, which v2
+// answers as 422 validation_failed at body.title or body.slug. Nil for any
+// other error.
+func collectionNameError(err error) *APIError {
+	if taken, ok := errors.AsType[*catalog.LibraryCollectionTitleTakenError](err); ok {
+		return fieldError("title", fmt.Sprintf("Another collection in %s already has this name", taken.LibraryName)).WithCause(err)
+	}
+	if catalog.IsLibraryCollectionSlugConflict(err) {
+		return fieldError("slug", "Another collection in this library already uses this slug").WithCause(err)
+	}
+	return nil
+}
+
+// validateCollectionType rejects values the library_collections
+// collection_type CHECK constraint would refuse. Create and restore skip it for
+// an empty value, which defaults to manual; an update has no default to fall
+// back to, so an explicit empty value is an error.
+func validateCollectionType(collectionType string) error {
+	if catalog.IsKnownType(collectionType) {
+		return nil
+	}
+	return fieldError("collection_type", "collection_type must be manual, smart, mdblist, or tmdb")
+}
+
+// normalizeCollectionVisibilityUpdate validates an update's visibility. Nil
+// means "not provided" and stays nil; an explicit empty value means the
+// default, so it becomes visible rather than reaching the CHECK constraint.
+func normalizeCollectionVisibilityUpdate(visibility *string) (*string, error) {
+	if visibility == nil {
+		return nil, nil
+	}
+	if err := validateCollectionVisibility(*visibility); err != nil {
+		return nil, err
+	}
+	if *visibility == "" {
+		v := adminCollectionVisible
+		return &v, nil
+	}
+	return visibility, nil
+}
+
+// normalizeAdminCollectionInput validates and normalizes the fields of a new
+// admin collection as the create command takes them: its visibility, type, title,
+// TMDB list source, rules (a smart collection's checked as smart rules),
+// sort, sync schedule, and management fields. It fills the defaults the
+// command stores and rewrites the JSON fields in their normalized form.
+func normalizeAdminCollectionInput(in *catalog.CreateLibraryCollectionInput) error {
+	if err := validateCollectionVisibility(in.Visibility); err != nil {
+		return err
+	}
+	if in.CollectionType != "" {
+		if err := validateCollectionType(in.CollectionType); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(in.Title) == "" {
+		return apiError(http.StatusBadRequest, "bad_request", "title is required")
+	}
+	if err := validateTMDBListSourceConfig(in.SourceConfig, in.SourceURL); err != nil {
+		return apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+	queryDefinition := defaultJSON(in.QueryDefinition)
+	if in.CollectionType == collectionTypeSmart {
+		var err error
+		if queryDefinition, err = normalizeSmartCollectionQueryDefinitionJSON(queryDefinition, false, false); err != nil {
+			return apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
+		}
+	} else if len(in.QueryDefinition) > 0 {
+		var err error
+		if queryDefinition, err = normalizeQueryDefinitionJSON(queryDefinition, false, false); err != nil {
+			return apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
+		}
+	}
+	// Library collections resolve with user scope stripped, so per-profile sort
+	// fields are rejected here rather than failing at browse time.
+	sortConfig, err := NormalizeCollectionSortConfig(in.SortConfig, false)
+	if err != nil {
+		return apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+	if in.SyncSchedule != nil {
+		if err := catalog.ParseCronExpression(*in.SyncSchedule); err != nil {
+			return apiError(http.StatusBadRequest, "bad_request", err.Error())
+		}
+	}
+	managementMode, managementSource, managementKey, err := normalizeCollectionManagementFields(in.ManagementMode, in.ManagementSource, in.ManagementKey)
+	if err != nil {
+		return apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+	in.Visibility = defaultCollectionVisibility(in.Visibility)
+	in.QueryDefinition, in.SortConfig = queryDefinition, json.RawMessage(sortConfig)
+	in.SourceConfig = defaultCollectionSourceConfig(in.SourceConfig)
+	in.ManagementMode, in.ManagementSource, in.ManagementKey = managementMode, managementSource, managementKey
+	return nil
+}
+
+// CheckRestoredCollection applies the admin collection create command's
+// checks (normalizeAdminCollectionInput) to a collection a backup restore
+// writes, so a restore stores nothing the editor would refuse.
+func (h *LibraryCollectionHandler) CheckRestoredCollection(in catalog.CreateLibraryCollectionInput) error {
+	return restoreCheckError(normalizeAdminCollectionInput(&in))
+}
+
+// restoreCheckError is an editor's refusal as a restore reports it: the
+// message an admin would have read, without the API error code.
+func restoreCheckError(err error) error {
+	if api, ok := errors.AsType[*APIError](err); ok {
+		return errors.New(api.Message)
+	}
+	return err
+}
+
+// validateCollectionVisibility rejects values the library_collections
+// visibility CHECK constraint would refuse. An empty value means the default.
+func validateCollectionVisibility(visibility string) error {
+	switch visibility {
+	case "", adminCollectionVisible, adminCollectionHidden:
+		return nil
+	}
+	return fieldError("visibility", "visibility must be visible or hidden")
+}
+
+func adminCollectionLookupAPIError(err error) error {
+	if errors.Is(err, catalog.ErrLibraryCollectionNotFound) {
+		return apiError(http.StatusNotFound, "not_found", "Collection not found")
+	}
+	return apiError(http.StatusInternalServerError, "internal_error", "Failed to load collection")
+}
+
+func validateAdminCollectionSourceUpdate(existing *models.LibraryCollection, req AdminCollectionUpdate) error {
+	proposedConfig := existing.SourceConfig
+	if len(req.SourceConfig) > 0 {
+		proposedConfig = req.SourceConfig
+	}
+	proposedURL := existing.SourceURL
+	if req.SourceURL != nil {
+		proposedURL = *req.SourceURL
+	}
+	if err := validateTMDBListSourceConfig(proposedConfig, proposedURL); err != nil {
+		return apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+	return nil
+}
+
+func (h *LibraryCollectionHandler) UpdateAdminCollection(ctx context.Context, collectionID string, req AdminCollectionUpdate) (AdminCollection, error) {
+	if req.PosterSourceURL != nil || req.BackdropSourceURL != nil {
+		return AdminCollection{}, apiError(400, "bad_request", "Use the artwork endpoint for artwork sources")
+	}
+	return h.updateAdminCollection(ctx, collectionID, req, func(string, string, string) error { return nil })
+}
+
+func (h *LibraryCollectionHandler) PreviewAdminCollection(ctx context.Context, req AdminCollectionPreviewRequest) (AdminCollectionPreview, error) {
+	var none AdminCollectionPreview
+	if h.Executor == nil {
+		return none, apiError(503, "service_unavailable", "Preview is not configured")
+	}
+	var def catalog.QueryDefinition
+	if len(req.QueryDefinition) > 0 {
+		normalized, err := normalizeQueryDefinitionJSON(req.QueryDefinition, false, false)
+		if err != nil {
+			return none, apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
+		}
+		if err := json.Unmarshal(normalized, &def); err != nil {
+			return none, apiError(http.StatusBadRequest, "bad_request", "Invalid query_definition")
+		}
+	}
+
+	items, total, err := h.Executor.Preview(ctx, def, catalog.AccessFilter{}, req.Limit)
+	if err != nil {
+		return none, apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+
+	resp := previewLibraryCollectionResponse{Items: make([]itemListResponse, 0, len(items)), Total: total}
+	for _, item := range items {
+		resp.Items = append(resp.Items, h.itemListResponseOf(ctx, item))
+	}
+	return resp, nil
+}
+
+func (h *LibraryCollectionHandler) importAdminMDBList(ctx context.Context, req AdminCollectionImportMDBList, artwork adminCollectionArtwork) (AdminCollectionImportResult, error) {
+	var none AdminCollectionImportResult
+	if !hasLibrarySelection(req.LibraryID, req.LibraryIDs) || strings.TrimSpace(req.Title) == "" || strings.TrimSpace(req.URL) == "" {
+		return none, apiError(http.StatusBadRequest, "bad_request", "library_id/library_ids, title, and url are required")
+	}
+	if req.Limit != nil && *req.Limit <= 0 {
+		return none, apiError(http.StatusBadRequest, "bad_request", "limit must be greater than 0")
+	}
+
+	collection, err := h.createMDBListCollection(ctx, req)
+	if err != nil {
+		if validationErr, ok := errors.AsType[requestValidationError](err); ok {
+			return none, apiError(http.StatusBadRequest, "bad_request", validationErr.Error())
+		}
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to create collection")
+	}
+
+	// Process admin artwork before sync so MaybeGenerateCollage sees the
+	// uploaded poster and skips collage generation.
+	if err := artwork(collection.ID, req.PosterSourceURL, req.BackdropSourceURL); err != nil {
+		return none, collectionArtworkError(err, "Failed to process uploaded images")
+	}
+
+	run, err := h.service.SyncCollection(ctx, collection.ID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to import MDBList collection")
+	}
+
+	refreshed, err := h.repo.GetByID(ctx, collection.ID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to load collection")
+	}
+
+	return importCollectionResponse{
+		Collection: h.libraryCollectionResponseOf(ctx, h.withViewerPoster(ctx, refreshed)),
+		SyncRun:    run,
+	}, nil
+}
+func (h *LibraryCollectionHandler) ImportAdminMDBList(ctx context.Context, req AdminCollectionImportMDBList) (AdminCollectionImportResult, error) {
+	return h.importAdminMDBList(ctx, req, h.adminArtworkSources(ctx))
+}
+
+func (h *LibraryCollectionHandler) importAdminTMDB(ctx context.Context, req AdminCollectionImportTMDB, artwork adminCollectionArtwork) (AdminCollectionImportResult, error) {
+	var none AdminCollectionImportResult
+	if !hasLibrarySelection(req.LibraryID, req.LibraryIDs) || strings.TrimSpace(req.Title) == "" {
+		return none, apiError(http.StatusBadRequest, "bad_request", "library_id/library_ids and title are required")
+	}
+	if _, _, _, err := normalizeTMDBPresetRequest(req.Preset, req.MediaType, req.TimeWindow); err != nil {
+		return none, apiError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+	if req.Limit != nil && *req.Limit <= 0 {
+		return none, apiError(http.StatusBadRequest, "bad_request", "limit must be greater than 0")
+	}
+
+	collection, err := h.createTMDBCollection(ctx, req)
+	if err != nil {
+		if validationErr, ok := errors.AsType[requestValidationError](err); ok {
+			return none, apiError(http.StatusBadRequest, "bad_request", validationErr.Error())
+		}
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to create collection")
+	}
+
+	// Process admin artwork before sync so MaybeGenerateCollage sees the
+	// uploaded poster and skips collage generation.
+	if err := artwork(collection.ID, req.PosterSourceURL, req.BackdropSourceURL); err != nil {
+		return none, collectionArtworkError(err, "Failed to process uploaded images")
+	}
+
+	run, err := h.service.SyncCollection(ctx, collection.ID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to sync TMDB collection")
+	}
+
+	refreshed, err := h.repo.GetByID(ctx, collection.ID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to load collection")
+	}
+
+	return importCollectionResponse{
+		Collection: h.libraryCollectionResponseOf(ctx, h.withViewerPoster(ctx, refreshed)),
+		SyncRun:    run,
+	}, nil
+}
+func (h *LibraryCollectionHandler) ImportAdminTMDB(ctx context.Context, req AdminCollectionImportTMDB) (AdminCollectionImportResult, error) {
+	return h.importAdminTMDB(ctx, req, h.adminArtworkSources(ctx))
+}
+
+func (h *LibraryCollectionHandler) importAdminTMDBList(ctx context.Context, req AdminCollectionImportTMDBList, artwork adminCollectionArtwork) (AdminCollectionImportResult, error) {
+	var none AdminCollectionImportResult
+	if !hasLibrarySelection(req.LibraryID, req.LibraryIDs) || strings.TrimSpace(req.Title) == "" || strings.TrimSpace(req.URL) == "" {
+		return none, apiError(http.StatusBadRequest, "bad_request", "library_id/library_ids, title, and url are required")
+	}
+	if req.Limit != nil && *req.Limit <= 0 {
+		return none, apiError(http.StatusBadRequest, "bad_request", "limit must be greater than 0")
+	}
+
+	collection, err := h.createTMDBListCollection(ctx, req)
+	if err != nil {
+		if validationErr, ok := errors.AsType[requestValidationError](err); ok {
+			return none, apiError(http.StatusBadRequest, "bad_request", validationErr.Error())
+		}
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to create collection")
+	}
+
+	// Process admin artwork before sync so MaybeGenerateCollage sees the
+	// uploaded poster and skips collage generation.
+	if err := artwork(collection.ID, req.PosterSourceURL, req.BackdropSourceURL); err != nil {
+		return none, collectionArtworkError(err, "Failed to process uploaded images")
+	}
+
+	run, err := h.service.SyncCollection(ctx, collection.ID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to sync TMDB list collection")
+	}
+
+	refreshed, err := h.repo.GetByID(ctx, collection.ID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to load collection")
+	}
+
+	return importCollectionResponse{
+		Collection: h.libraryCollectionResponseOf(ctx, h.withViewerPoster(ctx, refreshed)),
+		SyncRun:    run,
+	}, nil
+}
+func (h *LibraryCollectionHandler) ImportAdminTMDBList(ctx context.Context, req AdminCollectionImportTMDBList) (AdminCollectionImportResult, error) {
+	return h.importAdminTMDBList(ctx, req, h.adminArtworkSources(ctx))
+}
+
+func (h *LibraryCollectionHandler) GetAdminCollection(ctx context.Context, id string) (AdminCollection, int64, error) {
+	var none AdminCollection
+	before, err := h.repo.CollectionRevision(ctx, id)
+	if err != nil {
+		return none, 0, err
+	}
+	c, err := h.repo.GetByID(ctx, id)
+	if err != nil {
+		return none, 0, err
+	}
+	after, err := h.repo.CollectionRevision(ctx, id)
+	if err != nil {
+		return none, 0, err
+	}
+	if before != after {
+		return none, 0, catalog.ErrLibraryCollectionRevisionMismatch
+	}
+	// Canonical editor bodies must not contain expiring artwork signatures.
+	copy := *c
+	copy.PosterURL = ""
+	copy.BackdropURL = ""
+	return h.libraryCollectionResponseOf(ctx, &copy), after, nil
+}
+func (h *LibraryCollectionHandler) SyncAdminCollection(ctx context.Context, id string) (*models.LibraryCollectionSyncRun, error) {
+	if h.service == nil {
+		return nil, apiError(503, "service_unavailable", "Collection sync is not configured")
+	}
+	return h.service.SyncCollection(ctx, id)
+}
+func (h *LibraryCollectionHandler) ListAdminCollectionTemplates(ctx context.Context) ([]templates.BundleWithTemplates, error) {
+	return h.templateRegistry().BundlesWithTemplates(), nil
+}
+func (h *LibraryCollectionHandler) ApplyAdminCollectionTemplate(ctx context.Context, id string, req AdminCollectionTemplateApply) (AdminCollectionTemplateResult, error) {
+	result, err := h.applyTemplateBundle(ctx, id, req, nil)
+	if e, ok := errors.AsType[templateBundleApplyError](err); ok {
+		return result, apiError(e.status, e.code, e.message)
+	}
+	return result, err
+}
+func (h *LibraryCollectionHandler) QueueAdminCollectionTemplate(ctx context.Context, id string, req AdminCollectionTemplateApply, actingUserID int) (*models.AdminJob, error) {
+	if h.JobRepo == nil {
+		return nil, apiError(503, "service_unavailable", "Admin job queue is not configured")
+	}
+	if req.DryRun {
+		return nil, apiError(400, "bad_request", "dry_run is not supported for background apply jobs")
+	}
+	if _, ok := h.templateRegistry().GetBundle(id); !ok {
+		return nil, apiError(404, "not_found", "Template bundle not found")
+	}
+	ids := uniquePositiveInts(req.LibraryIDs)
+	if len(ids) == 0 {
+		return nil, apiError(400, "bad_request", "library_ids is required")
+	}
+	job, err := h.JobRepo.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeTemplateBundleApply, CreatedByUserID: actingUserID, RequestPayload: adminjob.TemplateBundleApplyRequest{BundleID: id, LibraryIDs: ids, DeleteExisting: req.DeleteExisting, Featured: toAdminJobTemplateBundleFeatured(req.Featured)}, Message: "Queued collection defaults apply"})
+	if err != nil {
+		return nil, err
+	}
+	publishEventJob(ctx, h.EventsHub, "job.created", job)
+	return job, nil
+}
+func (h *LibraryCollectionHandler) UploadAdminCollectionArtwork(ctx context.Context, id, kind string, data []byte) error {
+	if kind != collectionImagePoster && kind != adminCollectionBackdrop {
+		return apiError(400, "bad_request", "Artwork kind must be poster or backdrop")
+	}
+	if len(data) == 0 || len(data) > collectionImageMaxBytes {
+		return apiError(400, "bad_request", "Artwork must be nonempty and at most 10 MiB")
+	}
+	oldPath, err := h.adminCollectionImagePath(ctx, id, kind)
+	if err != nil {
+		return err
+	}
+	// Revisioned keys (issue #1258) mean the replacement uploads to a new key
+	// that cannot collide with the current artwork, so upload and commit it
+	// first. A failed upload or update then leaves the last valid image
+	// untouched. The previous revision is cleaned up only after the commit.
+	path, hash, err := h.processCollectionImage(ctx, id, kind, data)
+	if err != nil {
+		return err
+	}
+	input := catalog.UpdateLibraryCollectionInput{ID: id}
+	if kind == collectionImagePoster {
+		input.PosterURL = &path
+		input.PosterThumbhash = &hash
+		input.PosterAutoGenerated = new(false)
+		input.PosterFromTemplate = new(false)
+	} else {
+		input.BackdropURL = &path
+		input.BackdropThumbhash = &hash
+	}
+	if err := h.repo.Update(ctx, input); err != nil {
+		return err
+	}
+	h.cleanUpReplacedCollectionImage(ctx, id, kind, oldPath)
+	return nil
+}
+func (h *LibraryCollectionHandler) SetAdminCollectionArtworkSource(ctx context.Context, id, kind, url string) error {
+	if _, err := h.repo.GetByID(ctx, id); err != nil {
+		return err
+	}
+	data, err := downloadCollectionImageURL(adminCollectionImageContext(ctx), h.httpClient, url)
+	if err != nil {
+		return err
+	}
+	return h.UploadAdminCollectionArtwork(ctx, id, kind, data)
+}
+func (h *LibraryCollectionHandler) DeleteAdminCollectionArtwork(ctx context.Context, id, kind string) error {
+	if kind != collectionImagePoster && kind != adminCollectionBackdrop {
+		return apiError(400, "bad_request", "Artwork kind must be poster or backdrop")
+	}
+	collection, err := h.repo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	oldPath := collection.PosterURL
+	if kind == adminCollectionBackdrop {
+		oldPath = collection.BackdropURL
+	}
+	input := catalog.UpdateLibraryCollectionInput{ID: id}
+	if kind == collectionImagePoster {
+		input.PosterURL = new("")
+		input.PosterThumbhash = new("")
+		input.PosterAutoGenerated = new(false)
+		input.PosterFromTemplate = new(false)
+	} else {
+		input.BackdropURL = new("")
+		input.BackdropThumbhash = new("")
+	}
+	if err := h.repo.Update(ctx, input); err != nil {
+		return err
+	}
+	h.cleanUpReplacedCollectionImage(ctx, id, kind, oldPath)
+	if kind == collectionImagePoster && h.service != nil {
+		h.service.MaybeGenerateCollage(ctx, id)
+	}
+	return nil
+}
+func (h *LibraryCollectionHandler) adminManualCollection(ctx context.Context, id string) (*models.LibraryCollection, error) {
+	c, err := h.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if c.CollectionType != collectionManagementModeManual {
+		return nil, apiError(409, "collection_not_manual", "Only manual collections support manual items")
+	}
+	return c, nil
+}
+func (h *LibraryCollectionHandler) AddAdminCollectionItem(ctx context.Context, id, itemID string, position int) error {
+	c, err := h.adminManualCollection(ctx, id)
+	if err != nil {
+		return err
+	}
+	ids := c.LibraryIDs
+	if len(ids) == 0 {
+		ids = []int{c.LibraryID}
+	}
+	items, err := h.itemRepo.GetByIDsWithAccess(ctx, []string{itemID}, catalog.AccessFilter{AllowedLibraryIDs: ids})
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		return apiError(404, "not_found", "Item not found in collection libraries")
+	}
+	return h.repo.AddItemIfAbsent(ctx, id, itemID, position)
+}
+func (h *LibraryCollectionHandler) RemoveAdminCollectionItem(ctx context.Context, id, itemID string) error {
+	if _, err := h.adminManualCollection(ctx, id); err != nil {
+		return err
+	}
+	return h.repo.RemoveManualItem(ctx, id, itemID)
+}
+func (h *LibraryCollectionHandler) ReorderAdminCollectionItems(ctx context.Context, id string, ids []string) error {
+	if _, err := h.adminManualCollection(ctx, id); err != nil {
+		return err
+	}
+	if revision := adminCollectionExpectedRevision(ctx); revision != nil {
+		return h.repo.ReorderItemsIfRevision(ctx, id, ids, *revision)
+	}
+	return h.repo.ReorderItems(ctx, id, ids)
+}
+func (h *LibraryCollectionHandler) DeleteAdminCollection(ctx context.Context, id string) error {
+	revision := adminCollectionExpectedRevision(ctx)
+	if revision == nil {
+		return h.deleteServerCollection(ctx, id)
+	}
+	if err := h.repo.DeleteIfRevision(ctx, id, *revision); err != nil {
+		return err
+	}
+	h.cleanupDeletedCollection(ctx, id)
+	return nil
+}
+
+// renameCollectionRows carries a rename into the rows that still show the
+// collection under its old name, following the collection's current title so
+// overlapping renames end on the last one (userstore.FollowCollectionTitle).
+// Admin rows are retitled before the response re-reads the collection,
+// because retitling one advances the collection's revision and the caller's
+// next If-Match needs the new one. The rows profiles built, in every account,
+// are retitled after the response, detached from the request: that sweep
+// leaves the revision alone and grows with the number of accounts. The rename
+// has committed, so a dropped request must not cut either short; each has its
+// own deadline instead. A failure is logged and leaves those rows on the old
+// name.
+func (h *LibraryCollectionHandler) renameCollectionRows(ctx context.Context, collectionID, oldTitle, newTitle string) {
+	if strings.TrimSpace(oldTitle) == strings.TrimSpace(newTitle) {
+		return
+	}
+	detached := context.WithoutCancel(ctx)
+	ctx, cancel := context.WithTimeout(detached, userstore.RetitleTimeout)
+	defer cancel()
+	currentTitle := func(ctx context.Context) (string, error) { return h.repo.Title(ctx, collectionID) }
+	if h.SectionRepo != nil {
+		err := userstore.FollowCollectionTitle(ctx, oldTitle, currentTitle, func(ctx context.Context, from, to string) error {
+			return h.SectionRepo.RenameLibraryCollectionRows(ctx, collectionID, from, to)
+		})
+		if err != nil {
+			slog.WarnContext(ctx, "collection rename: retitling admin rows failed", "component", "api",
+				"collection_id", collectionID, "error", err)
+		}
+	}
+	if h.CollectionRowRenamer != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(detached, userstore.RetitleSweepTimeout)
+			defer cancel()
+			h.CollectionRowRenamer.RenameForCollection(ctx, collectionID, oldTitle, currentTitle)
+		}()
+	}
+}

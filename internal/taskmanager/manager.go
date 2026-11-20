@@ -1,0 +1,511 @@
+package taskmanager
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"sync"
+	"time"
+)
+
+// TriggerFactory is a function that creates a live Trigger from a TriggerConfig.
+type TriggerFactory func(TriggerConfig) Trigger
+
+// LibraryTypesFunc lists the media_folders.type value of every library.
+type LibraryTypesFunc func(ctx context.Context) ([]string, error)
+
+// TaskManager is the central orchestrator for background tasks.
+type TaskManager struct {
+	tasks          map[string]*taskWorker
+	mu             sync.RWMutex
+	triggerRepo    TriggerRepository
+	historyRepo    ExecutionRepository
+	triggerFactory TriggerFactory
+	logger         *slog.Logger
+	observers      []Observer
+	libraryTypes   LibraryTypesFunc
+	firingClaims   FiringClaims
+}
+
+// New creates a new TaskManager.
+func New(triggerRepo TriggerRepository, historyRepo ExecutionRepository, triggerFactory TriggerFactory, logger *slog.Logger) *TaskManager {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &TaskManager{
+		tasks:          make(map[string]*taskWorker),
+		triggerRepo:    triggerRepo,
+		historyRepo:    historyRepo,
+		triggerFactory: triggerFactory,
+		logger:         logger,
+	}
+}
+
+func (m *TaskManager) AddObserver(observer Observer) {
+	if m == nil || observer == nil {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.observers = append(m.observers, observer)
+}
+
+// SetLibraryTypes installs the lookup ListRelevantTasks uses to omit
+// LibraryScopedTask tasks for library kinds this server does not have. Without
+// it, every non-hidden task is listed.
+func (m *TaskManager) SetLibraryTypes(fn LibraryTypesFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.libraryTypes = fn
+}
+
+// Register adds a task to the manager. Must be called before Start.
+func (m *TaskManager) Register(task Task) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tasks[task.Key()] = newTaskWorker(task, m)
+}
+
+// Start loads triggers from the repository and begins all scheduling loops.
+func (m *TaskManager) Start(ctx context.Context) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for key, w := range m.tasks {
+		if latest, err := m.historyRepo.GetLatest(ctx, key); err == nil && latest != nil {
+			w.mu.Lock()
+			w.lastResult = latest
+			w.mu.Unlock()
+		}
+
+		configs, err := m.triggerRepo.GetTriggers(ctx, key)
+		if err == nil && configs == nil {
+			if followsDefaultTriggers(w.task) {
+				configs = w.task.DefaultTriggers()
+			} else {
+				// Default providers may read settings. Resolve them only for new
+				// schedules, outside the repository transaction. Initialization
+				// rechecks saved state so a concurrent edit still takes precedence.
+				configs, err = m.triggerRepo.GetOrCreateTriggers(ctx, key, w.task.DefaultTriggers())
+			}
+		}
+		if err != nil {
+			m.logger.ErrorContext(ctx, "failed to load triggers", "task", key, "error", err)
+			// Keep automatic runs idle on storage failure. The trigger loop
+			// still starts so a later administrator edit can recover the task.
+			configs = nil
+		}
+		if isManualOnly(w.task) {
+			// A schedule saved before the task became manual-only must not run it.
+			configs = nil
+		}
+
+		w.setTriggers(configs, m.triggerFactory, w.lastResult, false)
+
+		go m.triggerLoop(ctx, w)
+	}
+
+	m.logger.InfoContext(ctx, "task manager started", "tasks", len(m.tasks))
+}
+
+// triggerLoop listens on all trigger channels for a worker and runs the task
+// when any trigger fires.
+func (m *TaskManager) triggerLoop(ctx context.Context, w *taskWorker) {
+	for {
+		w.mu.RLock()
+		trigs := w.triggers
+		w.mu.RUnlock()
+
+		if len(trigs) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-w.triggerUpdate:
+				continue
+			}
+		}
+
+		// merged carries the trigger that fired, whose config gives the run's
+		// max runtime, or nil when the schedule changed.
+		merged := make(chan Trigger, 1)
+		done := make(chan struct{})
+
+		for _, tr := range trigs {
+			tr := tr
+			go func() {
+				select {
+				case <-done:
+					return
+				case _, ok := <-tr.C():
+					if ok {
+						select {
+						case merged <- tr:
+						default:
+						}
+					}
+				}
+			}()
+		}
+
+		go func() {
+			select {
+			case <-done:
+				return
+			case <-w.triggerUpdate:
+				select {
+				case merged <- nil:
+				default:
+				}
+			}
+		}()
+
+		var fired Trigger
+		select {
+		case <-ctx.Done():
+			close(done)
+			return
+		case fired = <-merged:
+			close(done)
+		}
+
+		// A schedule change only rebuilds the triggers. Checking fired too keeps
+		// a stale update signal, whose flag an earlier wake already cleared,
+		// from starting a run that no trigger asked for.
+		if changed := w.triggerChanged.CompareAndSwap(true, false); changed || fired == nil {
+			continue
+		}
+
+		shouldRun, shouldRunErr := m.shouldRunScheduledTask(ctx, w)
+		if shouldRunErr != nil {
+			// Fail closed: a preflight that cannot answer must not launch the
+			// task — for expensive conditional tasks a transient error would
+			// otherwise trigger the exact work the gate exists to suppress.
+			// Interval/daily triggers retry at their next firing; manual
+			// RunTask always bypasses the gate.
+			m.logger.WarnContext(ctx, "scheduled task preflight failed; skipping run",
+				"task", w.task.Key(), "error", shouldRunErr)
+			m.rearmTriggersFromNow(w)
+			continue
+		}
+		if !shouldRun {
+			m.rearmTriggersFromNow(w)
+			continue
+		}
+		if !m.claimFiring(ctx, w, fired) {
+			// Another server runs this firing. Rearm from now, as after a
+			// skipped preflight: this server's last result is older than that
+			// run, so an interval would otherwise fire again at once.
+			m.reloadLastResult(ctx, w)
+			m.rearmTriggersFromNow(w)
+			continue
+		}
+
+		result, err := w.run(ctx, fired.Config().MaxRuntime())
+		if err != nil {
+			// If the task is already running (e.g. via manual RunTask), don't
+			// rearm — the concurrent runner will rearm when it finishes.
+			// For other errors, rearm so the trigger fires again later.
+			if !errors.Is(err, ErrTaskAlreadyRunning) {
+				m.rearmTriggers(w)
+			}
+			continue
+		}
+
+		if result != nil {
+			if insertErr := m.historyRepo.Insert(ctx, *result); insertErr != nil {
+				m.logger.ErrorContext(ctx, "failed to persist execution result",
+					"task", w.task.Key(), "error", insertErr)
+			}
+		}
+
+		m.rearmTriggers(w)
+	}
+}
+
+func (m *TaskManager) shouldRunScheduledTask(ctx context.Context, w *taskWorker) (bool, error) {
+	task, ok := w.task.(ScheduledConditionalTask)
+	if !ok {
+		return true, nil
+	}
+	return task.ShouldRun(ctx)
+}
+
+// rearmTriggers stops and restarts all triggers for a worker.
+func (m *TaskManager) rearmTriggers(w *taskWorker) {
+	w.mu.Lock()
+	lastResult := w.lastResult
+	for _, tr := range w.triggers {
+		tr.Stop()
+		tr.Start(lastResult)
+	}
+	w.mu.Unlock()
+	w.notify()
+}
+
+// rearmTriggersFromNow restarts triggers after a skipped conditional task. This
+// intentionally ignores lastResult; otherwise an old completed_at can make an
+// interval trigger fire immediately in a loop while there is no work.
+func (m *TaskManager) rearmTriggersFromNow(w *taskWorker) {
+	w.mu.Lock()
+	for _, tr := range w.triggers {
+		tr.Stop()
+		tr.Start(nil)
+	}
+	w.mu.Unlock()
+	w.notify()
+}
+
+// Stop stops all triggers and cancels running tasks.
+func (m *TaskManager) Stop() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, w := range m.tasks {
+		w.stopTriggers()
+		w.mu.RLock()
+		if w.cancel != nil {
+			w.cancel()
+		}
+		w.mu.RUnlock()
+	}
+	m.logger.Info("task manager stopped")
+}
+
+// RunTask triggers immediate execution of a task.
+func (m *TaskManager) RunTask(ctx context.Context, key string) error {
+	w, err := m.getWorker(key)
+	if err != nil {
+		return err
+	}
+
+	result, err := w.run(ctx, 0)
+	if err != nil {
+		return err
+	}
+
+	if result != nil {
+		if insertErr := m.historyRepo.Insert(ctx, *result); insertErr != nil {
+			m.logger.ErrorContext(ctx, "failed to persist execution result", "task", key, "error", insertErr)
+		}
+	}
+
+	m.rearmTriggers(w)
+	return nil
+}
+
+// manualStartKey marks the execution context of a run started by StartTask.
+type manualStartKey struct{}
+
+// StartedManually reports whether ctx belongs to a task run started through
+// StartTask (the v2 admin run and trigger operations). Runs through RunTask,
+// including the trigger loop, internal kicks and the v1 admin task run route,
+// do not report it. Tasks use it to skip their scheduling floors when asked to
+// run now.
+func StartedManually(ctx context.Context) bool {
+	manual, _ := ctx.Value(manualStartKey{}).(bool)
+	return manual
+}
+
+// StartTask starts work on this process after synchronously reserving its worker.
+// It does not persist work intent or guarantee execution after a process failure.
+// The run's context reports StartedManually.
+func (m *TaskManager) StartTask(key string) (TaskInfo, error) {
+	w, err := m.getWorker(key)
+	if err != nil {
+		return TaskInfo{}, err
+	}
+	ctx, cancel, err := w.reserve(context.WithValue(context.Background(), manualStartKey{}, true), 0)
+	if err != nil {
+		return TaskInfo{}, err
+	}
+	info := w.info()
+	go func() {
+		result := w.executeReserved(ctx, cancel)
+		if err := m.historyRepo.Insert(context.Background(), *result); err != nil {
+			m.logger.Error("failed to persist execution result", "task", key, "error", err)
+		}
+		m.rearmTriggers(w)
+	}()
+	return info, nil
+}
+
+// CancelTask requests cancellation of a running task.
+func (m *TaskManager) CancelTask(key string) error {
+	w, err := m.getWorker(key)
+	if err != nil {
+		return err
+	}
+	return w.requestCancel()
+}
+
+// GetTaskInfo returns the current state of a task.
+func (m *TaskManager) GetTaskInfo(key string) TaskInfo {
+	w, err := m.getWorker(key)
+	if err != nil {
+		return TaskInfo{}
+	}
+	return w.info()
+}
+
+// ListTasks returns info for all registered tasks, optionally including hidden ones.
+func (m *TaskManager) ListTasks(includeHidden bool) []TaskInfo {
+	return m.listTasks(func(w *taskWorker) bool { return includeHidden || !w.task.IsHidden() })
+}
+
+// ListRelevantTasks returns the non-hidden tasks an administrator can act on:
+// it also omits library-scoped tasks that no existing library needs. If the
+// library lookup fails, those tasks are listed.
+func (m *TaskManager) ListRelevantTasks(ctx context.Context) []TaskInfo {
+	m.mu.RLock()
+	lookup := m.libraryTypes
+	m.mu.RUnlock()
+
+	scoped := lookup != nil
+	var libraryTypes []string
+	if scoped {
+		types, err := lookup(ctx)
+		if err != nil {
+			m.logger.WarnContext(ctx, "listing library types for task list", "error", err)
+			scoped = false
+		}
+		libraryTypes = types
+	}
+	return m.listTasks(func(w *taskWorker) bool {
+		return !w.task.IsHidden() && (!scoped || servesAnyLibrary(w.task, libraryTypes))
+	})
+}
+
+func (m *TaskManager) listTasks(include func(*taskWorker) bool) []TaskInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var infos []TaskInfo
+	for _, w := range m.tasks {
+		if include(w) {
+			infos = append(infos, w.info())
+		}
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Key < infos[j].Key })
+	return infos
+}
+
+func isManualOnly(task Task) bool {
+	manual, ok := task.(ManualOnlyTask)
+	return ok && manual.ManualOnly()
+}
+
+func followsDefaultTriggers(task Task) bool {
+	follower, ok := task.(DefaultFollowingTask)
+	return ok && follower.FollowsDefaultTriggers()
+}
+
+func startSpread(task Task) time.Duration {
+	spreader, ok := task.(StartSpreader)
+	if !ok {
+		return 0
+	}
+	return spreader.StartSpread()
+}
+
+func servesAnyLibrary(task Task, libraryTypes []string) bool {
+	scopedTask, ok := task.(LibraryScopedTask)
+	if !ok {
+		return true
+	}
+	for _, libraryType := range libraryTypes {
+		if scopedTask.ServesLibrary(libraryType) {
+			return true
+		}
+	}
+	return false
+}
+
+// UpdateTriggers replaces the triggers for a task.
+func (m *TaskManager) UpdateTriggers(key string, triggerConfigs []TriggerConfig) error {
+	w, err := m.getWorker(key)
+	if err != nil {
+		return err
+	}
+	w.scheduleMu.Lock()
+	defer w.scheduleMu.Unlock()
+	if isManualOnly(w.task) && len(triggerConfigs) > 0 {
+		return ErrTaskManualOnly
+	}
+
+	if err := m.triggerRepo.SetTriggers(context.Background(), key, triggerConfigs); err != nil {
+		return err
+	}
+
+	w.setTriggers(triggerConfigs, m.triggerFactory, nil, true)
+	m.notifyTaskUpdated(w.info())
+	return nil
+}
+
+// GetSchedule reads the durable editor state rather than a live trigger snapshot.
+// A DefaultFollowingTask with no saved schedule reports its DefaultTriggers at
+// revision zero, the schedule it runs until one is saved.
+func (m *TaskManager) GetSchedule(ctx context.Context, key string) (Schedule, error) {
+	w, err := m.getWorker(key)
+	if err != nil {
+		return Schedule{}, err
+	}
+	repo, ok := m.triggerRepo.(GuardedTriggerRepository)
+	if !ok {
+		return Schedule{}, fmt.Errorf("guarded task schedules unavailable")
+	}
+	schedule, err := repo.GetSchedule(ctx, key)
+	if err == nil && schedule.Revision == 0 && followsDefaultTriggers(w.task) {
+		schedule.Triggers = w.task.DefaultTriggers()
+	}
+	return schedule, err
+}
+
+// UpdateSchedule persists under the original revision and installs that schedule
+// on this process. Other running processes do not automatically reload it.
+func (m *TaskManager) UpdateSchedule(ctx context.Context, key string, expected int64, configs []TriggerConfig) (Schedule, error) {
+	w, err := m.getWorker(key)
+	if err != nil {
+		return Schedule{}, err
+	}
+	if isManualOnly(w.task) && len(configs) > 0 {
+		return Schedule{}, ErrTaskManualOnly
+	}
+	repo, ok := m.triggerRepo.(GuardedTriggerRepository)
+	if !ok {
+		return Schedule{}, fmt.Errorf("guarded task schedules unavailable")
+	}
+	w.scheduleMu.Lock()
+	defer w.scheduleMu.Unlock()
+	saved, err := repo.ReplaceSchedule(ctx, key, expected, configs)
+	if err != nil {
+		return Schedule{}, err
+	}
+	w.setTriggers(saved.Triggers, m.triggerFactory, nil, true)
+	return saved, nil
+}
+
+func (m *TaskManager) notifyTaskUpdated(info TaskInfo) {
+	if m == nil {
+		return
+	}
+
+	m.mu.RLock()
+	observers := append([]Observer(nil), m.observers...)
+	m.mu.RUnlock()
+	for _, observer := range observers {
+		observer.TaskUpdated(info)
+	}
+}
+
+func (m *TaskManager) getWorker(key string) (*taskWorker, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	w, ok := m.tasks[key]
+	if !ok {
+		return nil, ErrTaskNotFound
+	}
+	return w, nil
+}

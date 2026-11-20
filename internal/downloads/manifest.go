@@ -1,0 +1,660 @@
+package downloads
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
+)
+
+// manifestVersion is bumped whenever the OfflineManifest DTO shape changes.
+const manifestVersion = 2
+
+const preparedAudioLayoutStereo = "stereo"
+
+// apiDownloadsPrefix is the namespace every offline asset reference is minted
+// under. Manifests are stored and handed to clients verbatim, so the reference
+// has to stay resolvable after the /api/v1 tombstone; the v2 projection only
+// validates the prefix it finds here.
+const apiDownloadsPrefix = "/api/v2/downloads/"
+
+// ManifestSource assembles catalog detail for a content id. GetItemDetail
+// enforces per-profile content/library access via its filter, which doubles as
+// the manifest/artwork access re-check.
+type ManifestSource interface {
+	GetItemDetail(ctx context.Context, contentID string, filter catalog.AccessFilter) (*catalog.ItemDetail, error)
+}
+
+// SubtitleSource enumerates and fetches downloaded (S3) subtitle assets.
+type SubtitleSource interface {
+	ListDownloadedSubtitles(ctx context.Context, mediaFileID int) ([]subtitles.DownloadedSubtitle, error)
+	GetSubtitleContent(ctx context.Context, id int) (*subtitles.DownloadedSubtitle, []byte, error)
+}
+
+// Marker is a time range (intro/credits/recap/preview) in seconds.
+type Marker struct {
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+}
+
+// OfflineChapter is a chapter with only stable references (no presigned URL).
+type OfflineChapter struct {
+	Index              int     `json:"index"`
+	Title              string  `json:"title,omitempty"`
+	StartSeconds       float64 `json:"start_seconds"`
+	EndSeconds         float64 `json:"end_seconds"`
+	ThumbnailThumbhash string  `json:"thumbnail_thumbhash,omitempty"`
+}
+
+// OfflineSubtitle is one downloadable subtitle asset. FetchURL is an
+// authenticated proxy endpoint, never a presigned URL. Revision is set only for
+// downloaded (stored) subtitles: an opaque token that changes whenever the
+// delivered bytes can change, such as a timing correction, so an offline
+// client knows to fetch the asset again.
+type OfflineSubtitle struct {
+	Language        string `json:"language" doc:"Subtitle language: BCP 47 tag (en, pt-BR), empty when unknown; older rows may carry a legacy value"`
+	Title           string `json:"title,omitempty"`
+	Format          string `json:"format"`
+	Forced          bool   `json:"forced"`
+	HearingImpaired bool   `json:"hearing_impaired"`
+	External        bool   `json:"external"`
+	FetchURL        string `json:"fetch_url" format:"uri-reference"`
+	FileSize        int64  `json:"file_size,omitempty"`
+	Revision        string `json:"revision,omitempty"`
+}
+
+// OfflineAudioTrack describes audio streams the client may expose offline.
+type OfflineAudioTrack struct {
+	Index      int    `json:"index"`
+	Title      string `json:"title,omitempty"`
+	Language   string `json:"language,omitempty" doc:"Track language from the file: BCP 47 tag, ISO 639-1 where one exists (en, pt-BR); und when the file marks it undetermined. Older scans may carry an ISO 639-2 code or the file's raw tag"`
+	Codec      string `json:"codec,omitempty"`
+	Layout     string `json:"layout,omitempty"`
+	Channels   int    `json:"channels,omitempty"`
+	Bitrate    int    `json:"bitrate,omitempty"`
+	SampleRate int    `json:"sample_rate,omitempty"`
+	Default    bool   `json:"default"`
+}
+
+// OfflineIdentity mirrors userstore.WatchIdentity so a client can re-resolve
+// content_id after a server-side rescan.
+type OfflineIdentity struct {
+	StableType        string            `json:"stable_type,omitempty"`
+	ProviderIDs       map[string]string `json:"provider_ids,omitempty"`
+	SeriesProviderIDs map[string]string `json:"series_provider_ids,omitempty"`
+	Season            *int              `json:"season,omitempty"`
+	Episode           *int              `json:"episode,omitempty"`
+}
+
+// OfflineIntegrity gives clients stable metadata for local file validation.
+type OfflineIntegrity struct {
+	ExpectedBytes int64  `json:"expected_bytes"`
+	MediaFileHash string `json:"media_file_hash,omitempty"`
+	MetadataETag  string `json:"metadata_etag"`
+}
+
+// OfflineManifest is the stable, presigned-URL-free bundle a client stores to
+// play a managed download fully offline.
+type OfflineManifest struct {
+	DownloadID        string `json:"download_id"`
+	ContentID         string `json:"content_id"`
+	EpisodeID         string `json:"episode_id,omitempty"`
+	Type              string `json:"type"`
+	Revision          int    `json:"revision"`
+	Quality           string `json:"quality"`
+	EffectiveQuality  string `json:"effective_quality"`
+	DeliveryFormat    string `json:"delivery_format"`
+	TargetBitrateKbps int    `json:"target_bitrate_kbps"`
+	MediaFileID       int    `json:"media_file_id"`
+	FileSize          int64  `json:"file_size"`
+
+	Title         string   `json:"title"`
+	Year          int      `json:"year,omitempty"`
+	Overview      string   `json:"overview,omitempty"`
+	Runtime       int      `json:"runtime,omitempty"`
+	ContentRating string   `json:"content_rating,omitempty"`
+	Genres        []string `json:"genres,omitempty"`
+	SeriesID      string   `json:"series_id,omitempty"`
+	SeriesTitle   string   `json:"series_title,omitempty"`
+	SeasonNumber  *int     `json:"season_number,omitempty"`
+	EpisodeNumber *int     `json:"episode_number,omitempty"`
+
+	// Artwork: stable thumbhashes inline + authenticated proxy URLs (never
+	// presigned S3 URLs). The client downloads the proxy URLs once.
+	PosterThumbhash   string `json:"poster_thumbhash,omitempty"`
+	BackdropThumbhash string `json:"backdrop_thumbhash,omitempty"`
+	ArtworkURLs       struct {
+		Poster   string `json:"poster,omitempty"`
+		Backdrop string `json:"backdrop,omitempty"`
+		Logo     string `json:"logo,omitempty"`
+		// SeriesPoster is v2-only; see SeriesPosterThumbhash.
+		SeriesPoster string `json:"-"`
+	} `json:"artwork_urls"`
+	// An episode's poster is its still, so episode manifests also name the
+	// parent series poster for series-level offline screens. Only the v2
+	// manifest carries the series poster; the frozen v1 manifest omits it.
+	SeriesPosterThumbhash string `json:"-"`
+
+	Container               string              `json:"container"`
+	CodecVideo              string              `json:"codec_video"`
+	CodecAudio              string              `json:"codec_audio"`
+	Resolution              string              `json:"resolution"`
+	HDR                     bool                `json:"hdr"`
+	Duration                int                 `json:"duration_seconds"`
+	SelectedAudioTrackIndex *int                `json:"selected_audio_track_index,omitempty"`
+	AudioTracks             []OfflineAudioTrack `json:"audio_tracks,omitempty"`
+
+	Chapters       []OfflineChapter       `json:"chapters,omitempty"`
+	Intro          *Marker                `json:"intro,omitempty"`
+	Credits        *Marker                `json:"credits,omitempty"`
+	Recap          *Marker                `json:"recap,omitempty"`
+	Preview        *Marker                `json:"preview,omitempty"`
+	MarkerSegments []models.MarkerSegment `json:"-"`
+
+	Subtitles []OfflineSubtitle `json:"subtitles"`
+
+	StableIdentity OfflineIdentity  `json:"stable_identity"`
+	Integrity      OfflineIntegrity `json:"integrity"`
+
+	ManifestVersion int    `json:"manifest_version"`
+	GeneratedAt     string `json:"generated_at"`
+}
+
+// ManifestBuilder assembles an OfflineManifest from the catalog detail path and
+// the download's subtitle assets, stripping every presigned URL.
+type ManifestBuilder struct {
+	detail           ManifestSource
+	subs             SubtitleSource
+	fileRepo         FileResolver
+	MarkerPopulation MarkerPopulationService
+	// externalTimings applies sidecar timing corrections to the revisions
+	// and sizes of external subtitles; nil describes them as they are on disk.
+	externalTimings subtitles.ExternalTimingLookup
+	// artifact resolves a download's linked prepared artifact so artifact-backed
+	// manifests can describe the delivered file instead of the catalog source.
+	artifact func(ctx context.Context, id string) (*Artifact, error)
+}
+
+type MarkerPopulationService interface {
+	Populate(context.Context, *models.MediaFile) (*models.MediaFile, bool, error)
+}
+
+// NewManifestBuilder constructs a ManifestBuilder. artifact may be nil when no
+// prepare-to-file pipeline exists (only original downloads are servable then).
+func NewManifestBuilder(detail ManifestSource, subs SubtitleSource, fileRepo FileResolver, artifact func(ctx context.Context, id string) (*Artifact, error)) *ManifestBuilder {
+	return &ManifestBuilder{detail: detail, subs: subs, fileRepo: fileRepo, artifact: artifact}
+}
+
+// Build assembles the manifest for a managed entry. The filter enforces the
+// requesting profile's content access (GetItemDetail returns
+// catalog.ErrItemNotFound when denied).
+func (b *ManifestBuilder) Build(ctx context.Context, dl *Download, filter catalog.AccessFilter) (*OfflineManifest, error) {
+	return b.build(ctx, dl, filter, nil, true)
+}
+
+// episodeSeriesID returns the parent series of an episode entry, or "" for
+// anything else. Series extras and manga chapters also carry a SeriesID, so
+// the entry's EpisodeID decides. The manifest's series_poster and the artwork
+// route that serves it both use this rule.
+func episodeSeriesID(dl *Download, detail *catalog.ItemDetail) string {
+	if dl.EpisodeID == "" {
+		return ""
+	}
+	return detail.SeriesID
+}
+
+// build is Build with an optional per-batch series-detail cache: a season
+// batch shares one series, so the batch endpoint resolves its detail once
+// instead of once per episode.
+func (b *ManifestBuilder) build(ctx context.Context, dl *Download, filter catalog.AccessFilter, seriesCache map[string]*catalog.ItemDetail, populateMarkers bool) (*OfflineManifest, error) {
+	detail, err := b.detail.GetItemDetail(ctx, manifestContentID(dl), filter)
+	if err != nil {
+		return nil, err
+	}
+	file := b.lookupFile(ctx, dl.MediaFileID)
+	var seriesDetail *catalog.ItemDetail
+	if seriesID := episodeSeriesID(dl, detail); seriesID != "" {
+		if cached, ok := seriesCache[seriesID]; ok {
+			seriesDetail = cached
+		} else if sd, err := b.detail.GetItemDetail(ctx, seriesID, filter); err == nil {
+			seriesDetail = sd
+			if seriesCache != nil {
+				seriesCache[seriesID] = sd
+			}
+		}
+	}
+
+	m := &OfflineManifest{
+		DownloadID:        dl.ID,
+		ContentID:         dl.ContentID,
+		EpisodeID:         dl.EpisodeID,
+		Type:              detail.Type,
+		Revision:          dl.Revision,
+		Quality:           dl.Quality,
+		EffectiveQuality:  dl.EffectiveQuality,
+		DeliveryFormat:    dl.Format,
+		TargetBitrateKbps: dl.TargetBitrateKbps,
+		MediaFileID:       dl.MediaFileID,
+		FileSize:          dl.FileSize,
+		Title:             detail.Title,
+		Year:              detail.Year,
+		Overview:          detail.Overview,
+		Runtime:           detail.Runtime,
+		ContentRating:     detail.ContentRating,
+		Genres:            detail.Genres,
+		SeriesID:          detail.SeriesID,
+		SeriesTitle:       detail.SeriesTitle,
+		SeasonNumber:      detail.SeasonNumber,
+		EpisodeNumber:     detail.EpisodeNumber,
+		PosterThumbhash:   detail.PosterThumbhash,
+		BackdropThumbhash: detail.BackdropThumbhash,
+		Intro:             toMarker(detail.Intro),
+		Credits:           toMarker(detail.Credits),
+		Recap:             toMarker(detail.Recap),
+		Preview:           toMarker(detail.Preview),
+		StableIdentity:    stableIdentity(dl, detail, seriesDetail),
+		Integrity:         buildIntegrity(dl, file),
+		ManifestVersion:   manifestVersion,
+		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+	}
+
+	// Artwork: emit a proxy URL only when the source actually has the image.
+	if detail.PosterURL != "" {
+		m.ArtworkURLs.Poster = artworkProxyURL(dl.ID, "poster")
+	}
+	if detail.BackdropURL != "" {
+		m.ArtworkURLs.Backdrop = artworkProxyURL(dl.ID, "backdrop")
+	}
+	if detail.LogoURL != "" {
+		m.ArtworkURLs.Logo = artworkProxyURL(dl.ID, "logo")
+	}
+	if seriesDetail != nil {
+		m.SeriesPosterThumbhash = seriesDetail.PosterThumbhash
+		if seriesDetail.PosterURL != "" {
+			m.ArtworkURLs.SeriesPoster = artworkProxyURL(dl.ID, "series_poster")
+		}
+	}
+
+	if v := pickVersion(detail, dl.MediaFileID); v != nil {
+		if v.FileID == dl.MediaFileID {
+			selected := *v
+			if file != nil && file.ID == dl.MediaFileID {
+				if populateMarkers && b.MarkerPopulation != nil {
+					lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					populated, _, lookupErr := b.MarkerPopulation.Populate(lookupCtx, file)
+					cancel()
+					if lookupErr != nil {
+						slog.WarnContext(ctx, "download marker lookup failed", "file_id", file.ID, "error", lookupErr)
+					}
+					if populated != nil {
+						file = populated
+					}
+				}
+				selected.SetMarkers(file)
+				m.Intro, m.Credits, m.Recap, m.Preview = toMarker(selected.Intro), toMarker(selected.Credits), toMarker(selected.Recap), toMarker(selected.Preview)
+			}
+			m.MarkerSegments = selected.EffectiveMarkerSegments()
+		}
+		m.Container = v.Container
+		m.CodecVideo = v.CodecVideo
+		m.CodecAudio = v.CodecAudio
+		m.Resolution = v.Resolution
+		m.HDR = v.HDR
+		m.Duration = v.Duration
+		m.SelectedAudioTrackIndex = v.EffectiveAudioTrackIndex
+		m.AudioTracks = toOfflineAudioTracks(v.AudioTracks)
+		m.Chapters = toOfflineChapters(v.Chapters)
+	}
+
+	// Remux/transcode entries deliver the prepared artifact, not the catalog
+	// source: describe that file so the client picks the right decoder/tracks.
+	var prepared *Artifact
+	if dl.Format != FormatOriginal && dl.ArtifactID != "" && b.artifact != nil {
+		if a, err := b.artifact(ctx, dl.ArtifactID); err == nil && a != nil {
+			prepared = a
+			applyArtifactParams(m, a, file)
+		}
+	}
+
+	m.Subtitles = b.buildSubtitles(ctx, dl, file, prepared)
+	return m, nil
+}
+
+// applyArtifactParams overwrites the source file's media parameters with the
+// prepared artifact's target parameters. "copy" targets keep the source value.
+func applyArtifactParams(m *OfflineManifest, a *Artifact, file *models.MediaFile) {
+	if a.Container != "" {
+		m.Container = a.Container
+	}
+	if a.CodecVideo != "" && a.CodecVideo != "copy" {
+		m.CodecVideo = a.CodecVideo
+	}
+	if a.CodecAudio != "" && a.CodecAudio != "copy" {
+		m.CodecAudio = a.CodecAudio
+	}
+	if a.Resolution != "" {
+		m.Resolution = a.Resolution
+	}
+	if a.TrackRecipeVersion != "" {
+		applyPreparedAudioTracks(m, a, file)
+		return
+	}
+	// A legacy prepared file contains exactly one audio stream — the track the
+	// encode selected (playback.PrepareFile mapped a single audio track).
+	if len(m.AudioTracks) > 0 {
+		idx := a.AudioTrackIndex
+		if idx < 0 || idx >= len(m.AudioTracks) {
+			idx = 0
+		}
+		track := m.AudioTracks[idx]
+		track.Index = 0
+		track.Default = true
+		if a.CodecAudio != "" && a.CodecAudio != "copy" {
+			track.Codec = a.CodecAudio
+		}
+		m.AudioTracks = []OfflineAudioTrack{track}
+		selected := 0
+		m.SelectedAudioTrackIndex = &selected
+	}
+}
+
+// applyPreparedAudioTracks describes a multi-track prepared file from the
+// audio inventory frozen when it became ready, falling back to the current
+// source probe for an artifact that is not ready yet. The viewer's catalog
+// selection is a source position; it is carried to the output position the
+// prepared plan gave that track, and stays valid unless the source has since
+// changed at that position.
+func applyPreparedAudioTracks(m *OfflineManifest, a *Artifact, file *models.MediaFile) {
+	// A nil inventory was never frozen; an empty one froze a prepared file
+	// with no audio and must not be rebuilt from a later probe.
+	tracks := a.PreparedAudioTracks
+	if tracks == nil {
+		tracks = preparedAudioTracks(file, a)
+	}
+	if len(tracks) == 0 {
+		if file != nil || a.PreparedAudioTracks != nil {
+			// No source track was decodable, so the prepared file has no audio.
+			m.AudioTracks, m.SelectedAudioTrackIndex, m.CodecAudio = nil, nil, ""
+		}
+		return
+	}
+	m.AudioTracks = tracks
+	fileDefault := 0
+	for i, track := range tracks {
+		if track.Default {
+			fileDefault = i
+			break
+		}
+	}
+	m.CodecAudio = tracks[fileDefault].Codec
+	if selected := m.SelectedAudioTrackIndex; selected != nil && file != nil && *selected >= 0 && *selected < len(file.AudioTracks) {
+		// The frozen inventory records no source positions, so the current
+		// plan supplies them. A plan of a different length means the source
+		// was re-probed into another layout and cannot be mapped.
+		plan := playback.PlanPreparedTracks(file, a.CodecAudio, a.AudioTrackIndex)
+		output := slices.IndexFunc(plan.Audio, func(track playback.PreparedAudioTrack) bool { return track.SourceIndex == *selected })
+		if output >= 0 && len(plan.Audio) == len(tracks) && file.AudioTracks[*selected].Language == tracks[output].Language {
+			m.SelectedAudioTrackIndex = &output
+			return
+		}
+	}
+	m.SelectedAudioTrackIndex = &fileDefault
+}
+
+// preparedAudioTracks describes the audio streams a multi-track prepared file
+// built from file contains, in output order, with encoded tracks reporting the
+// AAC output layout.
+func preparedAudioTracks(file *models.MediaFile, a *Artifact) []OfflineAudioTrack {
+	if file == nil || a == nil || a.TrackRecipeVersion == "" {
+		return nil
+	}
+	plan := playback.PlanPreparedTracks(file, a.CodecAudio, a.AudioTrackIndex)
+	source := toOfflineAudioTracks(file.AudioTracks)
+	tracks := make([]OfflineAudioTrack, 0, len(plan.Audio))
+	channels, bitrateKbps := playback.ResolveAACOutputV3(0, 0)
+	for i, planned := range plan.Audio {
+		track := source[planned.SourceIndex]
+		track.Index = i
+		track.Default = planned.Default
+		if planned.Codec == playback.PreparedAudioAAC {
+			track.Codec = playback.PreparedAudioAAC
+			track.Channels = channels
+			track.Layout = preparedAudioLayoutStereo
+			track.Bitrate = bitrateKbps
+		}
+		tracks = append(tracks, track)
+	}
+	return tracks
+}
+
+// buildSubtitles enumerates external (sidecar), embedded sidecar, and
+// downloaded (S3) subtitle assets for the download's media file (already
+// loaded by build — no re-fetch). Other embedded tracks live inside the
+// downloaded video file and need no separate fetch. A multi-track prepared MP4
+// carries plain-text subtitles as timed text; ASS/SSA and PGS tracks are
+// offered as .ass/.sup sidecars extracted from the source instead.
+func (b *ManifestBuilder) buildSubtitles(ctx context.Context, dl *Download, file *models.MediaFile, prepared *Artifact) []OfflineSubtitle {
+	out := []OfflineSubtitle{}
+
+	if file != nil {
+		for i, ext := range file.ExternalSubtitles {
+			// The revision follows the delivered bytes: the file on disk and
+			// its timing correction. An unreadable sidecar is still listed;
+			// fetching it reports the error.
+			var size int64
+			var revision string
+			if data, err := playback.LoadExternalSubtitleRaw(ext.Path); err == nil {
+				timed, rev, timingErr := subtitles.ExternalDelivery(ctx, b.externalTimings, file.ID, subtitles.SubtitleFormat(strings.ToLower(ext.Format)), ext.Language, data)
+				if timingErr != nil {
+					slog.WarnContext(ctx, "download sidecar timing lookup failed", "file_id", file.ID, "error", timingErr)
+				} else {
+					size, revision = int64(len(timed)), rev
+				}
+			}
+			out = append(out, OfflineSubtitle{
+				Language:        ext.Language,
+				Title:           ext.Title,
+				Format:          ext.Format,
+				Forced:          ext.Forced,
+				HearingImpaired: ext.HearingImpaired,
+				External:        true,
+				FetchURL:        subtitleProxyURL(dl.ID, fmt.Sprintf("external:%d", i)),
+				FileSize:        size,
+				Revision:        revision,
+			})
+		}
+		if prepared != nil && prepared.TrackRecipeVersion != "" {
+			for i, track := range file.SubtitleTracks {
+				format := playback.PreparedSubtitleSidecarFormat(track.Codec)
+				if track.External || format == "" {
+					continue
+				}
+				out = append(out, OfflineSubtitle{
+					Language:        track.Language,
+					Title:           track.EmbeddedTitle,
+					Format:          format,
+					Forced:          track.Forced,
+					HearingImpaired: track.HearingImpaired,
+					FetchURL:        subtitleProxyURL(dl.ID, fmt.Sprintf("%s:%d", subtitleRefEmbedded, i)),
+				})
+			}
+		}
+	}
+
+	if b.subs != nil {
+		if downloaded, err := b.subs.ListDownloadedSubtitles(ctx, dl.MediaFileID); err == nil {
+			for _, sub := range downloaded {
+				out = append(out, OfflineSubtitle{
+					Language:        sub.Language,
+					Format:          string(sub.Format),
+					HearingImpaired: sub.HearingImpaired,
+					External:        false,
+					FetchURL:        subtitleProxyURL(dl.ID, fmt.Sprintf("downloaded:%d", sub.ID)),
+					Revision:        subtitles.DeliveryRevision(&sub),
+				})
+			}
+		}
+	}
+
+	return out
+}
+
+func (b *ManifestBuilder) lookupFile(ctx context.Context, mediaFileID int) *models.MediaFile {
+	if b.fileRepo == nil || mediaFileID <= 0 {
+		return nil
+	}
+	file, err := b.fileRepo.GetByID(ctx, mediaFileID)
+	if err != nil {
+		return nil
+	}
+	return file
+}
+
+// manifestContentID resolves the item the manifest describes: the episode's own
+// content id for episode entries, otherwise the movie's content id.
+func manifestContentID(dl *Download) string {
+	if dl.EpisodeID != "" {
+		return dl.EpisodeID
+	}
+	return dl.ContentID
+}
+
+func artworkProxyURL(downloadID, kind string) string {
+	return apiDownloadsPrefix + downloadID + "/artwork/" + kind
+}
+
+func subtitleProxyURL(downloadID, ref string) string {
+	return apiDownloadsPrefix + downloadID + "/subtitles/" + ref
+}
+
+func pickVersion(detail *catalog.ItemDetail, mediaFileID int) *catalog.FileVersion {
+	for i := range detail.Versions {
+		if detail.Versions[i].FileID == mediaFileID {
+			return &detail.Versions[i]
+		}
+	}
+	if len(detail.Versions) > 0 {
+		return &detail.Versions[0]
+	}
+	return nil
+}
+
+func toMarker(m *catalog.Marker) *Marker {
+	if m == nil {
+		return nil
+	}
+	return &Marker{Start: m.Start, End: m.End}
+}
+
+func toOfflineChapters(chapters []catalog.VersionChapter) []OfflineChapter {
+	if len(chapters) == 0 {
+		return nil
+	}
+	out := make([]OfflineChapter, 0, len(chapters))
+	for _, c := range chapters {
+		out = append(out, OfflineChapter{
+			Index:              c.Index,
+			Title:              c.Title,
+			StartSeconds:       c.StartSeconds,
+			EndSeconds:         c.EndSeconds,
+			ThumbnailThumbhash: c.ThumbnailThumbhash,
+		})
+	}
+	return out
+}
+
+func toOfflineAudioTracks(tracks []models.AudioTrack) []OfflineAudioTrack {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]OfflineAudioTrack, 0, len(tracks))
+	for i, t := range tracks {
+		out = append(out, OfflineAudioTrack{
+			Index:      i,
+			Title:      firstNonEmpty(t.Title, t.EmbeddedTitle),
+			Language:   t.Language,
+			Codec:      t.Codec,
+			Layout:     t.Layout,
+			Channels:   t.Channels,
+			Bitrate:    t.Bitrate,
+			SampleRate: t.SampleRate,
+			Default:    t.Default,
+		})
+	}
+	return out
+}
+
+func stableIdentity(dl *Download, detail, seriesDetail *catalog.ItemDetail) OfflineIdentity {
+	providerIDs := map[string]string{}
+	addProviderIDs(providerIDs, detail)
+	id := OfflineIdentity{
+		StableType:  detail.Type,
+		ProviderIDs: providerIDs,
+		Season:      detail.SeasonNumber,
+		Episode:     detail.EpisodeNumber,
+	}
+	if dl.EpisodeID != "" {
+		id.StableType = "episode"
+		seriesProviderIDs := map[string]string{}
+		addProviderIDs(seriesProviderIDs, seriesDetail)
+		if len(seriesProviderIDs) > 0 {
+			id.SeriesProviderIDs = seriesProviderIDs
+		}
+	}
+	if len(providerIDs) == 0 {
+		id.ProviderIDs = nil
+	}
+	return id
+}
+
+func addProviderIDs(out map[string]string, detail *catalog.ItemDetail) {
+	if detail == nil {
+		return
+	}
+	if detail.ImdbID != "" {
+		out["imdb"] = detail.ImdbID
+	}
+	if detail.TmdbID != "" {
+		out["tmdb"] = detail.TmdbID
+	}
+	if detail.TvdbID != "" {
+		out["tvdb"] = detail.TvdbID
+	}
+}
+
+func buildIntegrity(dl *Download, file *models.MediaFile) OfflineIntegrity {
+	hash := ""
+	modified := ""
+	if file != nil {
+		hash = file.FileHash
+		if file.FileModifiedAt != nil {
+			modified = file.FileModifiedAt.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%s|%s|%s|%d|%d|%s",
+		dl.ID, dl.Revision, dl.Format, dl.Quality,
+		dl.EffectiveQuality, dl.TargetBitrateKbps, dl.FileSize, modified)))
+	return OfflineIntegrity{
+		ExpectedBytes: dl.FileSize,
+		MediaFileHash: hash,
+		MetadataETag:  hex.EncodeToString(sum[:]),
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}

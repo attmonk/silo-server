@@ -1,0 +1,324 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router";
+import { Check, Loader2, Sparkles } from "lucide-react";
+import { toast } from "sonner";
+import DefaultArtwork from "@/components/DefaultArtwork";
+import { Button } from "@/components/ui/button";
+import { useAuth } from "@/hooks/useAuth";
+import { useT } from "@/i18n";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { decodeThumbhash } from "@/lib/thumbhash";
+import type { SectionItem } from "@/api/types";
+import { useTasteSeedItems, useSubmitTasteSeed } from "@/hooks/queries/tasteSeed";
+import { setTasteSeedDismissed } from "@/lib/tasteSeed";
+
+const MIN_PICKS = 3;
+
+export default function TasteSeed() {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const { profile } = useAuth();
+  const t = useT();
+  useDocumentTitle(t("web.home.tasteSeed.title"));
+
+  const isReturning = searchParams.get("from") === "settings";
+  // Finishing the picker opens the recommendations it just shaped; skipping
+  // it, or returning from settings, goes back where the user came from.
+  const exitPath = isReturning ? "/settings/personalize" : "/";
+  const donePath = isReturning ? "/settings/personalize" : "/recommendations";
+
+  // Track only the user's explicit toggles. Final `selected` set is derived
+  // from items + toggles each render, so already-favorited items are
+  // automatically pre-selected without needing setState-in-effect.
+  const [userToggles, setUserToggles] = useState<Map<string, boolean>>(new Map());
+
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetching,
+    isFetchingNextPage,
+    isFetchNextPageError,
+    isPending,
+  } = useTasteSeedItems(true);
+  const submit = useSubmitTasteSeed();
+
+  // Flatten paginated pages into a single item list.
+  const items = useMemo(() => data?.pages.flatMap((p) => p.items) ?? [], [data]);
+
+  // Derive the selected set: items already favorited are selected unless the
+  // user explicitly deselected them; user-added picks are also selected.
+  const selected = useMemo(() => {
+    const set = new Set<string>();
+    for (const item of items) {
+      const toggle = userToggles.get(item.content_id);
+      if (toggle === true) {
+        set.add(item.content_id);
+      } else if (toggle === false) {
+        // user explicitly deselected — leave out
+      } else if (item.user_state?.is_favorite) {
+        set.add(item.content_id);
+      }
+    }
+    return set;
+  }, [items, userToggles]);
+
+  // A page can hydrate to no cards the profile may see. Keep paging until a
+  // card shows up or the catalog runs out, instead of settling on the empty
+  // state; the sentinel below only exists once cards render.
+  const waitingForCards = items.length === 0 && hasNextPage && !isFetchNextPageError;
+  useEffect(() => {
+    if (isPending || !waitingForCards || isFetchingNextPage) return;
+    void fetchNextPage();
+  }, [fetchNextPage, isFetchingNextPage, isPending, waitingForCards]);
+
+  // Infinite-scroll trigger: load the next page when sentinel becomes visible.
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel || !hasNextPage || isFetchingNextPage) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          void fetchNextPage();
+        }
+      },
+      { rootMargin: "400px 0px" },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [fetchNextPage, hasNextPage, isFetchingNextPage]);
+
+  const toggle = useCallback(
+    (contentId: string) => {
+      setUserToggles((prev) => {
+        const next = new Map(prev);
+        const currentlySelected = selected.has(contentId);
+        next.set(contentId, !currentlySelected);
+        return next;
+      });
+    },
+    [selected],
+  );
+
+  const handleSkip = useCallback(() => {
+    if (profile) {
+      setTasteSeedDismissed(profile.id);
+    }
+    navigate(exitPath, { replace: true });
+  }, [navigate, profile, exitPath]);
+
+  const handleSubmit = useCallback(async () => {
+    if (selected.size < MIN_PICKS) {
+      toast.error(t("web.home.tasteSeed.minPicks", { count: MIN_PICKS }));
+      return;
+    }
+    // Add the picks that aren't favourites yet and remove the favourites the
+    // user unselected. Only loaded cards count: a favourite on a page the
+    // user never scrolled to stays put.
+    const alreadyFavorited = items
+      .filter((i) => i.user_state?.is_favorite)
+      .map((i) => i.content_id);
+    const favoritedSet = new Set(alreadyFavorited);
+    const add = Array.from(selected).filter((id) => !favoritedSet.has(id));
+    const remove = alreadyFavorited.filter((id) => !selected.has(id));
+
+    if (add.length === 0 && remove.length === 0) {
+      // Nothing changed, but still record the dismissed flag so future
+      // logins skip the redirect.
+      if (profile) {
+        setTasteSeedDismissed(profile.id);
+      }
+      navigate(donePath, { replace: true });
+      return;
+    }
+
+    try {
+      const result = await submit.mutateAsync({ add, remove });
+      if (profile) {
+        setTasteSeedDismissed(profile.id);
+      }
+      if (result.added > 0 || result.removed === 0) {
+        toast.success(t("web.home.tasteSeed.added", { count: result.added }));
+      }
+      if (result.removed > 0) {
+        toast.success(t("web.common.toast.favorites.removed"));
+      }
+      navigate(donePath, { replace: true });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t("web.home.tasteSeed.saveFailed"));
+    }
+  }, [selected, items, submit, navigate, profile, donePath, t]);
+
+  const submitDisabled = selected.size < MIN_PICKS || submit.isPending;
+
+  return (
+    <div className="min-h-[100dvh]">
+      {/* Sticky header with progress + actions */}
+      <header className="bg-background/80 supports-[backdrop-filter]:bg-background/60 border-border sticky top-0 z-30 border-b backdrop-blur">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-3 px-4 py-4 sm:px-6">
+          <div className="min-w-0 flex-1">
+            <h1 className="flex items-center gap-2 text-xl font-bold tracking-tight sm:text-2xl">
+              <Sparkles className="text-primary h-5 w-5" aria-hidden="true" />
+              {t("web.home.tasteSeed.title")}
+            </h1>
+            <p className="text-muted-foreground mt-0.5 text-sm">
+              {selected.size === 0
+                ? t("web.home.tasteSeed.prompt", { count: MIN_PICKS })
+                : selected.size < MIN_PICKS
+                  ? t("web.home.tasteSeed.selectedCountMore", {
+                      remaining: MIN_PICKS - selected.size,
+                      count: selected.size,
+                    })
+                  : t("web.home.tasteSeed.selectedCount", { count: selected.size })}
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button variant="ghost" onClick={handleSkip} disabled={submit.isPending}>
+              {isReturning ? t("common.cancel") : t("web.home.tasteSeed.skip")}
+            </Button>
+            <Button onClick={handleSubmit} disabled={submitDisabled}>
+              {submit.isPending ? (
+                <>
+                  <Loader2 className="me-2 h-4 w-4 animate-spin" />
+                  {t("web.home.tasteSeed.saving")}
+                </>
+              ) : (
+                t("web.home.tasteSeed.done")
+              )}
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
+        {isPending || waitingForCards ? (
+          <TasteSeedGridSkeleton />
+        ) : items.length === 0 ? (
+          <div className="text-muted-foreground flex flex-col items-center gap-3 py-24 text-center">
+            <p className="text-base font-medium">{t("web.home.tasteSeed.emptyTitle")}</p>
+            <p className="text-sm">{t("web.home.tasteSeed.emptyBody")}</p>
+            <Button variant="ghost" className="mt-4" onClick={handleSkip}>
+              {t("web.home.tasteSeed.continue")}
+            </Button>
+          </div>
+        ) : (
+          <>
+            <div
+              role="listbox"
+              aria-multiselectable="true"
+              aria-label={t("web.home.tasteSeed.gridLabel")}
+              className="grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7"
+            >
+              {items.map((item) => (
+                <TasteSeedCard
+                  key={item.content_id}
+                  item={item}
+                  selected={selected.has(item.content_id)}
+                  onToggle={toggle}
+                />
+              ))}
+            </div>
+            {/* Infinite-scroll sentinel */}
+            <div ref={sentinelRef} className="h-12" />
+            {isFetchingNextPage && (
+              <div className="text-muted-foreground flex justify-center py-4 text-sm">
+                <Loader2 className="me-2 h-4 w-4 animate-spin" />
+                {t("web.home.tasteSeed.loadingMore")}
+              </div>
+            )}
+            {!hasNextPage && !isFetching && items.length > 0 && (
+              <p className="text-muted-foreground py-6 text-center text-xs">
+                {t("web.home.tasteSeed.end")}
+              </p>
+            )}
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function TasteSeedCard({
+  item,
+  selected,
+  onToggle,
+}: {
+  item: SectionItem;
+  selected: boolean;
+  onToggle: (contentId: string) => void;
+}) {
+  const t = useT();
+  const [loaded, setLoaded] = useState(false);
+  // Keyed by URL so a re-signed poster is tried again.
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  const thumbhashUrl = item.poster_thumbhash ? decodeThumbhash(item.poster_thumbhash) : "";
+
+  return (
+    <button
+      type="button"
+      role="option"
+      aria-selected={selected}
+      aria-label={t(
+        selected ? "web.home.tasteSeed.deselectTitle" : "web.home.tasteSeed.selectTitle",
+        { title: item.title },
+      )}
+      onClick={() => onToggle(item.content_id)}
+      className="group focus-visible:ring-ring relative block overflow-hidden rounded-xl text-start focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
+    >
+      <div
+        className="relative aspect-[2/3] overflow-hidden rounded-xl"
+        style={
+          thumbhashUrl
+            ? {
+                backgroundImage: `url(${thumbhashUrl})`,
+                backgroundSize: "cover",
+                backgroundPosition: "center",
+              }
+            : undefined
+        }
+      >
+        {item.poster_url && failedUrl !== item.poster_url ? (
+          <img
+            src={item.poster_url}
+            alt=""
+            className={`h-full w-full object-cover transition-opacity duration-300 ${loaded ? "opacity-100" : "opacity-0"}`}
+            loading="lazy"
+            onLoad={() => setLoaded(true)}
+            onError={() => setFailedUrl(item.poster_url ?? null)}
+          />
+        ) : (
+          !thumbhashUrl && <DefaultArtwork mediaType={item.type} />
+        )}
+
+        {/* Dim overlay when unselected to make selected posters pop */}
+        <div
+          className={`pointer-events-none absolute inset-0 transition-opacity ${
+            selected ? "bg-primary/20 opacity-100" : "bg-black/0 group-hover:bg-black/15"
+          }`}
+        />
+
+        {/* Selection check indicator */}
+        <span
+          className={`absolute end-2 top-2 inline-flex size-7 items-center justify-center rounded-full border transition ${
+            selected
+              ? "border-primary bg-primary text-primary-foreground"
+              : "border-white/60 bg-black/40 text-transparent group-hover:bg-black/55"
+          }`}
+        >
+          <Check className="size-4" />
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function TasteSeedGridSkeleton() {
+  return (
+    <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7">
+      {Array.from({ length: 24 }).map((_, i) => (
+        <div key={i} className="bg-muted/40 aspect-[2/3] animate-pulse rounded-xl" />
+      ))}
+    </div>
+  );
+}

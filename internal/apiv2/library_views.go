@@ -1,0 +1,548 @@
+package apiv2
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
+	"github.com/Silo-Server/silo-server/internal/ratingsources"
+	"github.com/Silo-Server/silo-server/internal/sections"
+	"github.com/Silo-Server/silo-server/internal/usercollections"
+)
+
+// The libraries domain, viewer side: the profile-scoped /library/{id} reads
+// that render a library's home page (sections and their cards) and its
+// Collections tab. Cards are the shared CatalogItem (catalog_types.go).
+
+// LibraryViewInput names the library a viewer is browsing.
+type LibraryViewInput struct {
+	ID ID `path:"id" doc:"Library identifier" example:"1"`
+}
+
+// SectionClient is the client family a viewer section read declares. It
+// decides whether a featured section an administrator kept off the apps is
+// part of the answer.
+type SectionClient struct {
+	ClientFamily string `header:"X-Silo-Client-Family" doc:"The caller's client family: tv, mobile, tablet, desktop or web. Only web receives a featured section an administrator limited to the web app (an admin section's web_only). For any other value, or none, layouts and lists leave that section out and reading it alone answers 404" example:"tv"`
+}
+
+// web reports whether the caller declared the web client family.
+func (c SectionClient) web() bool {
+	return handlers.IsWebClientFamily(c.ClientFamily)
+}
+
+// LibraryLayoutInput is the getLibraryLayout query.
+type LibraryLayoutInput struct {
+	ID ID `path:"id" doc:"Library identifier" example:"1"`
+	SectionClient
+}
+
+// LibrarySectionsInput is the listLibrarySections query.
+type LibrarySectionsInput struct {
+	ID ID `path:"id" doc:"Library identifier" example:"1"`
+	SectionItemLimitQuery
+	ArtworkQuery
+	SectionClient
+}
+
+// SectionItemLimitQuery is the optional per-row cap the aggregate section
+// reads (listHomeSections, listLibrarySections) accept. The maximum must
+// equal handlers.MaxSectionItemLimitCap, which getHomeCapabilities
+// advertises; TestHomeCapabilities pins the two.
+type SectionItemLimitQuery struct {
+	ItemLimit int `query:"item_limit" minimum:"1" maximum:"100" doc:"Answer at most this many cards per section: each section's item_limit becomes the smaller of its own and this value; total_count keeps its meaning. Absent keeps each section's own limit. Send it only when getHomeCapabilities reports section_item_limit_max; an older server rejects the parameter" example:"20"`
+}
+
+// sectionViewerCapped is sectionViewer with the request's per-row cap.
+func sectionViewerCapped(ctx context.Context, art imagesize.Request, client SectionClient, itemLimit int) handlers.SectionViewer {
+	viewer := sectionViewer(ctx, art, client)
+	viewer.ItemLimitCap = itemLimit
+	return viewer
+}
+
+// LibrarySectionItemsInput is the getLibrarySectionItems query.
+type LibrarySectionItemsInput struct {
+	ID        ID     `path:"id" doc:"Library identifier" example:"1"`
+	SectionID string `path:"section_id" minLength:"1" doc:"Section identifier from the layout" example:"recently_added"`
+	ArtworkQuery
+	SectionClient
+}
+
+// SectionTitleKey names the translation catalog message a section's title
+// is the English of. Both fields are absent when the title is text an
+// administrator or the profile typed.
+type SectionTitleKey struct {
+	TitleKey  string            `json:"title_key,omitempty" doc:"Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present" example:"home.section.recentlyAddedIn"`
+	TitleArgs map[string]string `json:"title_args,omitempty" doc:"Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none" example:"{\"library\":\"Movies\"}"`
+}
+
+func sectionTitleKeyOf(key string, args map[string]string) SectionTitleKey {
+	if key == "" {
+		return SectionTitleKey{}
+	}
+	return SectionTitleKey{TitleKey: key, TitleArgs: args}
+}
+
+// SectionLayoutEntry is one section of a page layout, without items.
+type SectionLayoutEntry struct {
+	ID          string `json:"id" example:"recently_added"`
+	SectionType string `json:"section_type" example:"recently_added"`
+	Title       string `json:"title" example:"Recently Added"`
+	Featured    bool   `json:"featured" example:"false"`
+	ItemLimit   int    `json:"item_limit" example:"20"`
+	IsCustom    bool   `json:"is_custom" doc:"An administrator-defined section rather than a built-in one" example:"false"`
+	Customized  bool   `json:"customized" doc:"The profile has overridden the section's placement or visibility" example:"false"`
+	SectionTitleKey
+}
+
+// SectionLayout is a page's sections in display order.
+type SectionLayout struct {
+	Sections []SectionLayoutEntry `json:"sections" doc:"Empty, never null"`
+}
+
+// SectionLayoutOutput is the getLibraryLayout response.
+type SectionLayoutOutput struct {
+	Body SectionLayout
+}
+
+// Section is one page section with its cards.
+type Section struct {
+	ID          string                  `json:"id" example:"recently_added"`
+	SectionType string                  `json:"section_type" example:"recently_added"`
+	Title       string                  `json:"title" example:"Recently Added"`
+	Featured    bool                    `json:"featured" example:"false"`
+	ItemLimit   int                     `json:"item_limit" example:"20"`
+	TotalCount  int                     `json:"total_count" doc:"Items the section has in total, at least the number returned" example:"120"`
+	IsCustom    bool                    `json:"is_custom" example:"false"`
+	Customized  bool                    `json:"customized" example:"false"`
+	Items       []CatalogItem           `json:"items" doc:"Empty, never null"`
+	HasMore     bool                    `json:"has_more,omitzero" doc:"The section holds more cards than items: reading it again without item_limit answers more. Sent only by getHomeSectionItems and getHomeLayout's included_sections when the request carried item_limit, and absent when false" example:"true"`
+	Collections []SectionCollectionCard `json:"collections,omitempty" doc:"The cards of a row of collections (section_type collection_posters), in the row's order: the collections the viewer can see. Such a section has no items, total_count is the number of collections, and item_limit does not apply. Absent on every other section. See getHomeCapabilities collection_rows"`
+	SectionTitleKey
+}
+
+// SectionCollectionCard is one collection on a row of collections.
+type SectionCollectionCard struct {
+	ID                string  `json:"id" example:"01J9Z8C3W4R5T6Y7U8I9O0P1Q2"`
+	Source            string  `json:"source" enum:"library,user" doc:"library for a server collection, user for a personal collection" example:"library"`
+	Title             string  `json:"title" example:"Marvel"`
+	PosterURL         string  `json:"poster_url" format:"uri-reference" doc:"Presigned, short-lived; empty when none"`
+	PosterThumbhash   string  `json:"poster_thumbhash,omitempty"`
+	PosterIsCollage   bool    `json:"poster_is_collage" doc:"poster_url is the acting profile's collage of the collection's first titles it can see, composed by the server because the collection has no uploaded, template or imported poster. False for an uploaded, template or imported poster and whenever poster_url is empty" example:"false"`
+	BackdropURL       string  `json:"backdrop_url,omitempty" format:"uri-reference" doc:"Presigned, short-lived backdrop of a server collection that has one, for a hero backdrop while the card is focused: the page-width variant, or the card thumbnail when the backdrop is set to another artwork such as the collection's poster. Absent when none and on personal collections"`
+	BackdropThumbhash string  `json:"backdrop_thumbhash,omitempty"`
+	ItemCount         int     `json:"item_count" doc:"The titles the acting profile sees in the collection" example:"12"`
+	LibraryID         *ID     `json:"library_id,omitempty" doc:"Present on a server collection: a library the viewer can open that holds it, for the collection's page link. On a library page, that library" example:"1"`
+	CreatorProfileID  *string `json:"creator_profile_id,omitempty" doc:"Present on a personal collection: the profile that made it"`
+}
+
+// sectionCollectionCardsOf maps a row of collections' cards, or nil when the
+// section has none.
+func sectionCollectionCardsOf(cards []sections.CollectionCard) []SectionCollectionCard {
+	if len(cards) == 0 {
+		return nil
+	}
+	out := make([]SectionCollectionCard, 0, len(cards))
+	for _, c := range cards {
+		card := SectionCollectionCard{ID: c.ID, Source: c.Source, Title: c.Title, PosterURL: c.PosterURL, PosterThumbhash: c.PosterThumbhash,
+			PosterIsCollage: c.PosterIsCollage && c.PosterURL != "", BackdropURL: c.BackdropURL, BackdropThumbhash: c.BackdropThumbhash, ItemCount: c.ItemCount, CreatorProfileID: c.CreatorProfileID}
+		if c.LibraryID != nil {
+			card.LibraryID = new(IDFromInt(int64(*c.LibraryID)))
+		}
+		out = append(out, card)
+	}
+	return out
+}
+
+// SectionCollection is a page's sections with their cards.
+type SectionCollection struct {
+	Sections []Section `json:"sections" doc:"Empty, never null"`
+}
+
+// SectionCollectionOutput is the listLibrarySections response.
+type SectionCollectionOutput struct {
+	Body SectionCollection
+}
+
+// SectionOutput is the getLibrarySectionItems response.
+type SectionOutput struct {
+	Body Section
+}
+
+// CuratedCollection is one curated collection in full.
+type CuratedCollection struct {
+	ID                string          `json:"id" example:"01J9Z8C3W4R5T6Y7U8I9O0P1Q2"`
+	LibraryID         ID              `json:"library_id" example:"1"`
+	LibraryIDs        []ID            `json:"library_ids" doc:"Every library the collection spans; empty, never null"`
+	Slug              string          `json:"slug" example:"oscar-winners"`
+	Title             string          `json:"title" example:"Oscar Winners"`
+	Description       string          `json:"description"`
+	CollectionType    string          `json:"collection_type" doc:"manual, smart, or an import type" example:"manual"`
+	Visibility        string          `json:"visibility" example:"visible"`
+	SortOrder         int             `json:"sort_order" example:"0"`
+	GroupID           *string         `json:"group_id" doc:"null when ungrouped"`
+	Featured          bool            `json:"featured" example:"false"`
+	PosterURL         string          `json:"poster_url" format:"uri-reference" doc:"Presigned, short-lived; empty when none"`
+	BackdropURL       string          `json:"backdrop_url" format:"uri-reference" doc:"Presigned, short-lived; empty when none"`
+	PosterThumbhash   string          `json:"poster_thumbhash,omitempty"`
+	BackdropThumbhash string          `json:"backdrop_thumbhash,omitempty"`
+	SourceURL         string          `json:"source_url" doc:"Where an imported collection came from (a list URL or a tmdb:// source); empty when not imported; not validated as a URI"`
+	QueryDefinition   json.RawMessage `json:"query_definition" doc:"Smart collection query; null when not a smart collection"`
+	SortConfig        json.RawMessage `json:"sort_config" doc:"Sort configuration document; null when default"`
+	SourceConfig      json.RawMessage `json:"source_config" doc:"Import source configuration; null when not imported"`
+	ManagementMode    string          `json:"management_mode" example:"manual"`
+	ManagementSource  string          `json:"management_source"`
+	ManagementKey     string          `json:"management_key"`
+	LastSyncStatus    string          `json:"last_sync_status"`
+	LastSyncMessage   string          `json:"last_sync_message"`
+	LastSyncAt        *Instant        `json:"last_sync_at,omitempty"`
+	SyncSchedule      string          `json:"sync_schedule,omitempty"`
+	NextSyncAt        *Instant        `json:"next_sync_at,omitempty"`
+	ItemCount         int             `json:"item_count" example:"12"`
+	CreatedAt         Instant         `json:"created_at" example:"2026-01-02T03:04:05.678Z"`
+	UpdatedAt         Instant         `json:"updated_at" example:"2026-01-02T03:04:05.678Z"`
+	PosterIsCollage   bool            `json:"poster_is_collage" doc:"poster_url is the acting profile's collage of the collection's first titles it can see, composed by the server because the collection has no uploaded, template or imported poster. False for an uploaded, template or imported poster and whenever poster_url is empty. See getCollectionCapabilities poster_collages" example:"false"`
+}
+
+// LibraryCollectionCard is a collection as the Collections tab shows it.
+type LibraryCollectionCard struct {
+	ID               string  `json:"id" example:"01J9Z8C3W4R5T6Y7U8I9O0P1Q2"`
+	Title            string  `json:"title" example:"Oscar Winners"`
+	PosterURL        string  `json:"poster_url" format:"uri-reference" doc:"Presigned, short-lived; empty when none"`
+	PosterThumbhash  string  `json:"poster_thumbhash,omitempty"`
+	ItemCount        int     `json:"item_count" example:"12"`
+	Featured         bool    `json:"featured,omitempty"`
+	CreatorProfileID *string `json:"creator_profile_id,omitempty" doc:"Present on a personal collection: the profile that made it"`
+	PosterIsCollage  bool    `json:"poster_is_collage" doc:"poster_url is the acting profile's collage of the collection's first titles it can see, composed by the server because the collection has no uploaded, template or imported poster. False for an uploaded, template or imported poster and whenever poster_url is empty. See getCollectionCapabilities poster_collages" example:"false"`
+}
+
+// LibraryCollectionGroup is one group of the Collections tab.
+type LibraryCollectionGroup struct {
+	ID          string                  `json:"id" example:"01J9Z8C3W4R5T6Y7U8I9O0P1Q3"`
+	Name        string                  `json:"name" example:"Franchises"`
+	Kind        string                  `json:"kind" doc:"admin or user_collections" example:"admin"`
+	SortMode    string                  `json:"sort_mode" example:"name_asc"`
+	SortOrder   int                     `json:"sort_order" example:"0"`
+	Collections []LibraryCollectionCard `json:"collections"`
+}
+
+// LibraryCollectionUngrouped is the tab's collections outside any group.
+type LibraryCollectionUngrouped struct {
+	SortOrder   int                     `json:"sort_order" example:"9999"`
+	Collections []LibraryCollectionCard `json:"collections"`
+}
+
+// LibraryCollectionTab is a library's Collections tab.
+type LibraryCollectionTab struct {
+	LibraryID   ID                          `json:"library_id" example:"1"`
+	Collections []CuratedCollection         `json:"collections" doc:"Every visible curated collection in full; empty, never null"`
+	Groups      []LibraryCollectionGroup    `json:"groups" doc:"Non-empty groups in display order; empty when groups are not configured"`
+	Ungrouped   *LibraryCollectionUngrouped `json:"ungrouped,omitempty" doc:"Absent when every collection is grouped"`
+}
+
+// LibraryCollectionTabOutput is the getLibraryCollections response.
+type LibraryCollectionTabOutput struct {
+	Body LibraryCollectionTab
+}
+
+// UserCollection is a personal collection the viewer opted into a library tab.
+type UserCollection struct {
+	ID               string  `json:"id" example:"01J9Z8C3W4R5T6Y7U8I9O0P1Q4"`
+	CreatorProfileID string  `json:"creator_profile_id" example:"p-owner"`
+	Name             string  `json:"name" example:"Rainy days"`
+	Description      string  `json:"description,omitempty"`
+	CollectionType   string  `json:"collection_type" example:"manual"`
+	ItemCount        int     `json:"item_count" example:"4"`
+	PosterURL        string  `json:"poster_url,omitempty" format:"uri-reference" doc:"Presigned, short-lived"`
+	PosterThumbhash  string  `json:"poster_thumbhash,omitempty"`
+	PosterIsCollage  bool    `json:"poster_is_collage" doc:"poster_url is the acting profile's collage of the collection's first titles it can see, composed by the server because the collection has no uploaded, template or imported poster. False for an uploaded, template or imported poster and whenever poster_url is empty. See getCollectionCapabilities poster_collages" example:"false"`
+	CreatedAt        Instant `json:"created_at" example:"2026-01-02T03:04:05.678Z"`
+	UpdatedAt        Instant `json:"updated_at" example:"2026-01-02T03:04:05.678Z"`
+}
+
+// UserCollectionCollection is the listLibraryUserCollections envelope.
+type UserCollectionCollection struct {
+	Collection[UserCollection]
+}
+
+// UserCollectionCollectionOutput is the listLibraryUserCollections response.
+type UserCollectionCollectionOutput struct {
+	Body UserCollectionCollection
+}
+
+// CatalogItemCollection is a page of cards.
+type CatalogItemCollection struct {
+	Collection[CatalogItem]
+}
+
+// CatalogItemCollectionOutput answers a collection of catalog cards.
+type CatalogItemCollectionOutput struct {
+	Body CatalogItemCollection
+}
+
+func registerLibraryViews(reg *Registry) {
+	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/library/{id}/layout", "getLibraryLayout", "libraries",
+		"The library's section layout for the acting profile, without items.")), reg.getLibraryLayout)
+	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/library/{id}/sections", "listLibrarySections", "libraries",
+		"The library's sections that have cards for the acting profile, with those cards.")), reg.listLibrarySections)
+	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/library/{id}/sections/{section_id}/items", "getLibrarySectionItems", "libraries",
+		"One section of the library with its cards.")), reg.getLibrarySectionItems)
+	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/library/{id}/collections", "getLibraryCollections", "libraries",
+		"The library's Collections tab: curated collections, their groups, and the viewer's opted-in personal collections.")), reg.getLibraryCollections)
+	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/library/{id}/user-collections", "listLibraryUserCollections", "libraries",
+		"The viewer's own personal collections opted into this library's tab.")), reg.listLibraryUserCollections)
+}
+
+// viewerIdentity is the profile-scoped caller; the gate guarantees both.
+func viewerIdentity(ctx context.Context) (int, string, *Problem) {
+	claims := claimsFrom(ctx)
+	profileID := profileFrom(ctx)
+	if claims == nil || profileID == "" {
+		return 0, "", NewProblem(TypeAuthenticationRequired, "Authentication is required.")
+	}
+	return claims.UserID, profileID, nil
+}
+
+// cardAvailabilityWanted reports whether the acting profile draws the
+// availability poster badge. Card reads count seasons and episodes only then:
+// the badge is off by default, and the count is the one card lookup whose
+// cost grows with the number of episodes behind a page.
+func cardAvailabilityWanted(ctx context.Context) bool {
+	scope, ok := access.GetScope(ctx)
+	return ok && scope.CardAvailability
+}
+
+// sectionViewer is what the section seams need beyond the context. The v2
+// listener does not read a device header, so the access filter carries no
+// device id.
+func sectionViewer(ctx context.Context, art imagesize.Request, client SectionClient) handlers.SectionViewer {
+	return handlers.SectionViewer{
+		Access:                  handlers.AccessFilterFromContext(ctx, ""),
+		ImageSize:               art.Size,
+		ImageWidths:             art.Widths,
+		IncludeCardAvailability: cardAvailabilityWanted(ctx),
+		Web:                     client.web(),
+	}
+}
+
+func (reg *Registry) librarySections() (LibrarySectionService, *Problem) {
+	if reg.deps.LibrarySections == nil {
+		return nil, unavailable("library sections")
+	}
+	return reg.deps.LibrarySections, nil
+}
+
+func (reg *Registry) libraryCollections() (LibraryCollectionService, *Problem) {
+	if reg.deps.LibraryCollections == nil {
+		return nil, unavailable("library collections")
+	}
+	return reg.deps.LibraryCollections, nil
+}
+
+func (reg *Registry) getLibraryLayout(ctx context.Context, in *LibraryLayoutInput) (*SectionLayoutOutput, error) {
+	svc, p := reg.librarySections()
+	if p != nil {
+		return nil, p
+	}
+	id, p := libraryID(in.ID)
+	if p != nil {
+		return nil, p
+	}
+	if _, _, p := viewerIdentity(ctx); p != nil {
+		return nil, p
+	}
+	view, err := svc.LibraryLayout(ctx, id, handlers.SectionViewer{Web: in.web()})
+	if err != nil {
+		return nil, serviceProblem(err)
+	}
+	return &SectionLayoutOutput{Body: sectionLayoutOf(view)}, nil
+}
+
+func sectionLayoutOf(view handlers.SectionLayoutView) SectionLayout {
+	out := SectionLayout{Sections: make([]SectionLayoutEntry, 0, len(view.Sections))}
+	for _, s := range view.Sections {
+		out.Sections = append(out.Sections, SectionLayoutEntry{ID: s.ID, SectionType: s.SectionType, Title: s.Title, Featured: s.Featured, ItemLimit: s.ItemLimit, IsCustom: s.IsCustom, Customized: s.Customized, SectionTitleKey: sectionTitleKeyOf(s.TitleKey, s.TitleArgs)})
+	}
+	return out
+}
+
+func sectionOf(v handlers.SectionView, sel ratingsources.Selection) Section {
+	resumeRow := v.SectionType == string(sections.SectionContinueWatching) || v.SectionType == string(sections.SectionNextUp)
+	items := make([]CatalogItem, 0, len(v.Items))
+	for _, item := range v.Items {
+		card := catalogItemOfSection(item, sel)
+		if resumeRow {
+			withResumeEpisodeBackdrop(&card, item)
+		}
+		items = append(items, card)
+	}
+	return Section{ID: v.ID, SectionType: v.SectionType, Title: v.Title, Featured: v.Featured, ItemLimit: v.ItemLimit, TotalCount: v.TotalCount, IsCustom: v.IsCustom, Customized: v.Customized, SectionTitleKey: sectionTitleKeyOf(v.TitleKey, v.TitleArgs), Items: items, HasMore: v.HasMore, Collections: sectionCollectionCardsOf(v.Collections)}
+}
+
+func (reg *Registry) listLibrarySections(ctx context.Context, in *LibrarySectionsInput) (*SectionCollectionOutput, error) {
+	svc, p := reg.librarySections()
+	if p != nil {
+		return nil, p
+	}
+	id, p := libraryID(in.ID)
+	if p != nil {
+		return nil, p
+	}
+	if _, _, p := viewerIdentity(ctx); p != nil {
+		return nil, p
+	}
+	view, err := svc.LibrarySections(ctx, id, sectionViewerCapped(ctx, in.Artwork(), in.SectionClient, in.ItemLimit))
+	if err != nil {
+		return nil, serviceProblem(err)
+	}
+	out := SectionCollection{Sections: make([]Section, 0, len(view.Sections))}
+	sel := reg.ratingSelection(ctx)
+	for _, s := range view.Sections {
+		out.Sections = append(out.Sections, sectionOf(s, sel))
+	}
+	return &SectionCollectionOutput{Body: out}, nil
+}
+
+func (reg *Registry) getLibrarySectionItems(ctx context.Context, in *LibrarySectionItemsInput) (*SectionOutput, error) {
+	svc, p := reg.librarySections()
+	if p != nil {
+		return nil, p
+	}
+	id, p := libraryID(in.ID)
+	if p != nil {
+		return nil, p
+	}
+	if _, _, p := viewerIdentity(ctx); p != nil {
+		return nil, p
+	}
+	view, err := svc.LibrarySectionItems(ctx, id, in.SectionID, sectionViewer(ctx, in.Artwork(), in.SectionClient))
+	if err != nil {
+		return nil, serviceProblem(err)
+	}
+	return &SectionOutput{Body: sectionOf(view, reg.ratingSelection(ctx))}, nil
+}
+
+func instantOfStamp(s string) *Instant {
+	if s == "" {
+		return nil
+	}
+	return instantOfRFC3339(&s)
+}
+
+func curatedCollectionOf(v handlers.LibraryCollectionView) CuratedCollection {
+	ids := make([]ID, 0, len(v.LibraryIDs))
+	for _, id := range v.LibraryIDs {
+		ids = append(ids, IDFromInt(int64(id)))
+	}
+	created, updated := Instant{}, Instant{}
+	if t := instantOfStamp(v.CreatedAt); t != nil {
+		created = *t
+	}
+	if t := instantOfStamp(v.UpdatedAt); t != nil {
+		updated = *t
+	}
+	return CuratedCollection{
+		ID: v.ID, LibraryID: IDFromInt(int64(v.LibraryID)), LibraryIDs: ids, Slug: v.Slug, Title: v.Title, Description: v.Description,
+		CollectionType: v.CollectionType, Visibility: v.Visibility, SortOrder: v.SortOrder, GroupID: v.GroupID, Featured: v.Featured,
+		PosterURL: v.PosterURL, BackdropURL: v.BackdropURL, PosterThumbhash: v.PosterThumbhash, BackdropThumbhash: v.BackdropThumbhash,
+		SourceURL: v.SourceURL, QueryDefinition: jsonValue(v.QueryDefinition), SortConfig: jsonValue(v.SortConfig), SourceConfig: jsonValue(v.SourceConfig),
+		ManagementMode: v.ManagementMode, ManagementSource: v.ManagementSource, ManagementKey: v.ManagementKey,
+		LastSyncStatus: v.LastSyncStatus, LastSyncMessage: v.LastSyncMessage, LastSyncAt: instantOfStamp(v.LastSyncAt), SyncSchedule: v.SyncSchedule, NextSyncAt: instantOfStamp(v.NextSyncAt),
+		ItemCount: v.ItemCount, CreatedAt: created, UpdatedAt: updated,
+		PosterIsCollage: v.PosterIsCollage && v.PosterURL != "",
+	}
+}
+
+// jsonValue is JSON null where the store holds no document, so the member
+// is always a JSON value.
+func jsonValue(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`null`)
+	}
+	return raw
+}
+
+func collectionCardsOf(cards []handlers.LibraryCollectionTabEntryView) []LibraryCollectionCard {
+	out := make([]LibraryCollectionCard, 0, len(cards))
+	for _, c := range cards {
+		out = append(out, LibraryCollectionCard{ID: c.ID, Title: c.Title, PosterURL: c.PosterURL, PosterThumbhash: c.PosterThumbhash, ItemCount: c.ItemCount, Featured: c.Featured, CreatorProfileID: c.CreatorProfileID,
+			PosterIsCollage: c.PosterIsCollage && c.PosterURL != ""})
+	}
+	return out
+}
+
+func (reg *Registry) getLibraryCollections(ctx context.Context, in *LibraryViewInput) (*LibraryCollectionTabOutput, error) {
+	svc, p := reg.libraryCollections()
+	if p != nil {
+		return nil, p
+	}
+	id, p := libraryID(in.ID)
+	if p != nil {
+		return nil, p
+	}
+	userID, profileID, p := viewerIdentity(ctx)
+	if p != nil {
+		return nil, p
+	}
+	// Marked as /api/v2, personal collections show their collages.
+	view, err := svc.LibraryCollectionsTab(handlers.WithNativeAPIV2(ctx), id, userID, profileID)
+	if err != nil {
+		return nil, serviceProblem(err)
+	}
+	out := LibraryCollectionTab{
+		LibraryID:   IDFromInt(int64(view.LibraryID)),
+		Collections: make([]CuratedCollection, 0, len(view.Collections)),
+		Groups:      make([]LibraryCollectionGroup, 0, len(view.Groups)),
+	}
+	for _, c := range view.Collections {
+		out.Collections = append(out.Collections, curatedCollectionOf(c))
+	}
+	for _, g := range view.Groups {
+		out.Groups = append(out.Groups, LibraryCollectionGroup{ID: g.ID, Name: g.Name, Kind: string(g.Kind), SortMode: string(g.SortMode), SortOrder: g.SortOrder, Collections: collectionCardsOf(g.Collections)})
+	}
+	if view.Ungrouped != nil {
+		out.Ungrouped = &LibraryCollectionUngrouped{SortOrder: view.Ungrouped.SortOrder, Collections: collectionCardsOf(view.Ungrouped.Collections)}
+	}
+	return &LibraryCollectionTabOutput{Body: out}, nil
+}
+
+func userCollectionOf(c usercollections.ServerVisibleCollection) UserCollection {
+	created, updated := Instant{}, Instant{}
+	if t := instantOfStamp(c.CreatedAt); t != nil {
+		created = *t
+	}
+	if t := instantOfStamp(c.UpdatedAt); t != nil {
+		updated = *t
+	}
+	return UserCollection{ID: c.ID, CreatorProfileID: c.CreatorProfileID, Name: c.Name, Description: c.Description, CollectionType: c.CollectionType,
+		ItemCount: c.ItemCount, PosterURL: c.PosterURL, PosterThumbhash: c.PosterThumbhash, PosterIsCollage: c.PosterIsCollage && c.PosterURL != "",
+		CreatedAt: created, UpdatedAt: updated}
+}
+
+func (reg *Registry) listLibraryUserCollections(ctx context.Context, in *LibraryViewInput) (*UserCollectionCollectionOutput, error) {
+	svc, p := reg.libraryCollections()
+	if p != nil {
+		return nil, p
+	}
+	id, p := libraryID(in.ID)
+	if p != nil {
+		return nil, p
+	}
+	userID, profileID, p := viewerIdentity(ctx)
+	if p != nil {
+		return nil, p
+	}
+	// Marked as /api/v2, personal collections show their collages.
+	views, err := svc.LibraryUserCollections(handlers.WithNativeAPIV2(ctx), id, userID, profileID)
+	if err != nil {
+		return nil, serviceProblem(err)
+	}
+	items := make([]UserCollection, 0, len(views))
+	for _, v := range views {
+		items = append(items, userCollectionOf(v))
+	}
+	return &UserCollectionCollectionOutput{Body: UserCollectionCollection{Collection: NewCollection(items)}}, nil
+}

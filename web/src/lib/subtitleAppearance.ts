@@ -1,0 +1,519 @@
+import type { CSSProperties } from "react";
+import { t } from "@/i18n";
+import type { VideoFitMode } from "@/player/types";
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+export interface SubtitleAppearance {
+  fontSize: "small" | "medium" | "large" | "xlarge" | "xxlarge";
+  fontFamily: "sans-serif" | "serif" | "monospace";
+  fontColor: string;
+  /** Opacity of the subtitle text itself, 1-100. Independent of backgroundOpacity. */
+  textOpacity: number;
+  backgroundColor: string;
+  backgroundStyle: "box" | "shadow" | "outline" | "none";
+  backgroundOpacity: number;
+  textOutline: boolean;
+  textOutlineColor: string;
+  position: "bottom" | "lower-third" | "top";
+}
+
+// ─── Defaults ───────────────────────────────────────────────────────────────
+
+export const DEFAULT_SUBTITLE_APPEARANCE: SubtitleAppearance = {
+  fontSize: "large",
+  fontFamily: "sans-serif",
+  fontColor: "#ffffff",
+  textOpacity: 100,
+  backgroundColor: "#000000",
+  backgroundStyle: "box",
+  backgroundOpacity: 75,
+  textOutline: false,
+  textOutlineColor: "#000000",
+  position: "bottom",
+};
+
+// ─── Option Arrays ──────────────────────────────────────────────────────────
+
+export const FONT_SIZE_OPTIONS = [
+  {
+    value: "small" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.fontSize.small");
+    },
+  },
+  {
+    value: "medium" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.fontSize.medium");
+    },
+  },
+  {
+    value: "large" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.fontSize.large");
+    },
+  },
+  {
+    value: "xlarge" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.fontSize.xLarge");
+    },
+  },
+  {
+    value: "xxlarge" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.fontSize.xxLarge");
+    },
+  },
+];
+
+export const FONT_FAMILY_OPTIONS = [
+  {
+    value: "sans-serif" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.fontFamily.sansSerif");
+    },
+  },
+  {
+    value: "serif" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.fontFamily.serif");
+    },
+  },
+  {
+    value: "monospace" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.fontFamily.monospace");
+    },
+  },
+];
+
+export const BACKGROUND_STYLE_OPTIONS = [
+  {
+    value: "box" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.backgroundStyle.box");
+    },
+  },
+  {
+    value: "shadow" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.backgroundStyle.dropShadow");
+    },
+  },
+  {
+    value: "outline" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.backgroundStyle.outline");
+    },
+  },
+  {
+    value: "none" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.backgroundStyle.none");
+    },
+  },
+];
+
+export const POSITION_OPTIONS = [
+  {
+    value: "bottom" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.position.bottom");
+    },
+  },
+  {
+    value: "lower-third" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.position.lowerThird");
+    },
+  },
+  {
+    value: "top" as const,
+    get label() {
+      return t("web.settings.subtitleOptions.position.top");
+    },
+  },
+];
+
+// ─── Color Palettes ─────────────────────────────────────────────────────────
+
+interface ColorSwatch {
+  hex: string;
+  label: string;
+}
+
+export const FONT_COLOR_PALETTE: ColorSwatch[] = [
+  {
+    hex: "#ffffff",
+    get label() {
+      return t("web.settings.subtitleOptions.fontColor.white");
+    },
+  },
+  {
+    hex: "#facc15",
+    get label() {
+      return t("web.settings.subtitleOptions.fontColor.yellow");
+    },
+  },
+  {
+    hex: "#22c55e",
+    get label() {
+      return t("web.settings.subtitleOptions.fontColor.green");
+    },
+  },
+  {
+    hex: "#06b6d4",
+    get label() {
+      return t("web.settings.subtitleOptions.fontColor.cyan");
+    },
+  },
+  {
+    hex: "#d946ef",
+    get label() {
+      return t("web.settings.subtitleOptions.fontColor.magenta");
+    },
+  },
+  {
+    hex: "#ef4444",
+    get label() {
+      return t("web.settings.subtitleOptions.fontColor.red");
+    },
+  },
+  {
+    hex: "#3b82f6",
+    get label() {
+      return t("web.settings.subtitleOptions.fontColor.blue");
+    },
+  },
+  {
+    hex: "#9ca3af",
+    get label() {
+      return t("web.settings.subtitleOptions.fontColor.gray");
+    },
+  },
+  {
+    hex: "#000000",
+    get label() {
+      return t("web.settings.subtitleOptions.fontColor.black");
+    },
+  },
+];
+
+export const BG_COLOR_PALETTE: ColorSwatch[] = [
+  {
+    hex: "#000000",
+    get label() {
+      return t("web.settings.subtitleOptions.backgroundColor.black");
+    },
+  },
+  {
+    hex: "#374151",
+    get label() {
+      return t("web.settings.subtitleOptions.backgroundColor.darkGray");
+    },
+  },
+  {
+    hex: "#1e3a5f",
+    get label() {
+      return t("web.settings.subtitleOptions.backgroundColor.navy");
+    },
+  },
+  {
+    hex: "#7f1d1d",
+    get label() {
+      return t("web.settings.subtitleOptions.backgroundColor.darkRed");
+    },
+  },
+  {
+    hex: "#14532d",
+    get label() {
+      return t("web.settings.subtitleOptions.backgroundColor.darkGreen");
+    },
+  },
+];
+
+// ─── Parser ─────────────────────────────────────────────────────────────────
+
+const VALID_FONT_SIZES: Set<string> = new Set(FONT_SIZE_OPTIONS.map((o) => o.value));
+const VALID_FONT_FAMILIES: Set<string> = new Set(FONT_FAMILY_OPTIONS.map((o) => o.value));
+const VALID_BG_STYLES: Set<string> = new Set(BACKGROUND_STYLE_OPTIONS.map((o) => o.value));
+const VALID_POSITIONS: Set<string> = new Set(POSITION_OPTIONS.map((o) => o.value));
+
+/**
+ * Coerces a stored subtitle appearance into a complete, valid one.
+ *
+ * Accepts both shapes the value has had: the canonical settings API stores it
+ * as a typed JSON object, while the legacy string-only endpoint stored the same
+ * object JSON-encoded into a string. Taking `unknown` means a caller never has
+ * to know which surface it read from, and every field still falls back to the
+ * default individually, so a partial or corrupt value degrades one field at a
+ * time rather than resetting the whole appearance.
+ */
+export function parseSubtitleAppearance(value: unknown): SubtitleAppearance {
+  if (value === null || value === undefined || value === "") {
+    return { ...DEFAULT_SUBTITLE_APPEARANCE };
+  }
+  try {
+    const p = (typeof value === "string" ? JSON.parse(value) : value) as Record<string, unknown>;
+    if (typeof p !== "object" || p === null || Array.isArray(p)) {
+      return { ...DEFAULT_SUBTITLE_APPEARANCE };
+    }
+    return {
+      fontSize: VALID_FONT_SIZES.has(p.fontSize as string)
+        ? (p.fontSize as SubtitleAppearance["fontSize"])
+        : DEFAULT_SUBTITLE_APPEARANCE.fontSize,
+      fontFamily: VALID_FONT_FAMILIES.has(p.fontFamily as string)
+        ? (p.fontFamily as SubtitleAppearance["fontFamily"])
+        : DEFAULT_SUBTITLE_APPEARANCE.fontFamily,
+      fontColor:
+        typeof p.fontColor === "string" && /^#[0-9a-fA-F]{6}$/.test(p.fontColor)
+          ? p.fontColor
+          : DEFAULT_SUBTITLE_APPEARANCE.fontColor,
+      textOpacity:
+        typeof p.textOpacity === "number" &&
+        Number.isInteger(p.textOpacity) &&
+        p.textOpacity >= 1 &&
+        p.textOpacity <= 100
+          ? p.textOpacity
+          : DEFAULT_SUBTITLE_APPEARANCE.textOpacity,
+      backgroundColor:
+        typeof p.backgroundColor === "string" && /^#[0-9a-fA-F]{6}$/.test(p.backgroundColor)
+          ? p.backgroundColor
+          : DEFAULT_SUBTITLE_APPEARANCE.backgroundColor,
+      backgroundStyle: VALID_BG_STYLES.has(p.backgroundStyle as string)
+        ? (p.backgroundStyle as SubtitleAppearance["backgroundStyle"])
+        : DEFAULT_SUBTITLE_APPEARANCE.backgroundStyle,
+      backgroundOpacity:
+        typeof p.backgroundOpacity === "number" &&
+        p.backgroundOpacity >= 0 &&
+        p.backgroundOpacity <= 100
+          ? p.backgroundOpacity
+          : DEFAULT_SUBTITLE_APPEARANCE.backgroundOpacity,
+      textOutline:
+        typeof p.textOutline === "boolean"
+          ? p.textOutline
+          : DEFAULT_SUBTITLE_APPEARANCE.textOutline,
+      textOutlineColor:
+        typeof p.textOutlineColor === "string" && /^#[0-9a-fA-F]{6}$/.test(p.textOutlineColor)
+          ? p.textOutlineColor
+          : DEFAULT_SUBTITLE_APPEARANCE.textOutlineColor,
+      position: VALID_POSITIONS.has(p.position as string)
+        ? (p.position as SubtitleAppearance["position"])
+        : DEFAULT_SUBTITLE_APPEARANCE.position,
+    };
+  } catch {
+    return { ...DEFAULT_SUBTITLE_APPEARANCE };
+  }
+}
+
+// ─── Style Computation ──────────────────────────────────────────────────────
+
+// Base cue font sizes in px at the 16:9 reference frame height below. The
+// player scales these proportionally with the rendered video so subtitles
+// keep the same relative size as the window grows or shrinks.
+const FONT_SIZE_MAP: Record<SubtitleAppearance["fontSize"], number> = {
+  small: 20,
+  medium: 26,
+  large: 32,
+  xlarge: 40,
+  xxlarge: 48,
+};
+
+/** Reference frame height (px) at which FONT_SIZE_MAP values apply as-is. */
+export const SUBTITLE_REFERENCE_HEIGHT = 720;
+
+/** Floor so cues stay legible in very small windows. */
+const MIN_SUBTITLE_FONT_PX = 12;
+
+export function computeSubtitleFontSize(
+  fontSize: SubtitleAppearance["fontSize"],
+  fontScale = 1,
+): string {
+  const px = Math.max(MIN_SUBTITLE_FONT_PX, Math.round(FONT_SIZE_MAP[fontSize] * fontScale));
+  return `${px}px`;
+}
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } {
+  const clean = hex.replace("#", "");
+  return {
+    r: parseInt(clean.substring(0, 2), 16),
+    g: parseInt(clean.substring(2, 4), 16),
+    b: parseInt(clean.substring(4, 6), 16),
+  };
+}
+
+function buildTextShadow(settings: SubtitleAppearance): string | undefined {
+  const shadows: string[] = [];
+  const outlineColor = settings.textOutlineColor;
+
+  if (settings.backgroundStyle === "shadow") {
+    shadows.push("2px 2px 4px rgba(0,0,0,0.9)");
+  }
+
+  if (settings.backgroundStyle === "outline") {
+    // 1px cardinal + 2px diagonal for a visible, rounded outline
+    const offsets = [
+      [-1, 0],
+      [1, 0],
+      [0, -1],
+      [0, 1],
+      [-2, -2],
+      [-2, 2],
+      [2, -2],
+      [2, 2],
+    ];
+    for (const [x, y] of offsets) {
+      shadows.push(`${x}px ${y}px 0 ${outlineColor}`);
+    }
+  }
+
+  if (settings.textOutline) {
+    shadows.push(`0 0 3px ${outlineColor}`, `0 0 3px ${outlineColor}`);
+  }
+
+  return shadows.length > 0 ? shadows.join(", ") : undefined;
+}
+
+export interface SubtitleStyles {
+  containerStyle: CSSProperties;
+  cueStyle: CSSProperties;
+}
+
+export function computeSubtitleStyles(settings: SubtitleAppearance, fontScale = 1): SubtitleStyles {
+  const containerStyle: CSSProperties = computePositionStyle(settings.position);
+  const cueStyle: CSSProperties = {};
+
+  // Font
+  cueStyle.fontSize = computeSubtitleFontSize(settings.fontSize, fontScale);
+  cueStyle.fontFamily = settings.fontFamily;
+  {
+    const { r, g, b } = hexToRgb(settings.fontColor);
+    cueStyle.color = `rgba(${r}, ${g}, ${b}, ${settings.textOpacity / 100})`;
+  }
+
+  // Background
+  if (settings.backgroundStyle === "box") {
+    const { r, g, b } = hexToRgb(settings.backgroundColor);
+    cueStyle.backgroundColor = `rgba(${r}, ${g}, ${b}, ${settings.backgroundOpacity / 100})`;
+  }
+
+  // Text shadow (handles shadow, outline, and textOutline — concatenated)
+  const textShadow = buildTextShadow(settings);
+  if (textShadow) {
+    cueStyle.textShadow = textShadow;
+  }
+
+  return { containerStyle, cueStyle };
+}
+
+// ─── Position (aspect-aware) ────────────────────────────────────────────────
+
+// Position offsets as a fraction of their anchor height. "Bottom" uses the
+// player window; "Lower Third" and "Top" use the 16:9 video reference frame.
+const POSITION_OFFSETS: Record<SubtitleAppearance["position"], number> = {
+  bottom: 0.07,
+  "lower-third": 0.12,
+  top: 0.07,
+};
+
+/**
+ * Percentage-of-container fallback used before the video's intrinsic aspect
+ * ratio is known (or in the preview pane where there's no real video).
+ */
+function computePositionStyle(position: SubtitleAppearance["position"]): CSSProperties {
+  if (position === "top") return { top: "8%", bottom: "auto" };
+  if (position === "lower-third") return { bottom: "12%" };
+  return { bottom: "7%" };
+}
+
+/**
+ * Height (px) of a 16:9 reference frame centered on the actually-rendered
+ * video area, or null before measurements are known.
+ * The frame matches the shorter dimension of the video so it never contracts
+ * inside it; for wider-than-16:9 content it extends into the letterbox.
+ */
+function resolveSubtitleReferenceHeight(
+  playerWidth: number,
+  playerHeight: number,
+  videoAspect: number,
+  videoFit: VideoFitMode,
+): number | null {
+  if (!Number.isFinite(videoAspect) || videoAspect <= 0 || playerWidth <= 0 || playerHeight <= 0) {
+    return null;
+  }
+
+  // Cover mode crops the rendered video to the player bounds, so subtitle
+  // sizing and placement should follow the visible viewport rather than the
+  // larger off-screen video frame.
+  if (videoFit === "cover") return playerHeight;
+
+  // Rendered video dimensions inside the player (object-fit: contain).
+  const playerAspect = playerWidth / playerHeight;
+  const videoHeight = playerAspect > videoAspect ? playerHeight : playerWidth / videoAspect;
+  const videoWidth = playerAspect > videoAspect ? playerHeight * videoAspect : playerWidth;
+
+  return videoAspect >= 16 / 9 ? videoWidth * (9 / 16) : videoHeight;
+}
+
+/**
+ * Font scale factor for the rendered video size: 1 at the 720px reference
+ * height, growing/shrinking proportionally with the window so subtitles keep
+ * the same size relative to the video. Falls back to 1 until measured.
+ */
+export function computeSubtitleFontScale(
+  playerWidth: number,
+  playerHeight: number,
+  videoAspect: number,
+  videoFit: VideoFitMode = "contain",
+): number {
+  const refHeight = resolveSubtitleReferenceHeight(
+    playerWidth,
+    playerHeight,
+    videoAspect,
+    videoFit,
+  );
+  return refHeight === null ? 1 : refHeight / SUBTITLE_REFERENCE_HEIGHT;
+}
+
+/**
+ * Aspect-aware positioning. "Bottom" is anchored to the player window so it
+ * can use the available letterbox space. "Lower Third" and "Top" are anchored
+ * to a 16:9 reference frame centered on the actually-rendered video area
+ * while Fit is active, keeping those positions attached to the video frame
+ * regardless of whether content is 16:9, 4:3, or 2.35:1. Fill mode anchors
+ * them to the visible player viewport because the video extends beyond it.
+ */
+export function computeSubtitlePositionStyle(
+  position: SubtitleAppearance["position"],
+  playerWidth: number,
+  playerHeight: number,
+  videoAspect: number,
+  videoFit: VideoFitMode = "contain",
+): CSSProperties {
+  if (position === "bottom") {
+    if (playerHeight <= 0) return computePositionStyle(position);
+    return { bottom: `${POSITION_OFFSETS.bottom * playerHeight}px` };
+  }
+
+  const refHeight = resolveSubtitleReferenceHeight(
+    playerWidth,
+    playerHeight,
+    videoAspect,
+    videoFit,
+  );
+  if (refHeight === null) {
+    return computePositionStyle(position);
+  }
+
+  // Reference frame is centered on the video, which is itself centered in
+  // the player container — so the reference is centered in the player too.
+  const refBottomFromPlayerBottom = (playerHeight - refHeight) / 2;
+  const offset = POSITION_OFFSETS[position] * refHeight;
+
+  if (position === "top") {
+    return { top: `${refBottomFromPlayerBottom + offset}px`, bottom: "auto" };
+  }
+  return { bottom: `${refBottomFromPlayerBottom + offset}px` };
+}

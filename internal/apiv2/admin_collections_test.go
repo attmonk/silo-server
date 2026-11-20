@@ -1,0 +1,299 @@
+package apiv2
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/adminjob"
+	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	catalogsvc "github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/collections/templates"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+type fakeAdminCollections struct {
+	listReads, sectionReads, countReads int
+	countedIDs                          []string
+	AdminCollectionService
+	AdminCollectionExtrasService
+	view                                               handlers.AdminCollection
+	revision                                           int64
+	reads, updates, deletes, creates, imports, applies int
+	mismatch                                           bool
+	deleted                                            bool
+	job                                                *models.AdminJob
+	syncErr                                            error
+	template                                           handlers.AdminCollectionTemplateResult
+	bundles                                            []templates.BundleWithTemplates
+	catalog                                            *templates.Catalog
+	catalogReads                                       int
+	featureReads                                       int
+	listed                                             []handlers.AdminCollection
+	sections                                           []handlers.AdminCollectionSection
+	rowCounts                                          map[string]handlers.AdminCollectionRowCount
+}
+
+func newFakeAdminCollections() *fakeAdminCollections {
+	return &fakeAdminCollections{revision: 1, view: handlers.AdminCollection{ID: "c1", LibraryID: 1, LibraryIDs: []int{1}, Title: "Original", CollectionType: "manual", CreatedAt: fixedTime().Format("2006-01-02T15:04:05Z07:00"), UpdatedAt: fixedTime().Format("2006-01-02T15:04:05Z07:00")}}
+}
+func (f *fakeAdminCollections) GetAdminCollection(_ context.Context, id string) (handlers.AdminCollection, int64, error) {
+	f.reads++
+	if f.deleted || id != "c1" {
+		return handlers.AdminCollection{}, 0, catalogsvc.ErrLibraryCollectionNotFound
+	}
+	return f.view, f.revision, nil
+}
+func (f *fakeAdminCollections) UpdateAdminCollection(_ context.Context, _ string, cmd handlers.AdminCollectionUpdate) (handlers.AdminCollection, error) {
+	f.updates++
+	f.revision++
+	if f.mismatch {
+		f.mismatch = false
+		return handlers.AdminCollection{}, catalogsvc.ErrLibraryCollectionRevisionMismatch
+	}
+	if cmd.Title != nil {
+		f.view.Title = *cmd.Title
+	}
+	return f.view, nil
+}
+func (f *fakeAdminCollections) DeleteAdminCollection(context.Context, string) error {
+	f.deletes++
+	if f.mismatch {
+		f.mismatch = false
+		f.revision++
+		return catalogsvc.ErrLibraryCollectionRevisionMismatch
+	}
+	f.deleted = true
+	return nil
+}
+func (f *fakeAdminCollections) CreateAdminCollection(context.Context, handlers.AdminCollectionCreate) (handlers.AdminCollection, error) {
+	f.creates++
+	return f.view, nil
+}
+func (f *fakeAdminCollections) ImportAdminMDBList(context.Context, handlers.AdminCollectionImportMDBList) (handlers.AdminCollectionImportResult, error) {
+	f.imports++
+	return handlers.AdminCollectionImportResult{Collection: f.view}, nil
+}
+func (f *fakeAdminCollections) ApplyAdminCollectionTemplate(context.Context, string, handlers.AdminCollectionTemplateApply) (handlers.AdminCollectionTemplateResult, error) {
+	f.applies++
+	if f.template.BundleID != "" {
+		return f.template, nil
+	}
+	return handlers.AdminCollectionTemplateResult{BundleID: "bundle"}, nil
+}
+func (f *fakeAdminCollections) SyncAdminCollection(context.Context, string) (*models.LibraryCollectionSyncRun, error) {
+	if f.syncErr != nil {
+		return nil, f.syncErr
+	}
+	return &models.LibraryCollectionSyncRun{ID: "run", CollectionID: "c1", Status: "completed", CreatedAt: fixedTime()}, nil
+}
+func (f *fakeAdminCollections) QueueAdminCollectionTemplate(context.Context, string, handlers.AdminCollectionTemplateApply, int) (*models.AdminJob, error) {
+	return f.job, nil
+}
+func adminCollectionsTestHandler(t *testing.T, f *fakeAdminCollections) http.Handler {
+	t.Helper()
+	deps, _ := libraryDeps(t)
+	deps.AdminCollections = f
+	return newTestHandler(t, deps)
+}
+
+func TestAdminCollectionsCanonicalAndMutationGuards(t *testing.T) {
+	for _, method := range []string{http.MethodPatch, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			f := newFakeAdminCollections()
+			h := adminCollectionsTestHandler(t, f)
+			path := "/api/v2/admin/collections/c1"
+			read := do(t, h, http.MethodGet, path, "", bearer(adminToken))
+			tag := read.Header().Get("ETag")
+			if read.Code != 200 || tag == "" || strings.HasPrefix(tag, "W/") {
+				t.Fatalf("canonical read %d %s tag=%s", read.Code, read.Body, tag)
+			}
+			again := do(t, h, http.MethodGet, path, "", bearer(adminToken))
+			if again.Body.String() != read.Body.String() || again.Header().Get("ETag") != tag {
+				t.Fatal("unchanged canonical read changed")
+			}
+			body := ""
+			if method == http.MethodPatch {
+				body = `{"title":"Edited"}`
+			}
+			if rec := do(t, h, method, path, body, bearer(adminToken)); rec.Code != 428 {
+				t.Fatalf("missing guard %d %s", rec.Code, rec.Body)
+			}
+			if rec := do(t, h, method, path, body, with(bearer(adminToken), "If-Match", `"stale"`)); rec.Code != 412 {
+				t.Fatalf("stale guard %d %s", rec.Code, rec.Body)
+			}
+			if f.updates+f.deletes != 0 {
+				t.Fatal("rejected precondition reached writer")
+			}
+			rec := do(t, h, method, path, body, with(bearer(adminToken), "If-Match", tag))
+			want := 200
+			if method == http.MethodDelete {
+				want = 204
+			}
+			if rec.Code != want {
+				t.Fatalf("exact guard %d %s", rec.Code, rec.Body)
+			}
+			if method == http.MethodPatch && (f.view.Title != "Edited" || rec.Header().Get("ETag") == tag) {
+				t.Fatal("successful update lost result or new tag")
+			}
+		})
+	}
+}
+func TestAdminCollectionsDatabaseMismatchRefreshesCurrentValidator(t *testing.T) {
+	for _, method := range []string{http.MethodPatch, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			f := newFakeAdminCollections()
+			h := adminCollectionsTestHandler(t, f)
+			path := "/api/v2/admin/collections/c1"
+			tag := do(t, h, http.MethodGet, path, "", bearer(adminToken)).Header().Get("ETag")
+			f.mismatch = true
+			body := ""
+			if method == http.MethodPatch {
+				body = `{"title":"Draft"}`
+			}
+			rec := do(t, h, method, path, body, with(bearer(adminToken), "If-Match", tag))
+			if rec.Code != 412 || f.updates+f.deletes != 1 || f.view.Title != "Original" || f.deleted {
+				t.Fatalf("DB conflict replayed or lost %d %s", rec.Code, rec.Body)
+			}
+			now := do(t, h, http.MethodGet, path, "", bearer(adminToken)).Header().Get("ETag")
+			if now == tag || rec.Header().Get("ETag") != now {
+				t.Fatalf("conflict missing current validator: %s versus %s", rec.Body, now)
+			}
+			rec = do(t, h, method, path, body, with(bearer(adminToken), "If-Match", "*"))
+			want := 200
+			if method == http.MethodDelete {
+				want = 204
+			}
+			if rec.Code != want {
+				t.Fatalf("wildcard %d %s", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+func TestAdminCollectionsActingAdminAndDemo(t *testing.T) {
+	f := newFakeAdminCollections()
+	deps, _ := libraryDeps(t)
+	deps.AdminCollections = f
+	deps.DemoSettings = fakeSettings{demo: true}
+	h := newTestHandler(t, deps)
+	path := "/api/v2/admin/collections/c1"
+	for _, headers := range []map[string]string{bearer(memberToken), with(bearer(adminToken), "X-Profile-Id", "p-owner")} {
+		requireProblem(t, do(t, h, http.MethodGet, path, "", headers), TypePermissionDenied)
+	}
+	if f.reads != 0 {
+		t.Fatal("unauthorized request reached service")
+	}
+	if rec := do(t, h, http.MethodPatch, path, `{"title":"Demo admin"}`, with(bearer(adminToken), "If-Match", "*")); rec.Code != 200 {
+		t.Fatalf("demo blocked acting admin %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestAdminCollectionJobSafeConditionalKindScopedMonitor(t *testing.T) {
+	f := newFakeAdminCollections()
+	f.job = &models.AdminJob{ID: "collection-job", JobType: adminjob.JobTypeTemplateBundleApply, Status: adminjob.StatusQueued, RequestedAt: fixedTime(), RequestPayload: json.RawMessage(`{"secret":"PRIVATE_PAYLOAD"}`), Message: "PRIVATE_MESSAGE", ErrorMessage: "PRIVATE_ERROR"}
+	deps, _ := libraryDeps(t)
+	deps.AdminCollections = f
+	deps.LibraryJobs = &fakeLibraryJobs{job: f.job}
+	h := newTestHandler(t, deps)
+	accepted := do(t, h, http.MethodPost, "/api/v2/admin/collections/template-bundles/bundle/apply-job", `{"library_ids":["1"]}`, bearer(adminToken))
+	if accepted.Code != 202 {
+		t.Fatalf("accept %d %s", accepted.Code, accepted.Body)
+	}
+	location := accepted.Header().Get("Location")
+	if location != "/api/v2/admin/collection-jobs/collection-job" {
+		t.Fatal(location)
+	}
+	poll := do(t, h, http.MethodGet, location, "", bearer(adminToken))
+	if poll.Code != 200 || poll.Header().Get("ETag") == "" || strings.Contains(poll.Body.String(), "PRIVATE_") {
+		t.Fatalf("unsafe poll %d %s", poll.Code, poll.Body)
+	}
+	conditional := do(t, h, http.MethodGet, location, "", with(bearer(adminToken), "If-None-Match", poll.Header().Get("ETag")))
+	if conditional.Code != 304 || conditional.Body.Len() != 0 {
+		t.Fatalf("conditional %d %s", conditional.Code, conditional.Body)
+	}
+
+	f.job.Status = adminjob.StatusCompleted
+	f.job.ResultPayload = json.RawMessage(`{"bundle_id":"bundle","failed":[{"template_id":"one","library_id":1,"reason":"Collection already exists"}]}`)
+	completed := do(t, h, http.MethodGet, location, "", with(bearer(adminToken), "If-None-Match", poll.Header().Get("ETag")))
+	if completed.Code != 200 || completed.Header().Get("Retry-After") != "" || strings.Contains(completed.Body.String(), "PRIVATE_") {
+		t.Fatalf("terminal projection %d %s", completed.Code, completed.Body)
+	}
+	var result AdminJob
+	decodeJSON(t, completed.Body, &result)
+	if !result.Terminal || result.Cancelable || result.TemplateResult == nil || result.TemplateResult.Failed[0].LibraryID != "1" || result.TemplateResult.Failed[0].Reason != "operation_failed" {
+		t.Fatalf("terminal job lost typed result: %+v", result)
+	}
+	f.job.JobType = adminjob.JobTypeDeleteLibrary
+	requireProblem(t, do(t, h, http.MethodGet, location, "", bearer(adminToken)), TypeNotFound)
+}
+
+// The per-entry reason explains a skipped or failed template; v1 returns it and
+// v2 must reach the wire with it too.
+func TestAdminCollectionTemplateApplyKeepsEntryReason(t *testing.T) {
+	f := newFakeAdminCollections()
+	f.template = handlers.AdminCollectionTemplateResult{BundleID: "bundle"}
+	if err := json.Unmarshal([]byte(`{"bundle_id":"bundle","skipped":[{"template_id":"existing","template_title":"Existing","library_id":1,"library_name":"Movies","reason":"Collection already exists"}],"delete_skipped":[{"library_id":1,"library_name":"Movies","collection_id":"c1","collection_title":"Existing","reason":"in_use_by_section"}],"featured_failed":[{"surface":"home","template_id":"existing","template_title":"Existing","reason":"Library has no featured slot"}]}`), &f.template); err != nil {
+		t.Fatal(err)
+	}
+	h := adminCollectionsTestHandler(t, f)
+	rec := do(t, h, http.MethodPost, "/api/v2/admin/collections/template-bundles/bundle/apply", `{"library_ids":["1"]}`, bearer(adminToken))
+	if rec.Code != 200 {
+		t.Fatalf("apply %d %s", rec.Code, rec.Body)
+	}
+	// Raw service text is replaced by a stable public code; only the
+	// documented reason codes pass through verbatim.
+	for _, want := range []string{`"reason":"operation_failed"`, `"reason":"in_use_by_section"`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("missing %s in %s", want, rec.Body)
+		}
+	}
+}
+
+// adminCollectionsServiceValidation runs create and update through the real
+// service, which validates before it touches the repository.
+type adminCollectionsServiceValidation struct {
+	*fakeAdminCollections
+	service *handlers.LibraryCollectionHandler
+}
+
+func (f adminCollectionsServiceValidation) CreateAdminCollection(ctx context.Context, cmd handlers.AdminCollectionCreate) (handlers.AdminCollection, error) {
+	return f.service.CreateAdminCollection(ctx, cmd)
+}
+func (f adminCollectionsServiceValidation) UpdateAdminCollection(ctx context.Context, id string, cmd handlers.AdminCollectionUpdate) (handlers.AdminCollection, error) {
+	return f.service.UpdateAdminCollection(ctx, id, cmd)
+}
+
+func TestAdminCollectionsRejectUnknownCollectionType(t *testing.T) {
+	deps, _ := libraryDeps(t)
+	deps.AdminCollections = adminCollectionsServiceValidation{fakeAdminCollections: newFakeAdminCollections(), service: &handlers.LibraryCollectionHandler{}}
+	h := newTestHandler(t, deps)
+	assertCollectionTypeProblem := func(label string, code int, body string) {
+		t.Helper()
+		var p struct {
+			Type   string `json:"type"`
+			Errors []struct {
+				Location string `json:"location"`
+				Detail   string `json:"detail"`
+			} `json:"errors"`
+		}
+		if err := json.Unmarshal([]byte(body), &p); err != nil {
+			t.Fatalf("%s: %v %s", label, err, body)
+		}
+		if code != http.StatusUnprocessableEntity || p.Type != TypeValidationFailed.URI() || len(p.Errors) != 1 ||
+			p.Errors[0].Location != "body.collection_type" || !strings.Contains(p.Errors[0].Detail, "manual, smart, mdblist, or tmdb") {
+			t.Fatalf("%s: got %d %s", label, code, body)
+		}
+	}
+
+	rec := do(t, h, http.MethodPost, "/api/v2/admin/collections", `{"title":"repro","library_id":"1","collection_type":"bogus"}`, bearer(adminToken))
+	assertCollectionTypeProblem("create", rec.Code, rec.Body.String())
+
+	path := "/api/v2/admin/collections/c1"
+	tag := do(t, h, http.MethodGet, path, "", bearer(adminToken)).Header().Get("ETag")
+	for _, body := range []string{`{"collection_type":"bogus"}`, `{"collection_type":""}`} {
+		rec := do(t, h, http.MethodPatch, path, body, with(bearer(adminToken), "If-Match", tag))
+		assertCollectionTypeProblem("update "+body, rec.Code, rec.Body.String())
+	}
+}

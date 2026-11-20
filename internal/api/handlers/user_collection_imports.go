@@ -1,0 +1,437 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"path"
+	"regexp"
+	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/artworkurl"
+	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/collections/templates"
+	"github.com/Silo-Server/silo-server/internal/collectionutil"
+	"github.com/Silo-Server/silo-server/internal/mdblist"
+	"github.com/Silo-Server/silo-server/internal/usercollections"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// UserCollectionImportHandler exposes the user-side template gallery and
+// import + sync endpoints. Authorization rules (only the creator can sync) are
+// enforced here; the underlying sync.Service is intentionally unauthenticated.
+type UserCollectionImportHandler struct {
+	storeProvider   userstore.UserStoreProvider
+	sync            *usercollections.Service
+	scheduler       *usercollections.Scheduler
+	registry        *templates.Registry
+	mdblist         *mdblist.Client
+	ArtworkStore    blobstore.Store
+	ArtworkResolver artworkurl.Resolver
+	frontendFS      fs.FS
+}
+
+func NewUserCollectionImportHandler(
+	provider userstore.UserStoreProvider,
+	sync *usercollections.Service,
+	scheduler *usercollections.Scheduler,
+	registry *templates.Registry,
+	mdblistClient *mdblist.Client,
+	frontendFS fs.FS,
+) *UserCollectionImportHandler {
+	if registry == nil {
+		registry = templates.Default
+	}
+	return &UserCollectionImportHandler{
+		storeProvider: provider,
+		sync:          sync,
+		scheduler:     scheduler,
+		registry:      registry,
+		mdblist:       mdblistClient,
+		frontendFS:    frontendFS,
+	}
+}
+
+type UserImportSharedFields struct {
+	Title                  string          `json:"title"`
+	Description            string          `json:"description"`
+	Limit                  *int            `json:"limit,omitempty"`
+	SyncSchedule           string          `json:"sync_schedule"`
+	IsShared               bool            `json:"is_shared"`
+	PosterURL              string          `json:"poster_url"`
+	LibraryIDs             []int           `json:"library_ids,omitempty"`
+	DisplayQueryDefinition json.RawMessage `json:"display_query_definition,omitempty"`
+	SortConfig             json.RawMessage `json:"sort_config,omitempty"`
+}
+
+type UserImportMDBListRequest struct {
+	UserImportSharedFields
+	URL string `json:"url"`
+}
+
+type UserImportTMDBRequest struct {
+	UserImportSharedFields
+	Preset     string `json:"preset"`
+	MediaType  string `json:"media_type"`
+	TimeWindow string `json:"time_window"`
+}
+
+type UserImportTMDBListRequest struct {
+	UserImportSharedFields
+	URL string `json:"url"`
+}
+
+type UserImportView struct {
+	Collection PersonalCollectionView      `json:"collection"`
+	Sync       *usercollections.SyncResult `json:"sync,omitempty"`
+}
+
+// ImportMDBList creates an MDBList-backed collection for the profile and
+// runs its first sync. v1 POST /collections/import/mdblist and v2
+// importMDBListCollection both call it; a failure is an *APIError.
+func (h *UserCollectionImportHandler) ImportMDBList(ctx context.Context, userID int, profileID string, req UserImportMDBListRequest) (UserImportView, error) {
+	var none UserImportView
+	if strings.TrimSpace(req.Title) == "" || strings.TrimSpace(req.URL) == "" {
+		return none, apiError(http.StatusBadRequest, policyErrorBadRequest, "title and url are required")
+	}
+	canonicalURL, err := usercollections.CanonicalMDBListURL(req.URL)
+	if err != nil {
+		return none, fieldError("url", "url must be an MDBList list (https://mdblist.com/lists/...)")
+	}
+	if err := validateOptionalLimit(req.Limit); err != nil {
+		return none, err
+	}
+	cfg := usercollections.SourceConfig{
+		Mode:       usercollections.SourceModeMDBList,
+		URL:        canonicalURL,
+		Limit:      req.Limit,
+		LibraryIDs: req.LibraryIDs,
+	}
+	return h.createImportedCollection(ctx, userID, profileID, "mdblist", cfg, req.UserImportSharedFields)
+}
+
+// ImportTMDB creates a TMDB-preset collection for the profile and runs its
+// first sync.
+func (h *UserCollectionImportHandler) ImportTMDB(ctx context.Context, userID int, profileID string, req UserImportTMDBRequest) (UserImportView, error) {
+	var none UserImportView
+	if strings.TrimSpace(req.Title) == "" {
+		return none, fieldError("title", "title is required")
+	}
+	preset, mediaType, timeWindow, err := normalizeTMDBPresetRequest(req.Preset, req.MediaType, req.TimeWindow)
+	if err != nil {
+		return none, apiError(http.StatusBadRequest, policyErrorBadRequest, err.Error())
+	}
+	if err := validateOptionalLimit(req.Limit); err != nil {
+		return none, err
+	}
+	cfg := usercollections.SourceConfig{
+		Mode:       usercollections.SourceModeTMDBPreset,
+		Preset:     preset,
+		MediaType:  mediaType,
+		TimeWindow: timeWindow,
+		Limit:      req.Limit,
+		LibraryIDs: req.LibraryIDs,
+	}
+	return h.createImportedCollection(ctx, userID, profileID, "tmdb", cfg, req.UserImportSharedFields)
+}
+
+// ImportTMDBList creates a collection that follows a public TMDB list for the
+// profile and runs its first sync.
+func (h *UserCollectionImportHandler) ImportTMDBList(ctx context.Context, userID int, profileID string, req UserImportTMDBListRequest) (UserImportView, error) {
+	var none UserImportView
+	if strings.TrimSpace(req.Title) == "" || strings.TrimSpace(req.URL) == "" {
+		return none, apiError(http.StatusBadRequest, policyErrorBadRequest, "title and url are required")
+	}
+	listURL, err := collectionutil.CanonicalTMDBListURL(req.URL)
+	if err != nil {
+		return none, fieldError("url", "url must be a TMDB list (https://www.themoviedb.org/list/...)")
+	}
+	if err := validateOptionalLimit(req.Limit); err != nil {
+		return none, err
+	}
+	cfg := usercollections.SourceConfig{
+		Mode:       usercollections.SourceModeTMDBList,
+		URL:        listURL,
+		Limit:      req.Limit,
+		LibraryIDs: req.LibraryIDs,
+	}
+	return h.createImportedCollection(ctx, userID, profileID, "tmdb", cfg, req.UserImportSharedFields)
+}
+
+func (h *UserCollectionImportHandler) createImportedCollection(
+	ctx context.Context,
+	userID int,
+	profileID string,
+	collectionType string,
+	cfg usercollections.SourceConfig,
+	shared UserImportSharedFields,
+) (UserImportView, error) {
+	var none UserImportView
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	if err := collectionFeatureError(store, "imports"); err != nil {
+		return UserImportView{}, err
+	}
+
+	schedule, err := usercollections.ResolveSyncSchedule(shared.SyncSchedule)
+	if err != nil {
+		return none, fieldError("sync_schedule", err.Error())
+	}
+	if err := validateOptionalLibraryIDs(cfg.LibraryIDs); err != nil {
+		return none, err
+	}
+	posterURL, err := importedPosterURL(shared.PosterURL)
+	if err != nil {
+		return none, err
+	}
+
+	sourceConfigJSON, err := usercollections.MarshalSourceConfig(cfg)
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to encode source config")
+	}
+	displayQueryDefinition, err := catalog.NormalizeDisplayQueryFragment(shared.DisplayQueryDefinition)
+	if err != nil {
+		return none, fieldError("display_query_definition", err.Error())
+	}
+	sortConfig, err := NormalizeCollectionSortConfig(shared.SortConfig, true)
+	if err != nil {
+		return none, fieldError("sort_config", err.Error())
+	}
+
+	collection, err := store.CreateCollection(ctx, userstore.CreateCollectionInput{
+		CreatorProfileID:       profileID,
+		Name:                   strings.TrimSpace(shared.Title),
+		Description:            strings.TrimSpace(shared.Description),
+		CollectionType:         collectionType,
+		IsShared:               shared.IsShared,
+		QueryDefinition:        "{}",
+		SortConfig:             sortConfig,
+		SourceURL:              cfg.DisplayURL(),
+		SourceConfig:           sourceConfigJSON,
+		SyncSchedule:           schedule,
+		NextSyncAt:             usercollections.InitialNextSyncAt(schedule),
+		DisplayQueryDefinition: displayQueryDefinition,
+		PosterURL:              posterURL,
+	})
+	if err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to create collection")
+	}
+
+	if err := h.storeBundledTemplatePoster(ctx, store, collection, posterURL); err != nil {
+		return none, apiError(http.StatusInternalServerError, "internal_error", "Failed to process template poster")
+	}
+
+	syncResult, updated, syncErr := h.sync.RunSync(ctx, userID, store, collection)
+	if syncErr != nil {
+		// RunSync recorded the failure, and the row is kept so the user can
+		// retry. Render what was stored, as a successful sync does; a
+		// schedule edited while the sync ran kept its own next run.
+		if updated, err = store.GetCollection(ctx, collection.ID); err != nil {
+			updated = collection
+			updated.LastSyncStatus = "failed"
+			updated.LastSyncMessage = syncErr.Error()
+		}
+	}
+
+	return UserImportView{
+		Collection: h.collectionView(ctx, *updated),
+		Sync:       syncResult,
+	}, nil
+}
+
+func (h *UserCollectionImportHandler) storeBundledTemplatePoster(
+	ctx context.Context,
+	store userstore.UserStore,
+	collection *userstore.Collection,
+	posterPath string,
+) error {
+	if collection == nil {
+		return nil
+	}
+	storedPath, thumbhash, stored, err := storeBundledCollectionPosterIfS3Configured(
+		ctx,
+		h.artworkBackend(),
+		h.frontendFS,
+		collection.ID,
+		userCollectionImagePrefix,
+		posterPath,
+	)
+	if err != nil || !stored {
+		if err != nil {
+			slog.WarnContext(ctx, "failed to store bundled user collection poster", "component", "api",
+				"collection_id", collection.ID,
+				"poster_path", posterPath,
+				"error", err,
+			)
+		}
+		return nil
+	}
+
+	if err := store.UpdateCollection(ctx, userstore.UpdateCollectionInput{
+		ID:               collection.ID,
+		RequestProfileID: collection.CreatorProfileID,
+		PosterURL:        &storedPath,
+		PosterThumbhash:  &thumbhash,
+	}); err != nil {
+		slog.WarnContext(ctx, "failed to persist bundled user collection poster", "component", "api",
+			"collection_id", collection.ID,
+			"poster_path", posterPath,
+			"stored_path", storedPath,
+			"error", err,
+		)
+		return nil
+	}
+	collection.PosterURL = storedPath
+	collection.PosterThumbhash = thumbhash
+	return nil
+}
+
+func (h *UserCollectionImportHandler) artworkBackend() blobstore.Store {
+	return h.ArtworkStore
+}
+
+// collectionView renders a stored collection with its poster presigned.
+func (h *UserCollectionImportHandler) collectionView(ctx context.Context, c userstore.Collection) PersonalCollectionView {
+	resp := toCollectionResponse(c)
+	resp.PosterURL = personalCollectionPosterURL(ctx, h.ArtworkResolver, c.ID, c.PosterURL)
+	return resp
+}
+
+type MDBListDiscoveryView struct {
+	Configured bool                  `json:"configured"`
+	Lists      []mdblist.ListSummary `json:"lists"`
+}
+
+// MDBListConfigured reports whether MDBList search and top lists can answer,
+// which needs an MDBList API key. v2 collection capabilities report it as
+// mdblist_search.
+func (h *UserCollectionImportHandler) MDBListConfigured() bool {
+	return h.mdblist != nil && h.mdblist.Configured()
+}
+
+// SearchMDBList answers the MDBList lists matching query. An unconfigured
+// MDBList client answers configured=false and no lists rather than an error,
+// so clients can hide the search box. v1 GET /collections/import/mdblist/search
+// and v2 searchMDBListLists both call it.
+func (h *UserCollectionImportHandler) SearchMDBList(ctx context.Context, query string) (MDBListDiscoveryView, error) {
+	if !h.MDBListConfigured() {
+		return MDBListDiscoveryView{Configured: false, Lists: []mdblist.ListSummary{}}, nil
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return MDBListDiscoveryView{}, fieldError("q", "q is required")
+	}
+	lists, err := h.mdblist.Search(ctx, query)
+	if err != nil {
+		return MDBListDiscoveryView{}, apiError(http.StatusBadGateway, "upstream_error", fmt.Sprintf("MDBList search failed: %v", err))
+	}
+	return MDBListDiscoveryView{Configured: true, Lists: lists}, nil
+}
+
+// TopMDBList answers MDBList's most-liked lists; see SearchMDBList for the
+// unconfigured answer.
+func (h *UserCollectionImportHandler) TopMDBList(ctx context.Context) (MDBListDiscoveryView, error) {
+	if !h.MDBListConfigured() {
+		return MDBListDiscoveryView{Configured: false, Lists: []mdblist.ListSummary{}}, nil
+	}
+	lists, err := h.mdblist.Top(ctx)
+	if err != nil {
+		return MDBListDiscoveryView{}, apiError(http.StatusBadGateway, "upstream_error", fmt.Sprintf("MDBList top failed: %v", err))
+	}
+	return MDBListDiscoveryView{Configured: true, Lists: lists}, nil
+}
+
+func validateOptionalLimit(limit *int) error {
+	if limit == nil {
+		return nil
+	}
+	if *limit <= 0 {
+		return fieldError("limit", "limit must be at least 1")
+	}
+	return nil
+}
+
+// templatePosterPath matches a path below the bundled template poster
+// directory written in plain file name characters. It leaves out percent
+// escapes, backslashes, queries and fragments, which a browser could resolve
+// to a path outside that directory.
+var templatePosterPath = regexp.MustCompile(`^` + regexp.QuoteMeta(collectionTemplateImageDir) + `[A-Za-z0-9._/-]+$`)
+
+// importedPosterURL returns the poster an import stores for its collection:
+// none, a bundled template poster, or an http(s) image URL. The stored value
+// is shown as the collection's poster, so a storage key is refused: only the
+// server names the objects a collection's poster is read from.
+func importedPosterURL(raw string) (string, error) {
+	poster := strings.TrimSpace(raw)
+	switch {
+	case poster == "":
+		return "", nil
+	case templatePosterPath.MatchString(poster) && poster == path.Clean(poster):
+		return poster, nil
+	case strings.HasPrefix(poster, "http://"), strings.HasPrefix(poster, "https://"):
+		if parsed, err := url.Parse(poster); err == nil && parsed.Host != "" && catalog.ImageURLOrEmpty(poster) != "" {
+			return poster, nil
+		}
+	}
+	return "", fieldError("poster_url", "poster_url must be a collection template poster or an http(s) image URL")
+}
+
+func validateOptionalLibraryIDs(libraryIDs []int) error {
+	for _, id := range libraryIDs {
+		if id <= 0 {
+			return fieldError("library_ids", "library_ids must contain positive IDs")
+		}
+	}
+	return nil
+}
+
+func (h *UserCollectionImportHandler) SyncPersonalCollection(ctx context.Context, userID int, profileID, collectionID string) (*usercollections.SyncResult, error) {
+	if h.sync == nil {
+		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Collection sync is unavailable")
+	}
+	if collectionID == "" {
+		return nil, apiError(http.StatusBadRequest, "bad_request", "Collection ID is required")
+	}
+
+	store, err := h.storeProvider.ForUser(ctx, userID)
+	if err != nil {
+		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to access user store")
+	}
+	if err := collectionFeatureError(store, "imports"); err != nil {
+		return nil, err
+	}
+	collection, err := store.GetCollection(ctx, collectionID)
+	if err != nil || !collection.VisibleTo(profileID) {
+		return nil, apiError(http.StatusNotFound, "not_found", "Collection not found")
+	}
+	if collection.CreatorProfileID != profileID {
+		return nil, apiError(http.StatusForbidden, "forbidden", "Only the creator can sync this collection")
+	}
+	if h.scheduler != nil && h.scheduler.IsInFlight(collectionID) {
+		return nil, apiError(http.StatusConflict, "sync_in_flight", "A sync is already running for this collection")
+	}
+
+	result, _, err := h.sync.RunSync(ctx, userID, store, collection)
+	if err != nil {
+		if errors.Is(err, usercollections.ErrSyncUnsupported) {
+			return nil, apiError(http.StatusBadRequest, "bad_request", "This collection does not support sync")
+		}
+		// RunSync recorded the failure on the collection. The frozen v1 route
+		// keeps answering 500; the cause lets v2 answer a source that refused
+		// or did not answer as dependency_unavailable with the reason.
+		return nil, apiError(http.StatusInternalServerError, "internal_error", fmt.Sprintf("Sync failed: %v", err)).WithCause(err)
+	}
+	return result, nil
+}
+
+func (h *UserCollectionImportHandler) CollectionTemplates() templates.Catalog {
+	return h.registry.Catalog()
+}

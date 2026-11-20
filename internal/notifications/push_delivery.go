@@ -1,0 +1,467 @@
+package notifications
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/oklog/ulid/v2"
+)
+
+const (
+	PushTriggerDelivery = "delivery"
+	PushTriggerTest     = "test"
+
+	PushOutcomePending   = "pending"
+	PushOutcomeDelivered = "delivered"
+	PushOutcomeRetrying  = "retrying"
+	PushOutcomeFailed    = "failed"
+)
+
+var (
+	ErrPushDeliveryUnavailable = errors.New("apple push delivery unavailable")
+	ErrPushDeliveryInvalid     = errors.New("invalid apple push delivery request")
+	ErrPushDeliveryNotFound    = errors.New("apple push device not found")
+)
+
+// PushDeliveryAttempt is one row in the APNs relay outbox/retry log.
+type PushDeliveryAttempt struct {
+	ID                     string
+	NotificationDeliveryID *string
+	PushDeviceID           string
+	TriggerType            string
+	Provider               string
+	Platform               string
+	AttemptNumber          int
+	AttemptedAt            time.Time
+	NextRetryAt            *time.Time
+	Outcome                string
+	RelayRequestID         *string
+	UpstreamStatus         *int
+	UpstreamReason         *string
+	FailureMessage         *string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+// newPushDeliveryAttempts builds the pending outbox rows fanning one delivery
+// out to its profile's eligible devices. Shared by the fanout worker and
+// operational dispatch so both outbox paths enqueue identical rows.
+func newPushDeliveryAttempts(deliveryID string, devices []PushDevice) []PushDeliveryAttempt {
+	attempts := make([]PushDeliveryAttempt, 0, len(devices))
+	for _, device := range devices {
+		attempts = append(attempts, PushDeliveryAttempt{
+			ID:                     ulid.Make().String(),
+			NotificationDeliveryID: &deliveryID,
+			PushDeviceID:           device.ID,
+			TriggerType:            PushTriggerDelivery,
+			Provider:               device.Provider,
+			Platform:               device.Platform,
+		})
+	}
+	return attempts
+}
+
+const pushAttemptReturning = `
+		RETURNING id, notification_delivery_id, push_device_id, trigger_type, provider, platform,
+		          attempt_number, attempted_at, next_retry_at, outcome, relay_request_id,
+		          upstream_status, upstream_reason, failure_message, created_at, updated_at`
+
+func scanPushDeliveryAttempts(rows pgx.Rows) ([]PushDeliveryAttempt, error) {
+	defer rows.Close()
+	attempts := make([]PushDeliveryAttempt, 0, 8)
+	for rows.Next() {
+		var attempt PushDeliveryAttempt
+		if err := rows.Scan(
+			&attempt.ID,
+			&attempt.NotificationDeliveryID,
+			&attempt.PushDeviceID,
+			&attempt.TriggerType,
+			&attempt.Provider,
+			&attempt.Platform,
+			&attempt.AttemptNumber,
+			&attempt.AttemptedAt,
+			&attempt.NextRetryAt,
+			&attempt.Outcome,
+			&attempt.RelayRequestID,
+			&attempt.UpstreamStatus,
+			&attempt.UpstreamReason,
+			&attempt.FailureMessage,
+			&attempt.CreatedAt,
+			&attempt.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan push attempt: %w", err)
+		}
+		attempts = append(attempts, attempt)
+	}
+	return attempts, rows.Err()
+}
+
+// pushDeviceLoginLive is true for a device whose registering login session has
+// not ended. It is checked when sending rather than written when a session ends
+// because sessions end on many paths, and expiry happens without any code
+// running. A session that no longer exists has ended: backups carry push_devices
+// but not auth_sessions. A device with no recorded session (an API key, or a
+// registration older than the column) keeps delivering.
+const pushDeviceLoginLive = `(push_devices.login_session_id IS NULL OR EXISTS (
+	SELECT 1 FROM auth_sessions s
+	WHERE s.id = push_devices.login_session_id AND ` + authSessionLive + `))`
+
+// authSessionLive is true for a session s that has not ended. It matches
+// auth.SessionRepository.IsValid.
+const authSessionLive = `s.revoked_at IS NULL AND s.expires_at > now()`
+
+// ListEnabledPushByProfiles loads delivery-eligible push devices for the
+// admin-enabled platforms, keyed by account and profile: profile IDs repeat
+// across accounts.
+func (r *PushDeviceRepository) ListEnabledPushByProfiles(ctx context.Context, tx pgx.Tx, profiles []profileKey, platforms []string) (map[profileKey][]PushDevice, error) {
+	out := make(map[profileKey][]PushDevice, len(profiles))
+	if len(profiles) == 0 || len(platforms) == 0 {
+		return out, nil
+	}
+	userIDs, profileIDs := profileKeyArrays(profiles)
+	rows, err := tx.Query(ctx, `SELECT `+pushDeviceColumns+`
+		FROM push_devices
+		WHERE (user_id, profile_id) IN (SELECT * FROM unnest($1::int[], $2::text[]))
+		  AND platform = ANY($3)
+		  AND provider = $4
+		  AND push_mode = $5
+		  AND enabled
+		  AND `+pushDeviceLoginLive,
+		userIDs, profileIDs, platforms, PushProviderSiloRelay, PushModePrivatePush)
+	if err != nil {
+		return nil, fmt.Errorf("list enabled push devices: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		device, err := scanPushDevice(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan enabled push device: %w", err)
+		}
+		key := profileKey{device.UserID, device.ProfileID}
+		out[key] = append(out[key], *device)
+	}
+	return out, rows.Err()
+}
+
+// EnqueuePushAttempts inserts pending APNs relay attempts in the fanout transaction.
+func (r *PushDeviceRepository) EnqueuePushAttempts(ctx context.Context, tx pgx.Tx, attempts []PushDeliveryAttempt) error {
+	if len(attempts) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	sb.WriteString(`
+		INSERT INTO push_delivery_attempts
+			(id, notification_delivery_id, push_device_id, trigger_type, provider, platform, attempt_number, outcome)
+		VALUES `)
+	args := make([]any, 0, len(attempts)*8)
+	for i, attempt := range attempts {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		base := len(args)
+		sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8))
+		args = append(args,
+			attempt.ID,
+			attempt.NotificationDeliveryID,
+			attempt.PushDeviceID,
+			defaultString(attempt.TriggerType, PushTriggerDelivery),
+			defaultString(attempt.Provider, PushProviderSiloRelay),
+			defaultString(attempt.Platform, PushPlatformApple),
+			0,
+			PushOutcomePending,
+		)
+	}
+	sb.WriteString(" ON CONFLICT DO NOTHING")
+	if _, err := tx.Exec(ctx, sb.String(), args...); err != nil {
+		return fmt.Errorf("enqueue push attempts: %w", err)
+	}
+	return nil
+}
+
+// EnqueueTestAttempt creates a pending diagnostic attempt for one enabled
+// device on the given platform and account. Profile IDs repeat across
+// accounts, so the account is part of the match, and another account's device
+// answers ErrPushDeliveryNotFound like a device that does not exist. The
+// attempt carries the device profile's
+// newest notification, so the device fetches and shows that notification's
+// real text exactly as for an ordinary push. A profile with no notification
+// yet gets a bare test whose push the device can only show as generic text.
+func (r *PushDeviceRepository) EnqueueTestAttempt(ctx context.Context, platform string, userID int, profileID, serverDeviceID string) (*PushDeliveryAttempt, *PushDevice, error) {
+	if r == nil || r.pool == nil {
+		return nil, nil, ErrPushDeliveryUnavailable
+	}
+	profileID = strings.TrimSpace(profileID)
+	serverDeviceID = strings.TrimSpace(serverDeviceID)
+	if profileID == "" {
+		return nil, nil, fmt.Errorf("%w: profile_id is required", ErrPushDeliveryInvalid)
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin push test attempt: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	query := `SELECT ` + pushDeviceColumns + `
+		FROM push_devices
+		WHERE user_id = $1
+		  AND profile_id = $2
+		  AND platform = $3
+		  AND provider = $4
+		  AND push_mode = $5
+		  AND enabled
+		  AND ` + pushDeviceLoginLive
+	args := []any{userID, profileID, platform, PushProviderSiloRelay, PushModePrivatePush}
+	if serverDeviceID != "" {
+		args = append(args, serverDeviceID)
+		query += fmt.Sprintf(" AND server_device_id = $%d", len(args))
+	}
+	query += ` ORDER BY last_seen_at DESC NULLS LAST, created_at DESC LIMIT 1 FOR UPDATE`
+
+	device, err := scanPushDevice(tx.QueryRow(ctx, query, args...))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, ErrPushDeliveryNotFound
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("select push test device: %w", err)
+	}
+
+	// Profile IDs are unique only within an account, so match the device's
+	// account too. The key-share lock keeps the row from being deleted
+	// before the attempt references it.
+	var deliveryID *string
+	err = tx.QueryRow(ctx, `
+		SELECT id FROM notification_deliveries
+		WHERE user_id = $1 AND profile_id = $2
+		ORDER BY created_at DESC, id DESC
+		LIMIT 1
+		FOR KEY SHARE`, device.UserID, device.ProfileID).Scan(&deliveryID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, fmt.Errorf("select push test delivery: %w", err)
+	}
+
+	attemptID := ulid.Make().String()
+	rows, err := tx.Query(ctx, `
+		INSERT INTO push_delivery_attempts
+			(id, notification_delivery_id, push_device_id, trigger_type, provider, platform, attempt_number, outcome)
+		VALUES ($1, $2, $3, $4, $5, $6, 0, $7)`+pushAttemptReturning,
+		attemptID, deliveryID, device.ID, PushTriggerTest, PushProviderSiloRelay, platform, PushOutcomePending)
+	if err != nil {
+		return nil, nil, fmt.Errorf("insert push test attempt: %w", err)
+	}
+	attempts, err := scanPushDeliveryAttempts(rows)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(attempts) != 1 {
+		return nil, nil, fmt.Errorf("insert push test attempt returned %d rows", len(attempts))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("commit push test attempt: %w", err)
+	}
+	return &attempts[0], device, nil
+}
+
+func (r *PushDeviceRepository) GetPushAttempt(ctx context.Context, id string) (*PushDeliveryAttempt, error) {
+	rows, err := r.pool.Query(ctx, `SELECT * FROM (
+		SELECT id, notification_delivery_id, push_device_id, trigger_type, provider, platform,
+		       attempt_number, attempted_at, next_retry_at, outcome, relay_request_id,
+		       upstream_status, upstream_reason, failure_message, created_at, updated_at
+		FROM push_delivery_attempts
+		WHERE id = $1
+	) attempt`, id)
+	if err != nil {
+		return nil, fmt.Errorf("get push attempt: %w", err)
+	}
+	attempts, err := scanPushDeliveryAttempts(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(attempts) == 0 {
+		return nil, nil
+	}
+	return &attempts[0], nil
+}
+
+// getPushDeviceByID loads a device and whether its login is still live. The
+// device is nil, with no error, when the row is gone.
+func (r *PushDeviceRepository) getPushDeviceByID(ctx context.Context, id string) (*PushDevice, bool, error) {
+	var loginLive bool
+	device, err := scanPushDevice(r.pool.QueryRow(ctx,
+		`SELECT `+pushDeviceColumns+`, `+pushDeviceLoginLive+` FROM push_devices WHERE id = $1`, id), &loginLive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("get push device: %w", err)
+	}
+	return device, loginLive, nil
+}
+
+// ClaimPendingPushForDelivery claims the delivery's own pending attempts for
+// immediate dispatch. An administrator test that carries the delivery stays
+// with the request that enqueued it.
+func (r *PushDeviceRepository) ClaimPendingPushForDelivery(ctx context.Context, deliveryID string) ([]PushDeliveryAttempt, error) {
+	return r.claimPushAttempts(ctx, `
+		UPDATE push_delivery_attempts SET outcome = 'retrying', next_retry_at = now() + $2, updated_at = now()
+		WHERE id IN (
+			SELECT id FROM push_delivery_attempts
+			WHERE notification_delivery_id = $1 AND trigger_type = $3 AND outcome = 'pending'
+			FOR UPDATE SKIP LOCKED
+		)`+pushAttemptReturning,
+		deliveryID, webhookClaimLease, PushTriggerDelivery)
+}
+
+func (r *PushDeviceRepository) ClaimPushAttemptByID(ctx context.Context, attemptID string) ([]PushDeliveryAttempt, error) {
+	return r.claimPushAttempts(ctx, `
+		UPDATE push_delivery_attempts SET outcome = 'retrying', next_retry_at = now() + $2, updated_at = now()
+		WHERE id IN (
+			SELECT id FROM push_delivery_attempts
+			WHERE id = $1 AND outcome = 'pending'
+			FOR UPDATE SKIP LOCKED
+		)`+pushAttemptReturning,
+		attemptID, webhookClaimLease)
+}
+
+func (r *PushDeviceRepository) ClaimDuePushAttempts(ctx context.Context, limit int) ([]PushDeliveryAttempt, error) {
+	return r.claimPushAttempts(ctx, `
+		UPDATE push_delivery_attempts SET outcome = 'retrying', next_retry_at = now() + $2, updated_at = now()
+		WHERE id IN (
+			SELECT id FROM push_delivery_attempts
+			WHERE (outcome = 'retrying' AND next_retry_at <= now())
+			   OR (outcome = 'pending' AND attempted_at <= now() - interval '60 seconds')
+			ORDER BY next_retry_at NULLS FIRST
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)`+pushAttemptReturning,
+		limit, webhookClaimLease)
+}
+
+func (r *PushDeviceRepository) claimPushAttempts(ctx context.Context, query string, args ...any) ([]PushDeliveryAttempt, error) {
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("claim push attempts: %w", err)
+	}
+	return scanPushDeliveryAttempts(rows)
+}
+
+func (r *PushDeviceRepository) FinalizePushAttempt(ctx context.Context, attemptID, outcome string, attemptNumber int, relayRequestID string, upstreamStatus *int, upstreamReason, failureMessage string, nextRetryAt *time.Time) (*PushDeliveryAttempt, error) {
+	var relayRequestIDPtr *string
+	if relayRequestID != "" {
+		relayRequestIDPtr = &relayRequestID
+	}
+	var upstreamReasonPtr *string
+	if upstreamReason != "" {
+		upstreamReasonPtr = &upstreamReason
+	}
+	var failureMessagePtr *string
+	if failureMessage != "" {
+		failureMessagePtr = &failureMessage
+	}
+	rows, err := r.pool.Query(ctx, `
+		UPDATE push_delivery_attempts
+		SET outcome = $2,
+		    attempt_number = $3,
+		    attempted_at = now(),
+		    next_retry_at = $4,
+		    relay_request_id = $5,
+		    upstream_status = $6,
+		    upstream_reason = left($7, 256),
+		    failure_message = left($8, 256),
+		    updated_at = now()
+		WHERE id = $1`+pushAttemptReturning,
+		attemptID, outcome, attemptNumber, nextRetryAt, relayRequestIDPtr, upstreamStatus, upstreamReasonPtr, failureMessagePtr)
+	if err != nil {
+		return nil, fmt.Errorf("finalize push attempt: %w", err)
+	}
+	attempts, err := scanPushDeliveryAttempts(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(attempts) == 0 {
+		return nil, nil
+	}
+	return &attempts[0], nil
+}
+
+// DeleteEndedLoginRegistrations removes the registrations, tokens included, of
+// login sessions that have ended. Their pushes already stopped at
+// pushDeviceLoginLive. An installation's ordering record stays: a later sign-in
+// registers at a newer generation.
+func (r *PushDeviceRepository) DeleteEndedLoginRegistrations(ctx context.Context) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM push_devices WHERE NOT `+pushDeviceLoginLive)
+	if err != nil {
+		return 0, fmt.Errorf("delete registrations of ended logins: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// DeleteRegistrationsWithNoLogin removes registrations with no recorded login
+// whose device has no live login. Such a registration predates login_session_id,
+// and a phone already signed out can never supply one, so it would otherwise
+// receive alerts until someone signs in on it again.
+//
+// Removing a working phone's registration is worse than the alert: its client
+// believes it is registered and sends nothing until a new sign-in. So only the
+// evidence below removes a row, and a signed-out phone it misses keeps delivering.
+// docs/notifications-push-api.md lists what it misses.
+func (r *PushDeviceRepository) DeleteRegistrationsWithNoLogin(ctx context.Context) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM push_devices d
+		WHERE d.login_session_id IS NULL
+		  -- An API key registers with no session, and it has no revoked state.
+		  AND NOT EXISTS (SELECT 1 FROM api_keys k WHERE k.user_id = d.user_id)
+		  -- Only Apple logins name the push device, on whichever account.
+		  AND NOT EXISTS (SELECT 1 FROM auth_sessions s WHERE s.device_id = d.device_id AND `+authSessionLive+`)
+		  AND (
+		    -- The account has no live login. That includes a row carried through a
+		    -- full restore, which leaves auth_sessions empty: the phone has to sign
+		    -- in again anyway, as for a recorded session the restore dropped.
+		    NOT EXISTS (SELECT 1 FROM auth_sessions s WHERE s.user_id = d.user_id AND `+authSessionLive+`)
+		    OR
+		    -- This Apple device's login was live at that write and has ended, since
+		    -- the check above leaves none live. A live login naming no device could
+		    -- be this phone's.
+		    (d.platform = $1
+		     AND EXISTS (SELECT 1 FROM auth_sessions s
+		                 WHERE s.user_id = d.user_id AND s.device_id = d.device_id
+		                   AND s.created_at <= d.last_seen_at
+		                   AND COALESCE(s.revoked_at, s.expires_at) >= d.last_seen_at)
+		     AND NOT EXISTS (SELECT 1 FROM auth_sessions s
+		                     WHERE s.user_id = d.user_id AND s.device_id IS NULL AND `+authSessionLive+`))
+		  )`, PushPlatformApple)
+	if err != nil {
+		return 0, fmt.Errorf("delete registrations with no login: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (r *PushDeviceRepository) RecordPushSuccess(ctx context.Context, deviceID string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE push_devices
+		SET last_success_at = now(), last_failure_at = NULL, last_failure_code = NULL, updated_at = now()
+		WHERE id = $1`, deviceID)
+	return err
+}
+
+func (r *PushDeviceRepository) RecordPushFailure(ctx context.Context, deviceID, code string, disable bool) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE push_devices
+		SET last_failure_at = now(),
+		    last_failure_code = left($2, 128),
+		    enabled = CASE WHEN $3 THEN false ELSE enabled END,
+		    updated_at = now()
+		WHERE id = $1`, deviceID, code, disable)
+	return err
+}
+
+func defaultString(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}

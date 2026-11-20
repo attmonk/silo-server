@@ -1,0 +1,717 @@
+import { useState, useCallback, useMemo, useRef, type ChangeEvent } from "react";
+import { joinList } from "@/lib/appLocale";
+import { Copy, Folder, Plus, Search, X } from "lucide-react";
+import { Direction } from "radix-ui";
+import { toast } from "sonner";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import type { FileVersion, ItemDetail, ItemMatchSearchRequest, MatchCandidate } from "@/api/types";
+import MediaLocations from "@/components/MediaLocations";
+import { ItemLibraryPicker } from "@/components/ItemLibraryPicker";
+import {
+  useApplyItemMatch,
+  useItemFiles,
+  useItemMatchHints,
+  useSearchItemMatchCandidates,
+} from "@/hooks/queries/items";
+import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
+import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
+import { useT } from "@/i18n";
+
+import { copyTextToClipboard } from "@/lib/clipboard";
+import { libraryIdsOfFiles } from "@/lib/itemLibraries";
+import { cn } from "@/lib/utils";
+import { formatDecimal } from "@/lib/numberFormat";
+
+type MatchableItem = Pick<
+  ItemDetail,
+  "content_id" | "title" | "year" | "series_id" | "season_number"
+> & {
+  type: string;
+  /** The library the caller is scoped to, if any; search and apply use it. */
+  library_id?: number;
+  versions?: FileVersion[];
+  folder_paths?: string[];
+};
+
+type ProviderIDInput = {
+  id: number;
+  provider: string;
+  value: string;
+};
+
+interface MatchItemDialogProps {
+  item: MatchableItem;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /**
+   * Called with the item's new content ID when applying the match moved it,
+   * so a page showing the old ID can follow it.
+   */
+  onReplaced?: (contentID: string) => void | Promise<void>;
+}
+
+// Example values shown as placeholders: ID formats, not text to translate.
+const EXAMPLE_IMDB_ID = "tt1234567";
+const EXAMPLE_NUMERIC_ID = "12345";
+const EXAMPLE_PROVIDER = "isbn";
+const EXAMPLE_PROVIDER_ID = "978...";
+
+function isVideoMatchType(type: string): boolean {
+  switch (type.trim().toLowerCase()) {
+    case "movie":
+    case "movies":
+    case "series":
+    case "show":
+    case "shows":
+    case "tv":
+    case "season":
+    case "seasons":
+    case "episode":
+    case "episodes":
+      return true;
+    default:
+      return false;
+  }
+}
+
+export default function MatchItemDialog({
+  item,
+  open,
+  onOpenChange,
+  onReplaced,
+}: MatchItemDialogProps) {
+  const t = useT();
+  const dir = Direction.useDirection();
+  const [title, setTitle] = useState(item.title);
+  const [year, setYear] = useState(item.year ? String(item.year) : "");
+  const [imdbId, setImdbId] = useState("");
+  const [tmdbId, setTmdbId] = useState("");
+  const [tvdbId, setTvdbId] = useState("");
+  const [providerIdInputs, setProviderIdInputs] = useState<ProviderIDInput[]>([
+    { id: 0, provider: "", value: "" },
+  ]);
+  const nextProviderIdInputId = useRef(1);
+  const [selectedCandidate, setSelectedCandidate] = useState<MatchCandidate | null>(null);
+  const isSeries = item.type === "series";
+  const showVideoExternalIds = isVideoMatchType(item.type);
+  const needsItemDetail = open && item.versions === undefined;
+  const { data: enrichedItem, isLoading: enrichedItemLoading } = useCatalogItemDetail(
+    needsItemDetail ? item.content_id : undefined,
+    needsItemDetail ? item.library_id : undefined,
+  );
+
+  // Without a library scope, an item in several libraries needs the admin to
+  // pick one: the server refuses to guess. Its file list says which libraries
+  // those are; that list is admin-only, so other curators search unscoped.
+  const isAdmin = useIsActingAdmin();
+  const lookUpLibraries = open && item.library_id === undefined && isAdmin;
+  const { data: filesData, isLoading: libraryLookupLoading } = useItemFiles(
+    lookUpLibraries ? item.content_id : undefined,
+  );
+  const itemLibraryIds = useMemo(
+    () => (lookUpLibraries ? libraryIdsOfFiles(filesData?.files ?? []) : []),
+    [lookUpLibraries, filesData],
+  );
+  const [pickedLibraryId, setPickedLibraryId] = useState<number>();
+  // The dialog stays mounted between opens, so drop a pick the item has since
+  // left (a split moved those files away).
+  const currentPick =
+    pickedLibraryId !== undefined && itemLibraryIds.includes(pickedLibraryId)
+      ? pickedLibraryId
+      : undefined;
+  const needsLibraryPick = item.library_id === undefined && itemLibraryIds.length > 1;
+  const libraryId = needsLibraryPick ? currentPick : item.library_id;
+  // Also blocks Apply: a candidate found in a library the item has since left
+  // would otherwise apply unscoped, which the server refuses.
+  const searchBlocked = libraryLookupLoading || (needsLibraryPick && currentPick === undefined);
+
+  // The item's own title and year come from its current match, which is the
+  // one an admin usually opens this dialog to correct. Suggest what the
+  // scanner read from the folder and file names instead, once per answer,
+  // leaving any field the admin has edited. Search waits for it, so a quick click
+  // cannot search the stale year.
+  const { data: hints, isLoading: hintsLoading } = useItemMatchHints(
+    open && !searchBlocked ? item.content_id : undefined,
+    libraryId,
+  );
+  const [seededHints, setSeededHints] = useState<typeof hints>();
+  const [editedFields, setEditedFields] = useState<ReadonlySet<(value: string) => void>>(new Set());
+  const suggest = (set: (value: string) => void, value: string) => {
+    if (!editedFields.has(set)) set(value);
+  };
+  if (hints && hints !== seededHints) {
+    setSeededHints(hints);
+    // An answer without a parsed title (another library's, say) falls back to
+    // the item's own title and year rather than keeping the last suggestion.
+    const suggestedYear = hints.title ? hints.year : item.year;
+    suggest(setTitle, hints.title || item.title);
+    suggest(setYear, suggestedYear ? String(suggestedYear) : "");
+    if (showVideoExternalIds) {
+      suggest(setImdbId, hints.provider_ids.imdb ?? "");
+      suggest(setTmdbId, hints.provider_ids.tmdb ?? "");
+      suggest(setTvdbId, hints.provider_ids.tvdb ?? "");
+    }
+  }
+  const editField = (set: (value: string) => void) => (e: ChangeEvent<HTMLInputElement>) => {
+    setEditedFields((edited) => new Set(edited).add(set));
+    set(e.target.value);
+  };
+  // The library a search resolves to, including the one an unscoped search of
+  // a single-library item lands in.
+  const searchScope = libraryId ?? (itemLibraryIds.length === 1 ? itemLibraryIds[0] : undefined);
+  const [searchedScope, setSearchedScope] = useState<number>();
+
+  const searchMutation = useSearchItemMatchCandidates(item.content_id);
+  const applyMutation = useApplyItemMatch();
+
+  // Results found under another library's settings do not apply to this one,
+  // e.g. after a split left the item in a single library.
+  const searchResults = searchedScope === searchScope ? searchMutation.data : undefined;
+  const candidates = searchResults?.candidates ?? [];
+  const scopedCandidate = searchResults ? selectedCandidate : null;
+  const effectiveItem = needsItemDetail ? (enrichedItem ?? item) : item;
+  const genericProviderIds = useMemo(() => {
+    if (showVideoExternalIds) return {};
+
+    return providerIdInputs.reduce<Record<string, string>>((acc, entry) => {
+      const provider = entry.provider.trim().toLowerCase();
+      const value = entry.value.trim();
+      if (provider && value) {
+        acc[provider] = value;
+      }
+      return acc;
+    }, {});
+  }, [providerIdInputs, showVideoExternalIds]);
+
+  const handleSearch = useCallback(() => {
+    setSelectedCandidate(null);
+    setSearchedScope(searchScope);
+    const normalizedYear = year.trim();
+    const parsedYear = normalizedYear === "" ? undefined : Number.parseInt(normalizedYear, 10);
+    const request: ItemMatchSearchRequest = {
+      title: title || undefined,
+      year: parsedYear !== undefined && Number.isFinite(parsedYear) ? parsedYear : undefined,
+      library_id: libraryId,
+    };
+
+    if (showVideoExternalIds) {
+      request.imdb_id = imdbId || undefined;
+      request.tmdb_id = tmdbId || undefined;
+      request.tvdb_id = tvdbId || undefined;
+    } else if (Object.keys(genericProviderIds).length > 0) {
+      request.provider_ids = genericProviderIds;
+    }
+
+    searchMutation.mutate(request);
+  }, [
+    title,
+    year,
+    libraryId,
+    searchScope,
+    showVideoExternalIds,
+    imdbId,
+    tmdbId,
+    tvdbId,
+    genericProviderIds,
+    searchMutation,
+  ]);
+
+  const updateProviderIdInput = useCallback(
+    (index: number, field: keyof ProviderIDInput, value: string) => {
+      setProviderIdInputs((current) =>
+        current.map((entry, entryIndex) =>
+          entryIndex === index ? { ...entry, [field]: value } : entry,
+        ),
+      );
+    },
+    [],
+  );
+
+  const addProviderIdInput = useCallback(() => {
+    const id = nextProviderIdInputId.current;
+    nextProviderIdInputId.current += 1;
+    setProviderIdInputs((current) => [...current, { id, provider: "", value: "" }]);
+  }, []);
+
+  const removeProviderIdInput = useCallback((index: number) => {
+    setProviderIdInputs((current) => {
+      const next = current.filter((_, entryIndex) => entryIndex !== index);
+      return next.length > 0 ? next : [{ id: 0, provider: "", value: "" }];
+    });
+  }, []);
+
+  const handleApply = useCallback(() => {
+    if (!scopedCandidate) return;
+    applyMutation.mutate(
+      {
+        item: libraryId === item.library_id ? item : { ...item, library_id: libraryId },
+        providerIds: scopedCandidate.provider_ids,
+        // Close before following the new ID: the page keys this dialog by
+        // content ID, so it unmounts on navigation and the per-call onSuccess
+        // below never runs, which would leave the page's open state set.
+        onReplaced: (contentID) => {
+          onOpenChange(false);
+          return onReplaced?.(contentID);
+        },
+      },
+      {
+        onSuccess: () => {
+          onOpenChange(false);
+        },
+      },
+    );
+  }, [scopedCandidate, applyMutation, item, libraryId, onOpenChange, onReplaced]);
+
+  // Candidates came from the previous library's search, so they no longer
+  // apply to the new one.
+  const pickLibrary = useCallback(
+    (id: number) => {
+      setPickedLibraryId(id);
+      setSelectedCandidate(null);
+      searchMutation.reset();
+    },
+    [searchMutation],
+  );
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex max-h-[85vh] max-w-2xl flex-col overflow-hidden">
+        <DialogHeader>
+          <DialogTitle>{t("web.item.dialog.matchItemTitle")}</DialogTitle>
+        </DialogHeader>
+
+        <div className="overlay-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overscroll-contain pe-1">
+          {/* Current item summary */}
+          <div className="bg-muted/50 shrink-0 rounded-lg px-3 py-2 text-sm">
+            <span className="font-medium">{item.title}</span>
+            {item.year ? (
+              <span className="text-muted-foreground ms-2">
+                {t("web.item.dialog.yearInParens", { year: item.year })}
+              </span>
+            ) : null}
+            <Badge variant="secondary" className="ms-2 text-[10px]">
+              {item.type}
+            </Badge>
+          </div>
+
+          {(enrichedItemLoading ||
+            (isSeries
+              ? effectiveItem.folder_paths !== undefined
+              : effectiveItem.versions !== undefined)) &&
+            (enrichedItemLoading ? (
+              <div className="text-muted-foreground bg-muted/30 shrink-0 rounded-lg border px-3 py-2 text-sm">
+                {t("web.item.match.loadingLocalMedia")}
+              </div>
+            ) : isSeries ? (
+              <FolderPathsList paths={effectiveItem.folder_paths ?? []} />
+            ) : (
+              <MediaLocations
+                title={t("web.item.match.localMedia")}
+                versions={effectiveItem.versions ?? []}
+                className="shrink-0"
+                compact
+                emptyMessage={t("web.item.match.noFilePaths")}
+              />
+            ))}
+
+          {/* Search inputs */}
+          <div className="grid shrink-0 grid-cols-2 gap-3">
+            <div className="col-span-2">
+              <Label htmlFor="match-title">{t("web.item.dialog.fieldTitle")}</Label>
+              <Input
+                id="match-title"
+                value={title}
+                onChange={editField(setTitle)}
+                placeholder={t("web.item.dialog.fieldTitle")}
+              />
+            </div>
+            <div>
+              <Label htmlFor="match-year">{t("web.item.dialog.fieldYear")}</Label>
+              <Input
+                id="match-year"
+                value={year}
+                onChange={editField(setYear)}
+                placeholder={t("web.item.dialog.fieldYear")}
+                type="number"
+              />
+            </div>
+            {showVideoExternalIds ? (
+              <>
+                <div>
+                  <Label htmlFor="match-imdb">{t("web.item.dialog.imdbId")}</Label>
+                  <Input
+                    id="match-imdb"
+                    value={imdbId}
+                    onChange={editField(setImdbId)}
+                    placeholder={EXAMPLE_IMDB_ID}
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="match-tmdb">{t("web.item.dialog.tmdbId")}</Label>
+                  <Input
+                    id="match-tmdb"
+                    value={tmdbId}
+                    onChange={editField(setTmdbId)}
+                    placeholder={EXAMPLE_NUMERIC_ID}
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="match-tvdb">{t("web.item.dialog.tvdbId")}</Label>
+                  <Input
+                    id="match-tvdb"
+                    value={tvdbId}
+                    onChange={editField(setTvdbId)}
+                    placeholder={EXAMPLE_NUMERIC_ID}
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="col-span-2 space-y-2">
+                <Label>{t("web.item.match.providerIds")}</Label>
+                {providerIdInputs.map((entry, index) => (
+                  <div
+                    key={entry.id}
+                    className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)_2rem] gap-2"
+                  >
+                    <Input
+                      value={entry.provider}
+                      onChange={(e) => updateProviderIdInput(index, "provider", e.target.value)}
+                      placeholder={EXAMPLE_PROVIDER}
+                      aria-label={t("web.item.match.provider")}
+                    />
+                    <Input
+                      value={entry.value}
+                      onChange={(e) => updateProviderIdInput(index, "value", e.target.value)}
+                      placeholder={EXAMPLE_PROVIDER_ID}
+                      aria-label={t("web.item.match.providerId")}
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-9 w-9"
+                      onClick={() => removeProviderIdInput(index)}
+                      disabled={providerIdInputs.length === 1 && !entry.provider && !entry.value}
+                      aria-label={t("web.item.match.removeProviderId")}
+                      title={t("web.item.match.removeProviderId")}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                ))}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  className="h-9 w-9"
+                  onClick={addProviderIdInput}
+                  aria-label={t("web.item.match.addProviderId")}
+                  title={t("web.item.match.addProviderId")}
+                >
+                  <Plus className="h-4 w-4" />
+                </Button>
+              </div>
+            )}
+          </div>
+
+          {needsLibraryPick && (
+            <div className="shrink-0">
+              <ItemLibraryPicker
+                libraryIds={itemLibraryIds}
+                value={currentPick}
+                onChange={pickLibrary}
+              />
+            </div>
+          )}
+
+          <Button
+            onClick={handleSearch}
+            disabled={searchMutation.isPending || searchBlocked || hintsLoading}
+            className="w-full shrink-0 gap-2"
+          >
+            <Search className={cn("h-4 w-4", searchMutation.isPending && "animate-spin")} />
+            {t("web.item.dialog.search")}
+          </Button>
+
+          {searchResults?.truncated && (
+            <p className="text-muted-foreground text-sm">{t("web.item.match.truncated")}</p>
+          )}
+          {/* Candidate list */}
+          {candidates.length > 0 && (
+            <div className="flex min-w-0 flex-col gap-2">
+              <Label>{t("web.item.match.results")}</Label>
+              <TooltipProvider delayDuration={150}>
+                <div className="space-y-1 pb-1">
+                  {candidates.map((candidate, index) => {
+                    const candidateKey = Object.entries(candidate.provider_ids)
+                      .map(([k, v]) => `${k}-${v}`)
+                      .join("_");
+                    const matchedFallbackTitle =
+                      candidate.title_is_fallback &&
+                      candidate.matched_title &&
+                      candidate.matched_title !== candidate.title
+                        ? candidate.matched_title
+                        : undefined;
+                    const displayTitle = matchedFallbackTitle ?? candidate.title;
+                    return (
+                      <button
+                        key={`${candidateKey}-${index}`}
+                        type="button"
+                        className={cn(
+                          "flex w-full min-w-0 items-start gap-3 rounded-lg border p-3 text-start transition-colors",
+                          selectedCandidate === candidate
+                            ? "border-primary bg-primary/5"
+                            : "border-border hover:bg-muted/50",
+                        )}
+                        onClick={() => setSelectedCandidate(candidate)}
+                        data-testid="match-candidate"
+                      >
+                        {candidate.image_url ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <img
+                                src={candidate.image_url}
+                                alt=""
+                                className="h-24 w-16 shrink-0 cursor-zoom-in rounded object-cover"
+                              />
+                            </TooltipTrigger>
+                            <TooltipContent
+                              side={dir === "rtl" ? "left" : "right"}
+                              className="border-border/60 overflow-hidden border bg-transparent p-0 shadow-xl"
+                            >
+                              <img
+                                src={candidate.image_url}
+                                alt={displayTitle}
+                                className="h-72 w-48 rounded-md object-cover"
+                              />
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <div className="bg-muted h-24 w-16 shrink-0 rounded" />
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-medium">{displayTitle}</div>
+                          {matchedFallbackTitle ? (
+                            <div className="text-muted-foreground truncate text-xs">
+                              {t("web.item.match.nativeTitle", { title: candidate.title })}
+                            </div>
+                          ) : candidate.original_title &&
+                            candidate.original_title !== candidate.title ? (
+                            <div className="text-muted-foreground truncate text-xs">
+                              {t("web.item.match.originalTitle", {
+                                title: candidate.original_title,
+                              })}
+                            </div>
+                          ) : null}
+                          {!matchedFallbackTitle &&
+                          candidate.matched_title &&
+                          candidate.matched_title !== candidate.title &&
+                          candidate.matched_title !== candidate.original_title ? (
+                            <div className="text-muted-foreground truncate text-xs">
+                              {t("web.item.match.matchedAlias", {
+                                title: candidate.matched_title,
+                              })}
+                            </div>
+                          ) : null}
+                          <div className="text-muted-foreground text-xs">
+                            {candidate.year ? candidate.year : ""}
+                          </div>
+                          <div className="mt-1 flex min-w-0 flex-wrap gap-1">
+                            {candidate.match_score !== undefined ? (
+                              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                                {t("web.item.match.score", {
+                                  score: formatDecimal(candidate.match_score, 1),
+                                })}
+                              </Badge>
+                            ) : null}
+                            {candidate.sources.map((source) => (
+                              <Badge key={source} variant="outline" className="text-[10px]">
+                                {source}
+                              </Badge>
+                            ))}
+                            {candidate.sources.length > 1 && (
+                              <Badge variant="secondary" className="text-[10px]">
+                                {t("web.item.match.sourcesAgree", {
+                                  count: candidate.sources.length,
+                                })}
+                              </Badge>
+                            )}
+                          </div>
+                          {candidate.match_reasons?.length ? (
+                            <div className="text-muted-foreground mt-1 text-xs">
+                              {t("web.item.match.matchReasons", {
+                                reasons: joinList(
+                                  candidate.match_reasons.map((reason) =>
+                                    reason.replace(/_/g, " "),
+                                  ),
+                                ),
+                              })}
+                            </div>
+                          ) : null}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </TooltipProvider>
+            </div>
+          )}
+
+          {searchMutation.isSuccess && searchResults && candidates.length === 0 && (
+            <p className="text-muted-foreground text-center text-sm">
+              {t("web.item.dialog.noCandidates")}
+            </p>
+          )}
+        </div>
+
+        {/* Apply button — pinned below scroll area */}
+        {scopedCandidate && (
+          <div className="border-border/50 shrink-0 border-t pt-4">
+            <Button
+              onClick={handleApply}
+              disabled={applyMutation.isPending || searchBlocked}
+              className="w-full"
+              data-testid="apply-match"
+            >
+              {applyMutation.isPending
+                ? t("web.item.dialog.applying")
+                : t("web.item.match.applyMatch")}
+            </Button>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function getFolderDisplayName(path: string): string {
+  const trimmed = path.trim().replace(/[\\/]+$/, "");
+  if (!trimmed) return path;
+
+  const segments = trimmed.split(/[\\/]/).filter(Boolean);
+  return segments[segments.length - 1] || trimmed;
+}
+
+function computeRootPath(paths: string[]): string {
+  if (paths.length === 0) return "";
+
+  const parentSegments = paths.map((path) => {
+    const trimmed = path.trim().replace(/[\\/]+$/, "");
+    return trimmed.split(/[\\/]/).filter(Boolean).slice(0, -1);
+  });
+  const first = parentSegments[0] ?? [];
+  const minLen = Math.min(...parentSegments.map((segments) => segments.length));
+
+  let sharedLength = 0;
+  for (let i = 0; i < minLen; i += 1) {
+    if (parentSegments.every((segments) => segments[i] === first[i])) {
+      sharedLength = i + 1;
+      continue;
+    }
+    break;
+  }
+
+  if (sharedLength === 0) return "";
+  return `/${first.slice(0, sharedLength).join("/")}`;
+}
+
+function FolderPathsList({ paths }: { paths: string[] }) {
+  const t = useT();
+  const folderData = useMemo(() => {
+    return {
+      folders: paths.map((fullPath) => ({
+        fullPath,
+        displayName: getFolderDisplayName(fullPath),
+      })),
+      rootPath: computeRootPath(paths),
+    };
+  }, [paths]);
+
+  if (paths.length === 0) {
+    return (
+      <section className="shrink-0 space-y-3">
+        <h2 className="text-base font-semibold tracking-tight">{t("web.item.match.localMedia")}</h2>
+        <div className="text-muted-foreground bg-muted/30 rounded-lg border px-3 py-2 text-sm">
+          {t("web.item.match.noFolderPaths")}
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="shrink-0 space-y-2">
+      <h2 className="text-base font-semibold tracking-tight">{t("web.item.match.localMedia")}</h2>
+      <div className="bg-background/70 rounded-lg border">
+        {folderData.rootPath ? (
+          <div className="border-b px-3 py-2">
+            <div className="text-muted-foreground mb-1 text-[11px] font-medium tracking-[0.08em] uppercase">
+              {t("web.item.match.rootPath")}
+            </div>
+            <div className="flex items-center gap-2">
+              <span
+                className="text-muted-foreground min-w-0 flex-1 truncate font-mono text-xs"
+                title={folderData.rootPath}
+              >
+                {folderData.rootPath}
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="text-muted-foreground hover:text-foreground h-6 w-6 shrink-0"
+                onClick={async () => {
+                  try {
+                    await copyTextToClipboard(folderData.rootPath);
+                    toast.success(t("web.item.match.copiedRootPath"));
+                  } catch {
+                    toast.error(t("web.item.dialog.copyPathFailed"));
+                  }
+                }}
+                title={t("web.item.match.copyRootPath")}
+                aria-label={t("web.item.match.copyRootPathFor", { path: folderData.rootPath })}
+              >
+                <Copy className="h-3 w-3" />
+              </Button>
+            </div>
+          </div>
+        ) : null}
+        <div className="divide-border/50 divide-y">
+          {folderData.folders.map(({ fullPath, displayName }) => (
+            <div key={fullPath} className="group flex items-center gap-2 px-3 py-2">
+              <Folder className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
+              <span
+                className="min-w-0 flex-1 truncate font-mono text-xs font-medium"
+                title={fullPath}
+              >
+                {displayName}
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="text-muted-foreground hover:text-foreground h-6 w-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+                onClick={async () => {
+                  try {
+                    await copyTextToClipboard(fullPath);
+                    toast.success(t("web.item.dialog.copiedFolderPath"));
+                  } catch {
+                    toast.error(t("web.item.dialog.copyPathFailed"));
+                  }
+                }}
+                title={t("web.item.match.copyFullPath")}
+                aria-label={t("web.item.match.copyFolderPathFor", { path: fullPath })}
+              >
+                <Copy className="h-3 w-3" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}

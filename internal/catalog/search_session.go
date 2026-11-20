@@ -1,0 +1,269 @@
+package catalog
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+const searchSessionTTL = 15 * time.Minute
+const searchSessionsPerAccount = 16
+
+// searchSessionSweepInterval throttles the in-memory store's cross-account
+// expiry sweep. Writes always prune their own account, so the per-account
+// bound never waits on the sweep; the sweep only reclaims idle accounts.
+const searchSessionSweepInterval = time.Minute
+
+var ErrSearchContinuationUnavailable = errors.New("search continuation storage is unavailable")
+var ErrSearchWindowUnsupported = errors.New("search index result window is unsupported")
+
+// CatalogSearchCursor pins the chosen retrieval implementation. PostgreSQL
+// retains live ranking keys; Meilisearch retains a shared immutable ranking.
+type CatalogSearchCursor struct {
+	Provider  string        `json:"provider"`
+	Config    string        `json:"config"`
+	SessionID string        `json:"session_id,omitempty"`
+	Position  int           `json:"position,omitempty"`
+	Postgres  *SearchCursor `json:"postgres,omitempty"`
+}
+
+func catalogSearchContinuation(cursor *QueryCursor) *CatalogSearchCursor {
+	if cursor == nil {
+		return nil
+	}
+	return cursor.Search
+}
+
+func wrapCatalogSearchCursor(cursor *CatalogSearchCursor) *QueryCursor {
+	if cursor == nil {
+		return nil
+	}
+	return &QueryCursor{Search: cursor}
+}
+
+type searchRankingSession struct {
+	Scope          string    `json:"scope"`
+	Config         string    `json:"config"`
+	IDs            []string  `json:"ids"`
+	Mode           string    `json:"mode"`
+	SemanticUsed   bool      `json:"semantic_used"`
+	FallbackReason string    `json:"fallback_reason,omitempty"`
+	WindowLimit    int       `json:"window_limit"`
+	ExpiresAt      time.Time `json:"expires_at"`
+}
+
+// searchSessionStore keeps immutable ranking sessions for an account. Expiry
+// or eviction invalidates a cursor; it never changes a stored ranking.
+type searchSessionStore interface {
+	put(ctx context.Context, userID int, session searchRankingSession) (string, error)
+	get(ctx context.Context, userID int, id string) (*searchRankingSession, error)
+}
+
+const searchSessionIDBytes = 24
+
+func newSearchSessionID() string {
+	value := make([]byte, searchSessionIDBytes)
+	_, _ = rand.Read(value)
+	return hex.EncodeToString(value)
+}
+
+func validSearchSessionID(id string) bool {
+	raw, err := hex.DecodeString(id)
+	return err == nil && len(raw) == searchSessionIDBytes
+}
+
+// redisSearchSessionStore shares sessions across API nodes.
+type redisSearchSessionStore struct {
+	client redis.UniversalClient
+}
+
+func searchSessionPrefix(userID int) string {
+	// Redis Cluster keeps the account index and its session values together.
+	return "catalog:search:{" + strconv.Itoa(userID) + "}:"
+}
+
+func (s *redisSearchSessionStore) put(ctx context.Context, userID int, session searchRankingSession) (string, error) {
+	id := newSearchSessionID()
+	encoded, err := json.Marshal(session)
+	if err != nil {
+		return "", err
+	}
+	prefix := searchSessionPrefix(userID)
+	// Create the immutable value and trim the account's retained sessions in
+	// one operation.
+	const script = `
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[3])
+local excess = redis.call('ZCARD', KEYS[2]) - tonumber(ARGV[5]) + 1
+if excess > 0 then
+ local old = redis.call('ZPOPMIN', KEYS[2], excess)
+ for i=1,#old,2 do redis.call('DEL', old[i]) end
+end
+redis.call('ZADD', KEYS[2], ARGV[4], KEYS[1])
+redis.call('PEXPIRE', KEYS[2], ARGV[2])
+return 1`
+	_, err = s.client.Eval(ctx, script, []string{prefix + id, prefix + "index"}, encoded,
+		searchSessionTTL.Milliseconds(), time.Now().UnixMicro(), session.ExpiresAt.UnixMicro(), searchSessionsPerAccount).Result()
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrSearchContinuationUnavailable, err)
+	}
+	return id, nil
+}
+
+func (s *redisSearchSessionStore) get(ctx context.Context, userID int, id string) (*searchRankingSession, error) {
+	if !validSearchSessionID(id) {
+		return nil, ErrCatalogCursorChanged
+	}
+	encoded, err := s.client.Get(ctx, searchSessionPrefix(userID)+id).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, ErrCatalogCursorChanged
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrSearchContinuationUnavailable, err)
+	}
+	var session searchRankingSession
+	if err := json.Unmarshal(encoded, &session); err != nil {
+		return nil, ErrCatalogCursorChanged
+	}
+	if !session.ExpiresAt.After(time.Now()) {
+		return nil, ErrCatalogCursorChanged
+	}
+	return &session, nil
+}
+
+// memorySearchSessionStore serves a single API process when no Redis client is
+// configured.
+type memorySearchSessionStore struct {
+	mu     sync.Mutex
+	memory map[int]map[string]searchRankingSession
+	// lastSweep is when put last pruned every account.
+	lastSweep time.Time
+	// now overrides the store's clock in tests.
+	now func() time.Time
+}
+
+func (s *memorySearchSessionStore) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+func pruneExpiredSearchSessions(sessions map[string]searchRankingSession, now time.Time) {
+	for sessionID, candidate := range sessions {
+		if !candidate.ExpiresAt.After(now) {
+			delete(sessions, sessionID)
+		}
+	}
+}
+
+func (s *memorySearchSessionStore) put(_ context.Context, userID int, session searchRankingSession) (string, error) {
+	id := newSearchSessionID()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.memory == nil {
+		s.memory = make(map[int]map[string]searchRankingSession)
+	}
+	now := s.clock()
+	if now.Sub(s.lastSweep) >= searchSessionSweepInterval {
+		s.lastSweep = now
+		for accountID, sessions := range s.memory {
+			pruneExpiredSearchSessions(sessions, now)
+			if len(sessions) == 0 {
+				delete(s.memory, accountID)
+			}
+		}
+	}
+	sessions := s.memory[userID]
+	if sessions == nil {
+		sessions = make(map[string]searchRankingSession)
+		s.memory[userID] = sessions
+	} else {
+		pruneExpiredSearchSessions(sessions, now)
+	}
+	if len(sessions) >= searchSessionsPerAccount {
+		oldestID := ""
+		var oldestExpiry time.Time
+		for sessionID, candidate := range sessions {
+			if oldestID == "" || candidate.ExpiresAt.Before(oldestExpiry) {
+				oldestID, oldestExpiry = sessionID, candidate.ExpiresAt
+			}
+		}
+		delete(sessions, oldestID)
+	}
+	session.IDs = append([]string(nil), session.IDs...)
+	sessions[id] = session
+	return id, nil
+}
+
+func (s *memorySearchSessionStore) get(_ context.Context, userID int, id string) (*searchRankingSession, error) {
+	if !validSearchSessionID(id) {
+		return nil, ErrCatalogCursorChanged
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sessions := s.memory[userID]
+	session, ok := sessions[id]
+	if !ok || !session.ExpiresAt.After(s.clock()) {
+		delete(sessions, id)
+		if len(sessions) == 0 {
+			delete(s.memory, userID)
+		}
+		return nil, ErrCatalogCursorChanged
+	}
+	session.IDs = append([]string(nil), session.IDs...)
+	return &session, nil
+}
+
+func searchScopeDigest(req CatalogSearchRequest) string {
+	value, _ := json.Marshal(struct {
+		Query      string
+		Types      []string
+		Access     AccessFilter
+		Definition QueryDefinition
+		Grouped    bool
+	}{req.Query, req.ItemTypes, req.Access, req.Definition, req.GroupByWork})
+	digest := sha256.Sum256(value)
+	return hex.EncodeToString(digest[:])
+}
+
+type SearchContinuationCapabilities struct {
+	Provider              string
+	ResultWindowLimit     int
+	SessionTTLSeconds     int
+	MaxSessionsPerAccount int
+}
+
+func (r *CatalogResolver) SearchContinuationCapabilities(ctx context.Context) (SearchContinuationCapabilities, error) {
+	result := SearchContinuationCapabilities{Provider: SearchProviderPostgres}
+	provider, ok := r.searchProvider.(*MeilisearchSearchProvider)
+	if !ok {
+		return result, nil
+	}
+	result.Provider = SearchProviderMeilisearch
+	result.SessionTTLSeconds = int(searchSessionTTL.Seconds())
+	result.MaxSessionsPerAccount = searchSessionsPerAccount
+	if provider.sessions == nil {
+		return result, ErrSearchContinuationUnavailable
+	}
+	_, _, window, err := provider.rankingIndex(ctx)
+	if errors.Is(err, ErrSearchProviderFallback) && !errors.Is(err, context.Canceled) {
+		// Ranking sessions fall back to PostgreSQL in this state, so report
+		// that path rather than failing feature detection.
+		return SearchContinuationCapabilities{Provider: SearchProviderPostgres}, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	result.ResultWindowLimit = window
+	return result, nil
+}

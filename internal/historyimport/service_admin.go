@@ -1,0 +1,162 @@
+package historyimport
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/netguard"
+)
+
+// AuthenticatePlex exchanges Plex username/password for an auth token via plex.tv.
+func (s *Service) AuthenticatePlex(ctx context.Context, username, password string) (string, error) {
+	if username == "" || password == "" {
+		return "", fmt.Errorf("username and password are required")
+	}
+	return s.plex.Authenticate(ctx, username, password)
+}
+
+// DiscoverExternalUsers queries the external server for its user list using the
+// source's stored admin token.
+func (s *Service) DiscoverExternalUsers(ctx context.Context, sourceID int) ([]ExternalUser, error) {
+	source, token, err := s.repo.GetSourceWithAdminToken(ctx, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	if token == "" {
+		return nil, ErrNoAdminToken
+	}
+	// An admin configured this server, so it may be on the local network.
+	ctx = netguard.WithPrivateAccess(ctx)
+
+	switch source.SourceType {
+	case SourceTypeEmby:
+		return s.emby.ListUsers(ctx, source.BaseURL, token)
+	case SourceTypeJellyfin:
+		return s.jellyfin.ListUsers(ctx, source.BaseURL, token)
+	case SourceTypePlex:
+		return s.plex.ListAccounts(ctx, source.BaseURL, token)
+	default:
+		return nil, fmt.Errorf("unsupported source type: %s", source.SourceType)
+	}
+}
+
+// CreateMapping persists a new (source user → Silo user + profile) mapping.
+func (s *Service) CreateMapping(ctx context.Context, input CreateMappingInput) (*UserMapping, error) {
+	return s.repo.CreateMapping(ctx, input)
+}
+
+// ListMappings returns all mappings for a source, enriched with Silo user/profile names.
+func (s *Service) ListMappings(ctx context.Context, sourceID int) ([]UserMapping, error) {
+	return s.repo.ListMappingsForSource(ctx, sourceID)
+}
+
+// GetMapping returns a single mapping by ID.
+func (s *Service) GetMapping(ctx context.Context, id int) (*UserMapping, error) {
+	return s.repo.GetMappingByID(ctx, id)
+}
+
+const BulkRunAccepted = "accepted"
+
+// CreateAdminRun persists dispatch intent before notifying the local runner.
+func (s *Service) CreateAdminRun(ctx context.Context, mappingID int, opts AdminRunOptions) (*Run, error) {
+	run, err := s.repo.EnqueueAdminRun(ctx, mappingID, opts)
+	if err != nil {
+		return nil, err
+	}
+	s.notifyRun(run)
+	s.wakeImportQueue()
+	return run, nil
+}
+
+// BulkCreateAdminRuns reports every mapping in stable source order. The size
+// check precedes all admissions; active mappings are outcomes, not omissions.
+// Every run in the batch gets the same options, so a lookback shares one cutoff.
+func (s *Service) BulkCreateAdminRuns(ctx context.Context, sourceID int, opts AdminRunOptions) (*BulkRunResult, error) {
+	ids, err := s.repo.bulkMappingIDs(ctx, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	source, err := s.repo.GetSourceByID(ctx, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	// Refuse the whole batch up front rather than failing every mapping.
+	if opts.PlayedSince != nil && source.SourceType != SourceTypeJellyfin {
+		return nil, ErrLookbackUnsupported
+	}
+	result := &BulkRunResult{Runs: []*Run{}, Outcomes: []BulkRunOutcome{}}
+	for _, id := range ids {
+		outcome := BulkRunOutcome{MappingID: id}
+		run, err := s.CreateAdminRun(ctx, id, opts)
+		switch {
+		case err == nil:
+			outcome.Status = BulkRunAccepted
+			outcome.Run = run
+			result.Runs = append(result.Runs, run)
+		case errors.Is(err, ErrActiveRunExists):
+			outcome.Status = "active"
+			result.Skipped++
+			outcome.Run, _ = s.repo.activeRunForMapping(ctx, id)
+		default:
+			outcome.Status = "failed"
+			outcome.Error = "Import could not be queued. Review this mapping and source before starting a new run."
+			result.Errors++
+			if errors.Is(err, ErrNoAdminToken) {
+				outcome.Error = "Source has no admin token configured."
+			}
+			if errors.Is(err, ErrMappingNotFound) {
+				outcome.Error = "Mapping no longer exists."
+			}
+		}
+		result.Outcomes = append(result.Outcomes, outcome)
+	}
+	return result, nil
+}
+
+func (s *Service) ListAdminActiveRuns(ctx context.Context, sourceID *int) ([]Run, error) {
+	return s.repo.ListActiveRuns(ctx, sourceID)
+}
+
+// GetAdminRun returns any run by ID regardless of which user owns it.
+func (s *Service) GetAdminRun(ctx context.Context, runID string) (*Run, error) {
+	return s.repo.GetRunByID(ctx, runID)
+}
+
+// CancelAdminRun persists cancellation and signals any in-process worker.
+func (s *Service) CancelAdminRun(ctx context.Context, runID string) error {
+	if err := s.repo.CancelRunIfActive(ctx, runID); err != nil {
+		return err
+	}
+	// Signal in-process goroutine if it's running on this instance.
+	s.cancelRunInProcess(runID)
+	s.notifyRunByID(ctx, runID)
+	return nil
+}
+
+// buildAdminProvider constructs the appropriate Provider for an admin-initiated
+// run. playedSince is the run's lookback cutoff, which enqueue admits only for
+// Jellyfin.
+func (s *Service) buildAdminProvider(source *Source, adminToken, externalUserID string, playedSince *time.Time) (Provider, error) {
+	switch source.SourceType {
+	case SourceTypeEmby:
+		auth := embyLocalAuth{
+			BaseURL:     source.BaseURL,
+			UserID:      externalUserID,
+			AccessToken: adminToken,
+		}
+		return NewEmbyProvider(s.emby, auth), nil
+	case SourceTypeJellyfin:
+		auth := jellyfinLocalAuth{
+			BaseURL:     source.BaseURL,
+			UserID:      externalUserID,
+			AccessToken: adminToken,
+		}
+		return NewJellyfinProvider(s.jellyfin, auth).WithPlayedSince(playedSince), nil
+	case SourceTypePlex:
+		return NewPlexAdminProvider(s.plex, source.BaseURL, adminToken, externalUserID), nil
+	default:
+		return nil, fmt.Errorf("unsupported source type: %s", source.SourceType)
+	}
+}

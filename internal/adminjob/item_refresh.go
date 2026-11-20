@@ -1,0 +1,980 @@
+package adminjob
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/cache"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/libraryingest"
+	"github.com/Silo-Server/silo-server/internal/librarykind"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/naming"
+	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/sections"
+)
+
+const (
+	JobTypeItemRefresh    = "item_refresh"
+	ScanScopeMovieParent  = "movie_parent"
+	ScanScopeSeriesRoot   = "series_root"
+	ScanScopeSeasonFolder = "season_folder"
+)
+
+type ItemRefreshMode string
+
+const (
+	ItemRefreshModeQuick    ItemRefreshMode = "quick"
+	ItemRefreshModeComplete ItemRefreshMode = "complete"
+	// ItemRefreshModeReset is a quick refresh that resets the target to its
+	// providers: it clears the target's locks and every value the providers
+	// lack (Reset to Provider in Edit Metadata).
+	ItemRefreshModeReset ItemRefreshMode = "reset"
+)
+
+var ErrScopeHasNoFiles = errors.New("cannot determine scan scope because this item has no indexed files")
+
+type ScopeResolutionError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *ScopeResolutionError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+type ItemRefreshRequest struct {
+	RequestedContentID     string          `json:"requested_content_id"`
+	RequestedType          string          `json:"requested_type"`
+	RequestedSeriesID      string          `json:"requested_series_id,omitempty"`
+	RequestedSeasonNumber  int             `json:"requested_season_number,omitempty"`
+	RequestedEpisodeNumber int             `json:"requested_episode_number,omitempty"`
+	RefreshTargetType      string          `json:"refresh_target_type"`
+	RefreshContentID       string          `json:"refresh_content_id"`
+	ScanFolderID           int             `json:"scan_folder_id"`
+	ScanPath               string          `json:"scan_path"`
+	ScanScope              string          `json:"scan_scope"`
+	Mode                   ItemRefreshMode `json:"mode,omitempty"`
+	CanonicalRootPath      string          `json:"canonical_root_path,omitempty"`
+	// CurationScope is set when a delegated metadata curator queued the job.
+	// The metadata refresh runs under it, so a merge it would perform is held
+	// to the curator's libraries as match, split and merge are.
+	CurationScope *access.MetadataCurationScope `json:"curation_scope,omitempty"`
+}
+
+type ItemRefreshResult struct {
+	RequestedContentID string              `json:"requested_content_id"`
+	RefreshContentID   string              `json:"refresh_content_id"`
+	DetailContentID    string              `json:"detail_content_id,omitempty"`
+	ScanPath           string              `json:"scan_path"`
+	ScanResult         *scanner.ScanResult `json:"scan_result"`
+	MatchedFiles       int                 `json:"matched_files"`
+	// ArtworkCacheWarning is set when the metadata refresh committed but its
+	// artwork did not finish caching. The refresh itself still succeeded.
+	ArtworkCacheWarning string `json:"artwork_cache_warning,omitempty"`
+}
+
+type itemRefreshItemRepo interface {
+	GetByID(ctx context.Context, contentID string) (*models.MediaItem, error)
+}
+
+type itemRefreshSeasonRepo interface {
+	GetByID(ctx context.Context, contentID string) (*models.Season, error)
+	GetBySeriesAndNumber(ctx context.Context, seriesID string, seasonNum int) (*models.Season, error)
+}
+
+type itemRefreshEpisodeRepo interface {
+	GetByID(ctx context.Context, contentID string) (*models.Episode, error)
+	GetBySeriesAndNumber(ctx context.Context, seriesID string, seasonNum int, episodeNum int) (*models.Episode, error)
+	ListBySeries(ctx context.Context, seriesID string) ([]*models.Episode, error)
+	ListBySeason(ctx context.Context, seriesID string, seasonNum int) ([]*models.Episode, error)
+	ListBySeasonID(ctx context.Context, seasonID string) ([]*models.Episode, error)
+}
+
+type itemRefreshFolderRepo interface {
+	GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
+}
+
+type itemRefreshFileRepo interface {
+	GetByContentID(ctx context.Context, contentID string) ([]*models.MediaFile, error)
+	GetByEpisodeID(ctx context.Context, episodeID string) ([]*models.MediaFile, error)
+	GetByFolderAndPathPrefix(ctx context.Context, folderID int, pathPrefix string) ([]*models.MediaFile, error)
+	ClearContentLinksByPathPrefix(ctx context.Context, folderID int, pathPrefix string) (int, error)
+}
+
+type itemRefreshRootClaimRepo interface {
+	DeleteByFolderAndRoot(ctx context.Context, folderID int, rootPath string) error
+}
+
+type itemRefreshGroupClaimRepo interface {
+	DeleteByFolderAndObservedPathPrefix(ctx context.Context, folderID int, pathPrefix string) error
+}
+
+type itemRefreshSkippedRootRepo interface {
+	Upsert(ctx context.Context, root models.SkippedMediaRoot) error
+	Delete(ctx context.Context, folderID int, rootPath string) error
+	DeleteMissingInScope(ctx context.Context, folderID int, scopePath string, seenRoots []string) error
+}
+
+type ItemRefreshResolver struct {
+	itemRepo    itemRefreshItemRepo
+	seasonRepo  itemRefreshSeasonRepo
+	episodeRepo itemRefreshEpisodeRepo
+	folderRepo  itemRefreshFolderRepo
+	fileRepo    itemRefreshFileRepo
+}
+
+func NewItemRefreshResolver(
+	itemRepo itemRefreshItemRepo,
+	seasonRepo itemRefreshSeasonRepo,
+	episodeRepo itemRefreshEpisodeRepo,
+	folderRepo itemRefreshFolderRepo,
+	fileRepo itemRefreshFileRepo,
+) *ItemRefreshResolver {
+	return &ItemRefreshResolver{
+		itemRepo:    itemRepo,
+		seasonRepo:  seasonRepo,
+		episodeRepo: episodeRepo,
+		folderRepo:  folderRepo,
+		fileRepo:    fileRepo,
+	}
+}
+
+func (r *ItemRefreshResolver) Resolve(ctx context.Context, contentID string) (*ItemRefreshRequest, error) {
+	return r.resolve(ctx, contentID, 0, ItemRefreshModeQuick)
+}
+
+func (r *ItemRefreshResolver) ResolveWithMode(ctx context.Context, contentID string, mode ItemRefreshMode) (*ItemRefreshRequest, error) {
+	return r.resolve(ctx, contentID, 0, normalizeItemRefreshMode(mode))
+}
+
+func (r *ItemRefreshResolver) ResolveForLibrary(ctx context.Context, contentID string, libraryID int) (*ItemRefreshRequest, error) {
+	if libraryID <= 0 {
+		return nil, fmt.Errorf("library_id is required")
+	}
+	return r.resolve(ctx, contentID, libraryID, ItemRefreshModeQuick)
+}
+
+func (r *ItemRefreshResolver) resolve(ctx context.Context, contentID string, libraryID int, mode ItemRefreshMode) (*ItemRefreshRequest, error) {
+	if item, err := r.itemRepo.GetByID(ctx, contentID); err == nil {
+		if item.Type == "series" {
+			return r.resolveSeries(ctx, item, libraryID, mode)
+		}
+		return r.resolveMovie(ctx, item, libraryID, mode)
+	} else if !errors.Is(err, catalog.ErrItemNotFound) {
+		return nil, err
+	}
+
+	if season, err := r.seasonRepo.GetByID(ctx, contentID); err == nil {
+		return r.resolveSeason(ctx, season, libraryID, mode)
+	} else if !errors.Is(err, catalog.ErrSeasonNotFound) {
+		return nil, err
+	}
+
+	episode, err := r.episodeRepo.GetByID(ctx, contentID)
+	if err != nil {
+		if errors.Is(err, catalog.ErrEpisodeNotFound) {
+			return nil, &ScopeResolutionError{
+				StatusCode: 404,
+				Message:    "Item not found",
+			}
+		}
+		return nil, err
+	}
+	return r.resolveEpisode(ctx, episode, libraryID, mode)
+}
+
+func (r *ItemRefreshResolver) resolveMovie(ctx context.Context, item *models.MediaItem, libraryID int, mode ItemRefreshMode) (*ItemRefreshRequest, error) {
+	files, err := r.fileRepo.GetByContentID(ctx, item.ContentID)
+	if err != nil {
+		return nil, err
+	}
+	file, err := firstPresentFileInLibrary(files, libraryID)
+	if err != nil {
+		return nil, err
+	}
+	// A complete refresh clears the scope's content links, which gives an
+	// audiobook a new content ID and orphans its progress and favorites. An
+	// audiobook's reset already clears its match and reads its tags again, so
+	// a complete refresh of one runs as a reset.
+	if item.Type == itemTypeAudiobook && mode == ItemRefreshModeComplete {
+		mode = ItemRefreshModeReset
+	}
+	req := &ItemRefreshRequest{
+		RequestedContentID: item.ContentID,
+		RequestedType:      item.Type,
+		RefreshTargetType:  "item",
+		RefreshContentID:   item.ContentID,
+		ScanScope:          ScanScopeMovieParent,
+		Mode:               mode,
+	}
+	if mode == ItemRefreshModeComplete {
+		return r.buildCompleteRequest(ctx, file, req)
+	}
+	return r.buildRequest(ctx, file.MediaFolderID, filepath.Dir(file.FilePath), req)
+}
+
+func (r *ItemRefreshResolver) resolveSeries(ctx context.Context, item *models.MediaItem, libraryID int, mode ItemRefreshMode) (*ItemRefreshRequest, error) {
+	file, err := r.findSeriesRepresentativeFile(ctx, item.ContentID, libraryID)
+	if err != nil {
+		return nil, err
+	}
+	req := &ItemRefreshRequest{
+		RequestedContentID: item.ContentID,
+		RequestedType:      item.Type,
+		RefreshTargetType:  "item",
+		RefreshContentID:   item.ContentID,
+		ScanScope:          ScanScopeSeriesRoot,
+		Mode:               mode,
+	}
+	if mode == ItemRefreshModeComplete {
+		return r.buildCompleteRequest(ctx, file, req)
+	}
+	folder, err := r.folderRepo.GetByID(ctx, file.MediaFolderID)
+	if err != nil {
+		return nil, err
+	}
+	var libraryRoots []string
+	if folder != nil {
+		libraryRoots = folder.Paths
+	}
+	scanPath := filepath.Dir(file.FilePath)
+	// Library roots keep mount directories such as /mnt/s3 from being read as
+	// season folders and widening the refresh scan above the library.
+	if root, ok := naming.DetectSeriesRoot(file.FilePath, "series", libraryRoots...); ok && root != nil && root.RootPath != "" {
+		scanPath = filepath.Clean(root.RootPath)
+	}
+	return r.buildRequest(ctx, file.MediaFolderID, scanPath, req)
+}
+
+func (r *ItemRefreshResolver) resolveSeason(ctx context.Context, season *models.Season, libraryID int, mode ItemRefreshMode) (*ItemRefreshRequest, error) {
+	file, err := r.findSeasonRepresentativeFile(ctx, season.SeriesID, season.SeasonNumber, season.ContentID, libraryID)
+	if err != nil {
+		return nil, err
+	}
+	req := &ItemRefreshRequest{
+		RequestedContentID:    season.ContentID,
+		RequestedType:         "season",
+		RequestedSeriesID:     season.SeriesID,
+		RequestedSeasonNumber: season.SeasonNumber,
+		RefreshTargetType:     "season",
+		RefreshContentID:      season.ContentID,
+		ScanScope:             ScanScopeSeasonFolder,
+		Mode:                  mode,
+	}
+	if mode == ItemRefreshModeComplete {
+		return r.buildCompleteRequest(ctx, file, req)
+	}
+	return r.buildRequest(ctx, file.MediaFolderID, filepath.Dir(file.FilePath), req)
+}
+
+func (r *ItemRefreshResolver) resolveEpisode(ctx context.Context, episode *models.Episode, libraryID int, mode ItemRefreshMode) (*ItemRefreshRequest, error) {
+	files, err := r.fileRepo.GetByEpisodeID(ctx, episode.ContentID)
+	if err != nil {
+		return nil, err
+	}
+	file, err := firstPresentFileInLibrary(files, libraryID)
+	if err != nil {
+		file, err = r.findSeasonRepresentativeFile(ctx, episode.SeriesID, episode.SeasonNumber, episode.SeasonID, libraryID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	req := &ItemRefreshRequest{
+		RequestedContentID:     episode.ContentID,
+		RequestedType:          "episode",
+		RequestedSeriesID:      episode.SeriesID,
+		RequestedSeasonNumber:  episode.SeasonNumber,
+		RequestedEpisodeNumber: episode.EpisodeNumber,
+		RefreshTargetType:      "episode",
+		RefreshContentID:       episode.ContentID,
+		ScanScope:              ScanScopeSeasonFolder,
+		Mode:                   mode,
+	}
+	if mode == ItemRefreshModeComplete {
+		return r.buildCompleteRequest(ctx, file, req)
+	}
+	return r.buildRequest(ctx, file.MediaFolderID, filepath.Dir(file.FilePath), req)
+}
+
+func (r *ItemRefreshResolver) buildRequest(ctx context.Context, folderID int, scanPath string, req *ItemRefreshRequest) (*ItemRefreshRequest, error) {
+	if _, err := r.folderRepo.GetByID(ctx, folderID); err != nil {
+		return nil, err
+	}
+	// The scan path derives from the linked media file selected above, whose
+	// stored path keeps the logical form below the library root (walks do not
+	// replace it with a symlink target). Scanner.ScanSubtree refuses a path
+	// outside the folder's roots, so no prefix check is repeated here.
+	cleanPath := filepath.Clean(scanPath)
+	req.ScanFolderID = folderID
+	req.ScanPath = cleanPath
+	return req, nil
+}
+
+func (r *ItemRefreshResolver) buildCompleteRequest(ctx context.Context, file *models.MediaFile, req *ItemRefreshRequest) (*ItemRefreshRequest, error) {
+	scanPath, canonicalRootPath, err := r.deriveCompleteRefreshScope(ctx, file)
+	if err != nil {
+		return nil, err
+	}
+	req.CanonicalRootPath = canonicalRootPath
+	return r.buildRequest(ctx, file.MediaFolderID, scanPath, req)
+}
+
+func (r *ItemRefreshResolver) deriveCompleteRefreshScope(ctx context.Context, file *models.MediaFile) (string, string, error) {
+	folder, err := r.folderRepo.GetByID(ctx, file.MediaFolderID)
+	if err != nil {
+		return "", "", err
+	}
+
+	cleanFilePath := filepath.Clean(file.FilePath)
+	parentDir := filepath.Clean(filepath.Dir(cleanFilePath))
+	if file.CanonicalRootPath != "" {
+		canonicalRootPath := filepath.Clean(file.CanonicalRootPath)
+		switch {
+		case shouldRefreshSeriesCanonicalRoot(folder, file):
+			return canonicalRootPath, canonicalRootPath, nil
+		case file.ContentID != "" && canonicalRootPath == parentDir:
+			return canonicalRootPath, canonicalRootPath, nil
+		case file.ContentID != "":
+			return cleanFilePath, canonicalRootPath, nil
+		default:
+			return cleanFilePath, canonicalRootPath, nil
+		}
+	}
+	if file.EpisodeID != "" || file.SeasonNumber != 0 || file.EpisodeNumber != 0 {
+		return parentDir, "", nil
+	}
+	return cleanFilePath, "", nil
+}
+
+func shouldRefreshSeriesCanonicalRoot(folder *models.MediaFolder, file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	if file.EpisodeID != "" || file.SeasonNumber != 0 || file.EpisodeNumber != 0 {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(file.BaseType), "series") {
+		return true
+	}
+	if folder == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(folder.Type)) {
+	case "series", "tv", "show", "tvshows":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *ItemRefreshResolver) findSeriesRepresentativeFile(ctx context.Context, seriesID string, libraryID int) (*models.MediaFile, error) {
+	episodes, err := r.episodeRepo.ListBySeries(ctx, seriesID)
+	if err != nil {
+		return nil, err
+	}
+	for _, episode := range episodes {
+		files, fileErr := r.fileRepo.GetByEpisodeID(ctx, episode.ContentID)
+		if fileErr != nil {
+			return nil, fileErr
+		}
+		if file, pickErr := firstPresentFileInLibrary(files, libraryID); pickErr == nil {
+			return file, nil
+		}
+	}
+
+	files, err := r.fileRepo.GetByContentID(ctx, seriesID)
+	if err != nil {
+		return nil, err
+	}
+	return firstPresentFileInLibrary(files, libraryID)
+}
+
+func (r *ItemRefreshResolver) findSeasonRepresentativeFile(ctx context.Context, seriesID string, seasonNumber int, seasonID string, libraryID int) (*models.MediaFile, error) {
+	var (
+		episodes []*models.Episode
+		err      error
+	)
+	if seasonID != "" {
+		episodes, err = r.episodeRepo.ListBySeasonID(ctx, seasonID)
+	} else {
+		episodes, err = r.episodeRepo.ListBySeason(ctx, seriesID, seasonNumber)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, episode := range episodes {
+		files, fileErr := r.fileRepo.GetByEpisodeID(ctx, episode.ContentID)
+		if fileErr != nil {
+			return nil, fileErr
+		}
+		if file, pickErr := firstPresentFileInLibrary(files, libraryID); pickErr == nil {
+			return file, nil
+		}
+	}
+	return nil, &ScopeResolutionError{
+		StatusCode: 409,
+		Message:    ErrScopeHasNoFiles.Error(),
+	}
+}
+
+func firstPresentFileInLibrary(files []*models.MediaFile, libraryID int) (*models.MediaFile, error) {
+	for _, file := range files {
+		if file == nil || file.MissingSince != nil {
+			continue
+		}
+		if libraryID > 0 && file.MediaFolderID != libraryID {
+			continue
+		}
+		return file, nil
+	}
+	return nil, &ScopeResolutionError{
+		StatusCode: 409,
+		Message:    ErrScopeHasNoFiles.Error(),
+	}
+}
+
+type ItemRefreshIngester interface {
+	IngestSubtree(ctx context.Context, folder *models.MediaFolder, subtreePath string) (*libraryingest.Result, error)
+	// IngestUnlinkedSubtree ingests a subtree whose content links a complete
+	// refresh cleared, matching it before it returns.
+	IngestUnlinkedSubtree(ctx context.Context, folder *models.MediaFolder, subtreePath string) (*libraryingest.Result, error)
+}
+
+type ItemRefreshArtworkCacher interface {
+	// ArtworkCachingEnabled reports whether caching would actually run. The
+	// cacher is wired whenever object storage is configured, independently of
+	// the metadata.cache_images setting, so the refresh asks before it
+	// advertises an artwork step.
+	ArtworkCachingEnabled() bool
+	CacheTargetArtwork(ctx context.Context, targetContentID string) error
+}
+
+// ItemRefreshMetadataRefresher refreshes or resets an item's metadata
+// (metadata.MetadataService).
+type ItemRefreshMetadataRefresher interface {
+	RefreshItem(ctx context.Context, contentID string) error
+	RefreshItemForLibrary(ctx context.Context, contentID string, folderID int) error
+	RefreshTargetForLibrary(ctx context.Context, targetType, contentID string, folderID int) error
+	ResetTargetForLibrary(ctx context.Context, targetType, contentID string, folderID int) error
+}
+
+// ItemRefreshAudiobookEnricher refreshes and resets an audiobook's provider
+// match under the audiobook rules (audiobooks.Enricher). The general metadata
+// refresher never runs on an audiobook. The refresh claims the book before
+// its scan so the enrichment sweep leaves it alone until the refresh ends; an
+// empty token means the book gets no provider step (an ignored match).
+type ItemRefreshAudiobookEnricher interface {
+	ClaimRefresh(ctx context.Context, contentID string) (token string, err error)
+	ResetMatchTx(ctx context.Context, tx pgx.Tx, contentID, token string) error
+	Refresh(ctx context.Context, contentID, token string) error
+	ReleaseRefresh(ctx context.Context, contentID, token string)
+}
+
+type ItemRefreshExecutor struct {
+	folderRepo      itemRefreshFolderRepo
+	fileRepo        itemRefreshFileRepo
+	rootClaimRepo   itemRefreshRootClaimRepo
+	groupClaimRepo  itemRefreshGroupClaimRepo
+	skippedRootRepo itemRefreshSkippedRootRepo
+	seasonRepo      itemRefreshSeasonRepo
+	episodeRepo     itemRefreshEpisodeRepo
+	ingester        ItemRefreshIngester
+	scanRuns        directScanRunRepository
+	refresher       ItemRefreshMetadataRefresher
+	audiobooks      ItemRefreshAudiobookEnricher
+	artworkCacher   ItemRefreshArtworkCacher
+	eventBus        cache.EventBus
+	realtimeHub     *notifications.Hub
+	// evictRails drops this node's cached home rails that list the given
+	// content IDs; tests replace it.
+	evictRails func(contentIDs ...string)
+	// audiobookTagRereadDone is scanner.AudiobookTagRereadDone; tests
+	// replace it.
+	audiobookTagRereadDone func(context.Context) bool
+	// relinkWait bounds how long a complete refresh waits for its scope's
+	// files to be linked again; zero means completeRefreshRelinkWait.
+	relinkWait time.Duration
+	// itemStatuses lets a complete refresh wait out a series match that
+	// another worker is still running; see SetItemStatusReader.
+	itemStatuses itemRefreshItemStatusReader
+}
+
+// A complete refresh resolves the rebuilt item from the files its scope links
+// again. The ingest matches them itself, but the background match worker can
+// claim a series root first; the refresh then waits for that match to link the
+// files, up to completeRefreshRelinkWait, checking every
+// completeRefreshRelinkPoll.
+const (
+	completeRefreshRelinkWait = 60 * time.Second
+	completeRefreshRelinkPoll = 500 * time.Millisecond
+)
+
+// errNoRebuiltContent is a complete refresh scope whose files are not linked
+// to any item.
+var errNoRebuiltContent = errors.New("no rebuilt content found in refresh scope")
+
+// errRebuiltTargetNotFound is a requested season or episode that the rebuilt
+// series does not hold (yet): its row can appear after the first file links.
+var errRebuiltTargetNotFound = errors.New("target not found")
+
+// errRebuiltItemMatching is a scope whose files are linked to a series
+// skeleton that the match worker hasn't matched yet.
+var errRebuiltItemMatching = errors.New("rebuilt series is still being matched")
+
+// itemRefreshItemStatusReader reads catalog item statuses.
+type itemRefreshItemStatusReader interface {
+	GetStatusByIDs(ctx context.Context, ids []string) (map[string]string, error)
+}
+
+// isSeriesTarget reports whether a refresh of requestedType rebuilds a series
+// root, which the TV match queue matches.
+func isSeriesTarget(requestedType string) bool {
+	switch requestedType {
+	case "series", "season", "episode":
+		return true
+	}
+	return false
+}
+
+func NewItemRefreshExecutor(
+	folderRepo itemRefreshFolderRepo,
+	fileRepo itemRefreshFileRepo,
+	rootClaimRepo itemRefreshRootClaimRepo,
+	groupClaimRepo itemRefreshGroupClaimRepo,
+	skippedRootRepo itemRefreshSkippedRootRepo,
+	seasonRepo itemRefreshSeasonRepo,
+	episodeRepo itemRefreshEpisodeRepo,
+	ingester ItemRefreshIngester,
+	scanRuns directScanRunRepository,
+	refresher ItemRefreshMetadataRefresher,
+	eventBus cache.EventBus,
+	realtimeHub *notifications.Hub,
+) *ItemRefreshExecutor {
+	return &ItemRefreshExecutor{
+		folderRepo:      folderRepo,
+		fileRepo:        fileRepo,
+		rootClaimRepo:   rootClaimRepo,
+		groupClaimRepo:  groupClaimRepo,
+		skippedRootRepo: skippedRootRepo,
+		seasonRepo:      seasonRepo,
+		episodeRepo:     episodeRepo,
+		ingester:        ingester,
+		scanRuns:        scanRuns,
+		refresher:       refresher,
+		eventBus:        eventBus,
+		evictRails:      sections.EvictResolvedListItems,
+
+		audiobookTagRereadDone: scanner.AudiobookTagRereadDone,
+		realtimeHub:            realtimeHub,
+	}
+}
+
+func (e *ItemRefreshExecutor) SetArtworkCacher(cacher ItemRefreshArtworkCacher) {
+	e.artworkCacher = cacher
+}
+
+// SetAudiobookEnricher installs the audiobook enricher, which refreshes and
+// resets an audiobook's match. Without it, a refresh of an audiobook only
+// reads its tags again.
+func (e *ItemRefreshExecutor) SetAudiobookEnricher(enricher ItemRefreshAudiobookEnricher) {
+	e.audiobooks = enricher
+}
+
+// SetItemStatusReader lets a complete refresh of a series, season or episode
+// tell a series that another worker is still matching from the rebuilt one.
+func (e *ItemRefreshExecutor) SetItemStatusReader(reader itemRefreshItemStatusReader) {
+	e.itemStatuses = reader
+}
+
+func (e *ItemRefreshExecutor) Execute(ctx context.Context, req ItemRefreshRequest, progress func(current, total int, message string)) (*ItemRefreshResult, error) {
+	if e.folderRepo == nil || e.ingester == nil || e.scanRuns == nil || e.refresher == nil {
+		return nil, fmt.Errorf("resolve scan scope: item refresh executor is not fully configured")
+	}
+	req.Mode = normalizeItemRefreshMode(req.Mode)
+	folder, err := e.folderRepo.GetByID(ctx, req.ScanFolderID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve scan scope: loading folder: %w", err)
+	}
+	if !folder.Enabled {
+		return nil, fmt.Errorf("resolve scan scope: library is disabled")
+	}
+	cacheArtwork := e.artworkCacher != nil && e.artworkCacher.ArtworkCachingEnabled()
+	progressTotal := 3
+	if cacheArtwork {
+		progressTotal = 4
+	}
+
+	refreshContentID := req.RefreshContentID
+	detailContentID := req.RequestedContentID
+	audiobook := req.RequestedType == itemTypeAudiobook
+	if audiobook && req.Mode == ItemRefreshModeComplete {
+		// A job queued before complete refreshes of audiobooks became resets.
+		req.Mode = ItemRefreshModeReset
+	}
+	refreshCtx := ctx
+	if req.CurationScope != nil {
+		refreshCtx = access.WithMetadataCurationAuthorizer(ctx, req.CurationScope.Authorizer())
+	}
+	// An audiobook is claimed before its scan, so the enrichment sweep leaves
+	// it alone from its tag read until the provider step below has finished.
+	audiobookToken := ""
+	if audiobook && e.audiobooks != nil {
+		token, err := e.audiobooks.ClaimRefresh(refreshCtx, refreshContentID)
+		if err != nil {
+			return nil, fmt.Errorf("claim audiobook for refresh: %w", err)
+		}
+		audiobookToken = token
+		defer e.audiobooks.ReleaseRefresh(ctx, refreshContentID, audiobookToken)
+	}
+	audiobookReset := audiobook && req.Mode == ItemRefreshModeReset
+
+	if req.Mode == ItemRefreshModeComplete {
+		if e.fileRepo == nil || e.rootClaimRepo == nil || e.groupClaimRepo == nil {
+			return nil, fmt.Errorf("resolve scan scope: complete item refresh requires file, root claim, and group claim repositories")
+		}
+		if err := e.prepareCompleteRefresh(ctx, folder, req); err != nil {
+			return nil, fmt.Errorf("prepare complete refresh: %w", err)
+		}
+	}
+
+	if progress != nil {
+		progress(1, progressTotal, "Scanning scope")
+	}
+	scanCtx, scanRun, err := beginDirectSubtreeScan(ctx, e.scanRuns, req.ScanFolderID, req.ScanPath, itemRefreshScanTrigger)
+	if err != nil {
+		return nil, fmt.Errorf("scan scope: %w", err)
+	}
+	stopScanHeartbeat := startDirectScanHeartbeat(e.scanRuns, scanRun, directScanHeartbeatEvery)
+	ingest := e.ingester.IngestSubtree
+	// Only a series root goes through the TV match queue whose quiet window
+	// the unlinked ingest waits out; a movie in a mixed library doesn't.
+	if req.Mode == ItemRefreshModeComplete && isSeriesTarget(req.RequestedType) {
+		ingest = e.ingester.IngestUnlinkedSubtree
+	}
+	// A quick refresh reads the item's tags again in place when it is an
+	// audiobook, and so does an audiobook's reset. A complete refresh has
+	// already cleared the scope's content links. An audiobook's reset clears
+	// its match inside the transaction that writes the re-read tags, so a
+	// scan that cannot read the book leaves it as it was.
+	switch {
+	case audiobookReset && audiobookToken != "":
+		scanCtx = scanner.WithAudiobookTagRereadReset(scanCtx, req.RefreshContentID, func(txCtx context.Context, tx pgx.Tx) error {
+			if req.CurationScope != nil {
+				txCtx = access.WithMetadataCurationAuthorizer(txCtx, req.CurationScope.Authorizer())
+			}
+			return e.audiobooks.ResetMatchTx(txCtx, tx, req.RefreshContentID, audiobookToken)
+		})
+	case req.Mode == ItemRefreshModeQuick || audiobook:
+		scanCtx = scanner.WithAudiobookTagReread(scanCtx, req.RefreshContentID)
+	}
+	ingestResult, err := ingest(scanCtx, folder, req.ScanPath)
+	stopScanHeartbeat()
+	if err != nil {
+		return nil, fmt.Errorf("scan scope: %w", failDirectScan(ctx, e.scanRuns, scanRun, err))
+	}
+	if err := completeDirectScan(ctx, e.scanRuns, scanRun, ingestResult); err != nil {
+		return nil, fmt.Errorf("scan scope: %w", err)
+	}
+	scanResult := ingestResult.ScanResult
+	// A scan of a path shared with other books succeeds when only this one
+	// failed, so a reset checks that the book was read. A partly written
+	// book still gets the cache invalidation below; only the provider step is
+	// skipped.
+	var audiobookErr error
+	if audiobookReset {
+		if err := scanner.AudiobookTagRereadResetErr(scanCtx); err != nil {
+			audiobookErr = fmt.Errorf("reset audiobook match: %w", err)
+		} else if !e.audiobookTagRereadDone(scanCtx) {
+			audiobookErr = fmt.Errorf("the scan did not read audiobook %s", refreshContentID)
+		}
+	}
+
+	if progress != nil {
+		progress(2, progressTotal, "Matching discovered files")
+	}
+	if refreshedFolder, reloadErr := e.folderRepo.GetByID(ctx, req.ScanFolderID); reloadErr == nil && !refreshedFolder.Enabled {
+		return nil, fmt.Errorf("match discovered files: library is disabled")
+	}
+	matched := ingestResult.MatchedFiles
+
+	if req.Mode == ItemRefreshModeComplete {
+		resolvedRefreshContentID, resolvedDetailContentID, err := e.resolveRelinkedTargets(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("resolve rebuilt item: %w", err)
+		}
+		refreshContentID = resolvedRefreshContentID
+		if resolvedDetailContentID != "" {
+			detailContentID = resolvedDetailContentID
+		}
+	}
+
+	if progress != nil {
+		progress(3, progressTotal, "Refreshing metadata")
+	}
+	if refreshedFolder, reloadErr := e.folderRepo.GetByID(ctx, req.ScanFolderID); reloadErr == nil && !refreshedFolder.Enabled {
+		return nil, fmt.Errorf("refresh metadata: library is disabled")
+	}
+	refreshTargetType := strings.TrimSpace(req.RefreshTargetType)
+	if refreshTargetType == "" {
+		switch req.RequestedType {
+		case "season", "episode":
+			refreshTargetType = req.RequestedType
+		default:
+			refreshTargetType = "item"
+		}
+	}
+	// The cache invalidation and events below run even when the audiobook
+	// refresh fails: the tag read (and a reset) are committed by then.
+	switch {
+	case audiobook && audiobookToken != "" && audiobookErr == nil:
+		audiobookErr = e.audiobooks.Refresh(refreshCtx, refreshContentID, audiobookToken)
+	case !audiobook:
+		refreshTarget := e.refresher.RefreshTargetForLibrary
+		if req.Mode == ItemRefreshModeReset {
+			refreshTarget = e.refresher.ResetTargetForLibrary
+		}
+		if err := refreshTarget(refreshCtx, refreshTargetType, refreshContentID, req.ScanFolderID); err != nil {
+			return nil, fmt.Errorf("refresh metadata: %w", err)
+		}
+	}
+	artworkWarning := ""
+	if cacheArtwork {
+		if progress != nil {
+			progress(4, progressTotal, "Caching refreshed artwork")
+		}
+		// The metadata refresh is already committed at this point, so artwork
+		// that fails to cache is reported as a warning on the result. Aborting
+		// here would skip the cache invalidation and the rebuilt content IDs
+		// below, leaving clients pointed at an item that no longer exists.
+		if err := e.artworkCacher.CacheTargetArtwork(ctx, refreshContentID); err != nil {
+			artworkWarning = err.Error()
+			slog.WarnContext(ctx, "item refresh: artwork caching did not complete",
+				"component", "adminjob",
+				"content_id", refreshContentID,
+				"error", err,
+			)
+		}
+	}
+
+	// Publish only after the metadata refresh: scan_complete advances the resolved
+	// list-cache generation, so emitting it earlier lets a rail rebuild from
+	// pre-refresh titles/posters and serve them for the whole cache TTL.
+	e.publish(cache.EventScanComplete, strconv.Itoa(req.ScanFolderID))
+	e.publish(cache.EventMetadataUpdated, refreshContentID)
+	// scan_complete only rotates Recently Added. Every other cached home rail
+	// that lists the item would keep its pre-refresh values, for example the
+	// manual edits a Reset to Provider just replaced. Evict this node's rails
+	// directly as well: without Redis the bus is a no-op, and a failed publish
+	// must not leave the node that ran the refresh serving stale rails.
+	changed := []string{refreshContentID}
+	if req.RequestedContentID != "" && req.RequestedContentID != refreshContentID {
+		changed = append(changed, req.RequestedContentID)
+	}
+	if e.evictRails != nil {
+		e.evictRails(changed...)
+	}
+	for _, contentID := range changed {
+		e.publish(cache.EventCatalogItemChanged, contentID)
+	}
+	if e.realtimeHub != nil {
+		if scanResult != nil && (scanResult.New > 0 || scanResult.Updated > 0 || scanResult.Missing > 0 || matched > 0) {
+			_ = e.realtimeHub.PublishCatalogLibraryChanged(ctx, notifications.LibraryChangeEvent{
+				LibraryID:    req.ScanFolderID,
+				Reason:       "item_refresh",
+				New:          scanResult.New,
+				Updated:      scanResult.Updated,
+				Missing:      scanResult.Missing,
+				MatchedFiles: matched,
+			})
+		}
+		_ = e.realtimeHub.PublishCatalogItemChanged(ctx, notifications.MetadataUpdateEvent{
+			LibraryID: req.ScanFolderID,
+			ContentID: refreshContentID,
+			Change:    metadataUpdatedChange,
+		})
+	}
+
+	if audiobookErr != nil {
+		return nil, fmt.Errorf("refresh metadata: %w", audiobookErr)
+	}
+	return &ItemRefreshResult{
+		RequestedContentID:  req.RequestedContentID,
+		RefreshContentID:    refreshContentID,
+		DetailContentID:     detailContentID,
+		ScanPath:            req.ScanPath,
+		ScanResult:          scanResult,
+		MatchedFiles:        matched,
+		ArtworkCacheWarning: artworkWarning,
+	}, nil
+}
+
+// itemTypeAudiobook is media_items.type for an audiobook.
+const itemTypeAudiobook = "audiobook"
+
+func (e *ItemRefreshExecutor) prepareCompleteRefresh(ctx context.Context, folder *models.MediaFolder, req ItemRefreshRequest) error {
+	if req.CanonicalRootPath != "" {
+		if err := e.rootClaimRepo.DeleteByFolderAndRoot(ctx, req.ScanFolderID, req.CanonicalRootPath); err != nil {
+			return fmt.Errorf("deleting root claim: %w", err)
+		}
+	}
+	if e.groupClaimRepo != nil {
+		if err := e.groupClaimRepo.DeleteByFolderAndObservedPathPrefix(ctx, req.ScanFolderID, req.ScanPath); err != nil {
+			return fmt.Errorf("deleting group claims: %w", err)
+		}
+	}
+	// The podcast scanner finds a show by the files linked to it and rewrites
+	// the show and its episodes from their tags on every scan. Clearing those
+	// links would make it mint new show and episode IDs, detaching favorites,
+	// progress and history, so a podcast keeps its links (issue #3405).
+	if librarykind.IsPodcast(folder.Type) {
+		return nil
+	}
+	if _, err := e.fileRepo.ClearContentLinksByPathPrefix(ctx, req.ScanFolderID, req.ScanPath); err != nil {
+		return fmt.Errorf("clearing content links: %w", err)
+	}
+	return nil
+}
+
+// resolveRelinkedTargets is resolveCompleteRefreshTargets once the scope is
+// rebuilt: while a present file in it is still unlinked, the linked series is
+// still a pending skeleton, or the requested season or episode isn't there
+// yet, it checks again until relinkWait passes. Then it resolves with what is
+// linked, so a file that never matches does not fail the refresh, and reports
+// errNoRebuiltContent when nothing is and errRebuiltItemMatching when the
+// series match hasn't finished.
+func (e *ItemRefreshExecutor) resolveRelinkedTargets(ctx context.Context, req ItemRefreshRequest) (string, string, error) {
+	wait := e.relinkWait
+	if wait <= 0 {
+		wait = completeRefreshRelinkWait
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		refreshID, detailID, unlinked, err := e.resolveCompleteRefreshTargets(ctx, req)
+		rebuilding := errors.Is(err, errNoRebuiltContent) || errors.Is(err, errRebuiltTargetNotFound) ||
+			errors.Is(err, errRebuiltItemMatching) || (err == nil && unlinked > 0)
+		if !rebuilding || !time.Now().Before(deadline) {
+			return refreshID, detailID, err
+		}
+		timer := time.NewTimer(min(completeRefreshRelinkPoll, time.Until(deadline)))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// resolveCompleteRefreshTargets resolves the rebuilt item from the scope's
+// linked files, and reports how many present files in the scope are still
+// unlinked. A local extra keeps no content link, so it doesn't count.
+func (e *ItemRefreshExecutor) resolveCompleteRefreshTargets(ctx context.Context, req ItemRefreshRequest) (string, string, int, error) {
+	files, err := e.fileRepo.GetByFolderAndPathPrefix(ctx, req.ScanFolderID, req.ScanPath)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("loading rebuilt files: %w", err)
+	}
+
+	distinctContentIDs := make(map[string]struct{})
+	unlinked := 0
+	for _, file := range files {
+		if file == nil || file.MissingSince != nil || file.ExtraID != "" {
+			continue
+		}
+		if file.ContentID == "" {
+			unlinked++
+			continue
+		}
+		distinctContentIDs[file.ContentID] = struct{}{}
+	}
+
+	switch len(distinctContentIDs) {
+	case 0:
+		return "", "", unlinked, errNoRebuiltContent
+	case 1:
+	default:
+		return "", "", unlinked, errors.New("multiple rebuilt content IDs found in refresh scope")
+	}
+
+	refreshContentID := ""
+	for contentID := range distinctContentIDs {
+		refreshContentID = contentID
+	}
+	// A series root match links the root's files to a pending skeleton before
+	// it asks the providers; the provider match can then merge that skeleton
+	// into another item. Until the match finishes, the skeleton isn't the
+	// rebuilt item. An item gone since the file read was merged away; the next
+	// read finds the files on the item that replaced it.
+	if e.itemStatuses != nil && isSeriesTarget(req.RequestedType) {
+		statuses, err := e.itemStatuses.GetStatusByIDs(ctx, []string{refreshContentID})
+		if err != nil {
+			return "", "", unlinked, fmt.Errorf("loading rebuilt item status: %w", err)
+		}
+		if status, ok := statuses[refreshContentID]; !ok || strings.EqualFold(strings.TrimSpace(status), "pending") {
+			return "", "", unlinked, errRebuiltItemMatching
+		}
+	}
+
+	detailContentID := refreshContentID
+	switch req.RequestedType {
+	case "season":
+		if e.seasonRepo != nil {
+			season, lookupErr := e.seasonRepo.GetBySeriesAndNumber(ctx, refreshContentID, req.RequestedSeasonNumber)
+			switch {
+			case lookupErr == nil && season != nil:
+				detailContentID = season.ContentID
+				refreshContentID = season.ContentID
+			case lookupErr == nil || errors.Is(lookupErr, catalog.ErrSeasonNotFound):
+				return "", "", unlinked, fmt.Errorf("rebuilt season %w", errRebuiltTargetNotFound)
+			default:
+				return "", "", unlinked, fmt.Errorf("loading rebuilt season: %w", lookupErr)
+			}
+		}
+	case "episode":
+		if e.episodeRepo != nil {
+			episode, lookupErr := e.episodeRepo.GetBySeriesAndNumber(ctx, refreshContentID, req.RequestedSeasonNumber, req.RequestedEpisodeNumber)
+			switch {
+			case lookupErr == nil && episode != nil:
+				detailContentID = episode.ContentID
+				refreshContentID = episode.ContentID
+			case lookupErr == nil || errors.Is(lookupErr, catalog.ErrEpisodeNotFound):
+				return "", "", unlinked, fmt.Errorf("rebuilt episode %w", errRebuiltTargetNotFound)
+			default:
+				return "", "", unlinked, fmt.Errorf("loading rebuilt episode: %w", lookupErr)
+			}
+		}
+	}
+
+	return refreshContentID, detailContentID, unlinked, nil
+}
+
+func normalizeItemRefreshMode(mode ItemRefreshMode) ItemRefreshMode {
+	switch mode {
+	case ItemRefreshModeComplete, ItemRefreshModeReset:
+		return mode
+	}
+	return ItemRefreshModeQuick
+}
+
+func (e *ItemRefreshExecutor) publish(eventType, payload string) {
+	if e.eventBus == nil {
+		return
+	}
+	_ = e.eventBus.Publish(context.Background(), cache.ChannelCatalog, cache.Event{
+		Type:    eventType,
+		Payload: payload,
+	})
+}

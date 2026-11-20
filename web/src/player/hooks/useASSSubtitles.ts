@@ -1,0 +1,529 @@
+import { useEffect, useRef, useState } from "react";
+import type JASSUB from "jassub";
+import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
+import { isASSCodec } from "../utils/subtitleCodecs";
+import {
+  applyASSMarginInset,
+  coverZoom,
+  NO_ASS_MARGIN_INSET,
+  NO_COVER_CROP,
+  resolveASSMarginInset,
+  sameASSMarginInset,
+  type ASSMarginInset,
+  type CoverCrop,
+} from "../utils/assFillMargins";
+import {
+  fallbackFontForSubtitle,
+  forceASSFontFamily,
+  loadSubtitleFontBundle,
+  loadSubtitleFallbackFontData,
+} from "../utils/subtitleFonts";
+// Liberation Sans (SIL OFL 1.1; license colocated as liberation-sans.LICENSE),
+// the font JASSUB uses as its built-in Latin default, taken verbatim from
+// jassub@2.4.2's dist/default.woff2. Vendored because jassub >= 2.5.4 still
+// references that file but no longer ships it in the npm package, which would
+// leave libass with no usable default font (queryFonts is disabled) and
+// silently render nothing.
+import liberationSansUrl from "../assets/liberation-sans.woff2?url";
+
+// Window drags and fullscreen transitions resize the player many times in a
+// row; reload the track once the crop settles rather than on every frame.
+const FILL_MARGIN_DEBOUNCE_MS = 150;
+
+// Attached fonts are optional: the server extracts them from the media file,
+// which can take far longer than the subtitle script itself. Once the script
+// has loaded, wait this long for them before rendering with the fallback
+// fonts; fonts that arrive later are added to the running renderer.
+const ATTACHED_FONT_WAIT_MS = 3_000;
+
+/** Resolves with the promise's value, or with undefined once `ms` pass first. */
+function settleWithin<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
+interface ASSFillState {
+  instance: JASSUB;
+  /** Track content before any Fill margin inset. */
+  baseContent: string;
+  /** The fallback font family forced onto the script, if one was. */
+  fallbackFamily?: string;
+  /** Inset currently loaded into the renderer. */
+  inset: ASSMarginInset;
+  /** JASSUB's own render-resolution settings, restored in Fit. */
+  prescaleFactor: number;
+  prescaleHeightLimit: number;
+}
+
+function fillInset(content: string, videoFit: VideoFitMode, coverCrop: CoverCrop) {
+  return videoFit === "cover" ? resolveASSMarginInset(content, coverCrop) : NO_ASS_MARGIN_INSET;
+}
+
+/**
+ * Whether the renderer's video has a frame size to resize against. JASSUB
+ * sizes its canvas from the video's intrinsic size, which is 0×0 while a
+ * stream reload (seek reanchor, quality or audio switch) has emptied the
+ * element. Resizing then leaves libass drawing into a 0×0 frame, and JASSUB
+ * resizes again only when the frame size changes, which a reloaded stream at
+ * the same resolution never does.
+ */
+function hasFrameSize(instance: JASSUB): boolean {
+  const video = instance._video;
+  return !!video && video.videoWidth > 0 && video.videoHeight > 0;
+}
+
+/** Resizes and repaints the renderer once it is ready and has a frame size. */
+function repaintASS(instance: JASSUB, isCurrent: () => boolean): void {
+  void instance.ready
+    .then(() => {
+      if (isCurrent() && hasFrameSize(instance)) return instance.resize(true);
+    })
+    .catch((err) => {
+      if (isCurrent()) console.error("[useASSSubtitles] Unable to repaint subtitles:", err);
+    });
+}
+
+/**
+ * Puts the canvas on the video's Fit/Fill crop, reloads the track with margins
+ * that keep regular events inside the visible area, and repaints. JASSUB sizes
+ * its canvas as if the video always used object-fit: contain, so Fill relies on
+ * the `player-ass-fill` override to crop the canvas exactly like the video and
+ * raises the render resolution by the zoom so the enlarged bitmap stays sharp.
+ */
+async function syncASSFill(
+  fill: ASSFillState,
+  videoFit: VideoFitMode,
+  coverCrop: CoverCrop,
+  isCurrent: () => boolean,
+): Promise<void> {
+  const { instance } = fill;
+  instance._canvas.classList.toggle("player-ass-fill", videoFit === "cover");
+  if (videoFit === "cover") {
+    instance.prescaleFactor = coverZoom(coverCrop);
+    instance.prescaleHeightLimit = Number.POSITIVE_INFINITY;
+  } else {
+    instance.prescaleFactor = fill.prescaleFactor;
+    instance.prescaleHeightLimit = fill.prescaleHeightLimit;
+  }
+  const inset = fillInset(fill.baseContent, videoFit, coverCrop);
+  if (!sameASSMarginInset(inset, fill.inset)) {
+    fill.inset = inset;
+    await instance.renderer.setTrack(applyASSMarginInset(fill.baseContent, inset));
+  }
+  if (isCurrent() && hasFrameSize(instance)) await instance.resize(true);
+}
+
+/**
+ * Manages client-side ASS/SSA subtitle rendering via JASSUB (libass WASM).
+ *
+ * When an ASS-codec subtitle track is active, this hook lazy-loads JASSUB,
+ * creates an instance attached to the video element, and renders styled
+ * subtitles onto a canvas overlay. When a non-ASS track is selected (or
+ * subtitles are turned off), the JASSUB instance is destroyed.
+ *
+ * The existing VTT subtitle pipeline (useSubtitleTracks) handles SRT/VTT;
+ * this hook handles ASS/SSA. The two are coordinated by the `isActive`
+ * return value — when true, the VTT overlay should be suppressed.
+ */
+export function useASSSubtitles(
+  videoRef: React.RefObject<HTMLVideoElement | null>,
+  subtitleUrls: PlayerSubtitleInfo[],
+  activeSubtitleIndex: number | null,
+  isDetached: boolean,
+  streamOriginSeconds: number,
+  subtitleDelayMs: number,
+  // "refreshing" is a reload of the track on screen for new timing: its
+  // current events stay up meanwhile, so it is not announced as loading.
+  onLoadState?: (state: "idle" | "loading" | "refreshing" | "ready" | "error") => void,
+  videoFit: VideoFitMode = "contain",
+  coverCrop: CoverCrop = NO_COVER_CROP,
+  // Bumped when the server retimed the active track behind an unchanged URL
+  // (subtitle sync or a timing reset); changing it swaps the track's script
+  // in the running renderer.
+  cueRevision = 0,
+  // Bumped when the browser decode engine's transport starts or stops. JASSUB
+  // re-arms requestVideoFrameCallback only from inside its own callback, and
+  // callbacks registered on an engine end with it, so the renderer rebuilds.
+  transportRevision = 0,
+): { isActive: boolean } {
+  const onLoadStateRef = useRef(onLoadState);
+  onLoadStateRef.current = onLoadState;
+  const videoFitRef = useRef(videoFit);
+  videoFitRef.current = videoFit;
+  const coverCropRef = useRef(coverCrop);
+  coverCropRef.current = coverCrop;
+  const jassubRef = useRef<JASSUB | null>(null);
+  const fillRef = useRef<ASSFillState | null>(null);
+  const syncedFitRef = useRef(videoFit);
+  const jassubImportRef = useRef<Promise<typeof JASSUB> | null>(null);
+  // The track and cue revision the running renderer was built from, and
+  // whether it finished loading: a retime swaps the script only then.
+  const cueRevisionRef = useRef(cueRevision);
+  cueRevisionRef.current = cueRevision;
+  const builtRef = useRef<{ url: string; revision: number; ready: boolean } | null>(null);
+  // Bumped to rebuild the renderer when a script swap cannot be made.
+  const [rebuild, setRebuild] = useState(0);
+  // Effective JASSUB time offset. JASSUB renders the ASS event matching
+  // `video.currentTime + timeOffset`, so an event at source time S appears
+  // at video time S - timeOffset. `streamOriginSeconds` accounts for HLS
+  // PTS rebasing; the user-facing delay (ms → s) must be SUBTRACTED so that
+  // positive delay = subtitles shown later, matching the VTT path's
+  // `start - origin + delay` cue shift.
+  const effectiveOffset = streamOriginSeconds - subtitleDelayMs / 1000;
+  const streamOriginRef = useRef(effectiveOffset);
+  streamOriginRef.current = effectiveOffset;
+
+  // Resolve the active subtitle track.
+  const activeSub =
+    activeSubtitleIndex !== null
+      ? (subtitleUrls.find((s) => s.index === activeSubtitleIndex) ?? null)
+      : null;
+
+  const isASS = activeSub !== null && isASSCodec(activeSub.codec);
+  const activeUrl = isASS ? activeSub.url : null;
+  const activeLanguage = isASS ? activeSub.language : "";
+  const activeFontBundleUrl = isASS ? activeSub.font_bundle_url : undefined;
+
+  // Main effect: create/destroy JASSUB based on active track.
+  useEffect(() => {
+    const video = videoRef.current;
+    onLoadStateRef.current?.("idle");
+
+    // Destroy JASSUB if the active track is not ASS, or player is detached,
+    // or no video element is available.
+    if (!activeUrl || !video || isDetached) {
+      if (jassubRef.current) {
+        jassubRef.current.destroy();
+        jassubRef.current = null;
+      }
+      return;
+    }
+
+    let cancelled = false;
+    let controller = new AbortController();
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let stopResizeToStream: (() => void) | null = null;
+
+    async function initJASSUB(signal: AbortSignal, progress: () => void) {
+      if (!video || cancelled) return;
+      onLoadStateRef.current?.("loading");
+      const built = { url: activeUrl!, revision: cueRevisionRef.current, ready: false };
+      builtRef.current = built;
+
+      // Lazy-load JASSUB module (only once).
+      if (!jassubImportRef.current) {
+        jassubImportRef.current = import("jassub")
+          .then((m) => m.default)
+          .catch((err) => {
+            jassubImportRef.current = null;
+            throw err;
+          });
+      }
+
+      const classPromise = jassubImportRef.current;
+      void classPromise.catch(() => {});
+
+      // Requested alongside the script, but never awaited past
+      // ATTACHED_FONT_WAIT_MS: the font request reports no progress, so
+      // waiting on it would let the stall timer abort the whole attempt.
+      const attachedFonts = activeFontBundleUrl
+        ? loadSubtitleFontBundle(activeFontBundleUrl, signal).catch((err): Uint8Array[] => {
+            if ((err as Error).name !== "AbortError") {
+              console.error(
+                `[useASSSubtitles] Failed to load subtitle font bundle ${activeFontBundleUrl}:`,
+                err,
+              );
+            }
+            return [];
+          })
+        : null;
+
+      let subContent: string;
+      try {
+        subContent = await fetch(activeUrl!, { signal }).then(async (response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          progress();
+          if (!response.body) return response.text();
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let text = "";
+          while (!signal.aborted && !cancelled) {
+            const { value, done } = await reader.read();
+            if (done) return text + decoder.decode();
+            progress();
+            text += decoder.decode(value, { stream: true });
+          }
+          throw new DOMException("Subtitle loading cancelled", "AbortError");
+        });
+      } catch (err) {
+        if (!cancelled && (err as Error).name !== "AbortError") {
+          console.error(`[useASSSubtitles] Failed to fetch ${activeUrl}:`, err);
+        }
+        throw err;
+      }
+
+      if (cancelled || signal.aborted) return;
+
+      const attachedFontData = attachedFonts
+        ? await settleWithin(attachedFonts, ATTACHED_FONT_WAIT_MS)
+        : [];
+      if (cancelled || signal.aborted) return;
+
+      // libass renders missing glyphs with its *default* font — it does not
+      // search other loaded fonts for coverage. JASSUB's built-in default
+      // (Liberation Sans) lacks many non-Latin glyphs, so for those scripts we
+      // point `defaultFont` at a font that covers them, chosen by track metadata
+      // first and subtitle text as a fallback. Each track switch destroys and
+      // rebuilds the instance, so this stays in sync per track.
+      const fallbackFont = fallbackFontForSubtitle(activeLanguage, subContent);
+
+      let fallbackFontData: Uint8Array[] | null = null;
+      if (fallbackFont) {
+        try {
+          fallbackFontData = await loadSubtitleFallbackFontData(fallbackFont);
+        } catch (err) {
+          if (!cancelled) {
+            console.error(
+              `[useASSSubtitles] Failed to load fallback font ${fallbackFont.family}:`,
+              err,
+            );
+          }
+        }
+      }
+
+      if (cancelled) return;
+
+      const renderedSubContent =
+        fallbackFont && fallbackFontData
+          ? forceASSFontFamily(subContent, fallbackFont.family)
+          : subContent;
+      const fonts = [...(attachedFontData ?? []), ...(fallbackFontData ?? [])];
+
+      const JASSUBClass = await classPromise;
+      if (cancelled || signal.aborted) return;
+      const initialInset = fillInset(renderedSubContent, videoFitRef.current, coverCropRef.current);
+      const instance = new JASSUBClass({
+        video,
+        subContent: applyASSMarginInset(renderedSubContent, initialInset),
+        timeOffset: streamOriginRef.current,
+        // The browser Local Font Access API is inconsistent and permissioned.
+        // Letting JASSUB probe it produces noisy console warnings for common ASS
+        // style fonts without making playback reliable across clients.
+        queryFonts: false,
+        availableFonts: { "liberation sans": liberationSansUrl },
+        ...(fonts.length > 0
+          ? {
+              fonts,
+              ...(fallbackFont && { defaultFont: fallbackFont.family }),
+            }
+          : {}),
+      });
+
+      // Guard against the effect being cleaned up while the constructor ran.
+      if (cancelled) {
+        instance.destroy();
+        return;
+      }
+
+      jassubRef.current = instance;
+      // Resizes skipped while a stream reload emptied the video happen here,
+      // once the next stream has a frame size. Some browsers report that size
+      // after loadedmetadata, with a resize event.
+      const resizeToStream = () => repaintASS(instance, () => jassubRef.current === instance);
+      video.addEventListener("loadedmetadata", resizeToStream);
+      video.addEventListener("resize", resizeToStream);
+      stopResizeToStream = () => {
+        video.removeEventListener("loadedmetadata", resizeToStream);
+        video.removeEventListener("resize", resizeToStream);
+      };
+      const fill: ASSFillState = {
+        instance,
+        baseContent: renderedSubContent,
+        fallbackFamily: fallbackFont && fallbackFontData ? fallbackFont.family : undefined,
+        inset: initialInset,
+        prescaleFactor: instance.prescaleFactor,
+        prescaleHeightLimit: instance.prescaleHeightLimit,
+      };
+      fillRef.current = fill;
+      instance._canvas.classList.toggle("player-ass-fill", videoFitRef.current === "cover");
+      if (attachedFonts && attachedFontData === undefined) {
+        const isCurrent = () => !cancelled && !signal.aborted && jassubRef.current === instance;
+        void attachedFonts
+          .then(async (lateFonts) => {
+            if (lateFonts.length === 0) return;
+            await instance.ready;
+            if (!isCurrent()) return;
+            await instance.renderer.addFonts(lateFonts);
+            repaintASS(instance, isCurrent);
+          })
+          .catch((err) => {
+            if (isCurrent()) console.error("[useASSSubtitles] Unable to add attached fonts:", err);
+          });
+      }
+      await instance.ready;
+      if (cancelled || signal.aborted || jassubRef.current !== instance) return;
+
+      // Fit and the player size can change while the subtitle source, fonts,
+      // or renderer are still loading. Re-read both after readiness so the
+      // first rendered frame cannot inherit what this effect started with.
+      await syncASSFill(
+        fill,
+        videoFitRef.current,
+        coverCropRef.current,
+        () => jassubRef.current === instance,
+      );
+      if (!cancelled && !signal.aborted && jassubRef.current === instance) {
+        built.ready = true;
+        onLoadStateRef.current?.("ready");
+      }
+    }
+
+    async function load() {
+      controller = new AbortController();
+      const attemptController = controller;
+      let progress = () => {};
+      const stalled = new Promise<never>((_, reject) => {
+        progress = () => {
+          if (cancelled || attemptController.signal.aborted) return;
+          if (timeout !== null) clearTimeout(timeout);
+          timeout = setTimeout(() => {
+            attemptController.abort();
+            reject(new Error("Subtitle loading stalled"));
+          }, 30_000);
+        };
+        progress();
+      });
+      try {
+        await Promise.race([initJASSUB(controller.signal, progress), stalled]);
+      } catch (err) {
+        if (cancelled) return;
+        attemptController.abort();
+        console.error("[useASSSubtitles] Unable to load subtitles:", err);
+        stopResizeToStream?.();
+        stopResizeToStream = null;
+        jassubRef.current?.destroy();
+        jassubRef.current = null;
+        onLoadStateRef.current?.("error");
+        retryTimer = setTimeout(() => void load(), 5_000);
+      } finally {
+        if (timeout !== null) clearTimeout(timeout);
+      }
+    }
+    void load();
+
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      if (timeout !== null) clearTimeout(timeout);
+      controller.abort();
+      stopResizeToStream?.();
+      // Destroy the current instance if the effect is being torn down
+      // (e.g. track switch or unmount). This covers the common case where
+      // initJASSUB has already completed and stored the instance.
+      if (jassubRef.current) {
+        jassubRef.current.destroy();
+        jassubRef.current = null;
+      }
+    };
+    // videoRef is a stable ref object. streamOriginSeconds is read from
+    // streamOriginRef inside the async function to always get the latest value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- videoRef and streamOriginRef are refs
+  }, [activeUrl, activeLanguage, activeFontBundleUrl, isDetached, rebuild, transportRevision]);
+
+  // A retime of the track on screen (subtitle sync, a timing reset) loads the
+  // corrected script into the running renderer: the current events stay up
+  // until it is in, and nothing is announced. A renderer still loading, or a
+  // swap that fails, rebuilds instead.
+  useEffect(() => {
+    const built = builtRef.current;
+    if (!activeUrl || !built || built.url !== activeUrl || built.revision === cueRevision) return;
+    const fill = fillRef.current;
+    if (!built.ready || !fill || jassubRef.current !== fill.instance) {
+      setRebuild((n) => n + 1);
+      return;
+    }
+    built.revision = cueRevision;
+    const { instance } = fill;
+    const controller = new AbortController();
+    onLoadStateRef.current?.("refreshing");
+    void (async () => {
+      try {
+        const response = await fetch(activeUrl, { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const text = await response.text();
+        if (controller.signal.aborted || jassubRef.current !== instance) return;
+        const content = fill.fallbackFamily ? forceASSFontFamily(text, fill.fallbackFamily) : text;
+        fill.baseContent = content;
+        fill.inset = fillInset(content, videoFitRef.current, coverCropRef.current);
+        await instance.renderer.setTrack(applyASSMarginInset(content, fill.inset));
+        if (!controller.signal.aborted && jassubRef.current === instance) {
+          onLoadStateRef.current?.("ready");
+        }
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        console.error("[useASSSubtitles] Unable to load retimed subtitles:", err);
+        setRebuild((n) => n + 1);
+      }
+    })();
+    return () => controller.abort();
+  }, [activeUrl, cueRevision]);
+
+  // Update JASSUB's time offset when either the media timeline remaps or
+  // the user nudges subtitle sync. Avoids destroying and recreating the
+  // instance for offset-only changes.
+  useEffect(() => {
+    const instance = jassubRef.current;
+    if (!instance || !activeUrl) return;
+
+    instance.timeOffset = effectiveOffset;
+    repaintASS(instance, () => jassubRef.current === instance);
+  }, [effectiveOffset, activeUrl]);
+
+  // Keep the canvas crop and the Fill margins in step with the video. A fit
+  // toggle applies immediately; crop changes from resizing are debounced.
+  const cropX = coverCrop.x;
+  const cropY = coverCrop.y;
+  useEffect(() => {
+    const fitChanged = syncedFitRef.current !== videoFit;
+    syncedFitRef.current = videoFit;
+    const fill = fillRef.current;
+    const instance = jassubRef.current;
+    if (!fill || !instance || fill.instance !== instance || !activeUrl) return;
+
+    instance._canvas.classList.toggle("player-ass-fill", videoFit === "cover");
+    const isCurrent = () => jassubRef.current === instance;
+    const timer = setTimeout(
+      () => {
+        void instance.ready
+          .then(() => {
+            if (isCurrent()) {
+              return syncASSFill(fill, videoFit, { x: cropX, y: cropY }, isCurrent);
+            }
+          })
+          .catch((err) => {
+            if (isCurrent()) {
+              console.error("[useASSSubtitles] Unable to apply video fit to subtitles:", err);
+            }
+          });
+      },
+      fitChanged ? 0 : FILL_MARGIN_DEBOUNCE_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [activeUrl, videoFit, cropX, cropY]);
+
+  // Cleanup on unmount.
+  useEffect(() => {
+    return () => {
+      if (jassubRef.current) {
+        jassubRef.current.destroy();
+        jassubRef.current = null;
+      }
+    };
+  }, []);
+
+  return { isActive: isASS && !isDetached };
+}

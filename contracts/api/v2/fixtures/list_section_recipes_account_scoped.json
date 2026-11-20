@@ -1,0 +1,56 @@
+{
+  "categories": [
+    {
+      "category": "library_staples",
+      "recipes": [
+        {
+          "type": "recently_added",
+          "category": "library_staples",
+          "presets": [],
+          "avoid_duplicates": true,
+          "supports_rotation": false,
+          "admin_only": false
+        }
+      ]
+    },
+    {
+      "category": "mood",
+      "recipes": [
+        {
+          "type": "mood",
+          "category": "mood",
+          "presets": [
+            {
+              "key": "cozy",
+              "display_name": "Cozy night in",
+              "icon": "moon",
+              "description_short": "Warm and gentle",
+              "description_long": "",
+              "default_params": {
+                "genres": [
+                  "comedy"
+                ],
+                "mood": "cozy"
+              },
+              "display_name_key": "home.recipe.cozy.name",
+              "description_short_key": "home.recipe.cozy.description"
+            },
+            {
+              "key": "bare",
+              "display_name": "Bare",
+              "icon": "dot",
+              "description_short": "No params",
+              "description_long": "",
+              "default_params": {},
+              "display_name_key": "home.recipe.bare.name",
+              "description_short_key": "home.recipe.bare.description"
+            }
+          ],
+          "avoid_duplicates": false,
+          "supports_rotation": true,
+          "admin_only": false
+        }
+      ]
+    }
+  ]
+}

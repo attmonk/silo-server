@@ -1,0 +1,275 @@
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  calendarKeys,
+  catalogKeys,
+  collectionKeys,
+  downloadKeys,
+  libraryKeys,
+  mediaSurfaceKeys,
+  profileKeys,
+  requestKeys,
+  sectionKeys,
+} from "@/hooks/queries/keys";
+import {
+  createCatalogInvalidationScheduler,
+  invalidateAccessDependentState,
+  PROGRESS_HOME_REFRESH_WINDOW_MS,
+  scheduleProgressHomeRefresh,
+  userStateChangeAffectsSectionMembership,
+} from "./realtimeCatalogInvalidation";
+
+const WINDOW_MS = 2_000;
+
+function catalogListKey(libraryId: number) {
+  return catalogKeys.list({
+    source: "section",
+    scope: "library",
+    section_id: "all",
+    library_id: libraryId,
+    limit: 60,
+    offset: 0,
+  });
+}
+
+/** Seeds one cached query per library so invalidation scope is observable. */
+function seedLibraries(queryClient: QueryClient, libraryIds: number[]) {
+  for (const libraryId of libraryIds) {
+    queryClient.setQueryData(catalogListKey(libraryId), { items: [] });
+  }
+}
+
+function invalidatedLibraries(queryClient: QueryClient, libraryIds: number[]) {
+  return libraryIds.filter(
+    (libraryId) => queryClient.getQueryState(catalogListKey(libraryId))?.isInvalidated,
+  );
+}
+
+describe("createCatalogInvalidationScheduler", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("invalidates the first event immediately", async () => {
+    const queryClient = new QueryClient();
+    seedLibraries(queryClient, [1, 3]);
+    const sectionKey = sectionKeys.libraryItems(3, "recently-added");
+    queryClient.setQueryData(sectionKey, { section: { id: "recently-added", items: [] } });
+    const scheduler = createCatalogInvalidationScheduler(queryClient, WINDOW_MS);
+
+    scheduler.schedule({ libraryId: 3, allowDashboardRefetch: false });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(invalidatedLibraries(queryClient, [1, 3])).toEqual([3]);
+    expect(queryClient.getQueryState(sectionKey)?.isInvalidated).toBe(true);
+  });
+
+  it("coalesces a burst into a single trailing sweep", async () => {
+    const queryClient = new QueryClient();
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+    const scheduler = createCatalogInvalidationScheduler(queryClient, WINDOW_MS);
+
+    scheduler.schedule({ libraryId: 3, allowDashboardRefetch: false });
+    await vi.advanceTimersByTimeAsync(0);
+    const afterLeadingEdge = invalidateQueries.mock.calls.length;
+
+    for (let i = 0; i < 50; i += 1) {
+      scheduler.schedule({ itemId: `item-${i}`, libraryId: 3, allowDashboardRefetch: false });
+    }
+    await vi.advanceTimersByTimeAsync(WINDOW_MS - 1);
+
+    expect(invalidateQueries.mock.calls.length).toBe(afterLeadingEdge);
+
+    await vi.advanceTimersByTimeAsync(1);
+
+    // Exactly one more sweep for all 50 events, not 50 sweeps.
+    expect(invalidateQueries.mock.calls.length).toBe(afterLeadingEdge * 2);
+  });
+
+  it("widens to an unscoped sweep when a window spans several libraries", async () => {
+    const queryClient = new QueryClient();
+    seedLibraries(queryClient, [1, 3]);
+    const scheduler = createCatalogInvalidationScheduler(queryClient, WINDOW_MS);
+
+    // Leading edge consumes the first event; the rest share one window.
+    scheduler.schedule({ libraryId: 3, allowDashboardRefetch: false });
+    await vi.advanceTimersByTimeAsync(0);
+    seedLibraries(queryClient, [1, 3]);
+
+    scheduler.schedule({ libraryId: 3, allowDashboardRefetch: false });
+    scheduler.schedule({ libraryId: 1, allowDashboardRefetch: false });
+    await vi.advanceTimersByTimeAsync(WINDOW_MS);
+
+    expect(invalidatedLibraries(queryClient, [1, 3])).toEqual([1, 3]);
+  });
+
+  it("drops queued work on cancel", async () => {
+    const queryClient = new QueryClient();
+    const scheduler = createCatalogInvalidationScheduler(queryClient, WINDOW_MS);
+
+    scheduler.schedule({ libraryId: 3, allowDashboardRefetch: false });
+    await vi.advanceTimersByTimeAsync(0);
+    seedLibraries(queryClient, [3]);
+
+    scheduler.schedule({ libraryId: 3, allowDashboardRefetch: false });
+    scheduler.cancel();
+    await vi.advanceTimersByTimeAsync(WINDOW_MS * 2);
+
+    expect(invalidatedLibraries(queryClient, [3])).toEqual([]);
+
+    // The window timer is gone too, so the next event leads again.
+    scheduler.schedule({ libraryId: 3, allowDashboardRefetch: false });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(invalidatedLibraries(queryClient, [3])).toEqual([3]);
+  });
+
+  it("keeps a library-wide event broad when coalesced with a single item", async () => {
+    const queryClient = new QueryClient();
+    const otherDetailKey = catalogKeys.itemDetail("item-2");
+    queryClient.setQueryData(otherDetailKey, { content_id: "item-2" });
+    const scheduler = createCatalogInvalidationScheduler(queryClient, WINDOW_MS);
+
+    try {
+      scheduler.schedule({ itemId: "item-1", libraryId: 3, allowDashboardRefetch: false });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(queryClient.getQueryState(otherDetailKey)?.isInvalidated).toBe(false);
+
+      scheduler.schedule({ itemId: "item-1", libraryId: 3, allowDashboardRefetch: false });
+      scheduler.schedule({ libraryId: 3, allowDashboardRefetch: false });
+      await vi.advanceTimersByTimeAsync(WINDOW_MS);
+
+      expect(queryClient.getQueryState(otherDetailKey)?.isInvalidated).toBe(true);
+    } finally {
+      scheduler.cancel();
+      queryClient.clear();
+    }
+  });
+
+  it("marks home section data stale (without refetching) on a library-scoped sweep", async () => {
+    const queryClient = new QueryClient();
+    const homeLayoutKey = sectionKeys.homeLayout();
+    const homeItemsKey = sectionKeys.homeItems("recently-added");
+    const loadHomeLayout = vi.fn(async () => ({ sections: [] }));
+    const loadHomeItems = vi.fn(async () => ({ items: [] }));
+    queryClient.setQueryData(homeLayoutKey, { sections: [] });
+    queryClient.setQueryData(homeItemsKey, { items: [] });
+    const layoutObserver = new QueryObserver(queryClient, {
+      queryKey: homeLayoutKey,
+      queryFn: loadHomeLayout,
+      staleTime: Infinity,
+    });
+    const itemsObserver = new QueryObserver(queryClient, {
+      queryKey: homeItemsKey,
+      queryFn: loadHomeItems,
+      staleTime: Infinity,
+    });
+    const unsubscribeLayout = layoutObserver.subscribe(() => {});
+    const unsubscribeItems = itemsObserver.subscribe(() => {});
+    const scheduler = createCatalogInvalidationScheduler(queryClient, WINDOW_MS);
+
+    try {
+      expect(loadHomeLayout).not.toHaveBeenCalled();
+      expect(loadHomeItems).not.toHaveBeenCalled();
+      scheduler.schedule({ libraryId: 3, allowDashboardRefetch: false });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Active home queries become stale so the home queue can refresh them,
+      // without this library sweep starting its own reads.
+      expect(queryClient.getQueryState(homeLayoutKey)?.isInvalidated).toBe(true);
+      expect(queryClient.getQueryState(homeItemsKey)?.isInvalidated).toBe(true);
+      expect(loadHomeLayout).not.toHaveBeenCalled();
+      expect(loadHomeItems).not.toHaveBeenCalled();
+      expect(queryClient.isFetching()).toBe(0);
+    } finally {
+      scheduler.cancel();
+      unsubscribeLayout();
+      unsubscribeItems();
+      queryClient.clear();
+    }
+  });
+});
+
+describe("userStateChangeAffectsSectionMembership", () => {
+  it("ignores progress ticks and accepts every membership change", () => {
+    expect(userStateChangeAffectsSectionMembership("progress")).toBe(false);
+    for (const change of ["favorite", "watchlist", "history", "watched", "home_dismissal"]) {
+      expect(userStateChangeAffectsSectionMembership(change)).toBe(true);
+    }
+  });
+
+  it("treats an unknown change as membership-affecting", () => {
+    expect(userStateChangeAffectsSectionMembership(undefined)).toBe(true);
+  });
+});
+
+describe("scheduleProgressHomeRefresh", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    // Drain any armed trailing refresh so module-level timer state cannot
+    // leak into the next test.
+    vi.runAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("coalesces a stream of progress ticks into one trailing refresh", () => {
+    const queryClient = new QueryClient();
+    const signal = () => queryClient.getQueryData<number>(mediaSurfaceKeys.refreshSignal()) ?? 0;
+
+    for (let i = 0; i < 10; i += 1) {
+      scheduleProgressHomeRefresh(queryClient);
+      vi.advanceTimersByTime(1_000);
+    }
+    // Ticks alone never reset the home load queue…
+    expect(signal()).toBe(0);
+
+    vi.advanceTimersByTime(PROGRESS_HOME_REFRESH_WINDOW_MS);
+    // …but an open home catches the playback within one window.
+    expect(signal()).toBe(1);
+
+    scheduleProgressHomeRefresh(queryClient);
+    vi.advanceTimersByTime(PROGRESS_HOME_REFRESH_WINDOW_MS);
+    expect(signal()).toBe(2);
+  });
+});
+
+describe("invalidateAccessDependentState", () => {
+  it("marks every access-dependent surface stale", async () => {
+    const queryClient = new QueryClient();
+    const keys = [
+      libraryKeys.user("profile-1"),
+      catalogListKey(1),
+      catalogKeys.itemDetail("movie-1"),
+      sectionKeys.home(),
+      collectionKeys.list(),
+      calendarKeys.week("2026-09-28", "all"),
+      requestKeys.status(),
+      downloadKeys.capability(),
+      profileKeys.list(),
+    ];
+    for (const key of keys) queryClient.setQueryData(key, {});
+
+    invalidateAccessDependentState(queryClient, { allowDashboardRefetch: false });
+    await Promise.resolve();
+
+    expect(keys.filter((key) => !queryClient.getQueryState(key)?.isInvalidated)).toEqual([]);
+  });
+
+  it("refreshes catalog lists while another list page is on its first read", async () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(catalogListKey(1), {});
+    // A page still loading, such as a letter jump's seek, holds a scan's list
+    // refreshes; an access change must not wait for it.
+    const firstRead = new QueryObserver(queryClient, {
+      queryKey: catalogListKey(2),
+      queryFn: () => new Promise<never>(() => undefined),
+    });
+    const unsubscribe = firstRead.subscribe(() => undefined);
+
+    invalidateAccessDependentState(queryClient, { allowDashboardRefetch: false });
+    await Promise.resolve();
+
+    expect(queryClient.getQueryState(catalogListKey(1))?.isInvalidated).toBe(true);
+    unsubscribe();
+    queryClient.clear();
+  });
+});

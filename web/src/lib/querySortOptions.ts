@@ -1,0 +1,396 @@
+import { t, type MessageKey } from "@/i18n";
+
+export type PersonalizedSorts = boolean | "date_viewed";
+export type QuerySortOrder = "asc" | "desc";
+export type QuerySortRelevanceScope =
+  | "movie"
+  | "series"
+  | "episode"
+  | "audiobook"
+  | "ebook"
+  | "manga"
+  | "all";
+export type QuerySortField =
+  | "title"
+  | "added_at"
+  | "release_date"
+  | "last_air_date"
+  | "latest_episode_added"
+  | "year"
+  | "content_rating"
+  | "runtime"
+  | "rating_imdb"
+  | "rating_tmdb"
+  | "rating_rt_critic"
+  | "rating_rt_audience"
+  | "resolution"
+  | "bitrate"
+  | "progress"
+  | "date_viewed"
+  | "plays"
+  | "author"
+  | "narrator"
+  | "series";
+
+type ApplicableMediaScope = Exclude<QuerySortRelevanceScope, "all">;
+
+export interface QuerySortOption {
+  value: QuerySortField;
+  labelKey: MessageKey;
+  /** The sort's name in the interface language, read when used. */
+  readonly label: string;
+  defaultOrder: QuerySortOrder;
+  personalized: boolean;
+  applicableMediaScopes: ApplicableMediaScope[];
+  /**
+   * When set, the wizard's scope selector switches to this scope
+   * if the user picks this sort in a different scope. Used for sorts
+   * whose semantics imply a particular media type (e.g. Latest Episode
+   * Air Date is most meaningful when results are episodes).
+   */
+  preferredMediaScope?: ApplicableMediaScope;
+  /**
+   * The rating source this sort orders by, for a rating an administrator can
+   * hide. Offered only when that source is shown.
+   */
+  ratingSource?: string;
+}
+
+export interface QuerySortOptionsConfig {
+  includePersonalized?: PersonalizedSorts;
+  relevanceScope?: QuerySortRelevanceScope;
+  /**
+   * The rating sources the server shows (getRatingsCapability). When set,
+   * sorts by any other rating are left out, since the server ignores them.
+   * Unset offers every sort.
+   */
+  shownRatingSources?: ReadonlySet<string>;
+  /**
+   * A sort already chosen stays offered even when its rating is hidden, so
+   * editing a saved collection does not silently change its order.
+   */
+  keepSortField?: string;
+}
+
+type QuerySortOptionsInput = boolean | QuerySortOptionsConfig;
+
+interface QuerySortLike {
+  field?: string | null;
+  order?: string | null;
+}
+
+// ALL_VIDEO_SCOPES is the universe of video-side scopes — used as the
+// baseline for the "all" relevance scope (mixed libraries / episode
+// browse mode) so that sorts limited to series+episode are still
+// filtered out as not universally applicable. Book scopes are explicit
+// opt-in: a sort field must list "audiobook" or "ebook" in its
+// applicableMediaScopes to be eligible for book-only libraries.
+const ALL_VIDEO_SCOPES: ApplicableMediaScope[] = ["movie", "series", "episode"];
+const ALL_MEDIA_SCOPES: ApplicableMediaScope[] = [...ALL_VIDEO_SCOPES, "audiobook", "ebook"];
+// Manga series rows are file-less containers: technical sorts (Duration,
+// Bitrate) are meaningless there, so manga is opt-in per sort field instead
+// of being part of ALL_MEDIA_SCOPES.
+
+type QuerySortOptionSpec = Omit<QuerySortOption, "label">;
+
+function withLabel(spec: QuerySortOptionSpec): QuerySortOption {
+  return {
+    ...spec,
+    get label() {
+      return t(this.labelKey);
+    },
+  };
+}
+
+const QUERY_SORT_OPTION_SPECS: QuerySortOptionSpec[] = [
+  {
+    value: "title",
+    labelKey: "catalog.sort.title",
+    defaultOrder: "asc",
+    personalized: false,
+    applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
+  },
+  {
+    value: "added_at",
+    labelKey: "catalog.sort.added",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
+  },
+  {
+    value: "release_date",
+    labelKey: "catalog.sort.released",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
+  },
+  {
+    value: "last_air_date",
+    labelKey: "web.common.sort.latestEpisodeAirDate",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: ["series", "episode"],
+    preferredMediaScope: "episode",
+  },
+  {
+    value: "latest_episode_added",
+    labelKey: "web.common.sort.latestEpisodeAdded",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: ["series"],
+  },
+  {
+    value: "year",
+    labelKey: "catalog.sort.year",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
+  },
+  {
+    value: "content_rating",
+    labelKey: "web.common.sort.contentRating",
+    defaultOrder: "asc",
+    personalized: false,
+    applicableMediaScopes: ALL_VIDEO_SCOPES,
+  },
+  {
+    value: "runtime",
+    labelKey: "web.common.sort.duration",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: ALL_MEDIA_SCOPES,
+  },
+  {
+    value: "rating_imdb",
+    labelKey: "catalog.sort.imdbRating",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: ALL_VIDEO_SCOPES,
+  },
+  {
+    value: "rating_tmdb",
+    labelKey: "web.common.sort.tmdbRating",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: ALL_VIDEO_SCOPES,
+  },
+  {
+    value: "rating_rt_critic",
+    labelKey: "web.common.sort.rtCriticRating",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: ALL_VIDEO_SCOPES,
+    ratingSource: "rt_critic",
+  },
+  {
+    value: "rating_rt_audience",
+    labelKey: "web.common.sort.rtAudienceRating",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: ALL_VIDEO_SCOPES,
+    ratingSource: "rt_audience",
+  },
+  {
+    value: "resolution",
+    labelKey: "catalog.sort.resolution",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: ALL_VIDEO_SCOPES,
+  },
+  {
+    value: "bitrate",
+    labelKey: "web.common.sort.bitrate",
+    defaultOrder: "desc",
+    personalized: false,
+    applicableMediaScopes: ALL_MEDIA_SCOPES,
+  },
+  {
+    value: "progress",
+    labelKey: "web.common.sort.progress",
+    defaultOrder: "desc",
+    personalized: true,
+    applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
+  },
+  {
+    value: "date_viewed",
+    labelKey: "web.common.sort.dateViewed",
+    defaultOrder: "desc",
+    personalized: true,
+    applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
+  },
+  {
+    value: "plays",
+    labelKey: "web.common.sort.plays",
+    defaultOrder: "desc",
+    personalized: true,
+    applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
+  },
+  // Book-native sorts. Author is shared by audiobooks and ebooks; narrator
+  // remains audiobook-only. Series is shared by the audiobook_series and
+  // ebook_series joins on the backend.
+  {
+    value: "author",
+    labelKey: "catalog.sort.author",
+    defaultOrder: "asc",
+    personalized: false,
+    applicableMediaScopes: ["audiobook", "ebook", "manga"],
+  },
+  {
+    value: "narrator",
+    labelKey: "catalog.sort.narrator",
+    defaultOrder: "asc",
+    personalized: false,
+    applicableMediaScopes: ["audiobook"],
+  },
+  {
+    value: "series",
+    labelKey: "catalog.sort.series",
+    defaultOrder: "asc",
+    personalized: false,
+    applicableMediaScopes: ["audiobook", "ebook"],
+  },
+];
+
+export const QUERY_SORT_OPTIONS: QuerySortOption[] = QUERY_SORT_OPTION_SPECS.map(withLabel);
+
+const QUERY_SORT_OPTION_MAP = new Map(QUERY_SORT_OPTIONS.map((option) => [option.value, option]));
+
+const EBOOK_SORT_LABELS: Partial<Record<QuerySortField, MessageKey>> = {
+  date_viewed: "web.common.sort.dateRead",
+  plays: "web.common.sort.reads",
+};
+
+function normalizeQuerySortOptionsConfig(
+  input: QuerySortOptionsInput = false,
+): QuerySortOptionsConfig {
+  if (typeof input === "boolean") {
+    return { includePersonalized: input };
+  }
+  return input;
+}
+
+function optionMatchesRelevanceScope(
+  option: QuerySortOption,
+  relevanceScope?: QuerySortRelevanceScope,
+): boolean {
+  if (!relevanceScope) {
+    return true;
+  }
+  // "all" — applies to mixed libraries and the episode browse mode.
+  // Match the historical baseline (universal across all video scopes)
+  // so series-only sorts still get normalized away. Book scopes are
+  // intentionally not part of this baseline; see ALL_VIDEO_SCOPES.
+  if (relevanceScope === "all") {
+    return ALL_VIDEO_SCOPES.every((scope) => option.applicableMediaScopes.includes(scope));
+  }
+  return option.applicableMediaScopes.includes(relevanceScope);
+}
+
+export function getQuerySortOptions(input: QuerySortOptionsInput = false): QuerySortOption[] {
+  const {
+    includePersonalized = false,
+    relevanceScope,
+    shownRatingSources,
+    keepSortField,
+  } = normalizeQuerySortOptionsConfig(input);
+
+  return QUERY_SORT_OPTIONS.filter(
+    (option) =>
+      (includePersonalized === true ||
+        !option.personalized ||
+        option.value === includePersonalized) &&
+      optionMatchesRelevanceScope(option, relevanceScope) &&
+      (!option.ratingSource ||
+        !shownRatingSources ||
+        shownRatingSources.has(option.ratingSource) ||
+        option.value === keepSortField),
+  ).map((option) => {
+    const ebookLabel =
+      relevanceScope === "ebook" || relevanceScope === "manga"
+        ? EBOOK_SORT_LABELS[option.value]
+        : undefined;
+    return ebookLabel ? withLabel({ ...option, labelKey: ebookLabel }) : option;
+  });
+}
+
+/**
+ * The sort scope for a query media scope. Movies & Series ("video") keeps the
+ * sorts valid for every video type, and manga reuses the ebook sorts (its
+ * chapters are ebook items).
+ */
+export function querySortScopeForMediaScope(mediaScope?: string): QuerySortRelevanceScope {
+  if (!mediaScope || mediaScope === "all" || mediaScope === "video") return "all";
+  if (mediaScope === "manga") return "ebook";
+  return mediaScope as QuerySortRelevanceScope;
+}
+
+export function normalizeQuerySortForScope(
+  sort?: QuerySortLike | null,
+  input: QuerySortOptionsInput = false,
+): { field: QuerySortField; order: QuerySortOrder } {
+  const sortOptions = getQuerySortOptions(input);
+  const normalizedField = normalizeQuerySortField(sort?.field);
+
+  if (normalizedField && normalizedField !== "relevance") {
+    const matchingOption = sortOptions.find((option) => option.value === normalizedField);
+    if (matchingOption) {
+      return {
+        field: matchingOption.value,
+        order:
+          sort?.order === "asc" || sort?.order === "desc"
+            ? sort.order
+            : matchingOption.defaultOrder,
+      };
+    }
+  }
+
+  const fallbackOption = sortOptions[0] ?? QUERY_SORT_OPTION_MAP.get("added_at");
+  if (!fallbackOption) {
+    return { field: "added_at", order: "desc" };
+  }
+
+  return {
+    field: fallbackOption.value,
+    order: fallbackOption.defaultOrder,
+  };
+}
+
+export function normalizeQuerySortField(
+  field?: string | null,
+): QuerySortField | "relevance" | undefined {
+  const normalized = field?.trim().toLowerCase();
+
+  switch (normalized) {
+    case undefined:
+      return undefined;
+    case "":
+      return undefined;
+    case "sort_title":
+      return "title";
+    case "recently_added":
+      return "added_at";
+    case "rating":
+      return "rating_imdb";
+    case "relevance":
+      return "relevance";
+    default:
+      return QUERY_SORT_OPTION_MAP.has(normalized as QuerySortField)
+        ? (normalized as QuerySortField)
+        : undefined;
+  }
+}
+
+export function getDefaultQuerySortOrder(field?: string | null): QuerySortOrder {
+  const normalized = normalizeQuerySortField(field);
+  if (!normalized || normalized === "relevance") {
+    return "desc";
+  }
+  return QUERY_SORT_OPTION_MAP.get(normalized)?.defaultOrder ?? "desc";
+}
+
+export function isPersonalizedQuerySortField(field?: string | null): boolean {
+  const normalized = normalizeQuerySortField(field);
+  return normalized != null && normalized !== "relevance"
+    ? (QUERY_SORT_OPTION_MAP.get(normalized)?.personalized ?? false)
+    : false;
+}

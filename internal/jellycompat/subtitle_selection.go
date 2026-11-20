@@ -1,0 +1,500 @@
+package jellycompat
+
+import (
+	"context"
+	"encoding/json"
+	"slices"
+	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/lang"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// Jellyfin SubtitlePlaybackMode values.
+const (
+	compatSubtitleDefault    = "Default"
+	compatSubtitleSmart      = "Smart"
+	compatSubtitleAlways     = "Always"
+	compatSubtitleOnlyForced = "OnlyForced"
+	compatSubtitleNone       = "None"
+)
+
+// Canonical playback.subtitle_mode values.
+const (
+	profileSubtitleAuto   = "auto"
+	profileSubtitleAlways = "always"
+	profileSubtitleOff    = "off"
+)
+
+// compatNativeSubtitleSettings maps a Jellyfin SubtitlePlaybackMode onto
+// Silo's canonical playback.subtitle_mode and playback.show_forced_subtitles.
+// Silo's "auto" is Jellyfin's Smart, and "off" is OnlyForced or None depending
+// on whether forced subtitles show; Default keeps "auto" and is recovered from
+// the saved Jellyfin configuration. ok is false for an unknown mode.
+func compatNativeSubtitleSettings(mode string) (nativeMode string, showForced bool, ok bool) {
+	switch mode {
+	case compatSubtitleDefault, compatSubtitleSmart:
+		return profileSubtitleAuto, true, true
+	case compatSubtitleAlways:
+		return profileSubtitleAlways, true, true
+	case compatSubtitleOnlyForced:
+		return profileSubtitleOff, true, true
+	case compatSubtitleNone:
+		return profileSubtitleOff, false, true
+	default:
+		return "", false, false
+	}
+}
+
+// compatJellyfinSubtitleMode is the inverse of compatNativeSubtitleSettings.
+// modeSet is false when no scope stores a subtitle mode; such a profile gets
+// Jellyfin's default user mode. savedMode is the mode the Jellyfin client last
+// saved, which distinguishes Default from Smart for "auto".
+func compatJellyfinSubtitleMode(nativeMode string, modeSet, showForced bool, savedMode string) string {
+	if !modeSet {
+		return compatSubtitleDefault
+	}
+	switch nativeMode {
+	case profileSubtitleAlways:
+		return compatSubtitleAlways
+	case profileSubtitleOff:
+		if showForced {
+			return compatSubtitleOnlyForced
+		}
+		return compatSubtitleNone
+	default:
+		if savedMode == compatSubtitleDefault {
+			return compatSubtitleDefault
+		}
+		return compatSubtitleSmart
+	}
+}
+
+// compatSubtitleCandidate is one subtitle stream offered for default
+// selection.
+type compatSubtitleCandidate struct {
+	Index    int
+	Language string
+	External bool
+	Default  bool
+	Forced   bool
+	// Traits a remembered series track signature is matched against.
+	Source          string
+	Codec           string
+	Label           string
+	HearingImpaired bool
+}
+
+// compatSubtitleCandidates lists a version's embedded and external subtitle
+// tracks, then its downloaded subtitles (served as external streams), with
+// the stream indexes PlaybackInfo advertises.
+func compatSubtitleCandidates(version catalog.FileVersion, downloaded []subtitles.DownloadedSubtitle) []compatSubtitleCandidate {
+	candidates := make([]compatSubtitleCandidate, 0, len(version.SubtitleTracks)+len(downloaded))
+	for index, track := range version.SubtitleTracks {
+		source := playback.SubtitleSourceEmbeddedV3
+		if track.External {
+			source = playback.SubtitleSourceExternalV3
+		}
+		candidates = append(candidates, compatSubtitleCandidate{
+			Index:           subtitleTrackIndex(version, track, index),
+			Language:        track.Language,
+			External:        track.External,
+			Default:         track.Default,
+			Forced:          track.Forced,
+			Source:          source,
+			Codec:           track.Codec,
+			Label:           compatSubtitleTrackLabel(track),
+			HearingImpaired: track.HearingImpaired,
+		})
+	}
+	base := nextDownloadedSubtitleIndex(version)
+	for index, dl := range downloaded {
+		label := dl.Language
+		if dl.ReleaseName != "" || dl.Provider != "" {
+			label = dl.ReleaseName + " (" + dl.Provider + ")"
+		}
+		candidates = append(candidates, compatSubtitleCandidate{
+			Index:           base + index,
+			Language:        dl.Language,
+			External:        true,
+			Source:          playback.SubtitleSourceDownloadedV3,
+			Codec:           string(dl.Format),
+			Label:           label,
+			HearingImpaired: dl.HearingImpaired,
+		})
+	}
+	return candidates
+}
+
+// compatWithoutForcedSubtitles drops forced tracks for a viewer whose native
+// settings hide them. Jellyfin has no such toggle; without this, its Smart and
+// Default modes would start a forced track the viewer turned off.
+func compatWithoutForcedSubtitles(candidates []compatSubtitleCandidate) []compatSubtitleCandidate {
+	return slices.DeleteFunc(slices.Clone(candidates), func(c compatSubtitleCandidate) bool { return c.Forced })
+}
+
+// compatDefaultSubtitleStreamIndex ports Jellyfin 12.1's
+// MediaStreamSelector.GetDefaultSubtitleStreamIndex, except that it prefers
+// embedded tracks over external ones (see the sort below). preferred is the
+// user's subtitle language preference (empty matches any language, as
+// upstream); audioLanguage is the language of the audio the client starts with.
+func compatDefaultSubtitleStreamIndex(candidates []compatSubtitleCandidate, preferred []string, mode, audioLanguage string) *int {
+	if mode == compatSubtitleNone {
+		return nil
+	}
+	matches := func(language string) bool { return compatMatchesPreferredLanguage(language, preferred) }
+	// Sort: default > preferred full > preferred forced > undefined forced >
+	// forced > embedded. Upstream ranks external first; Silo prefers a
+	// file's own tracks and only breaks ties with the source, so a full
+	// external track still beats an embedded forced one. The sort is stable,
+	// as LINQ's OrderBy is.
+	sorted := slices.Clone(candidates)
+	slices.SortStableFunc(sorted, func(a, b compatSubtitleCandidate) int {
+		for _, key := range []func(compatSubtitleCandidate) bool{
+			func(c compatSubtitleCandidate) bool { return c.Default },
+			func(c compatSubtitleCandidate) bool { return !c.Forced && matches(c.Language) },
+			func(c compatSubtitleCandidate) bool { return c.Forced && matches(c.Language) },
+			func(c compatSubtitleCandidate) bool { return c.Forced && compatLanguageUndefined(c.Language) },
+			func(c compatSubtitleCandidate) bool { return c.Forced },
+			func(c compatSubtitleCandidate) bool { return !c.External },
+		} {
+			if ka, kb := key(a), key(b); ka != kb {
+				if ka {
+					return -1
+				}
+				return 1
+			}
+		}
+		return 0
+	})
+	first := func(keep func(compatSubtitleCandidate) bool) *int {
+		for _, candidate := range sorted {
+			if keep(candidate) {
+				return intPtr(candidate.Index)
+			}
+		}
+		return nil
+	}
+	onlyForced := func() *int {
+		forced := make([]compatSubtitleCandidate, 0, len(sorted))
+		for _, candidate := range sorted {
+			if candidate.Forced && (matches(candidate.Language) || compatLanguageUndefined(candidate.Language)) {
+				forced = append(forced, candidate)
+			}
+		}
+		slices.SortStableFunc(forced, func(a, b compatSubtitleCandidate) int {
+			if ma, mb := matches(a.Language), matches(b.Language); ma != mb {
+				if ma {
+					return -1
+				}
+				return 1
+			}
+			if ua, ub := compatLanguageUndefined(a.Language), compatLanguageUndefined(b.Language); ua != ub {
+				if ua {
+					return -1
+				}
+				return 1
+			}
+			return 0
+		})
+		if len(forced) == 0 {
+			return nil
+		}
+		return intPtr(forced[0].Index)
+	}
+
+	switch mode {
+	case compatSubtitleDefault:
+		return first(func(c compatSubtitleCandidate) bool { return c.External || c.Default || c.Forced })
+	case compatSubtitleSmart:
+		// Subtitles only when the audio is not in a preferred subtitle
+		// language; otherwise behave like OnlyForced.
+		if !compatContainsLanguage(preferred, audioLanguage) {
+			return first(func(c compatSubtitleCandidate) bool { return matches(c.Language) })
+		}
+		return onlyForced()
+	case compatSubtitleAlways:
+		if index := first(func(c compatSubtitleCandidate) bool { return !c.Forced && matches(c.Language) }); index != nil {
+			return index
+		}
+		return onlyForced()
+	case compatSubtitleOnlyForced:
+		return onlyForced()
+	default:
+		return nil
+	}
+}
+
+// compatMatchesPreferredLanguage mirrors Jellyfin's MatchesPreferredLanguage:
+// an empty preference matches any language.
+func compatMatchesPreferredLanguage(language string, preferred []string) bool {
+	return len(preferred) == 0 || compatContainsLanguage(preferred, language)
+}
+
+// compatContainsLanguage reports whether language is one of preferred.
+// Jellyfin expands a bare language to every ISO 639 code for it and keeps a
+// regional preference exact; Silo compares primary languages for a bare
+// preference and full tags for a regional one.
+func compatContainsLanguage(preferred []string, language string) bool {
+	candidate := lang.CompatibleTag(language)
+	if candidate == "" {
+		return false
+	}
+	for _, want := range preferred {
+		wantTag := lang.CompatibleTag(want)
+		if wantTag == "" {
+			continue
+		}
+		if strings.Contains(wantTag, "-") {
+			if strings.EqualFold(wantTag, candidate) {
+				return true
+			}
+			continue
+		}
+		if primary := lang.PrimaryLanguage(candidate); primary != "" && primary == lang.PrimaryLanguage(wantTag) {
+			return true
+		}
+	}
+	return false
+}
+
+// compatLanguageUndefined mirrors Jellyfin's IsLanguageUndefined.
+func compatLanguageUndefined(language string) bool {
+	switch strings.ToLower(strings.TrimSpace(language)) {
+	case "", "und", "unknown", "undetermined", "mul", "zxx": //nolint:goconst // Jellyfin's undefined-language codes, listed verbatim
+		return true
+	default:
+		return false
+	}
+}
+
+// compatDetailSubtitleStreamIndex applies the same viewer preferences before
+// playback and after the playback audio choice has been negotiated.
+func compatDetailSubtitleStreamIndex(detail *upstreamItemDetail, version catalog.FileVersion, downloaded []subtitles.DownloadedSubtitle, savedMode string, audioIndex *int) *int {
+	mode := compatJellyfinSubtitleMode(detail.SubtitleMode, detail.SubtitleModeSet, detail.ShowForcedSubtitles, savedMode)
+	var preferred []string
+	if language := strings.TrimSpace(detail.SubtitleLanguage); language != "" {
+		preferred = []string{language}
+	}
+	candidates := compatSubtitleCandidates(version, downloaded)
+	// Silo clients remember the exact track picked for a series and start
+	// Always-mode playback on it, e.g. a Forced English track over the full
+	// English one, even when forced tracks are otherwise hidden; Jellyfin
+	// clients get the same track.
+	if mode == compatSubtitleAlways {
+		sig := detail.SubtitleTrackSignature
+		if index := compatSignatureSubtitleIndex(candidates, sig); index != nil {
+			return index
+		}
+		// A remux can retitle the remembered forced track, or a rescan add a
+		// region to its language. Rank the preferred language's tracks
+		// against the signature as the web player does, before forced tracks
+		// are hidden, so the forced track still wins. Other signatures keep
+		// Jellyfin's selection.
+		if !sig.IsZero() && sig.Forced && len(preferred) > 0 {
+			if index := compatSignatureFallbackSubtitleIndex(candidates, preferred[0], sig); index != nil {
+				return index
+			}
+		}
+	}
+	if !detail.ShowForcedSubtitles {
+		candidates = compatWithoutForcedSubtitles(candidates)
+	}
+	return compatDefaultSubtitleStreamIndex(candidates, preferred, mode, compatAudioTrack(version, audioIndex).Language)
+}
+
+// compatSignatureSubtitleIndex returns the first candidate matching every
+// trait of the remembered track signature, as the Silo web player does, or
+// nil. An empty signature label matches any label.
+func compatSignatureSubtitleIndex(candidates []compatSubtitleCandidate, sig *userstore.SubtitleTrackSignature) *int {
+	if sig.IsZero() {
+		return nil
+	}
+	same := compatSameSignatureTrait
+	for _, c := range candidates {
+		if same(c.Source, sig.Source) &&
+			same(c.Language, sig.Language) &&
+			same(c.Codec, sig.Codec) &&
+			(strings.TrimSpace(sig.Label) == "" || same(c.Label, sig.Label)) &&
+			c.Forced == sig.Forced &&
+			c.HearingImpaired == sig.HearingImpaired {
+			return intPtr(c.Index)
+		}
+	}
+	return nil
+}
+
+// compatSignatureFallbackSubtitleIndex ports the Silo web player's Always
+// fallback for a signature no candidate matches exactly
+// (findPreferredSubtitleIndexWithSignature): among the candidates in the
+// preferred language, the closest language tag wins, then the most matching
+// signature traits, then a full, plain, text, embedded track. The web player
+// also ranks tracks it would burn in last, which depends on a renderer
+// jellycompat does not know. It returns nil when no candidate is in the
+// preferred language.
+func compatSignatureFallbackSubtitleIndex(candidates []compatSubtitleCandidate, preferred string, sig *userstore.SubtitleTrackSignature) *int {
+	same := compatSameSignatureTrait
+	score := func(c compatSubtitleCandidate) int {
+		score := 0
+		if same(c.Source, sig.Source) {
+			score += 4
+		}
+		if c.Forced == sig.Forced {
+			score += 2
+		}
+		if c.HearingImpaired == sig.HearingImpaired {
+			score += 2
+		}
+		if same(c.Codec, sig.Codec) {
+			score++
+		}
+		if same(c.Label, sig.Label) {
+			score++
+		}
+		return score
+	}
+	priority := func(c compatSubtitleCandidate) int {
+		priority := 0
+		if c.Forced {
+			priority += 16
+		}
+		if c.HearingImpaired {
+			priority += 8
+		}
+		if compatBitmapSubtitle(c.Codec) {
+			priority += 4
+		}
+		switch c.Source {
+		case playback.SubtitleSourceExternalV3:
+			priority++
+		case playback.SubtitleSourceDownloadedV3:
+			priority += 2
+		}
+		return priority
+	}
+	var best *int
+	var bestRank, bestScore, bestPriority int
+	for _, c := range candidates {
+		rank := compatLanguageMatchRank(c.Language, preferred)
+		if rank < 0 {
+			continue
+		}
+		s, p := score(c), priority(c)
+		if best == nil || rank < bestRank || (rank == bestRank && (s > bestScore || (s == bestScore && p < bestPriority))) {
+			best, bestRank, bestScore, bestPriority = intPtr(c.Index), rank, s, p
+		}
+	}
+	return best
+}
+
+// compatLanguageMatchRank orders a remembered-track fallback as the web
+// player does: the same tag, then the bare language, then another variant.
+// Unlike ordinary Jellyfin selection, a regional preference can fall back
+// within its primary language. Unrelated languages return -1.
+func compatLanguageMatchRank(language, preferred string) int {
+	candidate := lang.CompatibleTag(language)
+	preferredTag := lang.CompatibleTag(preferred)
+	if candidate == "" || preferredTag == "" {
+		return -1
+	}
+	if candidate == preferredTag {
+		return 0
+	}
+	if primary := lang.PrimaryLanguage(candidate); primary == "" || primary != lang.PrimaryLanguage(preferredTag) {
+		return -1
+	}
+	if !strings.Contains(candidate, "-") {
+		return 1
+	}
+	return 2
+}
+
+// compatBitmapSubtitle mirrors the web player's isBitmapCodec.
+func compatBitmapSubtitle(codec string) bool {
+	switch compatSubtitleProfileFormat(codec) {
+	case "pgssub", "dvdsub", "dvbsub", "dvb_teletext": //nolint:goconst // the bitmap formats compatSubtitleProfileFormat returns
+		return true
+	default:
+		return false
+	}
+}
+
+// compatSameSignatureTrait compares a candidate's trait with a remembered
+// signature's, ignoring case and surrounding space.
+func compatSameSignatureTrait(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+// compatSubtitleTrackLabel is the label the playback v3 inventory gives a
+// track, which Silo clients record in its signature: title, then embedded
+// title, the sidecar file name, and language. Catalog marks an untitled
+// sidecar whose Title was filled from its file name.
+func compatSubtitleTrackLabel(track catalog.VersionSubtitleTrack) string {
+	title := track.Title
+	if track.External && track.TitleIsFallback {
+		title = ""
+	}
+	for _, label := range []string{title, track.EmbeddedTitle, track.FileName, track.Language} {
+		if label = strings.TrimSpace(label); label != "" {
+			return label
+		}
+	}
+	return ""
+}
+
+// savedCompatSubtitleMode returns the SubtitleMode the viewer's Jellyfin
+// client last saved, or "" when none is stored or it cannot be read. It only
+// tells Jellyfin's Default apart from Smart, which share Silo's "auto".
+func savedCompatSubtitleMode(ctx context.Context, provider userstore.UserStoreProvider, session *Session) string {
+	saved, _ := compatSavedConfiguration(ctx, provider, session)
+	return saved.SubtitleMode
+}
+
+// compatSavedUserConfiguration holds the user configuration fields a Jellyfin
+// client saved that playback consults.
+type compatSavedUserConfiguration struct {
+	SubtitleMode               string
+	RememberAudioSelections    *bool
+	RememberSubtitleSelections *bool
+}
+
+// remembersAudio reports RememberAudioSelections, true unless the client
+// turned it off, as in Jellyfin.
+func (c compatSavedUserConfiguration) remembersAudio() bool {
+	return c.RememberAudioSelections == nil || *c.RememberAudioSelections
+}
+
+// remembersSubtitles reports RememberSubtitleSelections, true unless the
+// client turned it off.
+func (c compatSavedUserConfiguration) remembersSubtitles() bool {
+	return c.RememberSubtitleSelections == nil || *c.RememberSubtitleSelections
+}
+
+// compatSavedConfiguration reads the configuration the viewer's Jellyfin
+// client last saved. It is zero when none is stored, and zero with an error
+// when it cannot be read, so a caller that must honor an opt-out can tell the
+// two apart.
+func compatSavedConfiguration(ctx context.Context, provider userstore.UserStoreProvider, session *Session) (compatSavedUserConfiguration, error) {
+	var saved compatSavedUserConfiguration
+	if provider == nil || session == nil || session.ProfileID == "" {
+		return saved, nil
+	}
+	store, err := provider.ForUser(ctx, session.StreamAppUserID)
+	if err != nil {
+		return saved, err
+	}
+	if store == nil {
+		return saved, nil
+	}
+	raw, err := store.GetSetting(ctx, configurationKey(session.ProfileID))
+	if err != nil || raw == "" {
+		return saved, err
+	}
+	if err := json.Unmarshal([]byte(raw), &saved); err != nil {
+		return compatSavedUserConfiguration{}, err
+	}
+	return saved, nil
+}

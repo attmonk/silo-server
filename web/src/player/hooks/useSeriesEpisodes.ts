@@ -1,0 +1,78 @@
+import { useQuery } from "@tanstack/react-query";
+import { catalogKeys } from "@/hooks/queries/keys";
+import { fetchCatalogSeriesSeasons, fetchCatalogSeasonEpisodes } from "@/hooks/queries/catalogRead";
+import type { EpisodeRef } from "../types";
+
+/**
+ * Fetches the episode list for the current season and (conditionally) the next
+ * season so that cross-season "next episode" navigation works.
+ *
+ * Returns a flat, chronologically-sorted EpisodeRef[] spanning up to two seasons,
+ * holding only the episodes this viewer can play.
+ */
+export function useSeriesEpisodes(
+  seriesId: string | undefined,
+  currentSeason: number,
+  libraryId?: number,
+): { episodes: EpisodeRef[]; isLoading: boolean } {
+  // Fetch the seasons list so we know whether a next season exists.
+  const { data: seasonsData, isLoading: seasonsLoading } = useQuery({
+    queryKey: catalogKeys.seriesSeasons(seriesId!, libraryId),
+    queryFn: ({ signal }) => fetchCatalogSeriesSeasons(seriesId!, libraryId, { signal }),
+    enabled: !!seriesId,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const seasons = seasonsData?.seasons ?? [];
+  const currentSeasonInfo = seasons.find((s) => s.season_number === currentSeason);
+  const nextSeasonInfo = seasons.find((s) => s.season_number === currentSeason + 1);
+
+  // Fetch current season episodes. Up Next draws a still several times wider
+  // than the series page's episode cards, so the player keeps its own copy
+  // under a longer key; invalidating the season's episodes still reaches it.
+  const { data: currentEpisodesData, isLoading: currentLoading } = useQuery({
+    queryKey: [...catalogKeys.seasonEpisodes(seriesId!, currentSeason, libraryId), "up-next"],
+    queryFn: ({ signal }) =>
+      fetchCatalogSeasonEpisodes(seriesId!, currentSeason, libraryId, { signal }, "upNext"),
+    enabled: !!seriesId && currentSeason >= 0 && !!currentSeasonInfo,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  // Fetch next season episodes only when a next season exists.
+  const { data: nextEpisodesData, isLoading: nextLoading } = useQuery({
+    queryKey: [...catalogKeys.seasonEpisodes(seriesId!, currentSeason + 1, libraryId), "up-next"],
+    queryFn: ({ signal }) =>
+      fetchCatalogSeasonEpisodes(seriesId!, currentSeason + 1, libraryId, { signal }, "upNext"),
+    enabled: !!seriesId && !!nextSeasonInfo,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const currentEpisodes = currentEpisodesData?.episodes ?? [];
+  const nextEpisodes = nextEpisodesData?.episodes ?? [];
+
+  // The server lists an episode this viewer can't play (every file outside
+  // their access) with no files, and marks a file it couldn't read as
+  // unreadable, which playback refuses. Leaving out an episode with no
+  // readable file lets Next, Previous and autoplay step over it.
+  const playable = [...currentEpisodes, ...nextEpisodes].filter((ep) =>
+    ep.files.some((file) => !file.unreadable),
+  );
+  const episodes: EpisodeRef[] = playable.map((ep) => ({
+    contentId: ep.content_id,
+    seasonNumber: ep.season_number,
+    episodeNumber: ep.episode_number,
+    title: ep.title,
+    runtime: ep.runtime,
+    overview: ep.overview,
+    machineTranslatedFields: ep.machine_translated_fields,
+    stillUrl: ep.still_url,
+    stillIsEpisodeStill: ep.still_is_episode_still,
+    stillThumbhash: ep.still_thumbhash,
+    airDate: ep.air_date,
+    watchState: ep.user_data,
+  }));
+
+  const isLoading = seasonsLoading || currentLoading || (!!nextSeasonInfo && nextLoading);
+
+  return { episodes, isLoading };
+}

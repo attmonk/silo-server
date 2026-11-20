@@ -1,0 +1,911 @@
+package catalog
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// NextUpQuery controls what the next-up lookup returns.
+type NextUpQuery struct {
+	UserID           int
+	ProfileID        string
+	LibraryID        *int
+	LibraryIDs       []int
+	SeriesID         string // optional: filter to single series
+	AccessFilter     AccessFilter
+	Limit            int
+	EnableResumable  bool       // include in-progress episodes
+	EnableRewatching bool       // accepted but deferred (no-op)
+	DateCutoff       *time.Time // only series with activity after this date
+	// RankByRelease orders results by ActivityAt, so a series whose next
+	// episode was released after the profile finished the previous one moves
+	// up (the profile's ui.next_up_new_releases_first). Off, results keep the
+	// completion-time order and ActivityAt equals CompletedAt.
+	RankByRelease bool
+	// ExcludeEpisodeIDs leaves out a series whose next episode is listed:
+	// the episodes the profile dismissed from Home's Next Up. The exclusion
+	// runs inside the walk's result query, so the walk keeps going until it
+	// has Limit rows and a short result still means no more series are
+	// eligible.
+	ExcludeEpisodeIDs []string
+
+	// droppedSeriesIDs are the profile's actively dropped series, which a
+	// global lookup excludes. ListNextUp loads them; a series-scoped lookup
+	// never excludes its own series.
+	droppedSeriesIDs []string
+}
+
+// NextUpResult is one row from the next-up query.
+type NextUpResult struct {
+	ContentID     string
+	SeriesID      string
+	SeriesTitle   string
+	SeasonNumber  int
+	EpisodeNumber int
+	CompletedAt   time.Time // when the preceding episode was completed
+	// ActivityAt orders the results: CompletedAt, or the time this episode was
+	// released to the server when that came later. A series the profile had
+	// caught up on moves to the front when its next episode arrives.
+	ActivityAt  time.Time
+	IsResumable bool // true if this is an in-progress item (enableResumable)
+	// unplayable marks a resumable episode with no version within the
+	// viewer's playback-quality ceiling: it holds its series back instead of
+	// being offered.
+	unplayable bool
+}
+
+// NextUpRepository queries for next unwatched episodes per series.
+type NextUpRepository struct {
+	pool          *pgxpool.Pool
+	storeProvider userstore.UserStoreProvider
+}
+
+// NewNextUpRepository creates a NextUpRepository.
+func NewNextUpRepository(pool *pgxpool.Pool, storeProvider userstore.UserStoreProvider) *NextUpRepository {
+	return &NextUpRepository{pool: pool, storeProvider: storeProvider}
+}
+
+// ListNextUp returns the next unwatched episode per series for the given user.
+func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]NextUpResult, error) {
+	if r.storeProvider == nil || q.UserID <= 0 || q.ProfileID == "" {
+		return nil, nil
+	}
+
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+
+	if q.SeriesID == "" {
+		dropped, err := activeDroppedSeriesIDs(ctx, r.pool, q.UserID, q.ProfileID)
+		if err != nil {
+			return nil, err
+		}
+		q.droppedSeriesIDs = dropped
+	}
+
+	var results []NextUpResult
+	if q.SeriesID != "" {
+		query, args := buildListNextUpQuery(q, limit, nil)
+		rows, err := r.pool.Query(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("querying next-up episodes: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var res NextUpResult
+			if err := rows.Scan(
+				&res.ContentID, &res.SeriesID, &res.SeriesTitle,
+				&res.SeasonNumber, &res.EpisodeNumber, &res.CompletedAt, &res.ActivityAt,
+			); err != nil {
+				return nil, fmt.Errorf("scanning next-up row: %w", err)
+			}
+			results = append(results, res)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterating next-up rows: %w", err)
+		}
+	} else {
+		var cursor *nextUpWalkCursor
+		batchesRun := 0
+		exhausted := false
+
+		// The walk visits series by completion time and, by default, stops
+		// once it has limit rows, each batch asking only for the rows still
+		// missing. With RankByRelease, the first whole batches holding at
+		// least nextUpRankedCandidates rows are ranked by ActivityAt, so a
+		// newly released episode can lift its series to the front; a batch
+		// then keeps every walked series' row because trimming it by
+		// completion time could drop one. Rows from later batches, walked only
+		// for larger limits, follow in completion order without being lifted.
+		// The ranked set never depends on the limit, so every limit reads a
+		// prefix of one order and a Jellyfin client paging by raising the
+		// limit sees no row twice.
+		walkUntil := limit
+		if q.RankByRelease {
+			walkUntil = max(limit, nextUpRankedCandidates)
+		}
+		ranked := -1
+		for batch := 0; batch < nextUpAnchorMaxBatches; batch++ {
+			batchLimit := walkUntil - len(results)
+			if q.RankByRelease {
+				batchLimit = nextUpAnchorMaxSeries
+			}
+			batchResults, frontier, err := r.listNextUpBatch(ctx, q, batchLimit, cursor)
+			if err != nil {
+				return nil, err
+			}
+			batchesRun++
+			results = append(results, batchResults...)
+			if ranked < 0 && len(results) >= nextUpRankedCandidates {
+				ranked = len(results)
+			}
+
+			if len(results) >= walkUntil {
+				exhausted = true
+				break
+			}
+			if frontier == nil || frontier.n < nextUpAnchorMaxSeries {
+				exhausted = true
+				break
+			}
+			cursor = &frontier.nextUpWalkCursor
+		}
+
+		if !exhausted {
+			slog.WarnContext(ctx, "next-up anchor walk hit batch cap; eligible series tail left unscanned",
+				"component", "catalog",
+				"profile_id", q.ProfileID,
+				"batches", batchesRun,
+				"results_found", len(results))
+		}
+
+		if q.RankByRelease {
+			if ranked < 0 {
+				ranked = len(results)
+			}
+			sortNextUpByActivity(results[:ranked])
+		}
+		if len(results) > limit {
+			results = results[:limit]
+		}
+	}
+
+	if q.EnableResumable {
+		resumable, rErr := r.listResumableFirstEpisodes(ctx, q)
+		if rErr != nil {
+			return nil, rErr
+		}
+
+		if q.SeriesID != "" && len(resumable) > 0 {
+			// Show-detail tile: the in-progress episode wins over whatever
+			// "next aired" row the completed-episodes branch produced.
+			// The user is mid-watching this episode; surfacing the
+			// following one would skip past their actual position. When
+			// that episode can't play under the quality ceiling, the series
+			// waits rather than skipping ahead.
+			if resumable[0].unplayable {
+				return nil, nil
+			}
+			return resumable, nil
+		}
+
+		// Global next-up: dedup by series, completed-next row takes priority.
+		seen := make(map[string]bool, len(results))
+		for _, res := range results {
+			seen[res.SeriesID] = true
+		}
+		for _, res := range resumable {
+			if !seen[res.SeriesID] && !res.unplayable {
+				results = append(results, res)
+			}
+		}
+	}
+
+	return results, nil
+}
+
+// sortNextUpByActivity orders next-up rows by ActivityAt, newest first, with
+// completion time and then series ID (one row per series) breaking ties.
+func sortNextUpByActivity(results []NextUpResult) {
+	slices.SortFunc(results, func(a, b NextUpResult) int {
+		if c := b.ActivityAt.Compare(a.ActivityAt); c != 0 {
+			return c
+		}
+		if c := b.CompletedAt.Compare(a.CompletedAt); c != 0 {
+			return c
+		}
+		return strings.Compare(a.SeriesID, b.SeriesID)
+	})
+}
+
+type nextUpWalkCursor struct {
+	updatedAt   time.Time
+	mediaItemID string
+	seen        []string
+}
+
+type nextUpWalkFrontier struct {
+	nextUpWalkCursor
+	n int
+}
+
+// nextUpAnchorMaxSeries bounds the number of distinct series anchors visited by
+// one global next-up batch. A row-based cap let one series consume the window;
+// counting distinct series prevents that, while batching continues past a full
+// batch whose anchors are all ineligible. Series-scoped calls stay unbounded so
+// they can anchor on the series' last completed episode regardless of age.
+const nextUpAnchorMaxSeries = 96
+
+// nextUpAnchorMaxBatches bounds a global call to 10 × 96 = 960 visited series
+// as a runaway guard.
+const nextUpAnchorMaxBatches = 10
+
+// nextUpRankedCandidates is how many next-up rows a global call ranks by
+// ActivityAt, rounded up to whole walk batches, whatever its limit: the Home
+// row size. A series finished before all of them keeps its completion-time
+// place even when its next episode was just released — the bound the walk
+// exists for.
+const nextUpRankedCandidates = 100
+
+// listNextUpBatch walks one batch of up to nextUpAnchorMaxSeries series and
+// returns up to limit of their next-up rows, newest completion first.
+func (r *NextUpRepository) listNextUpBatch(
+	ctx context.Context,
+	q NextUpQuery,
+	limit int,
+	cursor *nextUpWalkCursor,
+) ([]NextUpResult, *nextUpWalkFrontier, error) {
+	query, args := buildListNextUpQuery(q, limit, cursor)
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("querying next-up episodes: %w", err)
+	}
+	defer rows.Close()
+
+	var results []NextUpResult
+	var frontier *nextUpWalkFrontier
+	for rows.Next() {
+		currentFrontier := nextUpWalkFrontier{}
+		var contentID, seriesID, seriesTitle *string
+		var seasonNumber, episodeNumber *int
+		var completedAt, activityAt *time.Time
+		if err := rows.Scan(
+			&currentFrontier.updatedAt,
+			&currentFrontier.mediaItemID,
+			&currentFrontier.seen,
+			&currentFrontier.n,
+			&contentID,
+			&seriesID,
+			&seriesTitle,
+			&seasonNumber,
+			&episodeNumber,
+			&completedAt,
+			&activityAt,
+		); err != nil {
+			return nil, nil, fmt.Errorf("scanning next-up row: %w", err)
+		}
+		frontier = &currentFrontier
+		if contentID == nil {
+			continue
+		}
+		results = append(results, NextUpResult{
+			ContentID:     *contentID,
+			SeriesID:      *seriesID,
+			SeriesTitle:   *seriesTitle,
+			SeasonNumber:  *seasonNumber,
+			EpisodeNumber: *episodeNumber,
+			CompletedAt:   *completedAt,
+			ActivityAt:    *activityAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterating next-up rows: %w", err)
+	}
+	return results, frontier, nil
+}
+
+// nextUpReleaseLateral finds when a next-up episode was released to the
+// server: the released_at of its earliest episode_availability row in scope.
+// The notifications availability detector sets released_at to the row's
+// available_at only for an episode that arrived after its library's first
+// full scan and whose file is new, so initial scans, imported history, late
+// metadata matches and files that come back never move a series; an episode
+// that lands later does. A content-ID merge (silo_rename_content_ids) can
+// give a row an earlier available_at from a row it absorbed, which is no
+// longer a release time, so the two must still match.
+const nextUpReleaseLateral = `LEFT JOIN LATERAL (
+			SELECT CASE WHEN ea.released_at = ea.available_at THEN ea.released_at END AS released_at
+			FROM episode_availability ea
+			WHERE ea.episode_id = next_ep.content_id%s
+			ORDER BY ea.available_at, ea.library_id
+			LIMIT 1
+		) released ON true`
+
+// nextUpLibraryScope is the libraries the request can reach: the requested
+// library or libraries within the viewer's access. Nil means every library
+// except the viewer's disabled ones; empty means none.
+func nextUpLibraryScope(q NextUpQuery) []int {
+	var requested []int
+	if q.LibraryID != nil {
+		requested = []int{*q.LibraryID}
+	} else {
+		requested = q.LibraryIDs
+	}
+	ids, none := q.AccessFilter.LibraryScope(requested)
+	if none {
+		return []int{}
+	}
+	return ids
+}
+
+// nextUpReleaseScope limits release lookups to the libraries the request can
+// reach, so an episode that arrived where the viewer can't follow never moves
+// a series ahead of one they can watch.
+func nextUpReleaseScope(q NextUpQuery, argIdx int) (string, []interface{}) {
+	ids := nextUpLibraryScope(q)
+	switch {
+	case ids != nil:
+		return fmt.Sprintf(" AND ea.library_id = ANY($%d::int[])", argIdx), []interface{}{ids}
+	case len(q.AccessFilter.DisabledLibraryIDs) > 0:
+		return fmt.Sprintf(" AND NOT (ea.library_id = ANY($%d::int[]))", argIdx), []interface{}{q.AccessFilter.DisabledLibraryIDs}
+	default:
+		return "", nil
+	}
+}
+
+// nextUpAnchorsCTE places each series' anchor for the successor lookup.
+// Specials carry no airing position and season 0 sorts first, so a special
+// anchor would only ever lead to the next special. When the anchor is a
+// special and the series has regular seasons, it moves to the profile's most
+// recent completed regular episode, or, when the profile has watched only
+// specials, to just before the first regular season. A series of specials
+// alone keeps stepping through them. updated_at stays the completion that
+// picked the series, so ordering and CompletedAt don't change; anchored_at is
+// the completion the anchor now stands on, -infinity before any regular one.
+const nextUpAnchorsCTE = `,
+		anchors AS (
+			SELECT
+				ce.series_id,
+				ce.updated_at,
+				COALESCE(regular.season_number, ce.season_number) AS season_number,
+				COALESCE(regular.episode_number, ce.episode_number) AS episode_number,
+				regular.season_number IS NOT NULL AS moved,
+				CASE
+					WHEN regular.season_number IS NULL THEN ce.updated_at
+					ELSE COALESCE(regular.completed_at, '-infinity'::timestamptz)
+				END AS anchored_at
+			FROM completed_episodes ce
+			LEFT JOIN LATERAL (
+				SELECT
+					COALESCE(done.season_number, 0) AS season_number,
+					COALESCE(done.episode_number, 2147483647) AS episode_number,
+					done.updated_at AS completed_at
+				FROM episodes e_reg
+				LEFT JOIN LATERAL (
+					SELECT e_d.season_number, e_d.episode_number, uwp_d.updated_at
+					FROM episodes e_d
+					JOIN user_watch_progress uwp_d
+					  ON uwp_d.media_item_id = e_d.content_id
+					 AND uwp_d.user_id = $1
+					 AND uwp_d.profile_id = $2
+					 AND uwp_d.completed = TRUE
+					WHERE e_d.series_id = ce.series_id
+					  AND e_d.season_number > 0
+					  AND NOT EXISTS (
+						  SELECT 1
+						  FROM user_history_hidden_items hhi
+						  WHERE hhi.user_id = uwp_d.user_id
+						    AND hhi.profile_id = uwp_d.profile_id
+						    AND hhi.media_item_id = uwp_d.media_item_id
+						    AND uwp_d.updated_at <= hhi.hidden_before
+					  )
+					ORDER BY uwp_d.updated_at DESC, e_d.season_number DESC, e_d.episode_number DESC
+					LIMIT 1
+				) done ON true
+				WHERE ce.season_number = 0
+				  AND e_reg.series_id = ce.series_id
+				  AND e_reg.season_number > 0
+				LIMIT 1
+			) regular ON true
+		)`
+
+func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (string, []interface{}) {
+	args := []interface{}{q.UserID, q.ProfileID, limit}
+	argIdx := 4
+
+	seriesFilter := ""
+	if q.SeriesID != "" {
+		seriesFilter = fmt.Sprintf(" AND e.series_id = $%d", argIdx)
+		args = append(args, q.SeriesID)
+		argIdx++
+	}
+
+	dateCutoffFilter := ""
+	if q.DateCutoff != nil {
+		dateCutoffFilter = fmt.Sprintf(" AND uwp.updated_at >= $%d", argIdx)
+		args = append(args, *q.DateCutoff)
+		argIdx++
+	}
+
+	// seedSeen is projected alongside the seed's picked series, which the global
+	// walk exposes as `pick`; the series-scoped branch has no walk and no seed.
+	cursorFilter := ""
+	seedSeen := "ARRAY[pick.series_id]"
+	if q.SeriesID == "" && cursor != nil {
+		cursorUpdatedAtArg := argIdx
+		cursorMediaItemIDArg := argIdx + 1
+		cursorSeenArg := argIdx + 2
+		cursorFilter = fmt.Sprintf(`
+				  AND (uwp.updated_at, uwp.media_item_id) < ($%d, $%d)
+				  AND NOT (e.series_id = ANY($%d))`, cursorUpdatedAtArg, cursorMediaItemIDArg, cursorSeenArg)
+		seedSeen = fmt.Sprintf("$%d::text[] || pick.series_id", cursorSeenArg)
+		args = append(args, cursor.updatedAt, cursor.mediaItemID, cursor.seen)
+		argIdx += 3
+	}
+
+	// Dropped series are excluded inside every walk step, like hidden rows, so
+	// they neither become anchors nor spend the walk's series budget. Without
+	// drops the query text is unchanged.
+	droppedFilter := ""
+	if q.SeriesID == "" && len(q.droppedSeriesIDs) > 0 {
+		droppedFilter = fmt.Sprintf(`
+					  AND NOT (e.series_id = ANY($%d::text[]))`, argIdx)
+		args = append(args, q.droppedSeriesIDs)
+		argIdx++
+	}
+
+	// Without RankByRelease the release lookup is skipped and a row's
+	// activity is its completion time.
+	releaseLateral, activityExpr := "", "es.updated_at"
+	if q.RankByRelease {
+		releaseScope, releaseArgs := nextUpReleaseScope(q, argIdx)
+		args = append(args, releaseArgs...)
+		releaseLateral = fmt.Sprintf(nextUpReleaseLateral, releaseScope)
+		activityExpr = "GREATEST(es.updated_at, released.released_at)"
+	}
+
+	// The successor stays the next episode with any present file. When none of
+	// its files fits the viewer's quality ceiling the series waits off Next Up
+	// until one arrives, rather than skipping to a later episode. An excluded
+	// successor also leaves its series out, and so does a series outside the
+	// requested libraries or the viewer's access. Filtering here rather than
+	// after the limit keeps the walk going until it has limit rows.
+	var resultConditions []string
+	nextArg := len(args) + 1
+	ApplyLibraryAccessFilter("si.content_id", AccessFilter{
+		AllowedLibraryIDs:  nextUpLibraryScope(q),
+		DisabledLibraryIDs: q.AccessFilter.DisabledLibraryIDs,
+	}, &resultConditions, &args, &nextArg)
+	ApplySectionAccessFilter("si", q.AccessFilter, &resultConditions, &args, &nextArg)
+	if playable := EpisodePlayableUnderCeilingSQL("next_ep.content_id", q.AccessFilter, func(value any) int {
+		// Numbered from args itself: the release scope above binds a value
+		// without advancing argIdx.
+		args = append(args, value)
+		return len(args)
+	}); playable != "" {
+		resultConditions = append(resultConditions, playable)
+	}
+	if len(q.ExcludeEpisodeIDs) > 0 {
+		args = append(args, q.ExcludeEpisodeIDs)
+		resultConditions = append(resultConditions, fmt.Sprintf("NOT (next_ep.content_id = ANY($%d::text[]))", len(args)))
+	}
+	resultWhere := ""
+	if len(resultConditions) > 0 {
+		resultWhere = "\n\t\tWHERE " + strings.Join(resultConditions, "\n\t\t  AND ")
+	}
+
+	// When resumable items are disabled, suppress next-up only if the series has
+	// newer in-progress activity than the most recent completed episode. Older
+	// partial watches should not block the user's current progression. Once the
+	// anchor has moved off a special, a regular episode is measured against the
+	// regular completion the anchor moved to instead (any time, before the
+	// first one).
+	inProgressExclusion := ""
+	if !q.EnableResumable {
+		inProgressExclusion = `
+		,
+		eligible_series AS (
+			SELECT a.*
+			FROM anchors a
+			WHERE NOT EXISTS (
+				SELECT 1 FROM user_watch_progress uwp_ip
+				JOIN episodes e_ip ON e_ip.content_id = uwp_ip.media_item_id
+				WHERE uwp_ip.user_id = $1
+				  AND uwp_ip.profile_id = $2
+				  AND uwp_ip.position_seconds > 0
+				  AND e_ip.series_id = a.series_id
+				  AND uwp_ip.updated_at > CASE WHEN a.moved AND e_ip.season_number > 0 THEN a.anchored_at ELSE a.updated_at END
+			)
+		)`
+	}
+
+	sourceTable := "anchors"
+	if !q.EnableResumable {
+		sourceTable = "eligible_series"
+	}
+
+	// Global queries use a recursive loose-index scan to find at most
+	// nextUpAnchorMaxSeries distinct series without letting one series' rows
+	// consume the budget. The compound cursor is the total order required when
+	// bulk updates give many rows the same timestamp; because media_item_id is
+	// unique it can only order the walk, never decide which episode of a series
+	// anchors it — see the anchor lateral below.
+	// Series-scoped queries keep the unbounded shape so the anchor is the
+	// series' last completed episode regardless of age. Hidden rows and the date
+	// cutoff are excluded inside every walk step so they neither become anchors
+	// nor advance the cursor.
+	var completedEpisodesCTE string
+	if q.SeriesID != "" {
+		completedEpisodesCTE = fmt.Sprintf(`completed_episodes AS (
+			SELECT DISTINCT ON (e.series_id)
+				e.series_id,
+				e.season_number,
+				e.episode_number,
+				uwp.updated_at
+			FROM user_watch_progress uwp
+			JOIN episodes e ON e.content_id = uwp.media_item_id
+			WHERE uwp.user_id = $1
+			  AND uwp.profile_id = $2
+			  AND uwp.completed = TRUE
+			  AND NOT EXISTS (
+				  SELECT 1
+				  FROM user_history_hidden_items hhi
+				  WHERE hhi.user_id = uwp.user_id
+				    AND hhi.profile_id = uwp.profile_id
+				    AND hhi.media_item_id = uwp.media_item_id
+				    AND uwp.updated_at <= hhi.hidden_before
+			  )
+			  %s
+			  %s
+			ORDER BY e.series_id, uwp.updated_at DESC, e.season_number DESC, e.episode_number DESC
+		)`, seriesFilter, dateCutoffFilter)
+	} else {
+		// Picking the series and picking which of its episodes to anchor on are
+		// two different orderings, so they are two different steps.
+		//
+		// The walk advances on (updated_at, media_item_id), the total order that
+		// guarantees forward progress. media_item_id is unique, so no two rows
+		// ever tie on that pair and any season/episode clause appended behind it
+		// is unreachable. A bulk mark-watched series — every row written with one
+		// timestamp — would then anchor on whichever content_id sorts highest,
+		// which is an arbitrary season once IDs are not scan-ordered (season 2
+		// scanned before a season-1 backfill), and the rail would surface an
+		// already-watched episode's successor.
+		//
+		// So `pick` chooses the series and the cursor position, and the anchor
+		// lateral then chooses the episode by (season, episode) among that
+		// series' rows sharing pick.updated_at — its newest completed timestamp.
+		// Pinning updated_at rather than re-sorting keeps this an index probe,
+		// and both rows carry the same updated_at, so cursor order and the
+		// reported CompletedAt are unchanged by the split.
+		anchorLateral := `JOIN LATERAL (
+				SELECT e_a.season_number, e_a.episode_number
+				FROM episodes e_a
+				JOIN user_watch_progress uwp_a
+				  ON uwp_a.media_item_id = e_a.content_id
+				 AND uwp_a.user_id = $1
+				 AND uwp_a.profile_id = $2
+				 AND uwp_a.completed = TRUE
+				 AND uwp_a.updated_at = pick.updated_at
+				WHERE e_a.series_id = pick.series_id
+				  AND NOT EXISTS (
+					  SELECT 1
+					  FROM user_history_hidden_items hhi
+					  WHERE hhi.user_id = uwp_a.user_id
+					    AND hhi.profile_id = uwp_a.profile_id
+					    AND hhi.media_item_id = uwp_a.media_item_id
+					    AND uwp_a.updated_at <= hhi.hidden_before
+				  )
+				ORDER BY e_a.season_number DESC, e_a.episode_number DESC
+				LIMIT 1
+			) anchor ON TRUE`
+
+		completedEpisodesCTE = fmt.Sprintf(`RECURSIVE walk AS (
+			(
+				SELECT
+					pick.series_id,
+					anchor.season_number,
+					anchor.episode_number,
+					pick.updated_at,
+					pick.media_item_id,
+					%s AS seen,
+					1 AS n
+				FROM (
+					SELECT e.series_id, uwp.updated_at, uwp.media_item_id
+					FROM user_watch_progress uwp
+					JOIN episodes e ON e.content_id = uwp.media_item_id
+					WHERE uwp.user_id = $1
+					  AND uwp.profile_id = $2
+					  AND uwp.completed = TRUE
+					  AND NOT EXISTS (
+						  SELECT 1
+						  FROM user_history_hidden_items hhi
+						  WHERE hhi.user_id = uwp.user_id
+						    AND hhi.profile_id = uwp.profile_id
+						    AND hhi.media_item_id = uwp.media_item_id
+						    AND uwp.updated_at <= hhi.hidden_before
+					  )
+					  %s
+					  %s
+					ORDER BY uwp.updated_at DESC, uwp.media_item_id DESC
+					LIMIT 1
+				) pick
+				%s
+			)
+			UNION ALL
+			SELECT
+				pick.series_id,
+				anchor.season_number,
+				anchor.episode_number,
+				pick.updated_at,
+				pick.media_item_id,
+				w.seen || pick.series_id,
+				w.n + 1
+			FROM walk w
+			JOIN LATERAL (
+				SELECT e.series_id, uwp.updated_at, uwp.media_item_id
+				FROM user_watch_progress uwp
+				JOIN episodes e ON e.content_id = uwp.media_item_id
+				WHERE uwp.user_id = $1
+				  AND uwp.profile_id = $2
+				  AND uwp.completed = TRUE
+				  AND (uwp.updated_at, uwp.media_item_id) < (w.updated_at, w.media_item_id)
+				  AND NOT (e.series_id = ANY(w.seen))
+				  AND NOT EXISTS (
+					  SELECT 1
+					  FROM user_history_hidden_items hhi
+					  WHERE hhi.user_id = uwp.user_id
+					    AND hhi.profile_id = uwp.profile_id
+					    AND hhi.media_item_id = uwp.media_item_id
+					    AND uwp.updated_at <= hhi.hidden_before
+				  )
+				  %s
+				ORDER BY uwp.updated_at DESC, uwp.media_item_id DESC
+				LIMIT 1
+			) pick ON true
+			%s
+			WHERE w.n < %d
+		),
+		completed_episodes AS (
+			SELECT series_id, season_number, episode_number, updated_at
+			FROM walk
+		)`, seedSeen, cursorFilter, dateCutoffFilter+droppedFilter, anchorLateral,
+			dateCutoffFilter+droppedFilter, anchorLateral, nextUpAnchorMaxSeries)
+	}
+
+	if q.SeriesID != "" {
+		query := fmt.Sprintf(`
+		WITH %s%s%s
+		SELECT
+			next_ep.content_id,
+			next_ep.series_id,
+			si.title,
+			next_ep.season_number,
+			next_ep.episode_number,
+			es.updated_at,
+			%s
+		FROM %s es
+		JOIN media_items si ON si.content_id = es.series_id
+		JOIN LATERAL (
+			SELECT e2.content_id, e2.series_id, e2.season_number, e2.episode_number
+			FROM episodes e2
+			WHERE e2.series_id = es.series_id
+			  AND (e2.season_number, e2.episode_number) > (es.season_number, es.episode_number)
+			  AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e2.content_id AND mf.missing_since IS NULL)
+			  AND NOT EXISTS (
+				  SELECT 1 FROM user_watch_progress uwp2
+				  WHERE uwp2.user_id = $1
+				    AND uwp2.profile_id = $2
+				    AND uwp2.media_item_id = e2.content_id
+				    AND (uwp2.completed = TRUE OR uwp2.position_seconds > 0)
+			  )
+			ORDER BY e2.season_number, e2.episode_number
+			LIMIT 1
+		) next_ep ON true
+		%s%s
+		ORDER BY es.updated_at DESC
+		LIMIT $3`, completedEpisodesCTE, nextUpAnchorsCTE, inProgressExclusion, activityExpr, sourceTable, releaseLateral, resultWhere)
+		return query, args
+	}
+
+	resultQuery := fmt.Sprintf(`
+		SELECT
+			next_ep.content_id,
+			next_ep.series_id,
+			si.title,
+			next_ep.season_number,
+			next_ep.episode_number,
+			es.updated_at AS completed_at,
+			%s AS activity_at
+		FROM %s es
+		JOIN media_items si ON si.content_id = es.series_id
+		JOIN LATERAL (
+			SELECT e2.content_id, e2.series_id, e2.season_number, e2.episode_number
+			FROM episodes e2
+			WHERE e2.series_id = es.series_id
+			  AND (e2.season_number, e2.episode_number) > (es.season_number, es.episode_number)
+			  AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e2.content_id AND mf.missing_since IS NULL)
+			  AND NOT EXISTS (
+				  SELECT 1 FROM user_watch_progress uwp2
+				  WHERE uwp2.user_id = $1
+				    AND uwp2.profile_id = $2
+				    AND uwp2.media_item_id = e2.content_id
+				    AND (uwp2.completed = TRUE OR uwp2.position_seconds > 0)
+			  )
+			ORDER BY e2.season_number, e2.episode_number
+			LIMIT 1
+		) next_ep ON true
+		%s%s
+		ORDER BY es.updated_at DESC
+		LIMIT $3`, activityExpr, sourceTable, releaseLateral, resultWhere)
+
+	query := fmt.Sprintf(`
+		WITH %s%s%s
+		,
+		frontier AS (
+			SELECT w.updated_at, w.media_item_id, w.seen, w.n
+			FROM walk w
+			ORDER BY w.n DESC
+			LIMIT 1
+		)
+		SELECT
+			f.updated_at AS frontier_updated_at,
+			f.media_item_id AS frontier_media_item_id,
+			f.seen AS frontier_seen,
+			f.n AS frontier_n,
+			r.content_id,
+			r.series_id,
+			r.title,
+			r.season_number,
+			r.episode_number,
+			r.completed_at,
+			r.activity_at
+		FROM frontier f
+		LEFT JOIN (
+			%s
+		) r ON true
+		ORDER BY r.completed_at DESC NULLS LAST`, completedEpisodesCTE, nextUpAnchorsCTE, inProgressExclusion, resultQuery)
+
+	return query, args
+}
+
+// buildListResumableFirstEpisodesQuery builds the SQL + args for the
+// resumable-first-episode lookup. Pulled out of listResumableFirstEpisodes
+// so the SeriesID-driven gate-drop is unit-testable without a live database.
+//
+// When q.SeriesID is set the WHERE clause is scoped to that series and the
+// "no completed episodes for this series" exclusion is dropped: the
+// show-detail tile is supposed to surface the in-progress episode even when
+// the user already finished earlier episodes of the same show. Without this
+// gate-drop the endpoint silently falls through to buildListNextUpQuery's
+// "next aired" row, which is the bug Codex flagged on PR #64.
+//
+// When q.SeriesID is empty (global /Shows/NextUp) the gate is preserved —
+// series with completed episodes go through the main query, and this branch
+// only contributes "started but no episode finished yet" series.
+func buildListResumableFirstEpisodesQuery(q NextUpQuery, inProgressIDs []string) (string, []interface{}) {
+	args := []interface{}{q.UserID, q.ProfileID, inProgressIDs}
+	seriesFilter := ""
+	if q.SeriesID != "" {
+		args = append(args, q.SeriesID)
+		seriesFilter = fmt.Sprintf(" AND e.series_id = $%d", len(args))
+	}
+
+	completedSeriesGate := `
+		  AND NOT EXISTS (
+			  SELECT 1 FROM user_watch_progress uwp_c
+			  JOIN episodes e_c ON e_c.content_id = uwp_c.media_item_id
+			  WHERE uwp_c.user_id = $1
+			    AND uwp_c.profile_id = $2
+			    AND uwp_c.completed = TRUE
+			    AND e_c.series_id = e.series_id
+		  )`
+	if q.SeriesID != "" {
+		completedSeriesGate = ""
+	}
+	if q.SeriesID == "" && len(q.droppedSeriesIDs) > 0 {
+		args = append(args, q.droppedSeriesIDs)
+		seriesFilter = fmt.Sprintf(" AND NOT (e.series_id = ANY($%d::text[]))", len(args))
+	}
+	// Whether the started episode has a version within the playback-quality
+	// ceiling. It stays in the result either way, so a blocked episode holds
+	// its series back instead of letting a later episode take its place.
+	playable := cursorTruePredicate
+	if ceiling := EpisodePlayableUnderCeilingSQL("e.content_id", q.AccessFilter, func(value any) int {
+		args = append(args, value)
+		return len(args)
+	}); ceiling != "" {
+		playable = ceiling
+	}
+
+	query := fmt.Sprintf(`
+		SELECT DISTINCT ON (e.series_id)
+			e.content_id,
+			e.series_id,
+			si.title,
+			e.season_number,
+			e.episode_number,
+			uwp.updated_at,
+			%s AS playable
+		FROM user_watch_progress uwp
+		JOIN episodes e ON e.content_id = uwp.media_item_id
+		JOIN media_items si ON si.content_id = e.series_id
+		WHERE uwp.user_id = $1
+		  AND uwp.profile_id = $2
+		  AND uwp.position_seconds > 0
+		  AND uwp.media_item_id = ANY($3)%s%s
+		ORDER BY e.series_id, uwp.updated_at DESC`, playable, seriesFilter, completedSeriesGate)
+
+	return query, args
+}
+
+// listResumableFirstEpisodes finds in-progress episodes for the user.
+//
+// Two callers, two semantics, one query:
+//
+//   - Global next-up (q.SeriesID == ""): only contribute series the user has
+//     never completed any episode of. Series with completed episodes go
+//     through buildListNextUpQuery's "next unwatched after the last
+//     completed" path; the resumable branch fills the gap for series that
+//     don't have a completed-episode anchor yet.
+//   - Show-detail tile (q.SeriesID != ""): the in-progress episode wins
+//     unconditionally, even when the user has already completed earlier
+//     episodes in the same series. The completed-then-mid-watching-the-
+//     next-one case is exactly what the show-detail "continue watching"
+//     tile is for, so the no-completed-episodes gate would defeat the
+//     endpoint's purpose. ListNextUp also flips its dedup priority to let
+//     this row win over the completed-next row from the main query.
+func (r *NextUpRepository) listResumableFirstEpisodes(ctx context.Context, q NextUpQuery) ([]NextUpResult, error) {
+	store, err := r.storeProvider.ForUser(ctx, q.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("getting user store: %w", err)
+	}
+
+	inProgressEntries, err := store.ListProgress(ctx, q.ProfileID, "in_progress", 100, 0)
+	if err != nil {
+		return nil, fmt.Errorf("listing in-progress: %w", err)
+	}
+	if len(inProgressEntries) == 0 {
+		return nil, nil
+	}
+
+	inProgressIDs := make([]string, 0, len(inProgressEntries))
+	for _, entry := range inProgressEntries {
+		inProgressIDs = append(inProgressIDs, entry.MediaItemID)
+	}
+
+	query, args := buildListResumableFirstEpisodesQuery(q, inProgressIDs)
+
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying resumable episodes: %w", err)
+	}
+	defer rows.Close()
+
+	var results []NextUpResult
+	for rows.Next() {
+		var res NextUpResult
+		var playable bool
+		res.IsResumable = true
+		if err := rows.Scan(
+			&res.ContentID, &res.SeriesID, &res.SeriesTitle,
+			&res.SeasonNumber, &res.EpisodeNumber, &res.CompletedAt, &playable,
+		); err != nil {
+			return nil, fmt.Errorf("scanning resumable row: %w", err)
+		}
+		res.ActivityAt = res.CompletedAt
+		res.unplayable = !playable
+		results = append(results, res)
+	}
+	return results, rows.Err()
+}

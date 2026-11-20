@@ -1,0 +1,159 @@
+package jellycompat
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+)
+
+func TestRequestLoggerRedactsQueryCredentials(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	const target = "/Items?%41piKey=query-secret&API_KEY=legacy-secret&Limit=20"
+	r := httptest.NewRequest(http.MethodGet, target, nil)
+	h := requestLoggerMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != strings.SplitN(target, "?", 2)[1] {
+			t.Fatal("logging changed the live query")
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	h.ServeHTTP(httptest.NewRecorder(), r)
+	assertLogSecretsAbsent(t, logs.String(), "query-secret", "legacy-secret")
+	for _, want := range []string{"Limit=20", `"status":202`, `"path":"/Items"`, "duration_ms"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("missing diagnostic %q: %s", want, logs.String())
+		}
+	}
+
+	// An HLS request carries the play session ID as a path segment and as a
+	// query parameter. HEAD has no route, so it is logged without route
+	// parameters.
+	logs.Reset()
+	var debugLogs bytes.Buffer
+	const hlsRoute = "/Videos/{id}/hls/{playlistId}/{segmentId}.{segmentContainer}"
+	mux := chi.NewRouter()
+	mux.Use(normalizeCompatPathMiddleware, newDebugLogMiddleware(&debugLogs, ""), requestLoggerMiddleware)
+	mux.Get(hlsRoute, func(http.ResponseWriter, *http.Request) {})
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(method,
+			"/emby/videos/item-1/hls/play-session-secret/12.ts?playSessionId=play-session-secret&MediaSourceId=source-1", nil))
+	}
+	assertLogSecretsAbsent(t, logs.String()+debugLogs.String(), "play-session-secret")
+	for _, want := range []string{
+		`"route":"` + hlsRoute + `"`, `"path":"/Videos/item-1/hls/`, `"original_path":"/emby/videos/item-1/hls/`,
+		"/12.ts", "MediaSourceId=source-1", `"status":405`,
+		`"play_session_id":"` + playSessionFingerprint("play-session-secret") + `"`,
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("missing diagnostic %q: %s", want, logs.String())
+		}
+	}
+	if !strings.Contains(debugLogs.String(), "/Videos/item-1/hls/") {
+		t.Errorf("debug log lost the route and item: %s", debugLogs.String())
+	}
+}
+
+func TestRedactHLSPlaySessionID(t *testing.T) {
+	for path, want := range map[string]string{
+		"/Videos/item-1/hls/play-1/12.ts":                "/Videos/item-1/hls/[REDACTED]/12.ts",
+		"/Videos/item-1/audio-v2/hls/play-1/stream.m3u8": "/Videos/item-1/audio-v2/hls/[REDACTED]/stream.m3u8",
+		"/emby/videos/item-1/hls/play-1/12.ts":           "/emby/videos/item-1/hls/[REDACTED]/12.ts",
+		"/Videos/hls/stream":                             "/Videos/hls/stream",
+		"/Items/item-1/hls/play-1/12.ts":                 "/Items/item-1/hls/play-1/12.ts",
+	} {
+		if got := redactHLSPlaySessionID(path); got != want {
+			t.Errorf("redactHLSPlaySessionID(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestSeasonsPanicLoggerRedactsQueryCredentials(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	codec := NewResourceIDCodec()
+	h := &ItemsHandler{codec: codec} // nil content triggers the recovery path.
+	r := httptest.NewRequest(http.MethodGet, "/Shows/series/Seasons?ApiKey=panic-secret&Limit=20", nil)
+	ctx := chi.NewRouteContext()
+	ctx.URLParams.Add("id", codec.EncodeStringID(EncodedIDItem, "series"))
+	r = r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, ctx))
+	r = r.WithContext(context.WithValue(r.Context(), compatSessionKey, &Session{}))
+	w := httptest.NewRecorder()
+	h.HandleSeasons(w, r)
+	if w.Code != http.StatusInternalServerError || !strings.Contains(logs.String(), "HandleSeasons panic") {
+		t.Fatalf("panic path not exercised: status=%d log=%s", w.Code, logs.String())
+	}
+	assertLogSecretsAbsent(t, logs.String(), "panic-secret")
+	if !strings.Contains(logs.String(), "Limit=20") {
+		t.Fatal("panic log lost harmless query")
+	}
+}
+
+func TestDebugLoggerRedactsCredentialsAndPreservesTraffic(t *testing.T) {
+	const requestBody = `{"Username":"example","Pw":"password-secret","nested":[{"PASSWORD":"nested-secret"}],"Limit":20}`
+	const responseBody = `{"AccessToken":"session-secret","Items":[{"Name":"Example","DirectStreamUrl":"/stream?api_key=stream-secret&Static=true"}]}`
+	var logs bytes.Buffer
+	h := newDebugLogMiddleware(&logs, "")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil || string(body) != requestBody || r.URL.Query().Get("ApiKey") != "query-secret" {
+			t.Fatal("debug logging changed the request")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Users/AuthenticateByName?ApiKey=query-secret&Limit=20", strings.NewReader(requestBody)))
+	if w.Body.String() != responseBody {
+		t.Fatal("debug logging changed the response")
+	}
+	assertLogSecretsAbsent(t, logs.String(), "password-secret", "nested-secret", "session-secret", "stream-secret", "query-secret")
+	for _, want := range []string{"Example", `"Limit": 20`, "Limit=20", "Static=true", "Status: 200", "[REDACTED]"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("missing diagnostic %q: %s", want, logs.String())
+		}
+	}
+}
+
+func TestDebugLoggerOmitsUnsafeBodiesWithoutTruncatingRequests(t *testing.T) {
+	for _, body := range []string{
+		`{"Pw":"malformed-secret"`,
+		`Pw=form-secret`,
+		strings.Repeat(" ", debugMaxBodyCapture) + `{"Pw":"oversize-secret"}`,
+	} {
+		t.Run(body[:8], func(t *testing.T) {
+			var logs bytes.Buffer
+			h := newDebugLogMiddleware(&logs, "")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got, err := io.ReadAll(r.Body)
+				if err != nil || string(got) != body {
+					t.Errorf("handler received %d bytes, want %d; error=%v", len(got), len(body), err)
+				}
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = io.WriteString(w, "response-secret")
+			}))
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)))
+			assertLogSecretsAbsent(t, logs.String(), "malformed-secret", "form-secret", "oversize-secret", "response-secret")
+			if !strings.Contains(logs.String(), "omitted") {
+				t.Fatal("missing body omission diagnostic")
+			}
+		})
+	}
+}
+
+func assertLogSecretsAbsent(t *testing.T, log string, secrets ...string) {
+	t.Helper()
+	for _, secret := range secrets {
+		if strings.Contains(log, secret) {
+			t.Errorf("log contains synthetic credential %q", secret)
+		}
+	}
+}

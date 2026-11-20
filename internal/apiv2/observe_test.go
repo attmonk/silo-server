@@ -1,0 +1,301 @@
+package apiv2
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"testing/iotest"
+
+	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/Silo-Server/silo-server/internal/logredact"
+)
+
+// captureLogs routes slog through the production redaction handler into a
+// buffer for the duration of the test.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(logredact.New(slog.NewJSONHandler(&buf, nil))))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// counterValue reads one series of a CounterVec by its full label set.
+func counterValue(t *testing.T, vec *prometheus.CounterVec, labels prometheus.Labels) float64 {
+	t.Helper()
+	c, err := vec.GetMetricWith(labels)
+	if err != nil {
+		t.Fatalf("labels %v: %v", labels, err)
+	}
+	return testutil.ToFloat64(c)
+}
+
+func TestRequestLabelsAreStable(t *testing.T) {
+	buf := captureLogs(t)
+	h := newTestHandler(t, parityDeps(false))
+
+	// A public success by a named client.
+	before := counterValue(t, requestsTotal, prometheus.Labels{"api_major": "2", "operation_id": "getSystemInfo", "method": "GET",
+		"status_class": "2xx", "error_code": "none", "auth_class": "public", "client": "apple"})
+	rec := do(t, h, http.MethodGet, "/api/v2/system/info", "", map[string]string{"X-Silo-Client": " Silo Apple TV\t", "X-Silo-Client-Version": "1.2.3"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	after := counterValue(t, requestsTotal, prometheus.Labels{"api_major": "2", "operation_id": "getSystemInfo", "method": "GET",
+		"status_class": "2xx", "error_code": "none", "auth_class": "public", "client": "apple"})
+	if after != before+1 {
+		t.Fatalf("public success series: %v -> %v", before, after)
+	}
+	line := buf.String()
+	for _, want := range []string{`"component":"apiv2"`, `"api_major":2`, `"operation_id":"getSystemInfo"`, `"status_class":"2xx"`,
+		`"error_code":"none"`, `"auth_class":"public"`, `"client_name":"Silo Apple TV"`, `"client_version":"1.2.3"`,
+		`"path_pattern":"/api/v2/system/info"`, `"request_id":"` + requestIDHeader(rec) + `"`} {
+		if !strings.Contains(line, want) {
+			t.Errorf("log line lacks %s: %s", want, line)
+		}
+	}
+	if strings.Contains(line, `"path":`) || strings.Contains(line, `"user_agent"`) {
+		t.Errorf("log line carries a raw path or user agent: %s", line)
+	}
+
+	// A session-authenticated denial: the gate's problem type is the error code.
+	buf.Reset()
+	rec = do(t, h, http.MethodPost, "/api/v2/probe/profile_scoped", `{"name":"x","cleared":null}`,
+		with(bearer(memberToken), "X-Profile-Id", "p-locked"))
+	requireProblem(t, rec, TypeProfileVerificationRequired)
+	if v := counterValue(t, requestsTotal, prometheus.Labels{"api_major": "2", "operation_id": "probeprofileScoped", "method": "POST",
+		"status_class": "4xx", "error_code": TypeProfileVerificationRequired.ID, "auth_class": "anonymous", "client": "none"}); v < 1 {
+		t.Fatalf("denial series not counted")
+	}
+	if line := buf.String(); !strings.Contains(line, `"error_code":"profile_verification_required"`) || !strings.Contains(line, `"auth_class":"anonymous"`) {
+		t.Errorf("denial log: %s", line)
+	}
+
+	// An admitted session credential.
+	buf.Reset()
+	rec = do(t, h, http.MethodPost, "/api/v2/probe/authenticated", `{"name":"x","cleared":null}`, bearer(memberToken))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if line := buf.String(); !strings.Contains(line, `"auth_class":"session"`) || !strings.Contains(line, `"user_id":1`) {
+		t.Errorf("admitted log: %s", line)
+	}
+
+	// The router fallbacks have no operation; the label is "none", never the path.
+	buf.Reset()
+	rec = do(t, h, http.MethodGet, "/api/v2/nowhere/12345", "", nil)
+	requireProblem(t, rec, TypeNotFound)
+	if v := counterValue(t, requestsTotal, prometheus.Labels{"api_major": "2", "operation_id": "none", "method": "GET",
+		"status_class": "4xx", "error_code": TypeNotFound.ID, "auth_class": "anonymous", "client": "none"}); v < 1 {
+		t.Fatalf("404 series not counted")
+	}
+	if line := buf.String(); strings.Contains(line, "12345") || !strings.Contains(line, `"operation_id":"none"`) {
+		t.Errorf("404 log: %s", line)
+	}
+}
+
+func TestSecretBearingRequestIsNotLogged(t *testing.T) {
+	buf := captureLogs(t)
+	h := newTestHandler(t, parityDeps(false))
+	const secret = "sk-very-secret-0123456789"
+	r := httptest.NewRequest(http.MethodGet, "/api/v2/system/info?token="+secret+"&api_key="+secret, nil)
+	r.Header.Set("Authorization", "Bearer "+secret)
+	r.Header.Set("Cookie", "session="+secret)
+	r.Header.Set("X-Silo-Client", "probe\x00"+secret[:2])
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	requireProblem(t, rec, TypeValidationFailed) // unknown query parameters
+	out := buf.String()
+	if out == "" {
+		t.Fatal("no log line")
+	}
+	if strings.Contains(out, secret) || strings.Contains(out, "token=") || strings.Contains(out, "api_key") {
+		t.Fatalf("log line leaks the request's secrets: %s", out)
+	}
+	if !strings.Contains(out, `"client_name":"probesk"`) {
+		t.Errorf("client name not clamped: %s", out)
+	}
+	if !strings.Contains(out, `"error_code":"validation_failed"`) {
+		t.Errorf("error code missing: %s", out)
+	}
+}
+
+func TestMethodLabelIsBounded(t *testing.T) {
+	h := newTestHandler(t, Dependencies{})
+	for _, m := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions} {
+		if got := methodLabel(m); got != m {
+			t.Errorf("methodLabel(%q) = %q", m, got)
+		}
+	}
+	if got := methodLabel("BREW"); got != labelOther {
+		t.Fatalf("methodLabel(BREW) = %q", got)
+	}
+
+	// The router answers an invented method with the 405 fallback; the
+	// series it lands on carries "other", and no series names the method.
+	buf := captureLogs(t)
+	labels := prometheus.Labels{"api_major": "2", "operation_id": "none", "method": labelOther,
+		"status_class": "4xx", "error_code": TypeMethodNotAllowed.ID, "auth_class": "anonymous", "client": "none"}
+	before := counterValue(t, requestsTotal, labels)
+	rec := do(t, h, "BREW", "/api/v2/system/info", "", nil)
+	requireProblem(t, rec, TypeMethodNotAllowed)
+	if after := counterValue(t, requestsTotal, labels); after != before+1 {
+		t.Fatalf("other-method series: %v -> %v", before, after)
+	}
+	for _, vec := range []prometheus.Collector{requestsTotal, requestDuration} {
+		ch := make(chan prometheus.Metric)
+		go func() {
+			vec.Collect(ch)
+			close(ch)
+		}()
+		for metric := range ch {
+			var m dto.Metric
+			if err := metric.Write(&m); err != nil {
+				t.Fatal(err)
+			}
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == labelMethod && lp.GetValue() == "BREW" {
+					t.Fatalf("series minted for raw method: %v", metric.Desc())
+				}
+			}
+		}
+	}
+	if line := buf.String(); !strings.Contains(line, `"method":"other"`) || strings.Contains(line, "BREW") {
+		t.Errorf("log line for an invented method: %s", line)
+	}
+}
+
+// zeroCopyWriter stands in for net/http's response writer, whose ReadFrom is
+// the sendfile path, and records how many bytes arrived through it. fromFile
+// counts the ones whose source sendfile could use: an *os.File, alone or under
+// one *io.LimitedReader.
+type zeroCopyWriter struct {
+	*httptest.ResponseRecorder
+	readFrom int64
+	fromFile int64
+}
+
+func (w *zeroCopyWriter) ReadFrom(src io.Reader) (int64, error) {
+	file := src
+	if limited, ok := src.(*io.LimitedReader); ok {
+		file = limited.R
+	}
+	_, isFile := file.(*os.File)
+	n, err := io.Copy(w.ResponseRecorder, src)
+	w.readFrom += n
+	if isFile {
+		w.fromFile += n
+	}
+	return n, err
+}
+
+func TestObservedMediaResponseKeepsZeroCopyAndCountsBytes(t *testing.T) {
+	buf := captureLogs(t)
+	inner := &zeroCopyWriter{ResponseRecorder: httptest.NewRecorder()}
+	body := strings.Repeat("x", 64<<10)
+	h := observe(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The download routes wrap the writer this way before serving a file.
+		wrapped := chimw.NewWrapResponseWriter(w, r.ProtoMajor)
+		// Hide strings.Reader's WriteTo so io.Copy has to use the writer's ReadFrom.
+		if _, err := io.Copy(wrapped, struct{ io.Reader }{strings.NewReader(body)}); err != nil {
+			t.Errorf("copy: %v", err)
+		}
+	}))
+	h.ServeHTTP(inner, httptest.NewRequest(http.MethodGet, "/api/v2/downloads/d1/file", nil))
+	if inner.readFrom != int64(len(body)) {
+		t.Fatalf("zero-copy bytes = %d, want %d", inner.readFrom, len(body))
+	}
+	if inner.Code != http.StatusOK || !strings.Contains(buf.String(), `"body_bytes":65536`) || !strings.Contains(buf.String(), `"status":200`) {
+		t.Fatalf("status %d, log %s", inner.Code, buf.String())
+	}
+}
+
+func TestObservedCopyFailingOnFirstReadKeepsErrorStatus(t *testing.T) {
+	buf := captureLogs(t)
+	inner := &zeroCopyWriter{ResponseRecorder: httptest.NewRecorder()}
+	h := observe(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(w, iotest.ErrReader(io.ErrUnexpectedEOF)); err == nil {
+			t.Error("copy succeeded")
+		}
+		http.Error(w, "upstream failed", http.StatusInternalServerError)
+	}))
+	h.ServeHTTP(inner, httptest.NewRequest(http.MethodGet, "/api/v2/downloads/d1/artwork/poster", nil))
+	if inner.Code != http.StatusInternalServerError || !strings.Contains(buf.String(), `"status":500`) {
+		t.Fatalf("status %d, log %s", inner.Code, buf.String())
+	}
+}
+
+// failingFlushWriter reports a transport error when flushed, as net/http does
+// after a write deadline passes.
+type failingFlushWriter struct{ *httptest.ResponseRecorder }
+
+func (failingFlushWriter) FlushError() error { return errFlushFailed }
+
+var errFlushFailed = errors.New("synthetic flush failure")
+
+func TestObservedFlushReturnsTransportError(t *testing.T) {
+	inner := failingFlushWriter{httptest.NewRecorder()}
+	var got error
+	h := observe(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = http.NewResponseController(w).Flush()
+	}))
+	h.ServeHTTP(inner, httptest.NewRequest(http.MethodGet, "/api/v2/downloads/d1/file", nil))
+	if !errors.Is(got, errFlushFailed) {
+		t.Fatalf("flush error = %v", got)
+	}
+}
+
+// A response the handler breaks after committing it, with
+// panic(http.ErrAbortHandler), is still recorded once, and the panic carries
+// on so net/http breaks the connection. It is aborted while the client waits;
+// once the client has gone, the abort is only how the response ended.
+func TestObservedAbortIsRecordedAndRepanics(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ctx       func() context.Context
+		wantClass string
+	}{
+		{"client waiting", context.Background, "aborted"},
+		{"client gone", func() context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx
+		}, "2xx"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureLogs(t)
+			labels := prometheus.Labels{labelAPIMajor: "2", labelOperationID: labelNone, labelMethod: http.MethodGet, labelStatusClass: tc.wantClass, labelErrorCode: labelNone, labelAuthClass: authClassAnonymous, labelClient: labelNone}
+			before := counterValue(t, requestsTotal, labels)
+			h := observe(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("partial"))
+				panic(http.ErrAbortHandler)
+			}))
+			func() {
+				defer func() {
+					if rec := recover(); rec != http.ErrAbortHandler { //nolint:errorlint // sentinel compared by identity, as net/http does
+						t.Fatalf("recovered %v, want http.ErrAbortHandler", rec)
+					}
+				}()
+				h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v2/stream/s1", nil).WithContext(tc.ctx()))
+			}()
+			if got := counterValue(t, requestsTotal, labels) - before; got != 1 {
+				t.Fatalf("%s request counted %v times, want 1", tc.wantClass, got)
+			}
+			if n := strings.Count(buf.String(), `"msg":"apiv2 request"`); n != 1 || !strings.Contains(buf.String(), `"status_class":"`+tc.wantClass+`"`) || !strings.Contains(buf.String(), `"status":200`) {
+				t.Fatalf("logged %d request lines, want one %s line with status 200: %s", n, tc.wantClass, buf.String())
+			}
+		})
+	}
+}

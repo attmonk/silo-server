@@ -1,0 +1,117 @@
+package apiv2
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
+	"github.com/Silo-Server/silo-server/internal/jellycompat"
+)
+
+// CompatConnectInfoService exposes only the settings a signed-in account needs
+// to connect a compatibility client; implementation details remain admin-only.
+type CompatConnectInfoService interface {
+	GetConnectInfo(context.Context) handlers.CompatConnectInfoResponse
+}
+
+type CompatConnectInfoOutput struct {
+	Body CompatConnectInfoResponse
+}
+
+type ImageCapabilities struct {
+	Capability
+	EpisodeStillProvenance bool                       `json:"episode_still_provenance" doc:"Responses may carry poster_is_episode_still, backdrop_is_episode_still, and still_is_episode_still where the server knows whether an episode image is the episode's own still; an absent field means unknown"`
+	EpisodeParentArtwork   bool                       `json:"episode_parent_artwork" doc:"Episode cards may carry series_poster_url, series_backdrop_url and season_poster_url with their thumbhashes, sized by the poster and backdrop slots, on Home and library sections (including Continue Watching and Next Up), catalog browse and search, Watch Tonight, and episode detail (getCatalogItem). There is no season backdrop field; in Continue Watching and Next Up rows an episode card's backdrop_url is the season backdrop, else the series backdrop, else the episode still"`
+	ExtendedItemArtwork    bool                       `json:"extended_item_artwork" doc:"Movie and series detail (getCatalogItem) may carry banner_url, thumb_url, clearart_url, disc_url and backdrop_urls, and widths lists banner, thumb, clearart and disc"`
+	SeasonListArtworkParam string                     `json:"season_list_artwork_param" doc:"Season-list boolean query parameter; false omits poster URLs and thumbhashes"`
+	Param                  string                     `json:"param"`
+	SlotWidthParams        map[string]string          `json:"slot_width_params" doc:"Per-slot width query parameters, keyed by slot: poster (poster_url, series_poster_url, season_poster_url), backdrop (backdrop_url, backdrop_urls, series_backdrop_url), logo (logo_url), still (an episode's still_url), photo (cast and crew photo_url). Each takes the width in device pixels the client draws that field at and overrides param for it; the server returns the narrowest cached size at least that wide, else the original. Accepted wherever param is"`
+	Sizes                  []imagesize.Size           `json:"sizes"`
+	Widths                 map[string]ImageSizeWidths `json:"widths"`
+	OriginalMaxWidthPx     int                        `json:"original_max_width_px"`
+	StorageBackend         string                     `json:"storage_backend" enum:"local,s3"`
+	Delivery               string                     `json:"delivery" enum:"server,direct"`
+}
+
+// slotWidthParams names each ArtworkQuery slot width parameter by its slot.
+var slotWidthParams = func() map[string]string {
+	params := make(map[string]string, len(imagesize.Slots))
+	for _, slot := range imagesize.Slots {
+		params[slot.Name()] = slot.Name() + "_width"
+	}
+	return params
+}()
+
+// extendedItemArtworkTypes are the item artwork types beyond poster, backdrop
+// and logo that movie and series detail can carry.
+var extendedItemArtworkTypes = []string{artworkkey.ImageBanner, artworkkey.ImageThumb, artworkkey.ImageClearArt, artworkkey.ImageDisc}
+
+type ImageCapabilitiesOutput struct {
+	Status       int
+	ETag         string `header:"ETag"`
+	CacheControl string `header:"Cache-Control"`
+	Body         ImageCapabilities
+}
+
+func registerOperationalDiscovery(reg *Registry) {
+	Register(reg, Operation{Operation: humaOp(http.MethodGet, Prefix+"/compat/connect-info", "getCompatConnectInfo", "compat", "Connection information for compatibility clients."), Class: ClassAuthenticated, ServiceBacked: true},
+		func(ctx context.Context, _ *struct{}) (*CompatConnectInfoOutput, error) {
+			if reg.deps.CompatConnectInfo == nil {
+				return nil, NewProblem(TypeDependencyUnavailable, "Compatibility connection information is not configured.")
+			}
+			v := reg.deps.CompatConnectInfo.GetConnectInfo(ctx)
+			return &CompatConnectInfoOutput{Body: CompatConnectInfoResponse{Jellyfin: v.Jellyfin, Account: CompatConnectAccountInfo(v.Account)}}, nil
+		})
+	Register(reg, Operation{Operation: humaOp(http.MethodGet, Prefix+"/images/capabilities", "getImageCapabilities", "images", "Available image sizes and their pixel widths."), Class: ClassProfileScoped, ProfileOptional: true},
+		func(context.Context, *CapabilityInput) (*ImageCapabilitiesOutput, error) {
+			view := handlers.GetImagesCapability(reg.deps.ArtworkBackend)
+			widths := make(map[string]ImageSizeWidths, len(view.Widths))
+			for key, value := range view.Widths {
+				widths[key] = ImageSizeWidths(value)
+			}
+			// The v1 capability view is frozen, so the extended artwork
+			// types are listed here only.
+			for _, imageType := range extendedItemArtworkTypes {
+				widths[imageType] = ImageSizeWidths(handlers.ImageWidthsFor(imageType))
+			}
+			return &ImageCapabilitiesOutput{Body: ImageCapabilities{
+				EpisodeStillProvenance: true,
+				EpisodeParentArtwork:   true,
+				ExtendedItemArtwork:    true,
+				SeasonListArtworkParam: view.SeasonListArtworkParam,
+				SlotWidthParams:        slotWidthParams,
+				StorageBackend:         view.StorageBackend, Delivery: view.Delivery,
+				Capability: Capability{State: StateAvailable}, Param: view.Param, Sizes: view.Sizes, Widths: widths, OriginalMaxWidthPx: view.OriginalMaxWidthPx,
+			}}, nil
+		})
+}
+
+// CompatConnectAccountInfo is the native transport projection, independent of handler views.
+type CompatConnectAccountInfo struct {
+	// PasswordLoginAvailable reports whether this account's own Silo
+	// password signs in: it has one, its own password sign-in is on, the
+	// server's switch is on or the account is break-glass, and no network
+	// provider refuses the person.
+	PasswordLoginAvailable bool `json:"password_login_available" doc:"True when the account's own Silo password signs in"`
+	// DirectoryLoginAvailable reports whether a password sign-in that names
+	// no provider, as a Jellyfin client's does, goes to the server's
+	// directory (LDAP), where this account has a linked identity.
+	DirectoryLoginAvailable bool `json:"directory_login_available" doc:"True when a password sign-in without a provider, such as a Jellyfin client's, goes to the server's directory (LDAP), where this account has a linked identity, so the directory username and password sign in"`
+	// DirectoryUsername is the username of that identity.
+	DirectoryUsername string `json:"directory_username,omitempty" doc:"The account's username at that directory; present when directory_login_available is true" example:"alice"`
+}
+
+// CompatConnectInfoResponse is the native transport projection, independent of handler views.
+type CompatConnectInfoResponse struct {
+	Jellyfin jellycompat.ConnectInfo  `json:"jellyfin"`
+	Account  CompatConnectAccountInfo `json:"account"`
+}
+
+// ImageSizeWidths is the native transport projection, independent of handler views.
+type ImageSizeWidths struct {
+	Small  int `json:"small"`
+	Medium int `json:"medium"`
+	Large  int `json:"large"`
+}

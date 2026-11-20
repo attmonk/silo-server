@@ -1,0 +1,328 @@
+export type PosterSize = "compact" | "standard" | "large";
+export interface CardPresentation {
+  poster_size: PosterSize;
+}
+
+export type PrimaryMenuBuiltin =
+  | "home"
+  | "movies"
+  | "series"
+  | "music"
+  | "audiobooks"
+  | "for_you"
+  | "calendar";
+
+export interface BuiltinMenuItem {
+  type: "builtin";
+  destination: PrimaryMenuBuiltin;
+}
+
+export interface LibraryMenuItem {
+  type: "library";
+  library_id: number;
+  label: string;
+}
+
+export interface SectionMenuItem {
+  type: "section";
+  library_id: number;
+  section_id: string;
+  label: string;
+}
+
+export interface CollectionMenuItem {
+  type: "collection";
+  collection_id: string;
+  label: string;
+  library_id?: number;
+}
+
+export type ShortcutTarget = LibraryMenuItem | SectionMenuItem | CollectionMenuItem;
+export type PrimaryMenuItem = BuiltinMenuItem | ShortcutTarget;
+
+export interface PrimaryMenuDocument {
+  items: PrimaryMenuItem[];
+}
+
+export interface ShortcutDocument {
+  items: ShortcutTarget[];
+}
+
+export const DEFAULT_CARD_PRESENTATION: CardPresentation = { poster_size: "standard" };
+
+/**
+ * The stored ui.card_presentation document. caption is retired and every card
+ * shows its title and details, but the schema still requires the field.
+ */
+export function cardPresentationValue(presentation: CardPresentation) {
+  return { poster_size: presentation.poster_size, caption: "title_metadata" } as const;
+}
+
+const BUILTIN_DESTINATIONS = new Set<PrimaryMenuBuiltin>([
+  "home",
+  "movies",
+  "series",
+  "music",
+  "audiobooks",
+  "for_you",
+  "calendar",
+]);
+const POSTER_SIZES = new Set<PosterSize>(["compact", "standard", "large"]);
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+const MAX_LABEL_CODE_POINTS = 256;
+
+function isLabel(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    [...value].length <= MAX_LABEL_CODE_POINTS
+  );
+}
+
+/** `text` trimmed and cut to the length a shortcut label may have. */
+export function shortcutLabel(text: string): string {
+  return [...text.trim()].slice(0, MAX_LABEL_CODE_POINTS).join("");
+}
+
+function isTargetId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && [...value].length <= 128;
+}
+
+function parseMenuItem(value: unknown, allowBuiltin: boolean): PrimaryMenuItem | null {
+  if (!isObject(value) || typeof value.type !== "string") return null;
+
+  if (value.type === "builtin" && allowBuiltin) {
+    if (
+      typeof value.destination === "string" &&
+      BUILTIN_DESTINATIONS.has(value.destination as PrimaryMenuBuiltin)
+    ) {
+      return { type: "builtin", destination: value.destination as PrimaryMenuBuiltin };
+    }
+    return null;
+  }
+
+  if (value.type === "library") {
+    return isPositiveInteger(value.library_id) && isLabel(value.label)
+      ? { type: "library", library_id: value.library_id, label: value.label.trim() }
+      : null;
+  }
+
+  if (value.type === "section") {
+    return isPositiveInteger(value.library_id) &&
+      isTargetId(value.section_id) &&
+      isLabel(value.label)
+      ? {
+          type: "section",
+          library_id: value.library_id,
+          section_id: value.section_id,
+          label: value.label.trim(),
+        }
+      : null;
+  }
+
+  if (value.type === "collection") {
+    if (
+      !isTargetId(value.collection_id) ||
+      !isLabel(value.label) ||
+      (value.library_id !== undefined && !isPositiveInteger(value.library_id))
+    ) {
+      return null;
+    }
+    return {
+      type: "collection",
+      collection_id: value.collection_id,
+      label: value.label.trim(),
+      ...(value.library_id === undefined ? {} : { library_id: value.library_id }),
+    };
+  }
+
+  return null;
+}
+
+export function parseCardPresentation(value: unknown): CardPresentation {
+  if (!isObject(value)) return DEFAULT_CARD_PRESENTATION;
+  const posterSize = value.poster_size;
+  if (typeof posterSize !== "string" || !POSTER_SIZES.has(posterSize as PosterSize)) {
+    return DEFAULT_CARD_PRESENTATION;
+  }
+  return { poster_size: posterSize as PosterSize };
+}
+
+export function menuItemKey(item: PrimaryMenuItem): string {
+  switch (item.type) {
+    case "builtin":
+      return `builtin:${item.destination}`;
+    case "library":
+      return `library:${item.library_id}`;
+    case "section":
+      return `section:${item.library_id}:${item.section_id}`;
+    case "collection":
+      return JSON.stringify(["collection", item.library_id ?? null, item.collection_id]);
+  }
+}
+
+export function parsePrimaryMenu(value: unknown): PrimaryMenuDocument | null {
+  if (value == null) return null;
+  if (!isObject(value) || !Array.isArray(value.items)) return null;
+
+  const items: PrimaryMenuItem[] = [];
+  const seen = new Set<string>();
+  for (const candidate of value.items.slice(0, 64)) {
+    const item = parseMenuItem(candidate, true);
+    if (!item) continue;
+    const key = menuItemKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push(item);
+  }
+
+  const homeCount = items.filter(
+    (item) => item.type === "builtin" && item.destination === "home",
+  ).length;
+  return items.length > 0 && homeCount === 1 ? { items } : null;
+}
+
+export function parseShortcuts(value: unknown): ShortcutDocument {
+  if (!isObject(value) || !Array.isArray(value.items)) return { items: [] };
+  const items: ShortcutTarget[] = [];
+  const seen = new Set<string>();
+  for (const candidate of value.items.slice(0, 256)) {
+    const item = parseMenuItem(candidate, false);
+    if (!item || item.type === "builtin") continue;
+    const key = menuItemKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push(item);
+  }
+  return { items };
+}
+
+export function defaultWebPrimaryMenu(): PrimaryMenuDocument {
+  return {
+    items: [
+      { type: "builtin", destination: "home" },
+      { type: "builtin", destination: "for_you" },
+      { type: "builtin", destination: "calendar" },
+    ],
+  };
+}
+
+export function moveMenuItem(
+  items: readonly PrimaryMenuItem[],
+  index: number,
+  direction: -1 | 1,
+): PrimaryMenuItem[] {
+  const target = index + direction;
+  if (index < 0 || index >= items.length || target < 0 || target >= items.length) {
+    return [...items];
+  }
+  const next = [...items];
+  [next[index], next[target]] = [next[target]!, next[index]!];
+  return next;
+}
+
+export function cardGridClasses(size: PosterSize): string {
+  switch (size) {
+    case "compact":
+      return "grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10 gap-3";
+    case "large":
+      return "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4";
+    default:
+      return "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-7 xl:grid-cols-8 gap-3";
+  }
+}
+
+const GRID_COLUMNS: Record<PosterSize, readonly number[]> = {
+  compact: [3, 5, 6, 8, 10],
+  standard: [3, 4, 5, 7, 8],
+  large: [2, 3, 4, 5, 6],
+};
+
+/**
+ * The card width cardGridClasses resolves to at a viewport width, in a grid
+ * `gridWidth` wide. Keep the two in step: artwork widths are requested from it.
+ */
+export function gridCardWidthPx(
+  size: PosterSize,
+  viewportWidth: number,
+  gridWidth: number,
+): number {
+  const breakpoint = [640, 768, 1024, 1280].filter((width) => viewportWidth >= width).length;
+  const columns = GRID_COLUMNS[size][breakpoint]!;
+  const gap = size === "large" ? 16 : 12;
+  return (gridWidth - gap * (columns - 1)) / columns;
+}
+
+export function carouselCardWidthClasses(size: PosterSize): string {
+  switch (size) {
+    case "compact":
+      return "w-[120px] shrink-0 sm:w-[140px] lg:w-[160px]";
+    case "large":
+      return "w-[170px] shrink-0 sm:w-[195px] lg:w-[220px]";
+    default:
+      return "w-[140px] shrink-0 sm:w-[160px] lg:w-[185px]";
+  }
+}
+
+/**
+ * The poster size a row of square (audiobook) covers is drawn at: one step
+ * under the profile's choice, because a square cover at a poster's width
+ * covers half again its area and crowds the row.
+ */
+export function squarePosterSize(size: PosterSize): PosterSize {
+  return size === "large" ? "standard" : "compact";
+}
+
+/** Width classes of square (audiobook cover) carousel cards. */
+export function squareCarouselCardWidthClasses(size: PosterSize): string {
+  return carouselCardWidthClasses(squarePosterSize(size));
+}
+
+/** Width classes of wide (16:9) carousel cards such as Continue Watching episodes. */
+export const WIDE_CAROUSEL_CARD_WIDTH_CLASSES = "w-[260px] shrink-0 sm:w-[315px]";
+
+/**
+ * The width in pixels that carouselCardWidthClasses (or, for "wide",
+ * WIDE_CAROUSEL_CARD_WIDTH_CLASSES) resolves to at a viewport width. Keep the
+ * two in step: carousel windowing sizes its first commit from this.
+ */
+export function carouselCardWidthPx(size: PosterSize | "wide", viewportWidth: number): number {
+  const [base, sm, lg] =
+    size === "wide"
+      ? [260, 315, 315]
+      : size === "compact"
+        ? [120, 140, 160]
+        : size === "large"
+          ? [170, 195, 220]
+          : [140, 160, 185];
+  return viewportWidth >= 1024 ? lg : viewportWidth >= 640 ? sm : base;
+}
+
+/**
+ * Placeholder height for an off-screen carousel row rendered under
+ * content-visibility: the row header plus a 2:3 poster at this size's card
+ * width plus the tallest caption. Kept beside carouselCardWidthClasses so a
+ * card-size change updates both; underestimating makes the scrollbar jump as
+ * rows render on approach.
+ */
+export function carouselIntrinsicHeight(size: PosterSize): string {
+  switch (size) {
+    case "compact":
+      return "21rem";
+    case "large":
+      return "27rem";
+    default:
+      return "23rem";
+  }
+}
+
+/** Height of the title and details lines under a grid poster. */
+export const CARD_TEXT_AREA_HEIGHT = 44;

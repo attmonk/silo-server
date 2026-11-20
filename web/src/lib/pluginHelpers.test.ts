@@ -1,0 +1,344 @@
+import { describe, expect, it } from "vitest";
+
+import type { PluginInstallation, TriggerConfig } from "@/api/types";
+
+import { capabilityListLabel, catalogJobs } from "./pluginCapabilities";
+import { parsePluginMarkdown } from "./pluginMarkdown";
+import {
+  installationTier,
+  pendingUpdateVersion,
+  pluginPagePath,
+  pluginResourceLinks,
+  safeExternalURL,
+  sourceLabel,
+  tierNotice,
+} from "./pluginPresentation";
+import {
+  matchesInstalledFilter,
+  parseInstalledFilter,
+  pluginStatus,
+  sortInstalledPlugins,
+} from "./pluginStatus";
+import { pluginStatusIndicator } from "./pluginStatusIndicator";
+import { describeTrigger, pluginTaskPath, pluginTaskTrigger } from "./taskTrigger";
+
+function installation(overrides: Partial<PluginInstallation> = {}): PluginInstallation {
+  return {
+    id: 1,
+    repository_id: 1,
+    plugin_id: "silo.test",
+    version: "1.0.0",
+    install_path: "/plugins/test",
+    enabled: true,
+    runtime: { resident: false, state: "stopped", restart_count: 0 },
+    source_kind: "silo",
+    updates_paused: false,
+    capabilities: [],
+    global_config_schema: [],
+    user_config_schema: [],
+    routes: [],
+    assets: [],
+    global_configs: [],
+    auth_bindings: [],
+    task_bindings: [],
+    update_policy: "auto",
+    signature: { state: "unknown" },
+    ...overrides,
+  };
+}
+
+const PRESENTATION_STUB = {
+  display_name: "",
+  summary: "",
+  description_markdown: "",
+  setup_markdown: "",
+  homepage_url: "",
+  source_url: "",
+  support_url: "",
+  changelog_url: "",
+  publisher_name: "",
+  publisher_url: "",
+  license_spdx: "",
+};
+
+const REQUIRED_ACCOUNT = [{ key: "account", title: "Account", json_schema: "{}", required: true }];
+
+describe("pluginPresentation", () => {
+  it("encodes plugin IDs into page paths", () => {
+    expect(pluginPagePath("silo.mdblist")).toBe("/admin/plugins/silo.mdblist");
+    expect(pluginPagePath("a/b?c#d")).toBe("/admin/plugins/a%2Fb%3Fc%23d");
+    expect(pluginPagePath("silo.example", { repositoryId: 7, version: "2.0+beta" })).toBe(
+      "/admin/plugins/silo.example?repository=7&version=2.0%2Bbeta",
+    );
+  });
+
+  it("labels every tier and gives community and external plugins a notice", () => {
+    expect(sourceLabel("silo")).toBe("Silo maintained");
+    expect(sourceLabel("approved_community")).toBe("Approved community");
+    expect(sourceLabel("external")).toBe("External source");
+    expect(tierNotice("silo")).toBeNull();
+    expect(tierNotice("approved_community")).toMatch(/Reviewed by Silo maintainers/);
+    expect(tierNotice("external")).toMatch(/Silo has not reviewed this plugin/);
+    expect(sourceLabel("unverified")).toBe("Unverified");
+    expect(tierNotice("unverified")).toMatch(/can't verify it or check it for updates/);
+  });
+
+  it("treats an installation without a repository as Unverified", () => {
+    const fromCatalog = { repository_id: 3, source_kind: "external" } as PluginInstallation;
+    const fromFile = { repository_id: null, source_kind: "external" } as PluginInstallation;
+    expect(installationTier(fromCatalog)).toBe("external");
+    expect(installationTier(fromFile)).toBe("unverified");
+  });
+
+  it("offers a recorded update only while updates can run", () => {
+    const base = {
+      repository_id: 3,
+      source_kind: "approved_community",
+      updates_paused: false,
+      available_version: "1.1.0",
+    } as PluginInstallation;
+    expect(pendingUpdateVersion(base)).toBe("1.1.0");
+    expect(pendingUpdateVersion({ ...base, updates_paused: true })).toBeNull();
+    expect(pendingUpdateVersion({ ...base, repository_id: null })).toBeNull();
+    expect(pendingUpdateVersion({ ...base, available_version: null })).toBeNull();
+  });
+
+  it("only allows http and https links", () => {
+    expect(safeExternalURL("https://example.com/x")).toBe("https://example.com/x");
+    expect(safeExternalURL("javascript:alert(1)")).toBeUndefined();
+    expect(safeExternalURL("data:text/html,x")).toBeUndefined();
+    expect(safeExternalURL("not a url")).toBeUndefined();
+    expect(
+      pluginResourceLinks(undefined, "https://github.com/Silo-Server/x").map((l) => l.label),
+    ).toEqual(["Source code"]);
+    // A rejected presentation URL falls back to the repository URL.
+    expect(
+      pluginResourceLinks(
+        {
+          display_name: "",
+          summary: "",
+          description_markdown: "",
+          setup_markdown: "",
+          homepage_url: "",
+          source_url: "javascript:alert(1)",
+          support_url: "",
+          changelog_url: "",
+          publisher_name: "",
+          publisher_url: "",
+          license_spdx: "",
+        },
+        "https://github.com/Silo-Server/x",
+      ),
+    ).toEqual([{ label: "Source code", url: "https://github.com/Silo-Server/x" }]);
+  });
+});
+
+describe("pluginCapabilities", () => {
+  it("lists a plugin's jobs once each, in a fixed order, without plumbing", () => {
+    expect(
+      capabilityListLabel([
+        { type: "image_resolver.v1", id: "a", display_name: "" },
+        { type: "http_routes.v1", id: "b", display_name: "" },
+        { type: "metadata_provider.v1", id: "c", display_name: "" },
+        { type: "metadata_provider.v1", id: "d", display_name: "" },
+      ]),
+    ).toBe("Metadata, Artwork");
+    expect(
+      catalogJobs([
+        [{ type: "marker_provider.v1", id: "m", display_name: "" }],
+        [{ type: "metadata_provider.v1", id: "t", display_name: "" }],
+      ]).map((kind) => kind.job),
+    ).toEqual(["metadata", "markers"]);
+  });
+});
+
+describe("pluginStatus", () => {
+  it("ranks failures, restarts, and missing settings as needing attention", () => {
+    expect(
+      pluginStatus(
+        installation({ runtime: { resident: true, state: "failed", restart_count: 1 } }),
+      ),
+    ).toMatchObject({ label: "Failed", attention: true, rank: 0 });
+    expect(
+      pluginStatus(
+        installation({ runtime: { resident: true, state: "backoff", restart_count: 3 } }),
+      ),
+    ).toMatchObject({ label: "Restarting (3)", attention: true, rank: 1 });
+    expect(pluginStatus(installation({ global_config_schema: REQUIRED_ACCOUNT }))).toMatchObject({
+      label: "Needs setup",
+      attention: true,
+      rank: 2,
+    });
+    const refused = installation({
+      update_failure: { version: "2.0.0", reason: "refused", failed_at: "2026-11-01T12:00:00Z" },
+    });
+    expect(pluginStatus(refused)).toMatchObject({ label: "Active", attention: true, rank: 2 });
+    expect(matchesInstalledFilter(refused, "attention")).toBe(true);
+    const badSignature = installation({ signature: { state: "invalid" } });
+    expect(pluginStatus(badSignature)).toMatchObject({ attention: true, rank: 2 });
+    expect(pluginStatus(installation({ signature: { state: "unsigned" } }))).toMatchObject({
+      attention: false,
+    });
+    expect(pluginStatus(installation())).toMatchObject({ label: "Active", attention: false });
+  });
+
+  it("never asks for attention on a plugin that is off", () => {
+    const off = installation({
+      enabled: false,
+      global_config_schema: REQUIRED_ACCOUNT,
+      runtime: { resident: true, state: "failed", restart_count: 1 },
+    });
+    expect(pluginStatus(off)).toMatchObject({ label: "Off", attention: false });
+    expect(matchesInstalledFilter(off, "off")).toBe(true);
+    expect(matchesInstalledFilter(off, "attention")).toBe(false);
+  });
+
+  it("sorts by the same catalog fallback name the tiles show", () => {
+    const older = installation({ id: 1, plugin_id: "silo.zzz", presentation: undefined });
+    const named = installation({ id: 2, plugin_id: "silo.mmm" });
+    expect(sortInstalledPlugins([named, older]).map((entry) => entry.id)).toEqual([2, 1]);
+    expect(
+      sortInstalledPlugins([named, older], (entry) =>
+        entry.id === 1 ? { ...PRESENTATION_STUB, display_name: "Aardvark" } : entry.presentation,
+      ).map((entry) => entry.id),
+    ).toEqual([1, 2]);
+  });
+
+  it("sorts problems first and off plugins last", () => {
+    const sorted = sortInstalledPlugins([
+      installation({ id: 1, plugin_id: "silo.zulu", enabled: false }),
+      installation({ id: 2, plugin_id: "silo.beta" }),
+      installation({ id: 3, plugin_id: "silo.alpha" }),
+      installation({ id: 4, plugin_id: "silo.keyed", global_config_schema: REQUIRED_ACCOUNT }),
+    ]);
+    expect(sorted.map((entry) => entry.id)).toEqual([4, 3, 2, 1]);
+  });
+
+  it("parses the filter param and matches updates", () => {
+    expect(parseInstalledFilter("update")).toBe("update");
+    expect(parseInstalledFilter("bogus")).toBe("all");
+    expect(parseInstalledFilter(null)).toBe("all");
+    expect(matchesInstalledFilter(installation({ available_version: "2.0.0" }), "update")).toBe(
+      true,
+    );
+  });
+});
+
+describe("pluginStatusIndicator", () => {
+  it("shows a non-resident plugin whose last launch failed as Failed with the error", () => {
+    const base = installation();
+    expect(
+      pluginStatusIndicator({
+        ...base,
+        runtime: { resident: false, state: "failed", restart_count: 0, last_error: "exit 2" },
+      }),
+    ).toMatchObject({ dotClass: "bg-destructive", label: "Failed", title: "exit 2" });
+    expect(
+      pluginStatusIndicator({
+        ...base,
+        runtime: { resident: false, state: "running", restart_count: 0 },
+      }),
+    ).toMatchObject({ dotClass: "bg-success", label: "Active" });
+    expect(
+      pluginStatusIndicator({
+        ...base,
+        enabled: false,
+        runtime: { resident: false, state: "failed", restart_count: 0, last_error: "exit 2" },
+      }),
+    ).toMatchObject({ label: "Off" });
+    expect(
+      pluginStatus(
+        installation({ runtime: { resident: false, state: "failed", restart_count: 0 } }),
+      ),
+    ).toMatchObject({ label: "Failed", attention: true, rank: 0 });
+  });
+});
+
+describe("taskTrigger", () => {
+  it("keeps the task list's short wording and the detail page's long wording", () => {
+    expect(describeTrigger({ type: "interval", interval_ms: 3 * 3_600_000 }, "short")).toBe(
+      "Every 3h",
+    );
+    expect(describeTrigger({ type: "interval", interval_ms: 2 * 86_400_000 }, "short")).toBe(
+      "Every 2d",
+    );
+    expect(describeTrigger({ type: "startup" }, "short")).toBe("On startup");
+    expect(describeTrigger({ type: "weekly", day_of_week: 1, time_of_day: "04:00" }, "short")).toBe(
+      "Mon at 04:00",
+    );
+    expect(describeTrigger({ type: "interval", interval_ms: 3 * 3_600_000 })).toBe(
+      "Every 3 hour(s)",
+    );
+    expect(describeTrigger({ type: "startup" })).toBe("On server startup");
+    expect(describeTrigger({ type: "weekly", day_of_week: 1, time_of_day: "04:00" })).toBe(
+      "Monday at 04:00",
+    );
+    expect(describeTrigger({ type: "daily", time_of_day: "03:00" })).toBe("Daily at 03:00");
+    expect(describeTrigger({ type: "interval", interval_ms: 5_400_000 })).toBe(
+      "Every 90 minute(s)",
+    );
+    expect(describeTrigger({ type: "interval", interval_ms: 90_000 }, "short")).toBe("Every 90s");
+  });
+
+  it("picks a plugin task's schedule like the server", () => {
+    const manifest: TriggerConfig = { type: "interval", interval_ms: 300_000 };
+    expect(pluginTaskTrigger(undefined)).toEqual({ type: "startup" });
+    expect(pluginTaskTrigger(undefined, manifest)).toEqual(manifest);
+    expect(pluginTaskTrigger({ type: "" }, manifest)).toEqual(manifest);
+    // A trigger the server cannot run falls through to the manifest default.
+    expect(pluginTaskTrigger({ type: "sometimes" }, manifest)).toEqual(manifest);
+    expect(pluginTaskTrigger({ type: "interval", interval_ms: "60000" })).toEqual({
+      type: "startup",
+    });
+    expect(pluginTaskTrigger({ type: "daily", time_of_day: "02:00" }, manifest)).toEqual({
+      type: "daily",
+      time_of_day: "02:00",
+    });
+    expect(describeTrigger({ type: "weekly", day_of_week: 7, time_of_day: "02:00" })).toBe(
+      "Day 7 at 02:00",
+    );
+    expect(pluginTaskPath(7, "refresh")).toBe("/admin/tasks/plugin%3A7%3Arefresh");
+  });
+});
+
+describe("parsePluginMarkdown", () => {
+  it("reads paragraphs, lists, and inline marks", () => {
+    expect(
+      parsePluginMarkdown(
+        "Add **MDBList** to a library.\nSee `dump_path`.\n\n- first\n- [docs](https://x.test)\n\n1. one\n2. two",
+      ),
+    ).toEqual([
+      {
+        kind: "paragraph",
+        inlines: [
+          { kind: "text", text: "Add " },
+          { kind: "strong", text: "MDBList" },
+          { kind: "text", text: " to a library. See " },
+          { kind: "code", text: "dump_path" },
+          { kind: "text", text: "." },
+        ],
+      },
+      {
+        kind: "list",
+        ordered: false,
+        items: [
+          [{ kind: "text", text: "first" }],
+          [{ kind: "link", text: "docs", href: "https://x.test" }],
+        ],
+      },
+      {
+        kind: "list",
+        ordered: true,
+        items: [[{ kind: "text", text: "one" }], [{ kind: "text", text: "two" }]],
+      },
+    ]);
+  });
+
+  it("keeps HTML and snake_case identifiers as literal text", () => {
+    expect(parsePluginMarkdown("<b>x</b> and dump_path_value")).toEqual([
+      { kind: "paragraph", inlines: [{ kind: "text", text: "<b>x</b> and dump_path_value" }] },
+    ]);
+    expect(parsePluginMarkdown("  ")).toEqual([]);
+    expect(parsePluginMarkdown(undefined)).toEqual([]);
+  });
+});

@@ -1,0 +1,486 @@
+package plugins
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"google.golang.org/protobuf/encoding/protojson"
+)
+
+func packageErrorTestManifest(pluginID, version string) *pluginv1.PluginManifest {
+	return &pluginv1.PluginManifest{
+		PluginId:           pluginID,
+		Version:            version,
+		Checksum:           strings.Repeat("a", 64),
+		SiloApiVersion:     DefaultSiloAPIVersion,
+		SupportedPlatforms: []*pluginv1.SupportedPlatform{{Os: "linux", Arch: "amd64"}},
+		Capabilities: []*pluginv1.CapabilityDescriptor{
+			{Type: "metadata_provider.v1", Id: "fixture", DisplayName: "Fixture"},
+		},
+	}
+}
+
+func packageErrorTestServer(t *testing.T, status int, body []byte) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// manifestScript is a plugin binary whose manifest command prints manifest
+// with its own SHA-256 as the checksum, as the SDK does. When ranMarker is
+// set, running it also creates that file, so a test can tell whether the
+// installer executed the binary.
+func manifestScript(t *testing.T, manifest *pluginv1.PluginManifest, ranMarker string) []byte {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses shell scripts")
+	}
+	manifest.Checksum = "CHECKSUM"
+	out, err := protojson.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n"
+	if ranMarker != "" {
+		script += "touch '" + ranMarker + "'\n"
+	}
+	return []byte(script + "sum=$( (sha256sum \"$0\" 2>/dev/null || shasum -a 256 \"$0\") | cut -d' ' -f1)\n" +
+		"sed \"s/CHECKSUM/$sum/\" <<'MANIFEST'\n" + string(out) + "\nMANIFEST\n")
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func requirePackageError(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("install succeeded, want a package error")
+	}
+	packageErr, ok := AsPackageError(err)
+	if !ok {
+		t.Fatalf("error %v is not a PackageError", err)
+	}
+	if !strings.Contains(packageErr.Message, want) {
+		t.Fatalf("package error message = %q, want it to contain %q", packageErr.Message, want)
+	}
+}
+
+func requireTransient(t *testing.T, err error, want bool) {
+	t.Helper()
+	packageErr, ok := AsPackageError(err)
+	if !ok || packageErr.Transient != want {
+		t.Fatalf("error %v transient = %v, want %v", err, ok && packageErr.Transient, want)
+	}
+}
+
+type testZipEntry struct {
+	name string
+	data []byte
+	dir  bool
+	// lzma stores the entry as LZMA, which archive/zip can't decompress.
+	lzma bool
+}
+
+var testBinaryEntry = testZipEntry{name: "plugin", data: []byte("#!/bin/sh\nexit 0\n")}
+
+// writeTestPluginZip writes a valid silo.metadb manifest whose checksum
+// matches testBinaryEntry, followed by entries in order.
+func writeTestPluginZip(t *testing.T, path string, assets []*pluginv1.PackagedAsset, entries ...testZipEntry) {
+	t.Helper()
+	manifest := testPluginManifest(t, "silo.metadb", "0.0.36")
+	manifest.Checksum = sha256Hex(testBinaryEntry.data)
+	manifest.Assets = assets
+	manifestBytes, err := protojson.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buffer bytes.Buffer
+	archive := zip.NewWriter(&buffer)
+	for _, entry := range append([]testZipEntry{{name: "manifest.json", data: manifestBytes}}, entries...) {
+		header := &zip.FileHeader{Name: entry.name, Method: zip.Deflate}
+		header.SetMode(0o644)
+		if entry.dir {
+			header.SetMode(fs.ModeDir | 0o755)
+		}
+		create := archive.CreateHeader
+		if entry.lzma {
+			header.Method = 14
+			header.CompressedSize64 = uint64(len(entry.data))
+			header.UncompressedSize64 = uint64(len(entry.data))
+			create = archive.CreateRaw
+		}
+		writer, err := create(header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(entry.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buffer.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A download that does not hash to the catalog's checksum is refused before
+// anything is written, with a reason the admin can read.
+func TestInstallBinaryChecksumMismatchIsPackageError(t *testing.T) {
+	server := packageErrorTestServer(t, http.StatusOK, []byte("tampered"))
+	installer := NewInstaller(nil, InstallerOptions{BaseDir: t.TempDir(), HTTPClient: server.Client()})
+
+	_, err := installer.InstallBinary(context.Background(), InstallBinaryRequest{
+		BinaryURL: server.URL + "/plugin",
+		Checksum:  sha256Hex([]byte("original")),
+	})
+	requirePackageError(t, err, "SHA-256 checksum")
+	requireTransient(t, err, false)
+}
+
+// A missing file stays missing; a host that is down or rate limiting may
+// answer a retry.
+func TestInstallBinaryDownloadStatusIsPackageError(t *testing.T) {
+	for _, tc := range []struct {
+		status    int
+		want      string
+		transient bool
+	}{
+		{status: http.StatusNotFound, want: "HTTP 404", transient: false},
+		{status: http.StatusTooManyRequests, want: "HTTP 429", transient: true},
+		{status: http.StatusBadGateway, want: "HTTP 502", transient: true},
+	} {
+		server := packageErrorTestServer(t, tc.status, nil)
+		installer := NewInstaller(nil, InstallerOptions{BaseDir: t.TempDir(), HTTPClient: server.Client()})
+
+		_, err := installer.InstallBinary(context.Background(), InstallBinaryRequest{
+			BinaryURL: server.URL + "/plugin",
+			Checksum:  sha256Hex(nil),
+		})
+		requirePackageError(t, err, tc.want)
+		requireTransient(t, err, tc.transient)
+	}
+}
+
+// A catalog entry must not install a binary that says it is another plugin
+// or another version: the catalog's identity decides which installation an
+// install replaces.
+func TestInstallBinaryRejectsBinaryNotListedByCatalog(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		manifest *pluginv1.PluginManifest
+	}{
+		{name: "other plugin", manifest: packageErrorTestManifest("silo.tmdb", "1.0.0")},
+		{name: "other version", manifest: packageErrorTestManifest("test.plugin", "2.0.0")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := manifestScript(t, tc.manifest, "")
+			server := packageErrorTestServer(t, http.StatusOK, body)
+			installer := NewInstaller(nil, InstallerOptions{BaseDir: t.TempDir(), HTTPClient: server.Client()})
+			_, err := installer.InstallBinary(context.Background(), InstallBinaryRequest{
+				BinaryURL: server.URL + "/plugin",
+				Checksum:  sha256Hex(body),
+				PluginID:  "test.plugin",
+				Version:   "1.0.0",
+			})
+			requirePackageError(t, err, "not the test.plugin 1.0.0 its catalog lists")
+		})
+	}
+}
+
+// Catalog indexes and checksum files follow the download rule: a host that
+// is down or rate limiting may answer a retry; a missing or invalid file
+// stays that way.
+func TestCatalogFetchFailuresAreClassified(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		body      string
+		want      string
+		transient bool
+	}{
+		{name: "catalog down", status: http.StatusBadGateway, want: "HTTP 502", transient: true},
+		{name: "catalog missing", status: http.StatusNotFound, want: "HTTP 404", transient: false},
+		{name: "catalog invalid", status: http.StatusOK, body: "not json", want: "isn't a valid plugin catalog", transient: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := packageErrorTestServer(t, tc.status, []byte(tc.body))
+			service := NewCatalogService(nil, CatalogServiceOptions{HTTPClient: server.Client()})
+			_, err := service.fetchRepositoryIndex(context.Background(), server.URL, "the test catalog")
+			requirePackageError(t, err, tc.want)
+			requireTransient(t, err, tc.transient)
+		})
+	}
+}
+
+func TestChecksumFileFailuresAreClassified(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		body      string
+		want      string
+		transient bool
+	}{
+		{name: "host rate limiting", status: http.StatusTooManyRequests, want: "HTTP 429", transient: true},
+		{name: "file missing", status: http.StatusNotFound, want: "HTTP 404", transient: false},
+		{name: "no entry for the download", status: http.StatusOK, body: strings.Repeat("a", 64) + "  other-file\n", want: "no valid SHA-256 checksum", transient: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := packageErrorTestServer(t, tc.status, []byte(tc.body))
+			service := NewCatalogService(nil, CatalogServiceOptions{HTTPClient: server.Client()})
+			_, err := service.fetchChecksumForBinary(context.Background(), server.URL+"/checksums.txt", server.URL+"/plugin-darwin-arm64")
+			requirePackageError(t, err, tc.want)
+			requireTransient(t, err, tc.transient)
+		})
+	}
+}
+
+// Archive installs (uploads, archive links and legacy catalog entries) get
+// the same API version and catalog identity checks as binaries.
+func TestInstallArchiveRefusesUnsupportedOrUnlistedPlugins(t *testing.T) {
+	future := testPluginManifest(t, "test.plugin", "1.0.0")
+	future.SiloApiVersion = "v2"
+	for _, tc := range []struct {
+		name string
+		req  InstallArchiveRequest
+		want string
+	}{
+		{name: "unsupported API", req: InstallArchiveRequest{}, want: `needs Silo plugin API "v2"`},
+		{name: "other plugin", req: InstallArchiveRequest{PluginID: "test.other", Version: "1.0.0"}, want: "not the test.other 1.0.0 its catalog lists"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := testPluginManifest(t, "test.plugin", "1.0.0")
+			if tc.name == "unsupported API" {
+				manifest = future
+			}
+			archivePath := filepath.Join(t.TempDir(), "plugin.zip")
+			writePluginArchive(t, archivePath, manifest)
+			req := tc.req
+			req.ArchivePath = archivePath
+			installer := NewInstaller(nil, InstallerOptions{BaseDir: t.TempDir()})
+			_, err := installer.InstallLocal(context.Background(), req)
+			requirePackageError(t, err, tc.want)
+			if entries, _ := os.ReadDir(installer.baseDir); len(entries) != 0 {
+				t.Fatalf("refused archive wrote %d entries to the plugin dir", len(entries))
+			}
+		})
+	}
+}
+
+// An uploaded archive the installer would refuse is refused with its reason
+// before an installed copy of the plugin is stopped.
+func TestServiceInstallLocalRefusesBeforeStoppingInstalledPlugin(t *testing.T) {
+	future := testPluginManifest(t, "silo.metadb", "0.0.36")
+	future.SiloApiVersion = "v2"
+	nestedForm := testPluginManifest(t, "silo.metadb", "0.0.36")
+	nestedForm.Capabilities = append(nestedForm.Capabilities, &pluginv1.CapabilityDescriptor{
+		Type: "notification_channel.v1", Id: "ntfy",
+		NotificationChannel: &pluginv1.NotificationChannelDescriptor{DisplayName: "ntfy", DestinationSchema: &pluginv1.ConfigSchema{
+			Key: "destination", JsonSchema: `{"type":"object","properties":{"auth":{"type":"object"}}}`,
+		}},
+	})
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, path string)
+		want  string
+	}{
+		{name: "unreadable archive", want: "archive couldn't be read", write: func(t *testing.T, path string) {
+			file, err := os.Create(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			archive := zip.NewWriter(file)
+			if _, err := archive.Create("readme.txt"); err != nil {
+				t.Fatal(err)
+			}
+			if err := archive.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "unsupported API", want: `needs Silo plugin API "v2"`, write: func(t *testing.T, path string) {
+			writePluginArchive(t, path, future)
+		}},
+		// The admin sees what is wrong with the manifest, not only that the
+		// archive was refused.
+		{name: "invalid manifest", want: `manifest is invalid: plugin capability "ntfy" destination schema`, write: func(t *testing.T, path string) {
+			writePluginArchive(t, path, nestedForm)
+		}},
+		// Extraction writes each entry to its cleaned path, so a second entry
+		// for the same file, on a case- or normalization-insensitive
+		// filesystem too, would replace the one that was checked.
+		{name: "manifest alias", want: "archive couldn't be read", write: func(t *testing.T, path string) {
+			writeTestPluginZip(t, path, nil, testBinaryEntry, testZipEntry{name: "./manifest.json", data: []byte("not json")})
+		}},
+		{name: "binary case alias", want: "archive couldn't be read", write: func(t *testing.T, path string) {
+			writeTestPluginZip(t, path, nil, testBinaryEntry, testZipEntry{name: "Plugin", data: []byte("other bytes")})
+		}},
+		{name: "asset normalization alias", want: "archive couldn't be read", write: func(t *testing.T, path string) {
+			writeTestPluginZip(t, path, []*pluginv1.PackagedAsset{{Path: "web/caf\u00e9.js"}}, testBinaryEntry,
+				testZipEntry{name: "web/caf\u00e9.js", data: []byte("checked")}, testZipEntry{name: "web/cafe\u0301.js", data: []byte("other")})
+		}},
+		{name: "long combining sequence alias", want: "archive couldn't be read", write: func(t *testing.T, path string) {
+			checked := "web/a" + strings.Repeat("\u0301", 30) + "\u0327.js"
+			alias := "web/a\u0327" + strings.Repeat("\u0301", 30) + ".js"
+			writeTestPluginZip(t, path, []*pluginv1.PackagedAsset{{Path: checked}}, testBinaryEntry,
+				testZipEntry{name: checked, data: []byte("checked")}, testZipEntry{name: alias, data: []byte("other")})
+		}},
+		// Assets are first decompressed when the archive is extracted,
+		// which happens after the installed plugin is stopped.
+		{name: "asset that can't be decompressed", want: "archive couldn't be read", write: func(t *testing.T, path string) {
+			writeTestPluginZip(t, path, []*pluginv1.PackagedAsset{{Path: "web/app.js"}}, testBinaryEntry,
+				testZipEntry{name: "web/app.js", data: []byte("not lzma"), lzma: true})
+		}},
+		{name: "entry inside binary", want: "archive couldn't be read", write: func(t *testing.T, path string) {
+			writeTestPluginZip(t, path, nil, testBinaryEntry, testZipEntry{name: "plugin/x", data: []byte("x")})
+		}},
+		{name: "binary directory", want: "archive couldn't be read", write: func(t *testing.T, path string) {
+			writeTestPluginZip(t, path, nil, testZipEntry{name: "plugin", data: testBinaryEntry.data, dir: true})
+		}},
+		{name: "asset directory", want: "archive couldn't be read", write: func(t *testing.T, path string) {
+			writeTestPluginZip(t, path, []*pluginv1.PackagedAsset{{Path: "web"}}, testBinaryEntry, testZipEntry{name: "web", dir: true})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			archivePath := filepath.Join(t.TempDir(), "plugin.zip")
+			tc.write(t, archivePath)
+			events := []string{}
+			store := newFakeServiceInstallationStore(&Installation{ID: 7, PluginID: "silo.metadb", Version: "0.0.34", InstallPath: t.TempDir(), Enabled: true})
+			store.events = &events
+			service := &Service{
+				installations: store,
+				installer:     NewInstaller(store, InstallerOptions{BaseDir: t.TempDir()}),
+				host:          &fakeServiceHost{events: &events},
+			}
+			_, err := service.InstallLocal(context.Background(), InstallArchiveRequest{ArchivePath: archivePath})
+			requirePackageError(t, err, tc.want)
+			if len(events) != 0 {
+				t.Fatalf("refused upload touched the installed plugin: %v", events)
+			}
+		})
+	}
+}
+
+// An uploaded binary that can't be stored, here because its manifest
+// declares an asset a lone binary can't carry, is refused while the
+// installed plugin keeps running.
+func TestServiceInstallBinaryUploadRefusesBeforeStoppingInstalledPlugin(t *testing.T) {
+	manifest := packageErrorTestManifest("test.plugin", "2.0.0")
+	manifest.Assets = []*pluginv1.PackagedAsset{{Path: "web/app.js"}}
+	binary := manifestScript(t, manifest, "")
+	events := []string{}
+	store := newFakeServiceInstallationStore(&Installation{ID: 7, PluginID: "test.plugin", Version: "1.0.0", InstallPath: t.TempDir(), Enabled: true})
+	store.events = &events
+	service := &Service{
+		installations: store,
+		installer:     NewInstaller(store, InstallerOptions{BaseDir: t.TempDir()}),
+		host:          &fakeServiceHost{events: &events},
+	}
+	if _, err := service.InstallBinaryUpload(context.Background(), binary); err == nil {
+		t.Fatal("InstallBinaryUpload() accepted a binary it can't store")
+	}
+	if len(events) != 0 {
+		t.Fatalf("refused upload touched the installed plugin: %v", events)
+	}
+}
+
+// An address the transport can never fetch is a final refusal, not an outage.
+func TestFetchPackageResourceRefusesInvalidAddress(t *testing.T) {
+	for _, rawURL := range []string{"ftp://example.invalid/plugin.zip", "http://[::1", "http://?x"} {
+		_, err := fetchPackageResource(context.Background(), http.DefaultClient, rawURL, "the plugin")
+		requirePackageError(t, err, "isn't a valid http or https link")
+		requireTransient(t, err, false)
+	}
+}
+
+// A canceled request is the caller's, not an unreachable host.
+func TestFetchPackageResourceKeepsCancellation(t *testing.T) {
+	server := packageErrorTestServer(t, http.StatusOK, []byte("{}"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := fetchPackageResource(ctx, server.Client(), server.URL, "the plugin")
+	if _, ok := AsPackageError(err); ok || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled fetch = %v, want context.Canceled and no PackageError", err)
+	}
+}
+
+func TestCatalogInvalidDownloadAddressIsPackageError(t *testing.T) {
+	service := NewCatalogService(nil, CatalogServiceOptions{})
+	pkg := CatalogPackage{
+		Manifest: packageErrorTestManifest("test.plugin", "1.0.0"),
+		Binaries: map[string]PlatformBinary{service.currentOS + "/" + service.currentArch: {URL: "http://[::1", Checksum: strings.Repeat("a", 64)}},
+	}
+	_, err := service.installTargetFromPackage(context.Background(), &Repository{ID: 1, URL: "https://example.test/catalog.json"}, pkg)
+	requirePackageError(t, err, "invalid download address")
+}
+
+// Only a binary that runs and fails, or isn't an executable at all, is
+// blamed on the package; a canceled request is not.
+func TestLoadManifestFromBinaryClassifiesRunFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses shell scripts")
+	}
+	_, _, err := loadManifestFromBinary(context.Background(), []byte("#!/bin/sh\nexit 3\n"))
+	requirePackageError(t, err, "couldn't run the plugin")
+
+	_, _, err = loadManifestFromBinary(context.Background(), []byte("not an executable"))
+	requirePackageError(t, err, "couldn't run the plugin")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = loadManifestFromBinary(ctx, []byte("#!/bin/sh\nexit 0\n"))
+	if _, ok := AsPackageError(err); ok || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled manifest read = %v, want context.Canceled and no PackageError", err)
+	}
+}
+
+// Reading the manifest runs the package's binary before an admin enables it,
+// so it gets the plugin environment, not the server's, including when the
+// server has no variable the plugin environment keeps.
+func TestLoadManifestFromBinaryWithholdsServerEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses shell scripts")
+	}
+	for _, onlyHostVariable := range []bool{false, true} {
+		if onlyHostVariable {
+			for _, kv := range os.Environ() {
+				name, _, _ := strings.Cut(kv, "=")
+				t.Setenv(name, "")
+				_ = os.Unsetenv(name)
+			}
+		}
+		t.Setenv("SILO_TEST_HOST_ONLY", "secret")
+		seen := filepath.Join(t.TempDir(), "seen")
+		script := "#!/bin/sh\nprintf '%s' \"${SILO_TEST_HOST_ONLY-absent}\" > '" + seen + "'\n"
+		_, _, _ = loadManifestFromBinary(context.Background(), []byte(script))
+		got, err := os.ReadFile(seen)
+		if err != nil {
+			t.Fatalf("only host variable %v: manifest command did not run: %v", onlyHostVariable, err)
+		}
+		if string(got) != "absent" {
+			t.Fatalf("only host variable %v: manifest command saw SILO_TEST_HOST_ONLY=%q, want it absent", onlyHostVariable, got)
+		}
+	}
+}

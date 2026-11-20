@@ -1,0 +1,378 @@
+package apiv2
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	"github.com/Silo-Server/silo-server/internal/clientip"
+)
+
+// behindTrustedProxy runs h behind clientip.Middleware, as the API listener
+// does, with httptest's default peer (192.0.2.1) as a trusted proxy.
+func behindTrustedProxy(t *testing.T, h http.Handler) http.Handler {
+	t.Helper()
+	trusted, err := clientip.ParseCIDRs("192.0.2.1/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return clientip.Middleware(clientip.NewResolver(trusted))(h)
+}
+
+// TestStartDeviceLoginForwardedOrigin: without a public URL the link names
+// the origin the device used, and a client that is not a trusted proxy cannot
+// choose its scheme or host with forwarded headers (#2917). TestStartDeviceLogin
+// covers a trusted proxy's headers.
+func TestStartDeviceLoginForwardedOrigin(t *testing.T) {
+	h := behindTrustedProxy(t, newTestHandler(t, pilotDeps(nil, nil)))
+	for _, tc := range []struct {
+		name, proto, host, want string
+	}{
+		{"proto list", "https,http", "", "http://example.com/activate"},
+		{"proto and host", "https", "silo.example.test", "http://example.com/activate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/api/v2/auth/device/start", strings.NewReader(`{}`))
+			r.RemoteAddr = "198.51.100.7:1234" // not a trusted proxy
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("X-Forwarded-Proto", tc.proto)
+			if tc.host != "" {
+				r.Header.Set("X-Forwarded-Host", tc.host)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, r)
+			if rec.Code != 201 || !contains(rec.Body.String(), `"verification_uri":"`+tc.want+`"`) {
+				t.Fatalf("%d %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestStartDeviceLogin(t *testing.T) {
+	h := behindTrustedProxy(t, newTestHandler(t, pilotDeps(nil, nil)))
+	rec := do(t, h, http.MethodPost, "/api/v2/auth/device/start", `{"device_name":"Living room TV","device_platform":"tvos"}`,
+		map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "silo.example.test"})
+	if rec.Code != 201 || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	want := `{"device_code":"dev-1","user_code":"4821-7730","match_code":"warm pony","verification_uri":"https://silo.example.test/activate","verification_uri_complete":"https://silo.example.test/activate?code=48217730","expires_at":"2026-01-02T03:19:05.678Z","expires_in":900,"interval":5,"device_name":"Living room TV","device_platform":"tvos","client_purpose":"device_login","temporary":false}` + "\n"
+	if rec.Body.String() != want {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	// A configured public URL wins over the address the device used, so a
+	// phone off the TV's network can still open the link.
+	pub := pilotDeps(nil, nil)
+	publicURL := "https://media.example.test/"
+	pub.ServerConnections.PublicURL = func() string { return publicURL }
+	public := behindTrustedProxy(t, newTestHandler(t, pub))
+	rec = do(t, public, http.MethodPost, "/api/v2/auth/device/start", `{}`,
+		map[string]string{"X-Forwarded-Proto": "http", "X-Forwarded-Host": "192.168.1.20:8090"})
+	if rec.Code != 201 || !contains(rec.Body.String(), `"verification_uri_complete":"https://media.example.test/activate?code=48217730"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// A public URL with a path keeps it.
+	publicURL = "https://Example.test/silo/"
+	rec = do(t, public, http.MethodPost, "/api/v2/auth/device/start", `{}`, nil)
+	if rec.Code != 201 || !contains(rec.Body.String(), `"verification_uri":"https://example.test/silo/activate"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// An unusable public URL falls back to the device's origin.
+	publicURL = "not a url"
+	rec = do(t, public, http.MethodPost, "/api/v2/auth/device/start", `{}`,
+		map[string]string{"X-Forwarded-Proto": "http", "X-Forwarded-Host": "192.168.1.20:8090"})
+	if rec.Code != 201 || !contains(rec.Body.String(), `"verification_uri":"http://192.168.1.20:8090/activate"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// An empty body is the v1 default request.
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/start", `{}`, nil)
+	if rec.Code != 201 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// remote_playback without temporary is the seam's rejection, at the member.
+	p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/start", `{"client_purpose":"remote_playback"}`, nil), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "body.client_purpose" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+	// An unknown purpose is refused by the schema before the seam.
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/start", `{"client_purpose":"other"}`, nil), TypeValidationFailed)
+	deps := pilotDeps(nil, nil)
+	deps.Devices = nil
+	requireProblem(t, do(t, newTestHandler(t, deps), http.MethodPost, "/api/v2/auth/device/start", `{}`, nil), TypeDependencyUnavailable)
+}
+
+func TestStartDeviceLoginRateLimited(t *testing.T) {
+	deps := pilotDeps(nil, nil)
+	var buckets []string
+	deps.BucketRateLimit = func(bucket string) func(http.Handler) http.Handler {
+		return func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				buckets = append(buckets, bucket)
+				w.Header().Set("Retry-After", "30")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":"rate_limit_exceeded","message":"Too many requests."}`))
+			})
+		}
+	}
+	h := newTestHandler(t, deps)
+	p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/start", `{}`, nil), TypeRateLimited)
+	if p.Status != 429 {
+		t.Fatalf("status = %d", p.Status)
+	}
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"x"}`, nil), TypeRateLimited)
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/auth/device?code=4821-7730", "", nil), TypeRateLimited)
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/cancel", `{"device_code":"x"}`, nil), TypeRateLimited)
+	// The capability document has no bucket and is never limited.
+	if rec := do(t, h, http.MethodGet, "/api/v2/auth/device/capability", "", nil); rec.Code != 200 {
+		t.Fatalf("capability limited: %d", rec.Code)
+	}
+	if len(buckets) != 4 || buckets[0] != "device_start" || buckets[1] != "device_poll" || buckets[2] != "device_lookup" || buckets[3] != "device_poll" {
+		t.Fatalf("buckets = %v", buckets)
+	}
+}
+
+// TestDecideDeviceLoginRateLimited pins that the three decisions, which take
+// a user code, spend the lookup's device_lookup guessing budget in place of
+// the generic authenticated limiter.
+func TestDecideDeviceLoginRateLimited(t *testing.T) {
+	deps := pilotDeps(nil, nil)
+	var buckets []string
+	deps.BucketRateLimit = func(bucket string) func(http.Handler) http.Handler {
+		return func(http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				buckets = append(buckets, bucket)
+				w.Header().Set("Retry-After", "30")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":"rate_limit_exceeded","message":"Too many requests."}`))
+			})
+		}
+	}
+	generic := 0
+	deps.RateLimit = func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			generic++
+			next.ServeHTTP(w, r)
+		})
+	}
+	h := newTestHandler(t, deps)
+	body := `{"code":"4821-7730"}`
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve", body, bearer(memberToken)), TypeRateLimited)
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/deny", body, bearer(memberToken)), TypeRateLimited)
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve-handoff", body, with(bearer(memberToken), "X-Profile-Id", "p-owner")), TypeRateLimited)
+	if len(buckets) != 3 || buckets[0] != "device_lookup" || buckets[1] != "device_lookup" || buckets[2] != "device_lookup" {
+		t.Fatalf("buckets = %v", buckets)
+	}
+	if generic != 0 {
+		t.Fatalf("generic limiter charged %d times alongside the bucket", generic)
+	}
+}
+
+func TestGetDeviceLogin(t *testing.T) {
+	h := newTestHandler(t, pilotDeps(nil, nil))
+	rec := do(t, h, http.MethodGet, "/api/v2/auth/device?code=4821-7730", "", nil)
+	if rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	want := `{"status":"pending","user_code":"4821-7730","match_code":"warm pony","device_name":"Living room TV","device_platform":"tvos","ip_address_hint":"192.168.1.x","expires_at":"2026-01-02T03:14:05.678Z","requested_at":"2026-01-02T03:04:05.678Z","client_purpose":"device_login","temporary":false,"server_name":"Silo"}` + "\n"
+	if rec.Body.String() != want {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	// With an identity service the approver also learns which deployment
+	// this is, for app links that must reach the same server.
+	ided := pilotDeps(nil, nil)
+	ided.ServerIdentity = fakeServerIdentity{id: "3f2a9d5e-6b1c-4c7e-9a0d-2f4b8c1e7a35"}
+	rec = do(t, newTestHandler(t, ided), http.MethodGet, "/api/v2/auth/device?code=48217730", "", nil)
+	if rec.Code != 200 || !contains(rec.Body.String(), `"server_id":"3f2a9d5e-6b1c-4c7e-9a0d-2f4b8c1e7a35"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// A request the device withdrew reads as canceled.
+	rec = do(t, h, http.MethodGet, "/api/v2/auth/device?token=br-canceled", "", nil)
+	if rec.Code != 200 || !contains(rec.Body.String(), `"status":"canceled"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// Expired: expires_at is omitted, the codes are blank, the status says so.
+	rec = do(t, h, http.MethodGet, "/api/v2/auth/device?token=br-expired", "", nil)
+	if rec.Code != 200 || contains(rec.Body.String(), "expires_at") || !contains(rec.Body.String(), `"status":"expired"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/auth/device?token=nope", "", nil), TypeNotFound)
+	p := requireProblem(t, do(t, h, http.MethodGet, "/api/v2/auth/device", "", nil), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "query.code" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+}
+
+// TestQuickConnectLookupNeedsSession: a six-digit Quick Connect code is looked
+// up only for the account's own signed-in session, which the public lookup
+// reads without requiring: a missing, expired or API-key credential is 401 for
+// every six-digit code, so a client refreshes instead of reading the code as
+// unknown, and an impersonation session is 403. Decisions pass the deciding
+// account, and the request is approved for a profile through approve-handoff.
+func TestQuickConnectLookupNeedsSession(t *testing.T) {
+	h := newTestHandler(t, pilotDeps(nil, nil))
+	for _, hdr := range []map[string]string{nil, bearer(expiredToken), bearer(apiKeyToken)} {
+		for _, code := range []string{"482177", "999999"} {
+			requireProblem(t, do(t, h, http.MethodGet, "/api/v2/auth/device?code="+code, "", hdr), TypeAuthenticationRequired)
+		}
+	}
+	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/auth/device?code=482177", "", bearer(impersonatedToken)), TypePermissionDenied)
+	rec := do(t, h, http.MethodGet, "/api/v2/auth/device?code=482177", "", bearer(memberToken))
+	if rec.Code != 200 || !contains(rec.Body.String(), `"client_purpose":"jellyfin_quick_connect"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// An eight-digit code still needs nothing, and a bad token doesn't hurt it.
+	if rec := do(t, h, http.MethodGet, "/api/v2/auth/device?code=4821-7730", "", bearer(expiredToken)); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/approve-handoff", `{"code":"482177"}`, owner)
+	if rec.Code != 200 || rec.Body.String() != `{"status":"approved"}`+"\n" {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve", `{"code":"482177"}`, bearer(memberToken)), TypeConflict)
+	if rec := do(t, h, http.MethodPost, "/api/v2/auth/device/deny", `{"code":"482177"}`, bearer(memberToken)); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestQuickConnectAttemptsRateLimited: a spent Quick Connect code budget is
+// 429 rate_limited with Retry-After.
+func TestQuickConnectAttemptsRateLimited(t *testing.T) {
+	deps := pilotDeps(nil, nil)
+	deps.Devices = fakeDevices{configured: true, err: &handlers.APIError{Status: http.StatusTooManyRequests, Code: "rate_limited", Message: "Too many Quick Connect codes tried. Try again later.", RetryAfter: 90}}
+	rec := do(t, newTestHandler(t, deps), http.MethodGet, "/api/v2/auth/device?code=482177", "", bearer(memberToken))
+	requireProblem(t, rec, TypeRateLimited)
+	if rec.Header().Get("Retry-After") != "90" {
+		t.Fatalf("Retry-After = %q", rec.Header().Get("Retry-After"))
+	}
+}
+
+func TestPollDeviceLogin(t *testing.T) {
+	h := newTestHandler(t, pilotDeps(nil, nil))
+	rec := do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"dev-pending"}`, nil)
+	if rec.Code != 200 || rec.Body.String() != `{"status":"pending","poll_after":5,"opened":false,"expires_at":"2026-01-02T03:14:05.678Z","profile_id":"","profile_token":"","temporary":false}`+"\n" {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// Once an approver has the page open the device keeps its code.
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"dev-opened"}`, nil)
+	if rec.Code != 200 || !contains(rec.Body.String(), `"status":"pending","poll_after":5,"opened":true`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"dev-canceled"}`, nil)
+	if rec.Code != 200 || !contains(rec.Body.String(), `"status":"canceled"`) || contains(rec.Body.String(), "expires_at") {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"dev-approved"}`, nil)
+	if rec.Code != 200 || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	want := `{"status":"approved","poll_after":5,"opened":false,"tokens":{"access_token":"acc","refresh_token":"ref","expires_in":3600,"user":{"id":"1","username":"laura","email":"laura@example.test","role":"user","permissions":[],"download_allowed":true,"password_change_required":false}},"profile_id":"","profile_token":"","temporary":false}` + "\n"
+	if rec.Body.String() != want {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"dev-handoff"}`, nil)
+	if rec.Code != 200 || !contains(rec.Body.String(), `"profile_id":"p-owner","profile_token":"ptok","temporary":true,"session_expires_at":"2026-01-02T05:04:05.678Z"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"nope"}`, nil), TypeNotFound)
+	p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":""}`, nil), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "body.device_code" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{}`, nil), TypeValidationFailed)
+}
+
+// TestDeviceLoginSessionBinding: start accepts only a well-formed binding,
+// the lookup shows a request's binding to the approver, and a bound request
+// is polled only with its secret; anything else is 403
+// device_binding_mismatch. The capability document advertises it.
+func TestDeviceLoginSessionBinding(t *testing.T) {
+	h := newTestHandler(t, pilotDeps(nil, nil))
+	if rec := do(t, h, http.MethodGet, "/api/v2/auth/device/capability", "", nil); rec.Code != 200 || !contains(rec.Body.String(), `"session_binding":true`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodPost, "/api/v2/auth/device/start", `{"binding":"`+fakeBinding+`"}`, nil); rec.Code != 201 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// An empty binding is malformed like any other, not a way to say
+	// "unbound": only omitting the member starts an unbound request.
+	for _, binding := range []string{"", fakeBinding[:42], fakeBinding + "=", fakeBinding[:42] + "+", strings.Repeat("A", 44)} {
+		p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/start", `{"binding":"`+binding+`"}`, nil), TypeValidationFailed)
+		if len(p.Errors) != 1 || p.Errors[0].Location != "body.binding" {
+			t.Fatalf("binding %q: errors = %+v", binding, p.Errors)
+		}
+	}
+
+	rec := do(t, h, http.MethodGet, "/api/v2/auth/device?code=1357-2468", "", nil)
+	if rec.Code != 200 || !contains(rec.Body.String(), `"binding":"`+fakeBinding+`"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+
+	for _, body := range []string{`{"device_code":"dev-bound"}`, `{"device_code":"dev-bound","binding_secret":"` + fakeBinding + `"}`} {
+		p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/poll", body, nil), TypeDeviceBindingMismatch)
+		if p.Status != http.StatusForbidden {
+			t.Fatalf("%s: status = %d", body, p.Status)
+		}
+	}
+	// An oversized secret is refused before it is decoded or hashed.
+	p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"dev-bound","binding_secret":"`+strings.Repeat("A", 65)+`"}`, nil), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "body.binding_secret" {
+		t.Fatalf("oversized secret: errors = %+v", p.Errors)
+	}
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"dev-bound","binding_secret":"`+fakeBindingSecret+`"}`, nil)
+	if rec.Code != 200 || !contains(rec.Body.String(), `"status":"approved"`) || !contains(rec.Body.String(), `"access_token":"acc"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// A secret sent for an unbound request is ignored.
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/poll", `{"device_code":"dev-pending","binding_secret":"`+fakeBindingSecret+`"}`, nil)
+	if rec.Code != 200 || !contains(rec.Body.String(), `"status":"pending"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDecideDeviceLogin(t *testing.T) {
+	h := newTestHandler(t, pilotDeps(nil, nil))
+	rec := do(t, h, http.MethodPost, "/api/v2/auth/device/approve", `{"token":"br-pending"}`, bearer(memberToken))
+	if rec.Code != 200 || rec.Body.String() != `{"status":"approved"}`+"\n" {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/deny", `{"code":"4821-7730"}`, bearer(memberToken))
+	if rec.Code != 200 || rec.Body.String() != `{"status":"denied"}`+"\n" {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
+	rec = do(t, h, http.MethodPost, "/api/v2/auth/device/approve-handoff", `{"token":"br-remote"}`, owner)
+	if rec.Code != 200 || rec.Body.String() != `{"status":"approved"}`+"\n" {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	// Each terminal state keeps its v1 status: 410 expired, 409 consumed/denied, 409 purpose mismatch.
+	p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve", `{"token":"br-expired"}`, bearer(memberToken)), TypeDeviceLoginExpired)
+	if p.Status != http.StatusGone {
+		t.Fatalf("status = %d", p.Status)
+	}
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve", `{"token":"br-consumed"}`, bearer(memberToken)), TypeConflict)
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/deny", `{"token":"br-denied"}`, bearer(memberToken)), TypeConflict)
+	// The device withdrew it: neither decision applies.
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve", `{"token":"br-canceled"}`, bearer(memberToken)), TypeConflict)
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/deny", `{"token":"br-canceled"}`, bearer(memberToken)), TypeConflict)
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve", `{"token":"br-remote"}`, bearer(memberToken)), TypeConflict)
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve-handoff", `{"token":"br-pending"}`, owner), TypeConflict)
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve", `{"token":"nope"}`, bearer(memberToken)), TypeNotFound)
+	// Neither code: named, not forwarded as a lookup of nothing.
+	p = requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve", `{}`, bearer(memberToken)), TypeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Location != "body.code" {
+		t.Fatalf("errors = %+v", p.Errors)
+	}
+	// Only a login session decides: an approval gives the device a session,
+	// which an API key or an impersonation session must not mint.
+	for _, hdr := range []map[string]string{with(bearer(apiKeyToken), "X-Profile-Id", "p-primary"), bearer(impersonatedToken)} {
+		requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve", `{"token":"br-pending"}`, hdr), TypePermissionDenied)
+		requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/deny", `{"token":"br-pending"}`, hdr), TypePermissionDenied)
+		requireProblem(t, do(t, h, http.MethodPost, "/api/v2/auth/device/approve-handoff", `{"token":"br-remote"}`, with(hdr, "X-Profile-Id", "p-owner")), TypePermissionDenied)
+	}
+}
+
+func contains(s, sub string) bool { return strings.Contains(s, sub) }

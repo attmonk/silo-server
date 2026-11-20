@@ -1,0 +1,189 @@
+package jellycompat
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// fakeUserStore embeds userstore.UserStore so only ListProfiles needs an
+// implementation; any other method call panics (the synthesis path must not
+// touch them).
+type fakeUserStore struct {
+	userstore.UserStore
+	profiles []userstore.Profile
+	listErr  error
+}
+
+func (s *fakeUserStore) ListProfiles(context.Context) ([]userstore.Profile, error) {
+	return s.profiles, s.listErr
+}
+
+type fakeUserStoreProvider struct {
+	store    *fakeUserStore
+	forErr   error
+	forCalls int
+}
+
+func (p *fakeUserStoreProvider) ForUser(context.Context, int) (userstore.UserStore, error) {
+	p.forCalls++
+	if p.forErr != nil {
+		return nil, p.forErr
+	}
+	return p.store, nil
+}
+
+func (p *fakeUserStoreProvider) Close() error { return nil }
+
+// adminKeyAuthWithPrimary builds an authenticator backed by an admin key whose
+// account has a non-primary and a primary profile (in that order, so the test
+// proves IsPrimary selection is order-independent).
+func adminKeyAuthWithPrimary(t *testing.T, clock func() time.Time) (*AdminAPIKeyAuthenticator, *fakeUserStoreProvider, *fakeAPIKeyValidator) {
+	t.Helper()
+	validator := &fakeAPIKeyValidator{key: &models.APIKey{ID: 1, UserID: 2, Key: "sa_test"}}
+	users := &fakeAPIKeyUserLoader{user: &models.User{ID: 2, Username: "admin", Role: "admin", Enabled: true}}
+	provider := &fakeUserStoreProvider{store: &fakeUserStore{profiles: []userstore.Profile{
+		{ID: "kids", Name: "Kids", IsPrimary: false},
+		{ID: "p1", Name: "Parent", IsPrimary: true},
+	}}}
+	keyAuth := NewAdminAPIKeyAuthenticator(validator, users, provider, clock)
+	if keyAuth == nil {
+		t.Fatal("expected non-nil authenticator")
+	}
+	return keyAuth, provider, validator
+}
+
+func apiKeyRequest() *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/Items", nil)
+	req.Header.Set("X-Emby-Token", "sa_test")
+	return req
+}
+
+func TestRequireSessionOrAPIKeySession_RejectsNonAdminKey(t *testing.T) {
+	now := fixedNow()
+	clock := func() time.Time { return now }
+	validator := &fakeAPIKeyValidator{key: &models.APIKey{ID: 1, UserID: 2, Key: "sa_test"}}
+	users := &fakeAPIKeyUserLoader{user: &models.User{ID: 2, Username: "bob", Role: "user", Enabled: true}}
+	provider := &fakeUserStoreProvider{store: &fakeUserStore{profiles: []userstore.Profile{{ID: "p1", IsPrimary: true}}}}
+	keyAuth := NewAdminAPIKeyAuthenticator(validator, users, provider, clock)
+	sessionAuth := &Authenticator{sessions: NewSessionStore(time.Hour, clock)}
+
+	h := RequireSessionOrAPIKeySession(sessionAuth, keyAuth)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("handler should not run for a non-admin key")
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, apiKeyRequest())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	// The non-admin account's profiles must never be consulted.
+	if provider.forCalls != 0 {
+		t.Errorf("ForUser calls = %d, want 0 (rejected before synthesis)", provider.forCalls)
+	}
+}
+
+// TestRequireSessionOrAPIKeySession_FallsThroughWhenSynthesisUnavailable guards
+// the regression where the middleware fronts the whole browse group: a nil
+// authenticator or one without a UserStoreProvider must fall through to session
+// auth (clean 401) rather than panic.
+func TestRequireSessionOrAPIKeySession_FallsThroughWhenSynthesisUnavailable(t *testing.T) {
+	now := fixedNow()
+	clock := func() time.Time { return now }
+	sessionAuth := &Authenticator{sessions: NewSessionStore(time.Hour, clock)}
+
+	cases := map[string]*AdminAPIKeyAuthenticator{
+		"nil authenticator": nil,
+		"nil provider": NewAdminAPIKeyAuthenticator(
+			&fakeAPIKeyValidator{key: &models.APIKey{ID: 1, UserID: 2, Key: "sa_test"}},
+			&fakeAPIKeyUserLoader{user: &models.User{ID: 2, Role: "admin", Enabled: true}},
+			nil, clock,
+		),
+	}
+	for name, keyAuth := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := RequireSessionOrAPIKeySession(sessionAuth, keyAuth)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Fatal("handler should not run without a valid session")
+			}))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, apiKeyRequest()) // must not panic
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+// TestResolveSession_RevocationIsImmediate: once a key is revoked, the very next
+// request fails — no cached authorization decision survives (Finding 2).
+func TestResolveSession_RevocationIsImmediate(t *testing.T) {
+	now := fixedNow()
+	clock := func() time.Time { return now }
+	keyAuth, _, validator := adminKeyAuthWithPrimary(t, clock)
+	ctx := context.Background()
+
+	if s, _, handled := keyAuth.resolveSession(ctx, "sa_test"); !handled || s == nil {
+		t.Fatal("initial resolve should succeed")
+	}
+	validator.key = nil // revoke: GetByKey now returns not-found
+
+	s, res, handled := keyAuth.resolveSession(ctx, "sa_test")
+	if !handled {
+		t.Fatal("expected handled=true for an sa_ token")
+	}
+	if s != nil || res.ok {
+		t.Fatalf("revoked key must not resolve a session; got session=%v ok=%v", s != nil, res.ok)
+	}
+	if res.status != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", res.status)
+	}
+}
+
+// TestPlaybackSessionAuth_APIKeyViaPlaySessionId: HLS follow-up requests carry
+// only PlaySessionId. When the negotiated session's CompatToken is an sa_ key,
+// PlaybackSessionAuth must still resolve it (Finding 1).
+func TestPlaybackSessionAuth_APIKeyViaPlaySessionId(t *testing.T) {
+	now := fixedNow()
+	clock := func() time.Time { return now }
+	keyAuth, _, _ := adminKeyAuthWithPrimary(t, clock)
+	sessions := NewSessionStore(time.Hour, clock)
+	playback := NewPlaybackSessionStore(time.Hour, clock)
+	playback.Put(PlaybackSession{ID: "ps1", CompatToken: "sa_test", RouteItemID: "x"})
+
+	var got *Session
+	h := PlaybackSessionAuth(sessions, playback, keyAuth, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = SessionFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// No token header / no api_key — only PlaySessionId, like an HLS segment URL.
+	req := requestWithCompatRouteItem(httptest.NewRequest(http.MethodGet, "/Videos/x/hls/p/seg0.ts?PlaySessionId=ps1", nil), "x")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got == nil || got.Token != "sa_test" || got.StreamAppUserID != 2 {
+		t.Fatalf("expected synthesized api-key session (token sa_test, user 2); got %+v", got)
+	}
+}
+
+func TestRouter_UsersRequiresAuth(t *testing.T) {
+	cfg, err := config.LoadFromDB(map[string]string{})
+	if err != nil {
+		t.Fatalf("LoadFromDB: %v", err)
+	}
+	router := NewRouter(Dependencies{Config: cfg})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Users", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /Users status = %d, want 401", rec.Code)
+	}
+}

@@ -1,0 +1,5507 @@
+// Keep default listeners on TCP to reduce CVE-2026-98432 exposure on Linux.
+//go:debug multipathtcp=0
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime/debug"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/hashicorp/go-hclog"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	sdkcapability "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/capability"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/activitylog"
+	"github.com/Silo-Server/silo-server/internal/adminjob"
+	"github.com/Silo-Server/silo-server/internal/animeids"
+	"github.com/Silo-Server/silo-server/internal/api"
+	"github.com/Silo-Server/silo-server/internal/api/handlers"
+	"github.com/Silo-Server/silo-server/internal/apiusage"
+	"github.com/Silo-Server/silo-server/internal/apiv2"
+	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/artworkurl"
+	"github.com/Silo-Server/silo-server/internal/audiobooks"
+	"github.com/Silo-Server/silo-server/internal/audiobooks/abs"
+	"github.com/Silo-Server/silo-server/internal/audiobooks/podcastfeed"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/autoscan"
+	"github.com/Silo-Server/silo-server/internal/backup"
+	"github.com/Silo-Server/silo-server/internal/blobgc"
+	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/boxsets"
+	"github.com/Silo-Server/silo-server/internal/branding"
+	"github.com/Silo-Server/silo-server/internal/buildinfo"
+	"github.com/Silo-Server/silo-server/internal/cache"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/catalogseed"
+	"github.com/Silo-Server/silo-server/internal/chapterthumbs"
+	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/dashmetrics"
+	"github.com/Silo-Server/silo-server/internal/database"
+	"github.com/Silo-Server/silo-server/internal/database/pglock"
+	"github.com/Silo-Server/silo-server/internal/database/queryattr"
+	"github.com/Silo-Server/silo-server/internal/diagnostics"
+	"github.com/Silo-Server/silo-server/internal/downloads"
+	"github.com/Silo-Server/silo-server/internal/ebooks"
+	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/extrastills"
+	"github.com/Silo-Server/silo-server/internal/historyimport"
+	"github.com/Silo-Server/silo-server/internal/idgen"
+	"github.com/Silo-Server/silo-server/internal/imagecache"
+	"github.com/Silo-Server/silo-server/internal/intromarkers"
+	"github.com/Silo-Server/silo-server/internal/jellycompat"
+	"github.com/Silo-Server/silo-server/internal/keptsub"
+	"github.com/Silo-Server/silo-server/internal/lantls"
+	"github.com/Silo-Server/silo-server/internal/libraryingest"
+	"github.com/Silo-Server/silo-server/internal/librarymonitor"
+	"github.com/Silo-Server/silo-server/internal/literaryworks"
+	"github.com/Silo-Server/silo-server/internal/locationpref"
+	"github.com/Silo-Server/silo-server/internal/logfilter"
+	"github.com/Silo-Server/silo-server/internal/logredact"
+	"github.com/Silo-Server/silo-server/internal/logstream"
+	"github.com/Silo-Server/silo-server/internal/mail"
+	"github.com/Silo-Server/silo-server/internal/manga"
+	"github.com/Silo-Server/silo-server/internal/markers"
+	"github.com/Silo-Server/silo-server/internal/mdblist"
+	"github.com/Silo-Server/silo-server/internal/mediaartifact"
+	"github.com/Silo-Server/silo-server/internal/metadata"
+	"github.com/Silo-Server/silo-server/internal/metadata/tmdb"
+	"github.com/Silo-Server/silo-server/internal/netaccess"
+	"github.com/Silo-Server/silo-server/internal/netadmin"
+	"github.com/Silo-Server/silo-server/internal/overlays"
+
+	// Built-in metadata providers self-register into the metadata package's
+	// builtin registry on import; buildProviders resolves their seeded chain
+	// entries in-process (no gRPC).
+	_ "github.com/Silo-Server/silo-server/internal/metadata/nfo"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/nodeauth"
+	"github.com/Silo-Server/silo-server/internal/nodeconfig"
+	"github.com/Silo-Server/silo-server/internal/nodemetrics"
+	"github.com/Silo-Server/silo-server/internal/nodepool"
+	"github.com/Silo-Server/silo-server/internal/noderecipe"
+	"github.com/Silo-Server/silo-server/internal/nodesessions"
+	"github.com/Silo-Server/silo-server/internal/nodesource"
+	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/opslog"
+	"github.com/Silo-Server/silo-server/internal/partman"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/playback/planstore"
+	"github.com/Silo-Server/silo-server/internal/pluginhost"
+	"github.com/Silo-Server/silo-server/internal/plugins"
+	"github.com/Silo-Server/silo-server/internal/policy"
+	"github.com/Silo-Server/silo-server/internal/proxy"
+	"github.com/Silo-Server/silo-server/internal/ratelimit"
+	"github.com/Silo-Server/silo-server/internal/ratingsources"
+	"github.com/Silo-Server/silo-server/internal/recommendations"
+	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
+	"github.com/Silo-Server/silo-server/internal/requests/discoverrows"
+	"github.com/Silo-Server/silo-server/internal/s3client"
+	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/scanqueue"
+	"github.com/Silo-Server/silo-server/internal/secret"
+	"github.com/Silo-Server/silo-server/internal/sections"
+	"github.com/Silo-Server/silo-server/internal/server"
+	"github.com/Silo-Server/silo-server/internal/serveridentity"
+	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	"github.com/Silo-Server/silo-server/internal/storagetransition"
+	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
+	"github.com/Silo-Server/silo-server/internal/taskmanager"
+	taskrepository "github.com/Silo-Server/silo-server/internal/taskmanager/repository"
+	"github.com/Silo-Server/silo-server/internal/taskmanager/tasks"
+	"github.com/Silo-Server/silo-server/internal/taskmanager/triggers"
+	"github.com/Silo-Server/silo-server/internal/tcpcongestion"
+	"github.com/Silo-Server/silo-server/internal/telemetry"
+	"github.com/Silo-Server/silo-server/internal/transcodenode"
+	"github.com/Silo-Server/silo-server/internal/trickplay"
+	"github.com/Silo-Server/silo-server/internal/tuning"
+	"github.com/Silo-Server/silo-server/internal/usercollections"
+	"github.com/Silo-Server/silo-server/internal/userdb"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/userstore/pgstore"
+	"github.com/Silo-Server/silo-server/internal/watchlist"
+	"github.com/Silo-Server/silo-server/internal/watchstate"
+	"github.com/Silo-Server/silo-server/internal/watchsync"
+	"github.com/Silo-Server/silo-server/internal/worker"
+	"github.com/Silo-Server/silo-server/internal/workmetrics"
+	"github.com/Silo-Server/silo-server/migrations"
+	siloweb "github.com/Silo-Server/silo-server/web"
+)
+
+const serverModeTranscode = "transcode"
+
+// serverModeProxy is MODE for a proxy node.
+const serverModeProxy = "proxy"
+
+// resolveNodeIdentity returns a stable node identifier used by the
+// heartbeat writer, reconciler, and shutdown cleanup. Resolution order:
+// SILO_NODE_NAME > NODE_NAME > os.Hostname().
+func resolveNodeIdentity() string {
+	if v := os.Getenv("SILO_NODE_NAME"); v != "" {
+		return v
+	}
+	if v := os.Getenv("NODE_NAME"); v != "" {
+		return v
+	}
+	h, _ := os.Hostname()
+	return h
+}
+
+// nodeCapabilityFetcher adapts the authenticated node capability client to the
+// node health sweep, which stores capability reports opaquely.
+//
+// What is persisted is the node's own response bytes, not this server's
+// re-marshaling of the decoded struct. The two differ exactly when the node is
+// newer than the API server reading it, which is every rolling upgrade: a
+// re-marshal drops the fields this build has no struct member for, and stores
+// the truncation under the node's hash. After the API is upgraded the sweep
+// then sees the hashes agree and never refetches, leaving the durable inventory
+// permanently missing fields the new code reads. The bytes are bounded and
+// already parsed by the client, so storing them verbatim costs nothing but
+// keeps the payload honest about the hash filed with it.
+//
+// The hash comes out of the payload itself, because only the node knows what it
+// hashed. A report without one is refused rather than given a synthetic hash,
+// which would make an old node look like it had capability tracking.
+// The request bound comes from budget rather than a constant. A cold node's
+// answer runs the whole FFmpeg probe matrix, and the size of that matrix is a
+// function of how many hardware devices that node will actually probe — two
+// render devices legitimately push the advertised budget past two minutes.
+// Bounding every fetch at a fixed two minutes abandons such a node mid-probe
+// and reports a fetch failure for a node operating inside its published
+// contract. budget takes the node because the device set is a per-node
+// property: an hw_device override is exactly a node that probes a different
+// matrix from the one the cluster setting describes.
+//
+// The node's row says which kind of worker it is, and so which key signs the
+// request: a transcode node's own, or the shared secret for a proxy.
+func nodeCapabilityFetcher(keys nodeauth.Keyring, budget func(*nodepool.Node) time.Duration) nodepool.CapabilityFetcher {
+	client := &http.Client{}
+	return func(ctx context.Context, node *nodepool.Node) ([]byte, string, error) {
+		if node == nil {
+			return nil, "", fmt.Errorf("node capability request has no node")
+		}
+		ctx, cancel := context.WithTimeout(ctx, budget(node))
+		defer cancel()
+		info, payload, status, err := transcodenode.FetchHWCapabilitiesPayload(ctx, client, node.URL, node.SignTarget(), keys)
+		if err != nil {
+			return nil, "", err
+		}
+		if status != http.StatusOK {
+			return nil, "", fmt.Errorf("node capability request returned status %d", status)
+		}
+		return payload, info.CapabilityHash, nil
+	}
+}
+
+// libraryPathProvider adapts the folder repository to the sampler's media-root
+// provider.
+//
+// It runs on the sampling goroutine every interval, so it is bounded separately
+// from the caller's context: a database that has stopped answering must cost one
+// interval's disk sampling, not the sampler.
+func libraryPathProvider(repo *catalog.FolderRepository) func(context.Context) []string {
+	if repo == nil {
+		return nil
+	}
+	return cachedLibraryPaths(func(ctx context.Context) ([]string, error) {
+		queryCtx, cancel := context.WithTimeout(ctx, libraryPathQueryTimeout)
+		defer cancel()
+		return repo.DistinctLibraryPaths(queryCtx)
+	})
+}
+
+// cachedLibraryPaths wraps a library-root query so a failed read reuses the last
+// set that succeeded.
+//
+// Returning nothing on error is not the harmless degradation it looks like. The
+// sampler treats the returned set as the whole truth: refreshDisks prunes every
+// path outside it — dropping the cached capacity readings with it — and
+// diskStats omits them from the sample. A two-second database hiccup would
+// therefore blank every library mount from the admin resource panel and from
+// Prometheus, and leave the next pass reporting them unavailable until fresh
+// probes land, all while the mounts themselves are perfectly healthy. Only the
+// query failed, so the previous answer is still the best one available.
+//
+// An empty result that the database actually returned is cached like any other:
+// an operator who removed their last library has genuinely no roots.
+func cachedLibraryPaths(query func(context.Context) ([]string, error)) func(context.Context) []string {
+	var (
+		mu       sync.Mutex
+		lastGood []string
+	)
+	return func(ctx context.Context) []string {
+		paths, err := query(ctx)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			slog.DebugContext(ctx, "library paths unavailable for resource sampling; reusing the last known set",
+				"component", "app", "error", err, "roots", len(lastGood))
+			return slices.Clone(lastGood)
+		}
+		lastGood = slices.Clone(paths)
+		return paths
+	}
+}
+
+// libraryPathQueryTimeout bounds the per-sample library root lookup.
+const libraryPathQueryTimeout = 2 * time.Second
+
+// nodeCapabilityRequestTimeout is the floor under one capability request.
+//
+// The real bound is the node's own advertised probe budget, which
+// nodeCapabilityProbeBudget computes from the configured hardware — that grows
+// with the device count and passes two minutes at two devices. This floor covers
+// the rest of what a fetch does (transport, a node answering from a warm cache
+// but under load) and keeps a misconfigured or unreadable setting from
+// producing an absurdly small bound. The fetch runs detached from the health
+// sweep, so a generous bound costs the sweep nothing and lets a cold node's
+// first report land instead of timing out.
+const nodeCapabilityRequestTimeout = 2 * time.Minute
+
+// nodeCapabilityProbeBudget reports how long to allow one node's capability
+// fetch.
+//
+// The cluster settings are read live on every call, so an operator adding a
+// second render device does not have to restart the API for its fetches to stop
+// being cut short. The node's own overrides win over them, because the worker
+// builds its probe matrix from the policy it will actually run: a node that
+// overrides hw_device with two devices needs the two-device budget even on a
+// cluster configured with one, and it is precisely that node whose inventory
+// would otherwise fail to refresh every sweep.
+func nodeCapabilityProbeBudget(live func() *config.Config) func(*nodepool.Node) time.Duration {
+	return func(node *nodepool.Node) time.Duration {
+		hwAccel, hwDevice := "", ""
+		if live != nil {
+			if current := live(); current != nil {
+				hwAccel, hwDevice = current.Playback.HWAccel, current.Playback.HWDevice
+			}
+		}
+		// The same ladder every other caller prices a node's capability read
+		// with — its own advertisement, then its own policy, then this floor —
+		// so the sweep, the re-probe, and the two planning paths cannot end up
+		// allowing different amounts of time for one node's matrix.
+		return playback.ColdCapabilityRequestTimeout(
+			node.StoredCapabilities(),
+			node.EffectiveHWAccel(hwAccel),
+			node.EffectiveHWDevice(hwDevice),
+			nodeCapabilityRequestTimeout,
+		)
+	}
+}
+
+func clientIPResolverFromConfig(cfg *config.Config) (*clientip.Resolver, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("config is not loaded")
+	}
+	raw := cfg.ClientIP.TrustedProxies
+	if raw == "" {
+		raw = clientip.DefaultTrustedProxies
+	}
+	cidrs, err := clientip.ParseCIDRs(raw)
+	if err != nil {
+		return nil, err
+	}
+	return clientip.NewResolver(cidrs), nil
+}
+
+func registerClientIPConfigReload(watcher *nodeconfig.Watcher, resolver *clientip.Resolver) {
+	watcher.OnChange(func(old, updated *config.Config) {
+		if old != nil && old.ClientIP.TrustedProxies == updated.ClientIP.TrustedProxies {
+			return
+		}
+		raw := updated.ClientIP.TrustedProxies
+		if raw == "" {
+			raw = clientip.DefaultTrustedProxies
+		}
+		cidrs, err := clientip.ParseCIDRs(raw)
+		if err != nil {
+			slog.WarnContext(context.Background(), "clientip config reload failed", "component", "app", "error", err)
+			return
+		}
+		resolver.UpdateTrustedCIDRs(cidrs)
+	})
+}
+
+// newStreamTelemetryRegistry builds the telemetry registry for this process,
+// preferring the Redis-backed store in distributed mode. Distributed mode is
+// derived from whether Redis is configured unless the operator pinned
+// SILO_STREAM_TELEMETRY_DISTRIBUTED: a single-process deployment then stays on
+// the local store and a clustered one merges, without either being asked to set
+// a variable that only restates its own topology. Every process builds its
+// registry here, so the derivation belongs in this function rather than at the
+// call sites. It never falls back to LocalStore on a failed ping:
+// cache.NewRedisClient builds a lazy client that never dials, and a Redis
+// restart mid-deploy must not strand a publisher local-only for the life of the
+// process.
+func newStreamTelemetryRegistry(ctx context.Context, nodeID string, redisClient *redis.Client) *streamtelemetry.Registry {
+	streamTelemetryConfig := streamtelemetry.ConfigFromEnv(nodeID)
+	if !streamTelemetryConfig.DistributedExplicit {
+		streamTelemetryConfig.Distributed = redisClient != nil
+	}
+	store := streamtelemetry.GlobalSnapshotStore(streamtelemetry.NewLocalStore())
+	if streamTelemetryConfig.Enabled && streamTelemetryConfig.Distributed {
+		if redisClient != nil {
+			store = streamtelemetry.NewRedisStore(redisClient, streamTelemetryConfig, slog.Default())
+			pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
+			if pingErr := redisClient.Ping(pingCtx).Err(); pingErr != nil {
+				slog.ErrorContext(ctx, "stream telemetry distributed mode cannot reach redis; publisher will retry each sweep", "address", redisClient.Options().Addr, "error", pingErr)
+			}
+			pingCancel()
+		} else {
+			slog.ErrorContext(ctx, "stream telemetry distributed mode requested but redis is not configured; using local store")
+		}
+	}
+	if streamTelemetryConfig.Enabled {
+		slog.InfoContext(ctx, "stream telemetry observing families",
+			"families", strings.Join(streamTelemetryConfig.ObservedFamilies(), ","))
+	}
+	return streamtelemetry.NewRegistry(streamTelemetryConfig, store, slog.Default())
+}
+
+// newStreamTelemetryViewCache builds the bounded-staleness cache the admin
+// parity endpoint reads. It shares one cached view across every reader so the
+// merged rebuild is paid at most once per TTL, not once per request.
+func newStreamTelemetryViewCache(registry *streamtelemetry.Registry) *streamtelemetry.ViewCache {
+	if registry == nil {
+		return nil
+	}
+	// Reads the TTL off the registry rather than calling ConfigFromEnv again:
+	// a second parse logs every invalid variable twice and the two calls could
+	// disagree if the environment changed between them.
+	return streamtelemetry.NewViewCache(registry, registry.ViewTTL(), slog.Default())
+}
+
+// resolvePluginCacheDir returns the plugin cache root. The default sits in the
+// shared temp dir, where another local account could create it first and plant
+// plugin binaries, so it must be a private directory this user owns. A dir set
+// with SILO_PLUGIN_CACHE_DIR is the operator's to secure: container bind
+// mounts there are often owned by another uid on the host.
+func resolvePluginCacheDir() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("SILO_PLUGIN_CACHE_DIR")); v != "" {
+		return v, nil
+	}
+	dir := filepath.Join(os.TempDir(), "silo-plugins")
+	if err := plugins.EnsurePrivateCacheRoot(dir); err != nil {
+		return "", fmt.Errorf("%w; set SILO_PLUGIN_CACHE_DIR to a directory only the Silo user can write", err)
+	}
+	return dir, nil
+}
+
+func buildBaseHandler(format string, level slog.Leveler, otelHandler slog.Handler) slog.Handler {
+	opts := &slog.HandlerOptions{Level: level}
+	var console slog.Handler
+	if strings.EqualFold(format, "json") {
+		console = slog.NewJSONHandler(os.Stderr, opts)
+	} else {
+		console = slog.NewTextHandler(os.Stderr, opts)
+	}
+	if otelHandler == nil {
+		// Redact secrets before they reach stderr (the opslog DB path redacts
+		// separately when flattening rows).
+		return logredact.New(console)
+	}
+	// Fan out to the console and the OTel bridge. The OTel branch is level-gated
+	// by the shared level var so console and OTLP share one verbosity knob (see
+	// telemetry.LevelGated) — otherwise slog.MultiHandler.Enabled would OR the
+	// branches and export Debug records while stderr stays silent. The whole
+	// fan-out is wrapped in secret redaction so console and OTLP both emit
+	// masked output (the opslog DB path redacts separately).
+	return logredact.New(telemetry.FanOut(console, telemetry.LevelGated(otelHandler, level)))
+}
+
+func parseLogLevel(level string) slog.Level {
+	switch strings.ToLower(level) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+func mustGetSetting(store interface {
+	Get(context.Context, string) (string, error)
+}, ctx context.Context, key, fallback string) string {
+	value, err := store.Get(ctx, key)
+	if err != nil || strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+// logBufferSize bounds each node's in-memory queue of log entries awaiting a
+// batch insert; a full queue drops entries and counts them.
+const logBufferSize = 10000
+
+// logDrainStopTimeout bounds how long shutdown waits for a log consumer's
+// final flush.
+const logDrainStopTimeout = 5 * time.Second
+
+// startLogDrain runs a log consumer on its own context rather than appCtx: the
+// graceful shutdown sequence keeps logging after appCtx is canceled, and those
+// entries should still reach Postgres. stop cancels the consumer and waits,
+// bounded, for its final flush.
+func startLogDrain(run func(context.Context)) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run(ctx)
+	}()
+	return func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(logDrainStopTimeout):
+		}
+	}
+}
+
+// configureActivityLogging queues activity log entries in memory on this node
+// and persists them in batches, so the request path never waits on Redis or
+// Postgres. stop flushes what is queued.
+func configureActivityLogging(pool *pgxpool.Pool, logStreamHub *logstream.Hub) (activitylog.Writer, func()) {
+	buffer := logstream.NewBuffer[activitylog.LogEntry](logstream.StreamAudit, logBufferSize)
+	consumer := activitylog.NewConsumer(pool, logStreamHub)
+	return buffer, startLogDrain(func(ctx context.Context) { consumer.Run(ctx, buffer.Chan()) })
+}
+
+// keptSubtitleStore is where embedded subtitle tracks read whole are kept.
+// They come from users' media, so never a store whose objects are delivered
+// outside the server's own authorization: the operational store, which is a
+// private bucket or the local root that holds operational blobs, or, with
+// neither, the assets bucket only while its reads are presigned. A public or
+// token-delivered assets bucket gets nil, and nothing is kept: tracks are
+// read through their index or demuxed instead.
+func keptSubtitleStore(stores blobstore.Stores, assetsS3 *s3client.Client) blobstore.Store {
+	if stores.Operational != nil {
+		return stores.Operational
+	}
+	if stores.Assets != nil && assetsS3 != nil && !assetsS3.UsesExternalAuth() {
+		return stores.Assets
+	}
+	return nil
+}
+
+// configureOperationalLogging installs the slog default that captures records
+// into this node's in-memory operational log queue. stop flushes what is
+// queued.
+func configureOperationalLogging(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	settingsRepo catalog.SettingsStore,
+	logStreamHub *logstream.Hub,
+	filteredHandler slog.Handler,
+	nodeID string,
+) (repo *opslog.Repo, pm *partman.Manager, stop func()) {
+	if err := opslog.SeedDefaults(ctx, settingsRepo); err != nil {
+		log.Fatalf("seed opslog defaults: %v", err)
+	}
+	if err := diagnostics.SeedDefaults(ctx, settingsRepo); err != nil {
+		log.Fatalf("seed diagnostics defaults: %v", err)
+	}
+	opsPM := partman.NewManager(pool, "operational_logs", partman.Daily, 3)
+	if err := opsPM.EnsureFuturePartitions(ctx); err != nil {
+		// Non-fatal: a partition hiccup must not crash-loop the server (see the
+		// operational_logs partition incident). Writes fall back to the default
+		// partition and the periodic cleanup retries EnsureFuturePartitions.
+		slog.WarnContext(ctx, "ensure operational log partitions; continuing in degraded mode", "component", "app", "error", err)
+	}
+
+	buffer := logstream.NewBuffer[opslog.Entry](logstream.StreamApp, logBufferSize)
+	consumer := opslog.NewConsumer(pool, logStreamHub)
+	stop = startLogDrain(func(ctx context.Context) { consumer.Run(ctx, buffer.Chan()) })
+
+	opsCaptureLevel := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(mustGetSetting(settingsRepo, ctx, "opslog.capture_level", "info"))) {
+	case "debug":
+		opsCaptureLevel = slog.LevelDebug
+	case "warn", "warning":
+		opsCaptureLevel = slog.LevelWarn
+	case "error":
+		opsCaptureLevel = slog.LevelError
+	}
+
+	slog.SetDefault(slog.New(opslog.NewHandler(filteredHandler, buffer, opsCaptureLevel, nodeID)))
+
+	return opslog.NewRepo(pool), opsPM, stop
+}
+
+func maybeApplyPostgresTuning(ctx context.Context, pool *pgxpool.Pool, appMaxConnections int, mode string) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "integrated", "api":
+	default:
+		return
+	}
+
+	opts, err := database.LoadPostgresTuneOptionsFromEnv(appMaxConnections)
+	if err != nil {
+		slog.WarnContext(ctx, "postgres auto-tuning disabled", "component", "app", "error", err)
+		return
+	}
+	if !opts.Enabled {
+		return
+	}
+
+	tuneCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	result, err := database.ApplyPostgresTuning(tuneCtx, pool, opts)
+	for _, failure := range result.Failures {
+		slog.WarnContext(ctx, "postgres auto-tuning setting failed", "component", "app",
+			"name", failure.Name,
+			"value", failure.Value,
+			"error", failure.Err,
+		)
+	}
+	if err != nil {
+		slog.WarnContext(ctx, "postgres auto-tuning failed", "component", "app",
+			"error", err,
+			"applied", result.Applied,
+			"failures", len(result.Failures),
+		)
+		return
+	}
+
+	slog.InfoContext(ctx, "postgres auto-tuning applied", "component", "app",
+		"profile", opts.Profile,
+		"postgres_major", result.PostgresMajorVersion,
+		"settings", result.Applied,
+		"resets", len(result.Reset),
+		"failures", len(result.Failures),
+		"memory_budget_bytes", opts.MemoryBudgetBytes,
+		"detected_memory_bytes", opts.DetectedMemoryBytes,
+		"memory_source", opts.MemorySource,
+		"memory_budget_percent", opts.MemoryBudgetPercent,
+		"cpus", opts.CPUs,
+		"detected_cpus", opts.DetectedCPUs,
+		"connections", opts.Connections,
+		"storage", opts.Storage,
+		"db_size", result.DBSize,
+		"database_size_bytes", result.DatabaseSizeBytes,
+	)
+	if len(result.RestartRequired) > 0 {
+		slog.WarnContext(ctx, "postgres restart required to finish applying auto-tuned settings", "component", "app",
+			"settings", strings.Join(result.RestartRequired, ","),
+		)
+	}
+	if len(result.Reset) > 0 {
+		slog.InfoContext(ctx, "postgres auto-tuning reset stale settings", "component", "app",
+			"settings", strings.Join(result.Reset, ","),
+		)
+	}
+}
+
+// runCredentialBackfills sweeps any plaintext server-owned credential to
+// ciphertext on the primary (migration-running) node. All passes are
+// best-effort: a failed row leaves the prior plaintext (no new exposure) and
+// still reads via the read-path pass-through, so a backfill error must never
+// block boot. The sensitive-settings pass runs first so the arr
+// resolve-then-encrypt pass sees consistent referenced settings.
+// librarySettingsCleaner wires the per-user canonical settings cleanup the
+// library delete job runs, or nil when the user store is unavailable — the
+// executor treats a nil cleaner as "skip".
+func librarySettingsCleaner(pool *pgxpool.Pool, stores userstore.UserStoreProvider) adminjob.LibrarySettingsCleaner {
+	if pool == nil || stores == nil {
+		return nil
+	}
+	return userstore.NewSettingValuesCleaner(auth.NewUserRepository(pool), stores)
+}
+
+// convertLegacyAIProviders moves AI endpoints saved by older builds into the
+// provider registry, once. Every API node may run it; the settings lock makes
+// the first one do the work and the rest find nothing left to convert. A
+// failure leaves those jobs unconfigured rather than stopping the server.
+func convertLegacyAIProviders(ctx context.Context, settings *catalog.EncryptedSettingsRepo) {
+	converted := false
+	var unconverted []string
+	err := settings.UpdateAtomic(ctx, func(current map[string]string) (map[string]string, error) {
+		writes, refused, err := config.PlanAIProviderConversion(current)
+		converted, unconverted = len(writes) > 0, refused
+		return writes, err
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "AI provider conversion failed", "component", "app", "error", err)
+		return
+	}
+	if converted {
+		slog.InfoContext(ctx, "AI endpoints converted to providers", "component", "app")
+	}
+	if len(unconverted) > 0 {
+		// Only setting names: the refused URLs can carry credentials.
+		slog.WarnContext(ctx, "AI endpoints not converted: provider addresses cannot carry credentials or a query; connect these providers again in AI Services",
+			"component", "app", "settings", unconverted)
+	}
+}
+
+// settingsLoadError formats a startup settings read failure. A SECRET_KEY
+// mismatch gets the fix and this key's check value, which the GCM error alone
+// does not point to.
+func settingsLoadError(err error, secretKey []byte) string {
+	if !errors.Is(err, catalog.ErrSecretKeyMismatch) {
+		return fmt.Sprintf("loading settings: %v", err)
+	}
+	check, cerr := secret.KeyCheckValue(secretKey)
+	if cerr != nil {
+		check = "unavailable"
+	}
+	return fmt.Sprintf("loading settings: %v\n"+
+		"This server's SECRET_KEY has check value %s. "+
+		"Every API server and proxy node that uses this database needs the SECRET_KEY it was encrypted with; "+
+		"a transcode node's node key is a different credential. Restore the original key and restart. "+
+		"To compare keys, run: printf %%s \"$SECRET_KEY\" | silo secret check", err, check)
+}
+
+func runCredentialBackfills(ctx context.Context, pool *pgxpool.Pool, cipher *secret.Cipher, settings *catalog.EncryptedSettingsRepo) {
+	settingsN, err := settings.BackfillSensitiveSettings(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "secret backfill: sensitive settings", "component", "app", "error", err)
+	}
+	columnsN, err := secret.BackfillColumns(ctx, pool, cipher, secret.ColumnBackfillTargets())
+	if err != nil {
+		slog.ErrorContext(ctx, "secret backfill: credential columns", "component", "app", "error", err)
+	}
+	historyServersN, err := historyimport.NewRepository(pool, cipher).BackfillSessionServerSecrets(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "secret backfill: history import session server credentials", "component", "app", "error", err)
+	}
+	// The arr resolver is the encrypting settings decorator: it decrypts a
+	// sensitive target (e.g. requests.radarr.api_key) or passes through a
+	// plaintext custom key, exactly replicating the deleted resolveAPIKey.
+	arrN, err := secret.BackfillReferencedColumns(ctx, pool, cipher, settings.Get, secret.ArrKeyBackfillTargets())
+	if err != nil {
+		slog.ErrorContext(ctx, "secret backfill: arr api keys", "component", "app", "error", err)
+	}
+	pluginConfigsN, err := plugins.NewRuntimeConfigStore(pool, cipher).BackfillEncryptedConfigs(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "secret backfill: plugin runtime configs", "component", "app", "error", err)
+	}
+	if total := settingsN + columnsN + historyServersN + arrN + pluginConfigsN; total > 0 {
+		slog.InfoContext(ctx, "secret backfill: encrypted plaintext credentials at rest", "component", "app",
+			"settings", settingsN, "columns", columnsN, "history_session_servers", historyServersN,
+			"arr_keys", arrN, "plugin_configs", pluginConfigsN, "total", total)
+	}
+}
+
+func runCompatWebCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: silo compat-web {status|install|update|remove}")
+	}
+	command := args[0]
+	flags := flag.NewFlagSet("compat-web "+command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	root := flags.String("dir", config.DefaultJellyfinWebInstallDir, "Jellyfin Web component install root")
+	version := flags.String("version", config.DefaultJellyfinWebVersion, "Jellyfin Web version without leading v")
+	source := flags.String("source", jellycompat.DefaultWebSourceURL, "upstream jellyfin-web git repository")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	switch command {
+	case "status":
+		status := jellycompat.WebComponentStatusForConfig(&config.Config{
+			JellyfinCompat: config.JellyfinCompatConfig{
+				Enabled:       false,
+				WebVersion:    *version,
+				WebInstallDir: *root,
+				WebDir:        filepath.Join(*root, "current"),
+			},
+		}, map[string]string{
+			"jellyfin_compat.web_source_url": *source,
+		})
+		return json.NewEncoder(os.Stdout).Encode(status)
+	case "install", "update":
+		status, err := jellycompat.InstallWebComponent(ctx, jellycompat.WebComponentInstallOptions{
+			InstallRoot: *root,
+			SourceURL:   *source,
+			Version:     *version,
+		})
+		_ = json.NewEncoder(os.Stdout).Encode(status)
+		return err
+	case "remove":
+		return jellycompat.RemoveWebComponent(*root)
+	default:
+		return fmt.Errorf("unknown compat-web command %q", command)
+	}
+}
+
+// normalizeLoadedConfig repairs derived config values after every load: the
+// DB-seeded default is Jellyfin's Linux-only ffmpeg path, so resolve it
+// through the same discovery the playback pipeline uses. Registered as an
+// OnLoad hook on both config watchers so hot reloads cannot restore the
+// seeded value, and applied to the startup snapshot before the watchers run.
+func normalizeLoadedConfig(cfg *config.Config) {
+	cfg.Playback.FFmpegPath = playback.ResolveFFmpegPath(cfg.Playback.FFmpegPath)
+}
+
+// applyBootstrapOverrides replaces the settings the process environment owns
+// in a config built from the database.
+func applyBootstrapOverrides(cfg *config.Config, bc *config.BootstrapConfig) {
+	cfg.Server.Listen = bc.Listen
+	cfg.Server.Mode = bc.Mode
+	cfg.Database.URL = bc.DatabaseURL
+	cfg.JellyfinCompat.Listen = bc.JFListen
+	cfg.AudiobookshelfCompat = cfg.AudiobookshelfCompat.WithBootstrapListen(bc.ABSListen)
+	cfg.Redis = cfg.Redis.WithBootstrapURL(bc.RedisURL)
+}
+
+// addRedisBootstrapSettings records what REDIS_URL supplies to this process
+// in the maps the admin settings handlers read: the keys an admin cannot save
+// here and the values in effect. REDIS_URL names the database number too, so
+// redis.db is one of them and reports the number in use. With a value the
+// parser cannot read, a server that stays up has only the event bus connected,
+// to a bare address and on database 0.
+func addRedisBootstrapSettings(redisURL string, configured map[string]bool, values, vars map[string]string) {
+	if redisURL == "" {
+		return
+	}
+	configured["redis.url"] = true
+	values["redis.url"] = redisURL
+	vars["redis.url"] = "REDIS_URL"
+	configured[config.RedisDBSettingKey] = true
+	vars[config.RedisDBSettingKey] = "REDIS_URL"
+	db, _ := (config.RedisConfig{URL: redisURL}).Database()
+	values[config.RedisDBSettingKey] = strconv.Itoa(db)
+}
+
+// main starts the Silo server or a requested maintenance command.
+func main() {
+	var storageAdmission *pglock.NodeAdmission
+	// The admission session is detached from the pool and lives until process
+	// exit. Worker Stop methods do not all wait for in-flight writes, so closing
+	// the session in a defer could admit another node while this one still has
+	// a writer. Process exit stops those goroutines and closes the socket.
+	if err := telemetry.ConfigureRuntimeMetrics(); err != nil {
+		slog.Warn("runtime metrics configuration failed", "error", err)
+	}
+	if len(os.Args) > 1 && os.Args[1] == "compat-web" {
+		if err := runCompatWebCommand(context.Background(), os.Args[2:]); err != nil {
+			log.Fatalf("compat-web: %v", err)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "auth" {
+		if err := runAuthCommand(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			log.Fatalf("auth: %v", err)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "owner" {
+		if err := runOwnerCommand(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			log.Fatalf("owner: %v", err)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "postgres-tune-conf" {
+		if err := runPostgresTuneConfCommand(os.Args[2:], os.Stdout); err != nil {
+			log.Fatalf("postgres-tune-conf: %v", err)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "memory-limit" {
+		if err := runMemoryLimitCommand(os.Args[2:], os.Stdout); err != nil {
+			log.Fatalf("memory-limit: %v", err)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "backup" {
+		if err := runBackupMain(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			log.Fatalf("backup: %v", err)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "secret" {
+		if err := runSecretCommand(os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	envFile := flag.String("env", ".env", "path to .env bootstrap file")
+	migrateOnly := flag.Bool("migrate-only", false, "apply database migrations and exit")
+	migrateStatus := flag.Bool("migrate-status", false, "show database migration status and exit")
+	migrateDownTo := flag.Int64("migrate-down-to", -1,
+		"roll back every migration newer than this version and exit (the version to KEEP)")
+	flag.Parse()
+
+	ctx := context.Background()
+
+	// Step 0: Validate the embedded settings contract before anything can
+	// depend on it. A malformed or self-inconsistent manifest is a build defect,
+	// not a runtime condition, so failing here — loudly, before the first
+	// request — is the whole point: the alternative is shipping an image whose
+	// contract disagrees with the clients that vendored it.
+	contract, err := settingscontract.Load()
+	if err != nil {
+		log.Fatalf("settings contract: %v", err)
+	}
+	contractETag, err := settingscontract.ETag()
+	if err != nil {
+		log.Fatalf("settings contract: %v", err)
+	}
+	slog.Info("settings contract loaded",
+		"revision", contract.Revision,
+		"definitions", len(contract.Definitions),
+		"etag", contractETag)
+
+	// A transcode node branches before the bootstrap: it has no DATABASE_URL
+	// or SECRET_KEY to load and takes everything else from the core.
+	if !*migrateOnly && !*migrateStatus && *migrateDownTo < 0 && transcodeNodeMode(*envFile) {
+		runTranscodeNode()
+		return
+	}
+
+	// Step 1: Bootstrap from .env
+	bc, err := config.LoadBootstrap(*envFile)
+	if err != nil {
+		log.Fatalf("bootstrap: %v", err)
+	}
+	preferredPrefixes, prefixWarnings := locationpref.Parse(bc.PreferredPathPrefixes)
+	for _, w := range prefixWarnings {
+		slog.Warn("SILO_PREFERRED_PATH_PREFIXES", "problem", w)
+	}
+	locationpref.Set(preferredPrefixes)
+	if locationpref.Configured() {
+		slog.Info("preferred storage prefixes loaded", "prefixes", preferredPrefixes)
+	}
+	stopDebugListener, err := startBootstrapDebugListener(!*migrateOnly && !*migrateStatus && *migrateDownTo < 0)
+	if err != nil {
+		log.Fatalf("local profiling configuration: %v", err)
+	}
+	defer stopDebugListener()
+
+	// Construct the at-rest credential cipher from SECRET_KEY immediately after
+	// bootstrap, before any settings repo is built. It is threaded explicitly as
+	// a dependency into every repo that stores a server-owned secret — never a
+	// package-level global.
+	dataCipher, err := secret.New(bc.SecretKey)
+	if err != nil {
+		log.Fatalf("secret cipher: %v", err) //nolint:gocritic // exiting closes the debug listener with the process
+	}
+	// The API listener also answers TLS on its own port, with a key derived
+	// from SECRET_KEY, so signed-in clients can use the server's local-network
+	// address over a channel they authenticate by pin (internal/lantls).
+	lanTLS, err := lantls.New(bc.SecretKey)
+	if err != nil {
+		log.Fatalf("local network TLS: %v", err)
+	}
+
+	// The settings the environment sets (config.ReadEnvSettings). Only API
+	// servers read them, and maintenance commands skip them so a bad value
+	// cannot block a migration. Read before the pool opens, because
+	// SILO_DB_MAX_CONNECTIONS sizes it.
+	isPrimaryNode := bc.Mode == "integrated" || bc.Mode == "api" || bc.Mode == ""
+	var envSettings config.EnvSettings
+	if isPrimaryNode && !*migrateOnly && !*migrateStatus && *migrateDownTo < 0 {
+		envSettings, err = config.ReadEnvSettings(os.Getenv)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+	}
+
+	// Step 2: Connect to PostgreSQL (bootstrap pool sized by
+	// SILO_DB_MAX_CONNECTIONS, or the default until settings are read)
+	bootstrapDBCfg := config.DatabaseConfig{URL: bc.DatabaseURL, MaxConnections: bootstrapPoolSize(envSettings)}
+	pool, err := database.NewPoolForRole(ctx, bootstrapDBCfg, "application")
+	if err != nil {
+		log.Fatalf("database pool: %v", err)
+	}
+	defer func() { database.ClosePool(pool) }()
+	slog.Info("connected to PostgreSQL")
+
+	if *migrateStatus {
+		migCtx, migCancel := database.MigrationContext(ctx)
+		statusErr := database.PrintMigrationStatus(migCtx, pool, migrations.FS, "sql", os.Stdout)
+		migCancel()
+		if statusErr != nil {
+			log.Fatalf("failed to read migration status: %v", statusErr)
+		}
+		return
+	}
+
+	if *migrateDownTo >= 0 {
+		// Deliberately its own flag rather than a mode of --migrate-only: this
+		// discards data, and several of the migrations it reverses are Go ones
+		// the goose CLI cannot reach, so it is the only way to undo them
+		// short of restoring a backup.
+		migCtx, migCancel := database.MigrationContext(ctx)
+		migErr := database.MigrateDownTo(migCtx, pool, migrations.FS, "sql", *migrateDownTo)
+		migCancel()
+		if migErr != nil {
+			log.Fatalf("failed to roll back migrations: %v", migErr)
+		}
+		slog.Info("database migrations rolled back", "kept_through_version", *migrateDownTo)
+		return
+	}
+
+	// Every server that migrates runs the same sequence: wait for any other
+	// server's, back up the database when migrations are pending, then
+	// migrate (database.MigrateAtStartup, docs/architecture/backups.md).
+	migrationWait := database.MigrationWait()
+	startupMigrations := database.StartupOptions{
+		Wait:          migrationWait,
+		BeforeMigrate: beforeMigrateBackup(bc, pool, dataCipher, migrationWait),
+	}
+
+	if *migrateOnly {
+		if migErr := database.MigrateAtStartup(ctx, pool, migrations.FS, "sql", startupMigrations); migErr != nil {
+			log.Fatalf("failed to run migrations: %v", migErr)
+		}
+		slog.Info("database migrations applied")
+		return
+	}
+
+	// Run migrations only for integrated/api modes. Proxy and transcode nodes
+	// should never alter the schema — they may scale independently and would
+	// race or apply migrations before the primary node is deliberately upgraded.
+	// The same gate decides whether this node runs the credential-encryption
+	// backfills: only the primary (migration-running) node sweeps plaintext to
+	// ciphertext; secondary nodes read whatever the primary encrypted.
+	if isPrimaryNode {
+		if migErr := database.MigrateAtStartup(ctx, pool, migrations.FS, "sql", startupMigrations); migErr != nil {
+			log.Fatalf("failed to run migrations: %v", migErr)
+		}
+		slog.Info("database migrations applied")
+	}
+
+	// Step 3: Load settings from DB. settingsRepo is the encrypting decorator so
+	// every consumer (config.LoadFromDB, admin, ABS, watchers) transparently sees
+	// plaintext while sensitive keys rest as ciphertext. The settings backfill
+	// (run after migrations, before this GetAll) is wired further below.
+	settingsRepo := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), dataCipher)
+	if isPrimaryNode {
+		// Read once before the backfills: under a wrong SECRET_KEY they would
+		// encrypt plaintext credentials with that key, leaving rows the right
+		// key can no longer read.
+		if _, err := settingsRepo.GetAll(ctx); err != nil {
+			log.Fatal(settingsLoadError(err, bc.SecretKey))
+		}
+		runCredentialBackfills(ctx, pool, dataCipher, settingsRepo)
+		convertLegacyAIProviders(ctx, settingsRepo)
+	}
+	settings, err := settingsRepo.GetAll(ctx)
+	if err != nil {
+		log.Fatal(settingsLoadError(err, bc.SecretKey))
+	}
+
+	// Step 4: YAML import (one-time)
+	yamlPath := "silo.yaml"
+	if _, yamlErr := os.Stat(yamlPath); yamlErr == nil {
+		if settings["_yaml_imported"] == "" {
+			yamlSettings, importErr := config.YAMLToSettingsMap(yamlPath)
+			if importErr != nil {
+				log.Printf("WARN: could not import YAML config: %v", importErr)
+			} else {
+				for k, v := range yamlSettings {
+					if err := settingsRepo.Set(ctx, k, v); err != nil {
+						log.Printf("WARN: failed to import setting %s: %v", k, err)
+					}
+				}
+				if err := settingsRepo.Set(ctx, "_yaml_imported", "true"); err != nil {
+					slog.Warn("failed to set yaml import flag", "error", err)
+				}
+				log.Println("Imported config from silo.yaml — this file is no longer used")
+				settings, _ = settingsRepo.GetAll(ctx)
+			}
+		}
+	}
+
+	// The settings the environment sets win over the stored ones. Cluster-wide
+	// ones are stored so the admin UI and the other servers see the values in
+	// effect; per-process ones only overlay this process's settings.
+	envSettings, envChangedKeys, err := applyEnvSettings(ctx, settingsRepo, settings, envSettings, bc.RedisURL)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+
+	// Step 5: Auto-generate secrets
+	if strings.TrimSpace(settings[auth.JWTSecretSettingKey]) == "" {
+		// Fatal, not a warning: every process, this one too once its config
+		// watcher starts, reads the secret from the database, so a secret
+		// held only in memory would leave them with none. Processes starting
+		// at once converge on the first secret stored (#3312).
+		jwtSecret, err := auth.EnsureJWTSecret(ctx, settingsRepo)
+		if err != nil {
+			log.Fatalf("provisioning JWT secret: %v", err)
+		}
+		settings[auth.JWTSecretSettingKey] = jwtSecret
+	}
+	if settings["jellyfin_compat.server_id"] == "" {
+		serverID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("https://silo.local/jellycompat")).String()
+		if err := settingsRepo.Set(ctx, "jellyfin_compat.server_id", serverID); err != nil {
+			slog.Warn("failed to persist generated server ID", "error", err)
+		}
+		settings["jellyfin_compat.server_id"] = serverID
+	}
+
+	// Step 6: Build config from DB
+	cfg, err := config.LoadFromDB(settings)
+	if err != nil {
+		log.Fatalf("building config: %v", err)
+	}
+	normalizeLoadedConfig(cfg)
+
+	// Step 7: Apply bootstrap overrides
+	applyBootstrapOverrides(cfg, bc)
+
+	// Step 8: Recreate pool if max_connections differs from bootstrap default
+	if cfg.Database.MaxConnections != bootstrapDBCfg.MaxConnections {
+		database.ClosePool(pool)
+		pool, err = database.NewPoolForRole(ctx, cfg.Database, "application")
+		if err != nil {
+			log.Fatalf("recreating pool with configured max_connections: %v", err)
+		}
+	}
+	// Re-wrap with the encrypting decorator so the recreated pool's settings repo
+	// still encrypts/decrypts — no raw settings repo may escape into later wiring.
+	settingsRepo = catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), dataCipher)
+	// One reader for access.unrated_content, shared by every scope resolver and
+	// the recommendations engine: forgetting the builder call at a construction
+	// site fails silently (unrated titles hidden, no error).
+	unratedContent := config.NewUnratedContentPolicy(settingsRepo)
+	// One snapshot of the administrator's setting defaults (the Next Up and
+	// title-art defaults), shared by every resolver on this node so Home,
+	// Jellyfin clients and the settings pages agree. Admin writes refresh it in
+	// the router; other nodes' writes refresh it from the settings-changed event
+	// subscribed below, before clients are told to re-read.
+	adminDefaults := config.NewAdminDefaults(settingsRepo)
+	nodeID := resolveNodeIdentity()
+	// Lease a Sonyflake machine ID before anything generates IDs, so replicas
+	// sharing this database never share one. Only primary nodes mint IDs, and
+	// proxy and transcode nodes may start before the primary has migrated the
+	// lease table. Stop runs before the pool closes.
+	var idLease *idgen.Lease
+	if isPrimaryNode {
+		idLease, err = idgen.Start(ctx, pool, nodeID)
+		if err != nil {
+			log.Fatalf("id generator: %v", err)
+		}
+	}
+	defer idLease.Stop()
+	catalogSearchStartupSettings, err := catalog.CatalogSearchSettingsFromMap(settings)
+	if err != nil {
+		slog.Warn("catalog search: failed to load settings for startup wiring; using postgres", "err", err)
+		catalogSearchStartupSettings = catalog.DefaultCatalogSearchSettings()
+	}
+	activeCatalogSearchProvider := catalog.ActiveCatalogSearchProvider(catalogSearchStartupSettings)
+
+	// Step 9: Validate
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config validation: %v", err)
+	}
+
+	// Step 10: Configure log level. The level var and quiet filter are
+	// shared with the operational-logging handler chain and hot-reloaded by
+	// the config watcher in integrated mode.
+	logLevelVar := new(slog.LevelVar)
+	logLevelVar.Set(parseLogLevel(cfg.Server.LogLevel))
+
+	// Bootstrap OpenTelemetry (logs + traces) before installing the log handler
+	// chain. Setup depends only on OTEL_* / SILO_OTEL_ENABLED env (not the DB),
+	// so it is safe to call here. When disabled, this is fully dormant: no
+	// providers are installed and telemetryShutdown is a no-op.
+	telemetryCfg := telemetry.LoadConfig(nodeID)
+	telemetryProviders, telemetryShutdown, err := telemetry.Setup(ctx, telemetryCfg)
+	if err != nil {
+		// Telemetry is best-effort: a malformed OTEL_* environment must not
+		// crash-loop the server. Setup installed no globals and returned no-op
+		// providers, so continue with telemetry disabled.
+		slog.ErrorContext(ctx, "telemetry setup failed; continuing with telemetry disabled", "component", "app", "error", err)
+		telemetryCfg.Enabled = false
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := telemetryShutdown(shutdownCtx); err != nil {
+			slog.WarnContext(shutdownCtx, "telemetry shutdown error", "component", "app", "error", err)
+		}
+	}()
+
+	var otelLogHandler slog.Handler
+	if telemetryCfg.Enabled {
+		otelLogHandler = telemetry.NewOTelHandler(telemetryProviders.LoggerProvider)
+	}
+
+	baseHandler := buildBaseHandler(cfg.Server.LogFormat, logLevelVar, otelLogHandler)
+	quietFilter := logfilter.New(baseHandler, cfg.Server.LogQuiet)
+	slog.SetDefault(slog.New(quietFilter))
+
+	mode := cfg.Server.Mode
+	maybeApplyPostgresTuning(ctx, pool, cfg.Database.MaxConnections, mode)
+	queryAttribution := "off"
+	if queryattr.Initialize() {
+		queryAttribution = "on"
+	}
+	queryRun := uuid.NewString()
+	if isPrimaryNode && queryattr.Enabled() {
+		queryattr.RegisterMetrics(prometheus.DefaultRegisterer)
+	}
+	slog.Info("silo starting", "mode", mode, "listen", cfg.Server.Listen, "log_level", cfg.Server.LogLevel, "node_id", nodeID,
+		"query_attribution", queryAttribution, "query_run", queryRun)
+
+	appCtx, appCancel := context.WithCancel(ctx)
+	defer appCancel()
+	stopDebugOnCancel := context.AfterFunc(appCtx, stopDebugListener)
+	defer stopDebugOnCancel()
+	var streamTelemetryRegistry *streamtelemetry.Registry
+	var streamTelemetryViewCache *streamtelemetry.ViewCache
+	restartReqCh := make(chan struct{}, 1)
+	var restartRequested atomic.Bool
+	if mode == "integrated" || mode == "api" {
+		// Join the storage writer set before any blob store or worker starts.
+		// A transition owner holds this gate exclusively through its restart;
+		// the config watcher below rereads settings after admission returns.
+		storageAdmission, err = pglock.AdmitNode(appCtx, pool, pglock.StorageNodeAdmissionLockKey)
+		if err != nil {
+			log.Fatalf("storage node admission: %v", err)
+		}
+		go storageAdmission.Monitor(appCtx, time.Second)
+		go func() {
+			// A failed session is replaced while no transition runs; Lost
+			// closes only when this node owned a transition or another node
+			// took ownership while it was out. Either way it must restart.
+			select {
+			case <-storageAdmission.Lost():
+				if appCtx.Err() != nil {
+					return
+				}
+				slog.Error("storage node admission lost to a storage transition; stopping storage writers")
+				appCancel()
+				select {
+				case restartReqCh <- struct{}{}:
+				default:
+				}
+			case <-appCtx.Done():
+			}
+		}()
+	}
+
+	// Observers see what this process publishes, so work that must happen once
+	// per event runs on the node that produced it, with or without Redis.
+	eventBus := cache.NewObservedEventBus(cache.NewEventBus(cfg.Redis))
+	// Tell the servers already running that the environment changed stored
+	// settings, as an admin save does, so they reload now rather than at the
+	// next poll.
+	for _, key := range envChangedKeys {
+		_ = eventBus.Publish(ctx, cache.ChannelAdmin, cache.Event{Type: cache.EventSettingsChanged, Payload: key})
+	}
+	if err := eventBus.Subscribe(appCtx, cache.ChannelCatalog, func(event cache.Event) {
+		switch event.Type {
+		case cache.EventScanComplete:
+			sections.InvalidateResolvedListCache()
+		case cache.EventCatalogItemChanged:
+			sections.EvictResolvedListItems(event.Payload)
+		}
+	}); err != nil {
+		slog.Warn("subscribe section cache invalidation failed", "error", err)
+	}
+	logStreamHub := logstream.NewHub(nodeID, eventBus)
+	if err := logStreamHub.Start(appCtx); err != nil {
+		log.Fatalf("log stream hub start: %v", err)
+	}
+	realtimeHub := notifications.NewHub(nodeID, eventBus)
+	if err := realtimeHub.Start(appCtx); err != nil {
+		log.Fatalf("realtime hub start: %v", err)
+	}
+	eventsHub := realtimeHub.EventsHub()
+	scanRegistry := evt.NewScanRegistry()
+	opsRepo, opsPM, stopOperationalLog := configureOperationalLogging(appCtx, pool, settingsRepo, logStreamHub, quietFilter, nodeID)
+	defer func() {
+		if err := eventBus.Close(); err != nil {
+			slog.Warn("event bus close error", "error", err)
+		}
+	}()
+	// Deferred calls run in reverse: the log consumers flush first (the
+	// activity consumer is deferred later in main), the hub then sends their
+	// rows to other nodes' live tails, and the event bus closes last.
+	defer logStreamHub.Close()
+	defer stopOperationalLog()
+	if queryattr.Enabled() {
+		stopQuerySummary := startLogDrain(func(ctx context.Context) { queryattr.RunSummary(ctx, queryRun, buildinfo.Current().Display) })
+		defer stopQuerySummary()
+	}
+
+	tuningCfg, adjustments := tuning.Parse(os.Getenv)
+	tuning.LogAdjustments(ctx, adjustments)
+	netadmin.LogState(ctx)
+	opts := tcpcongestion.Options{
+		Congestion: tuningCfg.TCPCongestion == tuning.TCPCongestionBBR,
+		SendBuffer: tuningCfg.TCPSendBuffer,
+		Limits:     tcpcongestion.ReadLimits(ctx),
+	}
+
+	// Proxy mode runs with DB + Redis for hot-reload. Transcode nodes never
+	// reach here: they branch before the bootstrap (runTranscodeNode).
+	if mode == serverModeProxy { //nolint:nestif // the proxy wiring predates this branch; splitting it out is a separate change
+		// Delivery writes run in the background with a short deadline. Honor it
+		// on the sockets too, so a stalled Redis cannot retain their connections.
+		redisClient, err := cache.NewDeadlineRedisClientForRole(cfg.Redis, "worker")
+		if err != nil || redisClient == nil {
+			slog.Error("redis is required for this mode", "mode", mode, "error", err)
+			os.Exit(1)
+		}
+		streamTelemetryRegistry = newStreamTelemetryRegistry(appCtx, nodeID, redisClient)
+		streamTelemetryRegistry.Start(appCtx)
+
+		// Resolved before the watcher starts: SILO_NODE_URL (or NODE_URL) is
+		// this process's stream_nodes identity, and the watcher needs it on
+		// its very first load to overlay the node's own acceleration
+		// overrides. config.LoadBootstrap refuses a proxy without it.
+		nodeURL, givenName := proxyNodeIdentity(os.Getenv)
+		nodeName := givenName
+		if nodeName == "" {
+			nodeName = mode
+		}
+		// The proxy writes what it declares from its environment, and with
+		// SILO_NODE_REGISTER adds its own row, before the watcher first
+		// reads that row.
+		declaredRow, declareErr := declareProxyNode(appCtx, pool, eventBus, proxyDeclarationIdentity(nodeURL, givenName, nodeName, proxyRegistersItself()))
+		if declareErr != nil {
+			slog.Error("proxy cannot start: its node declaration was not applied", "error", declareErr)
+			os.Exit(1)
+		}
+
+		bootstrap := nodeconfig.BootstrapOverrides{
+			Listen:      cfg.Server.Listen,
+			Mode:        cfg.Server.Mode,
+			DatabaseURL: cfg.Database.URL,
+			JFListen:    cfg.JellyfinCompat.Listen,
+			RedisURL:    bc.RedisURL,
+			NodeURL:     nodeURL,
+			NodeName:    nodeName,
+		}
+		watcher := nodeconfig.NewWatcher(pool, dataCipher, eventBus, bootstrap)
+		watcher.OnLoad(normalizeLoadedConfig)
+		if declaredRow != nil {
+			watcher.PinNodeRow(declaredRow.ID, declaredRow.URL)
+		}
+		if err := watcher.Start(appCtx); err != nil {
+			slog.Error("config watcher start failed", "error", err)
+			os.Exit(1)
+		}
+
+		tracker := nodesessions.NewTracker(redisClient, nodeURL, nodeName, mode)
+		tracker.StartRefresh(appCtx)
+		defer func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			tracker.Cleanup(cleanupCtx)
+		}()
+		defer func() {
+			telemetryCtx, telemetryCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer telemetryCancel()
+			if stopErr := streamTelemetryRegistry.Stop(telemetryCtx); stopErr != nil {
+				slog.Error("stream telemetry shutdown error", "error", stopErr)
+			}
+		}()
+
+		srv := proxy.NewServer(watcher, tracker)
+		srv.SetDownloadBandwidth(pool, redisClient)
+		proxyIPResolver, resolverErr := clientIPResolverFromConfig(watcher.Config())
+		if resolverErr != nil {
+			log.Fatalf("load trusted CIDRs: %v", resolverErr)
+		}
+		registerClientIPConfigReload(watcher, proxyIPResolver)
+		srv.SetClientIPResolver(proxyIPResolver)
+		srv.SetStreamTelemetry(streamTelemetryRegistry)
+		// Network access providers run on this proxy too, one instance per
+		// node with its own overlay identity; see newProxyPluginHost.
+		pluginCacheDir, cacheDirErr := resolvePluginCacheDir()
+		if cacheDirErr != nil {
+			log.Fatalf("plugin cache: %v", cacheDirErr)
+		}
+		proxyPlugins := newProxyPluginHost(appCtx, pool, dataCipher, eventBus, watcher, nodeName, cfg.Server.Listen, pluginCacheDir)
+		srv.SetIngressTokens(proxyPlugins.broker.Registry)
+		srv.SetNetworkAccessStatus(proxyPlugins.broker.Status)
+		srv.SetNetworkAccessProviderHost(proxyPlugins.service)
+		// Serve header-authenticated sessions: the recipe comes from the
+		// shared grant store central wrote at plan time, and the caller's
+		// own access token is re-checked against the live login session in
+		// Postgres, so a revoked login stops streaming here immediately.
+		srv.SetMediaGrantAuthority(noderecipe.NewProxyGrantStore(redisClient, 0), auth.NewSessionRepository(pool))
+		// Consult the session-deny marker central writes on stop, expiry,
+		// and admin terminate before serving media, so a revoked stream
+		// token or grant stops here instead of at its 24h TTL.
+		srv.SetStreamDeny(playback.NewStreamDeny(redisClient))
+		// Proxies relay to transcode nodes, so they keep the same
+		// credential registry the API servers do and sign each relay
+		// with the node's own key.
+		proxyNodeKeys := startProxyNodeKeyRegistry(appCtx, pool, dataCipher, eventBus)
+		srv.SetNodeKeys(proxyNodeKeys.Keyring(func() string { return watcher.Config().Auth.JWTSecret }))
+		// Follow a Jellyfin-compatible transcode that the API moved off a
+		// transcode node this proxy cannot reach: the shared recipe store
+		// names the node it runs on now, and the event bus carries the
+		// request to move it.
+		srv.SetTranscodeMoveFollower(noderecipe.NewStore(redisClient, 0), eventBus)
+		srv.SetRemoteArtifactMissReporter(downloads.NewArtifactManager(
+			downloads.NewArtifactRepository(pool),
+			downloads.NewRepository(pool),
+			nil,
+			downloads.NewPlaybackPreparer(),
+			nodeID,
+			watcher.Config,
+			nil,
+		))
+		// Keep the capability hash /health advertises current, so the API's
+		// sweep refetches this proxy's inventory only when it actually changed.
+		srv.StartCapabilitySnapshots(appCtx)
+		// Sample host and GPU resources so /health, /status and /metrics can
+		// report them without doing any work on the request.
+		srv.StartMetricsSampler(appCtx)
+		_ = opsRepo
+		startStandaloneServer(mode, cfg.Server.Listen, srv.Handler(), appCancel, nil, proxyPlugins.hooks(), opts)
+		return
+	}
+
+	// Keep the administrator defaults fresh without waiting for a request.
+	// Started past the proxy/transcode return: those nodes never resolve a
+	// viewer's settings, so polling there would read for nothing.
+	go adminDefaults.Run(appCtx)
+
+	// Hot-reload config watcher for integrated/api mode. Reloads on
+	// EventSettingsChanged (Redis) with a 60s poll fallback, so settings
+	// changes apply without restart even on Redis-less deployments. The
+	// watcher's config supersedes the startup snapshot from here on. No
+	// NodeURL: an API host is not a stream node and has no row whose
+	// acceleration overrides could apply to it.
+	configWatcher := nodeconfig.NewWatcher(pool, dataCipher, eventBus, nodeconfig.BootstrapOverrides{
+		Listen:      bc.Listen,
+		Mode:        bc.Mode,
+		DatabaseURL: bc.DatabaseURL,
+		JFListen:    bc.JFListen,
+		ABSListen:   bc.ABSListen,
+		RedisURL:    bc.RedisURL,
+		Settings:    envSettings.Values(config.EnvScopeProcess),
+	})
+	configWatcher.OnLoad(normalizeLoadedConfig)
+	if err := configWatcher.Start(appCtx); err != nil {
+		log.Fatalf("config watcher start: %v", err)
+	}
+	cfg = configWatcher.Config()
+
+	// Apply server.log_level / server.log_quiet changes live. Both feed the
+	// shared level var and quiet filter inside the default logger chain.
+	configWatcher.OnChange(func(_, updated *config.Config) {
+		logLevelVar.Set(parseLogLevel(updated.Server.LogLevel))
+		quietFilter.SetQuiet(updated.Server.LogQuiet)
+	})
+
+	// Determine which components to initialize based on mode.
+	needsS3 := mode == "integrated" || mode == "api"
+	needsScanner := mode == "integrated" || mode == "api"
+	needsUserDB := mode == "integrated" || mode == "api"
+	needsWorkers := mode == "integrated" || mode == "api"
+
+	bootstrapSensitiveConfigured := map[string]bool{}
+	bootstrapSensitiveValues := map[string]string{}
+	bootstrapEnvVars := map[string]string{}
+	addRedisBootstrapSettings(bc.RedisURL, bootstrapSensitiveConfigured, bootstrapSensitiveValues, bootstrapEnvVars)
+	addEnvSettingLocks(envSettings, bootstrapSensitiveConfigured, bootstrapSensitiveValues, bootstrapEnvVars)
+
+	// Shared Redis client for components needing raw Redis beyond the event
+	// bus (websocket handshake tickets, session listing). Nil on Redis-less
+	// deployments; consumers fall back to in-process implementations.
+	if err := workmetrics.StartQueueSampler(appCtx, pool); err != nil {
+		slog.Warn("queue metrics registration failed", "error", err)
+	}
+	apiRedisClient, apiRedisErr := cache.NewRedisClientForRole(cfg.Redis, "api")
+	if apiRedisErr != nil {
+		slog.Warn("redis client init failed; multi-node websocket tickets disabled", "error", apiRedisErr)
+	} else if apiRedisClient != nil {
+		defer func() { _ = cache.CloseRedisClient(apiRedisClient) }()
+	}
+	// Download bandwidth accounting bounds each budget call with a deadline,
+	// which only a deadline-enabled client honors through Sentinel discovery.
+	var downloadBandwidthRedis *redis.Client
+	if apiRedisClient != nil {
+		var bandwidthRedisErr error
+		downloadBandwidthRedis, bandwidthRedisErr = cache.NewDeadlineRedisClientForRole(cfg.Redis, "api")
+		if bandwidthRedisErr != nil {
+			slog.Warn("redis client init failed; download bandwidth limits stay per API process", "error", bandwidthRedisErr)
+		} else if downloadBandwidthRedis != nil {
+			defer func() { _ = cache.CloseRedisClient(downloadBandwidthRedis) }()
+		}
+	}
+
+	// One TMDB client serves every feature in this process, so they share its
+	// response caches and spend one budget of tmdb.RequestsPerSecond: with
+	// Redis, one budget for every node together. Each wait bounds its own
+	// Redis call, so that client must let the deadline end a stalled read.
+	tmdbRedisClient, tmdbRedisErr := cache.NewDeadlineRedisClientForRole(cfg.Redis, "api")
+	if tmdbRedisErr != nil {
+		slog.Warn("redis client init failed; TMDB requests are limited per process", "error", tmdbRedisErr)
+	} else if tmdbRedisClient != nil {
+		defer func() { _ = cache.CloseRedisClient(tmdbRedisClient) }()
+	}
+	tmdbClient := tmdb.NewClientWithLimiter(cfg.TMDBAPIKey,
+		ratelimit.NewOutboundLimiter(tmdbRedisClient, "outbound:tmdb", tmdb.RequestsPerSecond))
+	defer tmdbClient.Close()
+
+	// The playback control relay bounds each lane ownership read and write
+	// at one second; this client's sockets give up at that deadline.
+	var playbackControlRedisClient *redis.Client
+	if apiRedisClient != nil {
+		controlClient, controlErr := cache.NewDeadlineRedisClientForRole(cfg.Redis, "api")
+		if controlErr != nil {
+			slog.Warn("redis client init failed; administrator playback commands reach only sessions on this replica", "error", controlErr)
+		} else if controlClient != nil {
+			defer func() { _ = cache.CloseRedisClient(controlClient) }()
+			playbackControlRedisClient = controlClient
+		}
+	}
+
+	if mode == "" || mode == "integrated" || mode == "api" {
+		streamTelemetryRegistry = newStreamTelemetryRegistry(appCtx, nodeID, apiRedisClient)
+		streamTelemetryRegistry.Start(appCtx)
+		streamTelemetryViewCache = newStreamTelemetryViewCache(streamTelemetryRegistry)
+	}
+
+	// Assigned below once the trusted-proxy config is seeded; captured by the
+	// OnServerSettingUpdated closure, which only runs on admin requests after
+	// startup completes.
+	var ipResolver *clientip.Resolver
+	// Assigned below when recommendations start; nil (a no-op) otherwise.
+	var settingsRecWorker *recommendations.Worker
+	// Assigned below with the marker plugin providers; nil without plugins.
+	// Runs after a save that turns markers.share_by_default off commits.
+	var defaultMarkerSharingStopped func(context.Context)
+	var shutdownWork []<-chan struct{}
+	registerShutdownWork := func(done <-chan struct{}) {
+		shutdownWork = append(shutdownWork, done)
+	}
+	normalizedBootstrapRedisURL, bootstrapRedisURLErr := config.NormalizeRedisURL(bc.RedisURL)
+	redisBootstrapAvailable := normalizedBootstrapRedisURL != "" && bootstrapRedisURLErr == nil
+
+	// The API routes connect the subtitle sync service to this hook; the
+	// Jellyfin routes share it, so a first play from either side syncs.
+	subtitlePlaySync := &subtitles.PlaySyncHook{}
+	// Set when shutdown begins; /api/v1/ready fails from then on.
+	var shuttingDown atomic.Bool
+	deps := api.Dependencies{
+		ShuttingDown:                 shuttingDown.Load,
+		AdminDefaults:                adminDefaults,
+		SubtitlePlaySync:             subtitlePlaySync,
+		Config:                       cfg,
+		LiveConfig:                   configWatcher.Config,
+		OnConfigChange:               configWatcher.OnChange,
+		BootstrapSensitiveConfigured: bootstrapSensitiveConfigured,
+		BootstrapSensitiveValues:     bootstrapSensitiveValues,
+		BootstrapEnvVars:             bootstrapEnvVars,
+		RedisBootstrapAvailable:      redisBootstrapAvailable,
+		AppContext:                   appCtx,
+		RegisterShutdownWork:         registerShutdownWork,
+		StreamTelemetry:              streamTelemetryRegistry,
+		StreamTelemetryViewCache:     streamTelemetryViewCache,
+		DB:                           pool,
+		SecretCipher:                 dataCipher,
+		EventBus:                     eventBus,
+		RedisClient:                  apiRedisClient,
+		PlaybackControlRedisClient:   playbackControlRedisClient,
+		TMDB:                         tmdbClient,
+		DownloadBandwidthRedis:       downloadBandwidthRedis,
+		LogStreamHub:                 logStreamHub,
+		RealtimeHub:                  realtimeHub,
+		EventsHub:                    eventsHub,
+		ScanRegistry:                 scanRegistry,
+		OpsLogRepo:                   opsRepo,
+		FFmpegLogSink:                playback.NewSlogFFmpegLogSink(slog.Default(), nodeID),
+		PublicURL:                    cfg.Server.PublicURL,
+		CatalogSearchSettings:        new(catalogSearchStartupSettings),
+		RequestServerRestart: func(context.Context) error {
+			if !restartRequested.CompareAndSwap(false, true) {
+				return handlers.ErrServerRestartAlreadyRequested
+			}
+			restartReqCh <- struct{}{}
+			return nil
+		},
+		BeforeServerSettingCommit: func(ctx context.Context, tx pgx.Tx, key, value string) error {
+			// Turning sharing by default off also stops providers that
+			// started sharing because their manifest asked to. It shares the
+			// save's transaction, so a failure fails the save instead of
+			// leaving them sharing.
+			if key == markers.SettingShareByDefault && !markers.ShareByDefaultEnabled(value) {
+				return stopDefaultMarkerSharingInTx(ctx, tx)
+			}
+			return nil
+		},
+		OnServerSettingUpdated: func(_ context.Context, key, value string) {
+			// Key-scoped reload for the client-IP trust boundary: unlike the
+			// whole-config watcher reload below, this cannot be blocked by an
+			// unrelated malformed setting failing config.LoadFromDB. Uses a
+			// fresh context — the setting is already persisted, so the reload
+			// must not be skipped because the admin request was canceled.
+			if key == clientip.SettingTrustedProxies && ipResolver != nil {
+				if loadErr := ipResolver.ReloadTrustedCIDRs(context.Background(), settingsRepo); loadErr != nil {
+					slog.WarnContext(context.Background(), "clientip config reload failed", "component", "app", "error", loadErr)
+				}
+			}
+			// Cached recommendation rows of profiles with a rating ceiling
+			// are built under the unrated-content decision.
+			if key == config.AccessUnratedContentSettingKey {
+				settingsRecWorker.NotifyUnratedContentChanged(context.Background(), config.UnratedContentCacheTTL+time.Second)
+			}
+			if key == markers.SettingShareByDefault && !markers.ShareByDefaultEnabled(value) && defaultMarkerSharingStopped != nil {
+				defaultMarkerSharingStopped(context.Background())
+			}
+			// Nudge the hot-reload watcher so same-process settings changes
+			// apply immediately even without Redis (the event bus is a no-op
+			// then, leaving only the 60s poll).
+			configWatcher.RequestReload()
+		},
+	}
+	accessGroupStore := access.NewGroupStore(pool)
+	audiobooksService := audiobooks.New(&audiobooksSettingsAdapter{repo: settingsRepo})
+	absCompatEnabled, err := audiobooksService.ABSCompatEnabled(appCtx)
+	if err != nil {
+		slog.Warn("Audiobookshelf compatibility disabled; failed to read setting", "err", err)
+		absCompatEnabled = false
+	}
+	adminJobCancelRegistry := adminjob.NewCancelRegistry()
+	deps.AdminJobCancelRegistry = adminJobCancelRegistry
+	if needsWorkers && deps.DB != nil {
+		deps.IntroRepository = intromarkers.NewRepository(deps.DB)
+		introConfig := intromarkers.DefaultConfig(cfg.Playback.FFmpegPath)
+		introConfig.HWAccel, introConfig.HWDevice = cfg.Playback.HWAccel, cfg.Playback.HWDevice
+		deps.IntroAnalyzer = intromarkers.NewAnalyzer(deps.IntroRepository, introConfig, slog.Default())
+		// markers.detection_workers, and the playback hardware settings that
+		// credits tail passes decode on, apply without a restart.
+		introAnalyzer := deps.IntroAnalyzer
+		introAnalyzer.SetWorkers(cfg.Markers.DetectionWorkers)
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			introAnalyzer.SetWorkers(updated.Markers.DetectionWorkers)
+			introAnalyzer.SetHardwareDecode(updated.Playback.HWAccel, updated.Playback.HWDevice)
+		})
+	}
+	if deps.DB != nil {
+		markerRegistry := markers.NewRegistry(slog.Default())
+		markerProviderConfig := markers.NewProviderConfigStore(deps.DB)
+		markerRegistry.UseConfigStore(markerProviderConfig)
+		if err := markerProviderConfig.Reload(appCtx); err != nil {
+			slog.Warn("load marker provider config failed; online fetching remains disabled until settings load",
+				"error", err)
+		}
+		if deps.EventBus != nil {
+			if err := deps.EventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
+				if event.Type != cache.EventMarkerProviderConfigChanged {
+					return
+				}
+				if err := markerProviderConfig.Reload(appCtx); err != nil {
+					slog.Warn("reload marker provider config failed", "provider", event.Payload, "error", err)
+				}
+			}); err != nil {
+				slog.Warn("subscribe marker provider config reload failed", "error", err)
+			}
+		}
+		deps.MarkerProviderConfig = markerProviderConfig
+		deps.MarkerRegistry = markerRegistry
+		markerResolver := markers.NewDBExternalIDResolver(deps.DB)
+		deps.MarkerResolver = markerResolver
+		markerContributionStore := markers.NewContributionStore(deps.DB)
+		deps.MarkerContributionStore = markerContributionStore
+		deps.MarkerContributionService = markers.NewContributionService(
+			markerRegistry, markerResolver, markerProviderConfig, markerContributionStore,
+			slog.Default().With("component", "markers.contribute"),
+		)
+	}
+	var watchProviderService *watchsync.Service
+	var watchProviderRegistry *watchsync.Registry
+	var watchProviderRepo *watchsync.PostgresRepository
+	if deps.DB != nil {
+		// Every watch provider is a plugin; reloadWatchSyncPluginProviders
+		// fills the registry once the plugin service starts.
+		watchProviderRegistry = watchsync.NewRegistry()
+		watchProviderRepo = watchsync.NewPostgresRepository(deps.DB, deps.SecretCipher)
+		watchProviderService = watchsync.NewService(watchProviderRepo, watchProviderRegistry)
+		deps.WatchProviderService = watchProviderService
+		deps.WatchProviderRegistry = watchProviderRegistry
+	}
+
+	// Every API server drains the catalog item change outbox; a row in the
+	// database spaces the drains out across the cluster.
+	if mode == "integrated" || mode == "api" {
+		go realtimeHub.RunItemChangePublisher(appCtx, catalog.NewItemChangeOutbox(pool))
+	}
+
+	// Initialize node pools for integrated/api modes.
+	if mode == "integrated" || mode == "api" {
+		nodeRepo := nodepool.NewRepository(pool)
+		deps.NodeRepo = nodeRepo
+
+		proxyPool := nodepool.NewProxyPool()
+		transcodePool := nodepool.NewTranscodePool()
+
+		proxyNodes, err := nodeRepo.ListEnabled(appCtx, nodepool.NodeTypeProxy)
+		if err != nil {
+			log.Fatalf("load enabled proxy nodes: %v", err)
+		}
+		transcodeNodes, err := nodeRepo.ListEnabled(appCtx, nodepool.NodeTypeTranscode)
+		if err != nil {
+			log.Fatalf("load enabled transcode nodes: %v", err)
+		}
+		proxyPool.SetNodes(proxyNodes)
+		transcodePool.SetNodes(transcodeNodes)
+
+		deps.ProxyPool = proxyPool
+		deps.TranscodePool = transcodePool
+
+		// Every stream node's credential, disabled nodes included: they keep
+		// serving the streams they already have.
+		nodeKeys := nodepool.NewKeyRegistry(nodeRepo, dataCipher)
+		if err := nodeKeys.Refresh(appCtx); err != nil {
+			log.Fatalf("load stream node credentials: %v", err)
+		}
+		nodeKeys.Start(appCtx)
+		deps.NodeKeyRegistry = nodeKeys
+		// Requests to a transcode node are signed with its own key, and only
+		// proxies get the shared secret. A transcode node without a usable key
+		// stays listed and health-checked but takes no work.
+		nodeKeyring := nodeKeys.Keyring(func() string { return configWatcher.Config().Auth.JWTSecret })
+		deps.NodeKeys = nodeKeyring
+		// Every piece of transcode-node work carries a source grant, signed
+		// with a key derived from the same secret as stream tokens.
+		deps.SourceGrants = nodesource.NewGrants(func() string { return configWatcher.Config().Auth.JWTSecret })
+		transcodePool.SetKeyCheck(nodeKeys.HasKey)
+
+		planner := nodepool.NewPlanner(proxyPool, transcodePool)
+		deps.NodePlanner = planner
+
+		healthChecker := nodepool.NewHealthChecker(proxyPool, transcodePool, nodeRepo)
+		planner.SetUnreachableHandler(healthChecker.ReportUnreachable)
+		healthChecker.SetUnreachableBroadcast(func(payload string) {
+			// Off the request path: the caller is a playback request that has
+			// already lost time to the dead node.
+			go func() {
+				publishCtx, cancel := context.WithTimeout(appCtx, 5*time.Second)
+				defer cancel()
+				if err := eventBus.Publish(publishCtx, cache.ChannelAdmin, cache.Event{Type: cache.EventNodeUnreachable, Payload: payload}); err != nil {
+					slog.Warn("publish unreachable stream node", "error", err)
+				}
+			}()
+		})
+		capabilityBudget := nodeCapabilityProbeBudget(configWatcher.Config)
+		healthChecker.SetCapabilityFetcher(nodeCapabilityFetcher(nodeKeyring, capabilityBudget))
+		// The sweep's backstop is derived from the same budget, so it can never
+		// be the deadline that fires first on a node with many devices.
+		healthChecker.SetCapabilityFetchBudget(capabilityBudget)
+		deps.NodeHealthChecker = healthChecker
+		healthChecker.Start(appCtx)
+		subscribeNodeDrainChanges(appCtx, eventBus, healthChecker)
+		slog.Info("node pools initialized", "proxy_nodes", len(proxyNodes), "transcode_nodes", len(transcodeNodes))
+
+		// The API host runs the same sampler the nodes do. It is not a
+		// registered stream node, so without this the machine serving admin
+		// requests — and, in integrated mode, transcoding — is the one host with
+		// no resource visibility. Unlike a node it also samples library roots:
+		// it is the process that knows what the library is, and its own view of
+		// a media mount is the one that is authoritative.
+		resourceSampler := nodemetrics.NewSampler(nodemetrics.Options{
+			// Read per sample rather than captured: in integrated mode this host
+			// is the one transcoding, and playback.transcode_dir is
+			// hot-reloadable. A startup snapshot would keep reporting headroom on
+			// the volume it used to write to while the new one fills unwatched.
+			ScratchDir: func() string {
+				if live := configWatcher.Config(); live != nil {
+					return live.Playback.TranscodeDir
+				}
+				return cfg.Playback.TranscodeDir
+			},
+			MediaRoots:       libraryPathProvider(catalog.NewFolderRepository(pool)),
+			DeviceSessions:   playback.HWDeviceLoadSnapshot,
+			DeviceIdentities: playback.SamplerDeviceIdentities,
+		})
+		resourceSampler.Start(appCtx)
+		deps.ResourceSampler = resourceSampler
+
+		// Subscribe to node pool change events for multi-instance reload.
+		_ = eventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
+			if event.Type == cache.EventNodeUnreachable {
+				healthChecker.ApplyUnreachableAnnouncement(event.Payload)
+				return
+			}
+			if event.Type == cache.EventNodePoolChanged {
+				nodeKeys.Invalidate()
+				pNodes, pErr := nodeRepo.ListEnabled(context.Background(), nodepool.NodeTypeProxy)
+				tNodes, tErr := nodeRepo.ListEnabled(context.Background(), nodepool.NodeTypeTranscode)
+				if pErr != nil || tErr != nil {
+					slog.Warn("node pool reload from event failed, keeping current pools",
+						"proxy_err", pErr, "transcode_err", tErr)
+					return
+				}
+				proxyPool.SetNodes(pNodes)
+				transcodePool.SetNodes(tNodes)
+				slog.Info("node pools reloaded from event", "proxy", len(pNodes), "transcode", len(tNodes))
+			}
+		})
+	}
+
+	// Step 3: Create S3 clients (if needed).
+	if storageAdmission != nil {
+		if err := storageAdmission.Probe(appCtx); err != nil {
+			log.Fatalf("storage node admission before opening storage: %v", err)
+		}
+	}
+	if needsS3 {
+		configureS3Clients(cfg, &deps)
+	}
+	// Runs after configureS3Clients: an S3 backend takes both buckets from deps.
+	if err := configureBlobStorage(appCtx, mode, cfg, &deps, settingsRepo); err != nil {
+		log.Fatalf("configure blob storage: %v", err)
+	}
+	if needsWorkers && deps.DB != nil {
+		deps.Backups = newBackupService(pool, bc, settingsRepo, &deps)
+	}
+	if deps.DB != nil {
+		deps.ProfileTransfer = newProfileTransfer(pool, settingsRepo, cfg)
+	}
+	if storageAdmission != nil {
+		// While a failed admission session is replaced, no blob write may land:
+		// a transition elsewhere could otherwise miss it. Reads keep serving.
+		storageAdmission.SetWriteGate(func(ctx context.Context) (func(), error) {
+			return blobstore.PauseMutations(ctx, deps.Blobs.Assets, deps.Blobs.Operational)
+		})
+		// A node that was out while another node committed a transition must
+		// restart onto the new location instead of rejoining with these stores.
+		assetsIdentity, privateIdentity := deps.Blobs.Assets.Identity(), ""
+		if deps.S3Private != nil {
+			privateIdentity = blobstore.NewS3(deps.S3Private).Identity()
+		}
+		// Read the identity rows under the settings mutation lock, so a commit
+		// already in progress finishes before the check. The rows are plain,
+		// so an unreadable encrypted setting cannot block a rejoin.
+		identityRows := catalog.NewServerSettingsRepo(pool)
+		storageAdmission.SetRejoinCheck(func(ctx context.Context) error {
+			err := identityRows.UpdateAtomic(ctx, func(current map[string]string) (map[string]string, error) {
+				return nil, blobstore.CheckRecordedLocation(current, assetsIdentity, privateIdentity)
+			})
+			if errors.Is(err, blobstore.ErrLocationMoved) {
+				return fmt.Errorf("%w: %w", pglock.ErrStorageMoved, err)
+			}
+			return err
+		})
+	}
+
+	var literaryWorkService *literaryworks.Service
+	if deps.DB != nil {
+		literaryWorkService = literaryworks.NewService(literaryworks.NewRepository(deps.DB))
+	}
+
+	// Step 4: Create scanner (if needed).
+	if needsScanner && deps.DB != nil {
+		folderRepo := catalog.NewFolderRepository(deps.DB)
+		fileRepo := scanner.NewFileRepository(deps.DB)
+		deps.FolderRepo = folderRepo
+		deps.FileRepo = fileRepo
+
+		ffprobePath := scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)
+		s := scanner.NewScanner(fileRepo, ffprobePath, deps.Blobs.Assets, cfg.Scanner.Workers, cfg.Scanner.EmptyTrashAfterScan, cfg.Scanner.FileRemovalGrace)
+		s.SetSearchIndexProvider(activeCatalogSearchProvider)
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			s.SetWorkers(updated.Scanner.Workers)
+		})
+		s.SetLiteraryWorkLinker(literaryWorkService)
+		s.SetEbookEnrichmentQueue(ebooks.NewEnrichmentQueue(deps.DB))
+		deps.Scanner = s
+		probeEnsurer := scanner.NewPlaybackProbeEnsurer(fileRepo, ffprobePath, cfg.Playback.FFmpegPath, 10*time.Second)
+		// Probe repair and the copy-safety scan follow playback.ffmpeg_path
+		// without a restart; the scanner's own ffprobe path above still does not.
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			probeEnsurer.SetFFmpegPath(updated.Playback.FFmpegPath)
+		})
+		deps.ProbeEnsurer = probeEnsurer
+		slog.Info("scanner initialized")
+	}
+
+	var chapterThumbService *chapterthumbs.Service
+	if deps.FileRepo != nil && deps.FolderRepo != nil && deps.Blobs.Assets != nil {
+		chapterThumbService = chapterthumbs.NewService(
+			deps.FileRepo,
+			deps.FolderRepo,
+			deps.ProbeEnsurer,
+			settingsRepo,
+			deps.Blobs.Assets,
+			nil,
+			deps.TranscodePool,
+			cfg.Playback.FFmpegPath,
+			cfg.Playback.HWAccel,
+			cfg.Playback.HWDevice,
+			cfg.Playback.ChapterThumbnailWorkers,
+		)
+		if chapterThumbService != nil {
+			chapterThumbService.SetNodeKeys(deps.NodeKeys)
+			chapterThumbService.SetSourceGrants(deps.SourceGrants)
+			if queue := blobgc.NewQueue(deps.DB); queue != nil {
+				chapterThumbService.SetBlobQueue(queue)
+			}
+			chapterThumbService.Start(appCtx)
+			deps.ChapterThumbnailQueuer = chapterThumbService
+		}
+	}
+
+	var pluginHost *pluginhost.Host
+	var pluginService *plugins.Service
+	var pluginInstallationStore *plugins.InstallationStore
+	var pluginRuntimeConfigStore *plugins.RuntimeConfigStore
+	var refreshMarkerProviders func(context.Context) error
+	var pluginHTTPProxy *plugins.HTTPProxy
+	pluginAutoUpdateDone := make(chan struct{})
+	var pluginAutoUpdater *plugins.AutoUpdateService
+	// Network access providers: ingress tokens issued per plugin start and the
+	// providers' last reported status. Shared by the plugin host (issue,
+	// revoke, status pushes) and all three listeners (token validation).
+	networkAccess := netaccess.NewBroker()
+	deps.NetworkAccess = networkAccess
+	deps.LocalTLSPin = lanTLS.Pin()
+	if deps.DB != nil {
+		pluginCacheDir, cacheDirErr := resolvePluginCacheDir()
+		if cacheDirErr != nil {
+			log.Fatalf("plugin cache: %v", cacheDirErr)
+		}
+		repositoryStore := plugins.NewRepositoryStore(deps.DB)
+		installationStore := plugins.NewInstallationStore(deps.DB)
+		runtimeConfigStore := plugins.NewRuntimeConfigStore(deps.DB, deps.SecretCipher)
+		// This process is the api host: its resident plugins keep their
+		// per-instance state (overlay node keys) under the "api" scope.
+		instanceStateStore := plugins.NewInstanceStateStore(deps.DB, deps.SecretCipher).ForScope(plugins.HostScopeAPI)
+		hostInfo := func(ctx context.Context) (pluginhost.HostInfo, error) {
+			live := configWatcher.Config()
+			if live == nil {
+				live = cfg
+			}
+			name, _ := settingsRepo.Get(ctx, branding.KeyServerName)
+			if strings.TrimSpace(name) == "" {
+				name, _ = os.Hostname()
+			}
+			info := pluginhost.HostInfo{
+				PublicBaseURL:       live.Server.PublicURL,
+				PluginContentPrefix: plugins.ContentPrefix,
+				Role:                pluginhost.HostRoleAPI,
+				Name:                name,
+				Listeners: []pluginhost.HostListener{{
+					Name:        pluginhost.ListenerAPI,
+					Address:     pluginhost.LoopbackDialAddress(live.Server.Listen),
+					DefaultPort: pluginhost.DefaultPortAPI,
+				}},
+			}
+			if live.JellyfinCompat.Enabled && live.JellyfinCompat.Listen != "" {
+				info.Listeners = append(info.Listeners, pluginhost.HostListener{
+					Name:        pluginhost.ListenerJellyfin,
+					Address:     pluginhost.LoopbackDialAddress(live.JellyfinCompat.Listen),
+					DefaultPort: pluginhost.DefaultPortJellyfin,
+				})
+			}
+			if absCompatEnabled && live.AudiobookshelfCompat.Listen != "" {
+				info.Listeners = append(info.Listeners, pluginhost.HostListener{
+					Name:        pluginhost.ListenerABS,
+					Address:     pluginhost.LoopbackDialAddress(live.AudiobookshelfCompat.Listen),
+					DefaultPort: pluginhost.DefaultPortABS,
+				})
+			}
+			return info, nil
+		}
+		// Release signatures are checked and recorded for every catalog
+		// install, and a first-party plugin without a valid signature is
+		// refused before its binary runs
+		// (docs/architecture/plugin-trust.md#release-signatures).
+		pluginSignatures := plugins.NewSignatureChecker(plugins.SignatureCheckerOptions{
+			Enforce:   true,
+			CacheRoot: pluginCacheDir,
+		})
+		catalogService := plugins.NewCatalogService(repositoryStore, plugins.CatalogServiceOptions{
+			SiloAPIVersion: plugins.DefaultSiloAPIVersion,
+			Signatures:     pluginSignatures,
+		})
+		installer := plugins.NewInstaller(installationStore, plugins.InstallerOptions{
+			BaseDir:    pluginCacheDir,
+			Signatures: pluginSignatures,
+		})
+
+		libSource := pluginLibrarySource{groups: accessGroupStore}
+		if deps.FolderRepo != nil {
+			libSource.folders = deps.FolderRepo
+		}
+		if deps.DB != nil {
+			libSource.users = auth.NewUserRepository(deps.DB)
+		}
+		var libDataSource pluginhost.LibraryDataSource = libSource
+		presenceItemRepo := catalog.NewItemRepository(deps.DB)
+		catalogPresence := pluginhost.NewCatalogPresence(
+			func(ctx context.Context, mediaType string, tmdbIDs []string) ([]pluginhost.LibraryPresenceRecord, error) {
+				rows, err := presenceItemRepo.LookupTMDBIDs(ctx, mediaType, tmdbIDs)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]pluginhost.LibraryPresenceRecord, 0, len(rows))
+				for _, r := range rows {
+					out = append(out, pluginhost.LibraryPresenceRecord{
+						ExternalID: r.TMDBID,
+						MediaID:    r.MediaID,
+						LibraryID:  r.LibraryID,
+						Title:      r.Title,
+					})
+				}
+				return out, nil
+			},
+		)
+		pluginHost = pluginhost.NewHost(pluginhost.Config{
+			IdleStopAfter:   pluginhost.IdleStopAfter,
+			EventPublisher:  eventsHub,
+			LibraryLister:   pluginhost.NewLibraryLister(libDataSource),
+			CatalogPresence: catalogPresence,
+			InstalledPlugins: pluginhost.InstalledPluginListerFunc(
+				func(ctx context.Context) ([]pluginhost.InstalledPluginRecord, error) {
+					installations, err := installationStore.List(ctx)
+					if err != nil {
+						return nil, err
+					}
+					out := make([]pluginhost.InstalledPluginRecord, 0, len(installations))
+					for _, installation := range installations {
+						// The reserved builtin row is not a plugin; keep it out
+						// of the host's installed-plugin listing.
+						if installation.IsBuiltin() {
+							continue
+						}
+						capabilities, err := installationStore.ListCapabilities(ctx, installation.ID)
+						if err != nil {
+							return nil, err
+						}
+						descriptors := make([]*pluginv1.CapabilityDescriptor, 0, len(capabilities))
+						for _, capability := range capabilities {
+							descriptor, err := plugins.DecodeCapability(capability)
+							if err != nil {
+								return nil, err
+							}
+							descriptors = append(descriptors, descriptor)
+						}
+						out = append(out, pluginhost.InstalledPluginRecord{
+							InstallationID: installation.ID,
+							PluginID:       installation.PluginID,
+							Version:        installation.Version,
+							Enabled:        installation.Enabled,
+							Capabilities:   descriptors,
+						})
+					}
+					return out, nil
+				},
+			),
+			GlobalConfigSetter: pluginhost.GlobalConfigSetterFunc(
+				func(ctx context.Context, installationID int, key string, value map[string]any) error {
+					return runtimeConfigStore.PutGlobalConfig(ctx, installationID, key, value)
+				},
+			),
+			HostInfo:      hostInfo,
+			InstanceState: instanceStateStore,
+			NetworkAccess: networkAccess,
+			Logger: hclog.New(&hclog.LoggerOptions{
+				Name:   "plugin-host",
+				Level:  hclog.Info,
+				Output: os.Stderr,
+			}),
+		})
+		pluginService = plugins.NewService(
+			repositoryStore,
+			installationStore,
+			runtimeConfigStore,
+			catalogService,
+			installer,
+			plugins.NewHostAdapter(pluginHost),
+		)
+		// Crashes of resident plugins (network access providers) reach the
+		// supervisor through the host's exit watcher so they restart with
+		// backoff instead of waiting for the next lazy RPC.
+		pluginHost.SetExitHandler(pluginService.HandleResidentExit)
+		if watchProviderRegistry != nil {
+			reloadWatchProviders := func(ctx context.Context) {
+				if err := reloadWatchSyncPluginProviders(ctx, watchProviderRegistry, installationStore, pluginService, watchProviderRepo, watchProviderRepo); err != nil {
+					slog.WarnContext(ctx, "failed to reload watch sync plugin providers", "component", "app", "error", err)
+				}
+			}
+			pluginService.AddLifecycleHook(reloadWatchProviders)
+			reloadWatchProviders(appCtx)
+			// Lifecycle hooks fire only on the node that changed a plugin. Every
+			// API node also reconciles on a timer, so a plugin another node
+			// installed, removed, or reconfigured reaches this node's registry,
+			// and a reload that hit a transient error is retried.
+			go func() {
+				ticker := time.NewTicker(watchSyncPluginReconcileInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-appCtx.Done():
+						return
+					case <-ticker.C:
+						reloadWatchProviders(appCtx)
+					}
+				}
+			}()
+		}
+		if deps.MarkerRegistry != nil && deps.MarkerProviderConfig != nil {
+			markerPluginResolver := markers.NewPluginResolverAdapter(pluginService)
+			var refreshMu sync.Mutex
+			var loadedRevision string
+			refreshMarkerProviders = func(ctx context.Context) (err error) {
+				refreshMu.Lock()
+				defer refreshMu.Unlock()
+				reloading := false
+				defer func() {
+					if err != nil {
+						if reloading || ctx.Err() == nil {
+							loadedRevision = ""
+						}
+						if ctx.Err() == nil {
+							_ = deps.MarkerRegistry.SetProviders(nil)
+						}
+					}
+				}()
+				for range 3 {
+					revision, err := deps.MarkerProviderConfig.RuntimeRevision(ctx)
+					if err != nil {
+						return err
+					}
+					if revision == loadedRevision {
+						return nil
+					}
+					reloading = true
+					if err := deps.MarkerProviderConfig.Reload(ctx); err != nil {
+						return err
+					}
+					if err := reloadMarkerPluginProviders(ctx, deps.MarkerRegistry, deps.MarkerProviderConfig,
+						installationStore, runtimeConfigStore, settingsRepo, markerPluginResolver); err != nil {
+						return err
+					}
+					current, err := deps.MarkerProviderConfig.RuntimeRevision(ctx)
+					if err != nil {
+						return err
+					}
+					if current == revision {
+						loadedRevision = revision
+						return nil
+					}
+				}
+				return fmt.Errorf("marker provider configuration changed repeatedly during reload")
+			}
+			pluginService.AddLifecycleHook(func(ctx context.Context) {
+				if err := refreshMarkerProviders(ctx); err != nil {
+					slog.WarnContext(ctx, "reload marker plugin providers failed", "component", "app", "error", err)
+				}
+			})
+			defaultMarkerSharingStopped = func(ctx context.Context) {
+				if err := deps.MarkerProviderConfig.Reload(ctx); err != nil {
+					slog.WarnContext(ctx, "reload marker provider config failed", "error", err)
+				}
+				// Other nodes reload provider config only on this event.
+				if deps.EventBus != nil {
+					_ = deps.EventBus.Publish(ctx, cache.ChannelAdmin, cache.Event{
+						Type:    cache.EventMarkerProviderConfigChanged,
+						Payload: markers.SettingShareByDefault,
+					})
+				}
+			}
+		}
+		if err := pluginService.PreloadEnabled(appCtx); err != nil {
+			log.Fatalf("preload enabled plugins: %v", err)
+		}
+		slog.Info("plugin cache initialized", "base_dir", pluginCacheDir)
+
+		pluginAutoUpdater = plugins.NewAutoUpdateService(
+			repositoryStore,
+			installationStore,
+			catalogService,
+			installer,
+			pluginHost,
+			slog.Default(),
+			// Auto-updates rewrite installation rows (new version-specific
+			// InstallPath/Version) and delete the old install dir without going
+			// through pluginService. Wire OnLifecycleChange so the service's
+			// installation cache is invalidated and later plugin RPCs re-read
+			// the fresh row instead of a stale one.
+			pluginService.OnLifecycleChange,
+		)
+		if watchProviderRepo != nil {
+			// Install the plugins that replaced the built-in watch providers
+			// on servers with connections to carry over.
+			pluginAutoUpdater.SetRequiredPlugins(func(ctx context.Context) ([]string, error) {
+				return watchsync.FirstPartyPluginsToInstall(ctx, watchProviderRepo)
+			})
+		}
+		go func() {
+			defer close(pluginAutoUpdateDone)
+			if err := pluginAutoUpdater.Run(appCtx); err != nil {
+				slog.Error("plugin auto-update failed", "error", err)
+			}
+		}()
+		pluginInstallationStore = installationStore
+		pluginRuntimeConfigStore = runtimeConfigStore
+		pluginHTTPProxy = plugins.NewHTTPProxyWithTypedResolver(pluginService, pluginInstallationStore)
+		pluginHTTPProxy = pluginHTTPProxy.WithUserThemeLookup(plugins.FixedUserThemeLookup{})
+		if deps.DB != nil {
+			pluginHTTPProxy = pluginHTTPProxy.WithUserIdentityLookup(plugins.NewPgUserIdentityLookup(deps.DB))
+		}
+		// The admin network access reads name this process as the "api" host
+		// and refresh the shared status cache with what the provider answers.
+		pluginService.SetNetworkAccessHostInfo(hostInfo)
+		pluginService.SetNetworkAccessStatusSink(networkAccess)
+		// Proxy nodes run the same resident installations; every lifecycle
+		// change here is announced so they reconcile at once.
+		pluginService.PublishLifecycleChanges(eventBus)
+		deps.PluginService = pluginService
+		deps.PluginHTTPProxy = pluginHTTPProxy
+		defer func() {
+			if pluginHost == nil {
+				return
+			}
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := pluginHost.Shutdown(shutdownCtx); err != nil {
+				slog.Warn("failed to shut down plugin host", "error", err)
+			}
+		}()
+	} else {
+		close(pluginAutoUpdateDone)
+	}
+	if pluginService != nil && pluginInstallationStore != nil {
+		dispatcher := plugins.NewEventDispatcherWithTypedResolver(deps.EventBus, deps.EventsHub, pluginInstallationStore, pluginService, plugins.NewEventDeliveryStore(deps.DB), 4)
+		pluginService.SetEventDispatcher(dispatcher)
+		if err := dispatcher.Start(appCtx); err != nil {
+			log.Fatalf("plugin event dispatcher: %v", err)
+		}
+		defer dispatcher.Stop()
+		// Rerun the lifecycle hooks registered so far. PreloadEnabled ran them
+		// before PublishLifecycleChanges was registered, so this call is the
+		// first plugins_changed this API server publishes: proxy nodes
+		// reconcile when it comes up instead of on their next poll. The event
+		// dispatcher does not need the call; it builds its subscriber index
+		// from the store on the first event.
+		pluginService.OnLifecycleChange(appCtx)
+	}
+
+	// backgroundInit collects non-critical startup work (catalog-size-dependent
+	// seeding, network-bound reconciliation) that must not block the HTTP
+	// listener. The steps run sequentially in a background goroutine once the
+	// server is ready to serve. Failures are logged, never fatal.
+	var backgroundInit []func(context.Context)
+
+	// Step 4b: Create metadata service and match worker (if needed).
+	var metadataService *metadata.MetadataService
+	var metadataImageCacheProcessor *metadata.ImageCacheProcessor
+	var personRefreshService *metadata.PersonRefreshService
+	var matchWorker *metadata.MatchWorker
+	var libraryIngestExecutor *libraryingest.Executor
+	var libraryScanQueue *scanqueue.Service
+	var itemRefreshExecutor *adminjob.ItemRefreshExecutor
+	var libraryRefreshExecutor *adminjob.LibraryRefreshExecutor
+	var itemRepo *catalog.ItemRepository
+	var skippedRootRepo *metadata.SkippedRootRepository
+	var movieQueueRepo *metadata.MovieMatchQueueRepository
+	var seriesQueueRepo *metadata.SeriesRootMatchQueueRepository
+	var matchQueueCoordinator *metadata.MatchQueueCoordinator
+	var rootClaimRepo *catalog.RootClaimRepository
+	var groupClaimRepo *catalog.GroupClaimRepository
+	var seasonRepo *catalog.SeasonRepository
+	var episodeRepo *catalog.EpisodeRepository
+	var audiobookEnricher *audiobooks.Enricher
+	var ebookEnricher *ebooks.Enricher
+	var mangaEnricher *manga.Enricher
+	if needsWorkers && deps.DB != nil && deps.FileRepo != nil {
+		chainRepo := metadata.NewChainRepository(deps.DB)
+		// Make every existing library chain aware of the built-in providers
+		// before serving: materialize legacy content_level='' chains per level,
+		// then append registered builtins and move them to the front of each
+		// chain (idempotent; also the repair path after a stale chain-editor
+		// save drops a builtin row). Runs before the metadata service exists,
+		// so no chain cache to invalidate here.
+		syncCtx, syncCancel := context.WithTimeout(appCtx, 30*time.Second)
+		syncErr := metadata.SyncBuiltinProviderChains(syncCtx, chainRepo)
+		syncCancel()
+		if syncErr != nil {
+			log.Fatalf("sync builtin provider chains: %v", syncErr)
+		}
+		skippedRootRepo = metadata.NewSkippedRootRepository(deps.DB)
+		itemRepo = catalog.NewItemRepository(deps.DB).WithActiveSearchProvider(activeCatalogSearchProvider)
+		episodeRepo = catalog.NewEpisodeRepository(deps.DB)
+		seasonRepo = catalog.NewSeasonRepository(deps.DB)
+		personRepo := catalog.NewPersonRepository(deps.DB)
+		libraryRepo := catalog.NewLibraryItemRepository(deps.DB)
+
+		// Wait for plugin auto-update to finish before registering image resolvers.
+		<-pluginAutoUpdateDone
+
+		imageResolver := metadata.NewPluginImageResolver()
+		if pluginService != nil && pluginInstallationStore != nil {
+			reloadImageResolvers := func(ctx context.Context) {
+				if err := reloadPluginImageResolvers(ctx, pluginInstallationStore, imageResolver, pluginService); err != nil {
+					slog.WarnContext(ctx, "failed to reload plugin image resolvers", "component", "app", "error", err)
+				}
+			}
+			pluginService.AddLifecycleHook(reloadImageResolvers)
+			reloadImageResolvers(appCtx)
+		}
+		if deps.Blobs.Assets != nil {
+			imageResolver.SetArtworkResolver(deps.ArtworkResolver)
+			// The publication manifest answers for a key the catalog holds
+			// that names a rung its revision predates: after a ladder change,
+			// existing artwork lacks the new widest rung until the ladder
+			// backfill regenerates it.
+			imageResolver.SetArtworkAvailabilityReader(metadata.NewArtworkPublicationStore(deps.DB))
+		}
+		deps.ImageResolver = imageResolver
+		deps.PluginImageResolver = imageResolver
+
+		staleIDRepo := metadata.NewStaleMediaIDRepository(deps.DB)
+		providerIDRepo := catalog.NewProviderIDRepository(deps.DB)
+		movieQueueRepo = metadata.NewMovieMatchQueueRepository(deps.DB, deps.FileRepo)
+		seriesQueueRepo = metadata.NewSeriesRootMatchQueueRepository(deps.DB)
+		deps.MovieMatchQueueRepo = movieQueueRepo
+		deps.SeriesRootMatchQueueRepo = seriesQueueRepo
+		matchQueueCoordinator = metadata.NewMatchQueueCoordinator(movieQueueRepo, seriesQueueRepo)
+		backgroundInit = append(backgroundInit, func(ctx context.Context) {
+			if err := matchQueueCoordinator.WakeForChangedInputs(ctx); err != nil {
+				slog.WarnContext(ctx, "refresh metadata match queue inputs at startup failed", "component", "app", "error", err)
+			}
+		})
+		if pluginService != nil {
+			matchInputChanged := make(chan struct{}, 1)
+			go func() {
+				for {
+					select {
+					case <-appCtx.Done():
+						return
+					case <-matchInputChanged:
+						if err := matchQueueCoordinator.WakeForChangedInputs(appCtx); err != nil {
+							slog.WarnContext(appCtx, "wake metadata matches after plugin lifecycle change failed", "component", "app", "error", err)
+						}
+					}
+				}
+			}()
+			pluginService.AddLifecycleHook(func(context.Context) {
+				// Queue fingerprint reconciliation may touch thousands of parked
+				// rows. Coalesce lifecycle bursts and keep plugin admin requests
+				// independent of that background database work.
+				select {
+				case matchInputChanged <- struct{}{}:
+				default:
+				}
+			})
+		}
+		rootClaimRepo = catalog.NewRootClaimRepository(deps.DB)
+		groupClaimRepo = catalog.NewGroupClaimRepository(deps.DB)
+		pluginResolver := metadata.NewPluginResolverAdapter(pluginService)
+		// Serve the metadata chain's plugin-installation enabled-check from the
+		// plugins service's in-memory installation cache. Declared as the
+		// interface type and only assigned when pluginService is non-nil so a
+		// nil *plugins.Service is passed as a genuine nil interface (not a
+		// typed-nil), letting buildProviders fall back to the pool query.
+		var installationEnabledChecker metadata.InstallationEnabledChecker
+		if pluginService != nil {
+			installationEnabledChecker = pluginService
+		}
+		metadataService = metadata.NewMetadataService(
+			chainRepo, pluginResolver, installationEnabledChecker,
+			itemRepo, providerIDRepo, episodeRepo, seasonRepo, libraryRepo, deps.FolderRepo,
+			personRepo,
+			deps.FileRepo, skippedRootRepo, staleIDRepo, rootClaimRepo,
+		)
+		// Catalog merges and splits mark stale the recommendations of the
+		// profiles whose user state they moved.
+		if cfg.Recommendations.Enabled && deps.DB != nil {
+			metadataService.SetRecommendationStaler(recommendations.NewRepo(deps.DB))
+		}
+		// Drop the resolved-chain cache whenever a plugin is installed, enabled,
+		// disabled, updated, or uninstalled. The installation-enabled check is
+		// served from the plugins service's in-memory cache (invalidated on the
+		// same events), but resolveChainCached would otherwise keep serving a
+		// stale provider chain for up to chainCacheTTL after a provider's
+		// availability changes.
+		if pluginService != nil {
+			pluginService.AddLifecycleHook(func(context.Context) {
+				metadataService.InvalidateChainCache()
+			})
+		}
+		personRefreshService = metadata.NewPersonRefreshService(deps.DB, pluginResolver, personRepo)
+		personRefreshService.SetImageResolver(imageResolver)
+		// Person lookups reuse their resolved providers like the item chain
+		// cache does, and drop them on the same plugin lifecycle events.
+		if pluginService != nil {
+			pluginService.AddLifecycleHook(func(context.Context) {
+				personRefreshService.InvalidateProviders()
+			})
+		}
+
+		// Wire the audiobook enricher. It uses the same plugin resolver and chain
+		// repo as the movie/TV pipeline, but resolves providers at
+		// content_level='audiobook' and sweeps items directly rather than via a queue.
+		audiobookEnricher = audiobooks.NewEnricher(
+			deps.DB,
+			chainRepo,
+			pluginResolver,
+			itemRepo,
+			personRepo,
+			providerIDRepo,
+		)
+		ebookEnricher = ebooks.NewEnricher(
+			deps.DB,
+			chainRepo,
+			pluginResolver,
+			itemRepo,
+			personRepo,
+			providerIDRepo,
+		)
+		audiobookEnricher.SetLiteraryWorkLinker(literaryWorkService)
+		ebookEnricher.SetLiteraryWorkLinker(literaryWorkService)
+		mangaEnricher = manga.NewEnricher(
+			deps.DB,
+			chainRepo,
+			pluginResolver,
+			itemRepo,
+			personRepo,
+			providerIDRepo,
+		)
+
+		// Always wire the image resolver so plugin-prefixed URLs (e.g.
+		// metadb://) can be resolved to presigned HTTP URLs in API responses.
+		metadataService.SetImageResolver(imageResolver)
+		// Scans and the scheduled refresh re-apply local NFO and artwork
+		// metadata whose sidecar files changed.
+		metadataService.SetLocalSidecarStore(metadata.NewLocalSidecarRepository(deps.DB))
+		metadataService.SetFallbackLanguage(cfg.Metadata.FallbackLanguage)
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			metadataService.SetFallbackLanguage(updated.Metadata.FallbackLanguage)
+		})
+
+		// Wire the image cacher whenever object storage is available so explicit
+		// admin image applies can succeed even if automatic metadata caching is off.
+		if deps.Blobs.Assets != nil {
+			imageCacher := imagecache.New(deps.Blobs.Assets)
+			imageCacher.SetArtworkRevisionTracker(catalog.NewArtworkRevisionTracker(deps.DB))
+			metadataService.SetImageCacher(imageCacher)
+			imageCacheJobs := metadata.NewImageCacheJobRepository(deps.DB)
+			deps.ArtworkRepair = imageCacheJobs
+			metadataService.SetImageCacheJobEnqueuer(imageCacheJobs)
+			metadataImageCacheProcessor = metadata.NewImageCacheProcessorWithTargets(
+				imageCacheJobs,
+				imageCacher,
+				imageResolver,
+				metadata.ImageCacheProcessorTargets{
+					Items:               itemRepo,
+					ItemBackdrops:       catalog.NewItemBackdropRepository(deps.DB),
+					Seasons:             seasonRepo,
+					Episodes:            episodeRepo,
+					ItemLocalizations:   catalog.NewMediaItemLocalizationRepository(deps.DB),
+					SeasonLocalizations: catalog.NewSeasonLocalizationRepository(deps.DB),
+					People:              personRepo,
+				},
+			)
+			// Local file:// artwork (NFO sidecars): confine reads to the owning
+			// library's roots. The process whose refresh discovers a sidecar
+			// copies it, so a server without the library mount never has to.
+			metadataImageCacheProcessor.SetLibraryRootResolver(deps.FolderRepo)
+			metadataService.SetLocalArtworkCopier(metadataImageCacheProcessor)
+			// The admin image picker previews and applies the same local files,
+			// under the same confinement.
+			metadataService.SetLibraryRootResolver(deps.FolderRepo)
+			metadataService.SetAutoCacheImages(cfg.Metadata.CacheImages)
+			metadataImageCacheProcessor.SetEnabled(cfg.Metadata.CacheImages)
+			configWatcher.OnChange(func(_, updated *config.Config) {
+				metadataService.SetAutoCacheImages(updated.Metadata.CacheImages)
+				metadataImageCacheProcessor.SetEnabled(updated.Metadata.CacheImages)
+			})
+			if deps.Scanner != nil {
+				deps.Scanner.SetImageCacher(imageCacher)
+			}
+			if cfg.Metadata.CacheImages {
+				personRefreshService.SetImageCacher(imageCacher)
+				personRefreshService.SetImageCacheJobEnqueuer(imageCacheJobs)
+				slog.Info("metadata image caching enabled")
+			}
+			if audiobookEnricher != nil {
+				audiobookEnricher.SetImageCacher(imageCacher)
+				audiobookEnricher.SetImageCacheJobEnqueuer(imageCacheJobs)
+				audiobookEnricher.SetFFmpegPath(scanner.FFmpegPathFromFFprobe(scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)))
+			}
+			if ebookEnricher != nil {
+				ebookEnricher.SetImageCacher(imageCacher)
+				ebookEnricher.SetImageCacheJobEnqueuer(imageCacheJobs)
+			}
+			if mangaEnricher != nil {
+				mangaEnricher.SetImageCacher(imageCacher)
+				mangaEnricher.SetImageCacheJobEnqueuer(imageCacheJobs)
+			}
+		}
+
+		matchWorker = metadata.NewMatchWorker(metadataService, deps.FileRepo, cfg.Matcher.Workers, cfg.Matcher.BatchSize, 30*time.Second)
+		mwForReload := matchWorker
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			mwForReload.SetConcurrency(updated.Matcher.Workers, updated.Matcher.BatchSize)
+		})
+		matchWorker.SetRealtimeHub(deps.RealtimeHub)
+		if movieQueueRepo != nil {
+			matchWorker.SetMovieFileClaimer(movieQueueRepo)
+		}
+		if seriesQueueRepo != nil {
+			matchWorker.SetSeriesRootClaimer(seriesQueueRepo, cfg.Matcher.TVSeriesRootQueueEnabled())
+			backgroundInit = append(backgroundInit, func(ctx context.Context) {
+				if cleaned, err := seriesQueueRepo.CleanupLegacySeriesGroupQueue(ctx); err != nil {
+					slog.WarnContext(ctx, "failed to clean legacy series group queue rows", "component", "app", "error", err)
+				} else if cleaned > 0 {
+					slog.InfoContext(ctx, "cleaned legacy series group queue rows", "component", "app", "count", cleaned)
+				}
+			})
+		}
+		if deps.FolderRepo != nil {
+			backgroundInit = append(backgroundInit, func(ctx context.Context) {
+				start := time.Now()
+				enabledFolders, err := deps.FolderRepo.GetEnabled(ctx)
+				if err != nil {
+					slog.WarnContext(ctx, "failed to seed metadata queues", "component", "app", "error", err)
+					return
+				}
+				seedMovieQueue := func(folderID int) {
+					if movieQueueRepo == nil {
+						return
+					}
+					if err := movieQueueRepo.SyncForFolder(ctx, folderID); err != nil {
+						slog.WarnContext(ctx, "failed to seed movie match queue", "component", "app", "folder_id", folderID, "error", err)
+					}
+				}
+				seedSeriesQueue := func(folderID int) {
+					if seriesQueueRepo == nil {
+						return
+					}
+					if err := seriesQueueRepo.SyncForFolder(ctx, folderID); err != nil {
+						slog.WarnContext(ctx, "failed to seed series root queue", "component", "app", "folder_id", folderID, "error", err)
+					}
+				}
+				for _, folder := range enabledFolders {
+					if folder == nil {
+						continue
+					}
+					switch strings.ToLower(strings.TrimSpace(folder.Type)) {
+					case "movie", "movies":
+						seedMovieQueue(folder.ID)
+					case "series", "tv", "show", "tvshows":
+						seedSeriesQueue(folder.ID)
+					case "mixed":
+						seedSeriesQueue(folder.ID)
+						seedMovieQueue(folder.ID)
+					}
+				}
+				slog.InfoContext(ctx, "deferred init: metadata match queues seeded", "component", "app", "folders", len(enabledFolders), "duration", time.Since(start))
+			})
+		}
+
+		deps.SkippedRootRepo = skippedRootRepo
+		deps.StaleIDRepo = staleIDRepo
+		deps.PersonRepo = personRepo
+		personRefreshConfig := worker.DefaultPersonRefreshWorkerConfig()
+		personRefreshConfig.ClaimLease = catalog.PersonRefreshAttemptLease
+		personRefreshQueue := worker.NewPersonRefreshWorker(personRefreshService, personRefreshConfig)
+		personRefreshQueue.SetRatePerMinute(cfg.Metadata.PersonRefreshPerMinute)
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			personRefreshQueue.SetRatePerMinute(updated.Metadata.PersonRefreshPerMinute)
+		})
+		deps.PersonRefreshQueue = personRefreshQueue
+		deps.PersonRefresher = personRefreshService
+		deps.Refresher = metadataService
+		deps.MetadataService = metadataService
+		slog.Info("metadata service initialized and running")
+
+	}
+	if deps.Scanner != nil {
+		if matchQueueCoordinator != nil {
+			deps.Scanner.SetMetadataQueueProducer(matchQueueCoordinator)
+		}
+		if movieQueueRepo != nil {
+			deps.Scanner.SetMovieQueueSyncer(movieQueueRepo)
+		}
+		if seriesQueueRepo != nil {
+			deps.Scanner.SetSeriesQueueSyncer(seriesQueueRepo)
+		}
+	}
+	if deps.Scanner != nil && matchWorker != nil && deps.FolderRepo != nil && skippedRootRepo != nil {
+		libraryIngestExecutor = libraryingest.NewExecutor(
+			deps.Scanner,
+			matchWorker,
+			deps.FolderRepo,
+			skippedRootRepo,
+			deps.EventBus,
+			deps.RealtimeHub,
+		)
+		deps.LibraryIngester = libraryIngestExecutor
+		if metadataService != nil {
+			libraryIngestExecutor.SetLocalSidecarChecker(metadataService)
+		}
+		if deps.DB != nil {
+			libraryScanQueue = scanqueue.NewService(
+				scanqueue.NewRepository(deps.DB),
+				deps.FolderRepo,
+				libraryIngestExecutor,
+				deps.EventsHub,
+				appCtx,
+				cfg.Scanner.MaxConcurrentLibraries,
+				cfg.Scanner.MaxConcurrentScoped,
+			)
+			// Started below, after the notification system has attached its
+			// availability detector to the executor: a scan resumed by the
+			// workers before that wiring would complete without recording
+			// episode availability, silently losing release notifications.
+			deps.LibraryScanQueue = libraryScanQueue
+		}
+		if deps.DB != nil && deps.FileRepo != nil && metadataService != nil {
+			itemRefreshResolver := adminjob.NewItemRefreshResolver(
+				itemRepo,
+				seasonRepo,
+				episodeRepo,
+				deps.FolderRepo,
+				deps.FileRepo,
+			)
+			libraryRefreshExecutor = adminjob.NewLibraryRefreshExecutor(
+				adminjob.NewPGLibraryRefreshItemLister(deps.DB),
+				deps.FolderRepo,
+				itemRefreshResolver,
+				libraryIngestExecutor,
+				scanqueue.NewRepository(deps.DB),
+				metadataService,
+				deps.EventBus,
+				deps.RealtimeHub,
+			)
+			libraryRefreshExecutor.SetLibraryLockPool(deps.DB)
+			if audiobookEnricher != nil {
+				libraryRefreshExecutor.SetAudiobookEnricher(audiobookEnricher)
+			}
+		}
+		if metadataService != nil && deps.FileRepo != nil {
+			itemRefreshExecutor = adminjob.NewItemRefreshExecutor(
+				deps.FolderRepo,
+				deps.FileRepo,
+				rootClaimRepo,
+				groupClaimRepo,
+				skippedRootRepo,
+				seasonRepo,
+				episodeRepo,
+				libraryIngestExecutor,
+				scanqueue.NewRepository(deps.DB),
+				metadataService,
+				deps.EventBus,
+				deps.RealtimeHub,
+			)
+			if metadataImageCacheProcessor != nil {
+				itemRefreshExecutor.SetArtworkCacher(metadataImageCacheProcessor)
+			}
+			if itemRepo != nil {
+				itemRefreshExecutor.SetItemStatusReader(itemRepo)
+			}
+			if audiobookEnricher != nil {
+				itemRefreshExecutor.SetAudiobookEnricher(audiobookEnricher)
+			}
+		}
+	}
+
+	// Ensure PersonRepo is available for the router's DetailService.
+	if deps.DB != nil && deps.PersonRepo == nil {
+		deps.PersonRepo = catalog.NewPersonRepository(deps.DB)
+	}
+
+	// Step 5: Create user store provider (if needed).
+	var userStoreProvider userstore.UserStoreProvider
+	if needsUserDB {
+		switch cfg.UserDB.Backend {
+		case "sqlite":
+			poolConfig := userdb.PoolConfig{
+				MaxOpen:     cfg.UserDB.PoolMaxOpen,
+				IdleTimeout: cfg.UserDB.IdleTimeout,
+				DataDir:     "/var/lib/silo/userdb",
+			}
+			pool := userdb.NewUserDBPool(poolConfig)
+			userStoreProvider = userdb.NewSQLiteProvider(pool)
+			slog.Info("user store initialized", "backend", "sqlite", "max_open", poolConfig.MaxOpen)
+		default: // "postgres"
+			userStoreProvider = pgstore.NewPostgresProvider(deps.DB)
+			slog.Info("user store initialized", "backend", "postgres")
+		}
+		defer userStoreProvider.Close()
+	}
+
+	var policySystem *policy.System
+	if mode == "integrated" || mode == "api" {
+		policyDecisionLogger := policy.NewDecisionLogger(
+			deps.DB,
+			nodeID,
+			policy.WithDecisionLogLogger(slog.Default()),
+		)
+		policyDecisionLogger.SetVerbosity(cfg.Policy.DecisionLogVerbosity)
+		policyDecisionLogger.SetScopeSampleRate(cfg.Policy.DecisionLogScopeSampleRate)
+		policySystem = policy.NewSystem(
+			policy.NewPolicyStore(deps.DB),
+			deps.EventBus,
+			slog.Default(),
+			policy.WithSystemEvalTimeout(time.Duration(cfg.Policy.EvalTimeoutMS)*time.Millisecond),
+			policy.WithSystemDecisionLogger(policyDecisionLogger),
+		)
+		if err := policySystem.Start(appCtx); err != nil {
+			log.Fatalf("policy system start: %v", err)
+		}
+		deps.PolicySystem = policySystem
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			policySystem.SetEvalTimeout(time.Duration(updated.Policy.EvalTimeoutMS) * time.Millisecond)
+			if logger := policySystem.DecisionLogger(); logger != nil {
+				logger.SetVerbosity(updated.Policy.DecisionLogVerbosity)
+				logger.SetScopeSampleRate(updated.Policy.DecisionLogScopeSampleRate)
+			}
+		})
+		defer policySystem.Stop()
+	}
+
+	// White-label branding: one service shared by the API (public read + admin
+	// upload), the frontend handler (index.html title, favicon, manifest), the
+	// artwork reconcile task, and outgoing email. It is built before the
+	// notification system, which sends email. Uploaded images go to the
+	// artwork store (local disk or S3, whichever artwork storage uses), which
+	// configureBlobStorage always opens in a process that serves the API. Only
+	// a process without one passes a nil AssetStore (not a typed nil), so text
+	// branding still works there.
+	var brandingStore branding.AssetStore
+	if deps.Blobs.Assets != nil {
+		brandingStore = deps.Blobs.Assets
+	}
+	brandingSvc := branding.NewService(settingsRepo, brandingStore)
+	deps.EmailBrand = mail.NewBrandLoader(brandingSvc)
+
+	// User-facing release notifications. The system reads user state through
+	// the raw store provider; the provider handed to everything downstream is
+	// wrapped so every progress, history and Home removal mutation (REST
+	// handlers, jellycompat, imports, playback) feeds the interest index.
+	var notificationSystem *notifications.System
+	if deps.DB != nil && userStoreProvider != nil {
+		userRepo := auth.NewUserRepository(deps.DB)
+		profileTokens := access.NewProfileTokenService(cfg.Auth.JWTSecret, 0)
+		var notificationScopes notifications.ScopeResolver
+		if policySystem != nil {
+			notificationScopes = policy.NewViewerResolver(userRepo, userStoreProvider, profileTokens, policySystem.PDP(), accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+		} else {
+			// Legacy resolver: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
+			notificationScopes = access.NewResolver(userRepo, userStoreProvider, profileTokens, accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+		}
+		notificationSystem = notifications.NewSystem(
+			deps.DB,
+			settingsRepo,
+			userStoreProvider,
+			notificationScopes,
+			userRepo,
+			deps.EventsHub,
+			deps.RedisClient,
+			deps.SecretCipher,
+			mail.NewSMTPSender(settingsRepo),
+			deps.EmailBrand,
+		)
+		// A title arriving tells the profiles whose watchlist waited for it,
+		// unless a request of it tells them.
+		notificationSystem.SetWatchlistArrivals(
+			&watchlist.Arrivals{},
+			mediarequests.NewRepository(deps.DB, deps.SecretCipher),
+		)
+		userStoreProvider = notifications.WrapUserStoreProvider(userStoreProvider, notificationSystem)
+		deps.Notifications = notificationSystem
+		if pluginService != nil {
+			notificationSystem.SetPluginChannelHost(pluginChannelHost{plugins: pluginService})
+		}
+
+		if libraryIngestExecutor != nil {
+			libraryIngestExecutor.SetAvailabilityDetector(notificationSystem.Detector)
+		}
+		if needsWorkers {
+			notificationSystem.Start(appCtx)
+			defer notificationSystem.Wait()
+		}
+	}
+
+	// Start the scan queue only now that the availability detector (when
+	// notifications are enabled) is attached to the ingest executor, so scans
+	// resumed at startup cannot complete before the detector exists.
+	if libraryScanQueue != nil {
+		libraryScanQueue.Start()
+		defer libraryScanQueue.Stop()
+	}
+
+	// Real-time library monitoring. The status read serves every node's
+	// reports; the monitor itself runs wherever this process can scan, watches
+	// the library folders this node can see, and queues scans for changes. Its
+	// folder walks run in the background, so startup never waits on them.
+	if needsScanner && deps.DB != nil && deps.FolderRepo != nil {
+		monitorStatus := librarymonitor.NewStatusStore(deps.DB)
+		deps.LibraryMonitoring = &librarymonitor.StatusReader{
+			Store:         monitorStatus,
+			Folders:       deps.FolderRepo,
+			ServerEnabled: func() bool { return configWatcher.Config().Scanner.RealtimeMonitoring },
+		}
+		if libraryScanQueue != nil {
+			serverEnabled := configWatcher.Config().Scanner.RealtimeMonitoring
+			libraryMonitor, monitorErr := librarymonitor.New(librarymonitor.Config{
+				NodeID:        nodeID,
+				Folders:       deps.FolderRepo,
+				Queue:         libraryScanQueue,
+				Status:        monitorStatus,
+				Logger:        slog.Default(),
+				ServerEnabled: serverEnabled,
+			})
+			if monitorErr != nil {
+				slog.Error("real-time library monitoring disabled", "error", monitorErr)
+			} else {
+				configWatcher.OnChange(func(old, updated *config.Config) {
+					if old == nil || old.Scanner.RealtimeMonitoring != updated.Scanner.RealtimeMonitoring {
+						libraryMonitor.SetServerEnabled(updated.Scanner.RealtimeMonitoring)
+					}
+				})
+				// A reload between reading the switch and registering the hook
+				// would otherwise be missed.
+				if live := configWatcher.Config().Scanner.RealtimeMonitoring; live != serverEnabled {
+					libraryMonitor.SetServerEnabled(live)
+				}
+				libraryMonitor.Start(appCtx)
+				defer libraryMonitor.Stop()
+				deps.LibraryMonitor = libraryMonitor
+			}
+		}
+	}
+
+	if userStoreProvider != nil && pluginService != nil {
+		deps.PluginUserConfig = plugins.NewUserConfigStore(userStoreProvider, pluginService)
+	}
+
+	// Step 6: Create playback session manager and wire into dependencies.
+	sessionMgr := playback.NewSessionManager(6, 2) // defaults from plan: max_streams=6, max_transcodes=2
+	if apiRedisClient != nil {
+		// Proxy nodes record the media they serve, so a remote stream outlives a
+		// client that stopped reporting progress while it still pulls media. The
+		// idle sweep waits on this lookup, so it gets a client that gives up at
+		// the sweep's deadline.
+		deliveryRedisClient, deliveryRedisErr := cache.NewDeadlineRedisClientForRole(cfg.Redis, "api")
+		if deliveryRedisErr != nil {
+			slog.Warn("redis client init failed; node delivery will not keep playback sessions alive", "error", deliveryRedisErr)
+		} else if deliveryRedisClient != nil {
+			defer func() { _ = cache.CloseRedisClient(deliveryRedisClient) }()
+			sessionMgr.SetDeliveryActivityReader(func(ctx context.Context, sessions []playback.Session) (map[string]time.Time, error) {
+				ids := make([]string, len(sessions))
+				for i := range sessions {
+					ids[i] = sessions[i].ID
+				}
+				return nodesessions.RecentDeliveries(ctx, deliveryRedisClient, ids)
+			})
+		}
+	}
+	var compatTerminalRecoveryReady <-chan struct{}
+	if userStoreProvider != nil {
+		deps.UserStoreProvider = userStoreProvider
+	}
+	if watchProviderService != nil {
+		historyRepo := historyimport.NewRepository(deps.DB, deps.SecretCipher)
+		historyIdentity := watchstate.NewStableIdentityResolver(itemRepo, episodeRepo, catalog.NewProviderIDRepository(deps.DB))
+		// A sync's episodes follow what the profile may open, as any viewer
+		// read does, so it resolves scope the same way.
+		var watchProviderScopes interface {
+			Resolve(context.Context, access.ResolveInput) (access.Scope, error)
+		}
+		if policySystem != nil {
+			watchProviderScopes = policy.NewViewerResolver(auth.NewUserRepository(deps.DB), userStoreProvider, nil, policySystem.PDP(), accessGroupStore).WithUnratedContentPolicy(unratedContent)
+		} else {
+			// Legacy resolver: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path.
+			watchProviderScopes = access.NewResolver(auth.NewUserRepository(deps.DB), userStoreProvider, nil, accessGroupStore).WithUnratedContentPolicy(unratedContent)
+		}
+		watchProviderLibrary := catalog.NewLibraryItemRepository(deps.DB)
+		watchProviderService.
+			WithMatcher(historyimport.NewMatcher(historyRepo)).
+			WithProfileAccess(func(ctx context.Context, userID int, profileID string) (watchsync.ProfileAccess, error) {
+				// A sync runs for the connection's profile without a viewer,
+				// so a PIN does not apply; the profile's hidden-library
+				// preference is not an access rule.
+				scope, err := watchProviderScopes.Resolve(ctx, access.ResolveInput{
+					UserID: userID, ProfileID: profileID, SkipPINVerification: true, ContentAccessOnly: true,
+				})
+				if err != nil {
+					return watchsync.ProfileAccess{}, err
+				}
+				allowed := scope.AllowedLibraryIDs
+				if scope.LibrariesRestricted && allowed == nil {
+					allowed = []int{}
+				}
+				return watchsync.ProfileAccess{
+					AllowedLibraryIDs: allowed,
+					Accessible: func(ctx context.Context, contentIDs []string) (map[string]bool, error) {
+						return watchProviderLibrary.FilterAccessibleContentIDs(ctx, contentIDs, allowed, scope.DisabledLibraryIDs, scope.MaturityLimits)
+					},
+				}, nil
+			}).
+			WithWatchState(watchstate.NewService(userStoreProvider).WithStableIdentityResolver(historyIdentity)).
+			WithUserStoreProvider(userStoreProvider).
+			WithRatingStore(catalog.NewRatingsRepo(deps.DB)).
+			WithDroppedStore(notifications.TrackDroppedSeries(catalog.NewDroppedSeriesRepo(deps.DB), notificationSystem))
+		backgroundInit = append(backgroundInit, func(ctx context.Context) {
+			if compatTerminalRecoveryReady != nil {
+				select {
+				case <-compatTerminalRecoveryReady:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if err := watchProviderService.SweepOpenScrobbles(ctx); err != nil {
+				slog.WarnContext(ctx, "failed to sweep open watch provider scrobbles", "component", "app", "error", err)
+			}
+		})
+	}
+	// Auto-remove fully-watched movies from the watchlist (standalone behavior,
+	// default-on per profile), propagating removals to connected providers.
+	// Series are never removed; watchlist read paths hide fully-watched ones
+	// (catalog.WatchlistVisibility) so newly added episodes bring them back.
+	if itemRepo != nil && userStoreProvider != nil {
+		maintainer := watchlist.NewMaintainer(userStoreProvider, itemRepo)
+		if watchProviderService != nil {
+			maintainer.WithListEventDispatcher(watchProviderService)
+		}
+		deps.WatchCompletionObserver = maintainer
+	}
+	deps.SessionMgr = sessionMgr
+	deps.PlaybackRealtimeHub = playback.NewRealtimeHub()
+	deps.MarkerUpdateNotifier = playback.NewMarkerUpdateNotifier(sessionMgr, deps.PlaybackRealtimeHub)
+	if deps.EventBus != nil {
+		publish := func(ctx context.Context, payload string) error {
+			return deps.EventBus.Publish(ctx, cache.ChannelPlayback, cache.Event{Type: cache.EventMarkersUpdated, Payload: payload})
+		}
+		subscribe := func(ctx context.Context, handler func(string)) error {
+			return deps.EventBus.Subscribe(ctx, cache.ChannelPlayback, func(event cache.Event) {
+				if event.Type == cache.EventMarkersUpdated {
+					handler(event.Payload)
+				}
+			})
+		}
+		if err := deps.MarkerUpdateNotifier.UseEventBus(appCtx, publish, subscribe); err != nil {
+			slog.Warn("subscribe marker updates failed", "error", err)
+		}
+	}
+
+	if deps.DB != nil && deps.FileRepo != nil && deps.MarkerRegistry != nil {
+		deps.MarkerPopulation = markers.NewPopulationService(markers.PopulationOptions{
+			RefreshProviders: refreshMarkerProviders,
+			Registry:         deps.MarkerRegistry,
+			Resolver:         deps.MarkerResolver,
+			Settings:         settingsRepo,
+			Store:            markers.NewPopulationStore(deps.DB),
+			LoadFile:         deps.FileRepo.GetByID,
+			Write: func(ctx context.Context, file *models.MediaFile, result markers.Result) (bool, error) {
+				update := scanner.MarkerUpdateFromPayload(markers.BuildUpdatePayload(result))
+				update.ExpectedFile = file
+				return deps.FileRepo.UpsertMarkers(ctx, file.ID, update)
+			},
+			Notify: func(ctx context.Context, file *models.MediaFile) {
+				if chapterThumbService != nil {
+					chapterThumbService.PrepareMarkerFile(ctx, file)
+				}
+				deps.MarkerUpdateNotifier.MarkersUpdated(ctx, file)
+			},
+		})
+	}
+	if chapterThumbService != nil {
+		chapterThumbnailResolver := deps.ArtworkResolver
+		chapterThumbnailURLs := playback.ChapterThumbnailURLResolver(func(ctx context.Context, key string, ttl time.Duration) (string, error) {
+			if chapterThumbnailResolver == nil {
+				return "", fmt.Errorf("artwork resolver unavailable")
+			}
+			if value, ok := artworkurl.ResolveURLFor(ctx, chapterThumbnailResolver, key, ttl); ok {
+				return value.URL, nil
+			}
+			return "", fmt.Errorf("artwork URL unavailable")
+		})
+		thumbnailNotifier := playback.NewChapterThumbnailNotifier(sessionMgr, deps.PlaybackRealtimeHub, chapterThumbnailURLs, 0, planstore.NewPostgres(deps.DB))
+		if deps.EventBus != nil {
+			publish := func(ctx context.Context, payload string) error {
+				return deps.EventBus.Publish(ctx, cache.ChannelPlayback, cache.Event{Type: cache.EventMarkerThumbnailReady, Payload: payload})
+			}
+			subscribe := func(ctx context.Context, handler func(string)) error {
+				return deps.EventBus.Subscribe(ctx, cache.ChannelPlayback, func(event cache.Event) {
+					if event.Type == cache.EventMarkerThumbnailReady {
+						handler(event.Payload)
+					}
+				})
+			}
+			if err := thumbnailNotifier.UseMarkerEventBus(appCtx, publish, subscribe); err != nil {
+				slog.Warn("subscribe marker thumbnail updates failed", "error", err)
+			}
+		}
+		chapterThumbService.SetNotifier(thumbnailNotifier)
+	}
+
+	// Build the reconciler early enough that playback handlers can trigger
+	// immediate session syncs after start/stop events.
+	nodeIdentity := resolveNodeIdentity()
+
+	var reconciler *worker.Reconciler
+	var heartbeatWriter *worker.HeartbeatWriter
+	if needsWorkers && deps.DB != nil {
+		sessionProvider := func() []worker.SessionSync {
+			return buildLiveSessionSyncs(sessionMgr.AllSessions(), nodeIdentity)
+		}
+		reconciler = worker.NewReconciler(deps.DB, nodeIdentity, sessionProvider)
+		reconciler.EventBus = deps.EventBus
+		reconciler.EventsHub = deps.EventsHub
+		reconciler.PreSync = func() {
+			// Retire sessions that have not shown real playback activity
+			// recently enough to count as live. This keeps the in-memory
+			// limiter, transcode teardown, and synced admin view aligned.
+			if expired := sessionMgr.CleanStale(); len(expired) > 0 {
+				slog.Info("expired idle sessions", "count", len(expired))
+			}
+		}
+		deps.SessionSyncer = reconciler
+		deps.LiveSessionRowJSON = func(s *playback.Session) (json.RawMessage, error) {
+			return worker.SessionSyncRowJSON(buildLiveSessionSync(s, nodeIdentity), nodeIdentity)
+		}
+
+		nodeURL := fmt.Sprintf("http://%s%s", nodeIdentity, cfg.Server.Listen)
+		heartbeatWriter = worker.NewHeartbeatWriter(deps.DB, nodeIdentity, mode, nodeURL)
+	}
+
+	if deps.DB != nil {
+		adminStatsProvider, statsErr := handlers.NewAdminStatsProvider(appCtx, deps.DB, deps.EventBus, watchProviderRegistry)
+		if statsErr != nil {
+			log.Fatalf("failed to create admin stats provider: %v", statsErr)
+		}
+		defer adminStatsProvider.Close()
+		deps.AdminStatsProvider = adminStatsProvider
+
+		playbackActivityProvider, playbackActivityErr := handlers.NewAdminPlaybackActivityProvider(appCtx, deps.DB, deps.EventBus)
+		if playbackActivityErr != nil {
+			log.Fatalf("failed to create admin playback activity provider: %v", playbackActivityErr)
+		}
+		defer playbackActivityProvider.Close()
+		deps.AdminPlaybackActivityProvider = playbackActivityProvider
+
+		topActivityProvider, topActivityErr := handlers.NewAdminTopActivityProvider(appCtx, deps.DB, deps.EventBus)
+		if topActivityErr != nil {
+			log.Fatalf("failed to create admin top activity provider: %v", topActivityErr)
+		}
+		defer topActivityProvider.Close()
+		deps.AdminTopActivityProvider = topActivityProvider
+
+		timeseriesProvider, timeseriesErr := handlers.NewAdminTimeseriesProvider(appCtx, deps.DB, deps.EventBus)
+		if timeseriesErr != nil {
+			log.Fatalf("failed to create admin timeseries provider: %v", timeseriesErr)
+		}
+		defer timeseriesProvider.Close()
+		deps.AdminTimeseriesProvider = timeseriesProvider
+
+		downloadsStatsProvider, downloadsStatsErr := handlers.NewAdminDownloadsStatsProvider(appCtx, deps.DB, deps.EventBus)
+		if downloadsStatsErr != nil {
+			log.Fatalf("failed to create admin downloads stats provider: %v", downloadsStatsErr)
+		}
+		defer downloadsStatsProvider.Close()
+		deps.AdminDownloadsStatsProvider = downloadsStatsProvider
+
+		// The dashboard metrics sampler is the only writer of concurrent-stream
+		// and egress history. Proxy and transcode nodes serve bytes but do not
+		// own the catalog database, so only the API-facing modes sample. An
+		// unset SILO_MODE is the integrated default everywhere else in this
+		// file, so it samples too.
+		if mode == "integrated" || mode == "api" || mode == "" {
+			dashSampler := dashmetrics.NewSampler(deps.DB, deps.StreamTelemetry, nodeIdentity)
+			dashSampler.Start(appCtx)
+			defer dashSampler.Stop()
+		}
+	}
+
+	// Wire recommendations engine, worker, and ratings repo if enabled.
+	var recEngine *recommendations.Engine
+	var recWorker *recommendations.Worker
+	if cfg.Recommendations.Enabled && deps.DB != nil {
+		deps.RatingsRepo = catalog.NewRatingsRepo(deps.DB)
+		recEngine = recommendations.NewEngine(
+			deps.DB,
+			deps.RatingsRepo,
+			catalog.NewItemRepository(deps.DB),
+			catalog.NewPersonRepository(deps.DB),
+			userStoreProvider,
+			cfg.Recommendations,
+		).WithUnratedContentPolicy(unratedContent).
+			WithUserStoreOutsidePostgres(cfg.UserDB.Backend == "sqlite")
+		if userStoreProvider != nil {
+			// Cached rows are built under the scope the API resolves for the
+			// profile's own requests, so reads do not filter them down.
+			recUserRepo := auth.NewUserRepository(deps.DB)
+			if policySystem != nil {
+				recEngine.WithScopeResolver(policy.NewViewerResolver(recUserRepo, userStoreProvider, nil, policySystem.PDP(), accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults))
+			} else {
+				// Legacy resolver: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
+				recEngine.WithScopeResolver(access.NewResolver(recUserRepo, userStoreProvider, nil, accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults))
+			}
+		}
+		deps.Recommender = recEngine
+		deps.CatalogSearchVectorizer = recEngine
+		// A rotated embedding provider key applies at once; a new endpoint
+		// or model waits for the restart that rebuilds the engine.
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			recEngine.ApplyEmbeddingCredential(updated.Recommendations)
+		})
+
+		var err error
+		recWorker, err = recommendations.NewWorker(
+			recEngine,
+			cfg.Recommendations.EmbeddingsCron,
+			cfg.Recommendations.TasteProfilesCron,
+			cfg.Recommendations.CowatchCron,
+			cfg.Recommendations.RecommendationsCron,
+			cfg.Recommendations.EmbeddingsJobTimeout,
+		)
+		if err != nil {
+			slog.Error("failed to create recommendation worker", "error", err)
+		} else {
+			recWorker.WithJobHistory(taskrepository.NewPgExecutionRepository(deps.DB)).
+				WithPolicyCheck(policySystem.Current).
+				WithSavedConfig(func(ctx context.Context) (config.RecommendationsConfig, error) {
+					saved, err := settingsRepo.GetAll(ctx)
+					if err != nil {
+						return config.RecommendationsConfig{}, err
+					}
+					savedCfg, err := config.LoadFromDB(saved)
+					if err != nil {
+						return config.RecommendationsConfig{}, err
+					}
+					return savedCfg.Recommendations, nil
+				})
+			deps.RecWorker = recWorker
+			settingsRecWorker = recWorker
+			// Watch-provider syncs rebuild a profile's recommendations once
+			// per run that imported something.
+			if watchProviderService != nil {
+				watchProviderService.WithSignalsChangedNotifier(recWorker)
+			}
+			// A scope policy can change every profile's scope, and cached
+			// rows are built under it. The first node to load a new policy
+			// generation marks every profile stale; refreshes wait until
+			// their node has loaded it (WithPolicyCheck above).
+			policySystem.OnChangeApplied(recWorker.NotifyPolicyChanged)
+		}
+	}
+
+	// Client IP resolver with trusted proxy config.
+	if err := clientip.SeedDefaults(ctx, settingsRepo); err != nil {
+		log.Fatalf("seed clientip defaults: %v", err)
+	}
+	trustedCIDRs, err := clientip.LoadTrustedCIDRs(ctx, settingsRepo)
+	if err != nil {
+		log.Fatalf("load trusted CIDRs: %v", err)
+	}
+	ipResolver = clientip.NewResolver(trustedCIDRs)
+	deps.ClientIPResolver = ipResolver
+	// Hot-reload trusted proxies on settings changes via two complementary
+	// paths. The direct event-bus subscription re-reads only the clientip key,
+	// so a malformed unrelated setting (which fails the whole-config reload)
+	// cannot leave stale trust CIDRs on Redis-backed multi-instance deploys.
+	_ = eventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
+		if event.Type != cache.EventSettingsChanged {
+			return
+		}
+		if loadErr := ipResolver.ReloadTrustedCIDRs(context.Background(), settingsRepo); loadErr != nil {
+			slog.WarnContext(context.Background(), "clientip config reload failed", "component", "app", "error", loadErr)
+		}
+	})
+	// Another node's admin write of an administrator default: reload this
+	// node's snapshot. Its own subscription, so a slow settings read never
+	// holds up the trusted-proxy reload above. The writing node reloads before
+	// it publishes the client event; here the two can race, which the TTL and
+	// the web client's second re-read cover.
+	_ = eventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
+		if event.Type == cache.EventSettingsChanged {
+			adminDefaults.Changed(context.Background(), event.Payload)
+		}
+	})
+	// The config watcher covers the Redis-less poll/RequestReload path, so
+	// admin UI edits apply without a restart on single-node deployments too.
+	configWatcher.OnChange(func(_, _ *config.Config) {
+		// Re-read under the same resolver reload lock as direct/event callbacks.
+		// The watcher snapshot may predate a committed administrator write.
+		if loadErr := ipResolver.ReloadTrustedCIDRs(context.Background(), settingsRepo); loadErr != nil {
+			slog.WarnContext(context.Background(), "clientip config reload failed", "component", "app", "error", loadErr)
+		}
+	})
+
+	// Step 6b: Create rate limiter.
+	if cfg.RateLimit.Enabled && deps.DB != nil {
+		var perKeyLimiter, globalLimiter ratelimit.RateLimiter
+		isMemory := true
+
+		if cfg.RateLimit.Backend == "redis" {
+			// Each check bounds its own call, so the client must let that
+			// deadline end a stalled socket read.
+			redisClient, redisErr := cache.NewDeadlineRedisClientForRole(cfg.Redis, "tasks")
+			if redisErr != nil {
+				log.Fatalf("failed to create Redis client for rate limiting: %v", redisErr)
+			}
+			if redisClient != nil {
+				// One limiter for both, so a Redis outage pauses every check
+				// of a request at once.
+				redisLimiter := ratelimit.NewRedisLimiter(redisClient)
+				perKeyLimiter, globalLimiter = redisLimiter, redisLimiter
+				isMemory = false
+				defer func() { _ = cache.CloseRedisClient(redisClient) }()
+			}
+		}
+
+		if isMemory {
+			perKeyLimiter = ratelimit.NewMemoryLimiter()
+			globalLimiter = ratelimit.NewMemoryLimiter()
+		}
+		defer perKeyLimiter.Close()
+		defer globalLimiter.Close()
+
+		rateLimitMW := ratelimit.NewMiddleware(perKeyLimiter, globalLimiter, settingsRepo, isMemory)
+		if err := rateLimitMW.Init(context.Background()); err != nil {
+			log.Fatalf("failed to init rate limiter: %v", err)
+		}
+
+		// Subscribe for multi-instance reload (only fires if EventBus is Redis-backed)
+		_ = eventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
+			if event.Type == cache.EventSettingsChanged {
+				if reloadErr := rateLimitMW.Reload(context.Background()); reloadErr != nil {
+					slog.Warn("rate limit config reload from event failed", "error", reloadErr)
+				}
+			}
+		})
+
+		deps.RateLimitMW = rateLimitMW
+	}
+	// Profile PIN lockout is a security limit, independent of request rate
+	// limiting: it counts in Redis whenever Redis is configured, so every node
+	// shares one budget per profile even with ratelimit.backend at its memory
+	// default, and is process-local only on a Redis-less deployment.
+	deps.ProfilePINAttempts = ratelimit.NewProfilePINAttemptLimiter(apiRedisClient)
+	// The Quick Connect code budget per account follows the same rule, and
+	// the native approval routes and Jellyfin's Authorize share it.
+	deps.QuickConnectCodeAttempts = ratelimit.NewQuickConnectCodeAttemptLimiter(apiRedisClient)
+	// The per-name password sign-in budget follows the same rule. One
+	// limiter serves the native, Jellyfin and Audiobookshelf auth services,
+	// so no listener gets its own allowance.
+	deps.SignInAttempts = ratelimit.NewSignInNameAttemptLimiter(apiRedisClient)
+
+	// Activity log writer + consumer.
+	if err := activitylog.SeedDefaults(ctx, settingsRepo); err != nil {
+		log.Fatalf("seed activitylog defaults: %v", err)
+	}
+
+	if err := taskmanager.SeedHistoryRetentionDefaults(ctx, settingsRepo); err != nil {
+		log.Fatalf("seed task history retention defaults: %v", err)
+	}
+
+	// Seed default page sections for home and existing libraries.
+	sectionRepo := sections.NewRepository(pool)
+	var folders []*models.MediaFolder
+	if deps.FolderRepo != nil {
+		var listErr error
+		folders, listErr = deps.FolderRepo.List(ctx)
+		if listErr != nil {
+			log.Fatalf("list libraries for section defaults: %v", listErr)
+		}
+	}
+	if err := sectionRepo.SeedDefaults(ctx, "home", nil, sections.DefaultHomeSections(folders)); err != nil {
+		log.Fatalf("seed home section defaults: %v", err)
+	}
+	if deps.FolderRepo != nil {
+		for _, f := range folders {
+			id := f.ID
+			if seedErr := sectionRepo.SeedDefaults(ctx, "library", &id, sections.DefaultLibrarySectionsForType(&id, f.Type)); seedErr != nil {
+				slog.Warn("seed library section defaults", "library_id", id, "error", seedErr)
+			}
+		}
+	}
+	activityPM := partman.NewManager(pool, "activity_log", partman.Weekly, 2)
+	if err := activityPM.EnsureFuturePartitions(appCtx); err != nil {
+		// Non-fatal: see the operational_logs partition incident. Writes fall
+		// back to the default partition and periodic cleanup retries.
+		slog.Warn("ensure activity log partitions; continuing in degraded mode", "error", err)
+	}
+	policyPM := partman.NewManager(pool, "policy_decisions", partman.Daily, 3)
+	if err := policyPM.EnsureFuturePartitions(appCtx); err != nil {
+		// Non-fatal: decision logs fall back to the default partition and
+		// periodic cleanup retries partition creation.
+		slog.Warn("ensure policy decision log partitions; continuing in degraded mode", "error", err)
+	}
+	activityWriter, stopActivityLog := configureActivityLogging(pool, logStreamHub)
+	defer stopActivityLog()
+	deps.ActivityLogWriter = activityWriter
+	deps.ActivityLogRepo = activitylog.NewRepo(pool)
+	deps.APIUsage = apiusage.NewStore(pool)
+	deps.NodeID = nodeID
+
+	// Create refresh worker early so the task manager can use it for FindCandidates.
+	var refreshWorker *worker.RefreshWorker
+	var personRefreshWorker *worker.PersonRefreshWorker
+	if needsWorkers && deps.DB != nil {
+		refreshWorker = worker.NewRefreshWorker(deps.DB)
+		if deps.PersonRefreshQueue != nil {
+			personRefreshWorker, _ = deps.PersonRefreshQueue.(*worker.PersonRefreshWorker)
+		}
+	}
+
+	// Construct collection service for both the router and the collection sync scheduler.
+	var collectionSyncScheduler *catalog.CollectionSyncScheduler
+	var userCollectionScheduler *usercollections.Scheduler
+	var trendingRefresher *sections.TrendingRefresher
+	var seasonalListRefresher *sections.SeasonalListRefresher
+	if needsWorkers && deps.DB != nil {
+		collectionRepo := catalog.NewLibraryCollectionRepository(deps.DB)
+		collItemRepo := catalog.NewItemRepository(deps.DB)
+		libraryItemRepo := catalog.NewLibraryItemRepository(deps.DB)
+		collectionService := catalog.NewLibraryCollectionService(collectionRepo, collItemRepo, libraryItemRepo, nil)
+		collectionService.TMDBCollections = api.NewTMDBCollectionFetcher(tmdbClient)
+		deps.CollectionService = collectionService
+		collectionSyncScheduler = catalog.NewCollectionSyncScheduler(collectionRepo, collectionService, slog.Default())
+
+		// The trending refresher reuses the section repo (to find used source/
+		// window combos beyond the calendar's fixed feed), a snapshot repo, an
+		// item repo (external-ID matching), and the TMDB fetcher.
+		sectionDemand := sections.NewSectionDemandLister(sectionRepo, auth.NewUserRepository(deps.DB), userStoreProvider)
+		trendingRefresher = sections.NewTrendingRefresher(
+			sectionDemand,
+			sections.NewTrendingSnapshotRepository(pool),
+			catalog.NewItemRepository(deps.DB),
+			collectionService.TMDBCollections,
+		)
+		deps.TrendingRefresher = trendingRefresher
+		seasonalListRefresher = sections.NewSeasonalListRefresher(sectionDemand, sections.NewSeasonalListRepository(pool))
+		deps.SeasonalListRefresher = seasonalListRefresher
+
+		if deps.UserStoreProvider != nil {
+			// Imports fill their item limit with titles their owner profile
+			// can access. Scheduled syncs start with the task manager below,
+			// so the owner resolver is wired here, not in the router.
+			var ownerScopes scopeResolver
+			if policySystem != nil {
+				ownerScopes = policy.NewViewerResolver(auth.NewUserRepository(deps.DB), deps.UserStoreProvider, nil, policySystem.PDP(), accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+			} else {
+				// Legacy resolver: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
+				ownerScopes = access.NewResolver(auth.NewUserRepository(deps.DB), deps.UserStoreProvider, nil, accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+			}
+			userSync := usercollections.NewService(deps.UserStoreProvider, collItemRepo, libraryItemRepo, usercollections.NewOwnerAccess(ownerScopes), nil, slog.Default())
+			userSync.TMDBCollections = collectionService.TMDBCollections
+			// Syncs refresh collages and start with the task manager below,
+			// before the router exists, so the collage service is shared from
+			// here; the router gives it its generator.
+			deps.PersonalCollectionCollages = catalog.NewPersonalCollectionCollages(deps.DB, nil)
+			userSync.Collages = deps.PersonalCollectionCollages
+			userCollectionScheduler = usercollections.NewScheduler(deps.DB, userSync, slog.Default())
+			deps.UserCollectionSync = userSync
+			deps.UserCollectionScheduler = userCollectionScheduler
+			deps.MDBListClient = mdblist.NewClient(cfg.MDBListAPIKey, nil)
+			mdblistForReload := deps.MDBListClient
+			configWatcher.OnChange(func(_, updated *config.Config) {
+				mdblistForReload.SetAPIKey(updated.MDBListAPIKey)
+			})
+		}
+	}
+
+	// Sign-in providers come from enabled auth_provider.v1 bindings. The
+	// registry rebuilds on this node after a plugin lifecycle change (install,
+	// config save, removal) or an auth binding write, and on every other node
+	// when that change is announced on the admin channel, so no restart is
+	// needed (docs/architecture/external-sign-in.md).
+	var authProviderRegistry *auth.PluginProviderRegistry
+	if deps.DB != nil && pluginInstallationStore != nil && pluginRuntimeConfigStore != nil && deps.PluginService != nil {
+		// The resolver stores the plugins' refresh_state encrypted with the
+		// server secret, for the provider re-check at session refresh.
+		accountResolver := auth.NewAccountResolver(deps.DB,
+			auth.NewAccountProvisioner(auth.NewUserRepository(deps.DB), userStoreProvider),
+			func(ctx context.Context, userID int) {
+				if deps.OnUserSessionsRevoked != nil {
+					deps.OnUserSessionsRevoked(ctx, userID)
+				}
+			}).WithSecretCipher(dataCipher)
+		authProviderRegistry = auth.NewPluginProviderRegistry(auth.PluginProviderRegistryConfig{
+			Bindings:      pluginRuntimeConfigStore,
+			Installations: pluginInstallationStore,
+			GlobalConfigs: pluginRuntimeConfigStore,
+			Manifests:     deps.PluginService,
+			Clients:       deps.PluginService,
+			Sessions:      auth.NewSessionRepository(deps.DB),
+			Resolver:      accountResolver,
+		})
+		deps.AuthProviderRecheck = auth.NewProviderRecheck(accountResolver, authProviderRegistry)
+		if err := authProviderRegistry.Rebuild(appCtx); err != nil {
+			log.Fatalf("build sign-in providers: %v", err)
+		}
+		// A change made on this node applies before its request returns; a
+		// failure there, another node's announcement and the periodic resync
+		// go through RunRebuilds, which coalesces them and retries failures.
+		rebuildAuthProviders := func(ctx context.Context) {
+			if err := authProviderRegistry.Rebuild(ctx); err != nil {
+				slog.WarnContext(ctx, "rebuild sign-in providers failed; keeping the previous set and retrying", "component", "auth", "error", err)
+				authProviderRegistry.RequestRebuild()
+			}
+		}
+		go authProviderRegistry.RunRebuilds(appCtx, auth.ProviderRegistryResyncInterval, auth.ProviderRegistryRetryWait)
+		deps.PluginService.AddLifecycleHook(rebuildAuthProviders)
+		if err := eventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
+			if event.Type == cache.EventAuthProvidersChanged || event.Type == cache.EventPluginsChanged {
+				authProviderRegistry.RequestRebuild()
+			}
+		}); err != nil {
+			slog.Warn("subscribe sign-in provider changes failed; other nodes' binding changes apply at the next periodic resync", "error", err,
+				"resync_interval", auth.ProviderRegistryResyncInterval)
+		}
+		deps.AuthProviderSource = authProviderRegistry
+		deps.OnAuthProvidersChanged = func(ctx context.Context) {
+			rebuildAuthProviders(ctx)
+			if err := eventBus.Publish(ctx, cache.ChannelAdmin, cache.Event{Type: cache.EventAuthProvidersChanged}); err != nil {
+				slog.WarnContext(ctx, "publish sign-in provider change failed", "component", "auth", "error", err)
+			}
+		}
+	}
+
+	// Wire up task manager for admin task API.
+	if needsWorkers && deps.DB != nil {
+		triggerRepo := taskrepository.NewPgTriggerRepository(deps.DB)
+		historyRepo := taskrepository.NewPgExecutionRepository(deps.DB)
+		taskMgr := taskmanager.New(triggerRepo, historyRepo, triggers.New, slog.Default())
+		taskMgr.SetFiringClaims(taskrepository.NewPgFiringClaims(deps.DB))
+		if deps.EventsHub != nil {
+			taskMgr.AddObserver(evt.NewTaskObserver(deps.EventsHub))
+		}
+		if deps.FolderRepo != nil {
+			taskMgr.SetLibraryTypes(deps.FolderRepo.DistinctTypes)
+		}
+		// Routine retention sweeps run as steps of one Database Maintenance task.
+		var maintenanceSteps []taskmanager.Task
+
+		if deps.FolderRepo != nil && deps.LibraryScanQueue != nil {
+			taskMgr.Register(tasks.NewScanLibrariesTask(deps.FolderRepo, deps.LibraryScanQueue, deps.EventBus))
+		}
+		taskMgr.Register(tasks.NewCleanupOrphanedMediaItemsTask(catalog.NewOrphanedProvisionalCleaner(deps.DB)))
+		taskMgr.Register(tasks.NewBackfillMediaItemAliasesTask(catalog.NewItemAliasRepository(deps.DB)))
+		// The backfill reads media files, so it runs only where the scanner
+		// does: those processes have the libraries mounted.
+		if deps.FileRepo != nil {
+			taskMgr.Register(tasks.NewBackfillMatroskaTrackNumbersTask(deps.DB, scanner.NewMatroskaTrackBackfiller(deps.FileRepo)))
+			taskMgr.Register(tasks.NewBackfillHDR10PlusTask(deps.DB, scanner.NewHDR10PlusBackfiller(deps.FileRepo, scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath))))
+		}
+		taskMgr.Register(tasks.NewRefreshSeriesAirDatesTask(catalog.NewEpisodeRepository(deps.DB)))
+		boxSetSyncer := boxsets.NewSyncer(catalog.NewBoxSetRepository(deps.DB), tmdbClient)
+		if metadataService != nil {
+			boxSetSyncer.WithImages(metadataService.AutoImageCacher).WithFallbackLanguage(metadataService.FallbackLanguage)
+		}
+		taskMgr.Register(tasks.NewSyncMovieBoxSetsTask(deps.DB, boxSetSyncer))
+		go boxsets.Watch(appCtx, deps.EventsHub, func() {
+			if _, err := taskMgr.StartTask(tasks.SyncMovieBoxSetsTaskKey); err != nil {
+				slog.Debug("box set sync not started", "component", "app", "error", err)
+			}
+		})
+		if deps.Blobs.Assets != nil {
+			taskMgr.Register(tasks.NewCleanupArtworkRevisionsTask(
+				metadata.NewArtworkRevisionGarbageCollector(deps.DB, deps.Blobs.Assets),
+			))
+			// Kept subtitle tracks live in their own store (keptSubtitleStore).
+			keptFiles, keptStreams := keptsub.FileBlobNamespace(), keptsub.StreamBlobNamespace()
+			if kept := keptSubtitleStore(deps.Blobs, deps.S3Public); kept != nil {
+				keptFiles.Store, keptStreams.Store = kept, kept
+			}
+			mediaImages := []blobgc.Namespace{chapterthumbs.BlobNamespace(), trickplay.BlobNamespace(), keptFiles}
+			// Replaced chapter images and kept subtitle tracks are queued by key;
+			// the sweep lists by file.
+			collected := append([]blobgc.Namespace{chapterthumbs.ImageBlobNamespace(), keptStreams}, mediaImages...)
+			if collector := blobgc.NewCollector(deps.DB, deps.Blobs.Assets, collected...); collector != nil {
+				taskMgr.Register(tasks.NewCleanupRemovedMediaImagesTask(collector))
+			}
+			if sweeper := blobgc.NewSweeper(deps.DB, deps.Blobs.Assets, mediaImages...); sweeper != nil {
+				taskMgr.Register(tasks.NewSweepOrphanedMediaImagesTask(sweeper))
+			}
+			trickplayExtractor := trickplay.NewNodeExtractor(trickplay.NewLocalExtractor(settingsRepo), deps.NodePlanner, settingsRepo, deps.NodeKeys)
+			trickplayExtractor.SetSourceGrants(deps.SourceGrants)
+			if trickplayService := trickplay.NewService(deps.DB, deps.Blobs.Assets, settingsRepo, trickplayExtractor, deps.NodeID); trickplayService != nil {
+				trickplayReader := trickplay.NewReader(deps.DB, deps.Blobs.Assets, trickplayURLResolver(&deps))
+				if checker, ok := deps.Blobs.Assets.(trickplay.DeliveryChecker); ok && deps.ArtworkDelivery.External {
+					// Sheets confirmed fetchable through the external endpoint
+					// are read from it; the rest use the signed server route.
+					trickplayService.SetExternalDelivery(deps.ArtworkDelivery.Scope, checker)
+					trickplayReader.SetExternalDelivery(deps.ArtworkDelivery.Scope, deps.ArtworkResolver)
+				}
+				trickplayService.Start(appCtx)
+				taskMgr.Register(tasks.NewQueueSeekPreviewsTask(trickplayService))
+				deps.Trickplay = trickplayService
+				deps.TrickplayReader = trickplayReader
+				deps.TrickplayAdmin = trickplay.NewAdmin(deps.DB, deps.Blobs.Assets, trickplayService.Kick)
+			}
+		}
+		catalogSearchIndexer := catalog.NewCatalogSearchIndexerFromSettings(deps.DB, settingsRepo, catalogSearchStartupSettings)
+		if recEngine != nil {
+			catalogSearchIndexer.WithSemanticModelProvider(recEngine)
+		}
+		taskMgr.Register(tasks.NewSyncCatalogSearchIndexTask(catalogSearchIndexer))
+		taskMgr.Register(tasks.NewRebuildCatalogSearchIndexTask(catalogSearchIndexer))
+		maintenanceSteps = append(maintenanceSteps, tasks.NewCatalogSearchEventRetentionTask(catalog.NewSearchIndexEventRepository(deps.DB)))
+		if deps.IntroAnalyzer != nil {
+			taskMgr.Register(tasks.NewDetectIntroMarkersTask(deps.DB, deps.IntroAnalyzer, settingsRepo))
+		}
+		if deps.MarkerPopulation != nil {
+			taskMgr.Register(tasks.NewSyncMarkersTask(deps.MarkerPopulation))
+		}
+		if deps.MarkerContributionService != nil && deps.MarkerContributionStore != nil && deps.FileRepo != nil {
+			taskMgr.Register(tasks.NewContributeMarkersTask(
+				deps.MarkerContributionService, deps.MarkerContributionStore, deps.FileRepo,
+			))
+		}
+		if chapterBackfiller, ok := deps.ChapterThumbnailQueuer.(*chapterthumbs.Service); ok {
+			taskMgr.Register(tasks.NewChapterThumbnailBackfillTask(chapterBackfiller, 25))
+			// Local extras without an image beside them, and then movies with
+			// no poster, get a frame through the same extractor, in every library.
+			stillCacher := imagecache.New(deps.Blobs.Assets)
+			stillCacher.SetArtworkRevisionTracker(catalog.NewArtworkRevisionTracker(deps.DB))
+			taskMgr.Register(tasks.NewGenerateExtraStillsTask(
+				extrastills.NewGenerator(deps.DB, deps.FileRepo, chapterBackfiller, stillCacher).
+					WithPosters(stillCacher, mediaartifact.NewStore(deps.DB)), 200,
+			))
+		}
+		maintenanceSteps = append(maintenanceSteps, tasks.NewActivityLogCleanupTask(deps.DB, settingsRepo, activityPM))
+		taskMgr.Register(tasks.NewOperationalLogCleanupTask(deps.DB, settingsRepo, opsPM))
+		taskMgr.Register(tasks.NewSummarizeAPIUsageTask(deps.APIUsage))
+		maintenanceSteps = append(maintenanceSteps,
+			tasks.NewTaskHistoryCleanupTask(historyRepo, settingsRepo),
+			// Wired outside the autoscan service so events left by a disabled
+			// or unconfigured autoscan still age out.
+			tasks.NewAutoscanEventCleanupTask(autoscan.NewRepository(deps.DB, deps.SecretCipher), settingsRepo),
+			tasks.NewDeviceLoginCleanupTask(auth.NewDeviceLoginRetention(deps.DB)),
+			tasks.NewOAuthFlowCleanupTask(auth.NewPGOAuthStore(deps.DB)),
+		)
+		var diagnosticsStore diagnostics.ObjectStore
+		if deps.S3Private != nil {
+			diagnosticsStore = diagnostics.NewS3ObjectStore(deps.S3Private)
+		} else {
+			diagnosticsStore = diagnostics.NewLocalObjectStore(deps.Blobs.Operational)
+		}
+		taskMgr.Register(tasks.NewClientDiagnosticsCleanupTask(
+			diagnostics.NewPostgresRepository(deps.DB),
+			settingsRepo,
+			diagnosticsStore,
+		))
+		maintenanceSteps = append(maintenanceSteps, tasks.NewPolicyDecisionLogCleanupTask(deps.DB, settingsRepo, policyPM))
+		if deps.FileRepo != nil {
+			// Download prepare-to-file pipeline (Phase 3): a durable, leased encode
+			// queue hosted on the task manager. Built here (before Start) and shared
+			// with the API via deps so the download service can enqueue jobs.
+			liveDownloadConfig := func() *config.Config {
+				if deps.LiveConfig != nil {
+					if c := deps.LiveConfig(); c != nil {
+						return c
+					}
+				}
+				return deps.Config
+			}
+			var downloadWorkPlanner nodepool.TranscodeWorkPlanner
+			if deps.NodePlanner != nil {
+				downloadWorkPlanner = deps.NodePlanner
+			}
+			preparer := downloads.NewNodeAwarePreparer(downloads.NewPlaybackPreparer(), downloadWorkPlanner, liveDownloadConfig)
+			preparer.SetNodeKeys(deps.NodeKeys)
+			preparer.SetSourceGrants(deps.SourceGrants)
+			if deps.NodeRepo != nil {
+				preparer.SetOriginLookup(deps.NodeRepo)
+			}
+			// Prepared downloads cache a node's inventory separately from
+			// protocol-v3 planning, so the router's invalidation has to reach
+			// both. Set before NewRouter, which composes them.
+			deps.NodeCapabilityInvalidator = preparer.InvalidateNodeCapabilities
+			artifactMgr := downloads.NewArtifactManager(
+				downloads.NewArtifactRepository(deps.DB),
+				downloads.NewRepository(deps.DB),
+				deps.FileRepo,
+				preparer,
+				deps.NodeID,
+				liveDownloadConfig,
+				func(ctx context.Context, d *downloads.Download) {
+					if deps.EventsHub == nil {
+						return
+					}
+					_ = deps.EventsHub.PublishJSON(ctx, evt.ChannelUserState, "download", map[string]any{
+						"download_id":   d.ID,
+						"status":        d.Status,
+						"media_item_id": d.ContentID,
+						"format":        d.Format,
+					}, evt.PublishOptions{UserID: d.UserID, ProfileID: d.ProfileID})
+				},
+			)
+			artifactMgr.SetNodeKeys(deps.NodeKeys)
+			artifactMgr.SetSettingsReader(settingsRepo)
+			artifactMgr.SetFFmpegLogSink(playback.NewSlogFFmpegLogSink(slog.Default(), deps.NodeID))
+			artifactMgr.SetPreparationNotifier(func(ctx context.Context, event downloads.PreparationEvent) {
+				if deps.EventsHub == nil {
+					return
+				}
+				payload := map[string]any{"id": event.ArtifactID}
+				if event.Progress != nil {
+					payload["progress"] = map[string]any{
+						"encoded_seconds":  event.Progress.EncodedSeconds,
+						"duration_seconds": event.Progress.DurationSeconds,
+						"speed":            event.Progress.Speed,
+						"updated_at":       event.Progress.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+					}
+				}
+				_ = deps.EventsHub.PublishJSON(ctx, evt.ChannelDownloadPreparations, event.Name, payload, evt.PublishOptions{AdminOnly: true})
+			})
+			if deps.NodeRepo != nil {
+				artifactMgr.SetStorageNodes(deps.NodeRepo)
+			}
+			artifactMgr.SetStorageNotifier(func(ctx context.Context) {
+				if deps.EventsHub == nil {
+					return
+				}
+				_ = deps.EventsHub.PublishJSON(ctx, evt.ChannelDownloadPreparations, "download_storage.changed", map[string]any{}, evt.PublishOptions{AdminOnly: true})
+			})
+			encodeTask := tasks.NewEncodeDownloadArtifactsTask(artifactMgr)
+			artifactMgr.SetKick(func() { _ = taskMgr.RunTask(appCtx, encodeTask.Key()) })
+			taskMgr.Register(encodeTask)
+			deps.ArtifactManager = artifactMgr
+		}
+		if notificationSystem != nil {
+			taskMgr.Register(tasks.NewSeedContentAvailabilityTask(notificationSystem))
+			taskMgr.Register(tasks.NewRebuildReleaseInterestTask(notificationSystem))
+			maintenanceSteps = append(maintenanceSteps, tasks.NewNotificationsRetentionTask(notificationSystem))
+		}
+		// After notification retention, which reads ended sessions to tell whether
+		// an older push registration's device still has a login.
+		maintenanceSteps = append(maintenanceSteps, tasks.NewAuthSessionCleanupTask(auth.NewSessionRepository(deps.DB)))
+		if userStoreProvider != nil {
+			taskMgr.Register(tasks.NewSettingMutationsRetentionTask(userstore.NewSettingMutationSweeper(
+				auth.NewUserRepository(deps.DB), userStoreProvider,
+			)))
+		}
+		if matchWorker != nil {
+			taskMgr.Register(tasks.NewMatchMediaTask(matchWorker))
+		}
+		if refreshWorker != nil && metadataService != nil {
+			taskMgr.Register(tasks.NewRefreshMetadataTask(refreshWorker, metadataService))
+		}
+		if metadataService != nil {
+			taskMgr.Register(tasks.NewBulkMetadataEnrichmentTask(metadataService, pool))
+		}
+		if libraryRefreshExecutor != nil {
+			taskMgr.Register(tasks.NewRefreshAllLibraryMetadataTask(
+				deps.DB, deps.FolderRepo, adminjob.NewRepository(deps.DB), libraryRefreshExecutor,
+			))
+		}
+		if metadataImageCacheProcessor != nil {
+			tasks.SetImageWorkers(cfg.Metadata.ImageWorkers)
+			metadataImageCacheProcessor.SetWorkerBudget(tasks.ImageWorkerBudget())
+			configWatcher.OnChange(func(_, updated *config.Config) {
+				tasks.SetImageWorkers(updated.Metadata.ImageWorkers)
+				metadataImageCacheProcessor.SetWorkerBudget(tasks.ImageWorkerBudget())
+			})
+			cacheImagesTask := tasks.NewCacheMetadataImagesTask(metadataImageCacheProcessor)
+			// Artwork cached under an older variant ladder is missing the rungs
+			// a client can now ask for. Arm the one-shot regeneration pass; it
+			// records the version it finished and then costs nothing.
+			cacheImagesTask.SetLadderBackfill(
+				metadata.NewImageLadderBackfillStateRepository(pool),
+				artworkkey.LadderVersion,
+			)
+			taskMgr.Register(cacheImagesTask)
+			taskMgr.Register(tasks.NewBackfillMetadataImagesTask(metadataImageCacheProcessor))
+			if releaser := metadata.NewStoredArtworkReleaser(deps.DB); releaser != nil {
+				taskMgr.Register(tasks.NewReleaseStoredArtworkTask(releaser))
+				// Turning caching off releases stored artwork now, not at the
+				// next daily pass.
+				configWatcher.OnChange(func(previous, updated *config.Config) {
+					if previous == nil || !previous.Metadata.CacheImages || updated.Metadata.CacheImages {
+						return
+					}
+					if _, err := taskMgr.StartTask(tasks.ReleaseStoredArtworkTaskKey); err != nil {
+						slog.Debug("metadata: stored artwork release not started", "error", err)
+					}
+				})
+			}
+		}
+		if deps.Blobs.Assets != nil {
+			identity := deps.Blobs.Assets.Identity()
+			var brandingReconciler tasks.BrandingAssetReconciler
+			if brandingSvc != nil {
+				brandingReconciler = brandingSvc
+			}
+			reconcileArtwork := tasks.NewReconcileArtworkCacheTask(
+				metadata.NewArtworkCacheReconciler(deps.DB, deps.Blobs.Assets),
+				settingsRepo,
+				brandingReconciler,
+				identity,
+				deps.DB,
+			).WithLocation(blobstore.Location(deps.Blobs.Assets))
+			taskMgr.Register(reconcileArtwork)
+			go func() {
+				if err := reconcileArtwork.CheckStorageIdentity(appCtx); err != nil {
+					slog.WarnContext(appCtx, "artwork storage preflight failed", "task", reconcileArtwork.Key(), "error", err)
+				}
+			}()
+			// The reconcile above repairs catalog rows whose objects went
+			// missing. This sweeps the other direction: objects no row
+			// references. Only the sweep can reclaim a revision whose GC
+			// candidate was never enqueued, which nothing else ever reads back.
+			if sweeper := metadata.NewArtworkStorageSweeper(deps.DB, deps.Blobs.Assets); sweeper != nil {
+				taskMgr.Register(tasks.NewSweepArtworkStorageTask(sweeper, settingsRepo, identity))
+			}
+			if cleaner := chapterthumbs.NewOriginalsCleaner(deps.DB, deps.Blobs.Assets); cleaner != nil {
+				taskMgr.Register(tasks.NewCleanupChapterThumbnailOriginalsTask(cleaner, settingsRepo, identity))
+			}
+		}
+		if pluginAutoUpdater != nil {
+			taskMgr.Register(tasks.NewCheckPluginUpdatesTask(pluginAutoUpdater))
+		}
+		if collectionSyncScheduler != nil {
+			taskMgr.Register(tasks.NewSyncCollectionsTask(collectionSyncScheduler))
+		}
+		if trendingRefresher != nil {
+			taskMgr.Register(tasks.NewRefreshTrendingDiscoverTask(trendingRefresher))
+		}
+		if seasonalListRefresher != nil {
+			taskMgr.Register(tasks.NewRefreshSeasonalListsTask(seasonalListRefresher))
+		}
+		taskMgr.Register(tasks.NewRefreshAnimeIDsTask(animeids.NewRefresher(deps.DB)))
+		if userCollectionScheduler != nil {
+			taskMgr.Register(tasks.NewSyncUserCollectionsTask(userCollectionScheduler))
+		}
+		if watchProviderService != nil {
+			taskMgr.Register(tasks.NewSyncWatchProvidersTask(watchProviderService))
+		}
+		// The reconcile pass routes requests, which reads TMDB for requests
+		// whose routing facts were never captured. The TMDB client also lets a
+		// submission started here pick up a TVDB ID added on TMDB after the
+		// request was created.
+		requestReconcileSvc := mediarequests.NewService(
+			mediarequests.NewRepository(deps.DB, deps.SecretCipher),
+			tmdbClient,
+			mediarequests.NewCatalogPresence(
+				catalog.NewItemRepository(deps.DB),
+				catalog.NewProviderIDRepository(deps.DB),
+			),
+		)
+		requestReconcileSvc.SetAnimeIndex(animeids.NewStore(deps.DB))
+		requestReconcileSvc.SetRequesterIdentityResolver(plugins.RequesterIdentityFromLookup(plugins.NewPgUserIdentityLookup(deps.DB)))
+		if metadataService != nil {
+			requestReconcileSvc.SetTVDBIDResolver(metadataService)
+		}
+		api.AttachRequestRouter(requestReconcileSvc, pluginService)
+		requestReconcileSvc.SetGroupPolicyProvider(accessGroupStore)
+		if userStoreProvider != nil {
+			userRepo := auth.NewUserRepository(deps.DB)
+			profileTokens := access.NewProfileTokenService(cfg.Auth.JWTSecret, 0)
+			var reconcileResolver scopeResolver
+			if policySystem != nil {
+				reconcileResolver = policy.NewViewerResolver(userRepo, userStoreProvider, profileTokens, policySystem.PDP(), accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+			} else {
+				// Legacy resolver: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
+				reconcileResolver = access.NewResolver(userRepo, userStoreProvider, profileTokens, accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+			}
+			requestReconcileSvc.SetEntitlementResolver(scopeEntitlementResolver{resolver: reconcileResolver})
+		}
+		if notificationSystem != nil {
+			requestReconcileSvc.SetFulfillmentNotifier(notifications.NewRequestFulfillmentNotifier(notificationSystem))
+		}
+		taskMgr.Register(tasks.NewReconcileRequestsTask(requestReconcileSvc, 100, deps.DB))
+		taskMgr.Register(tasks.NewRefreshRequestDownloadsTask(requestReconcileSvc, 200, deps.DB))
+		taskMgr.Register(tasks.NewRefreshRequestDiscoverListsTask(discoverrows.NewRefresher(
+			mediarequests.NewRepository(deps.DB, deps.SecretCipher),
+			discoverrows.NewSnapshotRepository(deps.DB),
+			tmdbClient,
+		)))
+		if deps.FolderRepo != nil && deps.LibraryScanQueue != nil && pluginService != nil && pluginInstallationStore != nil {
+			autoscanRepo := autoscan.NewRepository(deps.DB, deps.SecretCipher)
+			if err := autoscanRepo.MarkInterruptedEvents(appCtx); err != nil {
+				slog.Warn("autoscan: failed to mark interrupted polls", "err", err)
+			}
+			autoscanSvc := api.BuildAutoscanService(
+				autoscanRepo,
+				pluginService,
+				pluginInstallationStore,
+				mediarequests.NewRepository(deps.DB, deps.SecretCipher),
+				deps.FolderRepo,
+				deps.LibraryScanQueue,
+				deps.RedisClient,
+			)
+			// The poll task's default interval seeds the schedule from the stored
+			// settings (DefaultPollIntervalSeconds); per-cycle gating still runs
+			// off the live settings inside PollOnce. Seed in MILLISECONDS as
+			// seconds*1000 — the SAME computation HandleUpdateSettings uses to
+			// reschedule — so startup and reschedule agree for sub-minute and
+			// non-60-multiple intervals (the old seconds/60 minutes path diverged).
+			var intervalMs int64 = 10 * 60 * 1000
+			if settings, serr := autoscanRepo.GetSettings(appCtx); serr == nil && settings.DefaultPollIntervalSeconds > 0 {
+				intervalMs = int64(settings.DefaultPollIntervalSeconds) * 1000
+			}
+			taskMgr.Register(tasks.NewAutoscanPollTask(autoscanSvc, intervalMs))
+			taskMgr.Register(tasks.NewAutoscanWebhookRetryTask(autoscanSvc))
+		}
+		reconcileProviderIDRepo := catalog.NewProviderIDRepository(deps.DB)
+		reconcileEpisodeRepo := catalog.NewEpisodeRepository(deps.DB)
+		historyResolver := watchstate.NewStableIdentityResolver(nil, reconcileEpisodeRepo, reconcileProviderIDRepo)
+		historyReconciler := watchstate.NewHistoryReconciler(deps.DB, historyResolver)
+		providerIDRepairer := metadata.NewProviderIDIntegrityRepairer(deps.DB)
+		if recWorker != nil {
+			providerIDRepairer.WithRecommendationStaler(recommendations.NewRepo(deps.DB))
+		}
+		taskMgr.Register(tasks.NewRepairProviderIDIntegrityTask(providerIDRepairer, historyReconciler))
+		taskMgr.Register(tasks.NewReconcileWatchHistoryTask(historyReconciler))
+		taskMgr.Register(tasks.NewSyncPodcastFeedsTask(podcastfeed.New(), podcastfeed.NewDBStore(deps.DB)))
+		if audiobookEnricher != nil {
+			taskMgr.Register(tasks.NewSyncAudiobookMetadataTask(audiobookEnricher))
+		}
+		if ebookEnricher != nil {
+			taskMgr.Register(tasks.NewSyncEbookMetadataTask(ebookEnricher))
+			taskMgr.Register(tasks.NewBackfillEbookMetadataTask(ebookEnricher))
+		}
+		if mangaEnricher != nil {
+			taskMgr.Register(tasks.NewSyncMangaMetadataTask(mangaEnricher))
+		}
+		taskMgr.Register(tasks.NewDatabaseMaintenanceTask(deps.DB, maintenanceSteps...))
+		if deps.AuthProviderRecheck != nil {
+			// Accounts that hold API keys or idle sessions never refresh, so
+			// their provider re-check runs on a schedule.
+			taskMgr.Register(tasks.NewRecheckExternalIdentitiesTask(deps.DB, deps.AuthProviderRecheck))
+		}
+		if pluginInstallationStore != nil && pluginRuntimeConfigStore != nil && pluginService != nil {
+			pluginTasks, err := plugins.NewTaskRegistryWithTypedResolver(pluginInstallationStore, pluginRuntimeConfigStore, pluginService).Tasks(appCtx)
+			if err != nil {
+				log.Fatalf("plugin task registry: %v", err)
+			}
+			for _, pluginTask := range pluginTasks {
+				taskMgr.Register(pluginTask)
+			}
+		}
+
+		if deps.Backups != nil {
+			taskMgr.Register(backup.NewTask(deps.Backups))
+			deps.Backups.SetTaskStarter(taskMgr)
+		}
+
+		taskMgr.Start(appCtx)
+		defer taskMgr.Stop()
+		deps.TaskManager = taskMgr
+		if deps.Backups != nil {
+			syncBackupSchedule(appCtx, deps.Backups, taskMgr, eventBus, configWatcher)
+		}
+		slog.Info("task manager started")
+	}
+
+	// Build the ABS-compatible REST + Socket.io handler when a DB pool is
+	// available. Routes are mounted at the root level by NewRouter (not under
+	// /api/v1/) so ABS clients resolve /login, /api/*, /abs/api/*, and
+	// /abs/socket.io/* without path prefix hacks.
+	var absH *abs.Handler
+	if absCompatEnabled && deps.DB != nil {
+		absUserRepo := auth.NewUserRepository(deps.DB)
+		absSessionRepo := auth.NewSessionRepository(deps.DB)
+		absJWTService := auth.NewJWTService(
+			cfg.Auth.JWTSecret,
+			cfg.Auth.AccessTokenExpiry,
+			cfg.Auth.RefreshTokenExpiry,
+		)
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			absJWTService.SetExpiries(updated.Auth.AccessTokenExpiry, updated.Auth.RefreshTokenExpiry)
+		})
+		absAuthSvc := auth.NewService(
+			auth.NewLocalProvider(absUserRepo, absSessionRepo),
+			absJWTService,
+			absSessionRepo,
+			absUserRepo,
+			nil, // invite codes: not needed for ABS compat
+			nil, // settings: not needed here
+			nil, // user store: not needed here
+		)
+		absAuthSvc.SetSignInAttempts(deps.SignInAttempts)
+		// Audiobookshelf compatibility (beta) signs in local accounts only:
+		// its sessions refresh without the provider re-check, so directory
+		// users are not routed to their provider here.
+		absItemRepo := catalog.NewItemRepository(deps.DB)
+		absEpisodeRepo := catalog.NewEpisodeRepository(deps.DB)
+		absSeasonRepo := catalog.NewSeasonRepository(deps.DB)
+		absPersonRepo := catalog.NewPersonRepository(deps.DB)
+		var absFileFetcher catalog.FileVersionFetcher
+		if deps.FileRepo != nil {
+			absFileFetcher = deps.FileRepo
+		}
+		absDetailSvc := catalog.NewDetailService(absItemRepo, absEpisodeRepo, absSeasonRepo, absPersonRepo, absFileFetcher)
+		if deps.ImageResolver != nil {
+			absDetailSvc.SetImageResolver(deps.ImageResolver)
+		}
+		var absScopeResolver scopeResolver
+		if policySystem != nil {
+			absScopeResolver = policy.NewViewerResolver(absUserRepo, userStoreProvider, nil, policySystem.PDP(), accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+		} else {
+			absScopeResolver = access.NewResolver(absUserRepo, userStoreProvider, nil, accessGroupStore).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+		}
+		absHDeps := audiobooks.ABSHandlerDeps{
+			Pool:     deps.DB,
+			Items:    absItemRepo,
+			Files:    deps.FileRepo,
+			Settings: settingsRepo,
+			Auth: &audiobooks.SiloCredValidator{
+				Auth:        absAuthSvc,
+				Pool:        deps.DB,
+				Stores:      userStoreProvider,
+				PINAttempts: deps.ProfilePINAttempts,
+			},
+			AccessResolver: audiobooks.NewABSAccessResolver(absUserRepo, userStoreProvider, absScopeResolver, accessGroupStore),
+			Recs:           recommendations.NewRepo(deps.DB),
+			Detail:         absDetailSvc,
+			SessionMgr:     sessionMgr,
+			SessionSyncer:  deps.SessionSyncer,
+		}
+		absH = audiobooksService.BuildABSHandler(absHDeps)
+		// Must precede Mount: Mount is what registers the observed handlers.
+		absH.SetStreamTelemetry(streamTelemetryRegistry)
+		deps.ABSHandler = absH
+	}
+	_ = audiobooksService
+
+	// Step 7: Build HTTP router with all dependencies.
+	// compatServer is populated after the compat server is constructed below;
+	// the closure captures the pointer so revocation calls reach the live instance.
+	var compatServer atomic.Pointer[jellycompat.Server]
+	dropCompatSessions := func(userID int) {
+		if compat := compatServer.Load(); compat != nil {
+			compat.SessionStore().EvictUser(userID)
+		}
+	}
+	// The revoking transaction deletes the account's stored
+	// Jellyfin-compatible sessions. Persistent lookups always check those
+	// rows; the admin event also lets each replica discard its cached copies.
+	if err := eventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
+		if event.Type != cache.EventUserSessionsRevoked {
+			return
+		}
+		if userID, err := strconv.Atoi(event.Payload); err == nil {
+			dropCompatSessions(userID)
+		}
+	}); err != nil {
+		slog.Warn("subscribe session revocation failed", "error", err)
+	}
+	deps.OnUserSessionsRevoked = func(ctx context.Context, userID int) {
+		dropCompatSessions(userID)
+		if err := eventBus.Publish(ctx, cache.ChannelAdmin, cache.Event{Type: cache.EventUserSessionsRevoked, Payload: strconv.Itoa(userID)}); err != nil {
+			slog.WarnContext(ctx, "publish session revocation failed", "user_id", userID, "error", err)
+		}
+	}
+	// Jellyfin- and Audiobookshelf-compatible downloads go through the
+	// router's download service, so they meet the same policy and share its
+	// bandwidth limiters. Without a service both refuse them.
+	var compatDownloads jellycompat.DownloadServer
+	deps.OnDownloadService = func(svc *downloads.Service) {
+		compatDownloads = svc
+		if absH != nil {
+			absH.SetDownloads(svc)
+		}
+	}
+
+	distFS, fsErr := fs.Sub(siloweb.DistFS, "dist")
+	if fsErr != nil {
+		log.Fatalf("failed to create frontend FS: %v", fsErr)
+	}
+	deps.FrontendFS = distFS
+	server.WebDistFS = distFS
+
+	// Expose the branding service (constructed before the task manager) to the
+	// API and the frontend handler.
+	deps.BrandingService = brandingSvc
+	server.Branding = brandingSvc
+	// Card overlay images share the assets store with branding; without one the
+	// library lists nothing new and uploads report storage as unconfigured.
+	var overlayImageStore overlays.ImageStore
+	if deps.Blobs.Assets != nil {
+		overlayImageStore = deps.Blobs.Assets
+	}
+	deps.OverlayImages = overlays.NewImageLibrary(deps.DB, overlayImageStore)
+	var transitionPrivate blobstore.Store
+	if deps.S3Private != nil {
+		transitionPrivate = deps.Blobs.Operational
+	}
+	storageTransitionSvc := storagetransition.New(deps.DB, settingsRepo, adminjob.NewRepository(deps.DB), deps.Blobs.Assets, transitionPrivate)
+	storageTransitionSvc.SetNodeAdmission(storageAdmission)
+	storageTransitionSvc.SetEnvironmentManaged(envSettings.Vars())
+	if brandingSvc != nil {
+		storageTransitionSvc.SetBrandingReconciler(brandingSvc.ReconcileMissingAssets)
+	}
+	if err := storageTransitionSvc.FinalizeCommitted(appCtx); err != nil {
+		log.Fatalf("finalize committed storage transition: %v", err)
+	}
+	deps.StorageTransition = storageTransitionSvc
+	if storageAdmission != nil {
+		// A lock lost during a long startup must stop this process before the
+		// HTTP listeners serve the old location.
+		if err := storageAdmission.Probe(appCtx); err != nil {
+			log.Fatalf("storage node admission before serving: %v", err)
+		}
+	}
+
+	if kept := keptSubtitleStore(deps.Blobs, deps.S3Public); deps.DB != nil && kept != nil {
+		// Embedded subtitle tracks read whole are kept in a private store and
+		// copied under the transcode directory, beside the subtitle cache.
+		deps.KeptSubtitles = keptsub.NewStore(keptsub.NewPgRepo(deps.DB), kept, keptsub.Options{
+			FFmpegPath: func() string { return deps.CurrentConfig().Playback.FFmpegPath },
+			MirrorDir: func() string {
+				if dir := deps.CurrentConfig().Playback.TranscodeDir; dir != "" {
+					return filepath.Join(dir, "subtitle-cache", "kept")
+				}
+				return ""
+			},
+		})
+		var nextEpisode keptsub.NextFileFunc
+		if deps.FileRepo != nil {
+			nextEpisode = keptsub.NextEpisodeFile(catalog.NewEpisodeRepository(deps.DB), deps.FileRepo)
+		}
+		deps.SubtitlePrefetch = keptsub.NewPrefetcher(deps.KeptSubtitles, nextEpisode)
+		deps.SubtitlePrefetch.Start(appCtx)
+		// The HLS streams this server runs read their on-demand subtitle
+		// renditions from kept tracks too.
+		if deps.KeptSubtitles != nil {
+			playback.SetRenditionKeptTracks(deps.KeptSubtitles)
+		}
+	}
+
+	router := api.NewRouter(deps)
+
+	// Step 8: Build the handler the primary port serves — the API router and
+	// frontend. Metrics use a separate opt-in listener; see newRootHandler.
+	rootHandler := newRootHandler(router)
+	stopMetricsListener, err := startMetricsListener(true)
+	if err != nil {
+		log.Fatalf("metrics listener: %v", err)
+	}
+	defer stopMetricsListener()
+
+	// Step 9: Start background workers (if needed).
+	var sessionCleaner *worker.SessionCleaner
+	var adminJobRunner *adminjob.Runner
+
+	if needsWorkers && deps.DB != nil {
+		if reconciler == nil {
+			log.Fatal("reconciler must be initialized before starting workers")
+		}
+		reconciler.Start()
+		defer reconciler.Stop()
+
+		if heartbeatWriter != nil {
+			heartbeatWriter.Start()
+			defer heartbeatWriter.Stop()
+		}
+
+		// RefreshWorker is kept as a RefreshCandidateFinder for the task manager's
+		// RefreshMetadataTask but no longer runs its own background loop.
+		// Scanning is handled exclusively by the task manager's ScanLibrariesTask.
+		if personRefreshWorker != nil {
+			personRefreshWorker.Start()
+			defer personRefreshWorker.Stop()
+		}
+
+		sessionCleaner = worker.NewSessionCleaner(deps.DB, cfg.UserDB.StaleGraceSeconds)
+		sessionCleaner.EventBus = deps.EventBus
+		sessionCleaner.EventsHub = deps.EventsHub
+		sessionCleaner.Start()
+		defer sessionCleaner.Stop()
+
+		var templateBundleApplyExecutor interface {
+			ExecuteTemplateBundleApply(context.Context, adminjob.TemplateBundleApplyRequest, func(int, int, string)) (any, error)
+		}
+		if deps.CollectionService != nil {
+			collectionRepo := catalog.NewLibraryCollectionRepository(deps.DB)
+			itemRepo := catalog.NewItemRepository(deps.DB)
+			collectionHandler := handlers.NewLibraryCollectionHandler(
+				collectionRepo,
+				deps.CollectionService,
+				itemRepo,
+				nil,
+			)
+			collectionHandler.ArtworkStore = deps.Blobs.Assets
+			collectionHandler.ArtworkResolver = deps.ArtworkResolver
+			collectionHandler.FrontendFS = deps.FrontendFS
+			collectionHandler.SectionRepo = sectionRepo
+			collectionHandler.FolderRepo = deps.FolderRepo
+			if collectionHandler.FolderRepo == nil {
+				collectionHandler.FolderRepo = catalog.NewFolderRepository(deps.DB)
+			}
+			templateBundleApplyExecutor = collectionHandler
+		}
+
+		// Private S3 keeps its existing artifact keys and presigned downloads.
+		// Without it, artifacts go to the operational blob store.
+		var artifactStore adminjob.ArtifactStore
+		if deps.S3Private != nil {
+			artifactStore = deps.S3Private
+		} else if api := blobstore.NewBucketAPI(deps.Blobs.Operational); api != nil {
+			artifactStore = api
+		}
+		adminJobRunner = adminjob.NewRunner(
+			adminjob.NewRepository(deps.DB),
+			catalogseed.NewService(deps.DB, catalog.NewPersonRepository(deps.DB), recommendations.NewRepo(deps.DB)).
+				WithEmbeddingModel(cfg.Recommendations.EmbeddingModel),
+			artifactStore,
+			itemRefreshExecutor,
+			libraryRefreshExecutor,
+			adminjob.NewLibraryDeleteExecutor(deps.FolderRepo, sectionRepo,
+				librarySettingsCleaner(deps.DB, userStoreProvider)),
+			adminjob.NewImageCacheCleanupExecutor(deps.Blobs.Assets),
+			templateBundleApplyExecutor,
+			deps.RealtimeHub,
+		)
+		adminJobRunner.SetCancelRegistry(adminJobCancelRegistry)
+		adminJobRunner.SetStorageTransitionExecutor(storageTransitionSvc)
+		if deps.Backups != nil {
+			adminJobRunner.SetBackupRestoreExecutor(backupRestoreExecutor{svc: deps.Backups})
+		}
+		adminJobRunner.SetStorageTransitionCommitted(deps.RequestServerRestart)
+		adminJobRunner.Start()
+		defer adminJobRunner.Stop()
+
+		// Start recommendation worker if enabled (reuse worker created above).
+		if recWorker != nil {
+			recWorker.Start()
+			defer recWorker.Stop()
+
+			// Resume a first or interrupted backfill now rather than at the
+			// next catch-up tick.
+			if needed, err := recEngine.NeedsEmbedding(appCtx); err != nil {
+				slog.WarnContext(appCtx, "checking for items that need embeddings failed", "component", "recommendations", "error", err)
+			} else if needed {
+				slog.InfoContext(appCtx, "items need embeddings; starting the embedding catch-up", "component", "recommendations")
+				recWorker.EmbedMissingNow()
+			}
+		}
+
+		slog.Info("background workers started")
+	}
+
+	// Step 10: Create and start the HTTP server.
+	srv := &http.Server{
+		Addr:         cfg.Server.Listen,
+		Handler:      rootHandler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	var compatSrv *http.Server
+	if (mode == "integrated" || mode == "api") && cfg.JellyfinCompat.Enabled && cfg.JellyfinCompat.Listen != "" {
+		compatDeps := jellycompat.Dependencies{
+			AdminDefaults:        adminDefaults,
+			ArtworkHandler:       apiv2.NewArtworkHandler(deps.Blobs.Assets, deps.ArtworkSigner, deps.ArtworkRepair),
+			Config:               cfg,
+			AppContext:           appCtx,
+			RegisterShutdownWork: registerShutdownWork,
+			LiveConfig:           configWatcher.Config,
+			DB:                   deps.DB,
+			SecretCipher:         dataCipher,
+			ClientIPResolver:     ipResolver,
+			IngressTokens:        networkAccess.Registry,
+			ActivityLogWriter:    deps.ActivityLogWriter,
+			NodeID:               deps.NodeID,
+			StreamTelemetry:      streamTelemetryRegistry,
+			NodePlanner:          deps.NodePlanner,
+			EventBus:             eventBus,
+			JWTSecret:            cfg.Auth.JWTSecret,
+			NodeKeys:             deps.NodeKeys,
+			SourceGrants:         deps.SourceGrants,
+			RecWorker:            recWorker,
+			FrontendFS:           deps.FrontendFS,
+			ArtworkStore:         deps.Blobs.Assets,
+			AvatarStore:          handlers.NewProfileAvatarStore(deps.Blobs),
+			// Hand remote-transcode recipes to the shared recipe store so a dedicated
+			// transcode node that restarts can rebuild a jellycompat session.
+			RecipeNodeStore: noderecipe.NewStore(apiRedisClient, 0),
+			// The relays to transcode nodes check the same deny markers the
+			// native API's stops write.
+			StreamDeny:       playback.NewStreamDeny(apiRedisClient),
+			SessionSyncer:    deps.SessionSyncer,
+			SubtitlePlaySync: subtitlePlaySync,
+			// One PIN budget per profile across the native and Jellyfin logins.
+			ProfilePINAttempts: deps.ProfilePINAttempts,
+			// The native limiter itself, so budgets, reloads, and counters
+			// are shared with the native API. Nil when rate limiting is off.
+			RateLimit: deps.RateLimitMW,
+		}
+
+		// Wire direct dependencies when DB is available.
+		if deps.DB != nil {
+			browseRepo := catalog.NewBrowseRepository(deps.DB)
+			itemRepo := catalog.NewItemRepository(deps.DB)
+			seasonRepo := catalog.NewSeasonRepository(deps.DB)
+			episodeRepo := catalog.NewEpisodeRepository(deps.DB)
+			providerIDRepo := catalog.NewProviderIDRepository(deps.DB)
+			personRepo := catalog.NewPersonRepository(deps.DB)
+			folderRepo := deps.FolderRepo
+
+			var fileFetcher catalog.FileVersionFetcher
+			if deps.FileRepo != nil {
+				fileFetcher = deps.FileRepo
+			}
+
+			detailSvc := newCompatDetailService(&deps, itemRepo, episodeRepo, seasonRepo, personRepo, fileFetcher, userStoreProvider)
+
+			compatDeps.BrowseRepo = browseRepo
+			compatDeps.ItemRepo = itemRepo
+			compatDeps.SeasonRepo = seasonRepo
+			compatDeps.EpisodeRepo = episodeRepo
+			compatDeps.ProviderIDRepo = providerIDRepo
+			compatDeps.StableIdentityResolver = watchstate.NewStableIdentityResolver(itemRepo, episodeRepo, providerIDRepo)
+			compatDeps.DetailSvc = detailSvc
+			compatDeps.FolderRepo = folderRepo
+			compatDeps.SessionMgr = sessionMgr
+			if deps.MarkerPopulation != nil {
+				compatDeps.MarkerPopulation = deps.MarkerPopulation
+			}
+			compatDeps.UserStoreProvider = userStoreProvider
+			compatDeps.WatchCompletionObserver = deps.WatchCompletionObserver
+			if eventsHub != nil {
+				compatDeps.UserStateEvents = eventsHub
+			}
+			if userStoreProvider != nil {
+				// Tracks Jellyfin clients play are saved through the same writes
+				// as PUT /api/v2/audio-prefs and /api/v2/subtitle-prefs.
+				compatAudioPrefs := handlers.NewAudioPrefHandler(userStoreProvider)
+				compatAudioPrefs.EventsHub = eventsHub
+				compatSubtitlePrefs := handlers.NewSubtitlePrefHandler(userStoreProvider)
+				compatSubtitlePrefs.EventsHub = eventsHub
+				compatDeps.AudioPreferences = compatAudioPrefs
+				compatDeps.SubtitlePreferences = compatSubtitlePrefs
+			}
+			compatDeps.SettingsRepo = settingsRepo
+			// The administrator's rating-source choice, read as the native
+			// API reads it, so Jellyfin clients get the Rotten Tomatoes
+			// critic score only while that source is shown.
+			compatDeps.RatingSources = ratingsources.NewPolicy(settingsRepo, func(ctx context.Context) ([]ratingsources.DeclaredSource, error) {
+				return metadata.DeclaredRatingSources(ctx, deps.DB)
+			})
+			compatDeps.PersonRepo = personRepo
+			if deps.CollectionService != nil {
+				compatDeps.CollectionPosters = deps.CollectionService
+			}
+			if watchProviderService != nil {
+				compatDeps.WatchScrobbler = watchProviderService
+			}
+			compatSearchService := catalog.NewCatalogSearchServiceFromSettings(
+				catalogSearchStartupSettings,
+				itemRepo,
+				catalog.NewSearchIndexEventRepository(deps.DB),
+				deps.CatalogSearchVectorizer,
+			)
+			if compatSearchService != nil {
+				compatSearchService.StartCoverageRefresh(appCtx)
+				compatDeps.CatalogSearchProvider = compatSearchService.Provider()
+				// Latch the resolved provider for the package-level enqueue
+				// helpers (idempotent with the API router's latch; this also
+				// covers modes that wire jellycompat without the router).
+				activeSearchProvider := catalog.SearchProviderPostgres
+				if _, ok := compatSearchService.Provider().(*catalog.MeilisearchSearchProvider); ok {
+					activeSearchProvider = catalog.SearchProviderMeilisearch
+				}
+				catalog.SetActiveSearchIndexProvider(activeSearchProvider)
+			}
+
+			if blobs := blobstore.NewByteStore(deps.Blobs.Assets); blobs != nil {
+				compatDeps.SubtitleBlobs = blobs
+			}
+			if deps.KeptSubtitles != nil {
+				compatDeps.KeptSubtitles = deps.KeptSubtitles
+			}
+			if deps.TrickplayReader != nil {
+				compatDeps.Trickplay = deps.TrickplayReader
+			}
+			compatDeps.PosterPresigner = jellycompat.NewResolverPosterPresigner(deps.ArtworkResolver)
+
+			if deps.FileRepo != nil {
+				compatDeps.FileResolver = deps.FileRepo
+				compatDeps.MediaSourceOwners = deps.FileRepo
+			}
+			compatDeps.Downloads = compatDownloads
+
+			compatDeps.SubtitleRepo = subtitles.NewPgRepository(deps.DB, deps.SecretCipher)
+
+			// /Movies/Recommendations reads the cached rows the native API
+			// reads. With recommendations disabled it has no reader and
+			// answers an empty list, so rows cached before are not served.
+			if cfg.Recommendations.Enabled {
+				var compatRecRefresh recommendations.ReadRefreshRequester
+				if recWorker != nil {
+					compatRecRefresh = recWorker
+				}
+				compatDeps.RecommendationReader = recommendations.NewReader(recommendations.NewRepo(deps.DB), catalog.NewRatingsRepo(deps.DB), compatRecRefresh, userStoreProvider).
+					WithUserStoreOutsidePostgres(cfg.UserDB.Backend == "sqlite")
+			}
+			// /Items/{id}/Similar ranks by embeddings when recommendations
+			// are enabled, and by genre otherwise.
+			if recEngine != nil {
+				compatDeps.Recommender = recEngine
+			}
+
+			// Construct auth service for jellycompat login.
+			userRepo := auth.NewUserRepository(deps.DB)
+			compatDeps.APIKeyValidator = auth.NewAPIKeyRepository(deps.DB)
+			compatDeps.APIKeyUserLoader = userRepo
+			compatDeps.ScanQueue = deps.LibraryScanQueue
+			sessionRepo := auth.NewSessionRepository(deps.DB)
+			jwtService := auth.NewJWTService(
+				cfg.Auth.JWTSecret,
+				cfg.Auth.AccessTokenExpiry,
+				cfg.Auth.RefreshTokenExpiry,
+			)
+			configWatcher.OnChange(func(_, updated *config.Config) {
+				jwtService.SetExpiries(updated.Auth.AccessTokenExpiry, updated.Auth.RefreshTokenExpiry)
+			})
+			provider := auth.NewLocalProvider(userRepo, sessionRepo)
+			compatDeps.AuthService = auth.NewService(provider, jwtService, sessionRepo, userRepo, nil, nil, nil)
+			compatDeps.AuthService.SetSignInAttempts(deps.SignInAttempts)
+			// Jellyfin Quick Connect runs on the device sign-in requests the
+			// native API approves; profile tokens are only for remote playback.
+			if devices := auth.NewDeviceLoginService(deps.DB, userRepo, jwtService, sessionRepo, compatDeps.UserStoreProvider, nil); devices != nil {
+				compatDeps.DeviceLogin = devices.WithQuickConnectAttempts(deps.QuickConnectCodeAttempts)
+			}
+			if authProviderRegistry != nil {
+				// Directory (LDAP) users sign in with their directory password.
+				compatDeps.AuthService.SetPluginProviderSource(authProviderRegistry)
+				// Compatibility sessions refresh their Silo session too.
+				compatDeps.AuthService.SetProviderRecheck(deps.AuthProviderRecheck)
+			}
+
+			// Access filter resolver for viewer-scoped library access.
+			// Backed by the shared access.Resolver so account-level library
+			// restrictions (users.library_ids), profile restrictions,
+			// user-disabled libraries, and rating/quality ceilings apply to
+			// the compat API exactly as they do to the native API.
+			if userStoreProvider != nil {
+				var compatScopeResolver jellycompat.ScopeResolver
+				if policySystem != nil {
+					compatScopeResolver = policy.NewViewerResolver(
+						userRepo,
+						userStoreProvider,
+						nil, // profile tokens unused: compat login already verifies PINs
+						policySystem.PDP(),
+						accessGroupStore,
+					).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+				} else {
+					// Legacy resolver: proxy/test wiring without a policy system. Production integrated/api modes always take the policy path. Removed with the legacy cleanup phase.
+					compatScopeResolver = access.NewResolver(
+						userRepo,
+						userStoreProvider,
+						nil, // profile tokens unused: compat login already verifies PINs
+						accessGroupStore,
+					).WithUnratedContentPolicy(unratedContent).WithAdminDefaults(adminDefaults)
+				}
+				compatDeps.AccessFilterFn = jellycompat.NewScopeAccessFilter(compatScopeResolver)
+				compatDeps.PlaybackScopeResolver = compatScopeResolver
+			}
+		}
+
+		// attmonk fork: Live TV bridge for Jellyfin clients (SILO_JELLYCOMPAT_LIVETV=off disables it).
+		if !jellycompat.LiveTVEnabledFromEnv(os.Getenv) {
+			slog.Info("jellycompat: Live TV bridge disabled by SILO_JELLYCOMPAT_LIVETV")
+		} else if pluginService != nil && pluginInstallationStore != nil {
+			// deps.PluginUserConfig may be nil; favorites then return 500 and listings still work.
+			// Branch so a nil pointer is not stored in the interface as a non-nil value.
+			var liveTVPrefs jellycompat.LiveTVPrefsStore
+			if deps.PluginUserConfig != nil {
+				liveTVPrefs = deps.PluginUserConfig
+			}
+			compatDeps.LiveTV = jellycompat.NewLiveTV(
+				jellycompat.NewPluginLiveTVRoutes(pluginService, pluginInstallationStore),
+				liveTVPrefs,
+				nil,
+			)
+			slog.Info("jellycompat: Live TV bridge enabled")
+		}
+
+		compat := jellycompat.NewServerWithDependencies(compatDeps)
+		compatServer.Store(compat)
+		compatTerminalRecoveryReady = compat.StartBackgroundTasks(context.Background())
+		compatSrv = compat.HTTPServer()
+		compatSrv.ReadTimeout = 30 * time.Second
+		compatSrv.WriteTimeout = 0
+		compatSrv.IdleTimeout = 120 * time.Second
+	}
+
+	// ABS-compat listener — dedicated http.Server bound to its own port
+	// (default :13378) that hosts the Audiobookshelf-compatible API.
+	// Mirrors the Jellyfin compat layout above. See newAudiobookshelfListener.
+	var absSrv *http.Server
+	if (mode == "integrated" || mode == "api") && deps.ABSHandler != nil && cfg.AudiobookshelfCompat.Listen != "" {
+		absSrv = newAudiobookshelfListener(cfg.AudiobookshelfCompat.Listen, deps.ABSHandler,
+			apiv2.NewArtworkHandler(deps.Blobs.Assets, deps.ArtworkSigner, deps.ArtworkRepair), ipResolver, networkAccess.Registry)
+	}
+
+	// Run non-critical startup work in the background so it doesn't delay the
+	// HTTP listener from accepting connections. Steps run sequentially and stop
+	// early if the app context is cancelled (shutdown).
+	if len(backgroundInit) > 0 {
+		go func() {
+			start := time.Now()
+			for _, step := range backgroundInit {
+				if appCtx.Err() != nil {
+					return
+				}
+				func() {
+					defer func() {
+						if p := recover(); p != nil {
+							slog.Error("deferred startup init step panicked; continuing",
+								"panic", p, "stack", string(debug.Stack()))
+						}
+					}()
+					step(appCtx)
+				}()
+			}
+			slog.Info("deferred startup init completed", "steps", len(backgroundInit), "duration", time.Since(start))
+		}()
+	}
+
+	errCh := make(chan error, 3)
+	// Closed when the LAN advertiser has sent its goodbye packets; nil when
+	// discovery is off. Shutdown ends the advertisement through lanCtx before
+	// the rest of appCtx, so LAN clients stop finding a server that is about
+	// to close.
+	var lanDiscoveryDone chan struct{}
+	lanCtx, stopLANDiscovery := context.WithCancel(appCtx)
+	defer stopLANDiscovery()
+	// Bind before serving so resident plugins, which reverse-proxy to this
+	// listener, are only started once it exists.
+	apiListener, _, apiListenErr := tcpcongestion.Listen(appCtx, "tcp", cfg.Server.Listen, tcpcongestion.ListenerAPI, opts)
+	if apiListenErr != nil {
+		errCh <- fmt.Errorf("HTTP server listen: %w", apiListenErr)
+	} else {
+		go func() {
+			slog.Info("HTTP server listening", "addr", cfg.Server.Listen)
+			if serveErr := srv.Serve(lantls.NewListener(apiListener, lanTLS.Config(), 0)); serveErr != nil && serveErr != http.ErrServerClosed {
+				errCh <- fmt.Errorf("HTTP server error: %w", serveErr)
+			}
+		}()
+		go func() {
+			if reconcileErr := storageTransitionSvc.RunPostRestartWork(appCtx); reconcileErr != nil && appCtx.Err() == nil {
+				slog.Error("post-restart storage transition reconciliation paused; it will resume on the next start", "error", reconcileErr)
+			}
+		}()
+		if cfg.Server.LANDiscovery && (mode == "integrated" || mode == "api") {
+			lanDiscoveryDone = make(chan struct{})
+			go func() {
+				defer close(lanDiscoveryDone)
+				advertiseOnLAN(lanCtx, apiListener.Addr(), serveridentity.New(catalog.NewServerSettingsRepo(pool)), brandingSvc)
+			}()
+		}
+		if pluginService != nil {
+			pluginService.StartResidents(appCtx)
+			if mode == "api" {
+				warnOnMultipleAPIReplicas(appCtx, cache.NewAPIReplicaPresence(apiRedisClient, nodeID), pluginService)
+			}
+		}
+	}
+	startCompatServer(appCtx, compatSrv, tcpcongestion.ListenerJellyfin, opts, errCh)
+	startCompatServer(appCtx, absSrv, tcpcongestion.ListenerABS, opts, errCh)
+	netadmin.Release()
+	// Step 11: Wait for termination signal.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+
+	// A signal fails readiness first and keeps serving for
+	// SILO_SHUTDOWN_DELAY, so a load balancer routes traffic away before the
+	// listeners close. A restart request stops at once, even during that wait:
+	// storage admission loss sends one after it has already stopped storage
+	// writers, and an administrator's restart has told players it is
+	// restarting now. A listener failure stops at once too.
+	waitForAPIStop(sigCh, restartReqCh, errCh, apiShutdownDelay(os.Getenv(apiShutdownDelayEnv)), func() {
+		shuttingDown.Store(true)
+		stopLANDiscovery()
+	})
+	appCancel()
+
+	// Step 12: Graceful shutdown sequence.
+	slog.Info("beginning graceful shutdown")
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	// Let the LAN advertiser withdraw the service (appCtx is already
+	// canceled) so clients drop it now rather than when its records expire.
+	if lanDiscoveryDone != nil {
+		select {
+		case <-lanDiscoveryDone:
+		case <-time.After(2 * time.Second):
+			slog.WarnContext(shutdownCtx, "LAN discovery did not withdraw its advertisement before shutdown")
+		}
+	}
+
+	// 0. Stop resident plugins first: their overlay listeners front the HTTP
+	// servers, so ingress goes away before the servers drain.
+	if pluginService != nil {
+		residentCtx, residentCancel := context.WithTimeout(shutdownCtx, 10*time.Second)
+		if stopErr := pluginService.StopResidents(residentCtx); stopErr != nil {
+			slog.Error("resident plugin shutdown error", "error", stopErr)
+		}
+		residentCancel()
+	}
+
+	// 1. Stop accepting new requests.
+	if shutdownErr := srv.Shutdown(shutdownCtx); shutdownErr != nil {
+		slog.Error("HTTP shutdown error", "error", shutdownErr)
+	}
+	if compatSrv != nil {
+		if shutdownErr := compatSrv.Shutdown(shutdownCtx); shutdownErr != nil {
+			slog.Error("jellyfin compat shutdown error", "error", shutdownErr)
+		}
+	}
+	if absSrv != nil {
+		if shutdownErr := absSrv.Shutdown(shutdownCtx); shutdownErr != nil {
+			slog.Error("abs compat shutdown error", "error", shutdownErr)
+		}
+	}
+	if err := runShutdownWorkWithTimeout(30*time.Second, func(cleanupCtx context.Context) error {
+		return waitForShutdownWork(cleanupCtx, shutdownWork)
+	}); err != nil {
+		slog.Error("playback cleanup did not finish before shutdown deadline", "error", err)
+	}
+	if stopErr := streamTelemetryRegistry.Stop(shutdownCtx); stopErr != nil {
+		slog.Error("stream telemetry shutdown error", "error", stopErr)
+	}
+
+	// 2. Clean up stale sessions.
+	if sessionCleaner != nil {
+		cleaned, cleanErr := sessionCleaner.CleanStale(shutdownCtx)
+		if cleanErr != nil {
+			slog.Error("stale session cleanup error", "error", cleanErr)
+		} else if cleaned > 0 {
+			slog.Info("cleaned stale sessions", "count", cleaned)
+		}
+	}
+
+	// 2b. Remove this node's heartbeat and sessions from shared state.
+	if heartbeatWriter != nil {
+		if err := heartbeatWriter.CleanupSelf(shutdownCtx); err != nil {
+			slog.Error("heartbeat cleanup error", "error", err)
+		}
+	}
+
+	// 3. Close user store provider.
+	if userStoreProvider != nil {
+		if closeErr := userStoreProvider.Close(); closeErr != nil {
+			slog.Error("user store provider close error", "error", closeErr)
+		}
+	}
+
+	// 4. (match worker is now managed by the task manager — no separate cancel needed)
+
+	// Suppress unused variable warnings for workers used only in deferred calls.
+	_ = reconciler
+	_ = heartbeatWriter
+	_ = refreshWorker
+	_ = adminJobRunner
+
+	slog.Info("server stopped")
+}
+
+// waitForShutdownWork waits for registered cleanup tasks within the process's
+// existing graceful-shutdown deadline.
+func waitForShutdownWork(ctx context.Context, work []<-chan struct{}) error {
+	for _, done := range work {
+		if done == nil {
+			continue
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// runShutdownWorkWithTimeout gives workload cleanup a fresh deadline after the
+// HTTP shutdown phase has consumed its own budget.
+func runShutdownWorkWithTimeout(timeout time.Duration, work func(context.Context) error) error {
+	if work == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return work(ctx)
+}
+
+// standaloneServerHooks lets a standalone mode run work that must bracket the
+// listener's lifetime: afterListen runs once the address is bound (resident
+// plugins reverse-proxy to it, so they start only then), beforeDrain runs
+// before the HTTP server drains (their overlay ingress goes away first).
+// drain, when set, runs first on SIGTERM: the node stops taking new work and
+// finishes what it has while everything keeps running.
+type standaloneServerHooks struct {
+	afterListen func()
+	beforeDrain func(context.Context)
+	drain       *nodeDrain
+}
+
+// startStandaloneServer runs a standalone HTTP server for proxy/transcode modes.
+// It listens on the given address, handles graceful shutdown on SIGTERM/SIGINT.
+func startStandaloneServer(mode, addr string, handler http.Handler, appCancel context.CancelFunc, shutdownWork func(context.Context) error, hooks standaloneServerHooks, opts tcpcongestion.Options) {
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 0, // no timeout for long streams
+		IdleTimeout:  120 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	// Bind before serving so the after-listen hook runs against a listener
+	// that exists.
+	var listener net.Listener
+	var listenErr error
+	if mode == serverModeProxy {
+		listener, _, listenErr = tcpcongestion.Listen(context.Background(), "tcp", addr, tcpcongestion.ListenerProxy, opts)
+	} else {
+		var config net.ListenConfig
+		listener, listenErr = config.Listen(context.Background(), "tcp", addr)
+	}
+	netadmin.Release()
+	if listenErr != nil {
+		errCh <- fmt.Errorf("HTTP server listen: %w", listenErr)
+	} else {
+		go func() {
+			slog.Info("HTTP server listening", "addr", addr)
+			if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("HTTP server error: %w", err)
+			}
+		}()
+		if hooks.afterListen != nil {
+			hooks.afterListen()
+		}
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+
+	select {
+	case sig := <-sigCh:
+		slog.Info("received signal, shutting down", "signal", sig)
+		if hooks.drain != nil {
+			hooks.drain.run(sigCh)
+		}
+	case serverErr := <-errCh:
+		slog.Error("server error, shutting down", "error", serverErr)
+	}
+	appCancel()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if hooks.beforeDrain != nil {
+		drainCtx, drainCancel := context.WithTimeout(shutdownCtx, 10*time.Second)
+		hooks.beforeDrain(drainCtx)
+		drainCancel()
+	}
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("HTTP shutdown error", "error", err)
+	}
+	if shutdownWork != nil {
+		if err := runShutdownWorkWithTimeout(30*time.Second, shutdownWork); err != nil {
+			slog.Error("standalone workload shutdown error", "error", err)
+		}
+	}
+	slog.Info("server stopped")
+}
+
+// newS3ClientIfConfigured creates an S3 client only if the bucket name is
+// configured. Returns nil if the bucket is empty (not configured).
+func newS3ClientIfConfigured(cfg s3client.BucketConfig) *s3client.Client {
+	if cfg.Bucket == "" {
+		return nil
+	}
+	return s3client.NewClient(cfg)
+}
+
+func trickplayURLResolver(deps *api.Dependencies) artworkurl.Resolver {
+	if deps.ArtworkDelivery.External {
+		// An external read endpoint can lag behind the S3 write that published
+		// the manifest. Until the service confirms the endpoint serves a
+		// revision, the signed server route reads the storage API directly.
+		return artworkurl.NewServerResolver(deps.ArtworkSigner)
+	}
+	return deps.ArtworkResolver
+}
+
+// configureBlobStorage initializes blob storage only in processes that own the
+// catalog. Workers share settings but do not have storage clients.
+func configureBlobStorage(ctx context.Context, mode string, cfg *config.Config, deps *api.Dependencies, settings blobstore.SettingsStore) error {
+	if mode != "integrated" && mode != "api" {
+		return nil
+	}
+	stores, backend, err := blobstore.Open(ctx, blobstore.Options{
+		Backend: cfg.Artwork.StorageBackend, LocalPath: cfg.Artwork.LocalPath,
+		S3: deps.S3Public, S3Private: deps.S3Private, Settings: settings,
+	})
+	if err != nil {
+		return err
+	}
+	store := stores.Assets
+	deps.Blobs = stores
+	deps.ArtworkBackend = backend
+	deps.ArtworkSigner = artworkurl.NewSigner(cfg.Auth.JWTSecret, cfg.S3.MetadataPresignExpiry)
+	deps.ArtworkResolver = artworkurl.NewServerResolver(deps.ArtworkSigner)
+	deps.ArtworkDelivery = api.ArtworkDelivery{Scope: store.Identity()}
+	if direct, ok := store.(blobstore.DirectURLer); ok {
+		ttl := cfg.S3.MetadataPresignExpiry
+		if ttl <= 0 {
+			ttl = 4 * time.Hour
+		}
+		deps.ArtworkResolver = artworkurl.NewDirectResolver(direct, deps.S3Public.EffectivePresignTTL(ttl))
+		deps.ArtworkDelivery = api.ArtworkDelivery{
+			Scope:    deps.S3Public.ArtworkDeliveryScope(),
+			External: deps.S3Public.UsesExternalDelivery(),
+		}
+	}
+	deps.ArtworkResolver = chapterthumbs.NewURLResolver(deps.DB, deps.ArtworkResolver)
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := store.Probe(probeCtx); err != nil {
+		slog.WarnContext(ctx, "blob storage unavailable; readiness will retry", "backend", backend, "error", err)
+	}
+	slog.InfoContext(ctx, "blob storage configured", "backend", backend, "local_path", cfg.Artwork.LocalPath,
+		"operational", stores.Operational != nil)
+	return nil
+}
+
+func configureS3Clients(cfg *config.Config, deps *api.Dependencies) {
+	if s3Public := newS3ClientIfConfigured(s3client.BucketConfig{
+		Role:           "metadata",
+		Endpoint:       cfg.S3.Public.Endpoint,
+		PublicEndpoint: cfg.S3.Public.ReadEndpoint,
+		Region:         cfg.S3.Public.Region,
+		Bucket:         cfg.S3.Public.Bucket,
+		KeyPrefix:      cfg.S3.Public.KeyPrefix,
+		AccessKey:      cfg.S3.Public.AccessKey,
+		SecretKey:      cfg.S3.Public.SecretKey,
+		PathStyle:      cfg.S3.Public.PathStyle,
+		URLAuth:        cfg.S3.Public.URLAuth,
+		TokenSecret:    cfg.S3.Public.TokenSecret,
+		TokenParam:     cfg.S3.Public.TokenParam,
+		TokenTTL:       cfg.S3.Public.TokenTTL,
+	}); s3Public != nil {
+		deps.S3Public = s3Public
+		slog.Info("S3 public assets client configured", "bucket", s3Public.Bucket())
+
+		// Allow browsers to fetch presigned client-facing assets directly from S3.
+		// Skip for public/token auth (e.g. Cloudflare R2) where CORS is managed externally.
+		if !s3Public.UsesExternalAuth() {
+			corsCtx, corsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if corsErr := s3Public.SetBucketCORS(corsCtx, s3Public.Bucket(), []string{"*"}); corsErr != nil {
+				slog.Warn("failed to set CORS on public assets bucket", "error", corsErr)
+			}
+			corsCancel()
+		}
+	}
+
+	if s3Private := newS3ClientIfConfigured(s3client.BucketConfig{
+		Role:      "operational",
+		Endpoint:  cfg.S3.Private.Endpoint,
+		Region:    cfg.S3.Private.Region,
+		Bucket:    cfg.S3.Private.Bucket,
+		KeyPrefix: cfg.S3.Private.KeyPrefix,
+		AccessKey: cfg.S3.Private.AccessKey,
+		SecretKey: cfg.S3.Private.SecretKey,
+		PathStyle: cfg.S3.Private.PathStyle,
+	}); s3Private != nil {
+		deps.S3Private = s3Private
+		slog.Info("S3 private internal client configured", "bucket", s3Private.Bucket())
+		if !s3Private.UsesExternalAuth() {
+			corsCtx, corsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if corsErr := s3Private.SetBucketCORS(corsCtx, s3Private.Bucket(), []string{"*"}); corsErr != nil {
+				slog.Warn("failed to set CORS on private assets bucket", "error", corsErr)
+			}
+			corsCancel()
+		}
+	}
+
+	// No user-db S3 client is built here. The SQLite user store replicates
+	// through Litestream, which takes cfg.S3.UserDB directly in
+	// internal/userdb/litestream.go and never reads an s3client.
+}
+
+type pluginImageResolverCapabilityStore interface {
+	ListEnabled(ctx context.Context) ([]*plugins.Installation, error)
+	ListCapabilities(ctx context.Context, installationID int) ([]*plugins.Capability, error)
+}
+
+func reloadPluginImageResolvers(
+	ctx context.Context,
+	store pluginImageResolverCapabilityStore,
+	resolver *metadata.PluginImageResolver,
+	service *plugins.Service,
+) error {
+	if resolver == nil {
+		return nil
+	}
+	if store == nil || service == nil {
+		resolver.ReplaceSources(nil)
+		return nil
+	}
+
+	installations, err := store.ListEnabled(ctx)
+	if err != nil {
+		return fmt.Errorf("list enabled plugin installations: %w", err)
+	}
+	sort.Slice(installations, func(i, j int) bool {
+		if installations[i] == nil {
+			return false
+		}
+		if installations[j] == nil {
+			return true
+		}
+		return installations[i].ID < installations[j].ID
+	})
+
+	var registrations []metadata.PluginImageResolverSourceRegistration
+	for _, installation := range installations {
+		if installation == nil {
+			continue
+		}
+		// Builtin installations resolve in-process metadata providers only;
+		// registering them here would claim their capability id as a gRPC
+		// image-resolver scheme with no binary behind it.
+		if installation.IsBuiltin() {
+			continue
+		}
+		capabilities, err := store.ListCapabilities(ctx, installation.ID)
+		if err != nil {
+			return fmt.Errorf("list image resolver capabilities for installation %d: %w", installation.ID, err)
+		}
+		sort.Slice(capabilities, func(i, j int) bool {
+			if capabilities[i] == nil {
+				return false
+			}
+			if capabilities[j] == nil {
+				return true
+			}
+			if capabilities[i].Type != capabilities[j].Type {
+				return capabilities[i].Type < capabilities[j].Type
+			}
+			return capabilities[i].ID < capabilities[j].ID
+		})
+
+		for _, capability := range capabilities {
+			if capability == nil {
+				continue
+			}
+			switch capability.Type {
+			case sdkcapability.ImageResolver:
+				schemes, priority := imageResolverCapabilityConfig(capability)
+				if len(schemes) == 0 {
+					slog.WarnContext(ctx, "plugin image resolver capability has no valid schemes", "component", "app",
+						"installation_id", installation.ID,
+						"capability_id", capability.ID)
+					continue
+				}
+				for _, scheme := range schemes {
+					source := metadata.NewPluginClientSource(installation.ID, capability.ID, func(
+						ctx context.Context, installationID int, capabilityID string,
+					) (metadata.PluginMetadataClient, error) {
+						return service.ImageResolverClient(ctx, installationID, capabilityID)
+					})
+					registrations = append(registrations, metadata.PluginImageResolverSourceRegistration{
+						Scheme:         scheme,
+						Source:         source,
+						Kind:           metadata.PluginImageResolverSourceExplicit,
+						Priority:       priority,
+						InstallationID: installation.ID,
+						CapabilityID:   capability.ID,
+					})
+				}
+			case sdkcapability.MetadataProvider:
+				scheme := strings.TrimSpace(capability.ID)
+				if !metadata.ValidImageResolverScheme(scheme) {
+					slog.WarnContext(ctx, "skipping legacy metadata image resolver with invalid scheme", "component", "app",
+						"installation_id", installation.ID,
+						"capability_id", capability.ID)
+					continue
+				}
+				source := metadata.NewPluginClientSource(installation.ID, capability.ID, func(
+					ctx context.Context, installationID int, capabilityID string,
+				) (metadata.PluginMetadataClient, error) {
+					return service.MetadataProviderClient(ctx, installationID, capabilityID)
+				})
+				registrations = append(registrations, metadata.PluginImageResolverSourceRegistration{
+					Scheme:         scheme,
+					Source:         source,
+					Kind:           metadata.PluginImageResolverSourceLegacy,
+					InstallationID: installation.ID,
+					CapabilityID:   capability.ID,
+				})
+			}
+		}
+	}
+
+	resolver.ReplaceSources(registrations)
+	slog.InfoContext(ctx, "reloaded plugin image resolvers", "component", "app", "sources", len(registrations))
+	return nil
+}
+
+func imageResolverCapabilityConfig(capability *plugins.Capability) ([]string, int) {
+	if capability == nil {
+		return nil, 0
+	}
+	meta := capabilityMetadataFields(capability.Metadata)
+	return metadataStringList(meta["schemes"]), metadataInt(meta["priority"])
+}
+
+func capabilityMetadataFields(raw map[string]any) map[string]any {
+	if raw == nil {
+		return nil
+	}
+	if nested, ok := raw["metadata"]; ok {
+		switch typed := nested.(type) {
+		case map[string]any:
+			return typed
+		}
+	}
+	return raw
+}
+
+func metadataStringList(value any) []string {
+	var out []string
+	switch typed := value.(type) {
+	case []string:
+		for _, item := range typed {
+			if scheme := strings.TrimSpace(item); metadata.ValidImageResolverScheme(scheme) {
+				out = append(out, scheme)
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				continue
+			}
+			if scheme := strings.TrimSpace(text); metadata.ValidImageResolverScheme(scheme) {
+				out = append(out, scheme)
+			}
+		}
+	}
+	return out
+}
+
+func metadataInt(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		n, _ := typed.Int64()
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+var watchSyncPluginReloadMu sync.Mutex
+
+type markerPluginCapabilityStore interface {
+	ListEnabled(ctx context.Context) ([]*plugins.Installation, error)
+	ListCapabilities(ctx context.Context, installationID int) ([]*plugins.Capability, error)
+}
+
+// watchSyncPluginService is the plugin service surface a watch provider
+// reload uses.
+type watchSyncPluginService interface {
+	InvalidateInstallationCache()
+	InstalledFromSiloRepository(ctx context.Context, installation *plugins.Installation) (bool, error)
+	WatchSyncProviderClient(ctx context.Context, installationID int, capabilityID string) (*pluginhost.WatchSyncProviderClient, error)
+	WatchSyncProviderConfig(ctx context.Context, installationID int) (*pluginv1.WatchSyncProviderConfig, error)
+	SeedGlobalConfig(ctx context.Context, installationID int, key string, value map[string]any) (bool, error)
+	WatchSyncConfigReady(ctx context.Context, installationID int) (bool, error)
+}
+
+// watchSyncPluginReconcileInterval is how often every API node rebuilds its
+// watch provider registry from the installed plugins.
+const watchSyncPluginReconcileInterval = 2 * time.Minute
+
+// firstPartyInstallation is a first-party watch provider plugin found by a
+// reload, whose app credentials may still need carrying over.
+type firstPartyInstallation struct {
+	installationID int
+	providerKey    string
+}
+
+func reloadWatchSyncPluginProviders(
+	ctx context.Context,
+	registry *watchsync.Registry,
+	store markerPluginCapabilityStore,
+	service watchSyncPluginService,
+	repository watchsync.PluginCredentialRepository,
+	migration watchsync.FirstPartyMigrationStore,
+) error {
+	if registry == nil {
+		return nil
+	}
+	firstParty, err := replaceWatchSyncPluginProviders(ctx, registry, store, service, repository, migration)
+	// Seeding saves plugin config, which fires the lifecycle hooks and with
+	// them this reload, so it runs after the reload lock is released. The
+	// nested reload finds the config saved and seeds nothing.
+	for _, installation := range firstParty {
+		seeded, seedErr := watchsync.SeedFirstPartyAppConfig(ctx, installation.providerKey, installation.installationID, migration, service)
+		if seedErr != nil {
+			slog.WarnContext(ctx, "failed to carry watch provider app credentials over to its plugin",
+				"component", "app",
+				"installation_id", installation.installationID,
+				"provider", installation.providerKey,
+				"error", seedErr,
+			)
+		} else if seeded {
+			slog.InfoContext(ctx, "carried watch provider app credentials over to its plugin",
+				"component", "app",
+				"installation_id", installation.installationID,
+				"provider", installation.providerKey,
+			)
+		}
+	}
+	return err
+}
+
+// replaceWatchSyncPluginProviders rebuilds the plugin providers in registry
+// and returns the first-party installations it registered.
+func replaceWatchSyncPluginProviders(
+	ctx context.Context,
+	registry *watchsync.Registry,
+	store markerPluginCapabilityStore,
+	service watchSyncPluginService,
+	repository watchsync.PluginCredentialRepository,
+	migration watchsync.FirstPartyMigrationStore,
+) ([]firstPartyInstallation, error) {
+	watchSyncPluginReloadMu.Lock()
+	defer watchSyncPluginReloadMu.Unlock()
+
+	var providers []watchsync.Provider
+	var firstParty []firstPartyInstallation
+	claimedLegacyKeys := make(map[string]bool)
+	if store == nil || service == nil {
+		return nil, registry.ReplacePluginProviders(providers)
+	}
+	// The rows below can have changed on another API node. Client and
+	// manifest reads must use those versions too, including on timer reloads.
+	service.InvalidateInstallationCache()
+	installations, err := store.ListEnabled(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list enabled watch sync plugin installations: %w", err)
+	}
+	sort.Slice(installations, func(i, j int) bool {
+		if installations[i] == nil {
+			return false
+		}
+		if installations[j] == nil {
+			return true
+		}
+		return installations[i].ID < installations[j].ID
+	})
+	for _, installation := range installations {
+		if installation == nil || installation.IsBuiltin() {
+			continue
+		}
+		if watchsync.RetiredPlugin(installation.PluginID) {
+			slog.WarnContext(ctx, "skip retired watch sync plugin; Silo no longer supports its provider",
+				"component", "app",
+				"installation_id", installation.ID,
+				"plugin_id", installation.PluginID,
+			)
+			continue
+		}
+		siloManaged, err := service.InstalledFromSiloRepository(ctx, installation)
+		if err != nil {
+			// Registering a first-party plugin under a per-installation key
+			// would hide its existing connections, so skip it until the
+			// repository can be read.
+			slog.WarnContext(ctx, "skip watch sync plugin with unreadable repository",
+				"component", "app",
+				"installation_id", installation.ID,
+				"error", err,
+			)
+			continue
+		}
+		capabilities, err := store.ListCapabilities(ctx, installation.ID)
+		if err != nil {
+			slog.WarnContext(ctx, "skip watch sync plugin with unreadable capabilities",
+				"component", "app",
+				"installation_id", installation.ID,
+				"error", err,
+			)
+			continue
+		}
+		for _, capability := range capabilities {
+			if capability == nil || capability.Type != sdkcapability.WatchSyncProvider {
+				continue
+			}
+			descriptor, err := plugins.DecodeCapability(capability)
+			if err != nil {
+				slog.WarnContext(ctx, "skip invalid watch sync plugin capability",
+					"component", "app",
+					"installation_id", installation.ID,
+					"capability_id", capability.ID,
+					"error", err,
+				)
+				continue
+			}
+			providerKey := watchsync.PluginProviderKey(installation.ID, installation.PluginID, capability.ID, siloManaged)
+			if legacyKey := watchsync.PluginProviderKey(installation.ID, installation.PluginID, capability.ID, true); legacyKey != providerKey {
+				slog.WarnContext(ctx, "first-party watch provider plugin was not installed from the Silo repository; connections made with it before stay unsynced",
+					"component", "app",
+					"installation_id", installation.ID,
+					"plugin_id", installation.PluginID,
+					"provider", legacyKey,
+				)
+			}
+			if _, legacy := watchsync.FirstPartyPluginID(providerKey); legacy && claimedLegacyKeys[providerKey] {
+				// Two Silo-managed installations of one first-party plugin, for
+				// example from API nodes that auto-installed it at the same
+				// time. The older one keeps the key; registering both would
+				// fail the whole reload.
+				slog.WarnContext(ctx, "skip duplicate first-party watch provider plugin installation",
+					"component", "app",
+					"installation_id", installation.ID,
+					"provider", providerKey,
+				)
+				continue
+			}
+			provider, err := watchsync.NewPluginProvider(watchsync.PluginProviderOptions{
+				InstallationID:         installation.ID,
+				ProviderKey:            providerKey,
+				CapabilityID:           capability.ID,
+				DisplayName:            descriptor.GetDisplayName(),
+				Descriptor:             descriptor.GetWatchSyncProvider(),
+				ConnectionConfigSchema: descriptor.GetConfigSchema(),
+				ResolveClient: func(callCtx context.Context, installationID int, capabilityID string) (watchsync.WatchSyncPluginClient, error) {
+					return service.WatchSyncProviderClient(callCtx, installationID, capabilityID)
+				},
+				ResolveConfig: func(callCtx context.Context, installationID int) (*pluginv1.WatchSyncProviderConfig, error) {
+					return service.WatchSyncProviderConfig(callCtx, installationID)
+				},
+				ConfigReady: func(callCtx context.Context, installationID int) (bool, error) {
+					return service.WatchSyncConfigReady(callCtx, installationID)
+				},
+				Repository: repository,
+			})
+			if err != nil {
+				slog.WarnContext(ctx, "skip unsupported watch sync plugin capability",
+					"component", "app",
+					"installation_id", installation.ID,
+					"capability_id", capability.ID,
+					"error", err,
+				)
+				continue
+			}
+			providers = append(providers, provider)
+			if _, ok := watchsync.FirstPartyPluginID(providerKey); ok {
+				claimedLegacyKeys[providerKey] = true
+				firstParty = append(firstParty, firstPartyInstallation{installationID: installation.ID, providerKey: providerKey})
+			}
+		}
+	}
+	if err := registry.ReplacePluginProviders(providers); err != nil {
+		return nil, err
+	}
+	for _, installation := range firstParty {
+		if err := watchsync.MarkFirstPartyMigrated(ctx, migration, installation.providerKey); err != nil {
+			slog.WarnContext(ctx, "failed to record watch provider plugin migration",
+				"component", "app",
+				"provider", installation.providerKey,
+				"error", err,
+			)
+		}
+	}
+	return firstParty, nil
+}
+
+type markerPluginRuntimeConfigStore interface {
+	ListGlobalConfigs(ctx context.Context, installationID int) ([]*plugins.RuntimeConfig, error)
+	PutGlobalConfig(ctx context.Context, installationID int, key string, value map[string]any) error
+}
+
+type markerLegacySettingsStore interface {
+	Get(ctx context.Context, key string) (string, error)
+}
+
+// markerProviderConfigDefaults is the part of markers.ProviderConfigStore that
+// seeds a provider's config row.
+type markerProviderConfigDefaults interface {
+	Get(provider string) (markers.ProviderConfig, bool)
+	Ensure(ctx context.Context, c markers.ProviderConfig) error
+	EnsureDefaultSharing(ctx context.Context, c markers.ProviderConfig) error
+}
+
+// markerContributionDefaults is the contribution config a marker capability's
+// manifest asks for. A fetch-only capability gets none, and automatic sharing
+// needs contribution on.
+func markerContributionDefaults(metadata map[string]any) markers.PluginContributionDefaults {
+	contribution := markers.PluginContributionDefaultsFromMetadata(metadata)
+	contribution.Enabled = contribution.Enabled && markers.PluginSupportsContributionFromMetadata(metadata)
+	contribution.AutoLocal = contribution.AutoLocal && contribution.Enabled
+	return contribution
+}
+
+// stopDefaultMarkerSharingInTx runs in the transaction that saves
+// markers.share_by_default=false. It reads the manifests from the database, not
+// the registry, so disabled plugins and ones this node has not loaded stop too,
+// and reads them through tx, so the save needs no second connection.
+func stopDefaultMarkerSharingInTx(ctx context.Context, tx pgx.Tx) error {
+	return markers.StopDefaultSharingInTx(ctx, tx, defaultSharingMarkerProviders)
+}
+
+// defaultSharingMarkerProviders lists the installed marker providers whose
+// manifest turns contribution on by default. It reads the manifest key alone,
+// not whether the current version accepts submissions, so a provider that is
+// fetch-only for now cannot resume sharing after a later update restores it.
+func defaultSharingMarkerProviders(ctx context.Context, tx pgx.Tx) ([]string, error) {
+	capabilities, err := plugins.ListCapabilitiesOfType(ctx, tx, sdkcapability.MarkerProvider)
+	if err != nil {
+		return nil, err
+	}
+	var providers []string
+	for _, capability := range capabilities {
+		descriptor, err := plugins.DecodeCapability(capability)
+		if err != nil {
+			return nil, fmt.Errorf("decode marker provider capability %d/%s: %w", capability.InstallationID, capability.ID, err)
+		}
+		if markers.PluginContributionDefaultsFromMetadata(markerCapabilityMetadata(descriptor)).Enabled {
+			providers = append(providers, markers.PluginProviderID(capability.InstallationID, capability.ID))
+		}
+	}
+	return providers, nil
+}
+
+func reloadMarkerPluginProviders(
+	ctx context.Context,
+	registry *markers.Registry,
+	configStore markerProviderConfigDefaults,
+	store markerPluginCapabilityStore,
+	runtimeConfigs markerPluginRuntimeConfigStore,
+	legacySettings markerLegacySettingsStore,
+	resolver *markers.PluginResolverAdapter,
+) error {
+	if registry == nil {
+		return nil
+	}
+	previous := make(map[string]string)
+	for _, provider := range registry.Providers() {
+		if revisioned, ok := provider.(interface{ CacheRevision() string }); ok {
+			previous[provider.ID()] = revisioned.CacheRevision()
+		}
+	}
+	refreshedRuntimes := make(map[int]bool)
+	var providers []markers.Provider
+	if store == nil || resolver == nil {
+		return registry.SetProviders(providers)
+	}
+
+	installations, err := store.ListEnabled(ctx)
+	if err != nil {
+		return fmt.Errorf("list enabled plugin installations: %w", err)
+	}
+	sort.Slice(installations, func(i, j int) bool {
+		if installations[i] == nil {
+			return false
+		}
+		if installations[j] == nil {
+			return true
+		}
+		return installations[i].ID < installations[j].ID
+	})
+
+	var configErr error
+	failClosed := func(err error) {
+		configErr = err
+		// A later reload error must not leave providers using an unknown
+		// configuration revision. Healthy providers are restored below.
+		_ = registry.SetProviders(nil)
+	}
+	nextPriority := 1000
+	for _, installation := range installations {
+		if installation == nil {
+			continue
+		}
+		// Builtin installations expose no marker providers; defense in depth
+		// alongside the capability-type filter below.
+		if installation.IsBuiltin() {
+			continue
+		}
+		capabilities, err := store.ListCapabilities(ctx, installation.ID)
+		if err != nil {
+			return fmt.Errorf("list marker provider capabilities for installation %d: %w", installation.ID, err)
+		}
+		sort.Slice(capabilities, func(i, j int) bool {
+			if capabilities[i] == nil {
+				return false
+			}
+			if capabilities[j] == nil {
+				return true
+			}
+			return capabilities[i].ID < capabilities[j].ID
+		})
+		for _, capability := range capabilities {
+			if capability == nil || capability.Type != sdkcapability.MarkerProvider {
+				continue
+			}
+			descriptor, err := plugins.DecodeCapability(capability)
+			if err != nil {
+				return fmt.Errorf("decode marker provider capability %d/%s: %w", installation.ID, capability.ID, err)
+			}
+			metadataMap := markerCapabilityMetadata(descriptor)
+			if err := copyLegacyIntroDBPluginConfig(ctx, runtimeConfigs, legacySettings, installation, capability); err != nil {
+				failClosed(err)
+				continue
+			}
+			var configRevisions []string
+			if runtimeConfigs != nil {
+				configs, err := runtimeConfigs.ListGlobalConfigs(ctx, installation.ID)
+				if err != nil {
+					failClosed(fmt.Errorf("list marker plugin configuration for installation %d: %w", installation.ID, err))
+					continue
+				}
+				for _, config := range configs {
+					if config != nil {
+						configRevisions = append(configRevisions, fmt.Sprintf("%q:%s", config.Key, config.UpdatedAt.UTC().Format(time.RFC3339Nano)))
+					}
+				}
+			}
+			sort.Strings(configRevisions)
+			cacheRevision := fmt.Sprintf("%q\n%s", installation.Version, strings.Join(configRevisions, "\n"))
+			providerID := markers.PluginProviderID(installation.ID, capability.ID)
+			if previous[providerID] != cacheRevision && !refreshedRuntimes[installation.ID] {
+				if err := resolver.RefreshMarkerRuntime(installation.ID); err != nil {
+					failClosed(fmt.Errorf("refresh marker plugin runtime %d: %w", installation.ID, err))
+					continue
+				}
+				refreshedRuntimes[installation.ID] = true
+			}
+			supportsContribution := markers.PluginSupportsContributionFromMetadata(metadataMap)
+			contribution := markerContributionDefaults(metadataMap)
+			pluginProvider, err := markers.NewPluginProvider(markers.PluginProviderOptions{
+				InstallationID:           installation.ID,
+				CapabilityID:             capability.ID,
+				DisplayName:              firstNonEmptyMarkerText(descriptor.GetDisplayName(), capability.ID),
+				PluginID:                 installation.PluginID,
+				CacheRevision:            cacheRevision,
+				RequiredExternalIDs:      markers.PluginRequiredExternalIDsFromMetadata(metadataMap),
+				SupportsAmend:            markers.PluginSupportsAmendFromMetadata(metadataMap),
+				SupportsAbsent:           markers.PluginSupportsAbsentFromMetadata(metadataMap),
+				DefaultContributeEnabled: contribution.Enabled,
+			}, resolver)
+			if err != nil {
+				return err
+			}
+			var provider markers.Provider = pluginProvider
+			if !supportsContribution {
+				provider = markers.NewReadOnlyPluginProvider(pluginProvider)
+			}
+			providers = append(providers, provider)
+
+			priority := nextPriority
+			nextPriority++
+			if configuredPriority, ok := markers.PluginDefaultFetchPriorityFromMetadata(metadataMap); ok {
+				priority = configuredPriority
+			}
+			if configStore != nil {
+				defaultConfig := markers.ProviderConfig{
+					Provider:                provider.ID(),
+					FetchEnabled:            true,
+					FetchPriority:           priority,
+					ContributeEnabled:       contribution.Enabled,
+					ContributeAutoLocal:     contribution.AutoLocal,
+					ContributeMinConfidence: contribution.MinConfidence,
+				}
+				ensure := configStore.Ensure
+				if legacy, ok := legacyIntroDBProviderConfig(configStore, installation, capability, provider.ID()); ok {
+					defaultConfig = legacy
+				} else if defaultConfig.ContributeEnabled {
+					// The manifest's sharing default applies only while the
+					// server shares by default, which the setup wizard records.
+					ensure = configStore.EnsureDefaultSharing
+				}
+				if err := ensure(ctx, defaultConfig); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	// Replace the registry even when configuration reads failed, so a provider
+	// cannot continue serving cached lookups with an unknown credential revision.
+	if err := registry.SetProviders(providers); err != nil {
+		return err
+	}
+	return configErr
+}
+
+func legacyIntroDBProviderConfig(
+	configStore markerProviderConfigDefaults,
+	installation *plugins.Installation,
+	capability *plugins.Capability,
+	providerID string,
+) (markers.ProviderConfig, bool) {
+	if configStore == nil ||
+		installation == nil ||
+		capability == nil ||
+		installation.PluginID != "silo.theintrodb" ||
+		capability.ID != "introdb" {
+		return markers.ProviderConfig{}, false
+	}
+	if _, exists := configStore.Get(providerID); exists {
+		return markers.ProviderConfig{}, false
+	}
+	legacy, ok := configStore.Get("introdb")
+	if !ok {
+		return markers.ProviderConfig{}, false
+	}
+	legacy.Provider = providerID
+	return legacy, true
+}
+
+func copyLegacyIntroDBPluginConfig(
+	ctx context.Context,
+	runtimeConfigs markerPluginRuntimeConfigStore,
+	legacySettings markerLegacySettingsStore,
+	installation *plugins.Installation,
+	capability *plugins.Capability,
+) error {
+	if runtimeConfigs == nil ||
+		legacySettings == nil ||
+		installation == nil ||
+		capability == nil ||
+		installation.PluginID != "silo.theintrodb" ||
+		capability.ID != "introdb" {
+		return nil
+	}
+	configs, err := runtimeConfigs.ListGlobalConfigs(ctx, installation.ID)
+	if err != nil {
+		return fmt.Errorf("list TheIntroDB plugin config: %w", err)
+	}
+	for _, config := range configs {
+		if config != nil && config.Key == "account" {
+			return nil
+		}
+	}
+	apiKey, err := legacySettings.Get(ctx, "introdb.api_key")
+	if err != nil {
+		return fmt.Errorf("load legacy introdb.api_key: %w", err)
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		return nil
+	}
+	if err := runtimeConfigs.PutGlobalConfig(ctx, installation.ID, "account", map[string]any{
+		"api_key": strings.TrimSpace(apiKey),
+	}); err != nil {
+		return fmt.Errorf("copy legacy introdb.api_key to plugin config: %w", err)
+	}
+	return nil
+}
+
+func markerCapabilityMetadata(descriptor *pluginv1.CapabilityDescriptor) map[string]any {
+	if descriptor == nil || descriptor.GetMetadata() == nil {
+		return nil
+	}
+	return descriptor.GetMetadata().AsMap()
+}
+
+func firstNonEmptyMarkerText(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+// mapFolderTypeToMediaType maps silo's MediaFolder.Type values
+// ("movies", "series", "mixed") to the SDK's MediaType values
+// ("movie", "tv", "mixed"). Unknown values map to "mixed".
+func mapFolderTypeToMediaType(t string) string {
+	switch t {
+	case "movies":
+		return "movie"
+	case "series":
+		return "tv"
+	default:
+		return "mixed"
+	}
+}
+
+type scopeResolver interface {
+	Resolve(ctx context.Context, input access.ResolveInput) (access.Scope, error)
+}
+
+type scopeEntitlementResolver struct {
+	resolver scopeResolver
+}
+
+func (r scopeEntitlementResolver) MaxPlaybackQuality(ctx context.Context, userID int, profileID string) (string, error) {
+	scope, err := r.resolveScope(ctx, userID, profileID)
+	if err != nil {
+		return "", err
+	}
+	return scope.MaxPlaybackQuality, nil
+}
+
+// MaxContentRating implements mediarequests.ContentRatingResolver so request
+// discovery honors the profile's parental rating ceiling.
+func (r scopeEntitlementResolver) MaxContentRating(ctx context.Context, userID int, profileID string) (string, error) {
+	scope, err := r.resolveScope(ctx, userID, profileID)
+	if err != nil {
+		return "", err
+	}
+	return scope.MaxContentRating, nil
+}
+
+func (r scopeEntitlementResolver) resolveScope(ctx context.Context, userID int, profileID string) (access.Scope, error) {
+	return r.resolver.Resolve(ctx, access.ResolveInput{
+		UserID:              userID,
+		ProfileID:           profileID,
+		SkipPINVerification: true,
+	})
+}
+
+// audiobooksSettingsAdapter bridges catalog.ServerSettingsRepo (which
+// exposes Get) to the audiobooks.SettingsReader interface (which
+// requires GetString). The two signatures are identical modulo name.
+type audiobooksSettingsAdapter struct {
+	repo catalog.SettingsStore
+}
+
+func (a *audiobooksSettingsAdapter) GetString(ctx context.Context, key string) (string, error) {
+	return a.repo.Get(ctx, key)
+}

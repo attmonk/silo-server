@@ -1,0 +1,290 @@
+package streamtoken
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+const (
+	PlayMethodBandwidthProbe = "bandwidth_probe_v1"
+	// PlayMethodDownload identifies a token minted only after the API has
+	// authorized a file download. Proxy download routes reject playback tokens.
+	PlayMethodDownload = "download"
+	// PlayMethodToneMapDownload makes attested prepared downloads fail closed on
+	// older proxies that do not validate the receipt fields.
+	PlayMethodToneMapDownload = "download_tonemap_v1"
+	// PlayMethodToneMapTranscode makes frozen tone-map reconstruction fail
+	// closed on older readers that do not understand its recipe fields.
+	PlayMethodToneMapTranscode = "transcode_tonemap_v1"
+	// PlayMethodAudioDownmixTranscode and PlayMethodAudioDownmixRemux make a
+	// frozen source-channel recipe fail closed on older readers. Without that
+	// fact, an old binary can reconstruct different audio bytes by omitting the
+	// multichannel-to-stereo boost.
+	PlayMethodAudioDownmixTranscode = "transcode_audio_downmix_v1"
+	PlayMethodAudioDownmixRemux     = "remux_audio_downmix_v1"
+	// PlayMethodCopyFMP4Transcode makes the versioned copy-video timestamp and
+	// bitstream recipe fail closed on readers predating that recipe.
+	PlayMethodCopyFMP4Transcode = "transcode_copy_fmp4_v1"
+	// PlayMethodSubtitleRenditionsTranscode and
+	// PlayMethodSubtitleRenditionsCopyFMP4 mark a transcode, or a copy-video
+	// transcode, that serves on-demand subtitle renditions. Readers predating
+	// them refuse the token instead of rebuilding the stream with the selected
+	// track's rendition alone, which would answer every other track's
+	// playlist with that track's cues.
+	PlayMethodSubtitleRenditionsTranscode = "transcode_subtitle_renditions_v1"
+	PlayMethodSubtitleRenditionsCopyFMP4  = "transcode_copy_fmp4_subtitle_renditions_v1"
+	// PlayMethodThemeDirect and PlayMethodThemeAAC authorize a detail-page
+	// theme song: its original bytes, or its progressive AAC conversion. They
+	// are not playback sessions, and workers that predate them reject them, so
+	// a theme token can never reach a video route or an older worker.
+	PlayMethodThemeDirect = "theme_direct_v1"
+	PlayMethodThemeAAC    = "theme_aac_v1"
+)
+
+// Claims holds everything a stateless proxy or transcode node needs
+// to serve a streaming session without database access.
+//
+// Under token-carried reconstruction (TR-lease) the token is also the durable
+// reconstruction descriptor: its claims carry the frozen byte-affecting encode
+// parameters (the former Postgres "recipe card"), while environment-specific
+// fields such as the tone-map filter are resolved from the live node. A
+// front-end that loses its in-memory session can rebuild ffmpeg from the token
+// the client re-presents — no shared per-session store. The ownership claims
+// (uid/pid/mfid) are lookup keys re-resolved against the authority on
+// reconstruct; they are never trusted on their own.
+type Claims struct {
+	SessionID string `json:"sid"`
+	// MediaPath is the file the token serves. It never goes on the wire in
+	// the clear: Sign seals it into SealedMediaPath and Verify opens it, so a
+	// client holding the token cannot read where the file lives. A token
+	// signed before sealing still carries it here and still verifies.
+	MediaPath string `json:"path,omitempty"`
+	// SealedMediaPath is MediaPath sealed by sealMediaPath.
+	SealedMediaPath        string  `json:"spath,omitempty"`
+	PlayMethod             string  `json:"method"`
+	TranscodeAudio         bool    `json:"ta,omitempty"`
+	TranscodeNode          string  `json:"tnode,omitempty"`
+	TranscodeTransportID   string  `json:"tid,omitempty"`
+	RoutingNetworkProvider *string `json:"rnp,omitempty"`
+	StreamLocation         string  `json:"sl,omitempty"`
+	RoutingWorkload        string  `json:"rwl,omitempty"`
+	RoutingExecution       string  `json:"rex,omitempty"`
+	RoutingExecutionNodeID int     `json:"rxnid,omitzero"`
+	RoutingEgress          string  `json:"reg,omitempty"`
+	RoutingEgressNodeID    int     `json:"renid,omitempty"`
+	TargetCodec            string  `json:"tc,omitempty"`
+	TargetRes              string  `json:"tres,omitempty"`
+	AudioCodec             string  `json:"ac,omitempty"`
+	AudioChannels          int     `json:"ach,omitempty"`
+	AudioTrackIndex        int     `json:"ati,omitempty"`
+	RequireAudioTrack      bool    `json:"rat,omitempty"`
+	AudioOnly              bool    `json:"ao,omitempty"`
+	// CopyAudioCodec is the codec of the source audio track a remux copies.
+	// The progressive remux and fMP4 HLS segments add aac_adtstoasc for a
+	// copied AAC track. Absent in older tokens, which keep the plain copy.
+	CopyAudioCodec string `json:"cac,omitempty"`
+	// DVProfile is the file's Dolby Vision profile (0 = none); remux nodes
+	// use it to strip dangling profile 7 RPUs. Absent in older tokens, which
+	// decodes as 0 (no strip — the pre-existing behavior).
+	DVProfile int `json:"dvp,omitempty"`
+	// RemuxDVMode freezes whether a Profile 7 remux preserves or strips DV
+	// metadata. Empty is the legacy auto behavior for old tokens.
+	RemuxDVMode string `json:"dvm,omitempty"`
+	// RemuxResumeLeadingPictureDrop asks a seeked progressive remux to drop
+	// open-GOP leading pictures when the executing FFmpeg supports it. It is
+	// best effort, so a node that predates the claim serves the plain copy.
+	RemuxResumeLeadingPictureDrop bool `json:"rlpd,omitempty"`
+
+	// Ownership / authorization lookup keys (re-resolved at reconstruct).
+	// Not trust assertions.
+	UserID      int    `json:"uid,omitempty"`
+	ProfileID   string `json:"pid,omitempty"`
+	MediaFileID int    `json:"mfid,omitempty"`
+	// OriginalStartedAtUnixNano is decoded directly into int64 by golang-jwt,
+	// preserving nanosecond precision. A future map[string]any decode path must
+	// not pass this through float64, which cannot represent this magnitude exactly.
+	OriginalStartedAtUnixNano int64 `json:"ostn,omitempty"`
+	// DownloadArtifactID is an opaque transcode-node artifact handle. For
+	// download tokens TranscodeNode is its authenticated origin; MediaPath stays
+	// empty so node-local filesystem paths never leave the owning node.
+	DownloadArtifactID string `json:"daid,omitempty"`
+	// DownloadArtifactRowID identifies the authoritative database row so a
+	// proxy can fence and requeue a signed remote locator that returns 404.
+	DownloadArtifactRowID        string `json:"darid,omitempty"`
+	DownloadArtifactSize         int64  `json:"dasz,omitempty"`
+	DownloadExecutionFingerprint string `json:"daef,omitempty"`
+	// DownloadFilename is the client-facing attachment name, for a source file
+	// and a prepared artifact alike: the API names the download for the
+	// caller, and remote artifact ids are internal attempt handles that must
+	// never become saved filenames.
+	DownloadFilename string `json:"dfn,omitempty"`
+	// ThemeID, ThemeSize and ThemeModifiedUnixNano identify the theme file a
+	// theme token authorizes. A worker refuses the file once its size or
+	// modification time no longer match, until a scan and a new token describe
+	// the replacement; a transcode node also re-approves the id and path.
+	ThemeID               int64 `json:"thid,omitempty"`
+	ThemeSize             int64 `json:"thsz,omitempty"`
+	ThemeModifiedUnixNano int64 `json:"thmt,omitempty"`
+
+	// Reconstruction recipe — the byte-affecting encode parameters, mirroring the
+	// former playback.RecipeCard. Zero for direct/remux tokens, which reconstruct
+	// from identity alone plus the client-supplied position.
+	SourceVideoCodec           string  `json:"svc,omitempty"`
+	SourceVideoProfile         string  `json:"svp,omitempty"`
+	SourceVideoBitDepth        int     `json:"svb,omitempty"`
+	SourceAudioChannels        int     `json:"sach,omitempty"`
+	SoftwareVideoDecode        bool    `json:"svd,omitempty"`
+	ToneMapPolicy              string  `json:"tmp,omitempty"`
+	ToneMapMode                string  `json:"tmm,omitempty"`
+	ToneMapSourceKind          string  `json:"tms,omitempty"`
+	ToneMapRecipeVersion       string  `json:"tmv,omitempty"`
+	CopyFMP4RecipeVersion      string  `json:"cfv,omitempty"`
+	ToneMapPreflightRequired   bool    `json:"tmpf,omitempty"`
+	ToneMapSourceRevision      string  `json:"tmsr,omitempty"`
+	ToneMapDVConfigPresent     bool    `json:"tmdc,omitempty"`
+	ToneMapDVBLCompatIDPresent bool    `json:"tmdbci,omitempty"`
+	ToneMapDVBLPresent         bool    `json:"tmdb,omitempty"`
+	ToneMapDVRPUPresent        bool    `json:"tmdr,omitempty"`
+	VideoBitstreamFilter       string  `json:"vbsf,omitempty"`
+	VideoSampleEntry           string  `json:"vse,omitempty"`
+	VideoRange                 string  `json:"vrg,omitempty"`
+	CopyVideoMPEGTS            bool    `json:"cvts,omitempty"`
+	KeyframePlaylist           bool    `json:"kfp,omitempty"`
+	KeyframePlanResume         bool    `json:"kfpr,omitempty"`
+	OutputSubdir               string  `json:"osd,omitempty"`
+	SeekSeconds                float64 `json:"seek,omitempty"`
+	StreamOriginSeconds        float64 `json:"origin,omitempty"`
+	CopySeekAnchorResolved     bool    `json:"origin_ok,omitempty"`
+	SegmentDuration            int     `json:"segd,omitempty"`
+	StartSegmentNumber         int     `json:"ssn,omitempty"`
+	SubtitleTrackIndex         int     `json:"sti,omitempty"`
+	SubtitleBurnIn             bool    `json:"sbi,omitempty"`
+	SubtitleCodec              string  `json:"sbc,omitempty"`
+	// SubtitleRendition emits the selected text track as the HLS WebVTT
+	// subtitle rendition of the transcode's own playlist.
+	SubtitleRendition      bool    `json:"srn,omitempty"`
+	TargetBitrateKbps      int     `json:"tbr,omitempty"`
+	TotalDuration          float64 `json:"dur,omitempty"`
+	FastStart              bool    `json:"fs,omitempty"`
+	ThrottleSeconds        int     `json:"ths,omitempty"`
+	TargetCodecAudio       string  `json:"tca,omitempty"`
+	TargetAudioChannels    int     `json:"tac,omitempty"`
+	TargetAudioBitrateKbps int     `json:"tabr,omitempty"`
+
+	// SubtitleRenditionTracks lists the on-demand subtitle renditions by
+	// container track number, in order, SubtitleRenditionDefault names the
+	// default one (0 for none), and SubtitleRenditionSourceSize and
+	// SubtitleRenditionSourceModTime the source version they read. A token
+	// that carries them has a PlayMethodSubtitleRenditions* method.
+	SubtitleRenditionTracks        []uint64 `json:"srt,omitempty"`
+	SubtitleRenditionDefault       uint64   `json:"srd,omitempty"`
+	SubtitleRenditionSourceSize    int64    `json:"srs,omitempty"`
+	SubtitleRenditionSourceModTime int64    `json:"srm,omitempty"`
+
+	// HLSVariableSubstitution records the client's hls_variable_substitution_v1
+	// delivery feature, so the relay and a reconstruct keep the playlist form
+	// the client negotiated. Absent in older tokens: the literal form.
+	HLSVariableSubstitution bool `json:"hvs,omitempty"`
+
+	// Recipe staleness hint, bumped on each re-mint after a recipe mutation
+	// (audio/quality/seek switch). An optional client-side hint only.
+	Version int `json:"ver,omitempty"`
+
+	jwt.RegisteredClaims
+}
+
+type StartedAtSource string
+
+const (
+	StartedAtSourceClaim    StartedAtSource = "claim"
+	StartedAtSourceIssuedAt StartedAtSource = "issued_at"
+	StartedAtSourceNone     StartedAtSource = "none"
+)
+
+// StartedAt resolves the session's creation time from the explicit claim first,
+// then the registered issue time. Only the explicit claim is authoritative:
+// Sign rewrites RegisteredClaims on every mint, so iat is issue time.
+func (c *Claims) StartedAt() (time.Time, StartedAtSource) {
+	if c == nil {
+		return time.Time{}, StartedAtSourceNone
+	}
+	if c.OriginalStartedAtUnixNano != 0 {
+		return time.Unix(0, c.OriginalStartedAtUnixNano).UTC(), StartedAtSourceClaim
+	}
+	if c.IssuedAt != nil {
+		return c.IssuedAt.UTC(), StartedAtSourceIssuedAt
+	}
+	return time.Time{}, StartedAtSourceNone
+}
+
+// ErrNoSecret reports that no signing secret is configured. An empty HMAC key
+// is one anyone can sign with, so Sign and Verify refuse it rather than mint
+// or accept tokens that grant arbitrary media paths.
+var ErrNoSecret = errors.New("stream token: signing secret is not configured")
+
+// Sign creates a signed JWT string from the given claims.
+func Sign(c Claims, secret string, ttl time.Duration) (string, error) {
+	if strings.TrimSpace(secret) == "" {
+		return "", ErrNoSecret
+	}
+	if c.MediaPath != "" {
+		sealed, err := sealMediaPath(c.MediaPath, secret)
+		if err != nil {
+			return "", err
+		}
+		c.MediaPath, c.SealedMediaPath = "", sealed
+	}
+	now := time.Now()
+	c.RegisteredClaims = jwt.RegisteredClaims{
+		ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+		IssuedAt:  jwt.NewNumericDate(now),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, c)
+	return token.SignedString([]byte(secret))
+}
+
+// AuthorizesPlaybackMedia reports whether the token is a playback session's
+// stream reference: it names a session and a playback recipe, not a
+// download, a theme song or a bandwidth probe.
+func (c *Claims) AuthorizesPlaybackMedia() bool {
+	if c == nil || c.SessionID == "" || c.UserID <= 0 {
+		return false
+	}
+	switch c.PlayMethod {
+	case "", PlayMethodBandwidthProbe, PlayMethodDownload, PlayMethodToneMapDownload, PlayMethodThemeDirect, PlayMethodThemeAAC:
+		return false
+	}
+	return true
+}
+
+// Verify parses and validates a stream token JWT string.
+func Verify(tokenString, secret string) (*Claims, error) {
+	if strings.TrimSpace(secret) == "" {
+		return nil, ErrNoSecret
+	}
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (any, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(secret), nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("invalid stream token: %w", err)
+	}
+	claims, ok := token.Claims.(*Claims)
+	if !ok || !token.Valid {
+		return nil, fmt.Errorf("invalid stream token claims")
+	}
+	if claims.SealedMediaPath != "" {
+		path, err := openMediaPath(claims.SealedMediaPath, secret)
+		if err != nil {
+			return nil, fmt.Errorf("invalid stream token claims: %w", err)
+		}
+		claims.MediaPath, claims.SealedMediaPath = path, ""
+	}
+	return claims, nil
+}

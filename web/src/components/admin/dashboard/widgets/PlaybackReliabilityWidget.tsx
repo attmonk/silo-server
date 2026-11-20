@@ -1,0 +1,106 @@
+import type { ReactNode } from "react";
+
+import { Card, CardContent } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useAdminPlaybackActivity } from "@/hooks/queries/admin/dashboardInsights";
+import { SectionError } from "../feedback";
+import { rangeHours, rangeTitle } from "../range";
+import { useWidgetRange } from "../widgetChrome";
+import { WidgetHeader } from "../WidgetHeader";
+import { WidgetRangePicker } from "../WidgetRangePicker";
+import { formatLocale } from "@/lib/appLocale";
+import { formatDecimal } from "@/lib/numberFormat";
+import { useT } from "@/i18n";
+import { formatPercentLabel } from "../format";
+
+/**
+ * Coarse playback health for the chosen window.
+ *
+ * Deliberately four counts and one rate: time-to-first-frame and failed-start
+ * counts would belong here, but nothing records playback *start* events yet
+ * (admin_playback_history only gains a row when a session finalizes). Adding
+ * them means capturing start telemetry in internal/playback first — until then
+ * this widget shows what the server actually knows rather than an estimate
+ * reverse-engineered from logs. See docs/admin-api.md.
+ */
+export function PlaybackReliabilityWidget() {
+  const t = useT();
+  const { range } = useWidgetRange();
+  const query = useAdminPlaybackActivity(rangeHours(range));
+  const reliability = query.data?.reliability;
+
+  return (
+    <Card className="h-full">
+      <WidgetHeader
+        title={rangeTitle(t("web.admin.dashboard.widgets.playbackReliability.title"), range)}
+      >
+        <WidgetRangePicker />
+      </WidgetHeader>
+      <CardContent className="min-h-0 flex-1 overflow-y-auto">
+        {query.isLoading ? (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {Array.from({ length: 4 }).map((_, index) => (
+              <Skeleton key={index} className="h-16 rounded-lg" />
+            ))}
+          </div>
+        ) : query.error || !reliability ? (
+          <SectionError message={t("web.admin.dashboard.widgets.playbackReliability.loadFailed")} />
+        ) : (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <MiniStat
+              label={t("web.admin.dashboard.widgets.playbackReliability.started")}
+              value={reliability.sessions_started.toLocaleString(formatLocale())}
+            />
+            <MiniStat
+              label={t("web.admin.dashboard.widgets.playbackReliability.transcodeStarts")}
+              value={reliability.transcode_starts.toLocaleString(formatLocale())}
+            />
+            <MiniStat
+              label={t("web.admin.dashboard.widgets.playbackReliability.completed")}
+              value={formatCompletionRate(
+                reliability.completion_rate,
+                reliability.finalized_sessions,
+              )}
+              detail={
+                reliability.finalized_sessions > 0
+                  ? t("web.admin.dashboard.widgets.playbackReliability.completedDetail", {
+                      completed: reliability.completed_sessions.toLocaleString(formatLocale()),
+                      finished: reliability.finalized_sessions.toLocaleString(formatLocale()),
+                    })
+                  : t("web.admin.dashboard.widgets.playbackReliability.noFinished")
+              }
+            />
+            <MiniStat
+              label={t("web.admin.dashboard.widgets.playbackReliability.profiles")}
+              value={reliability.unique_profiles.toLocaleString(formatLocale())}
+            />
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function MiniStat({ label, value, detail }: { label: string; value: string; detail?: ReactNode }) {
+  return (
+    <div className="bg-surface border-border rounded-lg border p-3">
+      <div className="text-[20px] leading-none font-extrabold tracking-tight tabular-nums">
+        {value}
+      </div>
+      <div className="text-muted-foreground mt-1.5 text-[11px] font-medium">{label}</div>
+      {detail ? <div className="text-muted-foreground mt-0.5 text-[10px]">{detail}</div> : null}
+    </div>
+  );
+}
+
+/**
+ * Completion is measured over finalized sessions only — sessions still playing
+ * have not had the chance to finish, so counting them would drag the rate down
+ * simply because someone is watching right now.
+ */
+function formatCompletionRate(rate: number, finalizedSessions: number): string {
+  if (finalizedSessions <= 0 || !Number.isFinite(rate)) {
+    return "—";
+  }
+  return formatPercentLabel(formatDecimal(Math.min(Math.max(rate, 0), 1) * 100, 0));
+}

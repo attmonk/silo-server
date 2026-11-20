@@ -1,0 +1,414 @@
+package userdb
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// Profile is an alias for the canonical type in userstore.
+type Profile = userstore.Profile
+
+// UpdateProfileInput is an alias for the canonical type in userstore.
+type UpdateProfileInput = userstore.UpdateProfileInput
+
+// CreateProfile inserts a new profile into the profiles table.
+// The Profile.ID field must be set before calling this function; if empty,
+// a new UUID is generated. CreatedAt and UpdatedAt are set to the current
+// UTC time if not already populated.
+func CreateProfile(db *sql.DB, p Profile) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning transaction for profile insert %s: %w", p.ID, err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := createProfile(tx, p); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func createProfile(exec preferenceSettingsExecutor, p Profile) error {
+	if p.ID == "" {
+		p.ID = generateUUID()
+	}
+	now := nowUTC()
+	if p.CreatedAt == "" {
+		p.CreatedAt = now
+	}
+	if p.UpdatedAt == "" {
+		p.UpdatedAt = now
+	}
+	if !p.ShowForcedSubtitles {
+		p.ShowForcedSubtitles = true
+	}
+
+	// The first profile in this per-user database is the primary.
+	var hasExisting bool
+	if err := exec.QueryRow("SELECT EXISTS(SELECT 1 FROM profiles)").Scan(&hasExisting); err != nil {
+		return fmt.Errorf("checking existing profiles for %s: %w", p.ID, err)
+	}
+	if !hasExisting {
+		p.IsPrimary = true
+	} else {
+		p.IsPrimary = false
+	}
+
+	_, err := exec.Exec(`
+		INSERT INTO profiles (
+			id, name, avatar, pin_hash, is_child, is_primary, max_content_rating, max_advisory_age,
+			require_advisory_age, requests_blocked,
+			quality_preference, language, subtitle_language, subtitle_mode,
+			auto_skip_intro, auto_skip_credits, auto_skip_recap, auto_play_next_preview,
+			show_forced_subtitles,
+			library_restrictions_enabled, max_playback_quality, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, 0), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Name, p.Avatar, p.PINHash, p.IsChild, p.IsPrimary, p.MaxContentRating, p.MaxAdvisoryAge,
+		p.RequireAdvisoryAge, p.RequestsBlocked,
+		p.QualityPreference, p.Language, p.SubtitleLanguage, p.SubtitleMode,
+		p.AutoSkipIntro, p.AutoSkipCredits, p.AutoSkipRecap, p.AutoPlayNextPreview,
+		p.ShowForcedSubtitles, p.LibraryRestrictionsEnabled,
+		p.MaxPlaybackQuality, p.CreatedAt, p.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("inserting profile %s: %w", p.ID, err)
+	}
+	if err := replaceProfileAllowedLibrariesTx(exec, p.ID, p.AllowedLibraryIDs); err != nil {
+		return err
+	}
+	return nil
+}
+
+// GetProfile retrieves a single profile by ID. Returns nil and no error if
+// the profile does not exist.
+func GetProfile(db *sql.DB, id string) (*Profile, error) {
+	var p Profile
+	err := db.QueryRow(`
+		SELECT id, name, avatar, pin_hash, is_child, is_primary, max_content_rating, COALESCE(max_advisory_age, 0),
+		       require_advisory_age, requests_blocked,
+		       quality_preference, language, subtitle_language, subtitle_mode,
+		       auto_skip_intro, auto_skip_credits, auto_skip_recap, auto_play_next_preview, show_forced_subtitles,
+		       library_restrictions_enabled, max_playback_quality, pin_revision, created_at, updated_at
+		FROM profiles WHERE id = ?`, id,
+	).Scan(
+		&p.ID, &p.Name, &p.Avatar, &p.PINHash, &p.IsChild, &p.IsPrimary, &p.MaxContentRating, &p.MaxAdvisoryAge,
+		&p.RequireAdvisoryAge, &p.RequestsBlocked,
+		&p.QualityPreference, &p.Language, &p.SubtitleLanguage, &p.SubtitleMode,
+		&p.AutoSkipIntro, &p.AutoSkipCredits, &p.AutoSkipRecap, &p.AutoPlayNextPreview, &p.ShowForcedSubtitles,
+		&p.LibraryRestrictionsEnabled, &p.MaxPlaybackQuality, &p.PINRevision, &p.CreatedAt, &p.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying profile %s: %w", id, err)
+	}
+	p.AllowedLibraryIDs, err = listProfileAllowedLibraries(db, id)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// ListProfiles returns all profiles ordered by creation time.
+func ListProfiles(db *sql.DB) ([]Profile, error) {
+	rows, err := db.Query(`
+		SELECT id, name, avatar, pin_hash, is_child, is_primary, max_content_rating, COALESCE(max_advisory_age, 0),
+		       require_advisory_age, requests_blocked,
+		       quality_preference, language, subtitle_language, subtitle_mode,
+		       auto_skip_intro, auto_skip_credits, auto_skip_recap, auto_play_next_preview, show_forced_subtitles,
+		       library_restrictions_enabled, max_playback_quality, pin_revision, created_at, updated_at
+		FROM profiles ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("listing profiles: %w", err)
+	}
+	defer rows.Close()
+
+	var profiles []Profile
+	for rows.Next() {
+		var p Profile
+		if err := rows.Scan(
+			&p.ID, &p.Name, &p.Avatar, &p.PINHash, &p.IsChild, &p.IsPrimary, &p.MaxContentRating, &p.MaxAdvisoryAge,
+			&p.RequireAdvisoryAge, &p.RequestsBlocked,
+			&p.QualityPreference, &p.Language, &p.SubtitleLanguage, &p.SubtitleMode,
+			&p.AutoSkipIntro, &p.AutoSkipCredits, &p.AutoSkipRecap, &p.AutoPlayNextPreview, &p.ShowForcedSubtitles,
+			&p.LibraryRestrictionsEnabled, &p.MaxPlaybackQuality, &p.PINRevision, &p.CreatedAt, &p.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scanning profile row: %w", err)
+		}
+		profiles = append(profiles, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating profile rows: %w", err)
+	}
+	if err := attachAllowedLibraries(db, profiles); err != nil {
+		return nil, err
+	}
+	return profiles, nil
+}
+
+// UpdateProfile applies partial updates to a profile. Only non-nil fields
+// in the UpdateProfileInput are changed.
+func UpdateProfile(db *sql.DB, id string, u UpdateProfileInput) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning transaction for profile update %s: %w", id, err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if err := updateProfile(tx, id, u); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func updateProfile(exec preferenceSettingsExecutor, id string, u UpdateProfileInput) error {
+	var setClauses []string
+	var args []any
+
+	if u.Name != nil {
+		setClauses = append(setClauses, "name = ?")
+		args = append(args, *u.Name)
+	}
+	if u.Avatar != nil {
+		setClauses = append(setClauses, "avatar = ?")
+		args = append(args, *u.Avatar)
+	}
+	if u.PINHash != nil {
+		setClauses = append(setClauses, "pin_hash = ?")
+		args = append(args, *u.PINHash)
+		// The profiles_pin_revision trigger advances pin_revision whenever
+		// pin_hash changes, which invalidates every token minted for the old
+		// PIN, and only this profile's.
+	}
+	if u.IsChild != nil {
+		setClauses = append(setClauses, "is_child = ?")
+		args = append(args, *u.IsChild)
+	}
+	if u.MaxContentRating != nil {
+		setClauses = append(setClauses, "max_content_rating = ?")
+		args = append(args, *u.MaxContentRating)
+	}
+	if u.MaxAdvisoryAge != nil {
+		// 0 clears the limit; the column stores "no limit" as NULL.
+		setClauses = append(setClauses, "max_advisory_age = NULLIF(?, 0)")
+		args = append(args, *u.MaxAdvisoryAge)
+	}
+	if u.RequireAdvisoryAge != nil {
+		setClauses = append(setClauses, "require_advisory_age = ?")
+		args = append(args, *u.RequireAdvisoryAge)
+	}
+	if u.RequestsBlocked != nil {
+		setClauses = append(setClauses, "requests_blocked = ?")
+		args = append(args, *u.RequestsBlocked)
+	}
+	if u.QualityPreference != nil {
+		setClauses = append(setClauses, "quality_preference = ?")
+		args = append(args, *u.QualityPreference)
+	}
+	if u.Language != nil {
+		setClauses = append(setClauses, "language = ?")
+		args = append(args, *u.Language)
+	}
+	if u.SubtitleLanguage != nil {
+		setClauses = append(setClauses, "subtitle_language = ?")
+		args = append(args, *u.SubtitleLanguage)
+	}
+	if u.SubtitleMode != nil {
+		setClauses = append(setClauses, "subtitle_mode = ?")
+		args = append(args, *u.SubtitleMode)
+	}
+	if u.AutoSkipIntro != nil {
+		setClauses = append(setClauses, "auto_skip_intro = ?")
+		args = append(args, *u.AutoSkipIntro)
+	}
+	if u.AutoSkipRecap != nil {
+		setClauses = append(setClauses, "auto_skip_recap = ?")
+		args = append(args, *u.AutoSkipRecap)
+	}
+	if u.AutoPlayNextPreview != nil {
+		setClauses = append(setClauses, "auto_play_next_preview = ?")
+		args = append(args, *u.AutoPlayNextPreview)
+	}
+	if u.AutoSkipCredits != nil {
+		setClauses = append(setClauses, "auto_skip_credits = ?")
+		args = append(args, *u.AutoSkipCredits)
+	}
+	if u.ShowForcedSubtitles != nil {
+		setClauses = append(setClauses, "show_forced_subtitles = ?")
+		args = append(args, *u.ShowForcedSubtitles)
+	}
+	if u.LibraryRestrictionsEnabled != nil {
+		setClauses = append(setClauses, "library_restrictions_enabled = ?")
+		args = append(args, *u.LibraryRestrictionsEnabled)
+	}
+	if u.MaxPlaybackQuality != nil {
+		setClauses = append(setClauses, "max_playback_quality = ?")
+		args = append(args, *u.MaxPlaybackQuality)
+	}
+
+	if len(setClauses) == 0 && u.AllowedLibraryIDs == nil {
+		return nil // nothing to update
+	}
+
+	var exists bool
+	if err := exec.QueryRow("SELECT EXISTS(SELECT 1 FROM profiles WHERE id = ?)", id).Scan(&exists); err != nil {
+		return fmt.Errorf("checking profile %s existence: %w", id, err)
+	}
+	if !exists {
+		return fmt.Errorf("profile %s not found", id)
+	}
+
+	if len(setClauses) > 0 {
+		// Always update the timestamp when profile attributes change.
+		setClauses = append(setClauses, "updated_at = ?")
+		args = append(args, nowUTC())
+
+		// WHERE clause.
+		args = append(args, id)
+
+		query := fmt.Sprintf("UPDATE profiles SET %s WHERE id = ?", strings.Join(setClauses, ", "))
+		result, err := exec.Exec(query, args...)
+		if err != nil {
+			return fmt.Errorf("updating profile %s: %w", id, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("checking rows affected for profile %s: %w", id, err)
+		}
+		if rows == 0 {
+			return fmt.Errorf("profile %s not found", id)
+		}
+	}
+
+	if u.AllowedLibraryIDs != nil {
+		if err := replaceProfileAllowedLibrariesTx(exec, id, *u.AllowedLibraryIDs); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// DeleteProfile removes a profile and every row of its own: lists, watch
+// progress and history, preferences, settings and personal collections
+// (plus their items), matching the Postgres store.
+func DeleteProfile(ctx context.Context, db *sql.DB, id string) ([]string, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("beginning transaction for profile delete: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Preferences belong to viewers, not creators, so deleting only this
+	// profile's rows below would leave other profiles' overrides pointing at
+	// personal collections that are about to be removed.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM collection_sort_preferences
+		WHERE collection_kind = 'user' AND collection_id IN (
+			SELECT id FROM personal_collections WHERE creator_profile_id = ?
+		)`, id); err != nil {
+		return nil, fmt.Errorf("deleting collection sort preferences for profile %s: %w", id, err)
+	}
+
+	// Delete personal_collection_items for collections owned by this profile.
+	_, err = tx.ExecContext(ctx, `
+		DELETE FROM personal_collection_items
+		WHERE collection_id IN (
+			SELECT id FROM personal_collections WHERE creator_profile_id = ?
+		)`, id)
+	if err != nil {
+		return nil, fmt.Errorf("deleting collection items for profile %s: %w", id, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM personal_collection_profiles
+		WHERE profile_id = ? OR collection_id IN (
+			SELECT id FROM personal_collections WHERE creator_profile_id = ?
+		)`, id, id); err != nil {
+		return nil, fmt.Errorf("deleting collection visibility for profile %s: %w", id, err)
+	}
+
+	// The profile's own collections, returned so the caller can remove their
+	// artwork once this commits.
+	collectionIDs, err := deleteProfileCollections(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cascade-delete related tables. This database declares no foreign keys, so
+	// user_setting_values is listed here; account-scope rows carry a NULL
+	// profile_id and are untouched, matching the Postgres backend.
+	cascadeTables := []string{
+		"favorites",
+		"watchlist",
+		"not_interested",
+		"watch_progress",
+		"watch_history",
+		"hidden_history_items",
+		"home_item_dismissals",
+		"collection_sort_preferences",
+		"profile_allowed_libraries",
+		sqliteAudioPreferencesTable,
+		sqliteSubtitlePreferencesTable,
+		"series_playback_preferences",
+		"library_playback_preferences",
+		"profile_onboarding",
+		"profile_section_overrides",
+		"user_devices",
+		"user_device_settings",
+		"user_setting_values",
+	}
+	for _, table := range cascadeTables {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE profile_id = ?", table), id); err != nil {
+			return nil, fmt.Errorf("deleting from %s for profile %s: %w", table, id, err)
+		}
+	}
+
+	// Jellyfin display preferences carry the profile in their key.
+	prefix := userstore.ProfileDisplayPrefsPrefix(id)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM jellycompat_displayprefs WHERE substr(prefs_id, 1, length(?)) = ?`, prefix, prefix); err != nil {
+		return nil, fmt.Errorf("deleting display preferences for profile %s: %w", id, err)
+	}
+
+	// Delete the profile itself.
+	result, err := tx.ExecContext(ctx, "DELETE FROM profiles WHERE id = ?", id)
+	if err != nil {
+		return nil, fmt.Errorf("deleting profile %s: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("checking rows affected for profile %s: %w", id, err)
+	}
+	if rows == 0 {
+		return nil, fmt.Errorf("profile %s not found", id)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return collectionIDs, nil
+}
+
+func deleteProfileCollections(ctx context.Context, tx *sql.Tx, profileID string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `DELETE FROM personal_collections WHERE creator_profile_id = ? RETURNING id`, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("deleting collections for profile %s: %w", profileID, err)
+	}
+	defer rows.Close() //nolint:errcheck // rows.Err reports the failure
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("deleting collections for profile %s: %w", profileID, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("deleting collections for profile %s: %w", profileID, err)
+	}
+	return ids, nil
+}

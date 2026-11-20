@@ -1,0 +1,484 @@
+// Package mediaprobe owns the FFprobe representation and normalization shared
+// by catalog scans and execution-time media validation.
+package mediaprobe
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/fspath"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+// ErrPrimaryVideoNotFound reports that FFprobe completed successfully but did
+// not describe a playable primary video stream.
+var ErrPrimaryVideoNotFound = errors.New("primary video stream not found")
+
+// ScalarString accepts FFprobe fields emitted as either JSON strings or
+// numbers depending on codec and container details.
+type ScalarString string
+
+// UnmarshalJSON accepts either a quoted scalar or a numeric FFprobe value.
+func (s *ScalarString) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*s = ""
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		*s = ScalarString(str)
+		return nil
+	}
+	var num json.Number
+	if err := json.Unmarshal(data, &num); err == nil {
+		*s = ScalarString(num.String())
+		return nil
+	}
+	return fmt.Errorf("unsupported ffprobe scalar %s", string(data))
+}
+
+// Stream is the FFprobe stream shape shared by full scans and live validation.
+// Refs is 0 from FFmpeg 8.1, which reports it only when reading frames;
+// FFmpeg 7 reported the decoder default of 1, not the real count.
+type Stream struct {
+	ID                 ScalarString      `json:"id"`
+	Index              int               `json:"index"`
+	CodecName          string            `json:"codec_name"`
+	CodecLongName      string            `json:"codec_long_name"`
+	CodecType          string            `json:"codec_type"`
+	Profile            string            `json:"profile"`
+	Level              int               `json:"level"`
+	Width              int               `json:"width"`
+	Height             int               `json:"height"`
+	DisplayAspectRatio string            `json:"display_aspect_ratio"`
+	FieldOrder         string            `json:"field_order"`
+	AvgFrameRate       string            `json:"avg_frame_rate"`
+	StartTime          string            `json:"start_time"`
+	Duration           string            `json:"duration"`
+	BitRate            string            `json:"bit_rate"`
+	ColorRange         string            `json:"color_range"`
+	ColorTransfer      string            `json:"color_transfer"`
+	ColorPrimaries     string            `json:"color_primaries"`
+	ColorSpace         string            `json:"color_space"`
+	PixFmt             string            `json:"pix_fmt"`
+	Refs               int               `json:"refs"`
+	BitsPerRawSample   ScalarString      `json:"bits_per_raw_sample"`
+	BitsPerSample      ScalarString      `json:"bits_per_sample"`
+	Channels           int               `json:"channels"`
+	ChannelLayout      string            `json:"channel_layout"`
+	SampleRate         string            `json:"sample_rate"`
+	Disposition        Disposition       `json:"disposition"`
+	Tags               map[string]string `json:"tags"`
+	SideDataList       []SideData        `json:"side_data_list"`
+	// FrameSideDataList holds side data read from the stream's first decoded
+	// frame. FFmpeg reports HDR10+ dynamic metadata only per frame, never in
+	// the stream's own side data, so a stream-only probe cannot see it.
+	FrameSideDataList []SideData `json:"-"`
+	// FrameSideDataRead reports that the first frame was read, so an empty
+	// FrameSideDataList means the frame carries no side data.
+	FrameSideDataRead bool `json:"-"`
+	// FrameColorRange is the range FFmpeg reported on that first frame.
+	FrameColorRange string `json:"-"`
+}
+
+// Disposition is the subset of FFprobe disposition flags used by scans.
+type Disposition struct {
+	Default     int `json:"default"`
+	Forced      int `json:"forced"`
+	AttachedPic int `json:"attached_pic"`
+}
+
+// SideData describes FFprobe metadata attached to a stream.
+type SideData struct {
+	SideDataType        string `json:"side_data_type"`
+	DVProfile           int    `json:"dv_profile"`
+	DVLevel             int    `json:"dv_level"`
+	DVBlPresent         int    `json:"bl_present_flag"`
+	DVElPresent         int    `json:"el_present_flag"`
+	DVRPUPresent        int    `json:"rpu_present_flag"`
+	DVBlPresentLegacy   int    `json:"dv_bl_present"`
+	DVElPresentLegacy   int    `json:"dv_el_present"`
+	DVRPUPresentLegacy  int    `json:"dv_rpu_present"`
+	DVBLCompatID        int    `json:"dv_bl_signal_compatibility_id"`
+	DVBLCompatIDPresent bool   `json:"-"`
+}
+
+// UnmarshalJSON preserves whether FFprobe emitted a Dolby Vision compatibility
+// identifier so an explicit zero is not confused with an omitted field.
+func (d *SideData) UnmarshalJSON(data []byte) error {
+	type alias SideData
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*d = SideData(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	_, d.DVBLCompatIDPresent = fields["dv_bl_signal_compatibility_id"]
+	return nil
+}
+
+// ProbePrimaryVideoTrack runs a metadata-only FFprobe and returns the first
+// playable video stream using the same normalization as a catalog scan.
+func ProbePrimaryVideoTrack(ctx context.Context, ffprobePath, filePath string) (models.VideoTrack, error) {
+	cmd := fspath.CommandContext(ctx, ffprobePath,
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_streams",
+		"-select_streams", "v",
+		filePath,
+	)
+	output, err := cmd.Output()
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return models.VideoTrack{}, contextErr
+		}
+		return models.VideoTrack{}, fmt.Errorf("ffprobe primary video failed for %s: %w", filePath, err)
+	}
+	var raw struct {
+		Streams []Stream `json:"streams"`
+	}
+	if err := json.Unmarshal(output, &raw); err != nil {
+		return models.VideoTrack{}, fmt.Errorf("ffprobe primary video JSON parse failed for %s: %w", filePath, err)
+	}
+	for _, stream := range raw.Streams {
+		if IsPrimaryVideoStream(stream) {
+			return NormalizeVideoTrack(stream), nil
+		}
+	}
+	return models.VideoTrack{}, ErrPrimaryVideoNotFound
+}
+
+// FFprobePathFromFFmpeg derives a sibling FFprobe executable from FFmpeg's
+// configured path, including platform-specific executable suffixes.
+func FFprobePathFromFFmpeg(ffmpegPath string) string {
+	ffmpegPath = strings.TrimSpace(ffmpegPath)
+	if ffmpegPath == "" {
+		return "ffprobe"
+	}
+	base := filepath.Base(ffmpegPath)
+	if i := strings.LastIndex(strings.ToLower(base), "ffmpeg"); i >= 0 {
+		return filepath.Join(filepath.Dir(ffmpegPath), base[:i]+"ffprobe"+base[i+len("ffmpeg"):])
+	}
+	return "ffprobe"
+}
+
+// IsPrimaryVideoStream excludes attached cover art from playable video facts.
+func IsPrimaryVideoStream(stream Stream) bool {
+	return stream.CodecType == "video" && stream.Disposition.AttachedPic == 0
+}
+
+// NeedsFrameSideData reports whether a stream's HDR10+ status depends on
+// frame side data. HDR10+ is defined only for PQ video, so other streams skip
+// the frame decode.
+func NeedsFrameSideData(stream Stream) bool {
+	return IsPrimaryVideoStream(stream) && IsPQTransfer(stream.ColorTransfer)
+}
+
+// IsPQTransfer reports whether colorTransfer is SMPTE ST 2084 (PQ).
+func IsPQTransfer(colorTransfer string) bool {
+	return strings.Contains(strings.ToLower(colorTransfer), "smpte2084")
+}
+
+// NormalizeVideoTrack converts FFprobe's raw video facts into the catalog's
+// authoritative normalized representation.
+func NormalizeVideoTrack(stream Stream) models.VideoTrack {
+	dvConfig, dvConfigPresent := dolbyVisionConfigRecord(stream.SideDataList)
+	dvProfile := positive(dvConfig.DVProfile)
+	dvLevel := positive(dvConfig.DVLevel)
+	dvELPresent := dvConfig.DVElPresent > 0 || dvConfig.DVElPresentLegacy > 0
+	colorRange := firstNonEmpty(stream.ColorRange, "unknown")
+	hdr10Plus := hasHDR10Plus(stream.SideDataList) || hasHDR10Plus(stream.FrameSideDataList)
+	return models.VideoTrack{
+		Title:               firstNonEmpty(stream.Tags["title"], stream.CodecLongName, strings.ToUpper(stream.CodecName)),
+		Codec:               stream.CodecName,
+		DolbyVision:         dolbyVisionProfile(dvProfile),
+		DVProfile:           dvProfile,
+		DVLevel:             dvLevel,
+		DVBLCompatID:        dvConfig.DVBLCompatID,
+		DVConfigPresent:     dvConfigPresent,
+		DVBLCompatIDPresent: dvConfigPresent && (dvConfig.DVBLCompatIDPresent || dvConfig.DVBLCompatID != 0),
+		DVBLPresent:         dvConfig.DVBlPresent > 0 || dvConfig.DVBlPresentLegacy > 0,
+		DVRPUPresent:        dvConfig.DVRPUPresent > 0 || dvConfig.DVRPUPresentLegacy > 0,
+		DVELPresent:         dvELPresent,
+		DVEnhancementLayer:  enhancementLayer(dvELPresent),
+		HDR10Plus:           hdr10Plus,
+		HDR10PlusUnchecked:  !hdr10Plus && NeedsFrameSideData(stream) && !stream.FrameSideDataRead,
+		Profile:             stream.Profile,
+		Level:               stream.Level,
+		Width:               stream.Width,
+		Height:              stream.Height,
+		AspectRatio:         stream.DisplayAspectRatio,
+		Interlaced:          isInterlaced(stream.FieldOrder),
+		FrameRate:           normalizeFrameRate(stream.AvgFrameRate),
+		Bitrate:             parseNumeric(stream.BitRate) / 1000,
+		VideoRange:          videoRangeLabel(stream, dvProfile),
+		VideoRangeType:      videoRangeType(stream, dvProfile, dvConfig.DVBLCompatID, hdr10Plus),
+		ColorRange:          colorRange,
+		FrameColorRange:     frameColorRange(stream),
+		ColorPrimaries:      stream.ColorPrimaries,
+		ColorSpace:          stream.ColorSpace,
+		ColorTransfer:       stream.ColorTransfer,
+		BitDepth:            models.NormalizeVideoBitDepth(parseBitDepth(stream), stream.PixFmt, stream.Profile),
+		PixelFormat:         stream.PixFmt,
+		ReferenceFrames:     stream.Refs,
+	}
+}
+
+// frameColorRange returns the stored form of the first decoded frame's range,
+// or "" when the frame was not read.
+func frameColorRange(stream Stream) string {
+	if !stream.FrameSideDataRead {
+		return ""
+	}
+	return RecordedFrameColorRange(stream.FrameColorRange)
+}
+
+// RecordedFrameColorRange is the value stored for a first frame that FFmpeg
+// reported range as: the range itself, or "unknown" when it reported none, so
+// a read frame is never mistaken for one not read.
+func RecordedFrameColorRange(reported string) string {
+	return firstNonEmpty(strings.TrimSpace(reported), "unknown")
+}
+
+func dolbyVisionConfigRecord(sideData []SideData) (SideData, bool) {
+	for _, data := range sideData {
+		if strings.EqualFold(data.SideDataType, "DOVI configuration record") {
+			return data, true
+		}
+	}
+	return SideData{}, false
+}
+
+func positive(value int) int {
+	if value > 0 {
+		return value
+	}
+	return 0
+}
+
+func dolbyVisionProfile(profile int) string {
+	if profile > 0 {
+		return fmt.Sprintf("Profile %d", profile)
+	}
+	return ""
+}
+
+func enhancementLayer(present bool) string {
+	if present {
+		return "unknown"
+	}
+	return "none"
+}
+
+// HasHDR10Plus reports whether side data, from a stream or a decoded frame,
+// carries HDR10+ dynamic metadata.
+func HasHDR10Plus(sideData []SideData) bool {
+	return hasHDR10Plus(sideData)
+}
+
+// Dolby Vision range types whose base layer also carries HDR10+ metadata.
+const (
+	rangeTypeDOVIWithHDR10Plus   = "DOVIWithHDR10Plus"
+	rangeTypeDOVIWithELHDR10Plus = "DOVIWithELHDR10Plus"
+)
+
+// RangeTypeWithHDR10Plus returns the video range type of a stored track
+// whose primary stream has been found to carry HDR10+ metadata. A track that
+// names Dolby Vision only in its range type, as older probes and seeded rows
+// can, keeps it.
+func RangeTypeWithHDR10Plus(track models.VideoTrack) string {
+	if track.DVProfile <= 0 {
+		switch rangeType := strings.TrimSpace(track.VideoRangeType); {
+		case strings.EqualFold(rangeType, "DOVIWithHDR10"), strings.EqualFold(rangeType, rangeTypeDOVIWithHDR10Plus):
+			return rangeTypeDOVIWithHDR10Plus
+		case strings.EqualFold(rangeType, "DOVIWithEL"), strings.EqualFold(rangeType, rangeTypeDOVIWithELHDR10Plus):
+			return rangeTypeDOVIWithELHDR10Plus
+		case strings.HasPrefix(strings.ToLower(rangeType), "dovi"):
+			return rangeType
+		}
+	}
+	return videoRangeType(Stream{ColorTransfer: track.ColorTransfer}, track.DVProfile, track.DVBLCompatID, true)
+}
+
+func hasHDR10Plus(sideData []SideData) bool {
+	for _, data := range sideData {
+		typ := strings.ToLower(data.SideDataType)
+		if strings.Contains(typ, "hdr10+") || strings.Contains(typ, "smpte2094-40") {
+			return true
+		}
+	}
+	return false
+}
+
+func videoRangeLabel(stream Stream, dvProfile int) string {
+	if dvProfile > 0 {
+		return "DolbyVision"
+	}
+	if isHDR(stream.ColorTransfer) {
+		return "HDR"
+	}
+	return ""
+}
+
+func videoRangeType(stream Stream, dvProfile, compatID int, hdr10Plus bool) string {
+	if dvProfile > 0 {
+		switch dvProfile {
+		case 5:
+			return "DOVI"
+		case 7:
+			if hdr10Plus {
+				return rangeTypeDOVIWithELHDR10Plus
+			}
+			return "DOVIWithEL"
+		case 8:
+			if hdr10Plus {
+				return rangeTypeDOVIWithHDR10Plus
+			}
+			switch compatID {
+			case 1:
+				return "DOVIWithHDR10"
+			case 2:
+				return "DOVIWithSDR"
+			case 4:
+				return "DOVIWithHLG"
+			default:
+				if isHLG(stream.ColorTransfer) {
+					return "DOVIWithHLG"
+				}
+				if isHDR(stream.ColorTransfer) {
+					return "DOVIWithHDR10"
+				}
+				return "DOVIWithSDR"
+			}
+		default:
+			return "DOVI"
+		}
+	}
+	if hdr10Plus {
+		return "HDR10Plus"
+	}
+	if isHLG(stream.ColorTransfer) {
+		return "HLG"
+	}
+	if isHDR(stream.ColorTransfer) {
+		return "HDR10"
+	}
+	return "SDR"
+}
+
+func parseBitDepth(stream Stream) int {
+	if value := parseNumeric(string(stream.BitsPerRawSample)); value > 0 {
+		return value
+	}
+	return parseNumeric(string(stream.BitsPerSample))
+}
+
+// Matroska statistics tags that mkvmerge writes with a track's measured
+// bitrate in bits per second; older muxers write the language-suffixed form.
+const (
+	matroskaBPSTag    = "BPS"
+	matroskaBPSEngTag = "BPS-eng"
+)
+
+// StreamBitrateKbps returns a stream's bitrate in kbps, or 0 when unknown.
+// Matroska has no per-stream bitrate field, so ffprobe reports bit_rate as
+// N/A there unless the codec header states one (AC-3, E-AC-3 and DTS do;
+// AAC, FLAC, Opus and TrueHD do not). mkvmerge writes the measured rate as a
+// BPS statistics tag (BPS-eng in older muxers), which is the fallback. The
+// tag order matches Jellyfin's ProbeResultNormalizer.
+func StreamBitrateKbps(stream Stream) int {
+	if kbps := bitrateKbps(stream.BitRate); kbps > 0 {
+		return kbps
+	}
+	for _, key := range []string{matroskaBPSEngTag, matroskaBPSTag} {
+		for tag, value := range stream.Tags {
+			if strings.EqualFold(tag, key) {
+				if kbps := bitrateKbps(value); kbps > 0 {
+					return kbps
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// maxStreamBitrateKbps (10 Gb/s) is far above any real audio stream or
+// compressed video. A larger value is a corrupt tag, and storing it would fail
+// every client bitrate limit and overflow clients' 32-bit bitrate fields.
+const maxStreamBitrateKbps = 10_000_000
+
+// bitrateKbps converts a bits-per-second string to kbps, or 0 when it is
+// unparseable or out of range.
+func bitrateKbps(raw string) int {
+	bps, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0
+	}
+	if kbps := bps / 1000; kbps > 0 && kbps <= maxStreamBitrateKbps {
+		return kbps
+	}
+	return 0
+}
+
+func parseNumeric(raw string) int {
+	value, _ := strconv.Atoi(raw)
+	return value
+}
+
+func normalizeFrameRate(raw string) string {
+	if raw == "" || raw == "0/0" {
+		return ""
+	}
+	if !strings.Contains(raw, "/") {
+		return raw
+	}
+	parts := strings.SplitN(strings.TrimSpace(raw), "/", 2)
+	if len(parts) != 2 {
+		return raw
+	}
+	numerator, errNumerator := strconv.ParseFloat(parts[0], 64)
+	denominator, errDenominator := strconv.ParseFloat(parts[1], 64)
+	if errNumerator != nil || errDenominator != nil || denominator == 0 {
+		return raw
+	}
+	fps := numerator / denominator
+	if fps == 0 {
+		return raw
+	}
+	return strconv.FormatFloat(fps, 'f', 3, 64)
+}
+
+func isInterlaced(fieldOrder string) bool {
+	switch strings.ToLower(fieldOrder) {
+	case "tt", "bb", "tb", "bt":
+		return true
+	default:
+		return false
+	}
+}
+
+func isHDR(colorTransfer string) bool {
+	value := strings.ToLower(colorTransfer)
+	return strings.Contains(value, "smpte2084") || strings.Contains(value, "arib-std-b67")
+}
+
+func isHLG(colorTransfer string) bool {
+	return strings.Contains(strings.ToLower(colorTransfer), "arib-std-b67")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}

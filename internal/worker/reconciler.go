@@ -1,0 +1,742 @@
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/cache"
+	evt "github.com/Silo-Server/silo-server/internal/events"
+)
+
+// SessionSync represents the data needed to sync a playback session to the
+// playback_sessions_sync table in PostgreSQL.
+type SessionSync struct {
+	SessionID            string
+	UserID               int
+	ProfileID            string
+	MediaFileID          int
+	RequestedMediaFileID int
+	PlayMethod           string // current live transport method for admin session views
+	ReportingNode        string
+	ClientIP             string
+	StreamLocation       string
+	ClientName           string
+	ClientVersion        string
+	ClientBuild          string
+	ClientChannel        string
+	ClientUserAgent      string
+	DeviceID             string
+	DevicePlatform       string
+	AudioTrackIndex      int
+	TranscodeAudio       bool
+	StreamBitrateKbps    int
+	TranscodeNodeURL     string
+	TargetResolution     string
+	TargetVideoCodec     string
+	OutputContainer      string
+	OutputProtocol       string
+	TargetAudioCodec     string
+	// TargetAudioChannels is the encoded output channel count when audio is
+	// re-encoded; 0 means the node did not report one. Admin views must not
+	// substitute the source count for it.
+	TargetAudioChannels int
+	TargetBitrateKbps   int
+	TranscodeHWAccel    string
+	ToneMapMode         string
+	// AdaptationReasons says why the route changes the file
+	// (playback.AdaptationReasons); empty for direct play.
+	AdaptationReasons       []string
+	RoutingNetworkProvider  *string
+	RoutingWorkload         string
+	RoutingExecution        string
+	RoutingExecutionNodeID  int
+	RoutingExecutionNodeURL string
+	RoutingEgress           string
+	RoutingEgressNodeID     int
+	RoutingEgressNodeURL    string
+	StartedAt               time.Time
+	UpdatedAt               time.Time
+	PositionSeconds         float64
+	// TimelineDurationSeconds is the length of the timeline PositionSeconds
+	// is measured on when that is more than the session's file, such as a
+	// whole multi-file audiobook; zero means the file's own duration.
+	TimelineDurationSeconds float64
+	IsPaused                bool
+	HasWebSocket            bool
+	IsJellyfinCompat        bool
+}
+
+// AggregateData represents the aggregate counts for a single user that are
+// synced to the user_aggregates table in PostgreSQL.
+type AggregateData struct {
+	TotalWatched   int
+	FavoritesCount int
+	WatchlistCount int
+	ActiveNode     string
+}
+
+// SessionSyncProvider returns the current set of active sessions to reconcile.
+// This is typically a closure that reads from the SessionManager.
+type SessionSyncProvider func() []SessionSync
+
+// PreSyncHook is called before each reconciliation cycle. Implementations
+// can use it to expire idle sessions from the in-memory manager so they are
+// no longer included in the snapshot sent to the database.
+type PreSyncHook func()
+
+// Reconciler performs background reconciliation of user data from per-user
+// SQLite databases into the central PostgreSQL instance.
+type Reconciler struct {
+	pool            *pgxpool.Pool
+	nodeName        string
+	sessionProvider SessionSyncProvider
+	interval        time.Duration
+	stop            chan struct{}
+	EventBus        cache.EventBus
+	EventsHub       *evt.Hub
+	PreSync         PreSyncHook
+	// syncMu guards syncRunning/syncPending. Session syncs are coalesced onto a
+	// single owner so concurrent callers (the periodic tick plus request-path
+	// start/stop triggers) can never commit an older session snapshot after a
+	// newer one — which would resurrect stopped sessions or drop freshly
+	// started ones — and so request goroutines never queue behind a slow sync.
+	syncMu      sync.Mutex
+	syncRunning bool
+	syncPending bool
+}
+
+// NewReconciler creates a new Reconciler with sensible defaults. The default
+// reconciliation interval is 30 seconds. The sessionProvider may be nil if
+// session sync is not needed (e.g. in tests).
+func NewReconciler(pool *pgxpool.Pool, nodeName string, sp SessionSyncProvider) *Reconciler {
+	return &Reconciler{
+		pool:            pool,
+		nodeName:        strings.TrimSpace(nodeName),
+		sessionProvider: sp,
+		interval:        15 * time.Second,
+		stop:            make(chan struct{}),
+	}
+}
+
+// ReconcileSessions upserts the given sessions into the playback_sessions_sync
+// table. Each session is inserted or updated based on its session_id primary
+// key, making the operation idempotent.
+func (r *Reconciler) ReconcileSessions(ctx context.Context, sessions []SessionSync) error {
+	if len(sessions) == 0 {
+		return nil
+	}
+
+	grouped := make(map[string][]SessionSync)
+	for _, session := range sessions {
+		grouped[session.ReportingNode] = append(grouped[session.ReportingNode], session)
+	}
+
+	for reportingNode, nodeSessions := range grouped {
+		if err := r.ReconcileNodeSessions(ctx, reportingNode, nodeSessions); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ReconcileNodeSessions upserts the sessions currently active on one reporting
+// node, then removes any stale rows for that same node that are no longer
+// present in the provided snapshot.
+func (r *Reconciler) ReconcileNodeSessions(ctx context.Context, reportingNode string, sessions []SessionSync) error {
+	reportingNode = strings.TrimSpace(reportingNode)
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Workers may still report playback for a deleted account. Keep those stale
+	// rows out of the snapshot and hold the remaining accounts until commit so
+	// concurrent deletion cannot invalidate the new user FK mid-reconciliation.
+	userIDs := make([]int, 0, len(sessions))
+	for _, session := range sessions {
+		userIDs = append(userIDs, session.UserID)
+	}
+	rows, err := tx.Query(ctx, `SELECT id FROM users WHERE id = ANY($1) ORDER BY id FOR KEY SHARE`, userIDs)
+	if err != nil {
+		return fmt.Errorf("locking snapshot accounts: %w", err)
+	}
+	existingIDs, err := pgx.CollectRows(rows, pgx.RowTo[int])
+	if err != nil {
+		return fmt.Errorf("reading snapshot accounts: %w", err)
+	}
+	existing := make(map[int]bool, len(existingIDs))
+	for _, id := range existingIDs {
+		existing[id] = true
+	}
+	liveSessions := make([]SessionSync, 0, len(sessions))
+	for _, session := range sessions {
+		if existing[session.UserID] {
+			liveSessions = append(liveSessions, session)
+		}
+	}
+	sessions = liveSessions
+
+	currentSessions, err := loadNodeSessionsSnapshot(ctx, tx, reportingNode)
+	if err != nil {
+		return fmt.Errorf("loading existing sessions for node %s: %w", reportingNode, err)
+	}
+	normalizedIncoming := normalizeSessionSyncs(reportingNode, sessions)
+	changed := !sessionSnapshotsEqual(currentSessions, normalizedIncoming)
+
+	sessionIDs := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		sessionIDs = append(sessionIDs, s.SessionID)
+		sessionNode := strings.TrimSpace(s.ReportingNode)
+		if sessionNode == "" {
+			sessionNode = reportingNode
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO playback_sessions_sync
+				(session_id, user_id, profile_id, media_file_id, requested_media_file_id, play_method,
+				 reporting_node, started_at, updated_at, last_sync_at, client_ip,
+				 client_name, client_version, client_build, client_channel, client_user_agent,
+				 audio_track_index, transcode_audio, stream_bitrate_kbps, transcode_node_url,
+				 target_resolution, target_video_codec, target_audio_codec, target_audio_channels,
+				 target_bitrate_kbps,
+				 transcode_hw_accel, tone_map_mode,
+				 routing_workload, routing_execution, routing_execution_node_id, routing_execution_node_url,
+				 routing_egress, routing_egress_node_id, routing_egress_node_url,
+				 position_seconds, is_paused, has_websocket, compat_origin, routing_network_provider,
+				 output_container, output_protocol, stream_location, device_id, device_platform, timeline_duration_seconds,
+				 adaptation_reasons)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10::inet, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45)
+			ON CONFLICT (session_id) DO UPDATE SET
+				user_id             = EXCLUDED.user_id,
+				profile_id          = EXCLUDED.profile_id,
+				media_file_id       = EXCLUDED.media_file_id,
+				requested_media_file_id = EXCLUDED.requested_media_file_id,
+				play_method         = EXCLUDED.play_method,
+				reporting_node      = EXCLUDED.reporting_node,
+				started_at          = EXCLUDED.started_at,
+				updated_at          = EXCLUDED.updated_at,
+				client_ip           = EXCLUDED.client_ip,
+				client_name         = EXCLUDED.client_name,
+				client_version      = EXCLUDED.client_version,
+				client_build        = EXCLUDED.client_build,
+				client_channel      = EXCLUDED.client_channel,
+				client_user_agent   = EXCLUDED.client_user_agent,
+				audio_track_index   = EXCLUDED.audio_track_index,
+				transcode_audio     = EXCLUDED.transcode_audio,
+				stream_bitrate_kbps = EXCLUDED.stream_bitrate_kbps,
+				transcode_node_url  = EXCLUDED.transcode_node_url,
+				target_resolution   = EXCLUDED.target_resolution,
+				target_video_codec  = EXCLUDED.target_video_codec,
+				target_audio_codec  = EXCLUDED.target_audio_codec,
+				target_audio_channels = EXCLUDED.target_audio_channels,
+				target_bitrate_kbps = EXCLUDED.target_bitrate_kbps,
+				transcode_hw_accel  = EXCLUDED.transcode_hw_accel,
+				tone_map_mode       = EXCLUDED.tone_map_mode,
+				routing_workload    = EXCLUDED.routing_workload,
+				routing_execution   = EXCLUDED.routing_execution,
+				routing_execution_node_id = EXCLUDED.routing_execution_node_id,
+				routing_execution_node_url = EXCLUDED.routing_execution_node_url,
+				routing_egress      = EXCLUDED.routing_egress,
+				routing_egress_node_id = EXCLUDED.routing_egress_node_id,
+				routing_egress_node_url = EXCLUDED.routing_egress_node_url,
+				position_seconds    = EXCLUDED.position_seconds,
+				is_paused           = EXCLUDED.is_paused,
+				has_websocket       = EXCLUDED.has_websocket,
+				compat_origin       = EXCLUDED.compat_origin,
+				routing_network_provider = EXCLUDED.routing_network_provider,
+				output_container    = EXCLUDED.output_container,
+				output_protocol     = EXCLUDED.output_protocol,
+				stream_location     = EXCLUDED.stream_location,
+				device_id           = EXCLUDED.device_id,
+				device_platform     = EXCLUDED.device_platform,
+				timeline_duration_seconds = EXCLUDED.timeline_duration_seconds,
+				adaptation_reasons  = EXCLUDED.adaptation_reasons,
+				last_sync_at        = NOW()
+		`, sessionSyncValues(s, sessionNode)...)
+		if err != nil {
+			return fmt.Errorf("upserting session %s: %w", s.SessionID, err)
+		}
+	}
+
+	if len(sessionIDs) == 0 {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM playback_sessions_sync
+			WHERE COALESCE(reporting_node, '') = $1
+		`, reportingNode); err != nil {
+			return fmt.Errorf("deleting empty snapshot for node %s: %w", reportingNode, err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM playback_sessions_sync
+			WHERE COALESCE(reporting_node, '') = $1
+			  AND NOT (session_id = ANY($2))
+		`, reportingNode, sessionIDs); err != nil {
+			return fmt.Errorf("deleting missing sessions for node %s: %w", reportingNode, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing transaction: %w", err)
+	}
+	// The two publishes serve different consumers and are not alternatives:
+	// the events hub pushes "sessions.replaced" to connected admin clients,
+	// while the cache bus invalidates the playback-derived admin aggregates
+	// (stats, activity, leaderboards, timeseries) across nodes. Gating the bus
+	// behind the hub's absence left those caches TTL-only in the normal
+	// configuration, where both are wired.
+	if changed && r.EventsHub != nil {
+		if err := r.EventsHub.PublishJSON(
+			ctx,
+			evt.ChannelSessions,
+			"sessions.replaced",
+			nil,
+			evt.PublishOptions{AdminOnly: true},
+		); err != nil {
+			log.Printf("reconciler: failed to publish session event for node %s: %v", reportingNode, err)
+		}
+	}
+	if changed && r.EventBus != nil {
+		if err := r.EventBus.Publish(ctx, cache.ChannelPlayback, cache.Event{
+			Type:    cache.EventPlaybackSessionsChanged,
+			Payload: reportingNode,
+		}); err != nil {
+			log.Printf("reconciler: failed to publish playback invalidation event for node %s: %v", reportingNode, err)
+		}
+	}
+
+	return nil
+}
+
+// loadNodeSessionsSnapshot loads the normalized live-session view for one node.
+func loadNodeSessionsSnapshot(ctx context.Context, tx pgx.Tx, reportingNode string) ([]SessionSync, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT
+			session_id,
+			user_id,
+			COALESCE(profile_id, ''),
+			media_file_id,
+			COALESCE(requested_media_file_id, media_file_id, 0),
+			COALESCE(play_method, ''),
+			COALESCE(reporting_node, ''),
+			COALESCE(HOST(client_ip), ''),
+			COALESCE(client_name, ''),
+			COALESCE(client_version, ''),
+			COALESCE(client_build, ''),
+			COALESCE(client_channel, ''),
+			COALESCE(client_user_agent, ''),
+			COALESCE(audio_track_index, 0),
+			COALESCE(transcode_audio, FALSE),
+			COALESCE(stream_bitrate_kbps, 0),
+			COALESCE(transcode_node_url, ''),
+			COALESCE(target_resolution, ''),
+			COALESCE(target_video_codec, ''),
+			COALESCE(target_audio_codec, ''),
+			COALESCE(target_audio_channels, 0),
+			COALESCE(target_bitrate_kbps, 0),
+			COALESCE(transcode_hw_accel, ''),
+			COALESCE(tone_map_mode, ''),
+			COALESCE(routing_workload, ''),
+			COALESCE(routing_execution, ''),
+			COALESCE(routing_execution_node_id, 0),
+			COALESCE(routing_execution_node_url, ''),
+			COALESCE(routing_egress, ''),
+			COALESCE(routing_egress_node_id, 0),
+			COALESCE(routing_egress_node_url, ''),
+			started_at,
+			updated_at,
+			COALESCE(position_seconds, 0),
+			COALESCE(is_paused, FALSE),
+			COALESCE(has_websocket, FALSE),
+			COALESCE(compat_origin, FALSE),
+			routing_network_provider,
+			COALESCE(output_container, ''),
+			COALESCE(output_protocol, ''),
+			COALESCE(stream_location, ''),
+			COALESCE(device_id, ''),
+			COALESCE(device_platform, ''),
+			COALESCE(timeline_duration_seconds, 0),
+			COALESCE(adaptation_reasons, '{}')
+		FROM playback_sessions_sync
+		WHERE COALESCE(reporting_node, '') = $1
+		ORDER BY session_id
+	`, reportingNode)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []SessionSync
+	for rows.Next() {
+		var s SessionSync
+		if err := rows.Scan(
+			&s.SessionID,
+			&s.UserID,
+			&s.ProfileID,
+			&s.MediaFileID,
+			&s.RequestedMediaFileID,
+			&s.PlayMethod,
+			&s.ReportingNode,
+			&s.ClientIP,
+			&s.ClientName,
+			&s.ClientVersion,
+			&s.ClientBuild,
+			&s.ClientChannel,
+			&s.ClientUserAgent,
+			&s.AudioTrackIndex,
+			&s.TranscodeAudio,
+			&s.StreamBitrateKbps,
+			&s.TranscodeNodeURL,
+			&s.TargetResolution,
+			&s.TargetVideoCodec,
+			&s.TargetAudioCodec,
+			&s.TargetAudioChannels,
+			&s.TargetBitrateKbps,
+			&s.TranscodeHWAccel,
+			&s.ToneMapMode,
+			&s.RoutingWorkload,
+			&s.RoutingExecution,
+			&s.RoutingExecutionNodeID,
+			&s.RoutingExecutionNodeURL,
+			&s.RoutingEgress,
+			&s.RoutingEgressNodeID,
+			&s.RoutingEgressNodeURL,
+			&s.StartedAt,
+			&s.UpdatedAt,
+			&s.PositionSeconds,
+			&s.IsPaused,
+			&s.HasWebSocket,
+			&s.IsJellyfinCompat,
+			&s.RoutingNetworkProvider,
+			&s.OutputContainer,
+			&s.OutputProtocol,
+			&s.StreamLocation,
+			&s.DeviceID,
+			&s.DevicePlatform,
+			&s.TimelineDurationSeconds,
+			&s.AdaptationReasons,
+		); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return sessions, nil
+}
+
+func normalizeSessionSyncs(reportingNode string, sessions []SessionSync) []SessionSync {
+	normalized := make([]SessionSync, len(sessions))
+	for i, s := range sessions {
+		cp := s
+		if strings.TrimSpace(cp.ReportingNode) == "" {
+			cp.ReportingNode = reportingNode
+		}
+		normalized[i] = cp
+	}
+	sort.Slice(normalized, func(i, j int) bool {
+		return normalized[i].SessionID < normalized[j].SessionID
+	})
+	return normalized
+}
+
+// sessionSnapshotsEqual reports whether two normalized live-session views match.
+func sessionSnapshotsEqual(left, right []SessionSync) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].SessionID != right[i].SessionID ||
+			left[i].UserID != right[i].UserID ||
+			left[i].ProfileID != right[i].ProfileID ||
+			left[i].MediaFileID != right[i].MediaFileID ||
+			left[i].RequestedMediaFileID != right[i].RequestedMediaFileID ||
+			left[i].PlayMethod != right[i].PlayMethod ||
+			left[i].ReportingNode != right[i].ReportingNode ||
+			left[i].ClientIP != right[i].ClientIP ||
+			left[i].StreamLocation != right[i].StreamLocation ||
+			left[i].ClientName != right[i].ClientName ||
+			left[i].ClientVersion != right[i].ClientVersion ||
+			left[i].ClientBuild != right[i].ClientBuild ||
+			left[i].ClientChannel != right[i].ClientChannel ||
+			left[i].ClientUserAgent != right[i].ClientUserAgent ||
+			left[i].DeviceID != right[i].DeviceID ||
+			left[i].DevicePlatform != right[i].DevicePlatform ||
+			left[i].AudioTrackIndex != right[i].AudioTrackIndex ||
+			left[i].TranscodeAudio != right[i].TranscodeAudio ||
+			left[i].StreamBitrateKbps != right[i].StreamBitrateKbps ||
+			left[i].TranscodeNodeURL != right[i].TranscodeNodeURL ||
+			left[i].TargetResolution != right[i].TargetResolution ||
+			left[i].TargetVideoCodec != right[i].TargetVideoCodec ||
+			left[i].OutputContainer != right[i].OutputContainer ||
+			left[i].OutputProtocol != right[i].OutputProtocol ||
+			left[i].TargetAudioCodec != right[i].TargetAudioCodec ||
+			left[i].TargetAudioChannels != right[i].TargetAudioChannels ||
+			left[i].TargetBitrateKbps != right[i].TargetBitrateKbps ||
+			left[i].TranscodeHWAccel != right[i].TranscodeHWAccel ||
+			left[i].ToneMapMode != right[i].ToneMapMode ||
+			!equalOptionalString(left[i].RoutingNetworkProvider, right[i].RoutingNetworkProvider) ||
+			left[i].RoutingWorkload != right[i].RoutingWorkload ||
+			left[i].RoutingExecution != right[i].RoutingExecution ||
+			left[i].RoutingExecutionNodeID != right[i].RoutingExecutionNodeID ||
+			left[i].RoutingExecutionNodeURL != right[i].RoutingExecutionNodeURL ||
+			left[i].RoutingEgress != right[i].RoutingEgress ||
+			left[i].RoutingEgressNodeID != right[i].RoutingEgressNodeID ||
+			left[i].RoutingEgressNodeURL != right[i].RoutingEgressNodeURL ||
+			!left[i].StartedAt.Equal(right[i].StartedAt) ||
+			!left[i].UpdatedAt.Equal(right[i].UpdatedAt) ||
+			normalizePositionSeconds(left[i].PositionSeconds) != normalizePositionSeconds(right[i].PositionSeconds) ||
+			left[i].IsPaused != right[i].IsPaused ||
+			left[i].HasWebSocket != right[i].HasWebSocket ||
+			left[i].IsJellyfinCompat != right[i].IsJellyfinCompat {
+			return false
+		}
+	}
+	return slices.EqualFunc(left, right, func(l, r SessionSync) bool {
+		return l.TimelineDurationSeconds == r.TimelineDurationSeconds &&
+			slices.Equal(nullableStrings(l.AdaptationReasons), nullableStrings(r.AdaptationReasons))
+	})
+}
+
+// nullableTimelineDuration stores an unset (or nonsensical) timeline duration
+// as NULL, which readers take as the file's own duration.
+func nullableTimelineDuration(seconds float64) any {
+	if seconds <= 0 {
+		return nil
+	}
+	return seconds
+}
+
+// sessionSyncColumns names the playback_sessions_sync columns a sync binds,
+// in the order sessionSyncValues returns them; last_sync_at is the database
+// clock and not among them.
+var sessionSyncColumns = []string{
+	"session_id", "user_id", "profile_id", "media_file_id", "requested_media_file_id", "play_method",
+	"reporting_node", "started_at", "updated_at", "client_ip",
+	"client_name", "client_version", "client_build", "client_channel", "client_user_agent",
+	"audio_track_index", "transcode_audio", "stream_bitrate_kbps", "transcode_node_url",
+	"target_resolution", "target_video_codec", "target_audio_codec", "target_audio_channels",
+	"target_bitrate_kbps",
+	"transcode_hw_accel", "tone_map_mode",
+	"routing_workload", "routing_execution", "routing_execution_node_id", "routing_execution_node_url",
+	"routing_egress", "routing_egress_node_id", "routing_egress_node_url",
+	"position_seconds", "is_paused", "has_websocket", "compat_origin", "routing_network_provider",
+	"output_container", "output_protocol", "stream_location", "device_id", "device_platform",
+	"timeline_duration_seconds", "adaptation_reasons",
+}
+
+// sessionSyncValues is one session as a sync stores it, in
+// sessionSyncColumns order.
+func sessionSyncValues(s SessionSync, sessionNode string) []any {
+	return []any{s.SessionID, s.UserID, s.ProfileID, s.MediaFileID, nullableInt(s.RequestedMediaFileID), s.PlayMethod,
+		sessionNode, s.StartedAt, s.UpdatedAt, nullableIP(s.ClientIP),
+		nullableString(s.ClientName), nullableString(s.ClientVersion), nullableString(s.ClientBuild),
+		nullableString(s.ClientChannel), nullableString(s.ClientUserAgent),
+		s.AudioTrackIndex, s.TranscodeAudio, nullableInt(s.StreamBitrateKbps), nullableString(s.TranscodeNodeURL),
+		nullableString(s.TargetResolution), nullableString(s.TargetVideoCodec),
+		nullableString(s.TargetAudioCodec), nullableInt(s.TargetAudioChannels),
+		nullableInt(s.TargetBitrateKbps),
+		nullableString(s.TranscodeHWAccel), nullableString(s.ToneMapMode),
+		nullableString(s.RoutingWorkload), nullableString(s.RoutingExecution), nullableInt(s.RoutingExecutionNodeID), nullableString(s.RoutingExecutionNodeURL),
+		nullableString(s.RoutingEgress), nullableInt(s.RoutingEgressNodeID), nullableString(s.RoutingEgressNodeURL), normalizePositionSeconds(s.PositionSeconds),
+		s.IsPaused, s.HasWebSocket, s.IsJellyfinCompat, s.RoutingNetworkProvider,
+		nullableString(s.OutputContainer), nullableString(s.OutputProtocol), s.StreamLocation,
+		nullableString(s.DeviceID), nullableString(s.DevicePlatform),
+		nullableTimelineDuration(s.TimelineDurationSeconds), nullableStrings(s.AdaptationReasons)}
+}
+
+// nullableStrings stores an empty list as NULL, as the other optional
+// columns store their zero value.
+func nullableStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	return values
+}
+
+// SessionSyncRowJSON renders a session as the playback_sessions_sync row a
+// sync would store for it now, so the row can be read through
+// jsonb_populate_record before, or without, a sync writing it.
+func SessionSyncRowJSON(s SessionSync, reportingNode string) (json.RawMessage, error) {
+	sessionNode := strings.TrimSpace(s.ReportingNode)
+	if sessionNode == "" {
+		sessionNode = strings.TrimSpace(reportingNode)
+	}
+	values := sessionSyncValues(s, sessionNode)
+	row := make(map[string]any, len(values)+1)
+	for i, column := range sessionSyncColumns {
+		row[column] = values[i]
+	}
+	row["last_sync_at"] = time.Now().UTC()
+	return json.Marshal(row)
+}
+
+func normalizePositionSeconds(position float64) float64 {
+	if position < 0 {
+		return 0
+	}
+	return position
+}
+
+func nullableIP(ip string) any {
+	if strings.TrimSpace(ip) == "" {
+		return nil
+	}
+	return ip
+}
+
+func nullableInt(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
+func nullableString(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
+}
+
+// ReconcileAggregates upserts the aggregate counts for a single user into the
+// user_aggregates table. The operation is idempotent.
+func (r *Reconciler) ReconcileAggregates(ctx context.Context, userID int, totals AggregateData) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO user_aggregates
+			(user_id, total_watched, favorites_count, watchlist_count, active_node, last_sync_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())
+		ON CONFLICT (user_id) DO UPDATE SET
+			total_watched   = EXCLUDED.total_watched,
+			favorites_count = EXCLUDED.favorites_count,
+			watchlist_count = EXCLUDED.watchlist_count,
+			active_node     = EXCLUDED.active_node,
+			last_sync_at    = NOW()
+	`, userID, totals.TotalWatched, totals.FavoritesCount, totals.WatchlistCount, totals.ActiveNode)
+	if err != nil {
+		return fmt.Errorf("upserting aggregates for user %d: %w", userID, err)
+	}
+
+	return nil
+}
+
+// Start begins the background reconciliation loop. It runs until Stop is
+// called. On each tick it syncs active playback sessions to PostgreSQL.
+func (r *Reconciler) Start() {
+	go func() {
+		ticker := time.NewTicker(r.interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-r.stop:
+				return
+			case <-ticker.C:
+				r.tick()
+			}
+		}
+	}()
+}
+
+// tick runs one reconciliation cycle.
+func (r *Reconciler) tick() {
+	if r.PreSync != nil {
+		r.PreSync()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := r.SyncNow(ctx); err != nil {
+		log.Printf("reconciler: session sync error: %v", err)
+	}
+}
+
+// SyncNow reconciles the current local session snapshot into the shared
+// table. When nodeName is configured, an empty snapshot still clears any rows
+// previously reported by that node.
+//
+// Syncs are coalesced: only one reconciliation runs at a time, and a call that
+// arrives while one is in flight returns immediately after asking the running
+// owner for one follow-up pass with a fresh snapshot. The follow-up capture
+// happens after the caller's state change, so its effect is never lost, and
+// snapshots always commit in capture order.
+func (r *Reconciler) SyncNow(ctx context.Context) error {
+	if r.sessionProvider == nil {
+		return nil
+	}
+
+	r.syncMu.Lock()
+	if r.syncRunning {
+		// The in-flight sync may have captured a snapshot that predates this
+		// caller's state change; have the owner run one more pass.
+		r.syncPending = true
+		r.syncMu.Unlock()
+		return nil
+	}
+	r.syncRunning = true
+	// The fresh capture below supersedes any pass queued before ownership.
+	r.syncPending = false
+	r.syncMu.Unlock()
+
+	err := r.syncOnce(ctx)
+	for {
+		r.syncMu.Lock()
+		// Leave a queued pass for the next caller (the periodic tick at the
+		// latest) rather than burning it on an already-expired context.
+		if !r.syncPending || ctx.Err() != nil {
+			r.syncRunning = false
+			r.syncMu.Unlock()
+			return err
+		}
+		r.syncPending = false
+		r.syncMu.Unlock()
+		if passErr := r.syncOnce(ctx); err == nil {
+			err = passErr
+		}
+	}
+}
+
+// syncOnce captures one session snapshot and reconciles it.
+func (r *Reconciler) syncOnce(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sessions := r.sessionProvider()
+	if len(sessions) == 0 {
+		if r.nodeName == "" {
+			return nil
+		}
+		return r.ReconcileNodeSessions(ctx, r.nodeName, nil)
+	}
+	if r.nodeName != "" {
+		for i := range sessions {
+			if strings.TrimSpace(sessions[i].ReportingNode) == "" {
+				sessions[i].ReportingNode = r.nodeName
+			}
+		}
+	}
+	return r.ReconcileSessions(ctx, sessions)
+}
+
+// Stop signals the reconciliation loop to stop.
+func (r *Reconciler) Stop() {
+	close(r.stop)
+}
+
+func equalOptionalString(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}

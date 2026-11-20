@@ -1,0 +1,712 @@
+package pgstore
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/auditmutation"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+)
+
+// scanProfile scans a profile row, converting TIMESTAMPTZ to string. extra
+// receives any columns the query selects after the profile's own.
+func scanProfile(scanner interface {
+	Scan(dest ...any) error
+}, extra ...any) (*userstore.Profile, error) {
+	var p userstore.Profile
+	var createdAt, updatedAt time.Time
+	err := scanner.Scan(append([]any{
+		&p.ID, &p.Name, &p.Avatar, &p.PINHash, &p.IsChild, &p.IsPrimary, &p.MaxContentRating, &p.MaxAdvisoryAge,
+		&p.RequireAdvisoryAge, &p.RequestsBlocked,
+		&p.QualityPreference, &p.Language, &p.PreferredMetadataLanguage, &p.SubtitleLanguage, &p.SubtitleMode,
+		&p.AutoSkipIntro, &p.AutoSkipCredits, &p.AutoSkipRecap, &p.AutoPlayNextPreview,
+		&p.LibraryRestrictionsEnabled,
+		&p.ShowForcedSubtitles, &p.MaxPlaybackQuality, &p.PINRevision, &createdAt, &updatedAt,
+	}, extra...)...)
+	if err != nil {
+		return nil, err
+	}
+	p.CreatedAt = timeToString(createdAt)
+	p.UpdatedAt = timeToString(updatedAt)
+	return &p, nil
+}
+
+func (s *PostgresUserStore) CreateProfile(ctx context.Context, p userstore.Profile) error {
+	return createProfile(ctx, s.pool, s.userID, p)
+}
+
+func createProfile(
+	ctx context.Context,
+	exec preferenceSettingsExecutor,
+	userID int,
+	p userstore.Profile,
+) error {
+	if p.ID == "" {
+		p.ID = generateUUID()
+	}
+	now := nowUTC()
+	if p.CreatedAt == "" {
+		p.CreatedAt = now
+	}
+	if p.UpdatedAt == "" {
+		p.UpdatedAt = now
+	}
+	if !p.ShowForcedSubtitles {
+		p.ShowForcedSubtitles = true
+	}
+
+	// The first profile created for a user becomes the primary, giving it
+	// rights to manage the household's other profiles without requiring a
+	// server-wide admin role.
+	var hasExisting bool
+	if err := exec.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM user_profiles WHERE user_id = $1)", userID,
+	).Scan(&hasExisting); err != nil {
+		return fmt.Errorf("checking existing profiles for user %d: %w", userID, err)
+	}
+	if !hasExisting {
+		p.IsPrimary = true
+	} else {
+		p.IsPrimary = false
+	}
+
+	_, err := exec.Exec(ctx, `
+		INSERT INTO user_profiles (
+			id, user_id, name, avatar, pin_hash, is_child, is_primary, max_content_rating, max_advisory_age,
+			require_advisory_age, requests_blocked,
+			quality_preference, language, preferred_metadata_language, subtitle_language, subtitle_mode,
+			auto_skip_intro, auto_skip_credits, auto_skip_recap, auto_play_next_preview,
+			library_restrictions_enabled,
+			show_forced_subtitles, max_playback_quality, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9::smallint, 0), $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)`,
+		p.ID, userID, p.Name, p.Avatar, p.PINHash, p.IsChild, p.IsPrimary, p.MaxContentRating, p.MaxAdvisoryAge,
+		p.RequireAdvisoryAge, p.RequestsBlocked,
+		p.QualityPreference, p.Language, p.PreferredMetadataLanguage, p.SubtitleLanguage, p.SubtitleMode,
+		p.AutoSkipIntro, p.AutoSkipCredits, p.AutoSkipRecap, p.AutoPlayNextPreview,
+		p.LibraryRestrictionsEnabled,
+		p.ShowForcedSubtitles, p.MaxPlaybackQuality, p.CreatedAt, p.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("inserting profile %s: %w", p.ID, err)
+	}
+	if err := replaceProfileAllowedLibraries(ctx, exec, userID, p.ID, p.AllowedLibraryIDs); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *PostgresUserStore) GetProfile(ctx context.Context, id string) (*userstore.Profile, error) {
+	return getProfile(ctx, s.pool, s.userID, id)
+}
+
+// ProfileInTransaction reuses the owning profile and library membership read.
+func ProfileInTransaction(ctx context.Context, tx pgx.Tx, userID int, id string) (*userstore.Profile, error) {
+	return getProfile(ctx, tx, userID, id)
+}
+func getProfile(ctx context.Context, db preferenceSettingsExecutor, userID int, id string) (*userstore.Profile, error) {
+	return profileFromRow(db.QueryRow(ctx, profileByIDQuery, userID, id), id)
+}
+
+// QueueProfile queues GetProfile's read for the account's profile id on
+// batch. The returned function reads the result from the sent batch, in the
+// order the batch's reads were queued, with GetProfile's answer: nil, nil when
+// the account has no such profile.
+func QueueProfile(batch *pgx.Batch, userID int, id string) func(pgx.BatchResults) (*userstore.Profile, error) {
+	batch.Queue(profileByIDQuery, userID, id)
+	return func(results pgx.BatchResults) (*userstore.Profile, error) {
+		return profileFromRow(results.QueryRow(), id)
+	}
+}
+
+// profileByIDQuery reads one profile together with its allowed libraries in
+// ascending id order, so a profile costs one statement.
+var profileByIDQuery = `
+	SELECT id, name, avatar, pin_hash, is_child, is_primary, max_content_rating, COALESCE(max_advisory_age, 0),
+	       require_advisory_age, requests_blocked,
+	       quality_preference, language, preferred_metadata_language, subtitle_language, subtitle_mode,
+	       auto_skip_intro, auto_skip_credits, auto_skip_recap, auto_play_next_preview, library_restrictions_enabled,
+	       show_forced_subtitles, max_playback_quality, pin_revision, created_at, updated_at,
+	       ARRAY(
+	           SELECT library_id FROM user_profile_allowed_libraries l
+	           WHERE l.user_id = user_profiles.user_id AND l.profile_id = user_profiles.id
+	           ORDER BY library_id ASC
+	       ),
+	       ARRAY(` + ProfileAllowedTitleIDsSQL("user_profiles.user_id", "user_profiles.id") + `)
+	FROM user_profiles WHERE user_id = $1 AND id = $2`
+
+// ProfileAllowedTitleIDsSQL renders the content IDs a profile is allowed
+// above its maturity limits: its own title allowances plus the titles of each
+// live-allowed collection. A collection allows its titles only while it is a
+// manual collection created by the account's current primary profile, so the
+// household manager alone decides what it holds, and only its movies and
+// series, as a title allowance may name (userstore.AllowanceTitleTypes).
+//
+// Every request the profile makes reads this, so both its result and its
+// work are bounded. It returns at most userstore.MaxAllowedTitles distinct
+// IDs: UNION ALL with no ORDER BY lets PostgreSQL stop once it has them. It
+// reads at most liveEntryScanLimit whole-title entries (an empty sub_item_id) of
+// the live collections, and deduplicates within them, leaving out titles
+// the profile is allowed directly. Past that many entries the rest stay
+// hidden, so heavily overlapping or very large live collections fail closed
+// rather than costing every request more. userIDExpr and profileIDExpr are
+// SQL expressions for the profile's key.
+func ProfileAllowedTitleIDsSQL(userIDExpr, profileIDExpr string) string {
+	return `
+	           WITH live AS (
+	               SELECT c.id FROM profile_collection_allowances ca
+	               JOIN user_personal_collections c ON c.user_id = ca.user_id AND c.id = ca.collection_id
+	               JOIN user_profiles creator ON creator.user_id = c.user_id AND creator.id = c.creator_profile_id
+	               WHERE ca.user_id = ` + userIDExpr + ` AND ca.profile_id = ` + profileIDExpr + `
+	                 AND c.collection_type = 'manual' AND creator.is_primary
+	           )
+	           SELECT content_id FROM profile_title_allowances ta
+	           WHERE ta.user_id = ` + userIDExpr + ` AND ta.profile_id = ` + profileIDExpr + `
+	           UNION ALL
+	           SELECT DISTINCT entry.media_item_id FROM (
+	               SELECT ci.media_item_id FROM live
+	               JOIN user_personal_collection_items ci ON ci.user_id = ` + userIDExpr + ` AND ci.collection_id = live.id AND ci.sub_item_id = ''
+	               LIMIT ` + strconv.Itoa(liveEntryScanLimit) + `
+	           ) entry
+	           JOIN media_items mi ON mi.content_id = entry.media_item_id
+	           WHERE mi.type IN ('movie', 'series')
+	             AND NOT EXISTS (SELECT 1 FROM profile_title_allowances dup
+	                 WHERE dup.user_id = ` + userIDExpr + ` AND dup.profile_id = ` + profileIDExpr + ` AND dup.content_id = entry.media_item_id)
+	           LIMIT ` + strconv.Itoa(userstore.MaxAllowedTitles)
+}
+
+// liveEntryScanLimit bounds the live-collection entries one profile read
+// takes: five times the titles it keeps, so collections that overlap up to
+// five times over still yield every distinct title.
+const liveEntryScanLimit = 5 * userstore.MaxAllowedTitles
+
+func profileFromRow(row pgx.Row, id string) (*userstore.Profile, error) {
+	var libraryIDs []int
+	var allowedTitleIDs []string
+	p, err := scanProfile(row, &libraryIDs, &allowedTitleIDs)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying profile %s: %w", id, err)
+	}
+	// A profile without allowed libraries keeps a nil list, as ListProfiles
+	// reports it.
+	if len(libraryIDs) > 0 {
+		p.AllowedLibraryIDs = libraryIDs
+	}
+	// The read returns distinct IDs in no set order; sorting keeps scope
+	// fingerprints stable.
+	if len(allowedTitleIDs) > 0 {
+		slices.Sort(allowedTitleIDs)
+		p.AllowedTitleIDs = allowedTitleIDs
+	}
+	return p, nil
+}
+
+func (s *PostgresUserStore) ListProfiles(ctx context.Context) ([]userstore.Profile, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, name, avatar, pin_hash, is_child, is_primary, max_content_rating, COALESCE(max_advisory_age, 0),
+		       require_advisory_age, requests_blocked,
+		       quality_preference, language, preferred_metadata_language, subtitle_language, subtitle_mode,
+		       auto_skip_intro, auto_skip_credits, auto_skip_recap, auto_play_next_preview, library_restrictions_enabled,
+		       show_forced_subtitles, max_playback_quality, pin_revision, created_at, updated_at
+		FROM user_profiles WHERE user_id = $1 ORDER BY created_at ASC`, s.userID)
+	if err != nil {
+		return nil, fmt.Errorf("listing profiles: %w", err)
+	}
+	defer rows.Close()
+
+	var profiles []userstore.Profile
+	for rows.Next() {
+		p, err := scanProfile(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning profile row: %w", err)
+		}
+		profiles = append(profiles, *p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating profile rows: %w", err)
+	}
+	if err := s.attachAllowedLibraries(ctx, profiles); err != nil {
+		return nil, err
+	}
+	return profiles, nil
+}
+
+func (s *PostgresUserStore) UpdateProfile(ctx context.Context, id string, u userstore.UpdateProfileInput) error {
+	return updateProfile(ctx, s.pool, s.userID, id, u)
+}
+
+func updateProfile(
+	ctx context.Context,
+	exec preferenceSettingsExecutor,
+	userID int,
+	id string,
+	u userstore.UpdateProfileInput,
+) error {
+	var setClauses []string
+	var args []any
+	argIdx := 1
+	accessPolicyChanged := u.PINHash != nil ||
+		u.IsChild != nil ||
+		u.MaxContentRating != nil ||
+		u.MaxAdvisoryAge != nil ||
+		u.RequireAdvisoryAge != nil ||
+		u.RequestsBlocked != nil ||
+		u.LibraryRestrictionsEnabled != nil ||
+		u.AllowedLibraryIDs != nil ||
+		u.MaxPlaybackQuality != nil
+
+	addArg := func(clause string, val any) {
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", clause, argIdx))
+		args = append(args, val)
+		argIdx++
+	}
+
+	if u.Name != nil {
+		addArg("name", *u.Name)
+	}
+	if u.Avatar != nil {
+		addArg("avatar", *u.Avatar)
+	}
+	if u.PINHash != nil {
+		addArg("pin_hash", *u.PINHash)
+		// The user_profiles_pin_revision trigger advances pin_revision in
+		// this same UPDATE whenever pin_hash changes, which invalidates every
+		// token minted for the old PIN, and only this profile's. It lives in
+		// the database so writers that do not know the column (an older node
+		// during a rolling deploy, manual SQL) advance it too.
+	}
+	if u.IsChild != nil {
+		addArg("is_child", *u.IsChild)
+	}
+	if u.MaxContentRating != nil {
+		addArg("max_content_rating", *u.MaxContentRating)
+	}
+	if u.MaxAdvisoryAge != nil {
+		// 0 clears the limit; the column stores "no limit" as NULL.
+		var age *int
+		if *u.MaxAdvisoryAge != 0 {
+			age = u.MaxAdvisoryAge
+		}
+		addArg("max_advisory_age", age)
+	}
+	if u.RequireAdvisoryAge != nil {
+		addArg("require_advisory_age", *u.RequireAdvisoryAge)
+	}
+	if u.RequestsBlocked != nil {
+		addArg("requests_blocked", *u.RequestsBlocked)
+	}
+	if u.QualityPreference != nil {
+		addArg("quality_preference", *u.QualityPreference)
+	}
+	if u.Language != nil {
+		addArg("language", *u.Language)
+	}
+	if u.PreferredMetadataLanguage != nil {
+		addArg("preferred_metadata_language", *u.PreferredMetadataLanguage)
+	}
+	if u.SubtitleLanguage != nil {
+		addArg("subtitle_language", *u.SubtitleLanguage)
+	}
+	if u.SubtitleMode != nil {
+		addArg("subtitle_mode", *u.SubtitleMode)
+	}
+	if u.AutoSkipIntro != nil {
+		addArg("auto_skip_intro", *u.AutoSkipIntro)
+	}
+	if u.AutoSkipCredits != nil {
+		addArg("auto_skip_credits", *u.AutoSkipCredits)
+	}
+	if u.AutoSkipRecap != nil {
+		addArg("auto_skip_recap", *u.AutoSkipRecap)
+	}
+	if u.AutoPlayNextPreview != nil {
+		addArg("auto_play_next_preview", *u.AutoPlayNextPreview)
+	}
+	if u.LibraryRestrictionsEnabled != nil {
+		addArg("library_restrictions_enabled", *u.LibraryRestrictionsEnabled)
+	}
+	if u.ShowForcedSubtitles != nil {
+		addArg("show_forced_subtitles", *u.ShowForcedSubtitles)
+	}
+	if u.MaxPlaybackQuality != nil {
+		addArg("max_playback_quality", *u.MaxPlaybackQuality)
+	}
+
+	if len(setClauses) == 0 && u.AllowedLibraryIDs == nil {
+		return nil
+	}
+
+	var exists bool
+	if err := exec.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM user_profiles WHERE user_id = $1 AND id = $2)", userID, id).Scan(&exists); err != nil {
+		return fmt.Errorf("checking profile %s existence: %w", id, err)
+	}
+	if !exists {
+		return fmt.Errorf("profile %s not found", id)
+	}
+
+	if len(setClauses) > 0 {
+		addArg("updated_at", nowUTC())
+
+		whereClause := fmt.Sprintf("WHERE user_id = $%d AND id = $%d", argIdx, argIdx+1)
+		args = append(args, userID, id)
+
+		query := fmt.Sprintf("UPDATE user_profiles SET %s %s", strings.Join(setClauses, ", "), whereClause)
+		result, err := exec.Exec(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("updating profile %s: %w", id, err)
+		}
+		if result.RowsAffected() == 0 {
+			return fmt.Errorf("profile %s not found", id)
+		}
+	}
+
+	if u.AllowedLibraryIDs != nil {
+		if err := replaceProfileAllowedLibraries(ctx, exec, userID, id, *u.AllowedLibraryIDs); err != nil {
+			return err
+		}
+	}
+	if accessPolicyChanged {
+		if _, err := exec.Exec(ctx, "UPDATE users SET access_policy_revision = access_policy_revision + 1 WHERE id = $1", userID); err != nil {
+			return fmt.Errorf("bumping access policy revision for user %d: %w", userID, err)
+		}
+	}
+	return nil
+}
+
+// profileCascadeTables are the tables DeleteProfile clears of the profile's
+// rows by (user_id, profile_id). Tables are listed rather than left to a
+// foreign key so both backends delete identically: the per-user SQLite store
+// has no foreign keys at all. Account-scope rows carry a NULL profile_id and
+// are untouched, which is what removing one household member has to mean.
+// TestPostgresDeleteProfileCoversEveryProfileTable keeps the list complete.
+var profileCascadeTables = []string{
+	"user_favorites",
+	"user_watchlist",
+	"user_watch_progress",
+	"user_watch_history",
+	"user_history_hidden_items",
+	"user_home_item_dismissals",
+	"user_collection_sort_preferences",
+	"user_personal_collection_profiles",
+	"user_audio_preferences",
+	"user_subtitle_preferences",
+	"user_series_playback_preferences",
+	"user_library_playback_preferences",
+	"user_profile_allowed_libraries",
+	"user_profile_onboarding",
+	"user_setting_values",
+	"user_dropped_series",
+	// Leaves titles no profile watchlists any more; the profile
+	// handler's watchlist-title purge sweeps those under the title lock.
+	"user_watchlist_titles",
+	// Promotion records the watchlist arrival notice reads; the same purge
+	// clears them after a delete from the SQLite store.
+	"watchlist_title_promotions",
+	// Recommendation state. A deleted profile's ratings would otherwise
+	// keep shaping other accounts' Similar Users rows, and its taste
+	// would be rebuilt every night.
+	"user_ratings",
+	"user_not_interested",
+	"user_taste_profiles",
+	"user_taste_clusters",
+	"recommendation_cache",
+	// Ebook reading data. Like the recommendation state, it lives in
+	// Postgres whichever store holds the profile; the profile handler
+	// purges it after a delete from any other store.
+	"ebook_reader_progress",
+	"ebook_reader_config",
+	"ebook_reader_annotations",
+}
+
+// lockProfileForDelete locks the profile row and reads the image the delete
+// will remove. Setting clears delete user_setting_values rows and then update
+// the profile's legacy columns under the account's preference-settings lock.
+// Taking that lock before the profile row lock keeps that order; locking the
+// profile first and then deleting its settings would deadlock against a clear.
+func (s *PostgresUserStore) lockProfileForDelete(ctx context.Context, tx pgx.Tx, id string) (*userstore.Profile, error) {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
+		preferenceSettingsAdvisoryClass, int32(s.userID)); err != nil { //nolint:gosec // users.id is a 32-bit serial, keyed as in WithPreferenceSettingsTransaction
+		return nil, fmt.Errorf("locking preference settings transaction: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM user_profiles WHERE user_id = $1 AND id = $2 FOR UPDATE", s.userID, id); err != nil {
+		return nil, fmt.Errorf("locking profile %s: %w", id, err)
+	}
+	deleted, err := getProfile(ctx, tx, s.userID, id)
+	if err != nil {
+		return nil, err
+	}
+	if deleted == nil {
+		return nil, fmt.Errorf("profile %s not found", id)
+	}
+	return deleted, nil
+}
+
+func (s *PostgresUserStore) DeleteProfile(ctx context.Context, id string) ([]string, error) {
+	return s.DeleteProfileAudited(ctx, id, nil)
+}
+
+var _ userstore.AuditedProfileDeleter = (*PostgresUserStore)(nil)
+
+// DeleteProfileAudited is DeleteProfile with audit run in the delete's
+// transaction before it commits; a nil audit records nothing. The profile row
+// is locked before it is read, so audit sees the image that was deleted.
+func (s *PostgresUserStore) DeleteProfileAudited(ctx context.Context, id string, audit func(tx pgx.Tx, deleted *userstore.Profile) error) ([]string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning transaction for profile delete: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// The account locks before any row, in the order imports take them
+	// (LockAccountForImport), so a deletion and an import of the same
+	// account wait on each other's locks rather than on each other's rows.
+	if err := LockAccountForImport(ctx, tx, s.userID); err != nil {
+		return nil, err
+	}
+
+	// Deleting the account locks it before its cascade reaches the profile
+	// and its collections, so the audit row's account keys come first.
+	if audit != nil {
+		if err := auditmutation.LockActors(ctx, tx); err != nil {
+			return nil, err
+		}
+	}
+
+	// Lock every collection whose revision the deletes below advance, in id
+	// order, before taking any revision row: the profile's own collections
+	// and those it has visibility rows on. The visibility and item deletes
+	// advance revisions through triggers, and a collection update, or
+	// another profile's delete, locks collections first; taking them in
+	// another order can deadlock.
+	if _, err := tx.Exec(ctx, `
+		SELECT 1 FROM user_personal_collections
+		WHERE user_id = $1 AND (profile_id = $2 OR id IN (
+			SELECT collection_id FROM user_personal_collection_profiles WHERE user_id = $1 AND profile_id = $2
+		))
+		ORDER BY id FOR UPDATE`,
+		s.userID, id); err != nil {
+		return nil, fmt.Errorf("locking collections of profile %s: %w", id, err)
+	}
+
+	var deleted *userstore.Profile
+	if audit != nil {
+		if deleted, err = s.lockProfileForDelete(ctx, tx, id); err != nil {
+			return nil, err
+		}
+	}
+
+	// Preferences belong to viewers, not creators, so remove every override
+	// for collections owned by the profile before those collections disappear.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM user_collection_sort_preferences
+		WHERE user_id = $1 AND collection_kind = 'user' AND collection_id IN (
+			SELECT id FROM user_personal_collections WHERE user_id = $1 AND profile_id = $2
+		)`, s.userID, id); err != nil {
+		return nil, fmt.Errorf("deleting collection sort preferences for profile %s: %w", id, err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		DELETE FROM user_personal_collection_items
+		WHERE user_id = $1 AND collection_id IN (
+			SELECT id FROM user_personal_collections WHERE user_id = $1 AND profile_id = $2
+		)`, s.userID, id)
+	if err != nil {
+		return nil, fmt.Errorf("deleting collection items for profile %s: %w", id, err)
+	}
+
+	// Visibility rows of the profile's own collections go with them, as
+	// their items do.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM user_personal_collection_profiles
+		WHERE user_id = $1 AND collection_id IN (
+			SELECT id FROM user_personal_collections WHERE user_id = $1 AND profile_id = $2
+		)`, s.userID, id); err != nil {
+		return nil, fmt.Errorf("deleting collection visibility for profile %s: %w", id, err)
+	}
+
+	// Jellyfin display preferences carry the profile in their key.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM jellycompat_displayprefs WHERE user_id = $1 AND left(prefs_id, length($2)) = $2`,
+		s.userID, userstore.ProfileDisplayPrefsPrefix(id)); err != nil {
+		return nil, fmt.Errorf("deleting display preferences for profile %s: %w", id, err)
+	}
+	// Jellyfin-compatible sessions signed in as the profile end with it. Every
+	// lookup reads the stored row, so deleting it ends them on all replicas.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM jellycompat_sessions WHERE streamapp_user_id = $1 AND profile_id = $2`,
+		s.userID, id); err != nil {
+		return nil, fmt.Errorf("deleting Jellyfin sessions for profile %s: %w", id, err)
+	}
+	if err := deleteProfileSectionOverrides(ctx, tx, s.userID, id); err != nil {
+		return nil, err
+	}
+
+	// The profile's own collections, returned so the caller can remove their
+	// artwork once this commits.
+	rows, err := tx.Query(ctx, "DELETE FROM user_personal_collections WHERE user_id = $1 AND profile_id = $2 RETURNING id", s.userID, id)
+	if err != nil {
+		return nil, fmt.Errorf("deleting collections for profile %s: %w", id, err)
+	}
+	collectionIDs, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("deleting collections for profile %s: %w", id, err)
+	}
+
+	for _, table := range profileCascadeTables {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE user_id = $1 AND profile_id = $2", table), s.userID, id); err != nil {
+			return nil, fmt.Errorf("deleting from %s for profile %s: %w", table, id, err)
+		}
+	}
+
+	result, err := tx.Exec(ctx, "DELETE FROM user_profiles WHERE user_id = $1 AND id = $2", s.userID, id)
+	if err != nil {
+		return nil, fmt.Errorf("deleting profile %s: %w", id, err)
+	}
+	if result.RowsAffected() == 0 {
+		return nil, fmt.Errorf("profile %s not found", id)
+	}
+	if audit != nil {
+		if err := audit(tx, deleted); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return collectionIDs, nil
+}
+
+// deleteProfileSectionOverrides takes a profile's entries out of the account's
+// section-override settings, which hold every profile's overrides for one
+// scope and library in one JSON value (see SaveSectionOverrides). A value left
+// with no entries is deleted, as ResetSectionOverrides does.
+func deleteProfileSectionOverrides(ctx context.Context, tx pgx.Tx, userID int, profileID string) error {
+	err := rewriteSectionOverrides(ctx, tx, userID, func(overrides []userstore.SectionOverride) ([]userstore.SectionOverride, bool) {
+		kept := slices.DeleteFunc(overrides, func(o userstore.SectionOverride) bool { return o.ProfileID == profileID })
+		return kept, len(kept) != len(overrides)
+	})
+	if err != nil {
+		return fmt.Errorf("profile %s: %w", profileID, err)
+	}
+	return nil
+}
+
+// rewriteSectionOverrides passes each of the account's section-override
+// settings through rewrite under lockSectionOverrides, and writes back the
+// ones it reports changed. A value left with no entries is deleted.
+func rewriteSectionOverrides(ctx context.Context, tx pgx.Tx, userID int, rewrite func([]userstore.SectionOverride) ([]userstore.SectionOverride, bool)) error {
+	if err := lockSectionOverrides(ctx, tx, userID); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT key, value FROM user_settings WHERE user_id = $1 AND key LIKE 'section\_overrides:%' FOR UPDATE`, userID)
+	if err != nil {
+		return fmt.Errorf("reading section overrides: %w", err)
+	}
+	type setting struct{ key, value string }
+	settings, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (setting, error) {
+		var s setting
+		err := row.Scan(&s.key, &s.value)
+		return s, err
+	})
+	if err != nil {
+		return fmt.Errorf("reading section overrides: %w", err)
+	}
+	for _, st := range settings {
+		var overrides []userstore.SectionOverride
+		if err := json.Unmarshal([]byte(st.value), &overrides); err != nil {
+			return fmt.Errorf("decoding section overrides %s: %w", st.key, err)
+		}
+		next, changed := rewrite(overrides)
+		if !changed {
+			continue
+		}
+		if len(next) == 0 {
+			_, err = tx.Exec(ctx, `DELETE FROM user_settings WHERE user_id = $1 AND key = $2`, userID, st.key)
+		} else {
+			data, _ := json.Marshal(next)
+			_, err = tx.Exec(ctx, `UPDATE user_settings SET value = $3 WHERE user_id = $1 AND key = $2`, userID, st.key, string(data))
+		}
+		if err != nil {
+			return fmt.Errorf("writing section overrides %s: %w", st.key, err)
+		}
+	}
+	return nil
+}
+
+// RestoredProfile is a profile a backup restore creates: its name, avatar,
+// primary flag, PIN hash, and every access field, with allowed libraries
+// already mapped to this server's.
+type RestoredProfile struct {
+	// ID is the new profile's id; NewProfileID makes one, so blobs keyed by
+	// it can be written before the row.
+	ID                         string
+	Name                       string
+	Avatar                     string
+	IsPrimary                  bool
+	PINHash                    string
+	IsChild                    bool
+	MaxContentRating           string
+	MaxAdvisoryAge             int
+	RequireAdvisoryAge         bool
+	RequestsBlocked            bool
+	LibraryRestrictionsEnabled bool
+	AllowedLibraryIDs          []int
+	MaxPlaybackQuality         string
+}
+
+// NewProfileID returns an id for a new profile.
+func NewProfileID() string { return generateUUID() }
+
+// LockProfilesInTx takes, in the caller's transaction, the account lock
+// ordinary profile creation counts and creates under, and returns how many
+// profiles the account has. Counting and creating under it means two
+// creations cannot both take the account's last place.
+func LockProfilesInTx(ctx context.Context, tx pgx.Tx, userID int) (int, error) {
+	if err := lockPreferenceSettings(ctx, tx, userID); err != nil {
+		return 0, err
+	}
+	ids, err := (&preferenceSettingsTx{exec: tx, userID: userID}).ListProfileIDs(ctx)
+	return len(ids), err
+}
+
+// CreateRestoredProfileInTx inserts a restored profile in the caller's
+// transaction; the caller holds LockProfilesInTx and checked the account's
+// limit. Its preferences take the column
+// defaults; a restore that carries them writes them separately. A primary
+// profile becomes primary only when the account has none, so the account's
+// household parent never changes. It reports whether the profile became the
+// primary, which drops any library limit it carried: the primary inherits
+// its account's libraries (access.ProfileLibraryLimit).
+func CreateRestoredProfileInTx(ctx context.Context, tx pgx.Tx, userID int, p RestoredProfile) (bool, error) {
+	if p.ID == "" {
+		return false, errors.New("a restored profile needs an id")
+	}
+	var hasPrimary bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_profiles WHERE user_id = $1 AND is_primary)`, userID).Scan(&hasPrimary); err != nil {
+		return false, fmt.Errorf("checking the primary profile of user %d: %w", userID, err)
+	}
+	primary := p.IsPrimary && !hasPrimary
+	if primary {
+		p.LibraryRestrictionsEnabled, p.AllowedLibraryIDs = false, nil
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_profiles (id, user_id, name, avatar, pin_hash, is_child, is_primary, max_content_rating, max_advisory_age,
+			require_advisory_age, requests_blocked, library_restrictions_enabled, max_playback_quality)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9::smallint, 0), $10, $11, $12, $13)`,
+		p.ID, userID, p.Name, p.Avatar, p.PINHash, p.IsChild, primary, p.MaxContentRating, p.MaxAdvisoryAge,
+		p.RequireAdvisoryAge, p.RequestsBlocked, p.LibraryRestrictionsEnabled, p.MaxPlaybackQuality); err != nil {
+		return false, fmt.Errorf("inserting restored profile: %w", err)
+	}
+	return primary, replaceProfileAllowedLibraries(ctx, tx, userID, p.ID, p.AllowedLibraryIDs)
+}

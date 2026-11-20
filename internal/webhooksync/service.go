@@ -1,0 +1,665 @@
+package webhooksync
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/Silo-Server/silo-server/internal/historyimport"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/watchstate"
+)
+
+// SignalsChangedNotifier records that a profile's recommendation signals
+// changed, so its taste profile and cached recommendations get rebuilt.
+// *recommendations.Worker implements it.
+type SignalsChangedNotifier interface {
+	NotifySignalsChanged(ctx context.Context, userID int, profileID string)
+}
+
+type Service struct {
+	repo      *Repository
+	matcher   *historyimport.Matcher
+	watch     *watchstate.Service
+	providers map[string]Provider
+
+	// localNetwork decides whether a connection's server address may be on
+	// this server's own network. Nil limits it to the public internet.
+	localNetwork *historyimport.LocalNetworkAccess
+
+	// signals hears about applied events that change a profile's
+	// recommendation signals. Nil reports nothing.
+	signals SignalsChangedNotifier
+}
+
+func NewService(repo *Repository, importRepo *historyimport.Repository, storeProvider userstore.UserStoreProvider) *Service {
+	plexClient := historyimport.NewPlexClient()
+	return &Service{
+		repo:    repo,
+		matcher: historyimport.NewMatcher(importRepo),
+		watch:   watchstate.NewService(storeProvider),
+		providers: map[string]Provider{
+			ProviderPlex:     NewPlexProvider(plexClient),
+			ProviderEmby:     NewEmbyProvider(),
+			ProviderJellyfin: NewJellyfinProvider(),
+		},
+	}
+}
+
+// SetLocalNetworkAccess installs the policy history import uses for server
+// addresses users supply.
+func (s *Service) SetLocalNetworkAccess(access *historyimport.LocalNetworkAccess) {
+	if s != nil {
+		s.localNetwork = access
+	}
+}
+
+// SetSignalsChangedNotifier installs where applied events that change a
+// profile's recommendation signals are reported.
+func (s *Service) SetSignalsChangedNotifier(notifier SignalsChangedNotifier) {
+	if s != nil {
+		s.signals = notifier
+	}
+}
+
+func (s *Service) notifySignalsChanged(ctx context.Context, userID int, profileID string) {
+	if s.signals != nil {
+		s.signals.NotifySignalsChanged(ctx, userID, profileID)
+	}
+}
+
+func (s *Service) SetStableIdentityResolver(identity *watchstate.StableIdentityResolver) {
+	if s == nil || s.watch == nil {
+		return
+	}
+	s.watch = s.watch.WithStableIdentityResolver(identity)
+}
+
+func (s *Service) provider(id string) (Provider, error) {
+	provider, ok := s.providers[id]
+	if !ok {
+		return nil, fmt.Errorf("unsupported provider %q", id)
+	}
+	return provider, nil
+}
+
+func (s *Service) CreateConnection(ctx context.Context, userID int, input CreateConnectionInput, baseURL string) (*CreateConnectionResult, error) {
+	provider, err := s.provider(input.Provider)
+	if err != nil {
+		return nil, err
+	}
+	if err := provider.ValidateCreateInput(input); err != nil {
+		return nil, err
+	}
+	// Only the Plex provider contacts the server; the others just receive
+	// its webhooks.
+	if input.Provider == ProviderPlex {
+		if _, err := s.localNetwork.CheckServerURL(ctx, userID, input.BaseURL); err != nil {
+			return nil, err
+		}
+	}
+	exists, err := s.repo.ProfileExistsForUser(ctx, userID, input.DefaultProfileID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, historyimport.ErrProfileNotFound
+	}
+	secret, err := randomSecret()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := s.repo.CreateConnection(ctx, Connection{
+		ID:               uuid.NewString(),
+		UserID:           userID,
+		Provider:         input.Provider,
+		ServerID:         input.ServerID,
+		ServerName:       input.ServerName,
+		BaseURL:          input.BaseURL,
+		AccessToken:      input.AccessToken,
+		DefaultProfileID: input.DefaultProfileID,
+		WebhookSecret:    secret,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if userID, userName, ok, err := provider.DefaultUser(s.localNetwork.Context(ctx, userID), conn, input); err != nil {
+		return nil, err
+	} else if ok {
+		if _, err := s.repo.CreateDefaultMapping(ctx, conn.ID, userID, userName, input.DefaultProfileID); err != nil {
+			return nil, err
+		}
+	}
+
+	return &CreateConnectionResult{
+		Connection: *conn,
+		WebhookURL: buildWebhookURL(baseURL, secret),
+	}, nil
+}
+
+func (s *Service) UpdateConnection(ctx context.Context, userID int, id string, input UpdateConnectionInput) (*Connection, error) {
+	if input.ServerName != nil && strings.TrimSpace(*input.ServerName) == "" {
+		return nil, fmt.Errorf("server_name cannot be empty")
+	}
+	if input.DefaultProfileID != nil && *input.DefaultProfileID != "" {
+		exists, err := s.repo.ProfileExistsForUser(ctx, userID, *input.DefaultProfileID)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, historyimport.ErrProfileNotFound
+		}
+	}
+	return s.repo.UpdateConnection(ctx, userID, id, input)
+}
+
+func (s *Service) DeleteConnection(ctx context.Context, userID int, id string) error {
+	return s.repo.DeleteConnection(ctx, userID, id)
+}
+
+func (s *Service) RotateWebhook(ctx context.Context, userID int, id, baseURL string) (*RotateWebhookResult, error) {
+	secret, err := randomSecret()
+	if err != nil {
+		return nil, err
+	}
+	if err := s.repo.UpdateWebhookSecret(ctx, userID, id, secret); err != nil {
+		return nil, err
+	}
+	return &RotateWebhookResult{WebhookURL: buildWebhookURL(baseURL, secret)}, nil
+}
+
+func (s *Service) GetProfileMappings(ctx context.Context, userID int, id string) (*ProfileMappingsResponse, error) {
+	conn, err := s.repo.GetConnection(ctx, userID, id)
+	if err != nil {
+		return nil, err
+	}
+	mappings, err := s.repo.ListMappings(ctx, conn.ID)
+	if err != nil {
+		return nil, err
+	}
+	provider, err := s.provider(conn.Provider)
+	if err != nil {
+		return nil, err
+	}
+	discovered, available, discoverErr := provider.DiscoverUsers(s.localNetwork.Context(ctx, conn.UserID), conn, mappings)
+	if discoverErr == nil {
+		conn.AccountDiscoveryAvailable = available
+		_ = s.repo.SetDiscoveryAvailable(ctx, conn.ID, available)
+	} else {
+		discovered = mappingsToDiscoveredUsers(mappings)
+	}
+	if len(discovered) == 0 {
+		discovered = mappingsToDiscoveredUsers(mappings)
+	}
+	return &ProfileMappingsResponse{
+		Mappings:                  mappings,
+		DiscoveredUsers:           discovered,
+		AccountDiscoveryAvailable: conn.AccountDiscoveryAvailable,
+	}, nil
+}
+
+func (s *Service) UpdateProfileMappings(ctx context.Context, userID int, id string, input UpdateProfileMappingsInput) ([]ProfileMapping, error) {
+	conn, err := s.repo.GetConnection(ctx, userID, id)
+	if err != nil {
+		return nil, err
+	}
+	for _, mapping := range input.Mappings {
+		if mapping.SiloProfileID == nil || *mapping.SiloProfileID == "" {
+			continue
+		}
+		exists, err := s.repo.ProfileExistsForUser(ctx, userID, *mapping.SiloProfileID)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, historyimport.ErrProfileNotFound
+		}
+	}
+	return s.repo.ReplaceMappings(ctx, conn.ID, input.Mappings)
+}
+
+func (s *Service) CreateEventLog(ctx context.Context, entry WebhookEventLog) (*WebhookEventLog, error) {
+	return s.repo.CreateEventLog(ctx, entry)
+}
+
+// MaxWebhookDeliveryBytes is the largest webhook delivery body any receiver
+// accepts. Every receiver route shares it, so the cap cannot depend on which
+// URL alias a provider was configured with.
+const MaxWebhookDeliveryBytes int64 = 10 << 20
+
+var ErrWebhookTooLarge = errors.New("webhook body exceeds limit")
+var ErrWebhookBody = errors.New("invalid webhook body")
+
+func (s *Service) ProcessWebhook(ctx context.Context, secret string, r *http.Request) (*ProcessWebhookResult, error) {
+	return s.ProcessWebhookBounded(ctx, secret, r, 0)
+}
+
+// ProcessWebhookBounded authenticates the receiver secret before reading the body.
+// The limit bounds the entire delivery before provider parsing or side effects;
+// a zero, negative or larger-than-default limit falls back to
+// MaxWebhookDeliveryBytes, so no caller can read an unbounded body.
+func (s *Service) ProcessWebhookBounded(ctx context.Context, secret string, r *http.Request, limit int64) (*ProcessWebhookResult, error) {
+	conn, err := s.repo.GetConnectionBySecret(ctx, secret)
+	if err != nil {
+		return nil, err
+	}
+	result := &ProcessWebhookResult{
+		ConnectionID: conn.ID,
+		Provider:     conn.Provider,
+	}
+	if limit <= 0 || limit > MaxWebhookDeliveryBytes {
+		limit = MaxWebhookDeliveryBytes
+	}
+	// Taken before the body is buffered, so a slow upload cannot make the
+	// delivery look newer than Silo activity written while it arrived.
+	ctx = withWebhookReceivedAt(ctx, time.Now())
+	body, readErr := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if int64(len(body)) > limit {
+		readErr = ErrWebhookTooLarge
+	} else if readErr != nil {
+		readErr = ErrWebhookBody
+	}
+	if readErr != nil {
+		result.Outcome = OutcomeRejected
+		result.Summary = "Rejected invalid webhook body"
+		result.ErrorMessage = readErr.Error()
+		_ = s.repo.MarkWebhookError(ctx, conn.ID, readErr.Error())
+		return result, readErr
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+	provider, err := s.provider(conn.Provider)
+	if err != nil {
+		return s.failWebhook(ctx, conn.ID, result, err, "Provider configuration failed")
+	}
+	event, err := provider.ParseWebhook(s.localNetwork.Context(ctx, conn.UserID), conn, r)
+	if err != nil {
+		result.Outcome = OutcomeRejected
+		result.Summary = "Rejected invalid " + conn.Provider + " webhook payload"
+		message := err.Error()
+		if refused, ok := historyimport.ServerAddressMessage(err); ok {
+			message = refused
+		}
+		result.ErrorMessage = message
+		_ = s.repo.MarkWebhookError(ctx, conn.ID, message)
+		return result, err
+	}
+	if event != nil {
+		result.EventKind = event.EventKind
+		result.Action = event.Action
+		result.UserID = event.UserID
+		result.UserName = event.UserName
+		result.ExternalItemID = event.ExternalItemID
+		result.MediaKind = event.MediaKind
+	}
+	if err := s.repo.MarkWebhookReceived(ctx, conn.ID); err != nil {
+		slog.WarnContext(ctx, "webhook sync: failed to mark receipt", "component", "webhooksync", "connection_id", conn.ID, "error", err)
+	}
+	if event == nil || !event.Apply {
+		result.Outcome = OutcomeIgnored
+		result.Summary = webhookResultSummary(event, "Ignored unsupported webhook event")
+		return result, nil
+	}
+	if err := s.repo.UpsertSeenUser(ctx, conn.ID, event.UserID, event.UserName); err != nil {
+		slog.WarnContext(ctx, "webhook sync: failed to upsert seen external user", "component", "webhooksync", "connection_id", conn.ID, "external_user_id", event.UserID, "error", err)
+	}
+
+	if mapping, err := s.repo.GetMappingByUser(ctx, conn.ID, event.UserID); err != nil {
+		return s.failWebhook(ctx, conn.ID, result, err, "Failed to resolve profile mapping")
+	} else if profileID, ok := resolveWebhookProfileID(mapping); ok {
+		result.ProfileID = profileID
+	} else {
+		result.Outcome = OutcomeSkipped
+		result.Summary = "Skipped because external user is not linked to a Silo profile"
+		return result, nil
+	}
+	profileID := result.ProfileID
+
+	// A new playback lets the next completion count as another watch. Its item
+	// state is keyed by the external IDs, so it needs no metadata or match.
+	if event.Action == ActionPlaybackStarted {
+		state, err := s.repo.GetItemState(ctx, conn.ID, event.UserID, event.ExternalItemID)
+		if err != nil {
+			return s.failWebhook(ctx, conn.ID, result, err, "Failed to load existing item state")
+		}
+		if state != nil && state.LastCompleted {
+			state.LastCompleted = false
+			if err := s.repo.UpsertItemState(ctx, *state); err != nil {
+				return s.failWebhook(ctx, conn.ID, result, err, "Failed to persist playback start")
+			}
+		}
+		result.Outcome = OutcomeIgnored
+		result.Summary = "Noted playback start; watch state unchanged"
+		return result, nil
+	}
+
+	record := event.Record.toHistoryImportRecord()
+	match, _, err := s.matcher.Match(ctx, record)
+	if err != nil {
+		return s.failWebhook(ctx, conn.ID, result, err, "Failed to match webhook item against the catalog")
+	}
+	if match == nil {
+		result.Outcome = OutcomeUnmatched
+		result.Summary = "Received webhook event but found no matching Silo item"
+		return result, nil
+	}
+	result.MatchedMediaItemID = match.MediaItemID
+	result.MatchedMediaItemTitle = match.Title
+
+	switch event.Action {
+	case ActionMarkUnplayed:
+		state, err := s.repo.GetItemState(ctx, conn.ID, event.UserID, event.ExternalItemID)
+		if err != nil {
+			return s.failWebhook(ctx, conn.ID, result, err, "Failed to load existing item state")
+		}
+		if state != nil && !event.OccurredAt.After(state.LastEventAt) {
+			result.Outcome = OutcomeSkipped
+			result.Summary = "Skipped stale mark-unplayed event"
+			return result, nil
+		}
+		if newer, err := s.localProgressIsNewer(ctx, conn.UserID, profileID, match.MediaItemID, state, event.OccurredAt); err != nil {
+			return s.failWebhook(ctx, conn.ID, result, err, "Failed to load local watch progress")
+		} else if newer {
+			result.Outcome = OutcomeSkipped
+			result.Summary = "Skipped because local watch progress is newer"
+			return result, nil
+		}
+		if err := s.watch.RecordImportedMarkUnplayed(ctx, conn.UserID, profileID, match.MediaItemID, event.OccurredAt); err != nil {
+			return s.failWebhook(ctx, conn.ID, result, err, "Failed to apply mark-unplayed event")
+		}
+		s.notifySignalsChanged(ctx, conn.UserID, profileID)
+		if err := s.repo.UpsertItemState(ctx, ItemState{
+			ConnectionID:       conn.ID,
+			ExternalUserID:     event.UserID,
+			ExternalItemID:     event.ExternalItemID,
+			MediaItemID:        match.MediaItemID,
+			LastEventAt:        event.OccurredAt,
+			LastCompleted:      false,
+			LastPositionSecond: 0,
+		}); err != nil {
+			return s.failWebhook(ctx, conn.ID, result, err, "Failed to persist mark-unplayed item state")
+		}
+		result.Outcome = OutcomeApplied
+		result.Summary = "Applied mark-unplayed event"
+		return result, nil
+	case ActionAddFavorite:
+		if err := s.watch.SetFavorite(ctx, conn.UserID, profileID, match.MediaItemID, true); err != nil {
+			return s.failWebhook(ctx, conn.ID, result, err, "Failed to add favorite from webhook event")
+		}
+		s.notifySignalsChanged(ctx, conn.UserID, profileID)
+		result.Outcome = OutcomeApplied
+		result.Summary = "Applied favorite add event"
+		return result, nil
+	case ActionRemoveFavorite:
+		if err := s.watch.SetFavorite(ctx, conn.UserID, profileID, match.MediaItemID, false); err != nil {
+			return s.failWebhook(ctx, conn.ID, result, err, "Failed to remove favorite from webhook event")
+		}
+		s.notifySignalsChanged(ctx, conn.UserID, profileID)
+		result.Outcome = OutcomeApplied
+		result.Summary = "Applied favorite removal event"
+		return result, nil
+	case ActionToggleFavorite:
+		if _, err := s.watch.ToggleFavorite(ctx, conn.UserID, profileID, match.MediaItemID); err != nil {
+			return s.failWebhook(ctx, conn.ID, result, err, "Failed to toggle favorite from webhook event")
+		}
+		s.notifySignalsChanged(ctx, conn.UserID, profileID)
+		result.Outcome = OutcomeApplied
+		result.Summary = "Applied favorite toggle event"
+		return result, nil
+	case "", ActionImportProgress:
+	default:
+		result.Outcome = OutcomeIgnored
+		result.Summary = "Ignored unsupported webhook action"
+		return result, nil
+	}
+
+	state, err := s.repo.GetItemState(ctx, conn.ID, event.UserID, event.ExternalItemID)
+	if err != nil {
+		return s.failWebhook(ctx, conn.ID, result, err, "Failed to load existing item state")
+	}
+	applied := ItemState{
+		ConnectionID:       conn.ID,
+		ExternalUserID:     event.UserID,
+		ExternalItemID:     event.ExternalItemID,
+		MediaItemID:        match.MediaItemID,
+		LastEventAt:        event.OccurredAt,
+		LastCompleted:      event.Completed,
+		LastPositionSecond: event.PositionSeconds,
+	}
+	if newer, err := s.localProgressIsNewer(ctx, conn.UserID, profileID, match.MediaItemID, state, record.UpdatedAt); err != nil {
+		return s.failWebhook(ctx, conn.ID, result, err, "Failed to load local watch progress")
+	} else if newer {
+		if endsPlaybackWithoutApplying(state, event) {
+			if err := s.repo.UpsertItemState(ctx, applied); err != nil {
+				return s.failWebhook(ctx, conn.ID, result, err, "Failed to persist playback completion")
+			}
+		}
+		result.Outcome = OutcomeSkipped
+		result.Summary = "Skipped because local watch progress is newer"
+		return result, nil
+	}
+	if shouldSkipEvent(state, event) {
+		result.Outcome = OutcomeSkipped
+		result.Summary = "Skipped stale or duplicate progress event"
+		return result, nil
+	}
+
+	_, err = s.watch.RecordImportedWatch(
+		ctx,
+		conn.UserID,
+		profileID,
+		match.MediaItemID,
+		record.DurationSeconds,
+		importedPosition(record),
+		record.Played,
+		record.UpdatedAt,
+		record.LastPlayedAt,
+	)
+	if err != nil {
+		return s.failWebhook(ctx, conn.ID, result, err, "Failed to apply imported watch progress")
+	}
+	// Only stop-like events reach here (see the providers), and any recorded
+	// stop can move the taste profile: a finish, a stop at half way or more,
+	// or an early abandonment. The native stop path notifies the same way.
+	s.notifySignalsChanged(ctx, conn.UserID, profileID)
+
+	if err := s.repo.UpsertItemState(ctx, applied); err != nil {
+		return s.failWebhook(ctx, conn.ID, result, err, "Failed to persist imported watch progress")
+	}
+
+	result.Outcome = OutcomeApplied
+	result.Summary = "Applied watch progress event"
+	return result, nil
+}
+
+// localProgressIsNewer reports whether the profile's Silo watch progress for
+// the item is at least as recent as the event, so a delayed delivery cannot
+// overwrite or erase newer activity. An unreadable progress row is an error,
+// so a delivery never writes over progress it could not check.
+func (s *Service) localProgressIsNewer(ctx context.Context, userID int, profileID, mediaItemID string, state *ItemState, eventAt time.Time) (bool, error) {
+	progress, err := s.watch.Progress(ctx, userID, profileID, mediaItemID)
+	if err != nil || progress == nil {
+		return false, err
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, progress.UpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("parse local progress updated_at: %w", err)
+	}
+	return progressOutranksEvent(updatedAt, progress.PositionSeconds, state, eventAt), nil
+}
+
+// progressOutranksEvent reports whether progress last updated at updatedAt at
+// position wins over an event at eventAt. User stores keep updated_at in whole
+// seconds, so the event is compared at that precision too and a tie within one
+// second goes to Silo. The progress this external user and item's last event
+// wrote is left to shouldSkipEvent, which orders events of the same pair,
+// including same-timestamp upgrades.
+func progressOutranksEvent(updatedAt time.Time, position float64, state *ItemState, eventAt time.Time) bool {
+	if isPairsOwnWrite(updatedAt, position, state) {
+		return false
+	}
+	return !eventAt.Truncate(time.Second).After(updatedAt)
+}
+
+// isPairsOwnWrite reports whether progress is the write of the last event
+// applied for the pair: no newer than that event and at the position it
+// stored (user stores keep 0 for a completed item). As in history import, the
+// position tells it apart from Silo playback within the same second.
+func isPairsOwnWrite(updatedAt time.Time, position float64, state *ItemState) bool {
+	if state == nil || updatedAt.After(state.LastEventAt) {
+		return false
+	}
+	written := state.LastPositionSecond
+	if state.LastCompleted {
+		written = 0
+	}
+	return position == written
+}
+
+func (s *Service) failWebhook(ctx context.Context, connectionID string, result *ProcessWebhookResult, err error, summary string) (*ProcessWebhookResult, error) {
+	if result == nil {
+		result = &ProcessWebhookResult{ConnectionID: connectionID}
+	}
+	result.Outcome = OutcomeError
+	result.Summary = summary
+	result.ErrorMessage = err.Error()
+	_ = s.repo.MarkWebhookError(ctx, connectionID, err.Error())
+	return result, err
+}
+
+func webhookResultSummary(event *CanonicalEvent, fallback string) string {
+	if event != nil && strings.TrimSpace(event.Summary) != "" {
+		return event.Summary
+	}
+	return fallback
+}
+
+func mappingsToDiscoveredUsers(mappings []ProfileMapping) []DiscoveredUser {
+	if len(mappings) == 0 {
+		return nil
+	}
+	out := make([]DiscoveredUser, 0, len(mappings))
+	for _, mapping := range mappings {
+		out = append(out, DiscoveredUser{
+			ExternalUserID:   mapping.ExternalUserID,
+			ExternalUserName: mapping.ExternalUserName,
+		})
+	}
+	return out
+}
+
+// endsPlaybackWithoutApplying reports whether a progress event that newer
+// Silo progress kept from applying should still be recorded as ending its
+// playback. A per-playback completion does, so the rest of that playback (a
+// stop in the credits, a repeated scrobble) stays ignored. An event no newer
+// than the pair's last one, such as a scrobble whose lookup finished late, is
+// not recorded, so the state's time never moves back and a playback that has
+// since restarted is not closed again.
+func endsPlaybackWithoutApplying(state *ItemState, event *CanonicalEvent) bool {
+	if !event.CompletionPerPlayback || !event.Completed {
+		return false
+	}
+	return state == nil || event.OccurredAt.After(state.LastEventAt)
+}
+
+// shouldSkipEvent reports whether a progress event is stale or repeats one
+// already applied for the same external user and item.
+func shouldSkipEvent(state *ItemState, event *CanonicalEvent) bool {
+	if state == nil {
+		return false
+	}
+	// Once a per-playback provider reports completion, the rest of that
+	// playback (a repeated scrobble, a stop in the credits) changes nothing
+	// until a new playback starts.
+	if event.CompletionPerPlayback && state.LastCompleted {
+		return true
+	}
+	// An older event never overrides a newer one, so a replayed completion
+	// cannot undo a later mark-unplayed.
+	if event.OccurredAt.Before(state.LastEventAt) {
+		return true
+	}
+	if event.OccurredAt.After(state.LastEventAt) {
+		return false
+	}
+	// A same-instant event applies only if it adds information.
+	if !state.LastCompleted && event.Completed {
+		return false
+	}
+	return event.PositionSeconds < state.LastPositionSecond+5
+}
+
+func resolveWebhookProfileID(mapping *ProfileMapping) (string, bool) {
+	if mapping == nil || mapping.SiloProfileID == nil || strings.TrimSpace(*mapping.SiloProfileID) == "" {
+		return "", false
+	}
+	return *mapping.SiloProfileID, true
+}
+
+func buildWebhookURL(baseURL, secret string) string {
+	if baseURL == "" {
+		return webhookSyncPathPrefix + secret
+	}
+	return strings.TrimRight(baseURL, "/") + webhookSyncPathPrefix + secret
+}
+
+func randomSecret() (string, error) {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate webhook secret: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func importedPosition(record historyimport.Record) float64 {
+	if record.Played && record.DurationSeconds > 0 {
+		return record.DurationSeconds
+	}
+	return record.PositionSeconds
+}
+
+func (r CanonicalRecord) toHistoryImportRecord() historyimport.Record {
+	return historyimport.Record{
+		ExternalID:      r.ExternalID,
+		Kind:            r.Kind,
+		Title:           r.Title,
+		Year:            r.Year,
+		IMDbID:          r.IMDbID,
+		TMDBID:          r.TMDBID,
+		TVDBID:          r.TVDBID,
+		SeriesTitle:     r.SeriesTitle,
+		SeriesYear:      r.SeriesYear,
+		SeriesIMDbID:    r.SeriesIMDbID,
+		SeriesTMDBID:    r.SeriesTMDBID,
+		SeriesTVDBID:    r.SeriesTVDBID,
+		SeasonNumber:    r.SeasonNumber,
+		EpisodeNumber:   r.EpisodeNumber,
+		Played:          r.Played,
+		LastPlayedAt:    r.LastPlayedAt,
+		PositionSeconds: r.PositionSeconds,
+		DurationSeconds: r.DurationSeconds,
+		UpdatedAt:       r.UpdatedAt,
+	}
+}
+
+type Provider interface {
+	ID() string
+	ValidateCreateInput(input CreateConnectionInput) error
+	DefaultUser(ctx context.Context, conn *Connection, input CreateConnectionInput) (externalUserID string, externalUserName string, ok bool, err error)
+	DiscoverUsers(ctx context.Context, conn *Connection, mappings []ProfileMapping) ([]DiscoveredUser, bool, error)
+	ParseWebhook(ctx context.Context, conn *Connection, r *http.Request) (*CanonicalEvent, error)
+}

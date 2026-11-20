@@ -1,0 +1,239 @@
+package fspath
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+)
+
+func TestEncodePreservesPathStructure(t *testing.T) {
+	dir := "/mnt/media/Takk for alt (2023)"
+	raw := dir + "/Season 01/B\xe5rd.mkv"
+	encoded := Encode(raw)
+	if !strings.HasPrefix(encoded, dir+"/") {
+		t.Fatalf("Encode(%q) = %q, lost the valid prefix", raw, encoded)
+	}
+	if got, want := filepath.Dir(encoded), dir+"/Season 01"; got != want {
+		t.Fatalf("Dir = %q, want %q", got, want)
+	}
+	if got := filepath.Base(encoded); Decode(got) != "B\xe5rd.mkv" {
+		t.Fatalf("Base = %q does not decode to the raw name", got)
+	}
+	if strings.Count(encoded, "/") != strings.Count(raw, "/") {
+		t.Fatalf("Encode changed the number of separators: %q", encoded)
+	}
+}
+
+func TestDisplayReadsEscapedBytesAsWindows1252(t *testing.T) {
+	for raw, want := range map[string]string{
+		"Takk for alt B\xe5rd Ylvis\xe5ker": "Takk for alt Bård Ylvisåker",
+		"Caf\xe9 \x96 \x93Quoted\x94 \x80":  "Café – “Quoted” €",
+		"undefined \x81 byte":               "undefined � byte",
+		"already UTF-8 Bård":                "already UTF-8 Bård",
+	} {
+		if got := Display(Encode(raw)); got != want {
+			t.Errorf("Display(Encode(%q)) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestOSWrappersOpenEncodedPaths(t *testing.T) {
+	dir := t.TempDir()
+	rawDir := filepath.Join(dir, "S\xe6son 1")
+	rawFile := filepath.Join(rawDir, "Episode B\xe5rd.mkv")
+	if err := os.Mkdir(rawDir, 0o755); err != nil {
+		t.Skipf("file system rejects non-UTF-8 names: %v", err)
+	}
+	if err := os.WriteFile(rawFile, []byte("video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(rawFile, filepath.Join(dir, "link.mkv")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := ReadDir(Encode(rawDir))
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != Encode("Episode B\xe5rd.mkv") {
+		t.Fatalf("ReadDir entries = %v, want the encoded name", entries)
+	}
+	info, err := entries[0].Info()
+	if err != nil || info.Name() != entries[0].Name() {
+		t.Fatalf("entry Info name = %v (%v), want %q", info, err, entries[0].Name())
+	}
+
+	encoded := filepath.Join(Encode(rawDir), entries[0].Name())
+	if encoded != Encode(rawFile) {
+		t.Fatalf("joined path %q, want %q", encoded, Encode(rawFile))
+	}
+	if info, err := Stat(encoded); err != nil || info.Name() != entries[0].Name() {
+		t.Fatalf("Stat = %v, %v", info, err)
+	}
+	if _, err := Lstat(encoded); err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	data, err := ReadFile(encoded)
+	if err != nil || string(data) != "video" {
+		t.Fatalf("ReadFile = %q, %v", data, err)
+	}
+	f, err := Open(encoded)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	opened, err := f.Stat()
+	_ = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lstat, _ := Lstat(encoded)
+	if !SameFile(lstat, opened) || !SameFile(info, lstat) {
+		t.Fatal("SameFile is false for the same file seen through Lstat, Open, and ReadDir")
+	}
+	if other, err := Stat(dir); err != nil || SameFile(lstat, other) {
+		t.Fatalf("SameFile is true for a different file (%v)", err)
+	}
+	if target, err := Readlink(filepath.Join(dir, "link.mkv")); err != nil || target != encoded {
+		t.Fatalf("Readlink = %q, %v; want %q", target, err, encoded)
+	}
+	resolved, err := EvalSymlinks(filepath.Join(dir, "link.mkv"))
+	if err != nil || resolved != encoded {
+		t.Fatalf("EvalSymlinks = %q, %v; want %q", resolved, err, encoded)
+	}
+
+	out, err := CommandContext(context.Background(), "cat", encoded).Output()
+	if err != nil || !bytes.Equal(out, []byte("video")) {
+		t.Fatalf("cat via CommandContext = %q, %v", out, err)
+	}
+}
+
+// A wedged mount must not pin the callers: each returns when its own context
+// ends, and callers for the same path share one blocked stat instead of
+// stranding a goroutine per request.
+func TestStatContextReturnsWhenContextEndsWhileStatBlocks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		var calls atomic.Int32
+		orig := osStat
+		osStat = func(name string) (os.FileInfo, error) {
+			calls.Add(1)
+			<-release
+			return nil, os.ErrNotExist
+		}
+		defer func() { osStat = orig }()
+		released := false
+		defer func() {
+			if !released {
+				close(release)
+			}
+		}()
+
+		const path = "/media/wedged/movie.mkv"
+		first, cancelFirst := context.WithCancel(context.Background())
+		defer cancelFirst()
+		firstDone := make(chan error, 1)
+		go func() {
+			_, err := StatContext(first, path)
+			firstDone <- err
+		}()
+		secondDone := make(chan error, 1)
+		go func() {
+			_, err := StatContext(context.Background(), path)
+			secondDone <- err
+		}()
+		synctest.Wait()
+		if n := calls.Load(); n != 1 {
+			t.Fatalf("stat ran %d times for one path, want the callers to share one", n)
+		}
+
+		cancelFirst()
+		synctest.Wait()
+		select {
+		case err := <-firstDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("StatContext error = %v, want context.Canceled", err)
+			}
+		default:
+			t.Fatal("StatContext still waiting on the blocked stat after its context ended")
+		}
+		select {
+		case err := <-secondDone:
+			t.Fatalf("caller with a live context returned %v before the stat did", err)
+		default:
+		}
+
+		close(release)
+		released = true
+		if err := <-secondDone; !os.IsNotExist(err) {
+			t.Fatalf("shared StatContext result = %v, want the stat's not-exist error", err)
+		}
+	})
+}
+
+// Cancel just after the entry check observes a live context, so completion
+// and cancellation are both ready when StatContext starts waiting.
+type cancelAfterErrCheckContext struct {
+	context.Context //nolint:containedctx // Wrap a real context to cancel immediately after the entry check.
+	cancel          context.CancelFunc
+}
+
+func (c *cancelAfterErrCheckContext) Err() error {
+	err := c.Context.Err()
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
+	return err
+}
+
+func TestStatContextPrefersCancellationToCompletedStat(t *testing.T) {
+	const path = "/media/completed/movie.mkv"
+	done := make(chan struct{})
+	close(done)
+	statCallsMu.Lock()
+	statCalls[path] = &statCall{done: done, err: os.ErrNotExist}
+	statCallsMu.Unlock()
+	t.Cleanup(func() {
+		statCallsMu.Lock()
+		delete(statCalls, path)
+		statCallsMu.Unlock()
+	})
+
+	// Exercise both select branches without relying on scheduler timing.
+	for range 64 {
+		ctx, cancel := context.WithCancel(t.Context())
+		_, err := StatContext(&cancelAfterErrCheckContext{Context: ctx, cancel: cancel}, path)
+		cancel()
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StatContext error = %v, want context.Canceled instead of the completed stat", err)
+		}
+	}
+}
+
+func TestFFConcatFileURLQuotesForFFconcat(t *testing.T) {
+	tests := map[string]string{
+		"/media/Movie (2020)/movie.mkv": `'file:/media/Movie (2020)/movie.mkv'`,
+		"/media/It's/it's.mkv":          `'file:/media/It'\''s/it'\''s.mkv'`,
+		`/media/a\b\'c.mkv`:             `'file:/media/a\b\'\''c.mkv'`,
+		"/media/#1: what?.mkv":          `'file:/media/#1: what?.mkv'`,
+		// An fspath-encoded name is written as its real bytes.
+		Encode("/media/B\xe5rd.mkv"): "'file:/media/B\xe5rd.mkv'",
+	}
+	for input, want := range tests {
+		got, err := FFConcatFileURL(input)
+		if err != nil || got != want {
+			t.Errorf("FFConcatFileURL(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"/media/a\nfile '/etc/passwd'.mkv", "/media/a\r.mkv", "/media/a\x00.mkv"} {
+		if got, err := FFConcatFileURL(input); err == nil {
+			t.Errorf("FFConcatFileURL(%q) = %q, want an error", input, got)
+		}
+	}
+}

@@ -1,0 +1,266 @@
+package plugins
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/capability"
+
+	"github.com/Silo-Server/silo-server/internal/pluginhost"
+)
+
+// countingHerdHost simulates the real Host: Start records the launched client so
+// a later Client() hits the warm cache; it counts Start calls and can delay each
+// launch to force concurrent overlap.
+type countingHerdHost struct {
+	mu          sync.Mutex
+	current     map[int]pluginClient
+	starts      int
+	startResult pluginClient
+	startErr    error
+	startDelay  time.Duration
+}
+
+func (h *countingHerdHost) Client(id int) (pluginClient, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if c, ok := h.current[id]; ok {
+		return c, nil
+	}
+	return nil, pluginhost.ErrClientNotFound
+}
+
+func (h *countingHerdHost) Start(_ context.Context, req pluginhost.StartRequest) (pluginClient, error) {
+	if h.startDelay > 0 {
+		time.Sleep(h.startDelay)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.starts++
+	if h.startErr != nil {
+		return nil, h.startErr
+	}
+	if h.current == nil {
+		h.current = map[int]pluginClient{}
+	}
+	h.current[req.InstallationID] = h.startResult
+	return h.startResult, nil
+}
+
+func (h *countingHerdHost) Stop(id int) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.current, id)
+	return nil
+}
+
+func (h *countingHerdHost) Shutdown(context.Context) error { return nil }
+func (h *countingHerdHost) NextStartSeq() uint64           { return 0 }
+
+func (h *countingHerdHost) startCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.starts
+}
+
+func TestEnsureClientSingleFlightsConcurrentLaunch(t *testing.T) {
+	manifest := testPluginManifest(t, "silo.metadb", "0.0.36")
+	store := installedPluginStore(t, 7, manifest)
+	host := &countingHerdHost{
+		startResult: &fakePluginClient{manifest: manifest},
+		startDelay:  25 * time.Millisecond,
+	}
+	service := &Service{installations: store, host: host}
+
+	const n = 20
+	var wg sync.WaitGroup
+	release := make(chan struct{})
+	clients := make([]pluginClient, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-release
+			clients[i], errs[i] = service.ensureClient(context.Background(), 7)
+		}(i)
+	}
+	close(release)
+	wg.Wait()
+
+	if got := host.startCount(); got != 1 {
+		t.Fatalf("host.Start calls = %d, want 1 (singleflighted)", got)
+	}
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("caller %d err = %v", i, errs[i])
+		}
+		if clients[i] != host.startResult {
+			t.Fatalf("caller %d got %#v, want shared launched client", i, clients[i])
+		}
+	}
+
+	if _, err := service.ensureClient(context.Background(), 7); err != nil {
+		t.Fatalf("post-warm ensureClient err = %v", err)
+	}
+	if got := host.startCount(); got != 1 {
+		t.Fatalf("post-warm host.Start calls = %d, want still 1", got)
+	}
+}
+
+// ctxCaptureHost blocks inside Start until released, and records whether the
+// launch context was canceled. It lets a test cancel the singleflight leader's
+// ctx while a launch is in flight.
+type ctxCaptureHost struct {
+	mu          sync.Mutex
+	current     map[int]pluginClient
+	startResult pluginClient
+	entered     chan struct{}
+	proceed     chan struct{}
+	sawCancel   bool
+}
+
+func (h *ctxCaptureHost) Client(id int) (pluginClient, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if c, ok := h.current[id]; ok {
+		return c, nil
+	}
+	return nil, pluginhost.ErrClientNotFound
+}
+
+func (h *ctxCaptureHost) Start(ctx context.Context, req pluginhost.StartRequest) (pluginClient, error) {
+	close(h.entered)
+	select {
+	case <-ctx.Done():
+		h.mu.Lock()
+		h.sawCancel = true
+		h.mu.Unlock()
+		return nil, ctx.Err()
+	case <-h.proceed:
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.current == nil {
+		h.current = map[int]pluginClient{}
+	}
+	h.current[req.InstallationID] = h.startResult
+	return h.startResult, nil
+}
+
+func (h *ctxCaptureHost) Stop(id int) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.current, id)
+	return nil
+}
+
+func (h *ctxCaptureHost) Shutdown(context.Context) error { return nil }
+func (h *ctxCaptureHost) NextStartSeq() uint64           { return 0 }
+
+func (h *ctxCaptureHost) canceledDuringLaunch() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sawCancel
+}
+
+// TestEnsureClientLaunchIsolatedFromLeaderCancellation pins that a deduped
+// launch is not coupled to the cancellation of whichever caller happened to be
+// the singleflight leader: if that caller's request is canceled mid-launch, the
+// shared launch (which other waiters depend on) must continue.
+func TestEnsureClientLaunchIsolatedFromLeaderCancellation(t *testing.T) {
+	manifest := testPluginManifest(t, "silo.metadb", "0.0.36")
+	store := installedPluginStore(t, 7, manifest)
+	host := &ctxCaptureHost{
+		startResult: &fakePluginClient{manifest: manifest},
+		entered:     make(chan struct{}),
+		proceed:     make(chan struct{}),
+	}
+	service := &Service{installations: store, host: host}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		c   pluginClient
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		c, err := service.ensureClient(ctx, 7)
+		done <- result{c, err}
+	}()
+
+	<-host.entered // launch is in flight inside Start
+	cancel()       // cancel the leader's ctx mid-launch
+
+	select {
+	case r := <-done:
+		t.Fatalf("ensureClient returned early after leader cancel (err=%v); launch was coupled to leader ctx", r.err)
+	case <-time.After(100 * time.Millisecond):
+		// still launching — isolated from the leader's cancellation, as required
+	}
+
+	close(host.proceed)
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("ensureClient err = %v, want nil", r.err)
+	}
+	if r.c != host.startResult {
+		t.Fatalf("got %#v, want launched client", r.c)
+	}
+	if host.canceledDuringLaunch() {
+		t.Fatalf("launch ctx was canceled by the leader; expected isolation")
+	}
+}
+
+func (h *countingHerdHost) Running(id int) bool {
+	_, err := h.Client(id)
+	return err == nil
+}
+
+func (h *ctxCaptureHost) Running(id int) bool {
+	_, err := h.Client(id)
+	return err == nil
+}
+
+// The host stops an idle plugin only when its start asked for that. An RPC
+// that finds no client, as after an idle stop, starts a lazy plugin with the
+// request set and reports the stopped plugin without an error; a resident is
+// the supervisor's and is never started with it.
+func TestOnlyLazyPluginsAreStartedWithStopWhenIdle(t *testing.T) {
+	manifest := testPluginManifest(t, "silo.metadb", "0.0.36")
+	store := installedPluginStore(t, 7, manifest)
+	host := &fakeServiceHost{clientErr: pluginhost.ErrClientNotFound}
+	service := &Service{installations: store, host: host}
+
+	// No process, as after an idle stop: reported stopped, not failed.
+	if state := service.RuntimeStateOf(store.byID[7]); state.State != ResidentStopped || state.LastError != "" {
+		t.Fatalf("runtime state of a stopped idle plugin = %+v, want stopped with no error", state)
+	}
+	if _, err := service.ensureClient(context.Background(), 7); err != nil {
+		t.Fatalf("ensureClient after an idle stop: %v", err)
+	}
+	if len(host.started) != 1 || len(host.stopped) != 0 {
+		t.Fatalf("starts = %d, stops = %d; want 1 start and no stop", len(host.started), len(host.stopped))
+	}
+	if !host.started[0].StopWhenIdle {
+		t.Fatal("a lazily started plugin was not started with StopWhenIdle")
+	}
+
+	resident := testPluginManifest(t, "silo.overlay", "1.0.0")
+	resident.Capabilities = []*pluginv1.CapabilityDescriptor{{
+		Type: capability.NetworkAccessProvider, Id: "overlay",
+		NetworkAccessProvider: &pluginv1.NetworkAccessProviderDescriptor{Provider: "tailscale"},
+	}}
+	residentStore := installedPluginStore(t, 8, resident)
+	residentHost := &fakeServiceHost{}
+	residentService := &Service{installations: residentStore, host: residentHost}
+	if _, err := residentService.start(context.Background(), 8, true); err != nil {
+		t.Fatalf("start resident: %v", err)
+	}
+	if len(residentHost.started) != 1 || residentHost.started[0].StopWhenIdle {
+		t.Fatalf("resident start requests = %+v, want one without StopWhenIdle", residentHost.started)
+	}
+}

@@ -1,0 +1,249 @@
+package playback
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
+)
+
+func TestPrepareFileResolvesOneDeviceAndReleasesAfterExit(t *testing.T) {
+	resetDeviceLoad(t)
+	devA, devB := "/dev/dri/renderD888", "/dev/dri/renderD889"
+	fakeDeviceStat(t, devA, devB)
+
+	// Fake ffmpeg: record argv, create the output (last arg) so finalize works.
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args.txt")
+	script := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > "+argsFile+"\neval \"touch \\${$#}\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(dir, "artifact.mp4")
+	err := PrepareFile(context.Background(), TranscodeOpts{
+		InputPath:        "/nonexistent/input.mkv",
+		TargetCodecVideo: "h264",
+		TargetCodecAudio: "aac",
+		FFmpegPath:       script,
+		HWAccel:          "vaapi",
+		HWDevice:         devA + "," + devB,
+	}, outputPath)
+	if err != nil {
+		t.Fatalf("PrepareFile: %v", err)
+	}
+
+	argv, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(argv)
+	if !strings.Contains(got, devA) {
+		t.Fatalf("ffmpeg args missing resolved device %s:\n%s", devA, got)
+	}
+	if strings.Contains(got, devA+","+devB) {
+		t.Fatalf("ffmpeg args contain the raw device list:\n%s", got)
+	}
+	if count := hwDeviceActiveCount(devA); count != 0 {
+		t.Fatalf("active count after PrepareFile returned = %d, want 0", count)
+	}
+}
+
+// prepareGPUCountSink records the NVENC workload count at each progress
+// reading, which arrives while FFmpeg is still running.
+type prepareGPUCountSink struct{ counts []int }
+
+func (s *prepareGPUCountSink) PrepareProgress(PrepareProgress) {
+	s.counts = append(s.counts, hwDeviceActiveCount(DefaultNVENCDevice))
+}
+
+// A download under explicit NVENC whose NVDEC rejects the source decodes on
+// the CPU with NVENC, and moves on to software only when that attempt failed
+// before writing any output. The software stage holds no GPU reservation.
+func TestPrepareFileRetriesRejectedDecodeOnCPU(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		mixedWrites  bool
+		wantErr      bool
+		wantSoftware bool
+	}{
+		{name: "mixed attempt dies while starting", wantSoftware: true},
+		{name: "mixed attempt fails after writing output", mixedWrites: true, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDeviceLoad(t)
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "invocations.log")
+			mixed := "exit 1"
+			if tt.mixedWrites {
+				mixed = "printf partial > \"$last\"; exit 1"
+			}
+			script := filepath.Join(dir, "ffmpeg")
+			fake := "#!/bin/sh\n" +
+				"for last; do :; done\n" +
+				"printf '%s\\n' \"$*\" >> " + logPath + "\n" +
+				"case \"$*\" in\n" +
+				"  *'-hwaccel cuda'*) echo '[hevc @ 0x1] Hardware is lacking required capabilities' >&2; exit 1 ;;\n" +
+				"  *h264_nvenc*) " + mixed + " ;;\n" +
+				"  *) printf 'progress=continue\\n'; printf x > \"$last\"; exit 0 ;;\n" +
+				"esac\n"
+			if err := os.WriteFile(script, []byte(fake), 0o755); err != nil {
+				t.Fatalf("write fake ffmpeg: %v", err)
+			}
+
+			sink := &prepareGPUCountSink{}
+			err := PrepareFile(context.Background(), TranscodeOpts{
+				InputPath:           "/media/movie.mkv",
+				FFmpegPath:          script,
+				PrepareProgressSink: sink,
+				SourceVideoCodec:    "hevc",
+				TargetCodecVideo:    "h264",
+				TargetCodecAudio:    "aac",
+				TargetResolution:    "720p",
+				TargetBitrateKbps:   2000,
+				HWAccel:             transcodeHWNVENC,
+				AudioTrackIndex:     -1,
+			}, filepath.Join(dir, "artifact.mp4"))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("PrepareFile() error = %v, want error %v", err, tt.wantErr)
+			}
+			log, readErr := os.ReadFile(logPath)
+			if readErr != nil {
+				t.Fatalf("read invocation log: %v", readErr)
+			}
+			attempts := strings.Split(strings.TrimSpace(string(log)), "\n")
+			wantAttempts := 2
+			if tt.wantSoftware {
+				wantAttempts = 3
+			}
+			if len(attempts) != wantAttempts || !strings.Contains(attempts[1], "h264_nvenc") || strings.Contains(attempts[1], "-hwaccel cuda") {
+				t.Fatalf("attempts = %q, want CUDA decode, then CPU decode with NVENC", attempts)
+			}
+			if tt.wantSoftware && !strings.Contains(attempts[2], "libx264") {
+				t.Fatalf("third attempt = %q, want libx264", attempts[2])
+			}
+			if tt.wantSoftware && (len(sink.counts) != 1 || sink.counts[0] != 0) {
+				t.Fatalf("NVENC workloads during the software encode = %v, want [0]", sink.counts)
+			}
+		})
+	}
+}
+
+func TestPrepareFileRetriesVideoToolboxFailureInSoftware(t *testing.T) {
+	setupHWAccelTest(t)
+	dir := t.TempDir()
+	script := filepath.Join(dir, "ffmpeg")
+	logPath := filepath.Join(dir, "invocations.log")
+	// Answers capability probes and smoke encodes, fails real VideoToolbox
+	// encodes, and succeeds software encodes by writing the output file
+	// (ffmpeg's contract PrepareFile finalizes on).
+	fake := "#!/bin/sh\n" +
+		"printf '%s\n' \"$*\" >> " + logPath + "\n" +
+		"case \"$*\" in\n" +
+		"  *-hwaccels*) echo videotoolbox; exit 0 ;;\n" +
+		"  *-encoders*) echo ' V..... h264_videotoolbox x'; echo ' V..... hevc_videotoolbox x'; exit 0 ;;\n" +
+		"  *videotoolbox*'-f null'*) exit 0 ;;\n" +
+		"  *videotoolbox*) exit 1 ;;\n" +
+		"  *) for last; do :; done; printf x > \"$last\"; exit 0 ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(script, []byte(fake), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "artifact.mp4")
+	err := PrepareFile(context.Background(), TranscodeOpts{
+		InputPath:         "/media/movie.mkv",
+		SessionID:         "prepare-vt-retry",
+		FFmpegPath:        script,
+		SourceVideoCodec:  "h264",
+		TargetCodecVideo:  "h264",
+		TargetCodecAudio:  "aac",
+		TargetResolution:  "720p",
+		TargetBitrateKbps: 2000,
+		HWAccel:           "videotoolbox",
+		AudioTrackIndex:   -1,
+	}, outputPath)
+	if err != nil {
+		t.Fatalf("PrepareFile() error = %v, want software retry to succeed", err)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("finalized artifact missing: %v", err)
+	}
+
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read invocation log: %v", err)
+	}
+	if !strings.Contains(string(log), "h264_videotoolbox -pix_fmt") {
+		t.Fatalf("first attempt should encode with VideoToolbox:\n%s", log)
+	}
+	if !strings.Contains(string(log), "libx264") {
+		t.Fatalf("retry should encode with libx264:\n%s", log)
+	}
+}
+
+func TestPrepareFileDoesNotDropHardwareToneMapGraphOnSoftwareRetry(t *testing.T) {
+	setupHWAccelTest(t)
+	dir := t.TempDir()
+	inputPath := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(inputPath, []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(inputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	track := models.VideoTrack{
+		Codec: "hevc", Profile: "Main 10", Level: 153, Width: 3840, Height: 2160, FrameRate: "23.976",
+		ColorRange: "tv", ColorPrimaries: "bt2020", ColorTransfer: "smpte2084", ColorSpace: "bt2020nc",
+		BitDepth: 10, PixelFormat: "yuv420p10le",
+	}
+	revision := tonemap.RevisionForFile(&models.MediaFile{ID: 42, FileSize: info.Size(), VideoTracks: []models.VideoTrack{track}})
+
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	logPath := filepath.Join(dir, "invocations.log")
+	ffmpegScript := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> " + logPath + "\n" +
+		"case \"$*\" in\n" +
+		"  *-hwaccels*) echo videotoolbox; exit 0 ;;\n" +
+		"  *-encoders*) echo ' V..... h264_videotoolbox x'; echo ' V..... hevc_videotoolbox x'; exit 0 ;;\n" +
+		"  *videotoolbox*'-f null'*) exit 0 ;;\n" +
+		"  *) exit 1 ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(ffmpegPath, []byte(ffmpegScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	liveJSON := `{"streams":[{"index":0,"codec_name":"hevc","codec_type":"video","profile":"Main 10","level":153,"width":3840,"height":2160,"avg_frame_rate":"24000/1001","pix_fmt":"yuv420p10le","bits_per_raw_sample":"10","color_range":"tv","color_primaries":"bt2020","color_transfer":"smpte2084","color_space":"bt2020nc"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "ffprobe"), []byte("#!/bin/sh\nprintf '%s' '"+liveJSON+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "artifact.mp4")
+	err = PrepareFile(t.Context(), TranscodeOpts{
+		InputPath: inputPath, FFmpegPath: ffmpegPath,
+		SourceVideoCodec: "hevc", SourceVideoBitDepth: 10,
+		TargetCodecVideo: "h264", TargetCodecAudio: "aac", TargetResolution: "1080p", TargetBitrateKbps: 8000,
+		HWAccel:       transcodeHWVideoToolbox,
+		ToneMapPolicy: tonemap.PolicyHardwareThenSoftware, ToneMapMode: tonemap.ModeHardware,
+		ToneMapSourceKind: tonemap.SourcePQ, ToneMapFilter: tonemap.HardwareFilterVideoToolbox,
+		ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3, ToneMapSourceRevision: revision,
+		AudioTrackIndex: -1,
+	}, outputPath)
+	if err == nil {
+		t.Fatal("PrepareFile() succeeded after the hardware tone-map encode failed")
+	}
+	logData, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(logData), "libx264") {
+		t.Fatalf("hardware tone-map failure retried without a valid software recipe:\n%s", logData)
+	}
+	if _, statErr := os.Stat(outputPath); !os.IsNotExist(statErr) {
+		t.Fatalf("invalid tone-mapped artifact was published: %v", statErr)
+	}
+}

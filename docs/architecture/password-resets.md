@@ -1,0 +1,195 @@
+# Password resets and temporary passwords
+
+An administrator can help a locked-out account in two ways without handling its
+password: issue a single-use reset link, or set a temporary password the account
+must replace at its next sign-in. When the server allows it, an account holder can
+also request a reset link from the sign-in page. Reset links live in `internal/passwordreset`.
+The temporary-password state lives in `internal/auth` and the auth middleware. The
+wire contract is in [admin-users-api.md](../admin-users-api.md#passwords) and
+[auth-api.md](../auth-api.md#temporary-passwords).
+
+Reset links apply only to accounts that sign in with a local password
+(`users.local_password_login_enabled`). An account an external authentication
+provider manages has no password here to reset, so the server refuses reset links
+for it and clients hide them. An administrator can still set a password on such an
+account; see Temporary passwords.
+
+## Reset links
+
+**One live link per account.** `password_reset_tokens` is keyed by `user_id`.
+Issuing a link upserts that row, so a newer link cancels the older one with no
+separate revocation step. Completing a reset deletes the row, which makes the link
+single-use. Expired rows stay until the next issue or the account's deletion,
+bounded at one row per account.
+
+**Stored as a digest.** Tokens use the invitation scheme (`auth.NewLinkToken`): 32
+random bytes, base64url in the link, SHA-256 hex at rest. The raw token exists
+only in the email or in the one response that discloses a shared link. The request
+log redacts the `{token}` path parameter of the deprecated path operations.
+
+<a id="link-tokens"></a>
+**Link tokens stay out of URLs the server sees.** A reset or invitation token is a
+bearer credential, and anything in front of Silo that logs request lines or
+`Referer` headers would store it. So:
+
+- `mail.AccountLink` puts the token in the link's fragment (`/reset-password#<token>`,
+  `/invite#<token>`), which a browser never sends.
+- The web app moves the token out of the address into the history entry's state
+  before it renders (`web/src/lib/linkToken.ts`, read by `useLinkToken`), so the router, and anything that
+  keys or stores by URL, never sees it. A link in the old path form is handled the
+  same way, so links issued before this rule still open.
+- The reset and claim screens send the token in a JSON body
+  (`POST /password-resets/lookup|complete`, `POST /invitations/lookup|accept`).
+  The path-token operations remain only as deprecated forms.
+- The HTML shell is served with `Referrer-Policy: strict-origin`, so the requests
+  an old path-form link's page makes before its address is cleared name only the
+  origin.
+
+A new screen that redeems a one-time token follows the same four points. An
+old-form link's own first request still carries its token; nothing after issue can
+change that, and such links expire within 24 hours (resets) or 7 days (invitations).
+
+**Bound to the password it replaces.** Each row records a SHA-256 fingerprint of
+`users.password_hash` at issue time, and a link only resolves while the account
+still has that hash. A password changed any other way (self-service, an
+administrator, another reset) retires outstanding links without other writers
+knowing this table exists. Resolving also requires the account to be enabled and
+to use local password sign-in.
+
+**Retired on recovery email changes.** A database trigger deletes the account's
+link in the transaction that changes `users.email`, covering every account writer.
+Rolling back the email change preserves the link; restoring an earlier address
+does not revive a deleted link. The column's `citext` comparison treats a change
+of letter case as the same recovery identity. Issuance locks the account before
+the link and checks that its email still matches the address read for delivery.
+If the email changes first, no link is issued; if issuance wins, the email change
+deletes that link. Mail sent after a concurrent change can therefore carry only
+an unusable link to the previous address.
+
+**Authority judged under the lock.** Only the Owner may issue a link for
+another admin, nobody else may issue one for the Owner, and a scoped API key
+may not issue one for any admin. The handler checks this on arrival.
+`Repository.Issue` checks it again in the transaction that stores the link,
+after locking the issuer and the account in id order, the order ownership
+transfers use. A promotion of the account, or an ownership move to it, deletes
+the account's link in its own transaction. When it commits first, issuance sees
+the new role and refuses; when issuance commits first, the promotion deletes the
+new link. Either way no link issued under the old role survives. The issuer's
+row is held `FOR KEY SHARE`. That waits for an ownership move, which locks both
+accounts `FOR UPDATE` before changing `is_owner`, so an Owner who hands
+ownership away cannot finish issuing a link for another admin. It does not wait
+for other writers of the issuer's row, such as access-group updates, which lock
+many accounts in no fixed order and could otherwise deadlock with issuance.
+
+**Uniform not-found.** Lookup and completion return the same `ErrNotFound` for
+unknown, expired, used, replaced, and outdated links, so a probe learns nothing.
+The public operations spend the `password_reset` per-IP rate-limit budget; with
+256-bit tokens this is anti-probe hygiene, not the guard.
+
+**One transaction.** Completion locks the account before the link, matching
+issuance, promotion and recovery email changes. It re-checks
+expiry against `clock_timestamp()`, deletes the link, replaces the password,
+clears `password_change_required`, and revokes every login session the account
+owns or impersonates from, then commits. The same transaction revokes the
+account's Audiobookshelf-compatible sessions, deletes its stored
+Jellyfin-compatible sessions, and denies any device sign-in it
+approved that the device has not collected yet, which would otherwise mint a
+fresh session afterwards. Personal API keys survive: the account created them on
+purpose, and revoking them would break its integrations, so the account or an
+administrator revokes them separately. Concurrent completions of one link have
+exactly one winner. Sign-in afterwards is a separate effect: when it fails, the
+response still reports the committed reset (`sign_in_required`) and the caller must
+not replay it. The `OnUserSessionsRevoked` hook then drops Jellyfin-compatible
+sessions held in memory, the same as for administrator account edits, on every
+replica: it announces the revocation on the admin event channel. A self-service
+password change that asks to sign out other sessions (`sign_out_other_sessions`)
+revokes the same set in its own transaction, except the session that asked
+(`RevokeOtherSignInsInTransaction`), and runs the same hook, so both stay in step.
+
+**Issuing takes the account lock too.** Every sign-out everywhere locks the
+account row before it revokes. A credential it covers is issued under that lock,
+after rechecking what the credential comes from in the same transaction, so it
+either commits first and is revoked or sees the revocation and is refused. A
+local password sign-in rechecks the password hash before opening its login
+session. Audiobookshelf-compatible sign-in, refresh, and `/authorize` hold the
+account row `FOR SHARE` while they check the login session the sign-in opened,
+the refresh token being rotated (revoked in that transaction), or the token
+`/authorize` was called with, then store their tokens. A credentials-plugin
+sign-in still opens its login session outside the lock. Jellyfin-compatible
+sessions carry the login session they came from and end with it.
+
+**No link without an external URL.** Links are built on `server.public_url`
+(`mail.AccountLinkBase`, shared with invitations). Without one, issuing fails with
+`capability_not_configured`, and the capability document reports it up front. Email
+delivery also refuses before minting when mail is unconfigured. A link nobody
+receives would still replace the one the account may already hold.
+
+## Self-service reset
+
+**Off until an administrator opts in.** `password_reset.self_service_enabled`
+defaults to false. The public capability document reports `available` only when
+the setting is on and the server can email a link (external URL and mail server);
+the sign-in page offers the request from that document alone.
+
+**The answer says nothing about accounts.** `POST /api/v2/password-resets` checks
+only availability before answering `202`. The lookup, link, and email run
+afterwards in a background task, so neither the response nor its latency reveals
+whether an account matched. Every reason not to send (no match, disabled account,
+external provider, no valid address, cooldown, a live administrator's link) is a
+silent no-op. The background work is bounded per node (`maxPendingRequests`) and
+recovers from panics; beyond the bound a request is dropped and logged, and the
+requester can ask again. A send that certainly failed, because the mail server
+was never reached (`mail.ErrNotSent`), withdraws the link so asking again works at
+once. An uncertain failure keeps the link and its cooldown: the message may have
+arrived, and withdrawing would let repeated requests send more mail. A node dying
+mid-send also leaves the link holding the cooldown, so the requester can ask again
+after five minutes.
+
+**Same link, shorter life, bounded rate.** A requested link is an ordinary row in
+`password_reset_tokens` that names the account as its own issuer, completed through the same screen and
+transaction as an administrator's. It lives `SelfServiceTTL` (an hour), not
+`DefaultTTL`, because nobody vouched for the request. `IssueUnlessRecent` replaces
+the account's link only when that link is older than the cooldown and is not a
+live link an administrator issued, as one upsert. Any other issuer, or none once
+that administrator is deleted, marks the link as an administrator's. That caps mail to one address
+across every node and client IP, stops repeated requests from continually
+replacing a link just sent, and keeps anyone who knows an account name from
+retiring the link an administrator shared. An administrator's `Issue` ignores
+both rules. The per-IP limit is the `password_reset_request` rate-limit
+budget.
+
+## Temporary passwords
+
+**Every password write decides the flag.** `users.password_change_required` is
+written only together with a password. An administrator's create or update sets it
+from `require_password_change`, false when omitted. An administrator's password
+write also turns local password sign-in back on for an account that had it off,
+so `require_password_change` applies to such an account too. A self-service change or a
+completed reset clears it. A write without a password never touches it, so no path
+leaves a stale flag behind.
+
+**Carried in the token, recomputed on issue.** Login, device pairing, OAuth
+completion, and refresh copy the flag from the account into the access-token claim
+`password_change_required`. The auth middleware already validates the token and its
+session on every request, so the restriction costs no extra read. An administrator
+setting a temporary password signs the account out everywhere in the same
+transaction, Audiobookshelf-compatible sessions included, so every session opened
+afterwards carries the claim. Choosing the new
+password revokes every other session of the account in the same transaction: each
+was opened with the temporary password, possibly by someone else, and its next
+refresh would otherwise lift the restriction. The session that chose the password
+gets tokens without the claim on its next refresh. An impersonating
+administrator's tokens never carry it.
+
+**Allowlist, fail closed.** `RequireAuth` admits a restricted session only to the
+exact routes in `passwordChangeRoutes`: reading the account, the password
+capability, changing the password, and logout. Everything
+else, including new routes, returns `403 password_change_required`. The
+`plugin_access` check refuses restricted tokens too. The refusal is still
+attributed to the account in the request log. A restricted session may change the
+password without choosing a profile, but must still prove the temporary password,
+and cannot reuse it as the new one.
+
+**Surfaces that cannot run the change refuse the login.** Jellyfin and
+Audiobookshelf compatible sign-ins call `auth.Service.CompatLoginWithLocalFallback`,
+which refuses an account holding a temporary password before opening a session.

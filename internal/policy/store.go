@@ -1,0 +1,323 @@
+package policy
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var (
+	// ErrDocumentNotFound is returned when a policy document id does not exist.
+	ErrDocumentNotFound = errors.New("policy document not found")
+	// ErrVersionNotFound is returned when a policy document version id does not
+	// exist or does not belong to the requested document.
+	ErrVersionNotFound = errors.New("policy document version not found")
+	// ErrVersionNotCompiled is returned when activation targets a version that
+	// failed compile-check.
+	ErrVersionNotCompiled = errors.New("policy document version did not compile")
+	// ErrDomainAlreadyEnabled is returned when enabling a document would leave
+	// more than one enabled document in the same policy domain.
+	ErrDomainAlreadyEnabled = errors.New("policy domain already has an enabled document")
+	// ErrDocumentHasActiveVersion is returned when deleting a document that still
+	// points at an active version.
+	ErrDocumentHasActiveVersion = errors.New("policy document has an active version")
+)
+
+// Document is an administrator-authored policy document identity. The source is
+// stored on immutable Version rows.
+type Document struct {
+	Revision        int64
+	ID              int64
+	Domain          string
+	Name            string
+	Enabled         bool
+	ActiveVersionID *int64
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// Version is one immutable saved body of Rego source for a policy document.
+type Version struct {
+	ID              int64
+	DocumentID      int64
+	VersionNumber   int
+	RegoSource      string
+	SourceSHA256    string
+	CompiledOK      bool
+	CompileError    *string
+	CreatedByUserID *int
+	Comment         *string
+	CreatedAt       time.Time
+}
+
+// ActiveSource is the enabled active source for one policy domain.
+type ActiveSource struct {
+	DocumentID int64
+	VersionID  int64
+	Source     string
+}
+
+// PolicyStore persists policy documents, immutable versions, active pointers,
+// and the global policy generation counter.
+type PolicyStore struct {
+	pool *pgxpool.Pool
+}
+
+// NewPolicyStore creates a PolicyStore backed by pgxpool.
+func NewPolicyStore(pool *pgxpool.Pool) *PolicyStore {
+	return &PolicyStore{pool: pool}
+}
+
+const documentColumns = `id, domain, name, enabled, active_version_id, created_at, updated_at, revision`
+
+const versionColumns = `id, document_id, version_number, rego_source, source_sha256, compiled_ok, compile_error, created_by_user_id, comment, created_at`
+
+const versionMetadataColumns = `id, document_id, version_number, source_sha256, compiled_ok, compile_error, created_by_user_id, comment, created_at`
+
+// GetDocument returns one policy document by id.
+func (s *PolicyStore) GetDocument(ctx context.Context, id int64) (Document, error) {
+	document, err := scanDocument(s.pool.QueryRow(ctx, `SELECT `+documentColumns+` FROM policy_documents WHERE id = $1`, id))
+	if err != nil {
+		return Document{}, err
+	}
+	return document, nil
+}
+
+// CreateDocument inserts a new enabled policy document.
+func (s *PolicyStore) CreateDocument(ctx context.Context, domain, name string) (Document, error) {
+	document, err := scanDocument(s.pool.QueryRow(ctx, `
+		INSERT INTO policy_documents (domain, name)
+		VALUES ($1, $2)
+		RETURNING `+documentColumns,
+		domain,
+		name,
+	))
+	if err != nil {
+		return Document{}, mapPolicyConstraintError("create policy document", err)
+	}
+	return document, nil
+}
+
+// CreateVersion appends an immutable version to a document, assigning the next
+// per-document version number under a document-row lock.
+func (s *PolicyStore) CreateVersion(ctx context.Context, documentID int64, regoSource, sha256 string, compiledOK bool, compileError *string, createdBy *int, comment string) (Version, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Version{}, fmt.Errorf("begin create policy version: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Account deletion takes the user row before locking attributed documents
+	// for ON DELETE SET NULL. Acquire the same author-before-document order;
+	// the insert's existing FK still reports a missing author.
+	if createdBy != nil {
+		if _, err := tx.Exec(ctx, `SELECT id FROM users WHERE id = $1 FOR KEY SHARE`, *createdBy); err != nil {
+			return Version{}, fmt.Errorf("lock policy version author: %w", err)
+		}
+	}
+
+	var lockedID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM policy_documents WHERE id = $1 FOR UPDATE`, documentID).Scan(&lockedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Version{}, ErrDocumentNotFound
+		}
+		return Version{}, fmt.Errorf("lock policy document: %w", err)
+	}
+
+	var versionNumber int
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(MAX(version_number), 0) + 1
+		FROM policy_document_versions
+		WHERE document_id = $1`,
+		documentID,
+	).Scan(&versionNumber); err != nil {
+		return Version{}, fmt.Errorf("next policy version number: %w", err)
+	}
+
+	version, err := scanVersion(tx.QueryRow(ctx, `
+		INSERT INTO policy_document_versions (
+			document_id, version_number, rego_source, source_sha256, compiled_ok,
+			compile_error, created_by_user_id, comment
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING `+versionColumns,
+		documentID,
+		versionNumber,
+		regoSource,
+		sha256,
+		compiledOK,
+		compileError,
+		createdBy,
+		nilIfEmpty(comment),
+	))
+	if err != nil {
+		return Version{}, fmt.Errorf("insert policy version: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Version{}, fmt.Errorf("commit create policy version: %w", err)
+	}
+	return version, nil
+}
+
+// GetVersion returns one immutable version, including its Rego source.
+func (s *PolicyStore) GetVersion(ctx context.Context, documentID, versionID int64) (Version, error) {
+	version, err := scanVersion(s.pool.QueryRow(ctx, `
+		SELECT `+versionColumns+`
+		FROM policy_document_versions
+		WHERE document_id = $1 AND id = $2`,
+		documentID,
+		versionID,
+	))
+	if err != nil {
+		return Version{}, err
+	}
+	return version, nil
+}
+
+// Activate points a document at a compiled version and bumps policy_generation
+// atomically with the pointer update.
+func (s *PolicyStore) Activate(ctx context.Context, documentID, versionID int64, evalBudget ...time.Duration) (int64, error) {
+	result, err := s.activate(ctx, documentID, versionID, nil, mutationEvalBudget(evalBudget))
+	return result.Generation, err
+}
+
+// ActiveSources returns enabled documents that have an active compiled version,
+// keyed by policy domain.
+func (s *PolicyStore) ActiveSources(ctx context.Context) (map[string]ActiveSource, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT d.domain, d.id, v.id, v.rego_source
+		FROM policy_documents d
+		JOIN policy_document_versions v ON v.id = d.active_version_id
+		WHERE d.enabled
+		ORDER BY d.domain ASC, d.id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list active policy sources: %w", err)
+	}
+	defer rows.Close()
+
+	sources := make(map[string]ActiveSource)
+	for rows.Next() {
+		var domain string
+		var source ActiveSource
+		if err := rows.Scan(&domain, &source.DocumentID, &source.VersionID, &source.Source); err != nil {
+			return nil, fmt.Errorf("scan active policy source: %w", err)
+		}
+		sources[domain] = source
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active policy sources: %w", err)
+	}
+	return sources, nil
+}
+
+// Generation returns the current global policy generation.
+func (s *PolicyStore) Generation(ctx context.Context) (int64, error) {
+	var generation int64
+	if err := s.pool.QueryRow(ctx, `SELECT generation FROM policy_generation WHERE id = true`).Scan(&generation); err != nil {
+		return 0, fmt.Errorf("read policy generation: %w", err)
+	}
+	return generation, nil
+}
+
+func scanDocument(row pgx.Row) (Document, error) {
+	var document Document
+	if err := row.Scan(
+		&document.ID,
+		&document.Domain,
+		&document.Name,
+		&document.Enabled,
+		&document.ActiveVersionID,
+		&document.CreatedAt,
+		&document.UpdatedAt,
+		&document.Revision,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Document{}, ErrDocumentNotFound
+		}
+		return Document{}, fmt.Errorf("scan policy document: %w", err)
+	}
+	return document, nil
+}
+
+func scanVersion(row pgx.Row) (Version, error) {
+	var version Version
+	if err := row.Scan(
+		&version.ID,
+		&version.DocumentID,
+		&version.VersionNumber,
+		&version.RegoSource,
+		&version.SourceSHA256,
+		&version.CompiledOK,
+		&version.CompileError,
+		&version.CreatedByUserID,
+		&version.Comment,
+		&version.CreatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Version{}, ErrVersionNotFound
+		}
+		return Version{}, fmt.Errorf("scan policy version: %w", err)
+	}
+	return version, nil
+}
+
+func scanVersionMetadata(row pgx.Row) (Version, error) {
+	var version Version
+	if err := row.Scan(
+		&version.ID,
+		&version.DocumentID,
+		&version.VersionNumber,
+		&version.SourceSHA256,
+		&version.CompiledOK,
+		&version.CompileError,
+		&version.CreatedByUserID,
+		&version.Comment,
+		&version.CreatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Version{}, ErrVersionNotFound
+		}
+		return Version{}, fmt.Errorf("scan policy version metadata: %w", err)
+	}
+	return version, nil
+}
+
+func bumpGeneration(ctx context.Context, tx pgx.Tx) (int64, error) {
+	var generation int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE policy_generation
+		SET generation = generation + 1, updated_at = now()
+		WHERE id = true
+		RETURNING generation`,
+	).Scan(&generation); err != nil {
+		return 0, fmt.Errorf("bump policy generation: %w", err)
+	}
+	return generation, nil
+}
+
+func mapPolicyConstraintError(context string, err error) error {
+	if isPolicyDomainEnabledViolation(err) {
+		return ErrDomainAlreadyEnabled
+	}
+	return fmt.Errorf("%s: %w", context, err)
+}
+
+func isPolicyDomainEnabledViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) &&
+		pgErr.Code == "23505" &&
+		pgErr.ConstraintName == "policy_documents_one_enabled_per_domain_idx"
+}
+
+func nilIfEmpty(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}

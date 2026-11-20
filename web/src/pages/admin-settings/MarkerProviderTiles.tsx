@@ -1,0 +1,515 @@
+import { useState } from "react";
+import { Link } from "react-router";
+import { toast } from "sonner";
+
+import type {
+  MarkerProviderConfig,
+  MarkerProviderUpdateRequest,
+  MarkerUserStats,
+  PluginInstallation,
+} from "@/api/types";
+import {
+  ProviderPanelActions,
+  ProviderTile,
+  ProviderTileGrid,
+  resolveProviderTileState,
+  type ProviderTestState,
+} from "@/components/settings/ProviderTile";
+import { AdvancedSection } from "@/components/settings/AdvancedSection";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useAdminPluginInstallations } from "@/hooks/queries/admin/plugins";
+import { installationConfigReady } from "@/lib/pluginConfigReady";
+import { useReportUnsavedChanges } from "@/hooks/useUnsavedChanges";
+import {
+  useMarkerProviders,
+  useUpdateMarkerProvider,
+  useValidateMarkerProvider,
+} from "@/hooks/queries/admin/markers";
+import { SETTINGS_NUMBER_WIDTH, SettingField, SettingFieldRow } from "./SettingField";
+import { MARKER_SHARING_DISCLOSURE_KEY } from "@/lib/markers";
+import { providerMonogram } from "@/lib/monogram";
+import { pluginPagePath } from "@/lib/pluginPresentation";
+import { useT, type Translate } from "@/i18n";
+
+const INTEGER_INPUT_PATTERN = /^[+-]?\d+$/;
+const CONFIDENCE_PERCENT_FORMAT = new Intl.NumberFormat("en-US", {
+  style: "percent",
+  useGrouping: false,
+  maximumSignificantDigits: 21,
+});
+
+/** Tile id namespace, so a marker provider can never collide with a subtitle one. */
+function markerTileID(provider: string): string {
+  return `marker:${provider}`;
+}
+
+function formatRate(t: Translate, value: number) {
+  return t("web.common.format.percent", { percent: Math.round(value * 100) });
+}
+
+/**
+ * A saved 0–1 confidence edited as a percentage. An unchanged percentage
+ * keeps the saved value exact: multiplying and dividing a custom confidence
+ * can otherwise introduce floating-point drift.
+ */
+function useConfidencePercent(saved: number) {
+  const savedPercent = CONFIDENCE_PERCENT_FORMAT.format(saved).replace("%", "");
+  const [input, setInput] = useState(savedPercent);
+  const trimmed = input.trim();
+  const percent = Number(trimmed);
+  const valid = trimmed !== "" && Number.isFinite(percent) && percent >= 0 && percent <= 100;
+  const value = percent === Number(savedPercent) ? saved : percent / 100;
+  return { input, setInput, valid, value, edited: value !== saved };
+}
+
+/** What the last connection test said, kept per provider while the page is open. */
+interface MarkerValidation {
+  test: ProviderTestState;
+  stats?: MarkerUserStats;
+}
+
+/**
+ * Whether the plugin behind a marker provider has the configuration it asks
+ * for. Silo never sees the key itself — it lives in the plugin's own runtime
+ * config — but it does know which config keys the plugin declares and which
+ * ones have a value saved, which is enough to stop a provider with no API key
+ * from reading as connected. `undefined` means "not known yet": the
+ * installations query is still in flight, or nothing matched, and a tile must
+ * not guess in that window.
+ */
+function markerCredentialsReady(
+  installations: PluginInstallation[] | undefined,
+  provider: MarkerProviderConfig,
+): boolean | undefined {
+  if (!installations) return undefined;
+  const installation = installations.find(
+    (candidate) => String(candidate.id) === provider.plugin_installation_id,
+  );
+  if (!installation) return undefined;
+  return installationConfigReady(installation);
+}
+
+/**
+ * Marker providers as tiles on the providers page, beside the subtitle and
+ * metadata ones. Each tile's panel holds the per-provider behavior (lookup
+ * order, contribution rules) that Silo owns; the provider's credentials belong
+ * to the plugin and are edited on its plugin page.
+ */
+export function MarkerProviderTiles({
+  expandedTile,
+  onExpand,
+  onCollapse,
+}: {
+  expandedTile: string | null;
+  onExpand: (id: string) => void;
+  onCollapse: () => void;
+}) {
+  const t = useT();
+  const providers = useMarkerProviders();
+  // Installed plugins render the credential state; the tiles are useful before
+  // that query lands, so they are never blocked on it.
+  const { data: installations } = useAdminPluginInstallations();
+  const [results, setResults] = useState<Record<string, MarkerValidation | undefined>>({});
+
+  if (providers.isLoading) {
+    return (
+      <ProviderTileGrid>
+        <Skeleton className="h-32 w-full rounded-2xl" />
+        <Skeleton className="h-32 w-full rounded-2xl" />
+      </ProviderTileGrid>
+    );
+  }
+
+  const providerList = providers.data?.providers ?? [];
+  if (providerList.length === 0) {
+    return (
+      <p className="text-muted-foreground text-sm">
+        {t("web.admin.settings.markers.provider.empty", {
+          link: (chunks) => (
+            <Link
+              to="/admin/plugins?tab=catalog"
+              className="hover:text-foreground font-medium underline underline-offset-2 transition-colors"
+            >
+              {chunks}
+            </Link>
+          ),
+        })}
+      </p>
+    );
+  }
+
+  return (
+    <ProviderTileGrid>
+      {providerList.map((provider) => {
+        const id = markerTileID(provider.provider);
+        return (
+          <MarkerProviderTile
+            // Server values in the key so a saved provider drops the drafts it
+            // was edited with instead of re-showing them over the new state.
+            key={[
+              provider.provider,
+              provider.fetch_enabled,
+              provider.fetch_priority,
+              provider.fetch_min_confidence,
+              provider.contribute_enabled,
+              provider.contribute_auto_local,
+              provider.contribute_min_confidence,
+              provider.is_submitter,
+            ].join(":")}
+            provider={provider}
+            credentialsReady={markerCredentialsReady(installations, provider)}
+            expanded={expandedTile === id}
+            onExpand={() => onExpand(id)}
+            onCollapse={onCollapse}
+            result={results[id]}
+            onValidated={(result) => setResults((current) => ({ ...current, [id]: result }))}
+          />
+        );
+      })}
+    </ProviderTileGrid>
+  );
+}
+
+function MarkerProviderTile({
+  provider,
+  credentialsReady,
+  expanded,
+  onExpand,
+  onCollapse,
+  result,
+  onValidated,
+}: {
+  provider: MarkerProviderConfig;
+  credentialsReady: boolean | undefined;
+  expanded: boolean;
+  onExpand: () => void;
+  onCollapse: () => void;
+  result: MarkerValidation | undefined;
+  onValidated: (result: MarkerValidation | undefined) => void;
+}) {
+  const t = useT();
+  const updateProvider = useUpdateMarkerProvider();
+  const validateProvider = useValidateMarkerProvider();
+  const displayName = provider.display_name || provider.provider;
+  const slug = provider.provider.replace(/[^a-zA-Z0-9_-]/g, "-");
+  const minConfidenceID = `marker-min-confidence-${slug}`;
+  const fetchMinConfidenceID = `marker-fetch-min-confidence-${slug}`;
+  const priorityID = `marker-priority-${slug}`;
+  const [fetchEnabled, setFetchEnabled] = useState(provider.fetch_enabled);
+  const [fetchPriority, setFetchPriority] = useState(String(provider.fetch_priority));
+  const [contributeEnabled, setContributeEnabled] = useState(provider.contribute_enabled);
+  const [autoLocal, setAutoLocal] = useState(provider.contribute_auto_local);
+  const minConfidence = useConfidencePercent(provider.contribute_min_confidence ?? 0.95);
+  const fetchMinConfidence = useConfidencePercent(provider.fetch_min_confidence ?? 0);
+  const confidenceValid = minConfidence.valid && fetchMinConfidence.valid;
+  const confidenceEdited = minConfidence.edited || fetchMinConfidence.edited;
+  const fetchPriorityInput = fetchPriority.trim();
+  const parsedFetchPriority = Number(fetchPriorityInput);
+  const priorityValid =
+    INTEGER_INPUT_PATTERN.test(fetchPriorityInput) && Number.isInteger(parsedFetchPriority);
+  const dirty =
+    provider.fetch_enabled !== fetchEnabled ||
+    provider.fetch_priority !== parsedFetchPriority ||
+    provider.contribute_enabled !== contributeEnabled ||
+    provider.contribute_auto_local !== autoLocal ||
+    !confidenceValid ||
+    confidenceEdited;
+  // The tile's draft lives outside useSettingsForm, so the navigation guard
+  // and the reload prompt only see it if the tile reports it itself.
+  useReportUnsavedChanges(dirty);
+
+  function save() {
+    if (!priorityValid) {
+      toast.error(t("web.admin.settings.markers.provider.priorityInvalid"));
+      return;
+    }
+    if (!confidenceValid) {
+      toast.error(t("web.admin.settings.markers.provider.confidenceInvalid"));
+      return;
+    }
+
+    // Send only what the admin changed. The server keeps its stored value for
+    // every other field, so a stale copy of the sharing switches on this page
+    // cannot undo a sharing opt-out saved elsewhere.
+    const patch: MarkerProviderUpdateRequest = {};
+    if (fetchEnabled !== provider.fetch_enabled) patch.fetch_enabled = fetchEnabled;
+    if (parsedFetchPriority !== provider.fetch_priority) patch.fetch_priority = parsedFetchPriority;
+    if (fetchMinConfidence.edited) patch.fetch_min_confidence = fetchMinConfidence.value;
+    if (contributeEnabled !== provider.contribute_enabled) {
+      patch.contribute_enabled = contributeEnabled;
+    }
+    const nextAutoLocal = contributeEnabled && autoLocal;
+    if (nextAutoLocal !== provider.contribute_auto_local) {
+      patch.contribute_auto_local = nextAutoLocal;
+    }
+    if (minConfidence.edited) patch.contribute_min_confidence = minConfidence.value;
+    updateProvider.mutate({ provider: provider.provider, patch });
+  }
+
+  function validate() {
+    const started = Date.now();
+    onValidated(undefined);
+    validateProvider.mutate(
+      { provider: provider.provider, displayName },
+      {
+        onSuccess: (response) =>
+          onValidated({
+            test: {
+              ok: response.valid,
+              message: response.valid
+                ? t("web.admin.settings.markers.provider.testSucceeded")
+                : (response.error ?? t("web.admin.settings.markers.provider.testFailed")),
+              at: Date.now(),
+              durationMs: Date.now() - started,
+            },
+            stats: response.stats,
+          }),
+        onError: (error) =>
+          onValidated({
+            test: {
+              ok: false,
+              message:
+                error instanceof Error
+                  ? error.message
+                  : t("web.admin.settings.markers.provider.testFailed"),
+              at: Date.now(),
+              durationMs: Date.now() - started,
+            },
+          }),
+      },
+    );
+  }
+
+  const test = result?.test;
+  const stats = result?.stats;
+  // "Connected" has to mean the server can actually look markers up here: the
+  // plugin has its configuration and the provider is on for lookup.
+  const connected = credentialsReady !== false && provider.fetch_enabled;
+  const state = resolveProviderTileState({ expanded, test, connected });
+  const statePill = expanded
+    ? undefined
+    : credentialsReady === false
+      ? t("web.admin.settings.markers.provider.needsSetup")
+      : provider.fetch_enabled
+        ? undefined
+        : t("web.admin.settings.markers.provider.connectedOff");
+  // Only a failure earns the extra line: the state word already says the rest.
+  const meta = !expanded && test && !test.ok ? test.message : undefined;
+  // The plugin's own page holds its API key and account settings.
+  const pluginPage = provider.plugin_id ? pluginPagePath(provider.plugin_id) : "/admin/plugins";
+
+  return (
+    <ProviderTile
+      name={displayName}
+      tagline={t("web.admin.settings.markers.provider.tagline")}
+      monogram={providerMonogram(displayName)}
+      monogramClass="bg-teal-500/20 text-teal-700 dark:text-teal-300"
+      state={state}
+      statePill={statePill}
+      meta={meta}
+      busy={updateProvider.isPending || validateProvider.isPending}
+      expanded={expanded}
+      primaryAction={{
+        label:
+          test && !test.ok
+            ? t("web.admin.settings.markers.provider.fix")
+            : credentialsReady === false
+              ? t("web.admin.settings.markers.provider.setUp")
+              : t("web.admin.settings.markers.provider.manage"),
+        onClick: onExpand,
+      }}
+    >
+      <p className="text-muted-foreground mb-1 text-xs">
+        {provider.source_type === "plugin" && provider.plugin_id
+          ? t("web.admin.settings.markers.provider.pluginPageNote", {
+              link: (chunks) => (
+                <Link to={pluginPage} className="underline underline-offset-2">
+                  {chunks}
+                </Link>
+              ),
+            })
+          : provider.provider}
+      </p>
+
+      <SettingField
+        label={t("web.admin.settings.markers.provider.fetchEnabled")}
+        type="toggle"
+        value={fetchEnabled ? "true" : "false"}
+        onChange={(value) => setFetchEnabled(value === "true")}
+      />
+      <SettingField
+        label={t("web.admin.settings.markers.provider.contributeEnabled")}
+        type="toggle"
+        value={provider.is_submitter && contributeEnabled ? "true" : "false"}
+        onChange={(value) => {
+          const next = value === "true";
+          setContributeEnabled(next);
+          if (!next) setAutoLocal(false);
+        }}
+        disabled={!provider.is_submitter}
+        description={
+          !provider.is_submitter
+            ? t("web.admin.settings.markers.provider.notSubmitter")
+            : provider.default_contribute_enabled
+              ? t(MARKER_SHARING_DISCLOSURE_KEY)
+              : undefined
+        }
+      />
+      <div className="border-border ms-3 border-s ps-4">
+        <SettingField
+          label={t("web.admin.settings.markers.provider.autoLocal")}
+          type="toggle"
+          value={provider.is_submitter && autoLocal ? "true" : "false"}
+          onChange={(value) => setAutoLocal(value === "true")}
+          disabled={!provider.is_submitter || !contributeEnabled}
+          description={t("web.admin.settings.markers.provider.autoLocalDescription")}
+        />
+      </div>
+      {/* Lookup order and the confidence thresholds have working defaults;
+          an edited or invalid value holds the section open so Save never
+          stalls on a field the admin cannot see. */}
+      <AdvancedSection
+        id={`providers.marker.${slug}`}
+        count={3}
+        forceOpen={
+          !priorityValid ||
+          !confidenceValid ||
+          provider.fetch_priority !== parsedFetchPriority ||
+          confidenceEdited
+        }
+      >
+        <SettingFieldRow
+          label={t("web.admin.settings.markers.provider.priority")}
+          htmlFor={priorityID}
+          description={t("web.admin.settings.markers.provider.priorityDescription")}
+        >
+          <Input
+            id={priorityID}
+            type="number"
+            value={fetchPriority}
+            step={1}
+            onChange={(event) => setFetchPriority(event.target.value)}
+            className={SETTINGS_NUMBER_WIDTH}
+            aria-invalid={!priorityValid}
+          />
+        </SettingFieldRow>
+        <SettingFieldRow
+          label={t("web.admin.settings.markers.provider.fetchMinConfidence")}
+          htmlFor={fetchMinConfidenceID}
+          description={t("web.admin.settings.markers.provider.fetchMinConfidenceDescription")}
+          unit={t("web.admin.common.units.percent")}
+        >
+          <Input
+            id={fetchMinConfidenceID}
+            type="number"
+            value={fetchMinConfidence.input}
+            min={0}
+            max={100}
+            step="any"
+            onChange={(event) => fetchMinConfidence.setInput(event.target.value)}
+            className={SETTINGS_NUMBER_WIDTH}
+            aria-invalid={!fetchMinConfidence.valid}
+          />
+        </SettingFieldRow>
+        <SettingFieldRow
+          label={t("web.admin.settings.markers.provider.contributeMinConfidence")}
+          htmlFor={minConfidenceID}
+          description={t("web.admin.settings.markers.provider.contributeMinConfidenceDescription")}
+          unit={t("web.admin.common.units.percent")}
+        >
+          <Input
+            id={minConfidenceID}
+            type="number"
+            value={minConfidence.input}
+            min={0}
+            max={100}
+            step="any"
+            onChange={(event) => minConfidence.setInput(event.target.value)}
+            className={SETTINGS_NUMBER_WIDTH}
+            aria-invalid={!minConfidence.valid}
+            disabled={!provider.is_submitter}
+          />
+        </SettingFieldRow>
+      </AdvancedSection>
+
+      {stats && (
+        <div className="border-border bg-muted/20 mt-3.5 rounded-md border px-3 py-3">
+          <dl className="grid gap-x-6 gap-y-2 text-xs sm:grid-cols-2">
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">
+                {t("web.admin.settings.markers.provider.statsTotal")}
+              </dt>
+              <dd className="font-medium">{stats.total}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">
+                {t("web.admin.settings.markers.provider.statsAccepted")}
+              </dt>
+              <dd className="font-medium">{stats.accepted}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">
+                {t("web.admin.settings.markers.provider.statsPending")}
+              </dt>
+              <dd className="font-medium">{stats.pending}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">
+                {t("web.admin.settings.markers.provider.statsRejected")}
+              </dt>
+              <dd className="font-medium">{stats.rejected}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">
+                {t("web.admin.settings.markers.provider.statsAcceptanceRate")}
+              </dt>
+              <dd className="font-medium">{formatRate(t, stats.acceptance_rate)}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">
+                {t("web.admin.settings.markers.provider.statsBestStreak")}
+              </dt>
+              <dd className="font-medium">{stats.best_streak}</dd>
+            </div>
+          </dl>
+        </div>
+      )}
+
+      <ProviderPanelActions test={test}>
+        <Button
+          type="button"
+          size="sm"
+          onClick={save}
+          disabled={!dirty || !priorityValid || !confidenceValid || updateProvider.isPending}
+        >
+          {updateProvider.isPending
+            ? t("web.admin.settings.markers.provider.saving")
+            : t("common.save")}
+        </Button>
+        {/* The test checks the provider account, which needs the plugin's
+            key. Reading markers can work without one, so a keyless plugin
+            gets no test that would call a working provider broken. Until the
+            plugin's config is known the button stays hidden; a plugin that
+            declares no config reads as ready and keeps it. */}
+        {provider.is_submitter && credentialsReady === true && (
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            onClick={validate}
+            disabled={validateProvider.isPending}
+          >
+            {validateProvider.isPending
+              ? t("web.admin.settings.markers.provider.testing")
+              : t("web.admin.settings.markers.provider.testConnection")}
+          </Button>
+        )}
+        <Button type="button" size="sm" variant="outline" onClick={onCollapse}>
+          {t("web.admin.settings.markers.provider.close")}
+        </Button>
+      </ProviderPanelActions>
+    </ProviderTile>
+  );
+}

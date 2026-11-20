@@ -1,0 +1,2014 @@
+package catalog
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/pathscope"
+)
+
+// EbookFinishedProgressThresholdSQL is models.EbookFinishedProgressThreshold
+// rendered as a SQL numeric literal. Queries that classify ebook reader
+// progress as finished must interpolate this value instead of hardcoding the
+// threshold so the definition of "finished" cannot drift between subsystems.
+var EbookFinishedProgressThresholdSQL = strconv.FormatFloat(models.EbookFinishedProgressThreshold, 'f', -1, 64)
+
+type QueryBuilder struct {
+	cursorTerms []queryCursorTerm
+	alias       string
+	argIdx      int
+	args        []any
+	userID      int
+	profileID   string
+	libraryIDs  []int
+	mediaScope  string
+	// titleNotNull records that the relation behind alias is media_items,
+	// whose title and sort_title are NOT NULL, so its title key never is.
+	titleNotNull bool
+	// requireUserHistoryCTE is set when an emitted clause references the
+	// per-user history aggregate (audit 2026-05-01 §3.1 Pattern B). The
+	// executor reads this flag to inject the user_last_watched CTE and
+	// the LEFT JOIN aliased as uhist before running the query.
+	requireUserHistoryCTE bool
+}
+
+type QuerySortPlan struct {
+	terms   []queryCursorTerm
+	Joins   []string
+	OrderBy string
+	Args    []any
+}
+
+func NewQueryBuilder(alias string) *QueryBuilder {
+	return &QueryBuilder{alias: alias, argIdx: 1}
+}
+
+func (qb *QueryBuilder) WithUserScope(userID int, profileID string) *QueryBuilder {
+	qb.userID = userID
+	qb.profileID = profileID
+	return qb
+}
+
+func (qb *QueryBuilder) WithLibraryScope(libraryIDs []int) *QueryBuilder {
+	qb.libraryIDs = append([]int(nil), libraryIDs...)
+	return qb
+}
+
+// WithMediaItemsRelation declares that alias is media_items itself rather than
+// a derived relation (episodes, search unions), so sort keys built from its
+// NOT NULL columns can be marked notNull for cursor seeks.
+func (qb *QueryBuilder) WithMediaItemsRelation() *QueryBuilder {
+	qb.titleNotNull = true
+	return qb
+}
+
+func (qb *QueryBuilder) WithMediaScope(scope string) *QueryBuilder {
+	qb.mediaScope = strings.TrimSpace(scope)
+	return qb
+}
+
+func (qb *QueryBuilder) WithArgIdx(argIdx int) *QueryBuilder {
+	if argIdx > 0 {
+		qb.argIdx = argIdx
+	}
+	return qb
+}
+
+func (qb *QueryBuilder) Build(input any) (string, []any, error) {
+	normalized, err := normalizeBuilderInput(input)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := normalized.Validate(); err != nil {
+		return "", nil, err
+	}
+
+	qb.argIdx = 1
+	qb.args = nil
+
+	if len(normalized.Groups) == 0 {
+		return "", nil, nil
+	}
+
+	topJoiner := " AND "
+	if normalized.Match == "any" {
+		topJoiner = " OR "
+	}
+
+	var groupClauses []string
+	for _, group := range normalized.Groups {
+		clause, err := qb.buildGroup(group)
+		if err != nil {
+			return "", nil, err
+		}
+		if clause != "" {
+			groupClauses = append(groupClauses, clause)
+		}
+	}
+
+	if len(groupClauses) == 0 {
+		return "", nil, nil
+	}
+	// The returned expression is always parenthesized so it stays atomic when
+	// callers AND access, library, and other outer constraints onto it. A
+	// match-any group (or a match-any top level) emits a top-level OR; without
+	// the parentheses, SQL precedence lets the first OR arm bypass every
+	// constraint appended afterward.
+	if len(groupClauses) == 1 {
+		return "(" + groupClauses[0] + ")", qb.args, nil
+	}
+
+	wrapped := make([]string, len(groupClauses))
+	for i, clause := range groupClauses {
+		wrapped[i] = "(" + clause + ")"
+	}
+	return "(" + strings.Join(wrapped, topJoiner) + ")", qb.args, nil
+}
+
+func normalizeBuilderInput(input any) (QueryDefinition, error) {
+	switch def := input.(type) {
+	case QueryDefinition:
+		return def.Normalize(), nil
+	case *QueryDefinition:
+		if def == nil {
+			return QueryDefinition{}.Normalize(), nil
+		}
+		return def.Normalize(), nil
+	}
+
+	var legacy struct {
+		Match  string       `json:"match"`
+		Groups []QueryGroup `json:"groups"`
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return QueryDefinition{}, err
+	}
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return QueryDefinition{}, err
+	}
+
+	return QueryDefinition{
+		Match:  legacy.Match,
+		Groups: legacy.Groups,
+	}.Normalize(), nil
+}
+
+func (qb *QueryBuilder) ArgIdx() int {
+	return qb.argIdx
+}
+
+// RequiresUserHistoryCTE reports whether the most recently built clauses
+// referenced the user_last_watched derived-table aggregate. The executor
+// uses this signal to inject the CTE definition and the LEFT JOIN that
+// surfaces uhist.last_watched (audit 2026-05-01 §3.1 Pattern B).
+func (qb *QueryBuilder) RequiresUserHistoryCTE() bool {
+	return qb.requireUserHistoryCTE
+}
+
+// UserHistoryCTEArgs returns the [userID, profileID] pair the executor must
+// prepend to the bound argument list when injecting the user_last_watched
+// CTE. Returns nil when the CTE is not required.
+func (qb *QueryBuilder) UserHistoryCTEArgs() []any {
+	if !qb.requireUserHistoryCTE {
+		return nil
+	}
+	return []any{qb.userID, qb.profileID}
+}
+
+// UserHistoryCTESQL returns the user_last_watched CTE definition. The two
+// placeholder positions (user_id, profile_id) are bound to the args returned
+// by UserHistoryCTEArgs and should be the first two entries in the final
+// statement's arg list. The CTE aggregates user_watch_history watched_at,
+// user_watch_progress.completed=TRUE updated_at, and completed ebook reader
+// progress updated_at into one row per media_item_id, filtering out videos the
+// user has hidden via
+// user_history_hidden_items. The single GROUP BY replaces the two
+// correlated MAX subqueries the previous lastWatchedExpr emitted (audit
+// 2026-05-01 §3.1 Pattern B).
+//
+// Watch history is recorded against episodes, so each episode row also counts
+// for its series: a show's last_watched is its most recently finished
+// episode. The hidden-item check runs on the episode itself, before the
+// rollup, because that is the item a history removal names.
+//
+// NULL handling: each UNION ALL branch sets exactly one of (uwh_at, uwp_at);
+// the other column is NULL. Postgres GREATEST and LEAST IGNORE NULL inputs
+// (unlike MySQL/Oracle, which propagate NULL) — "NULL values in the list
+// are ignored. The result will be NULL only if all the expressions evaluate
+// to NULL." So GREATEST(uwh_at, NULL) = uwh_at, and the per-row aggregate
+// reduces correctly to the timestamp from whichever source produced the row.
+// MAX over those values then yields the per-media_item maximum across both
+// sources. Do NOT wrap in COALESCE — that would mask future schema changes
+// that could legitimately produce two non-NULL values per row.
+// See https://www.postgresql.org/docs/current/functions-conditional.html#FUNCTIONS-GREATEST-LEAST
+func UserHistoryCTESQL(argIdx int) string {
+	return fmt.Sprintf(`user_last_watched AS (
+	SELECT watched.media_item_id, MAX(GREATEST(src.uwh_at, src.uwp_at)) AS last_watched
+	FROM (
+		-- Only finished plays count, as on the episode path: a title, or a
+		-- show through its episodes, is dated by when it was last finished.
+		SELECT uwh.media_item_id, uwh.watched_at AS uwh_at, NULL::timestamptz AS uwp_at
+		FROM user_watch_history uwh
+		WHERE uwh.user_id = $%d AND uwh.profile_id = $%d AND uwh.completed = TRUE
+		UNION ALL
+		SELECT uwp.media_item_id, NULL::timestamptz, uwp.updated_at
+		FROM user_watch_progress uwp
+		WHERE uwp.user_id = $%d AND uwp.profile_id = $%d AND uwp.completed = TRUE
+		UNION ALL
+		SELECT erp.content_id AS media_item_id, NULL::timestamptz, erp.updated_at
+		FROM ebook_reader_progress erp
+		WHERE erp.user_id = $%d AND erp.profile_id = $%d AND erp.progress >= %s
+	) src
+	LEFT JOIN episodes ep ON ep.content_id = src.media_item_id
+	CROSS JOIN LATERAL (VALUES (src.media_item_id), (ep.series_id)) AS watched(media_item_id)
+	WHERE watched.media_item_id IS NOT NULL
+	  AND NOT EXISTS (
+		SELECT 1 FROM user_history_hidden_items hhi
+		WHERE hhi.user_id = $%d AND hhi.profile_id = $%d
+		  AND hhi.media_item_id = src.media_item_id
+		  AND COALESCE(src.uwh_at, src.uwp_at) <= hhi.hidden_before
+	)
+	GROUP BY watched.media_item_id
+)`, argIdx, argIdx+1, argIdx, argIdx+1, argIdx, argIdx+1, EbookFinishedProgressThresholdSQL, argIdx, argIdx+1)
+}
+
+func (qb *QueryBuilder) BuildSortClause(sortConfig QuerySort) (string, []any, error) {
+	plan, err := qb.BuildSortPlan(sortConfig)
+	if err != nil {
+		return "", nil, err
+	}
+	return plan.OrderBy, plan.Args, nil
+}
+
+func (qb *QueryBuilder) BuildSortPlan(sortConfig QuerySort) (result QuerySortPlan, err error) {
+	qb.cursorTerms = nil
+	defer func() {
+		result.terms = append([]queryCursorTerm(nil), qb.cursorTerms...)
+		setCursorTermKinds(result.terms, NormalizeQuerySort(sortConfig).Field)
+	}()
+	sortConfig = NormalizeQuerySort(sortConfig)
+	sortDef, ok := querySortDefs[sortConfig.Field]
+	if !ok {
+		sortDef = querySortDefs[defaultSortField]
+	}
+
+	dir := "DESC"
+	if sortConfig.Order == "asc" {
+		dir = "ASC"
+	}
+
+	if sortDef.personalized {
+		if err := qb.ensureUserScope(sortConfig.Field); err != nil {
+			return QuerySortPlan{}, err
+		}
+	}
+
+	plan := QuerySortPlan{}
+	if isEpisodeCatalogScope(qb.mediaScope) && (sortConfig.Field == querySortReleaseDate || sortConfig.Field == querySortLastAirDate) {
+		plan.OrderBy = qb.episodeAirDateOrderBy(dir)
+		return plan, nil
+	}
+	titleExpr := qb.normalizedTitleExpr()
+
+	switch sortConfig.Field {
+	case "title":
+		qb.cursorTerms = []queryCursorTerm{{expression: titleExpr, descending: dir == "DESC", notNull: qb.titleNotNull}, {expression: qb.alias + ".content_id", notNull: true}}
+		plan.OrderBy = fmt.Sprintf("ORDER BY %s %s, %s.content_id ASC", titleExpr, dir, qb.alias)
+		return plan, nil
+	case "release_date":
+		plan.OrderBy = qb.orderByExpr(qb.releaseDateSortExpr(), dir, true, titleExpr)
+		return plan, nil
+	case "added_at":
+		expr, joins, args, nullsLast := qb.addedAtSortPlan()
+		plan.Joins = joins
+		plan.Args = args
+		plan.OrderBy = qb.orderByExpr(expr, dir, nullsLast, titleExpr)
+		return plan, nil
+	case "content_rating":
+		rankExpr := qb.contentRatingRankExpr()
+		labelExpr := qb.contentRatingLabelExpr()
+		qb.cursorTerms = []queryCursorTerm{{expression: rankExpr, descending: dir == "DESC"}, {expression: labelExpr, descending: dir == "DESC"}, {expression: titleExpr}, {expression: qb.alias + ".content_id"}}
+		plan.OrderBy = fmt.Sprintf(
+			"ORDER BY %s %s, %s %s, %s ASC, %s.content_id ASC",
+			rankExpr,
+			dir,
+			labelExpr,
+			dir,
+			titleExpr,
+			qb.alias,
+		)
+		return plan, nil
+	case "resolution":
+		joinSQL, args := qb.mediaFileSortJoin("max_resolution_rank", qb.resolutionRankExpr())
+		plan.Joins = []string{joinSQL}
+		plan.Args = args
+		plan.OrderBy = qb.orderByExpr("sort_files.max_resolution_rank", dir, true, titleExpr)
+		return plan, nil
+	case "bitrate":
+		joinSQL, args := qb.mediaFileSortJoin("max_bitrate", "MAX(mf.bitrate)")
+		plan.Joins = []string{joinSQL}
+		plan.Args = args
+		plan.OrderBy = qb.orderByExpr("sort_files.max_bitrate", dir, true, titleExpr)
+		return plan, nil
+	case "progress":
+		expr, joins, args := qb.progressSortPlan()
+		plan.Joins = joins
+		plan.Args = args
+		plan.OrderBy = qb.orderByExpr(expr, dir, true, titleExpr)
+		return plan, nil
+	case "date_viewed":
+		expr, joins, args := qb.dateViewedSortPlan()
+		plan.Joins = joins
+		plan.Args = args
+		plan.OrderBy = qb.orderByExpr(expr, dir, true, titleExpr)
+		return plan, nil
+	case "plays":
+		expr, joins, args := qb.playsSortPlan()
+		plan.Joins = joins
+		plan.Args = args
+		plan.OrderBy = qb.orderByExpr(expr, dir, true, titleExpr)
+		return plan, nil
+	case "last_air_date":
+		expr, joins := qb.lastAirDateSortPlan()
+		plan.Joins = joins
+		plan.OrderBy = qb.orderByExpr(expr, dir, true, titleExpr)
+		return plan, nil
+	case "author":
+		plan.Joins = []string{qb.personKindSortJoin(models.PersonKindAuthor, "sort_author")}
+		plan.OrderBy = qb.orderByExpr("sort_author.name", dir, true, titleExpr)
+		return plan, nil
+	case "narrator":
+		plan.Joins = []string{qb.personKindSortJoin(models.PersonKindNarrator, "sort_narrator")}
+		plan.OrderBy = qb.orderByExpr("sort_narrator.name", dir, true, titleExpr)
+		return plan, nil
+	case "series":
+		plan.Joins = []string{fmt.Sprintf(
+			"LEFT JOIN %s sort_series ON sort_series.content_id = %s.content_id",
+			qb.bookSeriesTable(),
+			qb.alias,
+		)}
+		qb.cursorTerms = []queryCursorTerm{{expression: "sort_series.series_name", descending: dir == "DESC", nullsLast: true}, {expression: "sort_series.series_index", nullsLast: true}, {expression: titleExpr}, {expression: qb.alias + ".content_id"}}
+		// Sort by series name primarily, then by series_index so books
+		// within the same series come back in narrative order. Title
+		// breaks ties for books that don't have a series_index.
+		clause := fmt.Sprintf(
+			"ORDER BY sort_series.series_name %s NULLS LAST, sort_series.series_index ASC NULLS LAST, %s ASC, %s.content_id ASC",
+			dir,
+			titleExpr,
+			qb.alias,
+		)
+		plan.OrderBy = clause
+		return plan, nil
+	}
+
+	plan.OrderBy = qb.orderByExpr(queryColumnSQL(qb.alias, sortDef.columnSQL), dir, sortDef.nullsLast, titleExpr)
+	if sortDef.titleSortOnly {
+		plan.OrderBy = fmt.Sprintf("ORDER BY %s %s, %s.content_id ASC", queryColumnSQL(qb.alias, sortDef.columnSQL), dir, qb.alias)
+	}
+	return plan, nil
+}
+
+func (qb *QueryBuilder) buildGroup(group QueryGroup) (string, error) {
+	if len(group.Rules) == 0 {
+		return "", nil
+	}
+
+	joiner := " AND "
+	if group.Match == "any" {
+		joiner = " OR "
+	}
+
+	combinedTechnicalClause, consumedRules, err := qb.buildSameFileTechnicalClause(group)
+	if err != nil {
+		return "", err
+	}
+
+	var ruleClauses []string
+	if combinedTechnicalClause != "" {
+		ruleClauses = append(ruleClauses, combinedTechnicalClause)
+	}
+	for index, rule := range group.Rules {
+		if consumedRules[index] {
+			continue
+		}
+		clause, err := qb.buildRule(rule)
+		if err != nil {
+			return "", err
+		}
+		if clause != "" {
+			ruleClauses = append(ruleClauses, clause)
+		}
+	}
+
+	if len(ruleClauses) == 0 {
+		return "", nil
+	}
+	return strings.Join(ruleClauses, joiner), nil
+}
+
+func (qb *QueryBuilder) buildRule(rule QueryRule) (string, error) {
+	def, ok := queryFieldDefs[rule.Field]
+	if !ok {
+		return "", fmt.Errorf("unknown filter field: %q", rule.Field)
+	}
+	if !def.allows(rule.Op) {
+		return "", fmt.Errorf("invalid operator %q for field %q", rule.Op, rule.Field)
+	}
+	if !def.executable {
+		return "", fmt.Errorf("field %q is not supported for SQL execution yet", rule.Field)
+	}
+
+	switch rule.Field {
+	case "actor":
+		return qb.buildPersonClause(models.PersonKindActor, rule)
+	case "director":
+		return qb.buildPersonClause(models.PersonKindDirector, rule)
+	case "writer":
+		return qb.buildPersonClause(models.PersonKindWriter, rule)
+	case "producer":
+		return qb.buildPersonClause(models.PersonKindProducer, rule)
+	case "author":
+		return qb.buildPersonClause(models.PersonKindAuthor, rule)
+	case "narrator":
+		return qb.buildPersonClause(models.PersonKindNarrator, rule)
+	case "series":
+		return qb.buildBookSeriesClause(rule)
+	case "watched":
+		return qb.buildWatchedClause(rule)
+	case "favorited":
+		return qb.buildFavoriteClause(rule)
+	case "in_watchlist":
+		return qb.buildWatchlistClause(rule)
+	case "in_progress":
+		return qb.buildInProgressClause(rule)
+	case "last_watched":
+		return qb.buildLastWatchedClause(rule)
+	case "added_at":
+		return qb.buildTimestampRuleClause(qb.addedAtFilterExpr(), rule)
+	case "release_date":
+		return qb.buildReleaseDateClause(rule)
+	case querySortLatestEpisodeAdded:
+		// An episode row has no newest episode of its own, so it matches no
+		// bound; the cross-type search evaluates show rules against episodes.
+		if isEpisodeCatalogScope(qb.mediaScope) {
+			return qb.buildTimestampRuleClause("NULL::timestamptz", rule)
+		}
+		return qb.buildTimestampRuleClause(queryColumnSQL(qb.alias, def.columnSQL), rule)
+	case querySortLastAirDate:
+		return qb.buildDateRuleClause(queryColumnSQL(qb.alias, def.columnSQL), rule)
+	case querySortTitle:
+		return qb.buildTextRuleClause(qb.alias+".title", rule)
+	case ruleFieldShowTitle:
+		if !isEpisodeCatalogScope(qb.mediaScope) {
+			return "FALSE", nil //nolint:goconst // Keep the SQL predicate literal beside the scope guard.
+		}
+		match, err := qb.buildTextRuleClause("show_title.title", rule)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("EXISTS (SELECT 1 FROM media_items show_title WHERE show_title.content_id = %s.episode_series_id AND %s)", qb.alias, match), nil
+	case ruleFieldDecade:
+		return qb.buildDecadeClause(rule)
+	case querySortRuntime, querySortRatingTMDb, querySortRatingRTCritic, querySortRatingRTAudience:
+		return qb.buildNumericRuleClause(queryColumnSQL(qb.alias, def.columnSQL), rule)
+	case "resolution":
+		return qb.buildResolutionClause(rule)
+	case "hdr":
+		return qb.buildMediaFileEqualityClause("mf.hdr", rule)
+	case "dolby_vision":
+		return qb.buildDolbyVisionClause(rule)
+	case "bitrate":
+		return qb.buildMediaFileComparisonClause("mf.bitrate", rule)
+	case "audio_language":
+		return qb.buildAudioLanguageClause(rule)
+	case "subtitle_language":
+		return qb.buildSubtitleLanguageClause(rule)
+	}
+
+	column := queryColumnSQL(qb.alias, def.columnSQL)
+
+	switch rule.Op {
+	case "is":
+		return qb.buildEqualityClause(column, def.isArray, rule.Value, false), nil
+	case "is_not":
+		return qb.buildEqualityClause(column, def.isArray, rule.Value, true), nil
+	case "contains":
+		if !def.isArray {
+			return "", fmt.Errorf("contains operator only valid for array fields")
+		}
+		qb.args = append(qb.args, rule.Value)
+		clause := fmt.Sprintf("%s @> ARRAY[$%d]::text[]", column, qb.argIdx)
+		qb.argIdx++
+		return clause, nil
+	case "gt":
+		return qb.buildComparisonClause(column, ">", rule.Value), nil
+	case "gte":
+		return qb.buildComparisonClause(column, ">=", rule.Value), nil
+	case "lt":
+		return qb.buildComparisonClause(column, "<", rule.Value), nil
+	case "lte":
+		return qb.buildComparisonClause(column, "<=", rule.Value), nil
+	case "between":
+		values, err := toBetweenValues(rule.Value)
+		if err != nil {
+			return "", fmt.Errorf("between requires [min, max] array: %w", err)
+		}
+		qb.args = append(qb.args, values[0], values[1])
+		clause := fmt.Sprintf("%s >= $%d AND %s <= $%d", column, qb.argIdx, column, qb.argIdx+1)
+		qb.argIdx += 2
+		return clause, nil
+	case "in_last":
+		duration, ok := rule.Value.(string)
+		if !ok {
+			return "", fmt.Errorf("in_last requires a duration string like '30d'")
+		}
+		interval, err := parseDuration(duration)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s >= NOW() - INTERVAL '%s'", column, interval), nil
+	default:
+		return "", fmt.Errorf("unhandled operator: %q", rule.Op)
+	}
+}
+
+func (qb *QueryBuilder) buildPersonClause(kind models.PersonKind, rule QueryRule) (string, error) {
+	qb.args = append(qb.args, rule.Value)
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM item_people ip
+		WHERE ip.content_id = %s.content_id
+		  AND ip.kind = %d
+		  AND ip.person_id IN (
+			SELECT p.id
+			FROM people p
+			WHERE LOWER(p.name) = LOWER($%d)
+		  )
+	)`, qb.alias, kind, qb.argIdx)
+	qb.argIdx++
+	if rule.Op == "is_not" {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+// personKindSortJoin emits a LEFT JOIN LATERAL that resolves the
+// alphabetically-first person name of the given kind per item, exposed
+// as <alias>.name. Used to power Author / Narrator sort plans without
+// a heavyweight aggregate over the whole join.
+func (qb *QueryBuilder) personKindSortJoin(kind models.PersonKind, alias string) string {
+	return fmt.Sprintf(
+		`LEFT JOIN LATERAL (
+			SELECT p.name
+			FROM item_people ip
+			JOIN people p ON p.id = ip.person_id
+			WHERE ip.content_id = %s.content_id
+			  AND ip.kind = %d
+			  AND p.name IS NOT NULL
+			  AND BTRIM(p.name) <> ''
+			ORDER BY p.name ASC
+			LIMIT 1
+		) %s ON TRUE`,
+		qb.alias, kind, alias,
+	)
+}
+
+func (qb *QueryBuilder) bookSeriesTable() string {
+	if qb.mediaScope == "ebook" {
+		return "ebook_series"
+	}
+	return "audiobook_series"
+}
+
+func (qb *QueryBuilder) buildBookSeriesClause(rule QueryRule) (string, error) {
+	qb.args = append(qb.args, rule.Value)
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM %s s
+		WHERE s.content_id = %s.content_id
+		  AND LOWER(BTRIM(s.series_name)) = LOWER(BTRIM($%d))
+)`, qb.bookSeriesTable(), qb.alias, qb.argIdx)
+	qb.argIdx++
+	if rule.Op == "is_not" {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+func (qb *QueryBuilder) buildResolutionClause(rule QueryRule) (string, error) {
+	value, ok := rule.Value.(string)
+	if !ok {
+		return "", fmt.Errorf("resolution requires a string value")
+	}
+	scopeClause := qb.mediaFileLibraryScopeClause("mf")
+	qb.args = append(qb.args, normalizeResolutionValue(value))
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM media_files mf
+		WHERE %s
+		  AND mf.missing_since IS NULL
+		  AND %s
+		  AND %s = $%d
+	)`, qb.mediaFileJoinCondition("mf"), scopeClause, normalizedResolutionExpr("mf.resolution"), qb.argIdx)
+	qb.argIdx++
+	if rule.Op == "is_not" {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+func (qb *QueryBuilder) buildMediaFileEqualityClause(column string, rule QueryRule) (string, error) {
+	scopeClause := qb.mediaFileLibraryScopeClause("mf")
+	qb.args = append(qb.args, rule.Value)
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM media_files mf
+		WHERE %s
+		  AND mf.missing_since IS NULL
+		  AND %s
+		  AND %s = $%d
+	)`, qb.mediaFileJoinCondition("mf"), scopeClause, column, qb.argIdx)
+	qb.argIdx++
+	if rule.Op == "is_not" {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+func (qb *QueryBuilder) buildMediaFileComparisonClause(column string, rule QueryRule) (string, error) {
+	scopeClause := qb.mediaFileLibraryScopeClause("mf")
+	switch rule.Op {
+	case "gt", "gte", "lt", "lte":
+		operator := map[string]string{"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}[rule.Op]
+		qb.args = append(qb.args, rule.Value)
+		clause := fmt.Sprintf(`EXISTS (
+			SELECT 1
+			FROM media_files mf
+			WHERE %s
+			  AND mf.missing_since IS NULL
+			  AND %s
+			  AND %s %s $%d
+		)`, qb.mediaFileJoinCondition("mf"), scopeClause, column, operator, qb.argIdx)
+		qb.argIdx++
+		return clause, nil
+	case "between":
+		values, err := toBetweenValues(rule.Value)
+		if err != nil {
+			return "", fmt.Errorf("between requires [min, max] array: %w", err)
+		}
+		qb.args = append(qb.args, values[0], values[1])
+		clause := fmt.Sprintf(`EXISTS (
+			SELECT 1
+			FROM media_files mf
+			WHERE %s
+			  AND mf.missing_since IS NULL
+			  AND %s
+			  AND %s >= $%d
+			  AND %s <= $%d
+		)`, qb.mediaFileJoinCondition("mf"), scopeClause, column, qb.argIdx, column, qb.argIdx+1)
+		qb.argIdx += 2
+		return clause, nil
+	default:
+		return "", fmt.Errorf("unsupported operator %q for media file comparison", rule.Op)
+	}
+}
+
+func (qb *QueryBuilder) buildDolbyVisionClause(rule QueryRule) (string, error) {
+	value, ok := rule.Value.(bool)
+	if !ok {
+		return "", fmt.Errorf("dolby_vision requires a boolean value")
+	}
+	scopeClause := qb.mediaFileLibraryScopeClause("mf")
+
+	inner := `EXISTS (
+		SELECT 1
+		FROM jsonb_array_elements(COALESCE(mf.video_tracks, '[]'::jsonb)) AS vt
+		WHERE NULLIF(BTRIM(vt->>'dolby_vision'), '') IS NOT NULL
+	)`
+	if !value {
+		inner = `NOT ` + inner
+	}
+
+	return fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM media_files mf
+		WHERE %s
+		  AND mf.missing_since IS NULL
+		  AND %s
+		  AND %s
+	)`, qb.mediaFileJoinCondition("mf"), scopeClause, inner), nil
+}
+
+func (qb *QueryBuilder) buildAudioLanguageClause(rule QueryRule) (string, error) {
+	value, ok := rule.Value.(string)
+	if !ok {
+		return "", fmt.Errorf("audio_language requires a string value")
+	}
+	scopeClause := qb.mediaFileLibraryScopeClause("mf")
+	// audio_language_codes is the STORED generated text[] of LOWER(language)
+	// codes from audio_tracks JSONB (migration 104). Filtering via @>
+	// ARRAY[...] uses the GIN index and avoids per-row JSONB unnest
+	// (audit 2026-05-01 §2.5b).
+	qb.args = append(qb.args, strings.ToLower(value))
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM media_files mf
+		WHERE %s
+		  AND mf.missing_since IS NULL
+		  AND %s
+		  AND mf.audio_language_codes @> ARRAY[$%d]::text[]
+	)`, qb.mediaFileJoinCondition("mf"), scopeClause, qb.argIdx)
+	qb.argIdx++
+	if rule.Op == "is_not" {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+func (qb *QueryBuilder) buildSubtitleLanguageClause(rule QueryRule) (string, error) {
+	value, ok := rule.Value.(string)
+	if !ok {
+		return "", fmt.Errorf("subtitle_language requires a string value")
+	}
+	scopeClause := qb.mediaFileLibraryScopeClause("mf")
+	// subtitle_language_codes (migration 104) covers embedded subtitle_tracks
+	// only. external_subtitles is still JSONB unnest as a fallback so the
+	// behavior of the OR-check is preserved (audit 2026-05-01 §2.5b).
+	qb.args = append(qb.args, strings.ToLower(value))
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM media_files mf
+		WHERE %s
+		  AND mf.missing_since IS NULL
+		  AND %s
+		  AND (
+			mf.subtitle_language_codes @> ARRAY[$%d]::text[]
+			OR EXISTS (
+				SELECT 1
+				FROM jsonb_array_elements(COALESCE(mf.external_subtitles, '[]'::jsonb)) AS track
+				WHERE LOWER(COALESCE(track->>'language', '')) = $%d
+			)
+		  )
+	)`, qb.mediaFileJoinCondition("mf"), scopeClause, qb.argIdx, qb.argIdx)
+	qb.argIdx++
+	if rule.Op == "is_not" {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+func (qb *QueryBuilder) buildSameFileTechnicalClause(group QueryGroup) (string, map[int]bool, error) {
+	if group.Match == "any" {
+		return "", nil, nil
+	}
+
+	startArgIdx := qb.argIdx
+	startArgsLen := len(qb.args)
+	consumed := make(map[int]bool)
+	predicates := make([]string, 0, len(group.Rules))
+	for index, rule := range group.Rules {
+		if !isSameFileTechnicalRule(rule) {
+			continue
+		}
+		predicate, err := qb.buildTechnicalMediaFilePredicate(rule, "mf")
+		if err != nil {
+			return "", nil, err
+		}
+		if predicate == "" {
+			continue
+		}
+		consumed[index] = true
+		predicates = append(predicates, predicate)
+	}
+
+	if len(predicates) < 2 {
+		qb.argIdx = startArgIdx
+		qb.args = qb.args[:startArgsLen]
+		return "", nil, nil
+	}
+
+	whereParts := []string{
+		qb.mediaFileJoinCondition("mf"),
+		"mf.missing_since IS NULL",
+	}
+	if len(qb.libraryIDs) > 0 {
+		placeholders, args := qb.consumeIntArgs(qb.libraryIDs)
+		qb.args = append(qb.args, args...)
+		whereParts = append(whereParts, fmt.Sprintf("mf.media_folder_id IN (%s)", strings.Join(placeholders, ", ")))
+	}
+	whereParts = append(whereParts, predicates...)
+
+	return fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM media_files mf
+		WHERE %s
+	)`, strings.Join(whereParts, "\n\t\t  AND ")), consumed, nil
+}
+
+func (qb *QueryBuilder) buildTechnicalMediaFilePredicate(rule QueryRule, alias string) (string, error) {
+	switch rule.Field {
+	case "resolution":
+		value, ok := rule.Value.(string)
+		if !ok {
+			return "", fmt.Errorf("resolution requires a string value")
+		}
+		qb.args = append(qb.args, normalizeResolutionValue(value))
+		predicate := fmt.Sprintf("%s = $%d", normalizedResolutionExpr(alias+".resolution"), qb.argIdx)
+		qb.argIdx++
+		return predicate, nil
+	case "hdr":
+		value, ok := rule.Value.(bool)
+		if !ok {
+			return "", fmt.Errorf("hdr requires a boolean value")
+		}
+		qb.args = append(qb.args, value)
+		predicate := fmt.Sprintf("%s.hdr = $%d", alias, qb.argIdx)
+		qb.argIdx++
+		return predicate, nil
+	case "dolby_vision":
+		value, ok := rule.Value.(bool)
+		if !ok {
+			return "", fmt.Errorf("dolby_vision requires a boolean value")
+		}
+		predicate := fmt.Sprintf(`EXISTS (
+			SELECT 1
+			FROM jsonb_array_elements(COALESCE(%s.video_tracks, '[]'::jsonb)) AS vt
+			WHERE NULLIF(BTRIM(vt->>'dolby_vision'), '') IS NOT NULL
+		)`, alias)
+		if !value {
+			return "NOT (" + predicate + ")", nil
+		}
+		return predicate, nil
+	case "bitrate":
+		return qb.buildMediaFileInlineComparisonPredicate(alias+".bitrate", rule)
+	case "audio_language":
+		value, ok := rule.Value.(string)
+		if !ok {
+			return "", fmt.Errorf("audio_language requires a string value")
+		}
+		// audio_language_codes is the STORED generated text[] derived from
+		// audio_tracks JSONB (migration 104). GIN containment beats per-row
+		// jsonb_array_elements unnest (audit 2026-05-01 §2.5b).
+		qb.args = append(qb.args, strings.ToLower(value))
+		predicate := fmt.Sprintf("%s.audio_language_codes @> ARRAY[$%d]::text[]", alias, qb.argIdx)
+		qb.argIdx++
+		return predicate, nil
+	case "subtitle_language":
+		value, ok := rule.Value.(string)
+		if !ok {
+			return "", fmt.Errorf("subtitle_language requires a string value")
+		}
+		// subtitle_language_codes (migration 104) covers embedded
+		// subtitle_tracks only. external_subtitles remains a JSONB unnest
+		// fallback to preserve OR-check behavior (audit 2026-05-01 §2.5b).
+		qb.args = append(qb.args, strings.ToLower(value))
+		predicate := fmt.Sprintf(`(
+			%s.subtitle_language_codes @> ARRAY[$%d]::text[]
+			OR EXISTS (
+				SELECT 1
+				FROM jsonb_array_elements(COALESCE(%s.external_subtitles, '[]'::jsonb)) AS track
+				WHERE LOWER(COALESCE(track->>'language', '')) = $%d
+			)
+		)`, alias, qb.argIdx, alias, qb.argIdx)
+		qb.argIdx++
+		return predicate, nil
+	default:
+		return "", fmt.Errorf("field %q does not support same-file filtering", rule.Field)
+	}
+}
+
+func (qb *QueryBuilder) buildMediaFileInlineComparisonPredicate(column string, rule QueryRule) (string, error) {
+	switch rule.Op {
+	case "gt", "gte", "lt", "lte":
+		operator := map[string]string{"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}[rule.Op]
+		qb.args = append(qb.args, rule.Value)
+		predicate := fmt.Sprintf("%s %s $%d", column, operator, qb.argIdx)
+		qb.argIdx++
+		return predicate, nil
+	case "between":
+		values, err := toBetweenValues(rule.Value)
+		if err != nil {
+			return "", fmt.Errorf("between requires [min, max] array: %w", err)
+		}
+		qb.args = append(qb.args, values[0], values[1])
+		predicate := fmt.Sprintf("%s >= $%d AND %s <= $%d", column, qb.argIdx, column, qb.argIdx+1)
+		qb.argIdx += 2
+		return predicate, nil
+	default:
+		return "", fmt.Errorf("unsupported operator %q for media file comparison", rule.Op)
+	}
+}
+
+func isSameFileTechnicalRule(rule QueryRule) bool {
+	if rule.Op == "is_not" {
+		return false
+	}
+	switch rule.Field {
+	case "resolution", "hdr", "dolby_vision", "bitrate", "audio_language", "subtitle_language":
+		return true
+	default:
+		return false
+	}
+}
+
+func (qb *QueryBuilder) mediaFileLibraryScopeClause(alias string) string {
+	if len(qb.libraryIDs) == 0 {
+		return "TRUE"
+	}
+	placeholders, args := qb.consumeIntArgs(qb.libraryIDs)
+	qb.args = append(qb.args, args...)
+	return fmt.Sprintf("%s.media_folder_id IN (%s)", alias, strings.Join(placeholders, ", "))
+}
+
+func (qb *QueryBuilder) mediaFileJoinCondition(mediaFileAlias string) string {
+	return catalogMediaFileJoinConditionForScope(qb.mediaScope, mediaFileAlias, qb.alias)
+}
+
+func (qb *QueryBuilder) mediaFileGroupExpr(mediaFileAlias string) string {
+	return catalogMediaFileGroupExprForScope(qb.mediaScope, mediaFileAlias)
+}
+
+func (qb *QueryBuilder) libraryContentExpr() string {
+	return catalogLibraryContentExprForScope(qb.mediaScope, qb.alias)
+}
+
+func normalizedResolutionExpr(column string) string {
+	return fmt.Sprintf(`CASE LOWER(NULLIF(BTRIM(%s), ''))
+		WHEN '4k' THEN '2160p'
+		WHEN 'uhd' THEN '2160p'
+		ELSE LOWER(NULLIF(BTRIM(%s), ''))
+	END`, column, column)
+}
+
+func normalizeResolutionValue(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "4k", "uhd":
+		return "2160p"
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}
+
+func (qb *QueryBuilder) ensureUserScope(field string) error {
+	if qb.userID == 0 || strings.TrimSpace(qb.profileID) == "" {
+		return fmt.Errorf("field %q requires user scope", field)
+	}
+	return nil
+}
+
+func (qb *QueryBuilder) buildWatchedClause(rule QueryRule) (string, error) {
+	if err := qb.ensureUserScope(rule.Field); err != nil {
+		return "", err
+	}
+	value, ok := rule.Value.(bool)
+	if !ok {
+		return "", fmt.Errorf("watched requires a boolean value")
+	}
+	clause := qb.userStateCompletionClause()
+	if !value {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+func (qb *QueryBuilder) buildFavoriteClause(rule QueryRule) (string, error) {
+	if err := qb.ensureUserScope(rule.Field); err != nil {
+		return "", err
+	}
+	value, ok := rule.Value.(bool)
+	if !ok {
+		return "", fmt.Errorf("favorited requires a boolean value")
+	}
+	qb.args = append(qb.args, qb.userID, qb.profileID)
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM user_favorites uf
+		WHERE uf.user_id = $%d
+		  AND uf.profile_id = $%d
+		  AND uf.media_item_id = %s.content_id
+	)`, qb.argIdx, qb.argIdx+1, qb.alias)
+	qb.argIdx += 2
+	if !value {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+func (qb *QueryBuilder) buildWatchlistClause(rule QueryRule) (string, error) {
+	if err := qb.ensureUserScope(rule.Field); err != nil {
+		return "", err
+	}
+	value, ok := rule.Value.(bool)
+	if !ok {
+		return "", fmt.Errorf("in_watchlist requires a boolean value")
+	}
+	qb.args = append(qb.args, qb.userID, qb.profileID)
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM user_watchlist uw
+		WHERE uw.user_id = $%d
+		  AND uw.profile_id = $%d
+		  AND uw.media_item_id = %s.content_id
+	)`, qb.argIdx, qb.argIdx+1, qb.alias)
+	qb.argIdx += 2
+	if !value {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+func (qb *QueryBuilder) buildInProgressClause(rule QueryRule) (string, error) {
+	if err := qb.ensureUserScope(rule.Field); err != nil {
+		return "", err
+	}
+	value, ok := rule.Value.(bool)
+	if !ok {
+		return "", fmt.Errorf("in_progress requires a boolean value")
+	}
+	if qb.mediaScope == "ebook" {
+		return qb.buildEbookInProgressClause(value), nil
+	}
+	qb.args = append(qb.args, qb.userID, qb.profileID)
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM user_watch_progress uwp
+		WHERE uwp.user_id = $%d
+		  AND uwp.profile_id = $%d
+		  AND uwp.media_item_id = %s.content_id
+		  AND uwp.position_seconds > 0
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM user_history_hidden_items hhi
+			WHERE hhi.user_id = $%d
+			  AND hhi.profile_id = $%d
+			  AND hhi.media_item_id = uwp.media_item_id
+			  AND uwp.updated_at <= hhi.hidden_before
+		  )
+	)`, qb.argIdx, qb.argIdx+1, qb.alias, qb.argIdx, qb.argIdx+1)
+	qb.argIdx += 2
+	if !value {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+func (qb *QueryBuilder) buildEbookInProgressClause(value bool) string {
+	qb.args = append(qb.args, qb.userID, qb.profileID)
+	clause := fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM ebook_reader_progress erp
+		WHERE erp.user_id = $%d
+		  AND erp.profile_id = $%d
+		  AND erp.content_id = %s.content_id
+		  AND erp.progress > 0
+		  AND erp.progress < %s
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM user_history_hidden_items hhi
+			WHERE hhi.user_id = $%d
+			  AND hhi.profile_id = $%d
+			  AND hhi.media_item_id = erp.content_id
+			  AND erp.updated_at <= hhi.hidden_before
+		  )
+	)`, qb.argIdx, qb.argIdx+1, qb.alias, EbookFinishedProgressThresholdSQL, qb.argIdx, qb.argIdx+1)
+	qb.argIdx += 2
+	if !value {
+		return "NOT (" + clause + ")"
+	}
+	return clause
+}
+
+// buildLastWatchedClause compares when the profile last finished the title.
+// A title it never finished reads as finished long ago, so it matches
+// "before" and "not in the last" but never "after" or "in the last".
+func (qb *QueryBuilder) buildLastWatchedClause(rule QueryRule) (string, error) {
+	if err := qb.ensureUserScope(rule.Field); err != nil {
+		return "", err
+	}
+	return qb.buildTimestampRuleClause(qb.lastWatchedExpr(rule.Field), rule)
+}
+
+// buildReleaseDateClause compares the item's release date: release_date when
+// set, else first_air_date when it is a real calendar date. The comparison is
+// emitted once per source column, ((release_date IS NOT NULL AND cmp) OR
+// (release_date IS NULL AND first_air_date cmp)), rather than over their
+// COALESCE, so the release_date indexes can serve it. Both forms agree for every NULL
+// combination, including under NOT.
+func (qb *QueryBuilder) buildReleaseDateClause(rule QueryRule) (string, error) {
+	// Build the comparison once around a marker so both arms reuse the same
+	// bound arguments, then substitute each source column for the marker.
+	const column = "\x00release_date\x00"
+	clause, err := qb.buildDateRuleClause(column, rule)
+	if err != nil {
+		return "", err
+	}
+	if isEpisodeCatalogScope(qb.mediaScope) {
+		return strings.ReplaceAll(clause, column, qb.alias+".episode_air_date"), nil
+	}
+	releaseDate := qb.alias + ".release_date"
+	firstAirDate := textDateSQL(fmt.Sprintf("NULLIF(BTRIM(%s.first_air_date), '')", qb.alias))
+	return fmt.Sprintf("((%[1]s IS NOT NULL AND %[2]s) OR (%[1]s IS NULL AND %[3]s))",
+		releaseDate,
+		strings.ReplaceAll(clause, column, releaseDate),
+		strings.ReplaceAll(clause, column, firstAirDate),
+	), nil
+}
+
+// textDateSQL reads a free-text YYYY-MM-DD expression as a date, or NULL when
+// it is not a real calendar date. A bare ::date raises SQLSTATE 22008 on a
+// well-shaped impossible value such as 2020-13-45 or 0000-00-00 and fails the
+// whole query. The outer WHEN admits years 0001-9999, months 01-12 and days
+// 01-31, which keeps make_date in range; the inner WHEN rejects a day past the
+// end of its month. CASE evaluates WHEN before THEN, so the cast only sees
+// real dates. pg_input_is_valid would do this in one call, but it needs
+// PostgreSQL 16.
+func textDateSQL(expr string) string {
+	return fmt.Sprintf("(CASE WHEN %[1]s ~ '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$' AND %[1]s !~ '^0000' "+
+		"THEN (CASE WHEN SUBSTR(%[1]s, 9, 2)::int <= EXTRACT(DAY FROM make_date(LEFT(%[1]s, 4)::int, SUBSTR(%[1]s, 6, 2)::int, 1) + INTERVAL '1 month - 1 day') "+
+		"THEN %[1]s::date END) END)", expr)
+}
+
+var comparisonSQL = map[string]string{"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+
+// buildTimestampRuleClause compares a timestamptz expression with a date
+// rule's bounds, or with a span ending now.
+func (qb *QueryBuilder) buildTimestampRuleClause(column string, rule QueryRule) (string, error) {
+	switch rule.Op {
+	case "gt", "gte", "lt", "lte":
+		return qb.buildTypedComparisonClause(column, comparisonSQL[rule.Op], rule.Value, "timestamptz"), nil
+	case "between":
+		return qb.buildTypedBetweenClause(column, rule.Value, "timestamptz")
+	case ruleOpInLast, ruleOpNotInLast:
+		interval, err := ruleInterval(rule)
+		if err != nil {
+			return "", err
+		}
+		return relativeDateClause(column, rule.Op, "NOW() - INTERVAL '"+interval+"'"), nil
+	default:
+		return "", fmt.Errorf("unsupported operator %q for %s", rule.Op, rule.Field)
+	}
+}
+
+// buildDateRuleClause is buildTimestampRuleClause for a date column: bounds
+// compare as dates, and a span ends today.
+func (qb *QueryBuilder) buildDateRuleClause(column string, rule QueryRule) (string, error) {
+	switch rule.Op {
+	case "gt", "gte", "lt", "lte":
+		return qb.buildTypedComparisonClause(column, comparisonSQL[rule.Op], rule.Value, "date"), nil
+	case "between":
+		return qb.buildTypedBetweenClause(column, rule.Value, "date")
+	case ruleOpInLast, ruleOpNotInLast:
+		interval, err := ruleInterval(rule)
+		if err != nil {
+			return "", err
+		}
+		return relativeDateClause(column, rule.Op, "(CURRENT_DATE - INTERVAL '"+interval+"')::date"), nil
+	default:
+		return "", fmt.Errorf("unsupported operator %q for %s", rule.Op, rule.Field)
+	}
+}
+
+// relativeDateClause keeps dates on or after cutoff for in_last, and dates
+// before it for not_in_last. A NULL date fails both.
+func relativeDateClause(column, op, cutoff string) string {
+	if op == ruleOpNotInLast {
+		return column + " < " + cutoff
+	}
+	return column + " >= " + cutoff
+}
+
+// ruleInterval reads an in_last or not_in_last span ("30d") as a SQL interval.
+func ruleInterval(rule QueryRule) (string, error) {
+	duration, ok := rule.Value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s requires a duration string like '30d'", rule.Op)
+	}
+	return parseDuration(duration)
+}
+
+// buildNumericRuleClause compares a numeric column. The bound values are cast
+// to numeric so a fractional value compares against an integer column instead
+// of failing to encode.
+func (qb *QueryBuilder) buildNumericRuleClause(column string, rule QueryRule) (string, error) {
+	switch rule.Op {
+	case "gt", "gte", "lt", "lte":
+		if _, ok := catalogFloat(rule.Value); !ok {
+			return "", fmt.Errorf("%s requires a number", rule.Field)
+		}
+		return qb.buildTypedComparisonClause(column, comparisonSQL[rule.Op], rule.Value, "numeric"), nil
+	case "between":
+		if _, ok := catalogFloatRange(rule.Value); !ok {
+			return "", fmt.Errorf("%s between requires [min, max] numbers", rule.Field)
+		}
+		return qb.buildTypedBetweenClause(column, rule.Value, "numeric")
+	default:
+		return "", fmt.Errorf("unsupported operator %q for %s", rule.Op, rule.Field)
+	}
+}
+
+// buildTextRuleClause matches text case-insensitively, whole or in part.
+// The partial operators escape LIKE wildcards, so "100%" matches literally.
+func (qb *QueryBuilder) buildTextRuleClause(column string, rule QueryRule) (string, error) {
+	value, ok := rule.Value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s requires a string value", rule.Field)
+	}
+	value = strings.TrimSpace(value)
+	escaped := pathscope.EscapeLike(value)
+	var clause string
+	switch rule.Op {
+	case "is", "is_not":
+		qb.args = append(qb.args, value)
+		clause = fmt.Sprintf("LOWER(BTRIM(%s)) = LOWER($%d)", column, qb.argIdx)
+	case "contains", ruleOpNotContains:
+		qb.args = append(qb.args, "%"+escaped+"%")
+		clause = fmt.Sprintf(`%s ILIKE $%d ESCAPE '\'`, column, qb.argIdx)
+	case ruleOpBeginsWith:
+		qb.args = append(qb.args, escaped+"%")
+		clause = fmt.Sprintf(`BTRIM(%s) ILIKE $%d ESCAPE '\'`, column, qb.argIdx)
+	case ruleOpEndsWith:
+		qb.args = append(qb.args, "%"+escaped)
+		clause = fmt.Sprintf(`BTRIM(%s) ILIKE $%d ESCAPE '\'`, column, qb.argIdx)
+	default:
+		return "", fmt.Errorf("unsupported operator %q for %s", rule.Op, rule.Field)
+	}
+	qb.argIdx++
+	if rule.Op == "is_not" || rule.Op == ruleOpNotContains {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+// buildDecadeClause matches a year within the decade the value starts
+// (1990 matches 1990 to 1999; 1995 reads as 1990).
+func (qb *QueryBuilder) buildDecadeClause(rule QueryRule) (string, error) {
+	start, ok := decadeStart(rule.Value)
+	if !ok {
+		return "", fmt.Errorf("decade requires a year such as 1990")
+	}
+	qb.args = append(qb.args, start, start+9)
+	column := qb.alias + ".year"
+	clause := fmt.Sprintf("%s >= $%d AND %s <= $%d", column, qb.argIdx, column, qb.argIdx+1)
+	qb.argIdx += 2
+	if rule.Op == "is_not" {
+		return "NOT (" + clause + ")", nil
+	}
+	return clause, nil
+}
+
+// decadeStart reads a decade rule's value as the decade's first year. Decade
+// 0 is refused: media_items.year is 0 when the year is unknown, so it would
+// catch every undated title.
+func decadeStart(value any) (int, bool) {
+	year, ok := catalogFloat(value)
+	if !ok || math.IsNaN(year) || year < 10 || year > 9999 {
+		return 0, false
+	}
+	start := int(year)
+	return start - start%10, true
+}
+
+// userStateCompletionClause emits a boolean predicate that is TRUE when the
+// current row is "played/read" for the active profile, matching the played
+// state surfaced by item user-data (internal/api/handlers/user_state.go). The
+// completion source is selected by item kind:
+//
+//   - movie / episode / audiobook / video leaf -> watch progress or completed
+//     history,
+//   - series / season -> every available child episode completed (rollup),
+//   - ebook -> reader progress at/above the finished threshold.
+//
+// For a query scoped to a single kind the matching branch is emitted directly.
+// For unscoped or "video" queries rows can mix kinds, so the kind is taken from
+// mi.type at run time via a CASE; this is what keeps the catalog `watched`
+// verdict in agreement with item user-data for mixed-media collections (notably
+// ebooks, which would otherwise be classified against the video source).
+//
+// Exactly one (user_id, profile_id) pair is bound regardless of branch: every
+// helper references the same two placeholders via base, so arg accounting stays
+// a constant +2.
+func (qb *QueryBuilder) userStateCompletionClause() string {
+	qb.args = append(qb.args, qb.userID, qb.profileID)
+	base := qb.argIdx
+	qb.argIdx += 2
+	rowID := qb.alias + ".content_id"
+
+	switch qb.mediaScope {
+	case "ebook":
+		return qb.ebookLeafCompletionSQL(rowID, base)
+	case "series":
+		return qb.episodeRollupCompletionSQL("series_id", qb.alias, base)
+	// No "season" case: season is not a valid media_scope, so a season-scoped
+	// query never reaches here. Season rows are encountered only under unscoped
+	// queries and are rolled up by the mi.type = 'season' branch below.
+	case "movie", "episode", "audiobook", "manga":
+		// Leaf kinds complete via watch progress / completed history. Manga has
+		// no dedicated read-state source yet; it stays on the leaf path until
+		// manga catalog filtering is finalized rather than getting a
+		// collection-only interpretation.
+		return qb.videoLeafCompletionSQL(rowID, base)
+	default:
+		return fmt.Sprintf(`(CASE
+		WHEN %[1]s.type = 'series' THEN %[2]s
+		WHEN %[1]s.type = 'season' THEN %[3]s
+		WHEN %[1]s.type = 'ebook' THEN %[4]s
+		ELSE %[5]s
+	END)`,
+			qb.alias,
+			qb.episodeRollupCompletionSQL("series_id", qb.alias, base),
+			qb.episodeRollupCompletionSQL("season_id", qb.alias, base),
+			qb.ebookLeafCompletionSQL(rowID, base),
+			qb.videoLeafCompletionSQL(rowID, base),
+		)
+	}
+}
+
+// videoLeafCompletionSQL returns the completed-progress-or-history predicate for
+// a single leaf row. contentExpr names the row's content id (e.g.
+// "mi.content_id" at the top level, or "episodes.content_id" inside a rollup).
+// It references the shared user/profile placeholders at base and base+1 and does
+// not append args or advance argIdx.
+func (qb *QueryBuilder) videoLeafCompletionSQL(contentExpr string, base int) string {
+	return fmt.Sprintf(`(
+		EXISTS (
+			SELECT 1
+			FROM user_watch_progress uwp
+			WHERE uwp.user_id = $%[1]d
+			  AND uwp.profile_id = $%[2]d
+			  AND uwp.media_item_id = %[3]s
+			  AND uwp.completed = TRUE
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM user_history_hidden_items hhi
+				WHERE hhi.user_id = $%[1]d
+				  AND hhi.profile_id = $%[2]d
+				  AND hhi.media_item_id = uwp.media_item_id
+				  AND uwp.updated_at <= hhi.hidden_before
+			  )
+		)
+		OR EXISTS (
+			SELECT 1
+			FROM user_watch_history uwh
+			WHERE uwh.user_id = $%[1]d
+			  AND uwh.profile_id = $%[2]d
+			  AND uwh.media_item_id = %[3]s
+			  AND uwh.completed = TRUE
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM user_history_hidden_items hhi
+				WHERE hhi.user_id = $%[1]d
+				  AND hhi.profile_id = $%[2]d
+				  AND hhi.media_item_id = uwh.media_item_id
+				  AND uwh.watched_at <= hhi.hidden_before
+			  )
+		)
+	)`, base, base+1, contentExpr)
+}
+
+// ebookLeafCompletionSQL returns the reader-progress-finished predicate for a
+// single ebook row, with the same hidden-history guard as the video leaf.
+func (qb *QueryBuilder) ebookLeafCompletionSQL(contentExpr string, base int) string {
+	return fmt.Sprintf(`EXISTS (
+		SELECT 1
+		FROM ebook_reader_progress erp
+		WHERE erp.user_id = $%[1]d
+		  AND erp.profile_id = $%[2]d
+		  AND erp.content_id = %[3]s
+		  AND erp.progress >= %[4]s
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM user_history_hidden_items hhi
+			WHERE hhi.user_id = $%[1]d
+			  AND hhi.profile_id = $%[2]d
+			  AND hhi.media_item_id = erp.content_id
+			  AND erp.updated_at <= hhi.hidden_before
+		  )
+	)`, base, base+1, contentExpr, EbookFinishedProgressThresholdSQL)
+}
+
+// episodeRollupCompletionSQL returns the "every available child episode is
+// completed" predicate used for series and season rows. linkColumn is the
+// episodes column linking to the parent ("series_id" or "season_id") and alias
+// is the row alias holding the parent content id.
+//
+// The child-episode set MUST match the episode repository's listing
+// (ListBySeriesIDs / ListBySeasonIDs) so this verdict agrees with item
+// user-data. That set is "episodes with at least one library link", expressed by
+// episodeAvailabilityPredicate (internal/catalog/episode_repo.go) — embedded
+// verbatim here. If that predicate changes, this rollup must change with it.
+//
+// A row is complete only when at least one available child exists and no
+// available child is incomplete, matching allEpisodesCompleted's false-on-empty
+// behavior.
+func (qb *QueryBuilder) episodeRollupCompletionSQL(linkColumn, alias string, base int) string {
+	leaf := qb.videoLeafCompletionSQL("episodes.content_id", base)
+	return fmt.Sprintf(`(
+		EXISTS (
+			SELECT 1
+			FROM episodes
+			WHERE episodes.%[1]s = %[2]s.content_id
+			  AND %[3]s
+		)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM episodes
+			WHERE episodes.%[1]s = %[2]s.content_id
+			  AND %[3]s
+			  AND NOT %[4]s
+		)
+	)`, linkColumn, alias, episodeAvailabilityPredicate, leaf)
+}
+
+// lastWatchedExpr returns the SQL expression the executor binds to the
+// per-user history aggregate. It signals the executor (via
+// requireUserHistoryCTE) that the user_last_watched CTE and a LEFT JOIN
+// aliased uhist on uhist.media_item_id = mi.content_id must be injected.
+// The previous implementation emitted two correlated MAX subqueries with
+// nested NOT EXISTS guards which fired ~2N times per filter row (audit
+// 2026-05-01 §3.1 Pattern B). The CTE aggregates user_watch_history and
+// user_watch_progress (completed) once per request and the JOIN reuses the
+// result for every candidate media item. We wrap the join column in
+// COALESCE(..., '-infinity'::timestamptz) so never-watched items behave the
+// same way under the comparison operators (lt/lte/between/in_last) as the
+// previous GREATEST(COALESCE(...), COALESCE(...)) form.
+func (qb *QueryBuilder) lastWatchedExpr(_ string) string {
+	qb.requireUserHistoryCTE = true
+	return "COALESCE(uhist.last_watched, '-infinity'::timestamptz)"
+}
+
+func (qb *QueryBuilder) buildTypedComparisonClause(column, op string, value any, cast string) string {
+	qb.args = append(qb.args, value)
+	placeholder := fmt.Sprintf("$%d", qb.argIdx)
+	if cast != "" {
+		placeholder += "::" + cast
+	}
+	clause := fmt.Sprintf("%s %s %s", column, op, placeholder)
+	qb.argIdx++
+	return clause
+}
+
+func (qb *QueryBuilder) buildTypedBetweenClause(column string, value any, cast string) (string, error) {
+	values, err := toBetweenValues(value)
+	if err != nil {
+		return "", fmt.Errorf("between requires [min, max] array: %w", err)
+	}
+	qb.args = append(qb.args, values[0], values[1])
+	left := fmt.Sprintf("$%d", qb.argIdx)
+	right := fmt.Sprintf("$%d", qb.argIdx+1)
+	if cast != "" {
+		left += "::" + cast
+		right += "::" + cast
+	}
+	clause := fmt.Sprintf("%s >= %s AND %s <= %s", column, left, column, right)
+	qb.argIdx += 2
+	return clause, nil
+}
+
+func (qb *QueryBuilder) normalizedTitleExpr() string {
+	if isEpisodeCatalogScope(qb.mediaScope) {
+		return fmt.Sprintf("%s.sort_key", qb.alias)
+	}
+	return fmt.Sprintf(
+		"LOWER(COALESCE(NULLIF(BTRIM(%s.sort_title), ''), %s.title))",
+		qb.alias,
+		qb.alias,
+	)
+}
+
+// episodeAirDateOrderBy orders episodes by air date, then keeps same-day
+// episodes together by series and in season/episode order, matching how a
+// show lists them. Series order on a tie is alphabetical in both directions;
+// season and episode numbers follow the requested direction.
+func (qb *QueryBuilder) episodeAirDateOrderBy(dir string) string {
+	descending := dir == "DESC"
+	qb.cursorTerms = []queryCursorTerm{
+		{expression: qb.alias + ".episode_air_date", kind: cursorKindDate, descending: descending, nullsLast: true},
+		{expression: qb.alias + ".episode_series_sort_key"},
+		{expression: qb.alias + ".episode_series_id"},
+		{expression: qb.alias + ".episode_season_number", kind: cursorKindNumber, descending: descending},
+		{expression: qb.alias + ".episode_number", kind: cursorKindNumber, descending: descending},
+		{expression: qb.alias + ".content_id"},
+	}
+	return fmt.Sprintf(
+		"ORDER BY %[1]s.episode_air_date %[2]s NULLS LAST, %[1]s.episode_series_sort_key ASC, %[1]s.episode_series_id ASC, %[1]s.episode_season_number %[2]s, %[1]s.episode_number %[2]s, %[1]s.content_id ASC",
+		qb.alias,
+		dir,
+	)
+}
+
+func (qb *QueryBuilder) releaseDateSortExpr() string {
+	if isEpisodeCatalogScope(qb.mediaScope) {
+		return fmt.Sprintf("%s.episode_air_date", qb.alias)
+	}
+	return ReleaseDateSortSQL(qb.alias)
+}
+
+func (qb *QueryBuilder) addedAtFilterExpr() string {
+	if isEpisodeCatalogScope(qb.mediaScope) {
+		return fmt.Sprintf("%s.episode_created_at", qb.alias)
+	}
+	return fmt.Sprintf("%s.created_at", qb.alias)
+}
+
+func (qb *QueryBuilder) orderByExpr(expr, dir string, nullsLast bool, titleExpr string) string {
+	qb.cursorTerms = []queryCursorTerm{{expression: expr, descending: dir == "DESC", nullsLast: nullsLast || dir != "DESC"}, {expression: titleExpr, nullsLast: true}, {expression: qb.alias + ".content_id", nullsLast: true}}
+	clause := fmt.Sprintf("ORDER BY %s %s", expr, dir)
+	if nullsLast {
+		clause += " NULLS LAST"
+	}
+	clause += fmt.Sprintf(", %s ASC, %s.content_id ASC", titleExpr, qb.alias)
+	return clause
+}
+
+func (qb *QueryBuilder) addedAtSortPlan() (string, []string, []any, bool) {
+	if len(qb.libraryIDs) == 0 {
+		return fmt.Sprintf("%s.created_at", qb.alias), nil, nil, false
+	}
+
+	placeholders, args := qb.consumeIntArgs(qb.libraryIDs)
+	if isEpisodeCatalogScope(qb.mediaScope) {
+		if len(qb.libraryIDs) == 1 {
+			joinSQL := fmt.Sprintf(
+				`JOIN episode_libraries sort_added ON sort_added.episode_id = %s.content_id AND sort_added.media_folder_id = %s`,
+				qb.alias,
+				placeholders[0],
+			)
+			return "sort_added.first_seen_at", []string{joinSQL}, args, false
+		}
+
+		joinSQL := fmt.Sprintf(
+			`LEFT JOIN (
+				SELECT el.episode_id AS content_id, MIN(el.first_seen_at) AS added_at
+				FROM episode_libraries el
+				WHERE el.media_folder_id IN (%s)
+				GROUP BY el.episode_id
+			) sort_added ON sort_added.content_id = %s.content_id`,
+			strings.Join(placeholders, ", "),
+			qb.alias,
+		)
+		return "sort_added.added_at", []string{joinSQL}, args, true
+	}
+
+	if len(qb.libraryIDs) == 1 {
+		// The executor's library scope admits only members of this library,
+		// so the inner join drops no row, and its one (content, library) row
+		// is the MIN the aggregate below would compute. first_seen_at is NOT
+		// NULL, so the order matches idx_item_libraries_folder_seen_content
+		// and a page reads only its own rows instead of aggregating the whole
+		// library.
+		joinSQL := fmt.Sprintf(
+			`JOIN media_item_libraries sort_added ON sort_added.content_id = %s AND sort_added.media_folder_id = %s`,
+			qb.libraryContentExpr(),
+			placeholders[0],
+		)
+		return "sort_added.first_seen_at", []string{joinSQL}, args, false
+	}
+
+	joinSQL := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT mil.content_id, MIN(mil.first_seen_at) AS added_at
+			FROM media_item_libraries mil
+			WHERE mil.media_folder_id IN (%s)
+			GROUP BY mil.content_id
+		) sort_added ON sort_added.content_id = %s`,
+		strings.Join(placeholders, ", "),
+		qb.libraryContentExpr(),
+	)
+	return "sort_added.added_at", []string{joinSQL}, args, true
+}
+
+// contentRatingRankExpr sorts by the stored minimum age, so ratings from
+// different national systems interleave correctly instead of only the eleven
+// US strings ordering at all. A rating with no age — unrated, or a string no
+// ladder recognizes — still sorts last.
+func (qb *QueryBuilder) contentRatingRankExpr() string {
+	return fmt.Sprintf("COALESCE(%s.content_rating_age, 2147483647)", qb.alias)
+}
+
+func (qb *QueryBuilder) contentRatingLabelExpr() string {
+	return fmt.Sprintf(
+		"LOWER(COALESCE(NULLIF(BTRIM(%s.content_rating), ''), '~~~~'))",
+		qb.alias,
+	)
+}
+
+func (qb *QueryBuilder) resolutionRankExpr() string {
+	return `MAX(
+		CASE UPPER(CASE LOWER(NULLIF(BTRIM(mf.resolution), ''))
+			WHEN '4k' THEN '2160p'
+			WHEN 'uhd' THEN '2160p'
+			ELSE LOWER(NULLIF(BTRIM(mf.resolution), ''))
+		END)
+			WHEN '480P' THEN 1
+			WHEN '720P' THEN 2
+			WHEN '1080P' THEN 3
+			WHEN '2160P' THEN 4
+			WHEN '4320P' THEN 5
+			ELSE NULL
+		END
+	)`
+}
+
+func (qb *QueryBuilder) mediaFileSortJoin(columnAlias, aggregateExpr string) (string, []any) {
+	whereParts := []string{"mf.missing_since IS NULL"}
+	var args []any
+	if len(qb.libraryIDs) > 0 {
+		placeholders, scopeArgs := qb.consumeIntArgs(qb.libraryIDs)
+		whereParts = append(whereParts, fmt.Sprintf("mf.media_folder_id IN (%s)", strings.Join(placeholders, ", ")))
+		args = append(args, scopeArgs...)
+	}
+	groupExpr := qb.mediaFileGroupExpr("mf")
+
+	joinSQL := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT %s AS content_id, %s AS %s
+			FROM media_files mf
+			WHERE %s
+			GROUP BY %s
+		) sort_files ON sort_files.content_id = %s.content_id`,
+		groupExpr,
+		aggregateExpr,
+		columnAlias,
+		strings.Join(whereParts, " AND "),
+		groupExpr,
+		qb.alias,
+	)
+	return joinSQL, args
+}
+
+func (qb *QueryBuilder) consumeIntArgs(values []int) ([]string, []any) {
+	placeholders := make([]string, len(values))
+	args := make([]any, 0, len(values))
+	for i, value := range values {
+		placeholders[i] = "$" + strconv.Itoa(qb.argIdx+i)
+		args = append(args, value)
+	}
+	qb.argIdx += len(values)
+	return placeholders, args
+}
+
+func (qb *QueryBuilder) progressSortPlan() (string, []string, []any) {
+	if qb.mediaScope == "ebook" {
+		return qb.ebookProgressSortPlan()
+	}
+	joinSQL := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT uwp.media_item_id AS content_id,
+				CASE
+					WHEN uwp.position_seconds > 0
+					  AND COALESCE(uwp.duration_seconds, 0) > 0
+					  AND (hhi.media_item_id IS NULL OR uwp.updated_at > hhi.hidden_before)
+					THEN uwp.position_seconds::double precision / NULLIF(uwp.duration_seconds, 0)
+					ELSE NULL
+				END AS progress_ratio
+			FROM user_watch_progress uwp
+			LEFT JOIN user_history_hidden_items hhi
+				ON hhi.user_id = $%d
+			   AND hhi.profile_id = $%d
+			   AND hhi.media_item_id = uwp.media_item_id
+			WHERE uwp.user_id = $%d
+			  AND uwp.profile_id = $%d
+		) sort_progress ON sort_progress.content_id = %s.content_id`,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.alias,
+	)
+	return "sort_progress.progress_ratio", []string{joinSQL}, []any{qb.userID, qb.profileID}
+}
+
+func (qb *QueryBuilder) ebookProgressSortPlan() (string, []string, []any) {
+	joinSQL := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT erp.content_id,
+				CASE
+					WHEN erp.progress > 0
+					  AND erp.progress < %s
+					  AND (hhi.media_item_id IS NULL OR erp.updated_at > hhi.hidden_before)
+					THEN erp.progress::double precision
+					ELSE NULL
+				END AS progress_ratio
+			FROM ebook_reader_progress erp
+			LEFT JOIN user_history_hidden_items hhi
+				ON hhi.user_id = $%d
+			   AND hhi.profile_id = $%d
+			   AND hhi.media_item_id = erp.content_id
+			WHERE erp.user_id = $%d
+			  AND erp.profile_id = $%d
+		) sort_progress ON sort_progress.content_id = %s.content_id`,
+		EbookFinishedProgressThresholdSQL,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.alias,
+	)
+	return "sort_progress.progress_ratio", []string{joinSQL}, []any{qb.userID, qb.profileID}
+}
+
+func (qb *QueryBuilder) dateViewedSortPlan() (string, []string, []any) {
+	if qb.mediaScope == "ebook" {
+		return qb.ebookDateViewedSortPlan()
+	}
+	historyJoin := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT uwh.media_item_id AS content_id, MAX(uwh.watched_at) AS viewed_at
+			FROM user_watch_history uwh
+			LEFT JOIN user_history_hidden_items hhi
+				ON hhi.user_id = $%d
+			   AND hhi.profile_id = $%d
+			   AND hhi.media_item_id = uwh.media_item_id
+			WHERE uwh.user_id = $%d
+			  AND uwh.profile_id = $%d
+			  AND uwh.completed = TRUE
+			  AND (hhi.media_item_id IS NULL OR uwh.watched_at > hhi.hidden_before)
+			GROUP BY uwh.media_item_id
+		) sort_history_viewed ON sort_history_viewed.content_id = %s.content_id`,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.alias,
+	)
+	progressJoin := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT uwp.media_item_id AS content_id,
+				CASE
+					WHEN uwp.completed = TRUE
+					  AND (hhi.media_item_id IS NULL OR uwp.updated_at > hhi.hidden_before)
+					THEN uwp.updated_at
+					ELSE NULL
+				END AS viewed_at
+			FROM user_watch_progress uwp
+			LEFT JOIN user_history_hidden_items hhi
+				ON hhi.user_id = $%d
+			   AND hhi.profile_id = $%d
+			   AND hhi.media_item_id = uwp.media_item_id
+			WHERE uwp.user_id = $%d
+			  AND uwp.profile_id = $%d
+		) sort_progress_viewed ON sort_progress_viewed.content_id = %s.content_id`,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.alias,
+	)
+	// GREATEST skips NULLs, so a never-watched title stays NULL and the
+	// sort's NULLS LAST puts it after the watched ones in both directions.
+	expr := `GREATEST(sort_history_viewed.viewed_at, sort_progress_viewed.viewed_at)`
+	return expr, []string{historyJoin, progressJoin}, []any{qb.userID, qb.profileID}
+}
+
+func (qb *QueryBuilder) ebookDateViewedSortPlan() (string, []string, []any) {
+	joinSQL := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT erp.content_id,
+				CASE
+					WHEN erp.progress >= %s
+					  AND (hhi.media_item_id IS NULL OR erp.updated_at > hhi.hidden_before)
+					THEN erp.updated_at
+					ELSE NULL
+				END AS viewed_at
+			FROM ebook_reader_progress erp
+			LEFT JOIN user_history_hidden_items hhi
+				ON hhi.user_id = $%d
+			   AND hhi.profile_id = $%d
+			   AND hhi.media_item_id = erp.content_id
+			WHERE erp.user_id = $%d
+			  AND erp.profile_id = $%d
+		) sort_ebook_viewed ON sort_ebook_viewed.content_id = %s.content_id`,
+		EbookFinishedProgressThresholdSQL,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.alias,
+	)
+	return "sort_ebook_viewed.viewed_at", []string{joinSQL}, []any{qb.userID, qb.profileID}
+}
+
+func (qb *QueryBuilder) playsSortPlan() (string, []string, []any) {
+	if qb.mediaScope == "ebook" {
+		return qb.ebookPlaysSortPlan()
+	}
+	historyJoin := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT uwh.media_item_id AS content_id, COUNT(*) AS play_count
+			FROM user_watch_history uwh
+			LEFT JOIN user_history_hidden_items hhi
+				ON hhi.user_id = $%d
+			   AND hhi.profile_id = $%d
+			   AND hhi.media_item_id = uwh.media_item_id
+			WHERE uwh.user_id = $%d
+			  AND uwh.profile_id = $%d
+			  AND uwh.completed = TRUE
+			  AND (hhi.media_item_id IS NULL OR uwh.watched_at > hhi.hidden_before)
+			GROUP BY uwh.media_item_id
+		) sort_history_plays ON sort_history_plays.content_id = %s.content_id`,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.alias,
+	)
+	progressJoin := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT uwp.media_item_id AS content_id,
+				CASE
+					WHEN uwp.completed = TRUE
+					  AND (hhi.media_item_id IS NULL OR uwp.updated_at > hhi.hidden_before)
+					THEN 1
+					ELSE 0
+				END AS completed_play_count
+			FROM user_watch_progress uwp
+			LEFT JOIN user_history_hidden_items hhi
+				ON hhi.user_id = $%d
+			   AND hhi.profile_id = $%d
+			   AND hhi.media_item_id = uwp.media_item_id
+			WHERE uwp.user_id = $%d
+			  AND uwp.profile_id = $%d
+		) sort_progress_plays ON sort_progress_plays.content_id = %s.content_id`,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.alias,
+	)
+	expr := `NULLIF(GREATEST(
+		COALESCE(sort_history_plays.play_count, 0),
+		COALESCE(sort_progress_plays.completed_play_count, 0)
+	), 0)`
+	return expr, []string{historyJoin, progressJoin}, []any{qb.userID, qb.profileID}
+}
+
+func (qb *QueryBuilder) ebookPlaysSortPlan() (string, []string, []any) {
+	joinSQL := fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT erp.content_id,
+				CASE
+					WHEN erp.progress >= %s
+					  AND (hhi.media_item_id IS NULL OR erp.updated_at > hhi.hidden_before)
+					THEN 1
+					ELSE 0
+				END AS completed_play_count
+			FROM ebook_reader_progress erp
+			LEFT JOIN user_history_hidden_items hhi
+				ON hhi.user_id = $%d
+			   AND hhi.profile_id = $%d
+			   AND hhi.media_item_id = erp.content_id
+			WHERE erp.user_id = $%d
+			  AND erp.profile_id = $%d
+		) sort_ebook_plays ON sort_ebook_plays.content_id = %s.content_id`,
+		EbookFinishedProgressThresholdSQL,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.argIdx,
+		qb.argIdx+1,
+		qb.alias,
+	)
+	return "NULLIF(sort_ebook_plays.completed_play_count, 0)", []string{joinSQL}, []any{qb.userID, qb.profileID}
+}
+
+// lastAirDateSortPlan orders by the newest aired episode with a file, the
+// value the last_air_date rule reads (issue #2741).
+func (qb *QueryBuilder) lastAirDateSortPlan() (string, []string) {
+	expr := queryColumnSQL(qb.alias, latestAvailableAirDateColumn)
+	return expr, nil // denormalized column — no JOIN required
+}
+
+func (qb *QueryBuilder) buildEqualityClause(column string, isArray bool, value any, negate bool) string {
+	qb.args = append(qb.args, value)
+	if isArray {
+		clause := fmt.Sprintf("%s @> ARRAY[$%d]::text[]", column, qb.argIdx)
+		qb.argIdx++
+		if negate {
+			return "NOT (" + clause + ")"
+		}
+		return clause
+	}
+
+	op := "="
+	if negate {
+		op = "!="
+	}
+	clause := fmt.Sprintf("%s %s $%d", column, op, qb.argIdx)
+	qb.argIdx++
+	return clause
+}
+
+func (qb *QueryBuilder) buildComparisonClause(column, op string, value any) string {
+	qb.args = append(qb.args, value)
+	clause := fmt.Sprintf("%s %s $%d", column, op, qb.argIdx)
+	qb.argIdx++
+	return clause
+}
+
+func toBetweenValues(v any) ([2]any, error) {
+	switch val := v.(type) {
+	case []any:
+		if len(val) != 2 {
+			return [2]any{}, fmt.Errorf("expected 2 elements, got %d", len(val))
+		}
+		return [2]any{val[0], val[1]}, nil
+	case json.RawMessage:
+		var arr []any
+		if err := json.Unmarshal(val, &arr); err != nil {
+			return [2]any{}, err
+		}
+		if len(arr) != 2 {
+			return [2]any{}, fmt.Errorf("expected 2 elements, got %d", len(arr))
+		}
+		return [2]any{arr[0], arr[1]}, nil
+	default:
+		return [2]any{}, fmt.Errorf("unsupported between value type: %T", v)
+	}
+}
+
+type relativeDuration struct {
+	amount int
+	unit   byte
+}
+
+func parseDuration(s string) (string, error) {
+	spec, err := parseDurationSpec(s)
+	if err != nil {
+		return "", err
+	}
+	return spec.sqlInterval(), nil
+}
+
+// postgresMinTimestamp is PostgreSQL's earliest timestamp and date,
+// 4714-11-24 BC (year -4713 in Go's proleptic calendar). A span whose
+// cutoff falls before it cannot be evaluated, so it is refused.
+var postgresMinTimestamp = time.Date(-4713, time.November, 24, 0, 0, 0, 0, time.UTC)
+
+// maxSpanAmount keeps the cutoff arithmetic from overflowing before that
+// check; in every unit it reaches far past 4714 BC.
+const maxSpanAmount = 100_000_000
+
+func parseDurationSpec(s string) (relativeDuration, error) {
+	normalized := strings.ToLower(strings.TrimSpace(s))
+	if len(normalized) < 2 {
+		return relativeDuration{}, fmt.Errorf("invalid duration: %q", s)
+	}
+
+	value := strings.TrimSpace(normalized[:len(normalized)-1])
+	unit := normalized[len(normalized)-1]
+	amount, err := strconv.Atoi(value)
+	if err != nil || amount <= 0 {
+		return relativeDuration{}, fmt.Errorf("invalid duration: %q", s)
+	}
+
+	switch unit {
+	case 'h', 'd', 'w', 'm', 'y':
+	default:
+		return relativeDuration{}, fmt.Errorf("unsupported duration unit %q", unit)
+	}
+	spec := relativeDuration{amount: amount, unit: unit}
+	if amount > maxSpanAmount || spec.cutoffTime(time.Now().UTC()).Before(postgresMinTimestamp) {
+		return relativeDuration{}, fmt.Errorf("invalid duration: %q", s)
+	}
+	return spec, nil
+}
+
+func (d relativeDuration) sqlInterval() string {
+	switch d.unit {
+	case 'h':
+		return fmt.Sprintf("%d hours", d.amount)
+	case 'd':
+		return fmt.Sprintf("%d days", d.amount)
+	case 'w':
+		return fmt.Sprintf("%d weeks", d.amount)
+	case 'm':
+		return fmt.Sprintf("%d months", d.amount)
+	case 'y':
+		return fmt.Sprintf("%d years", d.amount)
+	default:
+		return ""
+	}
+}
+
+func (d relativeDuration) cutoffTime(now time.Time) time.Time {
+	switch d.unit {
+	case 'h':
+		// Seconds rather than a time.Duration, which overflows past about 292 years.
+		return time.Unix(now.Unix()-int64(d.amount)*3600, int64(now.Nanosecond())).In(now.Location())
+	case 'd':
+		return now.AddDate(0, 0, -d.amount)
+	case 'w':
+		return now.AddDate(0, 0, -7*d.amount)
+	case 'm':
+		return now.AddDate(0, -d.amount, 0)
+	case 'y':
+		return now.AddDate(-d.amount, 0, 0)
+	default:
+		return now
+	}
+}

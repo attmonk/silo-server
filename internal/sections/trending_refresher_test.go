@@ -1,0 +1,248 @@
+package sections
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/sections/recipes"
+)
+
+type fakeSectionLister struct {
+	configs []json.RawMessage
+	err     error
+}
+
+func (f fakeSectionLister) ListTrendingDiscoverConfigs(context.Context) ([]json.RawMessage, error) {
+	return f.configs, f.err
+}
+
+type savedSnap struct {
+	contentIDs []string
+	entryCount int
+	status     string
+}
+
+type attemptRec struct {
+	status  string
+	message string
+}
+
+type fakeSnapshotStore struct {
+	saved      map[string]savedSnap
+	attempts   map[string]attemptRec
+	claimed    bool
+	claimErr   error
+	claimAt    time.Time
+	saveErr    error
+	attemptErr error
+}
+
+func newFakeSnapshotStore() *fakeSnapshotStore {
+	return &fakeSnapshotStore{saved: map[string]savedSnap{}, attempts: map[string]attemptRec{}, claimed: true, claimAt: time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)}
+}
+
+func (f *fakeSnapshotStore) TryClaimRefresh(context.Context, string, string, time.Duration) (time.Time, bool, error) {
+	return f.claimAt, f.claimed, f.claimErr
+}
+
+func (f *fakeSnapshotStore) SaveSuccess(_ context.Context, source, window string, contentIDs []string, entryCount int, status string, _, _ time.Time) error {
+	if f.saveErr != nil {
+		return f.saveErr
+	}
+	f.saved[source+"|"+window] = savedSnap{contentIDs: contentIDs, entryCount: entryCount, status: status}
+	return nil
+}
+
+func (f *fakeSnapshotStore) RecordAttempt(_ context.Context, source, window, status, message string, _ time.Time) error {
+	if f.attemptErr != nil {
+		return f.attemptErr
+	}
+	f.attempts[source+"|"+window] = attemptRec{status: status, message: message}
+	return nil
+}
+
+type fakeTMDB struct {
+	entries []catalog.TMDBCollectionEntry
+	err     error
+	calls   *int
+}
+
+func (f fakeTMDB) GetCollectionPreset(context.Context, string, string, string, int) ([]catalog.TMDBCollectionEntry, error) {
+	if f.calls != nil {
+		*f.calls = *f.calls + 1
+	}
+	return f.entries, f.err
+}
+
+type fakeResolver struct {
+	byType map[string]*catalog.ExternalIDLookup
+}
+
+func (f fakeResolver) GetByExternalIDs(_ context.Context, _ catalog.ExternalIDBatch, itemType string) (*catalog.ExternalIDLookup, error) {
+	if lk, ok := f.byType[itemType]; ok {
+		return lk, nil
+	}
+	return &catalog.ExternalIDLookup{ByTMDB: map[string]string{}, ByIMDb: map[string]string{}, ByTVDB: map[string]string{}}, nil
+}
+
+func tmdbConfig(t *testing.T, source, window string) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(recipes.TrendingDiscoverParams{Source: source, Window: window})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	return raw
+}
+
+func TestRefresherSkipsFetchWhenLeaseIsHeld(t *testing.T) {
+	store := newFakeSnapshotStore()
+	store.claimed = false
+	r := &TrendingRefresher{
+		Sections:     fakeSectionLister{configs: []json.RawMessage{tmdbConfig(t, "tmdb", "week")}},
+		Snapshots:    store,
+		Resolver:     fakeResolver{},
+		TMDBTrending: fakeTMDB{err: errors.New("must not fetch")},
+		Clock:        fixedClock(time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)),
+	}
+
+	data, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	var result TrendingRefreshResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Skipped != 1 || result.Failed != 0 {
+		t.Fatalf("result = %+v; want one skipped refresh", result)
+	}
+}
+
+func TestRefresherClaimErrorDoesNotFetch(t *testing.T) {
+	store := newFakeSnapshotStore()
+	store.claimErr = errors.New("database unavailable")
+	calls := 0
+	r := &TrendingRefresher{
+		Sections:     fakeSectionLister{configs: []json.RawMessage{tmdbConfig(t, "tmdb", "week")}},
+		Snapshots:    store,
+		Resolver:     fakeResolver{},
+		TMDBTrending: fakeTMDB{calls: &calls},
+	}
+	data, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	var result TrendingRefreshResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Failed != 1 || calls != 0 {
+		t.Fatalf("result=%+v calls=%d, want one failure and no fetch", result, calls)
+	}
+}
+
+func TestRefresherTreatsLeaseLossAsSkipped(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*fakeSnapshotStore)
+		tmdb      fakeTMDB
+	}{
+		{
+			name:      "saving success",
+			configure: func(store *fakeSnapshotStore) { store.saveErr = ErrTrendingRefreshLeaseLost },
+			tmdb:      fakeTMDB{entries: []catalog.TMDBCollectionEntry{{ID: 10, MediaType: "movie"}}},
+		},
+		{
+			name:      "recording failure",
+			configure: func(store *fakeSnapshotStore) { store.attemptErr = ErrTrendingRefreshLeaseLost },
+			tmdb:      fakeTMDB{err: errors.New("upstream unavailable")},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeSnapshotStore()
+			tc.configure(store)
+			r := &TrendingRefresher{
+				Sections:  fakeSectionLister{configs: []json.RawMessage{tmdbConfig(t, "tmdb", "week")}},
+				Snapshots: store,
+				Resolver: fakeResolver{byType: map[string]*catalog.ExternalIDLookup{
+					"movie": {ByTMDB: map[string]string{"10": "content-10"}, ByIMDb: map[string]string{}, ByTVDB: map[string]string{}},
+				}},
+				TMDBTrending: tc.tmdb,
+			}
+			data, err := r.RunOnce(context.Background())
+			if err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			var result TrendingRefreshResult
+			if err := json.Unmarshal(data, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Skipped != 1 || result.Failed != 0 {
+				t.Fatalf("result=%+v, want one skipped refresh", result)
+			}
+		})
+	}
+}
+
+func TestRefresherFailurePreservesLastGood(t *testing.T) {
+	store := newFakeSnapshotStore()
+	r := &TrendingRefresher{
+		Sections:     fakeSectionLister{configs: []json.RawMessage{tmdbConfig(t, "tmdb", "week")}},
+		Snapshots:    store,
+		Resolver:     fakeResolver{},
+		TMDBTrending: fakeTMDB{err: errors.New("tmdb 503")},
+		Clock:        fixedClock(time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)),
+	}
+
+	data, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if _, ok := store.saved["tmdb|week"]; ok {
+		t.Fatal("SaveSuccess must not be called on fetch failure (would clear last-good)")
+	}
+	att, ok := store.attempts["tmdb|week"]
+	if !ok || att.status != "error" {
+		t.Fatalf("attempt = %+v, ok=%v; want status error", att, ok)
+	}
+
+	var result TrendingRefreshResult
+	_ = json.Unmarshal(data, &result)
+	if result.Failed != 1 {
+		t.Fatalf("result.Failed = %d; want 1", result.Failed)
+	}
+}
+
+func TestRefresherEmptyProviderPreservesLastGood(t *testing.T) {
+	store := newFakeSnapshotStore()
+	r := &TrendingRefresher{
+		Sections:  fakeSectionLister{configs: []json.RawMessage{tmdbConfig(t, "tmdb", "week")}},
+		Snapshots: store,
+		Resolver:  fakeResolver{},
+		// TMDBTrending nil => provider unconfigured => empty entries, no error.
+		Clock: fixedClock(time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)),
+	}
+
+	data, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if _, ok := store.saved["tmdb|week"]; ok {
+		t.Fatal("SaveSuccess must not be called when provider returns no entries")
+	}
+	att := store.attempts["tmdb|week"]
+	if att.status != "empty" {
+		t.Fatalf("attempt status = %q; want empty", att.status)
+	}
+	var result TrendingRefreshResult
+	_ = json.Unmarshal(data, &result)
+	if result.Empty != 1 {
+		t.Fatalf("result.Empty = %d; want 1", result.Empty)
+	}
+}

@@ -1,0 +1,595 @@
+export interface BrowseParams {
+  q: string;
+  type: string;
+  sort: string;
+  order: string;
+  offset: number;
+  limit: number;
+  library_id?: number;
+  genre?: string;
+  year_min?: number;
+  year_max?: number;
+  content_rating?: string;
+}
+
+export interface InfiniteBrowseParams {
+  q: string;
+  type: string;
+  sort: string;
+  order: string;
+  limit: number;
+  library_id?: number;
+  genre?: string;
+  year_min?: number;
+  year_max?: number;
+  content_rating?: string;
+}
+
+export interface CatalogParams {
+  source: string;
+  q?: string;
+  title?: string;
+  scope?: string;
+  section_id?: string;
+  library_id?: number;
+  collection_id?: string;
+  person_id?: string;
+  type?: string;
+  uses_source_order?: boolean;
+  query_fingerprint?: string;
+  include_technical?: boolean;
+  include_total?: boolean;
+  limit: number;
+  offset?: number;
+  snapshot?: string;
+}
+
+export const itemKeys = {
+  all: ["items"] as const,
+  details: () => ["items", "detail"] as const,
+  detail: (id: string, libraryId?: number) =>
+    ["items", "detail", id, libraryId ?? "default"] as const,
+  matchHints: (id: string, libraryId?: number) =>
+    ["items", "matchHints", id, libraryId ?? "default"] as const,
+  watchDetail: (id: string, fileId?: number, libraryId?: number) =>
+    ["items", "watchDetail", id, fileId ?? "default", libraryId ?? "default"] as const,
+  watchTrickplay: (id: string, fileId: number) => ["items", "watchTrickplay", id, fileId] as const,
+  markers: (id: string) => ["items", "markers", id] as const,
+  browse: (params: BrowseParams) => ["items", "browse", params] as const,
+  infiniteBrowse: (params: InfiniteBrowseParams) => ["items", "infiniteBrowse", params] as const,
+  filters: () => ["items", "filters"] as const,
+};
+
+export const catalogKeys = {
+  all: ["catalog"] as const,
+  list: (params: CatalogParams) => ["catalog", "list", params] as const,
+  filters: (params: Omit<CatalogParams, "limit">) => ["catalog", "filters", params] as const,
+  allLetters: ["catalog", "letters"] as const,
+  letters: (params: Pick<CatalogParams, "library_id" | "type" | "query_fingerprint">) =>
+    ["catalog", "letters", params] as const,
+  allCounts: ["catalog", "count"] as const,
+  count: (params: Pick<CatalogParams, "library_id" | "type" | "query_fingerprint">) =>
+    ["catalog", "count", params] as const,
+  itemDetail: (id: string, libraryId?: number) =>
+    ["catalog", "items", id, "detail", libraryId ?? "default"] as const,
+  itemVersions: (id: string) => ["catalog", "items", id, "versions"] as const,
+  audiobookGroups: (libraryId: number, groupBy: string, sort: string, search: string) =>
+    ["catalog", "audiobookGroups", libraryId, groupBy, sort, search] as const,
+  itemEpisodes: (id: string, libraryId?: number) =>
+    ["catalog", "items", id, "episodes", libraryId ?? "default"] as const,
+  seriesSeasons: (seriesId: string, libraryId?: number) =>
+    ["catalog", "series", seriesId, "seasons", libraryId ?? "default"] as const,
+  seasonDetail: (seriesId: string, seasonNum: number, libraryId?: number) =>
+    [
+      "catalog",
+      "series",
+      seriesId,
+      "seasons",
+      seasonNum,
+      "detail",
+      libraryId ?? "default",
+    ] as const,
+  seasonEpisodes: (seriesId: string, seasonNum: number, libraryId?: number) =>
+    [
+      "catalog",
+      "series",
+      seriesId,
+      "seasons",
+      seasonNum,
+      "episodes",
+      libraryId ?? "default",
+    ] as const,
+};
+
+export const favoriteKeys = {
+  all: ["favorites"] as const,
+  list: () => ["favorites", "list"] as const,
+  exists: () => ["favorites", "exists"] as const,
+  check: (itemId: string) => ["favorites", "check", itemId] as const,
+};
+
+export const notInterestedKeys = {
+  all: ["notInterested"] as const,
+  list: () => ["notInterested", "list"] as const,
+};
+
+export const watchlistKeys = {
+  all: ["watchlist"] as const,
+  list: () => ["watchlist", "list"] as const,
+  check: (itemId: string) => ["watchlist", "check", itemId] as const,
+  /** Watchlist entries for titles the library doesn't have yet. */
+  titles: () => ["watchlist", "titles"] as const,
+};
+
+export const historyKeys = {
+  all: ["history"] as const,
+  list: () => ["history", "list"] as const,
+};
+
+export const shuffleKeys = {
+  all: ["shuffles"] as const,
+  detail: (shuffleId: string) => ["shuffles", shuffleId] as const,
+};
+
+export const collectionKeys = {
+  all: ["collections"] as const,
+  list: () => ["collections", "list"] as const,
+  server: () => ["collections", "server"] as const,
+  items: (collectionId: string) => ["collections", "items", collectionId] as const,
+  /** The list, each own manual collection marked with whether it holds the title. */
+  containing: (contentId: string) => ["collections", "containing", contentId] as const,
+  preview: (scope: "user" | "admin", fingerprint: string) =>
+    ["collections", "preview", scope, fingerprint] as const,
+  templates: () => ["collections", "templates"] as const,
+  mdblistSearch: (query: string) => ["collections", "mdblist", "search", query] as const,
+};
+
+export const requestKeys = {
+  all: ["requests"] as const,
+  status: () => ["requests", "status"] as const,
+  discovery: () => ["requests", "discovery"] as const,
+  discoverySection: (section: string) => ["requests", "discovery", section] as const,
+  discoverStudios: () => ["requests", "discover", "studios"] as const,
+  discoverNetworks: () => ["requests", "discover", "networks"] as const,
+  discoverGenres: () => ["requests", "discover", "genres"] as const,
+  discoverBrowse: (
+    kind: "studio" | "network" | "genre",
+    slug: string,
+    mediaType: string | undefined,
+    sort: string,
+  ) => ["requests", "discover", "browse", kind, slug, mediaType ?? "", sort] as const,
+  search: (mediaType: string, query: string, page: number, viewerKey: string) =>
+    ["requests", "search", viewerKey, mediaType, query, page] as const,
+  detail: (mediaType: string, tmdbID: number) => ["requests", "detail", mediaType, tmdbID] as const,
+  mine: (params: Record<string, unknown>) => ["requests", "mine", params] as const,
+  one: (id: string) => ["requests", "one", id] as const,
+  // Prefixes for refreshing every params variant at once.
+  discoverBrowseAll: () => ["requests", "discover", "browse"] as const,
+  detailAll: () => ["requests", "detail"] as const,
+  mineAll: () => ["requests", "mine"] as const,
+  searchAll: () => ["requests", "search"] as const,
+};
+
+export const libraryCollectionKeys = {
+  all: ["libraryCollections"] as const,
+  list: (libraryId: number) => ["libraryCollections", "list", libraryId] as const,
+  items: (libraryId: number, collectionId: string) =>
+    ["libraryCollections", "items", libraryId, collectionId] as const,
+  userContributed: (libraryId: number) =>
+    ["libraryCollections", "userContributed", libraryId] as const,
+};
+
+// The titles that name pinned collections, kept outside libraryCollectionKeys.all:
+// personal-collection writes and media changes invalidate that root, and
+// neither renames a library collection.
+export const libraryCollectionTitleKeys = {
+  all: ["libraryCollectionTitles"] as const,
+  library: (libraryId: number) => ["libraryCollectionTitles", libraryId] as const,
+};
+
+export const profileKeys = {
+  all: ["profiles"] as const,
+  list: () => ["profiles", "list"] as const,
+  householdSessions: () => ["profiles", "household", "sessions"] as const,
+};
+
+export const compatKeys = {
+  all: ["compat"] as const,
+  connectInfo: () => ["compat", "connect-info"] as const,
+};
+
+export const personKeys = {
+  all: ["people"] as const,
+  searchCapabilities: () => ["people", "search-capabilities"] as const,
+  search: (query: string, limit = 20, mediaScope?: string) =>
+    ["people", "search", query, limit, mediaScope ?? "all"] as const,
+  detail: (id: string) => ["people", "detail", id] as const,
+  catalog: (
+    id: string,
+    options: {
+      type?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) =>
+    [
+      "people",
+      "catalog",
+      id,
+      options.type ?? "all",
+      options.limit ?? 24,
+      options.offset ?? 0,
+    ] as const,
+};
+
+export const episodeKeys = {
+  all: ["episodes"] as const,
+  seasons: (seriesId: string) => ["episodes", "seasons", seriesId] as const,
+  seasonDetail: (seriesId: string, seasonNum: number) =>
+    ["episodes", "seasons", seriesId, seasonNum, "detail"] as const,
+  bySeason: (seriesId: string, seasonNum: number) => ["episodes", seriesId, seasonNum] as const,
+  byItem: (itemId: string) => ["episodes", "item", itemId] as const,
+};
+
+export const ebookKeys = {
+  readerProgress: (contentId: string | undefined) => ["ebook-reader-progress", contentId] as const,
+};
+
+export const libraryKeys = {
+  all: ["libraries"] as const,
+  user: (profileId?: string | null) => ["libraries", "user", profileId ?? "none"] as const,
+};
+
+export const progressKeys = {
+  all: ["progress"] as const,
+  list: (status?: string, libraryId?: number) => ["progress", "list", status, libraryId] as const,
+};
+
+export const deviceKeys = {
+  all: ["devices"] as const,
+  list: (scope: "own" | "household") => ["devices", "list", scope] as const,
+};
+
+export const settingsKeys = {
+  // The canonical value queries live under ["settings", "values", …] and build
+  // their own key (effectiveSettingsQueryKey), so one invalidation of that
+  // prefix covers every scope and batch.
+  all: ["settings"] as const,
+  overlayConfig: () => ["settings", "overlay-config"] as const,
+  plugins: () => ["settings", "plugins"] as const,
+  pluginDetail: (installationId: number) => ["settings", "plugins", installationId] as const,
+};
+
+export const notificationKeys = {
+  all: ["notifications"] as const,
+  list: (status: "all" | "unread" = "all") => ["notifications", "list", status] as const,
+  /** Every notified-series list; prefix of each status's key. */
+  seriesAll: () => ["notifications", "series"] as const,
+  series: (status: string) => ["notifications", "series", status] as const,
+  unreadCount: () => ["notifications", "unread-count"] as const,
+  preferences: () => ["notifications", "preferences"] as const,
+  emailPreferences: () => ["notifications", "email-preferences"] as const,
+  discordPreferences: () => ["notifications", "discord-preferences"] as const,
+  capability: () => ["notifications", "capability"] as const,
+  webhooks: () => ["notifications", "webhooks"] as const,
+  pluginChannels: () => ["notifications", "plugin-channels"] as const,
+  pluginDestinations: () => ["notifications", "plugin-destinations"] as const,
+  webPushSubscriptions: () => ["notifications", "web-push-subscriptions"] as const,
+};
+
+export const historyImportKeys = {
+  all: ["history-imports"] as const,
+  sources: () => ["history-imports", "sources"] as const,
+  capability: () => ["history-imports", "capability"] as const,
+  runs: (limit = 10) => ["history-imports", "runs", limit] as const,
+  run: (id?: string) => ["history-imports", "run", id] as const,
+  plexCheck: (sessionId?: string) => ["history-imports", "plex-check", sessionId] as const,
+};
+
+export const webhookSyncKeys = {
+  all: ["webhook-sync"] as const,
+  connections: () => ["webhook-sync", "connections"] as const,
+  events: (connectionId?: string) => ["webhook-sync", "events", connectionId] as const,
+  profileMappings: (connectionId?: string) =>
+    ["webhook-sync", "profile-mappings", connectionId] as const,
+  connection: (connectionId?: string) => ["webhook-sync", "connection", connectionId] as const,
+};
+
+export const watchProviderKeys = {
+  all: ["watch-providers"] as const,
+  providers: (profileId?: string | null) =>
+    ["watch-providers", profileId ?? "none", "providers"] as const,
+  connection: (profileId: string | null | undefined, provider: string) =>
+    ["watch-providers", profileId ?? "none", provider, "connection"] as const,
+  syncRuns: (profileId: string | null | undefined, provider: string) =>
+    ["watch-providers", profileId ?? "none", provider, "sync-runs"] as const,
+};
+
+export const sectionKeys = {
+  all: ["sections"] as const,
+  home: () => ["sections", "home"] as const,
+  homeLayout: () => ["sections", "home", "layout"] as const,
+  homeItemsRoot: () => ["sections", "home", "items"] as const,
+  homeItems: (sectionId: string) => ["sections", "home", "items", sectionId] as const,
+  libraryRoot: () => ["sections", "library"] as const,
+  libraryLayout: (libraryId: number) => ["sections", "library", libraryId, "layout"] as const,
+  library: (libraryId: number) => ["sections", "library", libraryId] as const,
+  libraryItemsRoot: (libraryId: number) => ["sections", "library", libraryId, "items"] as const,
+  libraryItems: (libraryId: number, sectionId: string) =>
+    ["sections", "library", libraryId, "items", sectionId] as const,
+  adminList: (scope: string, libraryId?: number) =>
+    ["sections", "admin", scope, libraryId] as const,
+  /** Mutation key on every admin row write, so the Home rows list can wait for them. */
+  adminWrite: () => ["sections", "admin-write"] as const,
+  profileOverrides: (scope: string, libraryId?: string) =>
+    ["sections", "profile", scope, libraryId] as const,
+  profileOverridesRaw: (scope: string, libraryId?: string) =>
+    ["sections", "profile", scope, libraryId, "raw"] as const,
+};
+
+export const mediaSurfaceKeys = {
+  // Client-only signal: keep it outside sectionKeys so refreshing section data
+  // cannot reset the counter immediately before a mutation increments it.
+  refreshSignal: () => ["media-surfaces", "refresh-signal"] as const,
+};
+
+export const ratingKeys = {
+  all: ["ratings"] as const,
+  item: (itemId: string) => ["ratings", itemId] as const,
+  list: () => ["ratings", "list"] as const,
+};
+
+export const subtitleKeys = {
+  all: ["subtitles"] as const,
+  downloaded: (mediaFileId: number) => ["subtitles", "downloaded", mediaFileId] as const,
+  providerStatus: () => ["subtitles", "provider-status"] as const,
+};
+
+export const recKeys = {
+  all: ["recommendations"] as const,
+  forYouMain: () => [...recKeys.all, "for-you", "main"] as const,
+  forYouRows: () => [...recKeys.all, "for-you", "rows"] as const,
+  similar: (itemId: string) => [...recKeys.all, "similar", itemId] as const,
+  tasteProfile: () => [...recKeys.all, "taste-profile"] as const,
+  discover: () => [...recKeys.all, "discover"] as const,
+  section: (kind: string, key?: string) => [...recKeys.all, "section", kind, key ?? ""] as const,
+  tasteSeedItems: () => [...recKeys.all, "taste-seed", "items"] as const,
+};
+
+export const calendarKeys = {
+  all: ["calendar"] as const,
+  week: (weekStart: string, filter: string, libraryId?: number, timezone?: string) =>
+    ["calendar", "week", weekStart, filter, libraryId ?? "all", timezone ?? "UTC"] as const,
+};
+
+export const downloadKeys = {
+  all: ["downloads"] as const,
+  list: () => ["downloads", "list"] as const,
+  capability: () => ["downloads", "capability"] as const,
+};
+
+export const themeKeys = {
+  all: ["theme"] as const,
+  branding: () => ["theme", "branding"] as const,
+};
+
+export const adminKeys = {
+  users: () => ["admin", "users"] as const,
+  // Outside users(): saving an account does not change the server defaults.
+  policyDefaults: () => ["admin", "policyDefaults"] as const,
+  accessGroups: () => ["admin", "accessGroups"] as const,
+  accessGroup: (id: number) => ["admin", "accessGroups", id] as const,
+  serverNotificationChannels: () => ["admin", "notifications", "serverChannels"] as const,
+  userDetail: (userId: number) => ["admin", "users", userId] as const,
+  userProfiles: (userId?: number) => ["admin", "users", userId, "profiles"] as const,
+  userSettings: (userId: number) => ["admin", "users", userId, "settings"] as const,
+  userSetting: (userId: number, key: string) =>
+    ["admin", "users", userId, "settings", key] as const,
+  userDeviceSettings: (userId: number) => ["admin", "users", userId, "deviceSettings"] as const,
+  userDeviceSettingsByKey: (userId: number, key: string) =>
+    ["admin", "users", userId, "deviceSettings", key] as const,
+  userSubtitleDeviceSettings: (userId: number) =>
+    ["admin", "users", userId, "deviceSettings", "subtitle_appearance"] as const,
+  devices: () => ["admin", "devices"] as const,
+  deviceDetail: (userId: number, deviceId: string) =>
+    ["admin", "devices", userId, deviceId] as const,
+  libraries: () => ["admin", "libraries"] as const,
+  libraryRealtimeMonitoring: () => ["admin", "libraries", "realtimeMonitoring"] as const,
+  libraryCapabilities: () => ["admin", "libraries", "capabilities"] as const,
+  trickplayLibraries: () => ["admin", "trickplay", "libraries"] as const,
+  itemTrickplay: (itemId: string) => ["admin", "trickplay", "items", itemId] as const,
+  libraryRoots: (libraryId?: number, state?: string, search?: string) =>
+    ["admin", "libraries", "roots", libraryId ?? "all", state ?? "all", search ?? ""] as const,
+  libraryMatchQueueStatuses: () => ["admin", "libraries", "metadataMatchQueue"] as const,
+  libraryMatchQueueDetail: (libraryId: number) =>
+    ["admin", "libraries", "metadataMatchQueue", libraryId] as const,
+  filesystemBrowse: (path: string) => ["admin", "filesystem", "browse", path] as const,
+  librarySkippedRoots: () => ["admin", "libraries", "skippedRoots"] as const,
+  staleMediaIDs: () => ["admin", "libraries", "staleMediaIDs"] as const,
+  jobs: (jobType?: string) => ["admin", "jobs", jobType] as const,
+  catalogImportSources: () => ["admin", "catalog", "importSources"] as const,
+  localImportSources: () => ["admin", "catalog", "localImportSources"] as const,
+  collections: (libraryId?: number) => ["admin", "collections", libraryId] as const,
+  /** The admin Home and library page rows that show a server collection. */
+  collectionRows: (collectionId: string) => ["admin", "collections", "rows", collectionId] as const,
+  collectionGroups: (libraryId?: number) => ["admin", "collectionGroups", libraryId] as const,
+  collectionTemplates: () => ["admin", "collections", "templates"] as const,
+  collectionTemplateBundles: () => ["admin", "collections", "templateBundles"] as const,
+  // Outside "collections": refreshing the admin collections after a write
+  // doesn't re-run a dry run; Starter packs checks its pack again itself.
+  starterPackDryRun: (packId: string, body: unknown) =>
+    ["admin", "starterPackDryRun", packId, body] as const,
+  libraryProviders: (id: number) => ["admin", "libraries", id, "providers"] as const,
+  libraryProviderDefaults: (libraryType: string) =>
+    ["admin", "libraries", "provider-defaults", libraryType] as const,
+  nodes: () => ["admin", "nodes"] as const,
+  // Outside "nodes": every node write refreshes the list, not what the build supports.
+  nodeCapabilities: () => ["admin", "nodeCapabilities"] as const,
+  stats: () => ["admin", "stats"] as const,
+  sessions: () => ["admin", "sessions"] as const,
+  downloadPreparations: () => ["admin", "downloadPreparations"] as const,
+  downloadStorage: () => ["admin", "downloadStorage"] as const,
+  backups: () => ["admin", "backups"] as const,
+  serverSettings: () => ["admin", "serverSettings"] as const,
+  serverStatus: () => ["admin", "serverStatus"] as const,
+  dashboardLayout: () => ["admin", "dashboard", "layout"] as const,
+  // Dashboard insight endpoints are keyed by their window so a 1h tile and a
+  // 24h chart cache separately; the matching `*Root` key is the prefix the
+  // dashboard's Refresh invalidates, which covers every window at once.
+  dashboardTimeseriesRoot: () => ["admin", "dashboard", "timeseries"] as const,
+  dashboardTimeseries: (hours: number) => ["admin", "dashboard", "timeseries", hours] as const,
+  playbackActivityRoot: () => ["admin", "dashboard", "playback-activity"] as const,
+  playbackActivity: (hours: number) => ["admin", "dashboard", "playback-activity", hours] as const,
+  topActivityRoot: () => ["admin", "dashboard", "top-activity"] as const,
+  topActivity: (days: number) => ["admin", "dashboard", "top-activity", days] as const,
+  downloadsStatsRoot: () => ["admin", "dashboard", "downloads-stats"] as const,
+  downloadsStats: (limit: number) => ["admin", "dashboard", "downloads-stats", limit] as const,
+  apiClientsRoot: () => ["admin", "dashboard", "api-clients"] as const,
+  apiClients: (hours: number) => ["admin", "dashboard", "api-clients", hours] as const,
+  apiClientEndpoints: (sessionId: string, hours: number) =>
+    ["admin", "dashboard", "api-clients", "endpoints", sessionId, hours] as const,
+  restartKeys: () => ["admin", "restartKeys"] as const,
+  catalogSearchStatus: () => ["admin", "catalogSearchStatus"] as const,
+  jellyfinCompatStatus: () => ["admin", "jellyfinCompatStatus"] as const,
+  networkAccessCapabilities: () => ["admin", "networkAccess", "capabilities"] as const,
+  networkAccessStatusRoot: () => ["admin", "networkAccess", "status"] as const,
+  networkAccessStatus: (provider: string) =>
+    ["admin", "networkAccess", "status", provider] as const,
+  requestsRoot: () => ["admin", "requests"] as const,
+  // The queue, its view counts, and a request's history sit under
+  // requestsRoot, so every request action refreshes them.
+  requestQueueRoot: () => ["admin", "requests", "queue"] as const,
+  requestQueue: (params: Record<string, unknown>) =>
+    ["admin", "requests", "queue", params] as const,
+  requestCounts: () => ["admin", "requests", "counts"] as const,
+  requestEvents: (id: string) => ["admin", "requests", "events", id] as const,
+  requestSettings: () => ["admin", "requests", "settings"] as const,
+  requestIntegrations: () => ["admin", "requests", "integrations"] as const,
+  // The route and option keys sit outside requestsRoot on purpose: every request, server,
+  // and settings write invalidates that root. Only adding or deleting a server
+  // changes a route (it can set or clear Everything else), and those writes
+  // refresh the routes themselves; reading the routes is one GET per route; the
+  // options each call out to the server's Sonarr or Radarr.
+  requestRoutes: () => ["admin", "requestRoutes"] as const,
+  // Under requestRoutes: switching it changes the routes (Everything else can
+  // be filled in) and what a preview answers.
+  requestRouting: () => ["admin", "requestRoutes", "mode"] as const,
+  // Under requestRoutes, so saving a rule refreshes an open preview.
+  requestRoutePreviewRoot: () => ["admin", "requestRoutes", "preview"] as const,
+  requestRoutePreview: (mediaType: string, tmdbId: number, requesterUserId?: number) =>
+    ["admin", "requestRoutes", "preview", mediaType, tmdbId, requesterUserId ?? null] as const,
+  // Outside requestRoutes: a rule save changes nothing TMDB answers.
+  requestRouteTitles: (mediaType: string, q: string) =>
+    ["admin", "requestRouteTitles", mediaType, q] as const,
+  requestIntegrationOptionsRoot: () => ["admin", "requestIntegrationOptions"] as const,
+  // The Discover layout sits outside requestsRoot: a request or settings write
+  // changes nothing it holds.
+  requestDiscoverLayout: () => ["admin", "requestDiscover", "layout"] as const,
+  requestDiscoverPreview: (row: unknown) => ["admin", "requestDiscover", "preview", row] as const,
+  requestWatchProviders: (mediaType: string, region: string) =>
+    ["admin", "requestDiscover", "watchProviders", mediaType, region] as const,
+  requestIntegrationOptions: (integrationId: string) =>
+    ["admin", "requestIntegrationOptions", integrationId] as const,
+  requestUserLimit: (userId: number) => ["admin", "requests", "users", userId, "limit"] as const,
+  // Scoped to the admin authority: the limit's validator names the profile
+  // that read it, so another profile's cached copy would fail its save.
+  requestGroupLimit: (groupId: number, scope: string) =>
+    ["admin", "requests", "groups", groupId, "limit", scope] as const,
+  recommendationsStatus: () => ["admin", "recommendationsStatus"] as const,
+  inviteCodes: () => ["admin", "inviteCodes"] as const,
+  invitations: () => ["admin", "invitations"] as const,
+  apiKeys: () => ["admin", "apiKeys"] as const,
+  rateLimitConfig: () => ["admin", "rateLimitConfig"] as const,
+  playbackHistory: (params: {
+    userId?: number;
+    profileId?: string;
+    mediaItemId?: string;
+    completed?: string;
+    limit?: number;
+  }) => ["admin", "playbackHistory", params] as const,
+  userIPs: (userId: number, days?: number) => ["admin", "users", userId, "ips", days] as const,
+  ipUsers: (ip: string, days?: number) => ["admin", "ips", ip, days] as const,
+  operationalLogsRoot: () => ["admin", "logs", "app"] as const,
+  operationalLogs: (params: Record<string, unknown>) => ["admin", "logs", "app", params] as const,
+  auditLogs: (params: Record<string, unknown>) => ["admin", "logs", "audit", params] as const,
+  diagnosticStatus: () => ["diagnostics", "status"] as const,
+  diagnosticReports: (params: Record<string, unknown>) =>
+    ["admin", "diagnostics", "reports", params] as const,
+  diagnosticReport: (id?: string) => ["admin", "diagnostics", "reports", id ?? "none"] as const,
+  policyCapability: () => ["policy", "capability"] as const,
+  policyVendor: () => ["admin", "policy", "vendor"] as const,
+  policyDocuments: () => ["admin", "policy", "documents"] as const,
+  policyDocument: (id?: string) => ["admin", "policy", "documents", id ?? "none"] as const,
+  policyVersions: (id?: string) =>
+    ["admin", "policy", "documents", id ?? "none", "versions"] as const,
+  policyVersion: (id?: string, version?: string) =>
+    ["admin", "policy", "documents", id ?? "none", "versions", version ?? "none"] as const,
+  policyDecisions: (params: Record<string, unknown>) =>
+    ["admin", "policy", "decisions", params] as const,
+  policyDecision: (id?: string) => ["admin", "policy", "decisions", id ?? "none"] as const,
+  subtitleProviders: () => ["admin", "subtitleProviders"] as const,
+  downloadedSubtitles: (params: {
+    provider?: string;
+    language?: string;
+    userId?: number;
+    mediaFileId?: number;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  }) => ["admin", "downloadedSubtitles", params] as const,
+  historyImportSources: () => ["admin", "historyImportSources"] as const,
+  historyImportExternalUsers: (sourceId: number) =>
+    ["admin", "historyImportSources", sourceId, "users"] as const,
+  historyImportMappings: (sourceId?: number) =>
+    ["admin", "historyImportMappings", sourceId] as const,
+  historyImportAdminRuns: (params?: Record<string, unknown>) =>
+    ["admin", "historyImportAdminRuns", params] as const,
+  historyImportAdminRun: (id?: string) =>
+    ["admin", "historyImportAdminRuns", "detail", id] as const,
+  activeScans: () => ["admin", "activeScans"] as const,
+  tasks: () => ["admin", "tasks"] as const,
+  // Under tasks() so every task-list invalidation also refreshes it.
+  tasksIncludingHidden: () => ["admin", "tasks", { includeHidden: true }] as const,
+  task: (key: string) => ["admin", "tasks", key] as const,
+  taskHistory: (key: string) => ["admin", "tasks", key, "history"] as const,
+  taskMetrics: (key: string) => ["admin", "tasks", key, "metrics"] as const,
+  markerCapabilities: () => ["admin", "markerCapabilities"] as const,
+  ratingSources: () => ["admin", "ratingSources"] as const,
+  ratingSourceCapabilities: () => ["admin", "ratingSourceCapabilities"] as const,
+  markerProviders: () => ["admin", "markerProviders"] as const,
+  markerProvider: (provider: string) => ["admin", "markerProviders", provider] as const,
+  markerProviderValidation: (provider: string) =>
+    ["admin", "markerProviders", provider, "validation"] as const,
+  markerHistoryRoot: () => ["admin", "markerHistory"] as const,
+  markerHistory: (limit: number) => ["admin", "markerHistory", "all", limit] as const,
+  markerItemHistory: (itemId: string) => ["admin", "markerHistory", "items", itemId] as const,
+  markerFileHistory: (fileId: number) => ["admin", "markerHistory", "files", fileId] as const,
+  pluginRepositories: () => ["admin", "plugins", "repositories"] as const,
+  pluginCatalog: () => ["admin", "plugins", "catalog"] as const,
+  pluginCatalogSettings: () => ["admin", "plugins", "catalogSettings"] as const,
+  pluginInstallations: () => ["admin", "plugins", "installations"] as const,
+  unmatchedItems: (search?: string, ignored = false) =>
+    search === undefined
+      ? (["admin", "libraries", "unmatchedItems"] as const)
+      : ([
+          "admin",
+          "libraries",
+          "unmatchedItems",
+          ignored ? "ignored" : "unmatched",
+          search,
+        ] as const),
+  itemImages: (id: string) => ["admin", "items", id, "images"] as const,
+  buildInfo: () => ["admin", "system", "buildInfo"] as const,
+  hwAccel: () => ["admin", "system", "hwAccel"] as const,
+  systemResources: () => ["admin", "system", "resources"] as const,
+  autoscanSettings: () => ["admin", "autoscan", "settings"] as const,
+  autoscanConnections: () => ["admin", "autoscan", "connections"] as const,
+  autoscanSources: () => ["admin", "autoscan", "sources"] as const,
+  autoscanScanSourcePlugins: () => ["admin", "autoscan", "scan-source-plugins"] as const,
+  autoscanStatus: () => ["admin", "autoscan", "status"] as const,
+  autoscanScansRoot: () => ["admin", "autoscan", "scans"] as const,
+  autoscanScans: (params?: Record<string, unknown>) =>
+    ["admin", "autoscan", "scans", params ?? {}] as const,
+  autoscanEvents: (params?: Record<string, unknown>) =>
+    ["admin", "autoscan", "events", params ?? {}] as const,
+};

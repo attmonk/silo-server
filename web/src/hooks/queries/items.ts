@@ -1,0 +1,862 @@
+import {
+  getAdminItemImages,
+  applyAdminItemImage,
+  uploadAdminItemImage,
+  type UploadItemImageType,
+} from "@/api/v2/adminImages";
+import { getAdminItemFiles, splitAdminItem } from "@/api/v2/adminSplit";
+import {
+  useIsMutating,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { useRealtimeEvents } from "@/components/realtimeEventsContext";
+import type {
+  ApplyItemImageRequest,
+  ItemDetail,
+  ItemMatchSearchRequest,
+  ItemSplitRequest,
+  WatchDetail,
+} from "@/api/types";
+import {
+  problemFieldDetail,
+  V2ProblemError,
+  V2TransportError,
+  v2,
+  type V2Result,
+} from "@/api/v2/request";
+import { StaleApiRequestContextError } from "@/api/client";
+import { adminTaskJobFromV2 } from "@/api/v2/adminTasks";
+import { catalogItemDetailFromV2 } from "@/api/v2/catalog";
+import { watchDetailFromV2 } from "@/api/v2/watch";
+import { adminKeys, catalogKeys, episodeKeys, itemKeys, sectionKeys } from "./keys";
+import { toast } from "sonner";
+import { t } from "@/i18n";
+import {
+  getCachedWatchedInvalidationKeys,
+  getWatchedToastMessage,
+} from "@/pages/ItemDetail/watchedState";
+import {
+  cancelItemDetailQueries,
+  dropInactiveWatchDetail,
+  invalidateMediaSurfaceQueries,
+  scheduleMediaSurfaceInvalidation,
+  updateCatalogItemDetail,
+} from "./mediaSurfaceRefresh";
+import { PERSONAL_STATE_WRITE_KEY } from "./personalStateWrites";
+import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
+
+/** Device pixels across the screen, capped at 1080p width, for the loading backdrop. */
+function loadingBackdropWidth(): number | undefined {
+  if (typeof window === "undefined" || !window.screen?.width) return undefined;
+  return Math.min(1920, Math.round(window.screen.width * (window.devicePixelRatio || 1)));
+}
+
+export async function fetchWatchDetail(
+  id: string,
+  fileId?: number,
+  libraryId?: number,
+  options?: RequestInit,
+): Promise<WatchDetail> {
+  const detail = await v2("GET /api/v2/watch/{id}", {
+    path: { id },
+    query: {
+      file_id: fileId != null ? String(fileId) : undefined,
+      library_id: libraryId != null ? String(libraryId) : undefined,
+      // The backdrop fills the loading screen, dimmed: screen width is enough.
+      backdrop_width: loadingBackdropWidth(),
+    },
+    signal: options?.signal ?? undefined,
+  });
+  return watchDetailFromV2(detail);
+}
+
+export function useWatchDetail(id: string | undefined, fileId?: number, libraryId?: number) {
+  return useQuery({
+    queryKey: itemKeys.watchDetail(id!, fileId, libraryId),
+    queryFn: () => fetchWatchDetail(id!, fileId, libraryId),
+    enabled: !!id,
+    staleTime: 0,
+  });
+}
+
+type RefreshMutationItem = Pick<ItemDetail, "content_id" | "type" | "series_id" | "season_number">;
+export type RefreshItemMetadataMode = "quick" | "complete";
+
+interface RefreshItemMetadataVariables {
+  item: RefreshMutationItem;
+  // reset is Reset to Provider in Edit Metadata, not a refresh dialog choice.
+  mode: RefreshItemMetadataMode | "reset";
+  onReplaced?: (contentID: string) => void | Promise<void>;
+}
+
+interface ItemRefreshJobResult {
+  requested_content_id?: string;
+  refresh_content_id?: string;
+  detail_content_id?: string;
+  scan_path?: string;
+  matched_files?: number;
+  // Either is set when the metadata refresh committed but its artwork did not
+  // finish caching. The refresh itself succeeded, so this is a warning, not an
+  // error. A job read through the API carries the flag, and the warning as
+  // admin text; a job that arrives as a live event carries only the server's
+  // own warning text.
+  artwork_cache_incomplete?: boolean;
+  artwork_cache_warning?: string;
+  scan_result?: {
+    new?: number;
+  };
+}
+
+interface RefreshItemMetadataContext {
+  toastID: string | number;
+  startURL: string; // Path and query; onReplaced follows only while the browser is still on them.
+}
+
+const itemMetadataRefreshKey = ["items", "metadata-refresh"] as const;
+
+export function useRefreshItemMetadata() {
+  const queryClient = useQueryClient();
+  const { awaitAdminJob } = useRealtimeEvents();
+  return useMutation({
+    mutationKey: itemMetadataRefreshKey,
+    retry: false,
+    onMutate: ({ mode }: RefreshItemMetadataVariables): RefreshItemMetadataContext => ({
+      toastID: toast.loading(
+        mode === "complete"
+          ? t("web.item.toast.refreshRunningComplete")
+          : t("web.item.toast.refreshRunningQuick"),
+      ),
+      startURL: window.location.pathname + window.location.search,
+    }),
+    mutationFn: async ({ item, mode }: RefreshItemMetadataVariables) => {
+      const job = adminTaskJobFromV2(
+        await v2("POST /api/v2/admin/items/{id}/refresh-metadata", {
+          path: { id: item.content_id },
+          body: { mode },
+          retryAuthentication: false,
+        }),
+      );
+      const completed = await awaitAdminJob(job.id);
+      return { job: completed };
+    },
+    onSuccess: async ({ job }, { item, mode, onReplaced }, context) => {
+      const result = (job.result_payload ?? {}) as ItemRefreshJobResult;
+      const refreshContentID = result.refresh_content_id;
+      const detailContentID = result.detail_content_id;
+      const newFiles = result.scan_result?.new ?? 0;
+
+      if (result.artwork_cache_incomplete || result.artwork_cache_warning) {
+        toast.warning(t("web.item.toast.refreshArtworkWarning"), {
+          id: context?.toastID,
+          // Empty when it is admin text a curator's session has not loaded.
+          description: result.artwork_cache_warning || undefined,
+        });
+      } else if (mode === "complete") {
+        toast.success(t("web.item.toast.completeRefreshFinished"), { id: context?.toastID });
+      } else if (newFiles > 0) {
+        toast.success(
+          t("web.item.toast.refreshedNewFiles", {
+            count: newFiles,
+            new_files: newFiles,
+          }),
+          { id: context?.toastID },
+        );
+      } else {
+        toast.success(t("web.item.toast.refreshed"), { id: context?.toastID });
+      }
+
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["items", "detail", item.content_id] }),
+        queryClient.invalidateQueries({
+          queryKey: ["catalog", "items", item.content_id, "detail"],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", item.content_id] }),
+      ]);
+
+      if (refreshContentID && refreshContentID !== item.content_id) {
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["items", "detail", refreshContentID] }),
+          queryClient.invalidateQueries({
+            queryKey: ["catalog", "items", refreshContentID, "detail"],
+          }),
+        ]);
+      }
+      if (
+        detailContentID &&
+        detailContentID !== item.content_id &&
+        detailContentID !== refreshContentID
+      ) {
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["items", "detail", detailContentID] }),
+          queryClient.invalidateQueries({
+            queryKey: ["catalog", "items", detailContentID, "detail"],
+          }),
+        ]);
+      }
+
+      if (item.type === "series") {
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: episodeKeys.seasons(item.content_id) }),
+          queryClient.invalidateQueries({
+            queryKey: ["catalog", "series", item.content_id, "seasons"],
+          }),
+          queryClient.invalidateQueries({ queryKey: episodeKeys.all }),
+        ]);
+      } else if ((item.type === "season" || item.type === "episode") && item.series_id) {
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["items", "detail", item.series_id] }),
+          queryClient.invalidateQueries({
+            queryKey: ["catalog", "items", item.series_id, "detail"],
+          }),
+          queryClient.invalidateQueries({ queryKey: episodeKeys.seasons(item.series_id) }),
+          queryClient.invalidateQueries({
+            queryKey: ["catalog", "series", item.series_id, "seasons"],
+          }),
+          queryClient.invalidateQueries({ queryKey: episodeKeys.all }),
+        ]);
+        if (item.season_number != null) {
+          await queryClient.invalidateQueries({
+            queryKey: episodeKeys.bySeason(item.series_id, item.season_number),
+          });
+          await queryClient.invalidateQueries({
+            queryKey: episodeKeys.seasonDetail(item.series_id, item.season_number),
+          });
+          await queryClient.invalidateQueries({
+            queryKey: catalogKeys.seasonEpisodes(item.series_id, item.season_number),
+          });
+          await queryClient.invalidateQueries({
+            queryKey: catalogKeys.seasonDetail(item.series_id, item.season_number),
+          });
+        }
+      }
+
+      // Runs after unmount too. Check the URL, not mount: a page whose old ID 404s must follow.
+      const onStartURL = window.location.pathname + window.location.search === context?.startURL;
+      if (detailContentID && detailContentID !== item.content_id && onStartURL) {
+        await onReplaced?.(detailContentID);
+      }
+    },
+    onError: (err, _variables, context) => {
+      // Signed out or switched account while it ran: nothing failed, so say nothing.
+      if (err instanceof StaleApiRequestContextError) {
+        toast.dismiss(context?.toastID);
+        return;
+      }
+      toast.error(err instanceof Error ? err.message : t("web.item.toast.refreshFailed"), {
+        id: context?.toastID,
+      });
+    },
+  });
+}
+
+/** The marker kinds an admin re-detection runs; a movie has credits only. */
+export type RedetectMarkersKind = "intro" | "credits" | "all";
+export type RedetectItemMarkersResponse =
+  V2Result<"POST /api/v2/admin/items/{id}/redetect-markers">;
+export async function redetectItemMarkers(
+  itemId: string,
+  kind: RedetectMarkersKind,
+): Promise<RedetectItemMarkersResponse> {
+  return v2("POST /api/v2/admin/items/{id}/redetect-markers", {
+    path: { id: itemId },
+    body: { kind },
+    retryAuthentication: false,
+  });
+}
+
+export type RedetectEpisodeIntroResponse = V2Result<"POST /api/v2/admin/items/{id}/redetect-intro">;
+/**
+ * Re-detects an episode's intro through the older episode-only operation,
+ * for API nodes that do not advertise the redetect_markers capability.
+ */
+export async function redetectEpisodeIntro(
+  episodeId: string,
+): Promise<RedetectEpisodeIntroResponse> {
+  return v2("POST /api/v2/admin/items/{id}/redetect-intro", {
+    path: { id: episodeId },
+    retryAuthentication: false,
+  });
+}
+
+const redetectionToasts = {
+  onSuccess: (response: { status: string }) => {
+    toast.success(
+      response.status === "already_running"
+        ? t("web.item.toast.redetectAlreadyRunning")
+        : t("web.item.toast.redetectStarted"),
+    );
+  },
+  onError: (error: unknown) => {
+    toast.error(error instanceof Error ? error.message : t("web.item.toast.redetectFailed"));
+  },
+};
+
+function isMissingOperation(error: unknown): boolean {
+  return (
+    (error instanceof V2ProblemError || error instanceof V2TransportError) && error.status === 404
+  );
+}
+
+/**
+ * Re-detects an item's markers. The capability read and this call can reach
+ * different API nodes during a rolling deploy or rollback, so a 404 drops the
+ * cached capability; with `introFallback` (episodes) an intro-only request
+ * retries once through the older episode-only operation. Other kinds surface
+ * the error, since that operation cannot re-detect credits.
+ */
+export function useRedetectItemMarkers({ introFallback = false } = {}) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    retry: false,
+    mutationFn: async ({ itemId, kind }: { itemId: string; kind: RedetectMarkersKind }) => {
+      try {
+        return await redetectItemMarkers(itemId, kind);
+      } catch (error) {
+        if (!isMissingOperation(error)) throw error;
+        void queryClient.invalidateQueries({ queryKey: adminKeys.markerCapabilities() });
+        if (!introFallback || kind !== "intro") throw error;
+        return redetectEpisodeIntro(itemId);
+      }
+    },
+    ...redetectionToasts,
+  });
+}
+
+export function useRedetectEpisodeIntro() {
+  return useMutation({
+    retry: false,
+    mutationFn: redetectEpisodeIntro,
+    ...redetectionToasts,
+  });
+}
+
+export interface UpdateItemMetadataRequest {
+  title?: string;
+  sort_title?: string;
+  original_title?: string;
+  overview?: string;
+  tagline?: string;
+  content_rating?: string;
+  year?: number;
+  runtime?: number;
+  genres?: string[];
+  studios?: string[];
+  networks?: string[];
+  countries?: string[];
+  release_date?: string | null;
+  first_air_date?: string | null;
+  last_air_date?: string | null;
+  air_time?: string | null;
+  air_timezone?: string | null;
+  air_date?: string | null;
+  rating_imdb?: number | null;
+  rating_tmdb?: number | null;
+  rating_rt_critic?: number | null;
+  rating_rt_audience?: number | null;
+  imdb_id?: string;
+  tmdb_id?: string;
+  tvdb_id?: string;
+  season_number?: number;
+  episode_number?: number;
+  locked_fields?: number[];
+}
+
+const itemMetadataWriteKey = (contentId: string) => ["items", "metadata-write", contentId] as const;
+const itemImageWriteKey = ["items", "image-write"] as const;
+
+export function useUpdateItemMetadata(contentId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: itemMetadataWriteKey(contentId),
+    retry: false,
+    mutationFn: async (data: UpdateItemMetadataRequest) =>
+      catalogItemDetailFromV2(
+        await v2("PATCH /api/v2/admin/items/{id}/metadata", {
+          path: { id: contentId },
+          body: data,
+          retryAuthentication: false,
+        }),
+      ),
+    // Returning the refetch keeps the save pending until the item is
+    // refetched. A reopened Edit Metadata seeds its form, and the whole lock
+    // list it sends, from the item, so it must not see the pre-save item.
+    onSuccess: () => {
+      toast.success(t("web.item.toast.metadataSaved"));
+      return invalidateMediaSurfaceQueries(queryClient, { itemId: contentId }).then(() => {
+        bumpHomeRefreshSignal(queryClient);
+      });
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : t("web.item.toast.saveMetadataFailed"));
+    },
+  });
+}
+
+// Whether a metadata save for the item is still running, including one
+// started from an earlier opening of Edit Metadata.
+export function useItemMetadataSavePending(contentId: string) {
+  return useIsMutating({ mutationKey: itemMetadataWriteKey(contentId) }) > 0;
+}
+
+// The image and refresh mutations take the item as a variable, so these read
+// them by the item they were started for. Edit Metadata unmounts its image
+// tab and starts a new form when it closes, so a reopened dialog sees an
+// image write or a reset from an earlier opening only through these.
+function startedFor(contentId: string) {
+  return (mutation: { state: { variables: unknown } }) =>
+    (mutation.state.variables as { item?: Pick<ItemDetail, "content_id"> } | undefined)?.item
+      ?.content_id === contentId;
+}
+
+// Whether an image apply or upload for the item is still running.
+export function useItemImageWritePending(contentId: string) {
+  return useIsMutating({ mutationKey: itemImageWriteKey, predicate: startedFor(contentId) }) > 0;
+}
+
+// Whether a Reset to Provider for the item is still running, until the item
+// has refetched. Only a reset clears the item's locks.
+export function useItemMetadataResetPending(contentId: string) {
+  const forItem = startedFor(contentId);
+  return (
+    useIsMutating({
+      mutationKey: itemMetadataRefreshKey,
+      predicate: (mutation) =>
+        forItem(mutation) &&
+        (mutation.state.variables as Partial<RefreshItemMetadataVariables> | undefined)?.mode ===
+          "reset",
+    }) > 0
+  );
+}
+
+type WatchedMutationItem = Pick<
+  ItemDetail,
+  "content_id" | "type" | "series_id" | "season_number" | "user_data"
+>;
+
+export function useWatchedStateMutation(item: WatchedMutationItem) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: PERSONAL_STATE_WRITE_KEY,
+    mutationFn: (nextPlayed: boolean) =>
+      // Marking a series expands to every episode server-side. keepalive
+      // lets the browser finish the request after a navigation or tab close,
+      // so a large series no longer depends on the user staying on the page.
+      // The server applies the mark in one transaction, so a request that
+      // never arrives leaves nothing marked rather than a partial subset.
+      nextPlayed
+        ? v2("POST /api/v2/watched/{id}", { path: { id: item.content_id }, keepalive: true })
+        : v2("DELETE /api/v2/watched/{id}", { path: { id: item.content_id }, keepalive: true }),
+    onMutate: async (nextPlayed: boolean) => {
+      // Marking watched no longer always flips the flag (a rewatch stays
+      // watched), so remember what to restore.
+      const previousPlayed = item.user_data?.played ?? !nextPlayed;
+      await cancelItemDetailQueries(queryClient, item.content_id);
+      updateCatalogItemDetail(queryClient, item.content_id, (detail) => ({
+        ...detail,
+        user_data: { ...detail.user_data, played: nextPlayed },
+        user_state: {
+          ...detail.user_state,
+          played: nextPlayed,
+          is_favorite: detail.user_state?.is_favorite ?? false,
+          in_watchlist: detail.user_state?.in_watchlist ?? false,
+        },
+      }));
+      return { previousPlayed };
+    },
+    // Revert only this mutation's own field. Restoring a whole snapshot would
+    // discard a concurrent favorite/watchlist toggle's optimistic state.
+    onError: (err, nextPlayed, context) => {
+      const previousPlayed = context?.previousPlayed ?? !nextPlayed;
+      updateCatalogItemDetail(queryClient, item.content_id, (detail) => ({
+        ...detail,
+        user_data: { ...detail.user_data, played: previousPlayed },
+        user_state: {
+          ...detail.user_state,
+          played: previousPlayed,
+          is_favorite: detail.user_state?.is_favorite ?? false,
+          in_watchlist: detail.user_state?.in_watchlist ?? false,
+        },
+      }));
+      toast.error(err instanceof Error ? err.message : t("web.item.toast.watchedUpdateFailed"));
+    },
+    onSuccess: (_data, nextPlayed) => {
+      toast.success(getWatchedToastMessage(item, nextPlayed));
+    },
+    onSettled: (_data, error) => {
+      // The detail query has to be refreshed: marking watched also zeroes
+      // `position_seconds` and moves season/series counts server-side, and the
+      // optimistic patch above only carries `played`. A mark that landed also
+      // clears the resume position, so a closed player must not start from
+      // its cached one while that refresh waits.
+      const knownRelatedIds = error
+        ? undefined
+        : dropInactiveWatchDetail(queryClient, item.content_id);
+      scheduleMediaSurfaceInvalidation(queryClient, {
+        itemId: item.content_id,
+        watchedKeys: getCachedWatchedInvalidationKeys(queryClient, item),
+        skipSimilarItems: true,
+        knownRelatedIds,
+      });
+    },
+  });
+}
+
+export function useSearchItemMatchCandidates(contentId: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (params: ItemMatchSearchRequest) =>
+      v2("POST /api/v2/admin/items/{id}/match/search", {
+        path: { id: contentId },
+        body: {
+          ...params,
+          library_id: params.library_id == null ? undefined : String(params.library_id),
+          limit: 500,
+        },
+        retryAuthentication: false,
+      }).then((result) => ({
+        ...result,
+        candidates: result.candidates.map((candidate) => ({
+          ...candidate,
+          image_url: candidate.image_url ?? "",
+          overview: candidate.overview ?? "",
+        })),
+      })),
+    retry: false,
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : t("web.item.toast.matchSearchFailed"));
+    },
+    meta: { queryClient },
+  });
+}
+
+/**
+ * The title, year, and provider IDs the scanner read from the item's folder
+ * and file names in the given library: what Match Item suggests searching
+ * instead of the item's current, possibly wrong, match.
+ */
+export function useItemMatchHints(contentId: string | undefined, libraryId: number | undefined) {
+  return useQuery({
+    queryKey: itemKeys.matchHints(contentId ?? "", libraryId),
+    queryFn: ({ signal }) =>
+      v2("GET /api/v2/admin/items/{id}/match/hints", {
+        path: { id: contentId ?? "" },
+        query: { library_id: libraryId == null ? undefined : String(libraryId) },
+        signal,
+      }),
+    enabled: Boolean(contentId),
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+type ApplyMatchItem = Pick<ItemDetail, "content_id" | "series_id" | "season_number"> & {
+  type: string;
+  library_id?: number;
+};
+
+interface ApplyItemMatchVariables {
+  item: ApplyMatchItem;
+  providerIds: Record<string, string>;
+  /**
+   * Called with the item's new content ID when applying the match moved it,
+   * so a page showing the old ID can follow it.
+   */
+  onReplaced?: (contentID: string) => void | Promise<void>;
+}
+
+export function useApplyItemMatch() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ item, providerIds }: ApplyItemMatchVariables) => {
+      return v2("POST /api/v2/admin/items/{id}/match/apply", {
+        path: { id: item.content_id },
+        body: {
+          provider_ids: providerIds,
+          library_id: item.library_id == null ? undefined : String(item.library_id),
+        },
+        retryAuthentication: false,
+      });
+    },
+    retry: false,
+    onSuccess: async (result, { item, onReplaced }) => {
+      toast.success(t("web.item.toast.matchApplied"));
+      const adminLists = Promise.all([
+        queryClient.invalidateQueries({ queryKey: adminKeys.staleMediaIDs() }),
+        queryClient.invalidateQueries({ queryKey: adminKeys.unmatchedItems() }),
+      ]);
+
+      if (result.content_id && result.content_id !== item.content_id) {
+        // The match moved the item to a new content ID, so the old one no
+        // longer resolves. Mark its queries stale without refetching them,
+        // move a page showing it to the new ID before anything else can
+        // refetch it, then refresh the lists and rows that still link to it.
+        await queryClient.invalidateQueries({
+          predicate: (query) => query.queryKey.includes(item.content_id),
+          refetchType: "none",
+        });
+        try {
+          await onReplaced?.(result.content_id);
+        } finally {
+          // The lists still link to the old ID even if following it failed.
+          // Home reads its rows through one-shot fetches, so it re-reads them
+          // only when the refresh signal changes.
+          void invalidateMediaSurfaceQueries(queryClient, {
+            itemId: item.content_id,
+            skipItemQueries: true,
+          }).then(
+            () => bumpHomeRefreshSignal(queryClient),
+            () => bumpHomeRefreshSignal(queryClient),
+          );
+        }
+        await adminLists;
+        return;
+      }
+
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["items", "detail", item.content_id] }),
+        queryClient.invalidateQueries({
+          queryKey: ["catalog", "items", item.content_id, "detail"],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", item.content_id] }),
+        adminLists,
+      ]);
+
+      if (item.type === "series") {
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: episodeKeys.seasons(item.content_id) }),
+          queryClient.invalidateQueries({
+            queryKey: ["catalog", "series", item.content_id, "seasons"],
+          }),
+          queryClient.invalidateQueries({ queryKey: episodeKeys.all }),
+        ]);
+      } else if ((item.type === "season" || item.type === "episode") && item.series_id) {
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["items", "detail", item.series_id] }),
+          queryClient.invalidateQueries({
+            queryKey: ["catalog", "items", item.series_id, "detail"],
+          }),
+          queryClient.invalidateQueries({ queryKey: episodeKeys.seasons(item.series_id) }),
+          queryClient.invalidateQueries({
+            queryKey: ["catalog", "series", item.series_id, "seasons"],
+          }),
+          queryClient.invalidateQueries({ queryKey: episodeKeys.all }),
+        ]);
+        if (item.season_number != null) {
+          await queryClient.invalidateQueries({
+            queryKey: episodeKeys.bySeason(item.series_id, item.season_number),
+          });
+          await queryClient.invalidateQueries({
+            queryKey: episodeKeys.seasonDetail(item.series_id, item.season_number),
+          });
+          await queryClient.invalidateQueries({
+            queryKey: catalogKeys.seasonEpisodes(item.series_id, item.season_number),
+          });
+          await queryClient.invalidateQueries({
+            queryKey: catalogKeys.seasonDetail(item.series_id, item.season_number),
+          });
+        }
+      }
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : t("web.item.toast.matchApplyFailed"));
+    },
+  });
+}
+
+// --- Split/merge hooks ---
+
+export function useItemFiles(contentId: string | undefined) {
+  return useQuery({
+    queryKey: ["items", "files", contentId],
+    queryFn: ({ signal }) => getAdminItemFiles(contentId ?? "", signal),
+    enabled: Boolean(contentId),
+    staleTime: 30_000,
+  });
+}
+
+export function useSplitItem() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    retry: false,
+    mutationFn: ({ contentId, request }: { contentId: string; request: ItemSplitRequest }) =>
+      splitAdminItem(contentId, request),
+    onSuccess: async (result, { contentId }) => {
+      if (result.dry_run) return;
+      toast.success(
+        t("web.item.toast.splitMoved", {
+          count: result.files_moved,
+          files_moved: result.files_moved,
+        }),
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["items", "detail", contentId] }),
+        queryClient.invalidateQueries({ queryKey: ["catalog", "items", contentId, "detail"] }),
+        queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", contentId] }),
+        queryClient.invalidateQueries({ queryKey: ["items", "files", contentId] }),
+        queryClient.invalidateQueries({ queryKey: adminKeys.unmatchedItems() }),
+      ]);
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : t("web.item.toast.splitFailed"));
+    },
+  });
+}
+
+// --- Image selector hooks ---
+
+export function useItemImages(contentId: string | undefined, enabled = true) {
+  return useQuery({
+    queryKey: adminKeys.itemImages(contentId!),
+    queryFn: ({ signal }) => getAdminItemImages(contentId!, signal),
+    enabled: !!contentId && enabled,
+    staleTime: 5 * 60_000,
+  });
+}
+
+type ApplyImageItem = Pick<ItemDetail, "content_id" | "type" | "series_id" | "season_number">;
+
+// A validation problem's first field detail says why an image was refused;
+// its summary only says that it was.
+function imageErrorMessage(err: unknown, fallback: string) {
+  if (err instanceof V2ProblemError) {
+    const field = err.problem.errors?.[0];
+    return field ? problemFieldDetail(field) : err.message;
+  }
+  return err instanceof Error ? err.message : fallback;
+}
+
+// Refreshes every view that shows the item's artwork, and the series' views
+// for a season or episode.
+async function invalidateAppliedImage(queryClient: QueryClient, item: ApplyImageItem) {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: adminKeys.itemImages(item.content_id) }),
+    queryClient.invalidateQueries({ queryKey: ["items", "detail", item.content_id] }),
+    queryClient.invalidateQueries({
+      queryKey: ["catalog", "items", item.content_id, "detail"],
+    }),
+    queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", item.content_id] }),
+    queryClient.invalidateQueries({ queryKey: catalogKeys.all }),
+    queryClient.invalidateQueries({ queryKey: sectionKeys.all }),
+  ]);
+
+  // Cascade for seasons/episodes to parent series.
+  if ((item.type === "season" || item.type === "episode") && item.series_id) {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["items", "detail", item.series_id] }),
+      queryClient.invalidateQueries({
+        queryKey: ["catalog", "items", item.series_id, "detail"],
+      }),
+      queryClient.invalidateQueries({ queryKey: episodeKeys.seasons(item.series_id) }),
+      queryClient.invalidateQueries({
+        queryKey: ["catalog", "series", item.series_id, "seasons"],
+      }),
+    ]);
+  }
+}
+
+export function useApplyItemImage() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: itemImageWriteKey,
+    mutationFn: async ({
+      item,
+      request,
+    }: {
+      item: ApplyImageItem;
+      request: ApplyItemImageRequest;
+    }) => applyAdminItemImage(item.content_id, request),
+    retry: false,
+    onSuccess: async (_, { item }) => {
+      toast.success(t("web.item.toast.imageApplied"));
+      await invalidateAppliedImage(queryClient, item);
+    },
+    onError: (err) => {
+      toast.error(imageErrorMessage(err, t("web.item.toast.imageApplyFailed")));
+    },
+  });
+}
+
+export function useUploadItemImage() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: itemImageWriteKey,
+    mutationFn: async ({
+      item,
+      type,
+      file,
+    }: {
+      item: ApplyImageItem;
+      type: UploadItemImageType;
+      file: File;
+    }) => uploadAdminItemImage(item.content_id, type, file),
+    retry: false,
+    onSuccess: async (_, { item }) => {
+      toast.success(t("web.item.toast.imageUploaded"));
+      await invalidateAppliedImage(queryClient, item);
+    },
+    onError: (err) => {
+      toast.error(imageErrorMessage(err, t("web.item.toast.imageUploadFailed")));
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Metadata AI translation (descriptions into the localization tables)
+// ---------------------------------------------------------------------------
+
+export type MetadataTranslationJob =
+  V2Result<"GET /api/v2/admin/items/{id}/metadata-translation/jobs">["jobs"][number];
+
+export interface TranslateItemMetadataRequest {
+  target_language: string;
+  include_children?: boolean;
+  force?: boolean;
+}
+
+export function useTranslateItemMetadata(contentId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    retry: false,
+    mutationFn: async (body: TranslateItemMetadataRequest) => ({
+      job: await v2("POST /api/v2/admin/items/{id}/metadata-translation", {
+        path: { id: contentId },
+        body,
+        retryAuthentication: false,
+      }),
+    }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["metadata-translation-jobs", contentId],
+      });
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : t("web.item.toast.translateFailed"));
+    },
+  });
+}
+
+/**
+ * Recent translation jobs for an item. Polls while a job is active so the
+ * metadata editor can show live progress without a websocket.
+ */
+export function useMetadataTranslationJobs(contentId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ["metadata-translation-jobs", contentId],
+    queryFn: () =>
+      v2("GET /api/v2/admin/items/{id}/metadata-translation/jobs", { path: { id: contentId } }),
+    enabled,
+    refetchInterval: (query) => {
+      const jobs = query.state.data?.jobs ?? [];
+      return jobs.some((j) => j.status === "pending" || j.status === "running") ? 1500 : false;
+    },
+  });
+}

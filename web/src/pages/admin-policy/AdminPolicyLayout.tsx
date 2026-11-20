@@ -1,0 +1,142 @@
+import { ArrowRight, PackageCheck, PenLine, ScrollText } from "lucide-react";
+import { useSearchParams } from "react-router";
+
+import { PageHeader } from "@/components/page/PageHeader";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { usePolicyCapability } from "@/hooks/queries/admin/policy";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { useT } from "@/i18n";
+
+import { PolicyDecisionLogTable } from "./PolicyDecisionLogTable";
+import { PolicyDocumentList } from "./PolicyDocumentList";
+import { PolicyVendorViewer } from "./PolicyVendorViewer";
+
+// Tab ids are stable URL contract (?tab=); labels are presentation only.
+const POLICY_TABS = new Set(["documents", "vendor", "decisions"]);
+
+function resolveTab(value: string | null) {
+  return value && POLICY_TABS.has(value) ? value : "documents";
+}
+
+const PIPELINE_STEPS = [
+  {
+    icon: PackageCheck,
+    title: "web.admin.access.policy.pipeline.baseline.title",
+    detail: "web.admin.access.policy.pipeline.baseline.detail",
+  },
+  {
+    icon: PenLine,
+    title: "web.admin.access.policy.pipeline.overrides.title",
+    detail: "web.admin.access.policy.pipeline.overrides.detail",
+  },
+  {
+    icon: ScrollText,
+    title: "web.admin.access.policy.pipeline.log.title",
+    detail: "web.admin.access.policy.pipeline.log.detail",
+  },
+] as const;
+
+function PolicyPipelineStrip() {
+  const t = useT();
+  return (
+    <div className="surface-panel-subtle rounded-2xl p-4">
+      <ol className="grid gap-4 md:grid-cols-3">
+        {PIPELINE_STEPS.map((step, index) => (
+          <li key={step.title} className="relative flex items-start gap-3">
+            <step.icon aria-hidden className="text-muted-foreground mt-0.5 size-4 shrink-0" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium">{t(step.title)}</p>
+              <p className="text-muted-foreground mt-0.5 text-xs leading-relaxed">
+                {t(step.detail)}
+              </p>
+            </div>
+            {index < PIPELINE_STEPS.length - 1 && (
+              <ArrowRight
+                aria-hidden
+                className="text-muted-foreground/50 absolute -end-3 top-1 hidden size-4 md:block"
+              />
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+export default function AdminPolicyLayout() {
+  const t = useT();
+  useDocumentTitle(t("web.admin.access.policy.title"));
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = resolveTab(searchParams.get("tab"));
+  const capability = usePolicyCapability();
+
+  function setTab(value: string) {
+    const next = new URLSearchParams(searchParams);
+    if (value === "documents") {
+      next.delete("tab");
+    } else {
+      next.set("tab", value);
+      next.delete("document");
+    }
+    setSearchParams(next, { replace: true });
+  }
+
+  const unavailable =
+    capability.isError ||
+    capability.data?.enabled === false ||
+    capability.data?.editor_available === false;
+
+  return (
+    <div className="space-y-6 pb-4 sm:pb-6">
+      <PageHeader
+        title={t("web.admin.access.policy.title")}
+        subtitle={t("web.admin.access.policy.subtitle")}
+      />
+
+      {capability.isLoading && (
+        <p className="text-muted-foreground text-sm">
+          {t("web.admin.access.policy.loadingCapability")}
+        </p>
+      )}
+
+      {unavailable && (
+        <div className="surface-panel-subtle rounded-2xl p-6">
+          <h2 className="text-lg font-semibold">
+            {t("web.admin.access.policy.unavailable.title")}
+          </h2>
+          <p className="text-muted-foreground mt-2 text-sm">
+            {t("web.admin.access.policy.unavailable.body")}
+          </p>
+        </div>
+      )}
+
+      {capability.data && !unavailable && (
+        <>
+          <PolicyPipelineStrip />
+
+          <Tabs value={tab} onValueChange={setTab}>
+            <TabsList>
+              <TabsTrigger value="documents">
+                {t("web.admin.access.policy.tab.overrides")}
+              </TabsTrigger>
+              <TabsTrigger value="vendor">{t("web.admin.access.policy.tab.baseline")}</TabsTrigger>
+              <TabsTrigger value="decisions">
+                {t("web.admin.access.policy.tab.decisions")}
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="documents" className="space-y-5">
+              <PolicyDocumentList domains={capability.data.decision_types} />
+            </TabsContent>
+            <TabsContent value="vendor" className="space-y-5">
+              <PolicyVendorViewer />
+            </TabsContent>
+            <TabsContent value="decisions" className="space-y-5">
+              <PolicyDecisionLogTable domains={capability.data.decision_types} />
+            </TabsContent>
+          </Tabs>
+        </>
+      )}
+    </div>
+  );
+}

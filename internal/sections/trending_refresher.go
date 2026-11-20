@@ -1,0 +1,313 @@
+package sections
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/sections/recipes"
+)
+
+// trendingFetchCap is the over-fetch size for each refresh. Library-only
+// matching drops globally-trending titles the server does not own, so we fetch
+// well beyond any section's display limit and store the matched, ordered list.
+const (
+	trendingFetchCap       = 200
+	trendingRefreshLease   = 5 * time.Minute
+	trendingRefreshOK      = "ok"
+	trendingRefreshEmpty   = "empty"
+	trendingRefreshSkipped = "skipped"
+	trendingRefreshError   = "error"
+)
+
+// CalendarTrendingSource and CalendarTrendingWindow name the snapshot behind
+// the calendar's Trending preset. RunOnce always refreshes it, so the calendar
+// does not depend on a home section happening to use the same feed.
+const (
+	CalendarTrendingSource = sourceTMDB
+	CalendarTrendingWindow = windowWeek
+)
+
+// trendingSectionConfigLister enumerates enabled trending_discover section
+// configs. Satisfied by *Repository.
+type trendingSectionConfigLister interface {
+	ListTrendingDiscoverConfigs(ctx context.Context) ([]json.RawMessage, error)
+}
+
+// trendingSnapshotStore is the write side of the snapshot table. Satisfied by
+// *TrendingSnapshotRepository.
+type trendingSnapshotStore interface {
+	TryClaimRefresh(ctx context.Context, source, window string, lease time.Duration) (claimAt time.Time, claimed bool, err error)
+	SaveSuccess(ctx context.Context, source, window string, contentIDs []string, entryCount int, status string, claimAt, refreshedAt time.Time) error
+	RecordAttempt(ctx context.Context, source, window, status, message string, claimAt time.Time) error
+}
+
+// externalIDResolver resolves external IDs to library content IDs for the
+// trending snapshots and seasonal lists. Satisfied by *catalog.ItemRepository.
+type externalIDResolver interface {
+	GetByExternalIDs(ctx context.Context, batch catalog.ExternalIDBatch, itemType string) (*catalog.ExternalIDLookup, error)
+}
+
+// TrendingRefresher fetches external global trending (TMDB), resolves it
+// to library content IDs, and persists one snapshot per canonical
+// (source, window). It is driven by a TaskManager task on an interval.
+type TrendingRefresher struct {
+	Sections     trendingSectionConfigLister
+	Snapshots    trendingSnapshotStore
+	Resolver     externalIDResolver
+	TMDBTrending catalog.TMDBCollectionFetcher
+
+	// Clock defaults to recipes.RealClock{}.
+	Clock  recipes.Clock
+	logger *slog.Logger
+}
+
+// NewTrendingRefresher creates a refresher with real-clock and default logger.
+func NewTrendingRefresher(
+	sectionsRepo trendingSectionConfigLister,
+	snapshots trendingSnapshotStore,
+	resolver externalIDResolver,
+	tmdb catalog.TMDBCollectionFetcher,
+) *TrendingRefresher {
+	return &TrendingRefresher{
+		Sections:     sectionsRepo,
+		Snapshots:    snapshots,
+		Resolver:     resolver,
+		TMDBTrending: tmdb,
+		Clock:        recipes.RealClock{},
+		logger:       slog.Default(),
+	}
+}
+
+func (r *TrendingRefresher) now() time.Time {
+	if r.Clock != nil {
+		return r.Clock.Now()
+	}
+	return time.Now()
+}
+
+func (r *TrendingRefresher) log() *slog.Logger {
+	if r.logger != nil {
+		return r.logger
+	}
+	return slog.Default()
+}
+
+// TrendingRefreshResult is the JSON summary attached to the task execution.
+type TrendingRefreshResult struct {
+	Combos    int `json:"combos"`
+	Refreshed int `json:"refreshed"`
+	Empty     int `json:"empty"`
+	Failed    int `json:"failed"`
+	Skipped   int `json:"skipped"`
+}
+
+// RefreshConfig immediately refreshes the one canonical feed described by a
+// section config. Scheduled aggregate discovery remains the recovery path when
+// this best-effort request is interrupted.
+func (r *TrendingRefresher) RefreshConfig(ctx context.Context, config json.RawMessage) {
+	combos := distinctTrendingCombos([]json.RawMessage{config})
+	if len(combos) == 1 {
+		r.refreshCombo(ctx, combos[0].source, combos[0].window)
+	}
+}
+
+type trendingCombo struct {
+	source string
+	window string
+}
+
+// CanonicalTrendingConfigKey returns the shared snapshot key represented by a
+// trending_discover config.
+func CanonicalTrendingConfigKey(raw json.RawMessage) string {
+	var p recipes.TrendingDiscoverParams
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &p)
+	}
+	source, window := canonicalTrendingKey(p.Source, p.Window)
+	return source + "|" + window
+}
+
+// distinctTrendingCombos parses section configs and returns the deduplicated set
+// of canonical (source, window) pairs that need a snapshot.
+func distinctTrendingCombos(configs []json.RawMessage) []trendingCombo {
+	seen := make(map[trendingCombo]struct{}, len(configs))
+	out := make([]trendingCombo, 0, len(configs))
+	for _, raw := range configs {
+		var p recipes.TrendingDiscoverParams
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &p)
+		}
+		source, window := canonicalTrendingKey(p.Source, p.Window)
+		c := trendingCombo{source: source, window: window}
+		if _, ok := seen[c]; ok {
+			continue
+		}
+		seen[c] = struct{}{}
+		out = append(out, c)
+	}
+	return out
+}
+
+// RunOnce refreshes the calendar's feed and every (source, window) used by an
+// enabled trending_discover section. Per-combo failures are recorded and never
+// abort the others; a failed section listing still refreshes the calendar feed
+// before returning its error. The JSON summary is suitable for task result data.
+func (r *TrendingRefresher) RunOnce(ctx context.Context) (json.RawMessage, error) {
+	configs, listErr := r.Sections.ListTrendingDiscoverConfigs(ctx)
+
+	combos := distinctTrendingCombos(configs)
+	calendar := trendingCombo{source: CalendarTrendingSource, window: CalendarTrendingWindow}
+	if !slices.Contains(combos, calendar) {
+		combos = append(combos, calendar)
+	}
+	result := TrendingRefreshResult{Combos: len(combos)}
+	for _, c := range combos {
+		switch r.refreshCombo(ctx, c.source, c.window) {
+		case trendingRefreshOK:
+			result.Refreshed++
+		case trendingRefreshEmpty:
+			result.Empty++
+		case trendingRefreshSkipped:
+			result.Skipped++
+		default:
+			result.Failed++
+		}
+	}
+
+	data, _ := json.Marshal(result)
+	if listErr != nil {
+		return data, fmt.Errorf("listing trending_discover sections: %w", listErr)
+	}
+	return data, nil
+}
+
+// refreshCombo refreshes a single canonical (source, window) and returns its
+// outcome: "ok", "empty", or "error". A fetch failure or an unconfigured/empty
+// provider preserves the last-good content list (RecordAttempt). When the
+// provider returns entries, the list is replaced even if nothing matched the
+// catalog ("empty" status with an empty list) — that genuinely reflects current
+// trending having no library matches.
+func (r *TrendingRefresher) refreshCombo(ctx context.Context, source, window string) string {
+	claimAt, claimed, err := r.Snapshots.TryClaimRefresh(ctx, source, window, trendingRefreshLease)
+	if err != nil {
+		r.log().ErrorContext(ctx, "trending refresh: lease claim failed", "source", source, "window", window, trendingRefreshError, err)
+		return trendingRefreshError
+	}
+	if !claimed {
+		return trendingRefreshSkipped
+	}
+	return r.refreshComboClaimed(ctx, source, window, claimAt)
+}
+
+func (r *TrendingRefresher) refreshComboClaimed(ctx context.Context, source, window string, claimAt time.Time) string {
+	entries, err := r.fetchEntries(ctx, window, trendingFetchCap)
+	if err != nil {
+		r.log().ErrorContext(ctx, "trending refresh: fetch failed", "source", source, "window", window, trendingRefreshError, err)
+		return r.finishAttempt(ctx, source, window, trendingRefreshError, err.Error(), claimAt)
+	}
+	if len(entries) == 0 {
+		// Provider unconfigured or returned nothing: keep last-good, mark empty.
+		return r.finishAttempt(ctx, source, window, trendingRefreshEmpty, "", claimAt)
+	}
+
+	contentIDs, err := r.resolveIDs(ctx, entries)
+	if err != nil {
+		r.log().ErrorContext(ctx, "trending refresh: resolve failed", "source", source, "window", window, trendingRefreshError, err)
+		return r.finishAttempt(ctx, source, window, trendingRefreshError, err.Error(), claimAt)
+	}
+
+	status := trendingRefreshOK
+	if len(contentIDs) == 0 {
+		status = trendingRefreshEmpty
+	}
+	if err := r.Snapshots.SaveSuccess(ctx, source, window, contentIDs, len(entries), status, claimAt, r.now()); err != nil {
+		if errors.Is(err, ErrTrendingRefreshLeaseLost) {
+			return trendingRefreshSkipped
+		}
+		r.log().ErrorContext(ctx, "trending refresh: save failed", "source", source, "window", window, trendingRefreshError, err)
+		return trendingRefreshError
+	}
+	return status
+}
+
+func (r *TrendingRefresher) finishAttempt(ctx context.Context, source, window, status, message string, claimAt time.Time) string {
+	if err := r.Snapshots.RecordAttempt(ctx, source, window, status, message, claimAt); err != nil {
+		if errors.Is(err, ErrTrendingRefreshLeaseLost) {
+			return trendingRefreshSkipped
+		}
+		r.log().ErrorContext(ctx, "trending refresh: recording attempt failed", "source", source, "window", window, "status", status, trendingRefreshError, err)
+		return trendingRefreshError
+	}
+	return status
+}
+
+// fetchEntries pulls the raw trending list from TMDB. An unconfigured TMDB
+// fetcher yields an empty list (no error).
+func (r *TrendingRefresher) fetchEntries(ctx context.Context, window string, fetchLimit int) ([]trendingDiscoverEntry, error) {
+	if r.TMDBTrending == nil {
+		return nil, nil
+	}
+	entries, err := r.TMDBTrending.GetCollectionPreset(ctx, "trending", "all", window, fetchLimit)
+	if err != nil {
+		return nil, err
+	}
+	// A trending list holds at most trendingFetchCap entries, so each gets its
+	// IMDb and TVDB IDs up front; a title the catalog holds without a TMDB ID
+	// still matches.
+	if enricher, ok := r.TMDBTrending.(catalog.TMDBExternalIDEnricher); ok {
+		if err := enricher.EnrichExternalIDs(ctx, entries); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]trendingDiscoverEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, newTrendingEntry(e.ID, e.TVDBID, e.IMDbID, e.MediaType))
+	}
+	return out, nil
+}
+
+// resolveIDs matches trending entries to library content IDs via two batched
+// external-ID lookups (movies, series), preserving trending order.
+func (r *TrendingRefresher) resolveIDs(ctx context.Context, entries []trendingDiscoverEntry) ([]string, error) {
+	if r.Resolver == nil {
+		return nil, fmt.Errorf("trending_discover: external ID resolver not configured")
+	}
+	var movieBatch, seriesBatch catalog.ExternalIDBatch
+	for _, e := range entries {
+		var batch *catalog.ExternalIDBatch
+		switch e.mediaType {
+		case "movie":
+			batch = &movieBatch
+		case "tv":
+			batch = &seriesBatch
+		default:
+			// Skip non-title entries (TMDB trending/all can return "person") so
+			// they never match an unrelated library title by shared external ID.
+			continue
+		}
+		if e.tmdbID != "" {
+			batch.TMDBIDs = append(batch.TMDBIDs, e.tmdbID)
+		}
+		if e.imdbID != "" {
+			batch.IMDbIDs = append(batch.IMDbIDs, e.imdbID)
+		}
+		if e.tvdbID != "" {
+			batch.TVDBIDs = append(batch.TVDBIDs, e.tvdbID)
+		}
+	}
+	movieLookup, err := r.Resolver.GetByExternalIDs(ctx, movieBatch, "movie")
+	if err != nil {
+		return nil, err
+	}
+	seriesLookup, err := r.Resolver.GetByExternalIDs(ctx, seriesBatch, "series")
+	if err != nil {
+		return nil, err
+	}
+	return orderedTrendingContentIDs(entries, movieLookup, seriesLookup), nil
+}

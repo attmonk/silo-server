@@ -1,0 +1,42 @@
+import { codeNumber, t } from "@/i18n";
+
+interface EpisodeCardLabelItem {
+  type?: string;
+  title?: string;
+  series_title?: string;
+  season_number?: number | null;
+  episode_number?: number | null;
+}
+
+export interface EpisodeCardLabels {
+  seriesTitle: string;
+  episodeTitle?: string;
+  episodeCode: string;
+}
+
+/** "S01E02", zero-padded like the Apple and Android episode cards. */
+export function formatEpisodeCode(seasonNumber: number, episodeNumber: number): string {
+  return t("web.detail.episodeCode", {
+    season: codeNumber(seasonNumber, 2),
+    episode: codeNumber(episodeNumber, 2),
+  });
+}
+
+export function buildEpisodeCardLabels(item: EpisodeCardLabelItem): EpisodeCardLabels | null {
+  if (
+    item.type !== "episode" ||
+    item.season_number == null ||
+    item.episode_number == null ||
+    !item.title
+  ) {
+    return null;
+  }
+
+  const hasSeriesTitle = Boolean(item.series_title && item.series_title !== item.title);
+
+  return {
+    seriesTitle: hasSeriesTitle ? item.series_title! : item.title,
+    episodeTitle: hasSeriesTitle ? item.title : undefined,
+    episodeCode: formatEpisodeCode(item.season_number, item.episode_number),
+  };
+}

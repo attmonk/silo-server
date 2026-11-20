@@ -1,0 +1,622 @@
+// Package imagecache downloads images from URLs, generates sized variants,
+// computes thumbhashes, and uploads all variants to S3.
+package imagecache
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/imageutil"
+	"github.com/Silo-Server/silo-server/internal/metadata"
+	"github.com/Silo-Server/silo-server/internal/netguard"
+)
+
+const (
+	maxDownloadBytes = metadata.MaxArtworkSourceBytes // allow oversized provider originals; cached variants are dimension-capped
+	downloadTimeout  = 30 * time.Second
+)
+
+// ObjectPutter is the artwork storage interface required by Cacher.
+type ObjectPutter interface {
+	Put(context.Context, string, []byte) error
+}
+
+// ContentMatcher avoids rewriting immutable objects with matching bytes.
+type ContentMatcher interface {
+	Matches(context.Context, string, []byte) (bool, error)
+}
+
+// ArtworkRevisionTracker persists the object manifest for an immutable
+// revision. The cacher first records an empty, image-type-backed manifest so
+// partial uploads remain collectible, then replaces it with the exact keys
+// only after every upload succeeds.
+type ArtworkRevisionTracker interface {
+	TrackArtworkRevision(ctx context.Context, originalPath, imageType string, objectKeys []string) error
+}
+
+// ImageURLResolver resolves plugin:// paths to HTTP URLs.
+type ImageURLResolver interface {
+	ResolveImageURL(ctx context.Context, path string, variant string) string
+}
+
+// CacheRequest describes a single image to cache. For season posters and
+// episode stills, ContentID is the parent series's provider ID and the
+// SeasonNumber / EpisodeNumber fields scope the S3 key so siblings do not
+// collide. Both pointers are nil for item-level images.
+type CacheRequest struct {
+	SourceURL     string
+	ProviderID    string
+	ContentType   string // "movies" or "series"
+	ContentID     string
+	ImageType     metadata.ImageType
+	SeasonNumber  *int
+	EpisodeNumber *int
+	Language      string
+	ImageResolver ImageURLResolver // optional; used when SourceURL is a plugin:// path
+	// KeyDiscriminator, when set, is inserted into the S3 key between the
+	// content ID and the image type (local sidecar art uses the file's 8-hex
+	// content hash) so re-cached art rotates to a fresh key.
+	KeyDiscriminator string
+}
+
+// CacheResult is returned by Cache on success.
+type CacheResult struct {
+	BasePath         string // S3 key prefix, e.g. "tmdb/movies/550/poster"
+	OriginalPath     string // exact immutable original-variant object key
+	Revision         string // content revision shared by generated variants
+	VariantPaths     map[string]string
+	Thumbhash        string // base64-encoded
+	Ext              string // file extension including dot (e.g. ".jpg", ".png")
+	UploadedVariants int
+	ExistingVariants int
+}
+
+// Cacher downloads and stores image variants to S3.
+type Cacher struct {
+	s3              ObjectPutter
+	revisionTracker ArtworkRevisionTracker
+	// httpClient's netguard transport checks every address it dials,
+	// redirect hops included: public addresses only, or the local network
+	// too when the request context carries netguard.WithPrivateAccess.
+	httpClient        *http.Client
+	enforcePublicURLs bool
+}
+
+// New creates a new Cacher backed by the given ObjectPutter.
+func New(s3 ObjectPutter) *Cacher {
+	return &Cacher{s3: s3, httpClient: newGuardedHTTPClient(), enforcePublicURLs: true}
+}
+
+// SetArtworkRevisionTracker wires durable revision lifecycle tracking. The
+// production server configures this whenever object storage is available.
+func (c *Cacher) SetArtworkRevisionTracker(tracker ArtworkRevisionTracker) {
+	if c != nil {
+		c.revisionTracker = tracker
+	}
+}
+
+// CacheImage implements metadata.ImageCacher using the internal Cache method.
+func (c *Cacher) CacheImage(ctx context.Context, req metadata.CacheImageRequest) (*metadata.CacheImageResult, error) {
+	result, err := c.Cache(ctx, CacheRequest{
+		SourceURL:     req.SourceURL,
+		ProviderID:    req.ProviderID,
+		ContentType:   req.ContentType,
+		ContentID:     req.ContentID,
+		ImageType:     req.ImageType,
+		SeasonNumber:  req.SeasonNumber,
+		EpisodeNumber: req.EpisodeNumber,
+		Language:      req.Language,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cacheImageResultFromCacheResult(result), nil
+}
+
+// CacheImageBytes implements metadata.ImageByteCacher using CacheBytes. Used
+// by the image cache processor for file:// sources that it reads itself.
+func (c *Cacher) CacheImageBytes(ctx context.Context, data []byte, req metadata.CacheImageRequest) (*metadata.CacheImageResult, error) {
+	result, err := c.CacheBytes(ctx, data, CacheRequest{
+		ProviderID:       req.ProviderID,
+		ContentType:      req.ContentType,
+		ContentID:        req.ContentID,
+		ImageType:        req.ImageType,
+		SeasonNumber:     req.SeasonNumber,
+		EpisodeNumber:    req.EpisodeNumber,
+		Language:         req.Language,
+		KeyDiscriminator: req.KeyDiscriminator,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cacheImageResultFromCacheResult(result), nil
+}
+
+func cacheImageResultFromCacheResult(result *CacheResult) *metadata.CacheImageResult {
+	return &metadata.CacheImageResult{
+		BasePath:         result.BasePath,
+		OriginalPath:     result.OriginalPath,
+		Revision:         result.Revision,
+		Thumbhash:        result.Thumbhash,
+		Ext:              result.Ext,
+		UploadedVariants: result.UploadedVariants,
+		ExistingVariants: result.ExistingVariants,
+	}
+}
+
+// CacheAudiobookCover is a thin convenience over CacheBytes specifically
+// for the audiobook scanner. Avoids exporting the imagecache request
+// struct to the scanner package (which would create an import cycle
+// scanner -> imagecache -> metadata -> scanner). Stores under
+// "local/audiobooks/{contentID}/poster/...".
+func (c *Cacher) CacheAudiobookCover(ctx context.Context, data []byte, contentID string) (storedPath string, thumbhash string, err error) {
+	res, err := c.CacheBytes(ctx, data, CacheRequest{
+		ProviderID:  "local",
+		ContentType: "audiobooks",
+		ContentID:   contentID,
+		ImageType:   metadata.ImagePoster,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return res.OriginalPath, res.Thumbhash, nil
+}
+
+// CacheEbookCover stores an embedded ebook cover under
+// "local/ebooks/{contentID}/poster/..." using the same poster variants as
+// provider-hosted book artwork.
+func (c *Cacher) CacheEbookCover(ctx context.Context, data []byte, contentID string) (storedPath string, thumbhash string, err error) {
+	res, err := c.CacheBytes(ctx, data, CacheRequest{
+		ProviderID:  "local",
+		ContentType: "ebooks",
+		ContentID:   contentID,
+		ImageType:   metadata.ImagePoster,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return res.OriginalPath, res.Thumbhash, nil
+}
+
+// CacheExtraStill stores a local extra's sidecar card image under
+// "local/extras/{extraID}/still/..." with the 16:9 still variants episode
+// stills use.
+func (c *Cacher) CacheExtraStill(ctx context.Context, data []byte, extraID string) (storedPath string, thumbhash string, err error) {
+	res, err := c.CacheBytes(ctx, data, CacheRequest{
+		ProviderID:  "local",
+		ContentType: "extras",
+		ContentID:   extraID,
+		ImageType:   metadata.ImageStill,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return res.OriginalPath, res.Thumbhash, nil
+}
+
+// moviesContentType is the key segment of movie artwork.
+const moviesContentType = "movies"
+
+// CacheFramePoster stores a poster taken from a movie's own video under the
+// item's local keys, "local/movies/{contentID}/{hash}/poster/...", where local
+// sidecar posters and uploads go, with the same poster variants. The hash of
+// the bytes gives each frame its own key.
+func (c *Cacher) CacheFramePoster(ctx context.Context, data []byte, contentID string) (storedPath string, thumbhash string, err error) {
+	digest := sha256.Sum256(data)
+	res, err := c.CacheBytes(ctx, data, CacheRequest{
+		ProviderID:       "local",
+		ContentType:      moviesContentType,
+		ContentID:        contentID,
+		ImageType:        metadata.ImagePoster,
+		KeyDiscriminator: hex.EncodeToString(digest[:4]),
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return res.OriginalPath, res.Thumbhash, nil
+}
+
+// validateCacheRequest checks the required identity fields and the
+// episode/season invariant shared by Cache and CacheBytes. Keeping it in one
+// place prevents the season/episode guard from drifting between the two paths:
+// buildBasePath only appends the episode segment inside the SeasonNumber branch,
+// so an episode without a season would silently collide distinct episodes' art
+// under the same S3 key.
+func validateCacheRequest(req CacheRequest) error {
+	if strings.TrimSpace(req.ProviderID) == "" {
+		return fmt.Errorf("imagecache: provider ID is required")
+	}
+	if strings.TrimSpace(req.ContentType) == "" {
+		return fmt.Errorf("imagecache: content type is required")
+	}
+	if strings.TrimSpace(req.ContentID) == "" {
+		return fmt.Errorf("imagecache: content ID is required")
+	}
+	if req.EpisodeNumber != nil && req.SeasonNumber == nil {
+		return fmt.Errorf("imagecache: episode number requires a season number")
+	}
+	return nil
+}
+
+// CacheBytes performs the same variant generation, thumbhash, and S3 upload as
+// Cache but starts from raw image bytes already in hand. Used by the
+// audiobook scanner to push embedded M4B cover art into S3 without round-
+// tripping through HTTP.
+func (c *Cacher) CacheBytes(ctx context.Context, data []byte, req CacheRequest) (*CacheResult, error) {
+	if err := validateCacheRequest(req); err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("imagecache: image data is empty")
+	}
+	data, err := rasterizeOperatorSource(data)
+	if err != nil {
+		return nil, fmt.Errorf("imagecache: rasterize: %w", err)
+	}
+	thumbhash, err := imageutil.Thumbhash(data)
+	if err != nil {
+		return nil, fmt.Errorf("imagecache: thumbhash: %w", err)
+	}
+	widths := variantWidths(req.ImageType)
+	result, err := imageutil.GenerateVariants(data, widths)
+	if err != nil {
+		return nil, fmt.Errorf("imagecache: generate variants: %w", err)
+	}
+	basePath := buildBasePath(req)
+	revision := variantRevision(result)
+	variantPaths := buildVariantPaths(basePath, revision, result)
+	originalPath := variantPaths[artworkkey.OriginalVariant]
+	if err := c.trackRevision(ctx, req.ImageType, originalPath, nil); err != nil {
+		return nil, err
+	}
+
+	uploadStats, err := c.uploadVariants(ctx, result, variantPaths)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.trackRevision(ctx, req.ImageType, originalPath, variantPaths); err != nil {
+		return nil, err
+	}
+	return &CacheResult{
+		BasePath:         basePath,
+		OriginalPath:     variantPaths[artworkkey.OriginalVariant],
+		Revision:         revision,
+		VariantPaths:     variantPaths,
+		Thumbhash:        thumbhash,
+		Ext:              result.Ext,
+		UploadedVariants: uploadStats.uploaded,
+		ExistingVariants: uploadStats.existing,
+	}, nil
+}
+
+// rasterizeOperatorSource renders an SVG, HEIF or AVIF source to a PNG and
+// returns any other source unchanged. Providers such as TMDB serve logos as
+// SVG, and artwork in a library folder may be an AVIF or a HEIC under a .jpg
+// name. Everything this package caches is a source the operator chose: a
+// provider download, a file in a library, or an admin's upload, which is
+// already limited to JPEG, PNG and WebP. Request paths that take a user's
+// image call imageutil directly, which refuses those formats.
+func rasterizeOperatorSource(data []byte) ([]byte, error) {
+	if !imageutil.NeedsRasterizing(data) {
+		return data, nil
+	}
+	return imageutil.Rasterize(data)
+}
+
+// Cache downloads the image at req.SourceURL and stores it through the same
+// variant, revision-tracking, and upload pipeline as CacheBytes.
+func (c *Cacher) Cache(ctx context.Context, req CacheRequest) (*CacheResult, error) {
+	if err := validateCacheRequest(req); err != nil {
+		return nil, err
+	}
+
+	url := req.SourceURL
+
+	// Resolve non-HTTP paths (e.g. plugin_id://path) via the resolver.
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		if req.ImageResolver == nil {
+			return nil, fmt.Errorf("imagecache: non-HTTP URL %q requires ImageResolver", url)
+		}
+		url = req.ImageResolver.ResolveImageURL(ctx, url, "original")
+		if url == "" {
+			return nil, fmt.Errorf("imagecache: resolver returned empty URL for %q", req.SourceURL)
+		}
+	}
+
+	data, err := c.downloadImage(ctx, url)
+	if err != nil {
+		return nil, fmt.Errorf("imagecache: download %s: %w", url, err)
+	}
+	return c.CacheBytes(ctx, data, req)
+}
+
+// variantWidths returns the resize widths for the given image type. The
+// ladder itself is owned by artworkkey so key expansion and GC manifests can
+// never drift from what is generated here.
+func variantWidths(t metadata.ImageType) []int {
+	return artworkkey.VariantWidths(metadata.ImageTypeToString(t))
+}
+
+type uploadVariantStats struct {
+	uploaded int
+	existing int
+}
+
+func (c *Cacher) uploadVariants(ctx context.Context, result *imageutil.VariantResult, variantPaths map[string]string) (uploadVariantStats, error) {
+	var wg sync.WaitGroup
+	uploadErrs := make([]error, len(result.Variants))
+	stats := make([]uploadVariantStats, len(result.Variants))
+	for i, v := range result.Variants {
+		wg.Add(1)
+		go func(idx int, variant imageutil.Variant) {
+			defer wg.Done()
+			key := variantPaths[variant.Key]
+			if matcher, ok := c.s3.(ContentMatcher); ok {
+				matches, err := matcher.Matches(ctx, key, variant.Data)
+				if err != nil {
+					uploadErrs[idx] = fmt.Errorf("imagecache: compare %s: %w", key, err)
+					return
+				}
+				if matches {
+					stats[idx].existing = 1
+					return
+				}
+			}
+			if err := putObjectWithRetry(ctx, c.s3, key, variant.Data); err != nil {
+				uploadErrs[idx] = fmt.Errorf("imagecache: upload %s: %w", key, err)
+				return
+			}
+			stats[idx].uploaded = 1
+		}(i, v)
+	}
+	wg.Wait()
+	var total uploadVariantStats
+	for _, err := range uploadErrs {
+		if err != nil {
+			return total, err
+		}
+	}
+	for _, s := range stats {
+		total.uploaded += s.uploaded
+		total.existing += s.existing
+	}
+	return total, nil
+}
+
+func variantRevision(result *imageutil.VariantResult) string {
+	h := sha256.New()
+	_, _ = io.WriteString(h, "silo-artwork-v1\x00")
+	_, _ = io.WriteString(h, result.Ext)
+	_, _ = h.Write([]byte{0})
+	variants := append([]imageutil.Variant(nil), result.Variants...)
+	sort.Slice(variants, func(i, j int) bool { return variants[i].Key < variants[j].Key })
+	var size [8]byte
+	for _, variant := range variants {
+		_, _ = io.WriteString(h, variant.Key)
+		_, _ = h.Write([]byte{0})
+		binary.BigEndian.PutUint64(size[:], uint64(len(variant.Data)))
+		_, _ = h.Write(size[:])
+		_, _ = h.Write(variant.Data)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func buildVariantPaths(basePath, revision string, result *imageutil.VariantResult) map[string]string {
+	paths := make(map[string]string, len(result.Variants))
+	for _, variant := range result.Variants {
+		paths[variant.Key] = artworkkey.Build(basePath, variant.Key, revision, result.Ext)
+	}
+	return paths
+}
+
+func (c *Cacher) trackRevision(ctx context.Context, imageType metadata.ImageType, originalPath string, variantPaths map[string]string) error {
+	if c == nil || c.revisionTracker == nil {
+		return nil
+	}
+	keys := make([]string, 0, len(variantPaths))
+	for _, key := range variantPaths {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if err := c.revisionTracker.TrackArtworkRevision(ctx, originalPath, metadata.ImageTypeToString(imageType), keys); err != nil {
+		return fmt.Errorf("imagecache: track artwork revision: %w", err)
+	}
+	return nil
+}
+
+func putObjectWithRetry(ctx context.Context, putter ObjectPutter, key string, data []byte) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := putter.Put(ctx, key, data)
+		if err != nil {
+			lastErr = err
+			if attempt == maxAttempts-1 {
+				break
+			}
+			timer := time.NewTimer(time.Duration(attempt+1) * 500 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
+		} else {
+			return nil
+		}
+	}
+	return lastErr
+}
+
+// buildBasePath constructs the S3 key prefix for a given image. Season
+// posters and episode stills nest under their parent series so a single
+// DeletePrefix on the series prefix cascades to all child images.
+//
+//	item-level:        {provider}/{type}/{id}/{imageType}
+//	localized item:   {provider}/{type}/{id}/localizations/{lang}/{imageType}
+//	season:           {provider}/{type}/{id}/seasons/{n}/{imageType}
+//	localized season: {provider}/{type}/{id}/localizations/{lang}/seasons/{n}/{imageType}
+//	episode:          {provider}/{type}/{id}/seasons/{n}/episodes/{m}/{imageType}
+//
+// A non-empty KeyDiscriminator (local sidecar content hash) is inserted
+// immediately before the image type so the variant's parent directory stays
+// the image type segment (the imageTypeFromCachedPath contract).
+func buildBasePath(req CacheRequest) string {
+	imageTypeName := imageTypeName(req.ImageType)
+	base := fmt.Sprintf("%s/%s/%s", req.ProviderID, req.ContentType, req.ContentID)
+	if lang := normalizeImageLanguage(req.Language); lang != "" {
+		base = fmt.Sprintf("%s/localizations/%s", base, lang)
+	}
+	if req.SeasonNumber != nil {
+		base = fmt.Sprintf("%s/seasons/%d", base, *req.SeasonNumber)
+		if req.EpisodeNumber != nil {
+			base = fmt.Sprintf("%s/episodes/%d", base, *req.EpisodeNumber)
+		}
+	}
+	if discriminator := strings.TrimSpace(req.KeyDiscriminator); discriminator != "" {
+		base = base + "/" + discriminator
+	}
+	return base + "/" + imageTypeName
+}
+
+// imageTypeName returns the lowercase string name for an ImageType.
+func imageTypeName(t metadata.ImageType) string {
+	switch t {
+	case metadata.ImagePoster:
+		return "poster"
+	case metadata.ImageBackdrop:
+		return "backdrop"
+	case metadata.ImageLogo:
+		return "logo"
+	case metadata.ImageStill:
+		return "still"
+	case metadata.ImageProfile:
+		return "profile"
+	case metadata.ImageBanner:
+		return "banner"
+	case metadata.ImageThumb:
+		return "thumb"
+	case metadata.ImageClearArt:
+		return "clearart"
+	case metadata.ImageDisc:
+		return "disc"
+	default:
+		return "unknown"
+	}
+}
+
+func normalizeImageLanguage(language string) string {
+	language = strings.ToLower(strings.TrimSpace(language))
+	if language == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range language {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+// downloadImage fetches the image at the given URL, enforcing size, timeout,
+// and network limits: public addresses only, or the local network too when
+// ctx carries netguard.WithPrivateAccess.
+func (c *Cacher) downloadImage(ctx context.Context, rawURL string) ([]byte, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse URL: %w", err)
+	}
+	if c.enforcePublicURLs {
+		if err := validateImageURLFor(ctx, parsed); err != nil {
+			return nil, err
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, downloadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+
+	client := c.httpClient
+	if client == nil {
+		client = newGuardedHTTPClient()
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http get: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	limited := io.LimitReader(resp.Body, maxDownloadBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if int64(len(data)) > maxDownloadBytes {
+		return nil, fmt.Errorf("image exceeds %d byte limit", maxDownloadBytes)
+	}
+
+	return data, nil
+}
+
+// newGuardedHTTPClient returns the image download client. Its netguard
+// transport keeps trusted and untrusted requests in separate connection pools.
+func newGuardedHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: netguard.NewTransport(),
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return http.ErrUseLastResponse
+			}
+			return validateImageURLFor(req.Context(), req.URL)
+		},
+	}
+}
+
+// validateImageURLFor checks u before it is requested. A literal IP host
+// gets an early netguard refusal; the transport checks every address it
+// dials, including hosts that resolve through DNS.
+func validateImageURLFor(ctx context.Context, u *url.URL) error {
+	if u == nil {
+		return fmt.Errorf("empty URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported URL scheme %q", u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("URL host is required")
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if err := netguard.CheckAddr(addr, netguard.PrivateAccess(ctx)); err != nil {
+			return fmt.Errorf("image host %q is not allowed: %w", host, err)
+		}
+	}
+	return nil
+}

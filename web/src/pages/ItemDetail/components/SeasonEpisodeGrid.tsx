@@ -1,0 +1,212 @@
+import { useMemo, useRef } from "react";
+import { Play } from "lucide-react";
+import type { EpisodeListItem } from "@/api/types";
+import CardPlayOverlay from "@/components/CardPlayOverlay";
+import { WatchedCheckIndicator } from "@/components/CardWatchedBadge";
+import { toEpisodeUserState } from "@/components/episodeUserState";
+import MediaItemMenu from "@/components/MediaItemMenu";
+import UnreadableFileBadge, { episodeFilesUnreadable } from "@/components/UnreadableFileBadge";
+import CardOverlays from "@/components/overlays/CardOverlays";
+import ViewTransitionLink from "@/components/ViewTransitionLink";
+import { useEpisodeSpoilerPrefs, type EpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
+import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import { useGridRowCap } from "@/hooks/useGridRowCap";
+import type { CardQuickActionMode } from "@/lib/cardQuickActions";
+import { buildItemHref } from "@/lib/mediaNavigation";
+import { isEpisodeStill, isEpisodeUnwatched, SPOILER_IMAGE_CLASS } from "@/lib/episodeSpoilers";
+import { overlayDataFromEpisodeListItem, type CardOverlayPrefs } from "@/lib/overlays";
+import { cn } from "@/lib/utils";
+import { EpisodeGridSkeleton } from "./SectionSkeletons";
+import { useT } from "@/i18n";
+import EpisodeCardCaption from "./EpisodeCardCaption";
+import { episodeLinkLibraryId, type EpisodeNavigationState } from "../itemDetailLayout";
+import WatchProgressBar from "@/components/WatchProgressBar";
+
+/**
+ * How much of a season stays visible before the section scrolls, so a long one
+ * cannot push the cast and crew off the page.
+ *
+ * Flat across breakpoints rather than scaled by column count: the cap is
+ * really a height budget, and four rows is already about one screen tall on a
+ * phone. Trading rows for columns there would only produce a nested scroll
+ * region taller than the viewport it sits in.
+ */
+const VISIBLE_EPISODE_ROWS = 4;
+
+interface SeasonEpisodeGridProps {
+  episodes: EpisodeListItem[];
+  /**
+   * The same episodes with every file playback can use (see
+   * useEpisodePlaybackList). Play and the unreadable badge follow these;
+   * defaults to `episodes`.
+   */
+  playbackEpisodes?: EpisodeListItem[];
+  isLoading: boolean;
+  episodeLinkState?: EpisodeNavigationState;
+  /** The page's library scope, kept on each episode link. */
+  libraryId?: number;
+}
+
+export default function SeasonEpisodeGrid({
+  episodes,
+  playbackEpisodes,
+  isLoading,
+  episodeLinkState,
+  libraryId,
+}: SeasonEpisodeGridProps) {
+  const t = useT();
+  const { prefs: overlayPrefs, quickActionMode } = useOverlayPrefs();
+  const spoilerPrefs = useEpisodeSpoilerPrefs();
+  const setGridRef = useGridRowCap<HTMLDivElement>(VISIBLE_EPISODE_ROWS, episodes.length);
+  const playbackById = useMemo(
+    () => new Map((playbackEpisodes ?? []).map((episode) => [episode.content_id, episode])),
+    [playbackEpisodes],
+  );
+
+  if (isLoading) {
+    return <EpisodeGridSkeleton />;
+  }
+
+  if (episodes.length === 0) {
+    return (
+      <div className="border-border text-muted-foreground bg-surface rounded-lg border p-5 text-sm">
+        {t("web.detail.seasons.noEpisodes")}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      ref={setGridRef}
+      // `pt-1 -mt-1` gives the top row's 4px hover lift somewhere to go: the
+      // scrollport clips both axes, and the cap adds this padding back.
+      className="overlay-scroll -mt-1 grid grid-cols-2 gap-4 overflow-y-auto pt-1 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5"
+    >
+      {episodes.map((episode) => (
+        <SeasonEpisodeCard
+          key={episode.content_id}
+          episode={episode}
+          playbackEpisode={playbackById.get(episode.content_id) ?? episode}
+          episodeLinkState={episodeLinkState}
+          libraryId={libraryId}
+          overlayPrefs={overlayPrefs}
+          quickActionMode={quickActionMode}
+          spoilerPrefs={spoilerPrefs}
+        />
+      ))}
+    </div>
+  );
+}
+
+function SeasonEpisodeCard({
+  episode,
+  playbackEpisode,
+  episodeLinkState,
+  libraryId,
+  overlayPrefs,
+  quickActionMode,
+  spoilerPrefs,
+}: {
+  episode: EpisodeListItem;
+  playbackEpisode: EpisodeListItem;
+  episodeLinkState?: EpisodeNavigationState;
+  libraryId?: number;
+  overlayPrefs: CardOverlayPrefs | null;
+  quickActionMode: CardQuickActionMode;
+  spoilerPrefs: EpisodeSpoilerPrefs;
+}) {
+  const t = useT();
+  const cardRef = useRef<HTMLDivElement>(null);
+  const hasPartialProgress =
+    !episode.user_data?.played &&
+    (episode.user_data?.position_seconds ?? 0) > 0 &&
+    (episode.user_data?.duration_seconds ?? 0) > 0;
+  const episodeTitle =
+    episode.title || t("web.detail.episodes.numbered", { episode: episode.episode_number });
+  const unwatched = isEpisodeUnwatched(episode.user_data);
+  const hideImage =
+    spoilerPrefs.hideImages && unwatched && isEpisodeStill(episode.still_is_episode_still);
+  const hideOverview = spoilerPrefs.hideOverviews && unwatched;
+  const episodeHref = buildItemHref({
+    contentId: episode.content_id,
+    libraryId: episodeLinkLibraryId(episode, libraryId),
+  });
+  const unreadable = episodeFilesUnreadable(playbackEpisode);
+  const playable = (playbackEpisode.files ?? []).some((file) => !file.unreadable);
+
+  return (
+    <div ref={cardRef} className="group/card media-card media-card-longpress">
+      <div className="group/media relative">
+        <ViewTransitionLink
+          to={episodeHref}
+          state={episodeLinkState}
+          prefetchOn="intent"
+          className="group block"
+        >
+          <div className="media-card-image relative aspect-video">
+            {episode.still_url ? (
+              <img
+                src={episode.still_url}
+                alt={episodeTitle}
+                decoding="async"
+                className={cn(
+                  "h-full w-full object-cover transition-transform duration-300",
+                  hideImage ? SPOILER_IMAGE_CLASS : "group-hover:scale-[1.03]",
+                )}
+                loading="lazy"
+              />
+            ) : (
+              <div className="flex h-full w-full items-center justify-center">
+                <Play size={32} className="text-muted-foreground/30" />
+              </div>
+            )}
+            {overlayPrefs && (
+              <CardOverlays
+                data={overlayDataFromEpisodeListItem(episode)}
+                prefs={overlayPrefs}
+                variant="wide"
+                hasProgressBar={hasPartialProgress}
+              />
+            )}
+            {/* Hover dim behind the play button */}
+            {playable && <div className="media-card-hover-dim absolute inset-0" />}
+            {hasPartialProgress && (
+              <WatchProgressBar
+                percent={
+                  ((episode.user_data?.position_seconds ?? 0) /
+                    (episode.user_data?.duration_seconds ?? 1)) *
+                  100
+                }
+                animate
+              />
+            )}
+          </div>
+        </ViewTransitionLink>
+        {playable && (
+          <CardPlayOverlay contentId={episode.content_id} title={episodeTitle} type="episode" />
+        )}
+        <MediaItemMenu
+          contentId={episode.content_id}
+          mediaType="episode"
+          userState={toEpisodeUserState(episode.user_data)}
+          variant="wide"
+          showCollectionActions={false}
+          showWatchedShortcut
+          hasPartialProgress={hasPartialProgress}
+          hasResumePosition={(episode.user_data?.position_seconds ?? 0) > 0}
+          quickActionMode={quickActionMode}
+          longPressRef={cardRef}
+          itemTitle={episodeTitle}
+        />
+      </div>
+      <ViewTransitionLink to={episodeHref} state={episodeLinkState} className="block">
+        <EpisodeCardCaption
+          episode={episode}
+          hideOverview={hideOverview}
+          badges={episode.user_data?.played && <WatchedCheckIndicator />}
+          notice={unreadable && <UnreadableFileBadge />}
+        />
+      </ViewTransitionLink>
+    </div>
+  );
+}

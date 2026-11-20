@@ -1,0 +1,191 @@
+# Administrator tasks and jobs
+
+The v2 administrator task surface uses generated web bindings. Apple and Android
+have no task or administrator-job HTTP calls in their checked source trees; the
+migration inventory also records only web consumers. Jellyfin compatibility has
+no equivalent management surface.
+
+## Execution and schedules
+
+`GET /api/v2/admin/tasks` returns the finite registered task list in `items`.
+By default it omits hidden tasks: queue workers, pollers, and repairs that run
+without an administrator, such as `match_media` or `cache_metadata_images`. It
+also omits tasks that serve one library kind, such as `sync_ebook_metadata`,
+while no library of that kind exists. `include_hidden=true` returns every
+registered task. `GET /api/v2/admin/tasks/{key}` reads runtime state on the
+responding process for any registered task, hidden or not. Both require
+acting-administrator access, as do task mutations and history.
+
+`POST /api/v2/admin/tasks/{key}/run` reserves the local worker before returning
+HTTP 200 with `execution_scope: "process"`. It starts execution asynchronously,
+but does not create a durable job or promise execution after a process failure.
+Concurrent local starts conflict. Another server has its own worker state.
+`POST /api/v2/admin/tasks/{key}/cancel` requests cancellation of the current local
+execution; completed effects remain. Neither operation automatically retries.
+While a task is `running` or `cancelling` on the responding process, its
+`started_at` reports when that run started; `last_execution` still describes
+the previous finished run. The realtime `task.updated` event and the events
+WebSocket's task snapshot do not carry it; refetch the task to read it.
+
+The `refresh_all_library_metadata` task runs a `full` library metadata refresh
+(see [libraries-api.md](libraries-api.md)) for each enabled library in turn,
+inside the task worker, with the same six-hour limit per library as a refresh
+job. It is manual-only: interval schedules are timed per process, so a cluster
+could start a second full refresh right after the first. Unlike a library
+refresh job, it creates no admin job, so it has no retained job record, no
+recovery after a process failure, and cancels as a whole on the server running
+it. A library with a refresh job queued or running, or another refresh holding
+its per-library lock, is skipped. A PostgreSQL advisory lock allows one run
+across all servers; a run that finds it held fails without refreshing anything.
+
+`backup` backs up the server daily at `backup.time` and on "Back up now"; its
+schedule follows that setting, so editing the task's triggers does not stick.
+A cluster-wide lock lets one server back up; the others record a skip. See
+[backups-api.md](backups-api.md#the-backup-task).
+
+`database_maintenance` runs the routine retention sweeps in turn, daily at 05:00
+by default: processed search index events, activity log, task history, autoscan
+events, expired login sessions, device sign-in requests, OAuth sign-in flows, policy
+decision log, and notifications. The log steps also
+create upcoming partitions, which startup creates as well. Every server fires
+the same trigger, so a PostgreSQL advisory lock lets one server run the steps;
+the others record a completed run that did nothing. Each step keeps its
+own retention settings. A failing step does not stop the later ones; the run
+fails if any step failed. Its history entries carry a `steps` array with each
+step's `key`, `name`, and `status`; error text stays in the server log, like
+other task failures.
+Operational log and client diagnostics cleanup stay separate tasks because
+their caps need a 15-minute cadence.
+
+`bulk_metadata_enrichment` looks movies and series up with enrichment-only
+metadata providers that batch their requests, such as MDBList, many titles at a
+time. Only providers that declare `bulk_lookup_limit` take part (see
+[metadata-enrichment-providers.md](architecture/metadata-enrichment-providers.md)).
+It runs hourly and skips runs with nothing to look up. A PostgreSQL advisory
+lock lets one server run it; the others record a completed run that did
+nothing. It records each answer as it goes, so a canceled run, a restart or a
+provider's spent quota loses no work, and the next run continues with the items
+still missing an answer. A run the quota stopped still completes successfully.
+The server log records each provider's found, empty and failed counts, and why
+its turn ended early, such as a spent quota.
+
+Manual-only tasks (`manual_only: true`) are repair and one-off tools. They
+reject schedules, and a schedule saved before a task became manual-only is
+ignored at startup. The web page lists them in a separate "On demand" group.
+
+`GET /api/v2/admin/tasks/{key}/triggers` reads persisted schedule configuration
+and a strong caller-bound ETag. `PUT` on that resource requires `If-Match` and a
+`triggers` array, including an empty array to disable scheduling. The database
+compares the original revision under the schedule parent lock, and every
+schedule writer advances the revision. A mismatch returns 412 with the
+observed validator, without rereading or retrying the write. An empty schedule
+remains configured across restarts rather than restoring task defaults. A plugin
+task without a persisted schedule reports the default it runs (binding trigger,
+else manifest default, else startup) at revision zero, under a validator that
+also changes when that default changes; the first `PUT` saves a schedule that
+then outranks the default. Only an administrator's edit saves one now, but a
+plugin task can still hold a schedule an earlier release saved from a binding
+trigger, which `GET` reports with its nonzero revision
+([plugin-scheduled-tasks.md](architecture/plugin-scheduled-tasks.md)).
+
+Successful edits apply to the responding process. Other running processes load
+the persisted configuration when they restart. Runtime state and persisted
+schedule state are separate reads. The web editor captures the persisted schedule
+when editing begins, keeps the draft and original validator after conflicts, and
+requires explicit review and revision adoption before another submission. It
+disables both mutation retries and authentication-refresh replay.
+
+A trigger's `max_runtime_ms` bounds each run that trigger starts. When it
+elapses, the task runner cancels the run's context, the same signal a cancel
+request sends, so a task stops wherever it stops on cancel and keeps the
+progress it saved. Unlike a cancel request, the task stays `running` until it
+returns. The run is then recorded as `cancelled` with an `error_message` naming
+the limit, including when an administrator cancelled it after the limit passed.
+Runs that no trigger started, such as manual runs, are not bounded, and a value
+too large to represent as a duration counts as no limit.
+
+A task can spread its scheduled starts so servers sharing a remote service do
+not start together. Each daily or weekly run of such a task starts at a random
+point in a window after its configured time, chosen when the run is scheduled,
+and `next_run_at` reports that time. The window applies to default and edited
+schedules alike and is not part of the stored triggers. `contribute_markers`
+spreads its runs over four hours. Manual runs start at once.
+
+## History and metrics
+
+`GET /api/v2/admin/tasks/{key}/history` returns persisted executions in an `items`
+envelope with explicit `page` state. The default limit is 20 and maximum 200.
+Database reads fetch at most limit plus one rows ordered by completed time and
+ID descending. Signed cursors bind the task, account, acting profile, and order.
+New completions appear after restarting history; loaded pages do not silently
+expand into a whole-history read. Live last-execution summaries have no saved ID;
+persisted history entries have opaque string IDs.
+
+`GET /api/v2/admin/tasks/refresh_metadata/metrics` returns typed queue counters
+and at most ten entries per sample list. Other tasks return 404. Raw diagnostic
+errors are replaced with safe failure summaries. Task history does not expose
+arbitrary internal result JSON; marker contribution counts have a typed result.
+Detailed operational diagnostics remain available through their existing surface.
+
+## Retained jobs
+
+`GET /api/v2/admin/jobs` lists retained jobs with an optional `kind` filter,
+default limit 20, maximum 200, and signed `(requested_at, id)` cursor ordering.
+The database fetches at most limit plus one rows. Cursors bind the filter,
+account, acting profile, and operation. The web exposes explicit continuation
+and restart controls for job histories.
+
+`GET /api/v2/admin/jobs/{id}` returns a safe typed job projection. The acting
+admin (an administrator acting through the account's primary profile; see
+[api-contract.md](architecture/api-contract.md)) may read all retained jobs;
+anyone else, including another profile on an administrator's account, may read
+only an item-refresh job their account started. A declared profile is verified
+like on any profile-scoped operation, with `X-Profile-Token` when it has a PIN. Hidden and missing jobs both return 404. Nonterminal responses supply
+`Retry-After: 5`. The projection keeps library identities, typed result counts,
+and authorized catalog artifact links, while excluding raw request documents,
+storage keys, file paths, and internal error text. Artifact links can expire and
+should be refreshed from the job resource.
+
+Storage-transition jobs include `storage_transition_result` throughout their
+lifecycle. Its `phase` is a fixed status value, `verified_objects` counts
+objects whose destination content was checked in the current copy pass, and
+`failure_category` classifies a failed phase without exposing provider errors,
+bucket names, object keys, or local paths. The count can restart when an
+interrupted pass resumes. A completed copy reports `restart_pending` until the
+new storage is active after restart. The job's raw message and error remain
+available only to internal diagnostics. Administrator-job responses and
+the jobs realtime channel use the same safe storage-transition receipt,
+including the websocket snapshot; they omit the raw request and result
+documents for this job type.
+
+Backup restore jobs (`backup_restore`) include `backup_restore_result`, the
+restore report described in [backups-api.md](backups-api.md#restore): each
+chosen item restored, unchanged, left out with a reason, or failed with its
+error, kept when the job is canceled or interrupted. A restore is never
+requeued: a worker that stops heartbeating leaves the job failed with
+`interrupted: true` in its report.
+
+The existing `POST /api/v2/library-jobs/{job_id}/cancel` contract remains intact.
+`POST /api/v2/admin/jobs/{id}/cancel` (`cancelAdminJob`) requests cancellation
+for library refresh, storage-transition, image cache cleanup, and backup
+restore jobs. A restore stops between items and keeps what committed. A job's
+`cancelable` field is true exactly when it is one of these types and not
+terminal, and every job resource that reports `cancelable: true` accepts the
+cancellation through its own cancel operation. A library refresh can therefore
+be canceled through either `cancelAdminJob` or the library-job endpoint; both
+record the same request. Other job types return `409 job_not_cancelable`.
+Cancellation retains
+completed effects and verified storage-copy checkpoints. An accepted
+cancellation returns `202`; an already canceled job returns `200`; a succeeded
+or failed job returns `409 job_not_cancelable`. A queued storage-transition
+cancellation also releases its staged target so a later transition can choose a
+different destination. A queued image cache cleanup, including one waiting
+between slices, is canceled at once and returns `200`. A running cleanup stops
+at the prefix it is deleting, so the cancel can take partial effect: cached
+images already deleted stay deleted and any not yet deleted remain in storage.
+The canceled job reports the totals it reached in `library_result`:
+`deleted_prefixes` counts fully deleted prefixes and `deleted_s3_objects` counts
+every deleted object, including any from the prefix the cancel interrupted. A
+cleanup canceled before it deleted anything reports zeros. The administrator
+task section does not add a generic durable scheduler or change
+the retention and dispatch guarantees of existing job owners.

@@ -1,0 +1,331 @@
+# Watch provider plugins
+
+Every watch provider is a `watch_sync_provider.v1` plugin. Simkl and MDBList
+used to be compiled into the server. They now ship as first-party plugins
+(`silo.watchprovider.simkl`, `silo.watchprovider.mdblist`) from the Silo plugin
+repository. Trakt took the same path and was later retired (see
+[Retired providers](#retired-providers)). The host side of the contract lives in
+`internal/watchsync/plugin_provider*.go`, and the first-party rules described
+here live in `internal/watchsync/first_party.go`.
+
+## Provider keys
+
+The registry key names a provider everywhere it is stored:
+
+- `watch_provider_connections.provider`
+- the AAD of every encrypted connection token (`TokenAAD`)
+- auth sessions and sync runs
+- the `source` of imported watch history
+
+A plugin capability is normally keyed `plugin:<installation id>:<capability id>`.
+That key is unique and cannot be claimed by a plugin.
+
+The first-party plugins keep the keys of the built-ins they replaced: `simkl`
+and `mdblist`. As a result, every connection, stored token,
+export record, rating and dropped-show agreement, and history source those
+built-ins wrote stays valid, and nothing is re-encrypted or renamed. Three rules
+protect this:
+
+- **Only a Silo-managed repository can claim a legacy key.** A plugin gets one
+  only when its installation came from a repository whose `source_kind` is
+  `silo`. Plugin IDs are not reserved, so a third-party plugin that reuses
+  `silo.watchprovider.simkl` gets a per-installation key. It never receives
+  the tokens of existing Simkl connections. Replacing an installation records
+  the new package's repository, and none for an upload, so a package from
+  elsewhere installed over a Silo one loses the key too.
+- **One installation holds a legacy key.** If two Silo-managed installations of
+  the same plugin exist, for example after two API nodes auto-installed it at
+  once, the older one registers and the other is skipped with a warning.
+- **The plugins must reproduce the built-ins' data formats.** They return the
+  same `provider_item_key` formats the built-ins produced. Stored list, rating,
+  dropped, and export rows match by that key.
+
+Remote cursors do not carry over. Built-in cursors were provider-specific and
+plugin cursors are stored per state kind under `plugin.remote.*`, so the first
+sync after the switch re-reads the provider once.
+
+## Credentials
+
+Every connection stores the complete credential bundle (`plugin_credentials`)
+next to the dedicated token columns. A row a built-in wrote has only the
+columns. Reading it falls back to them, and the next token write adds the
+bundle.
+
+Provider app credentials, such as the Simkl client ID and secret,
+live in the plugin's global config entry `app`. On reload, the host copies the
+legacy `watchsync.<key>.client_id` and `client_secret` server settings into that
+entry when the plugin has none saved. Existing tokens were issued to that app,
+so the plugin must keep using it. The copy is a create-only write, so it never
+overwrites config an admin or another node saved first, and it runs until it
+succeeds once (`watchsync.plugin_app_seeded.<key>`). Clearing the plugin's app
+config later does not bring the old values back.
+
+A plugin connection reports `credentials_configured` as false until every
+global config entry its manifest marks required has a saved value, as the
+built-ins did for their app credentials.
+
+## Retired providers
+
+Silo no longer supports Trakt. `RetiredPlugin` lists `silo.watchprovider.trakt`,
+and the host never registers an installation of it, from any repository, so a
+copy left installed cannot sync, scrobble, or claim a key. The `trakt` key is no
+longer a first-party key: no plugin can claim it, and no auto-install follows
+from old connections. Migration `20261016134645_retire_trakt_watch_sync` deleted the
+`trakt` connections with their per-connection rows, the legacy
+`watchsync.trakt.*` settings and migration markers, and disabled any installed
+copy. Watch history imported under the `trakt` source stays.
+
+Only that plugin ID is retired. A community Trakt plugin with its own plugin ID
+registers like any other third-party plugin, under a per-installation key; it
+starts with no connections, since the old ones were deleted.
+
+## Connection settings
+
+A plugin can declare connection settings in its watch-sync descriptor: preferences a
+profile changes on its connection at any time, such as whether Simkl logs rewatches.
+They differ from a capability's `config_schema`, which an API-key connection collects
+once when it is made and the host does not store.
+
+- The web settings page shows each `boolean` setting as a switch with the connection's
+  other sync options. The host skips a setting whose type it does not know.
+- Values live in `watch_provider_connections.connection_settings`, a JSON object of
+  setting key to the plugin contract's string encoding (`"true"` or `"false"`). Only
+  settings the profile changed are stored. An update merges its keys, and reconnecting
+  or refreshing tokens keeps them.
+- Every authenticated RPC carries the value of each declared setting, defaults
+  included, in `WatchSyncAuthenticatedContext.connection_settings`.
+- An update with an undeclared key or a value of the wrong type is rejected before
+  anything is stored. A stored value for a setting the plugin no longer declares stays
+  in the row but is not sent.
+
+## List sync rows
+
+`watch_provider_list_items` holds one row per item on a synced
+favorites or watchlist, unique on `(connection_id, list_kind, media_item_id)`.
+The `provider_item_key` is not unique. The key is the item's IMDb, TMDB, or TVDB
+id without its kind, and `media_items` does not keep those ids unique, so two
+items can share one: two library items for one title, or a movie and a series
+with the same TMDB id. The ratings and dropped-show rows work the same way.
+
+Several items with one key follow these rules:
+
+- A provider removal is held while another library item of the same kind,
+  still on the local list, has the key. Removing the key would take that item
+  off the provider too.
+- With removal sync on, an import does not add back an item whose local
+  removal has not reached the provider yet, unless the provider dated its
+  listing after the removal. An undated listing never counts as newer. A run
+  whose import of a list fails sends none of that list's removals, since the
+  import may have stopped before the newer listing that drops one.
+- A full import counts every IMDb, TMDB, and TVDB id on a provider row as
+  present for that row's kind, since a plugin's key can use a different id than
+  the one stored at export (a provider may key shows by TVDB id first). A row or stored
+  item without a kind matches any kind.
+- A remote tombstone removes every row with its key, and with its kind when it
+  names one. A library item that took over watchlist title rows at promotion
+  also matches the keys and IDs those rows knew. Plugin tombstones carry only the key, so one whose rows name more
+  than one kind of title changes nothing and adds a warning.
+
+A watchlist title the library doesn't have
+([external-watchlist.md](external-watchlist.md)) has a row whose
+`media_item_id` is `watchlist-title:<kind>:<tmdb id>`. Promotion deletes the
+title and its IDs, so the row's `title_ids` keep every ID the title has held
+(`tmdb:550`, `imdb:tt0137523`, `tvdb:121361`). Writes only add to them. Each
+import and removal pass refreshes them from the title while its entry stands,
+and promotion and the profile's removal add the title's IDs to the profile's
+rows for it, under the title lock, before deleting the title. Sync finds the
+library item through them and the row's provider key:
+
+- An entry gone from the watchlist is a promotion, not a local removal, while a
+  library item with one of those IDs is on the library watchlist. When exactly
+  one is, its row takes over the title row's remote presence and IDs, and its
+  provider key when it has no row yet or the provider doesn't list its row,
+  before the title row retires. A provider removal before the next import then
+  still reaches it, and a complete read listing the title under another of its
+  IDs keeps it. Listed title rows hand over first.
+- A complete read that keeps a title row, or the library item that took one
+  over, through another of the title's IDs moves the row to the provider key
+  that listing carried, as does a listing a pending local removal waits on. A
+  removal sends only the row's key, and plugins send the provider the one ID
+  in it, so a removal under an old key could leave the provider's entry
+  listed.
+- A provider removal of the title also takes that one library item off the
+  library watchlist, for a promotion that ran after the pass read the entry.
+- A pending local removal of a title also holds a listing under another TMDB
+  ID that shares one of the row's IDs or its provider key. A title can have
+  several such rows, one per TMDB ID it was listed under; a listing dated after
+  all of their removals is a new add and drops every one of them.
+- A pending local removal holds the title in its other form too, matched the
+  same way. A removed title row holds a listing that now matches a library
+  item, unless that item is already on the list. A removed library item holds
+  a listing of the title outside the library once the library lost the item.
+  Other library items that share an ID don't hold each other's listings. A
+  listing dated after the removals is a new add, and drops the other form's
+  removal too.
+
+## Sync-run admission
+
+Manual admission locks the current connection row for its provider, account and
+profile in a short Read Committed PostgreSQL transaction, independent of the
+session's default isolation. Provider deferral, active-run
+coalescing, stale-run retirement, the one-hour manual cooldown and insertion
+commit together. Queued or running rows through the existing ten-minute manual
+window coalesce. Older active rows are marked failed; that retirement commits
+even when its completion time causes a cooldown response.
+
+Scheduled insertion takes the same row lock and skips a live manual reservation
+within that window. Scheduled runs retain their existing overlap behavior with
+other scheduled runs and have no new timeout or takeover policy. A manual
+request can still retire an older scheduled row without stopping that worker.
+Both producers reserve before taking the process-local execution guard, and only
+a newly created reservation starts work.
+
+Completion takes the same short row lock, preserving real late results and
+counters even after timeout retirement. Terminal persistence uses a bounded
+context detached from work cancellation. No transaction spans provider work.
+All API nodes must use this admission boundary for the guarantee to hold; older
+nodes can still insert independently during a mixed-version rollout. Dispatch
+remains process-local, without durable replay or exactly-once provider effects.
+
+## Pending watches
+
+Watched imports read a provider incrementally. After a sync, the cursor is past every
+row it returned, so the provider never returns a watch again unless that title's
+entry changes. A watch that matched no library item when it was read would be lost
+for good once the title is added later. `watch_provider_pending_watches` keeps those
+watches instead.
+
+- Each row is keyed by `(connection_id, kind, provider_item_key)`. The kind is part of
+  the key because provider item keys repeat across kinds. A row belongs to the provider
+  account that returned it. Only the connection's current account writes rows: the
+  write checks the account under a lock on the connection row, which a rebind waits
+  for. Listing a connection's rows drops those of any other account. After a reconnect
+  to a different account, no watch from the old one imports, even from a sync of the
+  old account that was still running.
+- A plugin can return watched state for a SERIES item: the account finished the
+  series as of `last_watched_at`, which it must send. Without that time, the row is
+  skipped with a warning. The marker covers every regular-season episode in a library
+  that had aired by then, or that has no air date. Specials are not covered. Simkl
+  reports completed shows this way, because it lists no episodes for them.
+- A marker covers only episodes the connection's profile may open. They must be in
+  the libraries it may see, with the series in one of them too, and the series must be
+  within its maturity limits (`Service.WithProfileAccess`, resolved through
+  `access.Resolver` once per sync and checked with
+  `catalog.FilterAccessibleContentIDs`; the profile's PIN and hidden-library preference
+  don't apply). Without that limit, one marker would record, and a second provider's
+  export would send, episodes the profile can't open. The kept-marker hash uses the
+  same rules, so a change in what the profile may open re-applies the marker to the
+  new set.
+- Whole-series and whole-season markers stay kept after they match, with
+  `applied_episodes`, a hash of the episodes they covered (`historyimport.LeafSetHash`).
+  Each sync computes the same hash for every kept series marker in one query
+  (`historyimport.SeriesLeafHashes`, the same filter as the expansion). A marker whose
+  covered episodes changed is applied again. That marks an episode a library gains
+  later, even when another left between the same two syncs, and an episode already
+  marked keeps its play.
+- A connection keeps at most 50,000 rows (`maxPendingWatches`). Past that the oldest by
+  `last_watched_at` go, so a provider history that matches little of the library can't
+  grow what every sync reloads without bound. Listing returns nothing to a caller whose
+  account is no longer the connection's.
+- Every watched import matches the kept rows again after the provider's own rows, in
+  batched catalog reads (`historyimport.MatchAllOn`). A kept row that matches imports
+  like a fresh one and is deleted. One that still matches nothing adds no warning. A
+  provider row with the same kind and key replaces the kept row for that sync.
+- Writes are guarded by `last_watched_at`: an overlapping older sync cannot replace a
+  newer kept watch, and deleting a matched watch never removes a newer one. The rows are
+  written before the cursor is saved. If that write fails, the sync fails, and the
+  provider's rows are read again.
+- The plugin watched cursor key carries a version, now `plugin.remote.watched.v3`.
+  It's raised when an import change needs rows that an earlier version read and
+  dropped: v2 for pending watches, v3 for finished-series watched state. Each raise
+  makes every connection read its watched history once more in full. A node still
+  running an old version writes its old key, which is ignored, so a rolling deploy
+  can't undo the re-read. Imports never re-add a play the profile removed
+  (`user_history_hidden_items`).
+- A restore keeps the live connection's cursors and takes the kept rows from the backup.
+  A watch first kept after the backup was taken is not read again.
+
+## Watched-history export
+
+A sync drains a connection's whole pending history-export backlog, oldest play
+first, in calls of at most the plugin's `max_batch_size` plays. Each call's
+per-play results are stored before the next call, so a run that stops partway
+keeps its progress. The run pages the backlog by `(watched_at, id)`, so a play
+that fails waits for the next sync instead of being retried within the same
+run; a play stops being retried after five failed attempts. A rate-limit fault
+ends the run and defers the connection until the provider's retry time. A run
+with a deadline (a manual sync) stops starting calls three minutes before it,
+and an export created after the run read local history waits for the next run
+rather than being retired as missing. The same `max_batch_size` also bounds
+every other `ApplyEvents` call and the page size Silo asks for in
+`ListRemoteState`. A
+plugin must answer each play on its own. It reports `APPLIED` or `NO_CHANGE`
+only for a play the provider accepted, `REJECTED` for one the provider cannot
+take, and `RETRY` for one it cannot confirm. Silo records `APPLIED` as sent and
+never sends that play again.
+
+Mark unwatched keeps the plays in Silo's history, so Silo sends a provider no
+history removals: the server reports the `export_unwatched` capability as false
+whatever a plugin's descriptor declares, and the `export_unwatched_enabled`
+connection setting has no effect. A play stops being exported once a mark
+unwatched covers it. A live mark-watched event checks again before it sends,
+which narrows the window but does not close it: an unmark that lands while the
+event is being sent does not take the play back. A provider import of a play
+from before the unmark is skipped, so the item does not come back as watched.
+
+## Event media
+
+Playback scrobbles and watched exports send a plugin the
+item's catalog `title`, `year`, `series_title` and `series_year` with its
+external IDs, so a provider can create a title it has not seen. The service
+fills them from the catalog just before the events go out, because neither
+history rows nor scrobble sessions store titles. The lookup is best effort;
+when it fails or times out, events go out with their IDs alone.
+
+A playback event looks its titles up once, after its session writes, in the
+background and detached from the caller's deadline, with a five-second cap.
+It starts before the event joins its ordered dispatch queue, so lookups for
+queued events overlap, and a slow lookup can cost the event its titles but
+never the event. A confirmed stop, which has already claimed its delivery,
+waits for that lookup for at most half of the time it has left. Lookups that
+run on the caller's context, for watched exports and the
+open-scrobble sweep (one lookup for all its sessions), take at most five
+seconds and at most half of the time the caller has left.
+
+A Jellyfin client's Stopped report stages its stop and delivers it as a
+confirmed stop, which gives each provider up to two minutes, the plugin
+host's watch-sync deadline. That budget starts when watch-sync begins the
+dispatch, so time the stop spends queued behind earlier events it must follow
+counts against it. The report waits at most five seconds
+for that delivery before it answers; delivery carries on in the background. A
+staged stop that keeps failing is retried until an hour after the play
+stopped, then dropped with one warning. History export can still deliver a
+dropped completed play, but only when watched export is turned on for that
+connection and the play was recorded in local watch history.
+
+An episode's `title` is its own, and its `year` is its series' year, as on
+the import side. An item whose event kind differs from its catalog kind gets
+no titles: an episode without provider IDs is sent as a movie, and must not
+arrive named after the episode.
+
+On connect, a plugin's `INVALID_REQUEST` or `PERMANENT` fault and a
+connection config the host rejects mean the profile's input can't work. The
+v2 API answers them `422 validation_failed` with the plugin's safe message,
+scrubbed of the API key and every config secret, including each value inside
+a secret field that holds a JSON object or array.
+
+## Upgrade path
+
+Plugin auto-update installs a first-party plugin from the Silo repository when
+its key still has connections and the migration has not completed. It does so
+at startup and on every later update check, so a catalog that was unreachable at
+boot is retried. The migration completes when the plugin first registers under
+its key, which records `watchsync.plugin_migration.<key>`. The plugin then
+leaves the install list, so an admin who later uninstalls it does not get it
+back. Until the plugin registers, connections under its key stay stored but do
+not sync.
+
+Lifecycle hooks fire only on the node that changed a plugin, so every API node
+also invalidates its installation cache and rebuilds its watch provider registry
+every two minutes. A plugin another node installed reaches every node's registry
+within that interval.

@@ -1,0 +1,248 @@
+/**
+ * TMDB charts a Synced list can follow, and the choices TMDB accepts for each.
+ * Mirrors `validateTMDB` in internal/collections/templates/validate.go, so the
+ * editor never offers a combination the server refuses.
+ */
+import type { ImportTMDBCollectionRequest } from "@/api/types";
+import { englishText, t, type MessageKey, type TextValues } from "@/i18n";
+import { parseTMDBListID } from "@/lib/tmdbList";
+
+export type TMDBChartPreset = ImportTMDBCollectionRequest["preset"];
+export type TMDBChartMediaType = ImportTMDBCollectionRequest["media_type"];
+export type TMDBChartTimeWindow = NonNullable<ImportTMDBCollectionRequest["time_window"]>;
+
+export interface TMDBChart {
+  preset: TMDBChartPreset;
+  mediaType: TMDBChartMediaType;
+  /** Trending only. */
+  timeWindow?: TMDBChartTimeWindow;
+}
+
+/** The charts in the order the picker shows them; translate `labelKey` and `hintKey` at render. */
+export const TMDB_CHARTS: ReadonlyArray<{
+  preset: TMDBChartPreset;
+  labelKey: MessageKey;
+  hintKey: MessageKey;
+}> = [
+  {
+    preset: "trending",
+    labelKey: "web.collections.tmdbSources.chartTrending",
+    hintKey: "web.collections.tmdbSources.chartTrendingHint",
+  },
+  {
+    preset: "popular",
+    labelKey: "web.collections.tmdbSources.chartPopular",
+    hintKey: "web.collections.tmdbSources.chartPopularHint",
+  },
+  {
+    preset: "top_rated",
+    labelKey: "web.collections.tmdbSources.chartTopRated",
+    hintKey: "web.collections.tmdbSources.chartTopRatedHint",
+  },
+  {
+    preset: "now_playing",
+    labelKey: "web.collections.tmdbSources.chartNowPlaying",
+    hintKey: "web.collections.tmdbSources.chartNowPlayingHint",
+  },
+  {
+    preset: "upcoming",
+    labelKey: "web.collections.tmdbSources.chartUpcoming",
+    hintKey: "web.collections.tmdbSources.chartUpcomingHint",
+  },
+  {
+    preset: "airing_today",
+    labelKey: "web.collections.tmdbSources.chartAiringToday",
+    hintKey: "web.collections.tmdbSources.chartAiringTodayHint",
+  },
+  {
+    preset: "on_the_air",
+    labelKey: "web.collections.tmdbSources.chartOnTheAir",
+    hintKey: "web.collections.tmdbSources.chartOnTheAirHint",
+  },
+];
+
+/** A chart's name on its card: "Trending", "Top rated". */
+export function chartLabel(preset: TMDBChartPreset): string {
+  return t(TMDB_CHARTS.find((entry) => entry.preset === preset)!.labelKey);
+}
+
+const CHART_MEDIA_LABEL: Readonly<Record<TMDBChartMediaType, MessageKey>> = {
+  movie: "web.collections.tmdbSources.mediaMovies",
+  tv: "web.collections.tmdbSources.mediaTv",
+  all: "web.collections.tmdbSources.mediaBoth",
+};
+
+/** Show's choices: "Movies", "TV shows", "Both". */
+export function chartMediaLabel(mediaType: TMDBChartMediaType): string {
+  return t(CHART_MEDIA_LABEL[mediaType]);
+}
+
+/** "Trending over"'s choices: "Today", "This week". */
+export function chartWindowLabel(timeWindow: TMDBChartTimeWindow): string {
+  return timeWindow === "week"
+    ? t("web.collections.tmdbSources.windowWeek")
+    : t("web.collections.tmdbSources.windowDay");
+}
+
+/** What Show offers for a chart; Both only for Trending. */
+export function chartMediaTypes(preset: TMDBChartPreset): TMDBChartMediaType[] {
+  switch (preset) {
+    case "trending":
+      return ["movie", "tv", "all"];
+    case "popular":
+    case "top_rated":
+      return ["movie", "tv"];
+    case "now_playing":
+    case "upcoming":
+      return ["movie"];
+    case "airing_today":
+    case "on_the_air":
+      return ["tv"];
+  }
+}
+
+/** "Trending over" applies to Trending only. */
+export function chartHasTimeWindow(preset: TMDBChartPreset): boolean {
+  return preset === "trending";
+}
+
+/** Why Show is fixed for a chart TMDB has for one kind only; null when it isn't. */
+export function chartLockReason(preset: TMDBChartPreset): string | null {
+  const [only, ...more] = chartMediaTypes(preset);
+  if (more.length > 0) return null;
+  return t("web.collections.tmdbSources.chartLockReason", { kind: only ?? "tv" });
+}
+
+/**
+ * The chart with choices TMDB accepts: a Show it doesn't offer falls back to
+ * the first it does, and "Trending over" is kept for Trending only.
+ */
+export function normalizeChart(chart: TMDBChart): TMDBChart {
+  const allowed = chartMediaTypes(chart.preset);
+  const mediaType = allowed.includes(chart.mediaType) ? chart.mediaType : allowed[0]!;
+  if (!chartHasTimeWindow(chart.preset)) return { preset: chart.preset, mediaType };
+  return { preset: chart.preset, mediaType, timeWindow: chart.timeWindow ?? "day" };
+}
+
+/** A chart picked without choices yet: Trending starts on Both, today. */
+export function defaultChart(preset: TMDBChartPreset): TMDBChart {
+  return normalizeChart({ preset, mediaType: "all" });
+}
+
+export function sameChart(a: TMDBChart, b: TMDBChart): boolean {
+  const left = normalizeChart(a);
+  const right = normalizeChart(b);
+  return (
+    left.preset === right.preset &&
+    left.mediaType === right.mediaType &&
+    left.timeWindow === right.timeWindow
+  );
+}
+
+/** Formats a message: `englishText` for a name the client saves, `t` for one only shown. */
+type Text = (id: MessageKey, values?: TextValues) => string;
+
+/** Every chart's name, by its `preset/media[/window]` path (see `chartSource`). */
+const CHART_NAMES: Readonly<Record<string, MessageKey>> = {
+  "trending/movie/day": "web.common.collections.chartName.trendingMoviesToday",
+  "trending/movie/week": "web.common.collections.chartName.trendingMoviesThisWeek",
+  "trending/tv/day": "web.common.collections.chartName.trendingTvToday",
+  "trending/tv/week": "web.common.collections.chartName.trendingTvThisWeek",
+  "trending/all/day": "web.common.collections.chartName.trendingToday",
+  "trending/all/week": "web.common.collections.chartName.trendingThisWeek",
+  "popular/movie": "web.common.collections.chartName.popularMovies",
+  "popular/tv": "web.common.collections.chartName.popularTv",
+  "top_rated/movie": "web.common.collections.chartName.topRatedMovies",
+  "top_rated/tv": "web.common.collections.chartName.topRatedTv",
+  "now_playing/movie": "web.common.collections.chartName.nowPlayingMovies",
+  "upcoming/movie": "web.common.collections.chartName.upcomingMovies",
+  "airing_today/tv": "web.common.collections.chartName.airingTodayTv",
+  "on_the_air/tv": "web.common.collections.chartName.onTheAirTv",
+};
+
+/**
+ * The name a chart gets when no ready-made pick matches it: "Trending Movies Today".
+ * It becomes the stored name of a synced list or Discover row, so it is data and is
+ * English in every language by default; pass `t` only for a name that is shown and
+ * never saved (a placeholder).
+ */
+export function chartName(chart: TMDBChart, tx: Text = englishText): string {
+  const { preset, mediaType, timeWindow } = normalizeChart(chart);
+  return tx(CHART_NAMES[[preset, mediaType, timeWindow].filter(Boolean).join("/")]!);
+}
+
+/** The kind of titles a chart holds, for which libraries it can match into. */
+export function chartMediaKind(chart: TMDBChart): "movie" | "tv" | "mixed" {
+  const { mediaType } = normalizeChart(chart);
+  return mediaType === "all" ? "mixed" : mediaType;
+}
+
+// --- Stored sources -----------------------------------------------------------
+
+/** What the PATCH of a saved synced list sends for the list it follows. */
+export interface StoredSource {
+  source_url: string;
+  source_config: Record<string, unknown>;
+}
+
+/** `config` with `limit` set, or as it is when there is none. */
+export function withLimit(config: Record<string, unknown>, limit: number | undefined) {
+  return limit === undefined ? config : { ...config, limit };
+}
+
+function isChartPreset(value: unknown): value is TMDBChartPreset {
+  return TMDB_CHARTS.some((entry) => entry.preset === value);
+}
+
+/** The chart a stored `tmdb_preset` config names; one naming no known chart reads as Trending. */
+export function chartOfSourceConfig(config: Record<string, unknown> | undefined): TMDBChart {
+  const preset = config?.preset;
+  if (!isChartPreset(preset)) return defaultChart("trending");
+  const mediaType = config?.media_type;
+  const timeWindow = config?.time_window;
+  return normalizeChart({
+    preset,
+    mediaType:
+      mediaType === "movie" || mediaType === "tv" || mediaType === "all" ? mediaType : "all",
+    timeWindow: timeWindow === "day" || timeWindow === "week" ? timeWindow : undefined,
+  });
+}
+
+/** A chart as the server stores it: `tmdb://preset/media[/window]`. */
+export function chartSource(chart: TMDBChart, limit?: number): StoredSource {
+  const { preset, mediaType, timeWindow } = normalizeChart(chart);
+  const config: Record<string, unknown> = { mode: "tmdb_preset", preset, media_type: mediaType };
+  if (timeWindow) config.time_window = timeWindow;
+  return {
+    source_url: `tmdb://${[preset, mediaType, timeWindow].filter(Boolean).join("/")}`,
+    source_config: withLimit(config, limit),
+  };
+}
+
+/** A TMDB list link, stored as the list's canonical URL. */
+export function tmdbListSource(link: string, limit?: number): StoredSource {
+  const id = parseTMDBListID(link);
+  const url = id === null ? link.trim() : `https://www.themoviedb.org/list/${id}`;
+  return { source_url: url, source_config: withLimit({ mode: "tmdb_list", url }, limit) };
+}
+
+/** A franchise list: the TMDB collection it follows. */
+export function franchiseSource(collectionId: number, limit?: number): StoredSource {
+  return {
+    source_url: `tmdb://collection/${collectionId}`,
+    source_config: withLimit({ mode: "tmdb_collection", collection_id: collectionId }, limit),
+  };
+}
+
+/** "Trending movies, this week", "Top rated TV shows": what a chart follows, in words. */
+export function chartSummary(chart: TMDBChart): string {
+  const { preset, mediaType, timeWindow } = normalizeChart(chart);
+  const label = chartLabel(preset);
+  return timeWindow
+    ? t("web.collections.tmdbSources.chartSummaryWindow", {
+        chart: label,
+        media: mediaType,
+        window: timeWindow,
+      })
+    : t("web.collections.tmdbSources.chartSummary", { chart: label, media: mediaType });
+}

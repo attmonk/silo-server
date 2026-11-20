@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      # Integration branch for the API v2 program (#135). Stacked PRs merge
+      # here first; the merge commits need the same gate as main.
+      - apiv2
+      - feat/web-premiere-deploy
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  # cancel-in-progress: ${{ github.ref_name != 'main' }} # Declined: retain main's cancellation policy.
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOPRIVATE: github.com/Silo-Server/*
+  GONOSUMDB: github.com/Silo-Server/*
+  # Pinned so a lint gate cannot change its mind between two runs of the same
+  # commit. Built from source below rather than downloaded: a released binary
+  # refuses to run against a Go version newer than the one it was built with,
+  # and go.mod tracks Go closely enough that this repo is regularly ahead.
+  GOLANGCI_LINT_VERSION: v2.15.0
+
+# The default token is read-write. Only the cache prune job writes, and only
+# to the Actions cache; every other job keeps a read-only token, which is one
+# fewer thing a compromised dependency can reach.
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    permissions:
+      actions: write
+      contents: read
+    # attmonk fork: pinned to the synced upstream commit; bump on each upstream sync.
+    uses: Silo-Server/silo-server/.github/workflows/trusted-linux-ci.yml@bd40bd9ebfa46694818c8cabee581a479c51a8a1
+    with:
+      self_hosted: false

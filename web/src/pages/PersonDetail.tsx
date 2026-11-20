@@ -1,0 +1,309 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams } from "react-router";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Pencil, RefreshCw } from "lucide-react";
+
+import { getPerson } from "@/api/v2/people";
+import { isNotFoundProblem } from "@/api/v2/request";
+import { createEmptyQueryDefinition, type Person } from "@/api/types";
+import type { CatalogSearchState } from "@/pages/catalogSearchParams";
+import EditPersonDialog from "@/components/EditPersonDialog";
+import ItemGrid from "@/components/ItemGrid";
+import PageBack from "@/components/PageBack";
+import { loadErrorDescription } from "@/components/loadErrorDescription";
+import PageUnavailable from "@/components/PageUnavailable";
+import { Button } from "@/components/ui/button";
+import { useCatalogWindow } from "@/hooks/queries/catalog";
+import { personKeys } from "@/hooks/queries/keys";
+import {
+  invalidatePersonItemDetails,
+  observePersonRefresh,
+  useRefreshPerson,
+} from "@/hooks/queries/people";
+import { useAuth } from "@/hooks/useAuth";
+import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { Skeleton } from "@/components/ui/skeleton";
+import { formatBirthDate, computeAge } from "@/lib/date";
+import { getInitials } from "@/lib/text";
+import { useT, type MessageKey } from "@/i18n";
+
+type TypeFilter = "all" | "movie" | "series";
+
+const TYPE_FILTER_LABELS: Record<TypeFilter, MessageKey> = {
+  all: "web.person.filterAll",
+  movie: "web.person.filterMovies",
+  series: "web.person.filterSeries",
+};
+
+export default function PersonDetail() {
+  const { id } = useParams<{ id: string }>();
+  const t = useT();
+  const queryClient = useQueryClient();
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
+  const [editOpen, setEditOpen] = useState(false);
+  const autoRefreshRequestedPersonIdRef = useRef<string | null>(null);
+  const { user } = useAuth();
+  const isAdmin = useIsActingAdmin();
+  const refreshMutation = useRefreshPerson(id, isAdmin);
+
+  const {
+    data: cachedPerson,
+    isLoading: personLoading,
+    isFetching: personFetching,
+    error: personError,
+    refetch: refetchPerson,
+  } = useQuery({
+    queryKey: personKeys.detail(id!),
+    queryFn: ({ signal }) => getPerson(id!, { signal }),
+    enabled: !!id,
+    // Render a prefetched person at once, but still read it as a view so the
+    // server can queue a refresh the prefetch skipped.
+    refetchOnMount: "always",
+  });
+
+  // A 404 outranks a cached person: the view read runs even over prefetched
+  // data, and a person it finds gone must not keep their old page.
+  const personNotFound = isNotFoundProblem(personError);
+  const person = personNotFound ? undefined : cachedPerson;
+
+  useDocumentTitle(
+    personNotFound
+      ? t("web.person.notFoundTitle")
+      : (person?.name ?? t("web.person.fallbackTitle")),
+  );
+
+  const hasPerson = !!person;
+  useEffect(() => {
+    // A person read can queue a refresh even when all metadata is already present.
+    if (id && hasPerson) {
+      void invalidatePersonItemDetails(queryClient, id);
+      observePersonRefresh(queryClient, id);
+    }
+  }, [id, hasPerson, queryClient]);
+
+  useEffect(() => {
+    if (!person || !user || !isPersonMetadataIncomplete(person)) {
+      return;
+    }
+    if (autoRefreshRequestedPersonIdRef.current === person.id || refreshMutation.isPending) {
+      return;
+    }
+    autoRefreshRequestedPersonIdRef.current = person.id;
+    refreshMutation.mutate();
+  }, [person, refreshMutation, user]);
+
+  const catalogState: CatalogSearchState = useMemo(
+    () => ({
+      source: "person",
+      person_id: id,
+      query_definition: {
+        ...createEmptyQueryDefinition(),
+        media_scope: typeFilter === "all" ? undefined : typeFilter,
+        sort: { field: "year" as const, order: "desc" as const },
+      },
+    }),
+    [id, typeFilter],
+  );
+
+  const limit = 60;
+  const [visibleRange, setVisibleRange] = useState<[number, number]>([0, limit - 1]);
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const handleVisibleRangeChange = useCallback((start: number, end: number) => {
+    clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      setVisibleRange([start, end]);
+    }, 50);
+  }, []);
+  useEffect(() => () => clearTimeout(debounceRef.current), []);
+  const catalogQuery = useCatalogWindow(catalogState, { limit, visibleRange });
+
+  if (personLoading) {
+    return <PersonDetailSkeleton />;
+  }
+
+  if (!person) {
+    if (personError && !isNotFoundProblem(personError)) {
+      return (
+        <PageUnavailable
+          title={t("web.person.loadFailedTitle")}
+          description={loadErrorDescription(personError, t("web.person.loadFailedBody"))}
+          onRetry={() => void refetchPerson()}
+          retrying={personFetching}
+        />
+      );
+    }
+    return (
+      <PageUnavailable
+        title={t("web.person.unavailableTitle")}
+        description={t("web.person.unavailableBody")}
+      />
+    );
+  }
+
+  return (
+    <div>
+      {/* Person Header */}
+      <section className="page-shell relative pt-8 pb-6 sm:pt-10 sm:pb-8">
+        <PageBack />
+        <div className="mt-10 flex flex-col gap-6 sm:mt-12 lg:flex-row lg:gap-8">
+          {/* Photo */}
+          <div className="shrink-0 self-start">
+            <div className="media-card-image aspect-[2/3] w-[140px] overflow-hidden rounded-lg sm:w-[180px]">
+              {person.photo_url ? (
+                <img
+                  src={person.photo_url}
+                  alt={person.name}
+                  className="h-full w-full object-cover"
+                />
+              ) : (
+                <div className="bg-surface text-muted-foreground flex h-full w-full items-center justify-center text-3xl font-semibold">
+                  {getInitials(person.name)}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Info */}
+          <div className="min-w-0 flex-1 pt-1">
+            <div className="mb-3 flex flex-wrap items-center gap-3">
+              <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">{person.name}</h1>
+              {id && user && (
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => refreshMutation.mutate()}
+                    disabled={refreshMutation.isPending}
+                  >
+                    <RefreshCw
+                      className={`h-3.5 w-3.5 ${refreshMutation.isPending ? "animate-spin" : ""}`}
+                    />
+                    {refreshMutation.isPending
+                      ? isAdmin
+                        ? t("web.person.refreshing")
+                        : t("web.person.queueing")
+                      : isAdmin
+                        ? t("web.person.refreshNow")
+                        : t("web.person.refreshMetadata")}
+                  </Button>
+                  {isAdmin ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setEditOpen(true)}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                      {t("web.person.editMetadata")}
+                    </Button>
+                  ) : null}
+                </div>
+              )}
+            </div>
+
+            {/* Metadata badges */}
+            <div className="mb-4 flex flex-wrap items-center gap-2">
+              {person.birth_date && (
+                <span className="metadata-badge">
+                  {t("web.person.born", { date: formatBirthDate(person.birth_date) })}
+                </span>
+              )}
+              {person.birth_date && !person.death_date && (
+                <span className="metadata-badge">
+                  {t("web.person.age", { age: computeAge(person.birth_date) })}
+                </span>
+              )}
+              {person.death_date && person.birth_date && (
+                <span className="metadata-badge">
+                  {t("web.person.died", {
+                    date: formatBirthDate(person.death_date),
+                    age: computeAge(person.birth_date, person.death_date),
+                  })}
+                </span>
+              )}
+              {person.birthplace && <span className="metadata-badge">{person.birthplace}</span>}
+            </div>
+
+            {/* Bio */}
+            {person.bio && (
+              <p className="text-muted-foreground max-w-2xl text-sm leading-relaxed">
+                {person.bio}
+              </p>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* Divider */}
+      <div className="border-border/10 border-t" />
+
+      {/* Filmography */}
+      <div className="page-shell space-y-6 py-6 sm:py-8">
+        <div className="flex items-center justify-between">
+          <h2 className="text-xl font-semibold tracking-tight">{t("web.person.filmography")}</h2>
+          <div className="flex gap-1.5">
+            {(["all", "movie", "series"] as const).map((filter) => (
+              <button
+                key={filter}
+                type="button"
+                onClick={() => {
+                  setTypeFilter(filter);
+                  setVisibleRange([0, limit - 1]);
+                }}
+                className={`rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${
+                  typeFilter === filter
+                    ? "border-border/20 bg-foreground/10 text-foreground"
+                    : "border-border/10 text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {t(TYPE_FILTER_LABELS[filter])}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <ItemGrid
+          totalItems={catalogQuery.data?.totalItems ?? 0}
+          knownItems={catalogQuery.data?.knownItems}
+          pages={catalogQuery.data?.pages ?? new Map()}
+          pageSize={limit}
+          loading={catalogQuery.isLoading}
+          onVisibleRangeChange={handleVisibleRangeChange}
+        />
+      </div>
+
+      {isAdmin ? (
+        <EditPersonDialog
+          key={`${person.id}-${editOpen ? "open" : "closed"}`}
+          person={person}
+          open={editOpen}
+          onOpenChange={setEditOpen}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function isPersonMetadataIncomplete(person: Person) {
+  return !person.bio || !person.photo_url || !person.birth_date;
+}
+
+function PersonDetailSkeleton() {
+  return (
+    <div className="page-shell pt-8 sm:pt-10">
+      <div className="flex flex-col gap-6 lg:flex-row lg:gap-8">
+        <Skeleton className="aspect-[2/3] w-[140px] shrink-0 rounded-lg sm:w-[180px]" />
+        <div className="flex-1 space-y-3 pt-1">
+          <Skeleton className="h-8 w-48" />
+          <div className="flex gap-2">
+            <Skeleton className="h-5 w-32" />
+            <Skeleton className="h-5 w-24" />
+          </div>
+          <Skeleton className="h-16 w-full max-w-2xl" />
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,107 @@
+import { useEffect } from "react";
+
+/**
+ * Registers keyboard shortcuts for the video player.
+ * Space/K = play/pause, F = fullscreen, M = mute, C = toggle captions,
+ * P = picture-in-picture, ArrowLeft/Right = skip by the profile's intervals, ArrowUp/Down = volume ±5%.
+ */
+export function useKeyboardShortcuts(
+  videoRef: React.RefObject<HTMLVideoElement | null>,
+  toggleFullscreen: () => void,
+  handlePlayPause: () => void,
+  skip: { back: () => void; forward: () => void },
+  toggleCaptions: () => void,
+  toggleMuted: () => void,
+  togglePiP?: () => void,
+  enabled = true,
+) {
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.defaultPrevented) return;
+      // Don't intercept keys when typing in inputs.
+      const target = e.target as HTMLElement;
+      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) {
+        return;
+      }
+      // An open player menu or panel owns the keyboard: Space and Enter choose
+      // the focused item instead of toggling playback. The touch sheet's close
+      // and backdrop buttons sit beside the menu element, so they carry
+      // data-player-menu.
+      if (target.closest?.('dialog, [role="menu"], [role="dialog"], [data-player-menu]')) return;
+
+      const video = videoRef.current;
+      if (!video) return;
+
+      switch (e.key) {
+        case " ":
+        case "k":
+        case "K":
+          e.preventDefault();
+          handlePlayPause();
+          break;
+
+        case "f":
+        case "F":
+          e.preventDefault();
+          toggleFullscreen();
+          break;
+
+        case "m":
+        case "M":
+          e.preventDefault();
+          // Through the player, not the element: a room seek pre-roll mutes
+          // the element for itself and keeps the viewer's choice separately.
+          toggleMuted();
+          break;
+
+        case "c":
+        case "C":
+          e.preventDefault();
+          toggleCaptions();
+          break;
+
+        case "p":
+        case "P":
+          e.preventDefault();
+          togglePiP?.();
+          break;
+
+        case "ArrowLeft":
+          e.preventDefault();
+          skip.back();
+          break;
+
+        case "ArrowRight":
+          e.preventDefault();
+          skip.forward();
+          break;
+
+        case "ArrowUp":
+          e.preventDefault();
+          video.volume = Math.min(1, video.volume + 0.05);
+          break;
+
+        case "ArrowDown":
+          e.preventDefault();
+          video.volume = Math.max(0, video.volume - 0.05);
+          break;
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [
+    enabled,
+    handlePlayPause,
+    skip,
+    toggleCaptions,
+    toggleFullscreen,
+    toggleMuted,
+    togglePiP,
+    videoRef,
+  ]);
+}

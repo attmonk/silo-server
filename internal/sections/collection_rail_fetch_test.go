@@ -1,0 +1,60 @@
+package sections
+
+import (
+	"slices"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+)
+
+func TestCollectionRailQueryAccessIntersectsExplicitLibrary(t *testing.T) {
+	requestedLibraryID := 7
+
+	matching := collectionRailQueryAccess(
+		catalog.AccessFilter{AllowedLibraryIDs: []int{4, 7}},
+		&requestedLibraryID,
+		nil,
+	)
+	if len(matching.AllowedLibraryIDs) != 1 || matching.AllowedLibraryIDs[0] != requestedLibraryID {
+		t.Fatalf("matching access = %v, want [%d]", matching.AllowedLibraryIDs, requestedLibraryID)
+	}
+
+	blocked := collectionRailQueryAccess(
+		catalog.AccessFilter{AllowedLibraryIDs: []int{4}},
+		&requestedLibraryID,
+		nil,
+	)
+	if blocked.AllowedLibraryIDs == nil || len(blocked.AllowedLibraryIDs) != 0 {
+		t.Fatalf("blocked access = %v, want non-nil empty scope", blocked.AllowedLibraryIDs)
+	}
+}
+
+func TestCollectionRailQueryAccessKeepsEmptyScopeDenying(t *testing.T) {
+	got := collectionRailQueryAccess(catalog.AccessFilter{AllowedLibraryIDs: []int{}}, nil, []int{})
+	if got.AllowedLibraryIDs == nil || len(got.AllowedLibraryIDs) != 0 {
+		t.Fatalf("empty scope = %#v, want non-nil empty scope", got.AllowedLibraryIDs)
+	}
+}
+
+func TestNarrowLibraryScopeNeverWidensAllowedLibraries(t *testing.T) {
+	tests := []struct {
+		name           string
+		scope, allowed []int
+		want           []int
+	}{
+		{name: "unrestricted", scope: nil, allowed: nil, want: nil},
+		{name: "scope only", scope: []int{1, 2}, allowed: nil, want: []int{1, 2}},
+		{name: "allowed only", scope: nil, allowed: []int{2}, want: []int{2}},
+		{name: "overlap", scope: []int{1, 2}, allowed: []int{2, 3}, want: []int{2}},
+		{name: "disjoint", scope: []int{1}, allowed: []int{2}, want: []int{}},
+		{name: "nothing allowed", scope: []int{1}, allowed: []int{}, want: []int{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := narrowLibraryScope(tt.scope, tt.allowed)
+			if (got == nil) != (tt.want == nil) || !slices.Equal(got, tt.want) {
+				t.Fatalf("narrowLibraryScope(%#v, %#v) = %#v, want %#v", tt.scope, tt.allowed, got, tt.want)
+			}
+		})
+	}
+}

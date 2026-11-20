@@ -1,0 +1,194 @@
+import type { ReactNode } from "react";
+import { useAdminStats, useAdminSessions } from "@/hooks/queries/admin/stats";
+import { PageHeader } from "@/components/page/PageHeader";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Film, FileVideo, Users, Play } from "lucide-react";
+import type { AdminSession, AdminStats } from "@/api/types";
+import { JellyfinSessionPill } from "@/components/JellyfinSessionPill";
+import {
+  activityMethodMeta,
+  classifyActivityMethod,
+  getSessionClientLabel,
+} from "@/pages/adminActivityPresentation";
+import { formatDateTime } from "@/lib/datetime";
+import { formatLocale } from "@/lib/appLocale";
+import { useT } from "@/i18n";
+
+/** Placeholder for a session without a client label; a symbol, not text. */
+const EM_DASH = "—";
+
+export default function AdminStats() {
+  const t = useT();
+  const statsQuery = useAdminStats();
+  const sessionsQuery = useAdminSessions();
+  const sessions = sessionsQuery.data ?? [];
+
+  return (
+    <div className="space-y-6 pb-4 sm:pb-6">
+      <PageHeader
+        title={t("web.admin.stats.page.title")}
+        subtitle={t("web.admin.stats.page.subtitle")}
+      />
+
+      <StatsCards
+        stats={statsQuery.data}
+        sessionCount={sessions.length}
+        isLoading={statsQuery.isLoading}
+        error={statsQuery.error}
+      />
+
+      <SessionsSection
+        sessions={sessions}
+        isLoading={sessionsQuery.isLoading}
+        error={sessionsQuery.error}
+      />
+    </div>
+  );
+}
+
+function StatsCards({
+  stats,
+  sessionCount,
+  isLoading,
+  error,
+}: {
+  stats: AdminStats | undefined;
+  sessionCount: number;
+  isLoading: boolean;
+  error: unknown;
+}) {
+  const t = useT();
+  if (error) {
+    return <SectionError message={t("web.admin.stats.cards.loadFailed")} />;
+  }
+  if (isLoading || !stats) {
+    return (
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} className="h-[108px] rounded-2xl" />
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-4">
+      <StatCard
+        title={t("web.admin.stats.cards.mediaItems")}
+        value={stats.total_items}
+        icon={<Film className="h-4 w-4" />}
+      />
+      <StatCard
+        title={t("web.admin.stats.cards.files")}
+        value={stats.total_files}
+        icon={<FileVideo className="h-4 w-4" />}
+      />
+      <StatCard
+        title={t("web.admin.stats.cards.users")}
+        value={stats.total_users}
+        icon={<Users className="h-4 w-4" />}
+      />
+      <StatCard
+        title={t("web.admin.stats.cards.activeSessions")}
+        value={sessionCount}
+        icon={<Play className="h-4 w-4" />}
+      />
+    </div>
+  );
+}
+
+function SessionsSection({
+  sessions,
+  isLoading,
+  error,
+}: {
+  sessions: AdminSession[];
+  isLoading: boolean;
+  error: unknown;
+}) {
+  const t = useT();
+  return (
+    <div className="space-y-3">
+      <h2 className="text-lg font-medium tracking-tight">{t("web.admin.stats.sessions.title")}</h2>
+      {isLoading ? (
+        <div className="surface-panel space-y-2 rounded-2xl p-4">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-10 w-full rounded-md" />
+          ))}
+        </div>
+      ) : error ? (
+        <SectionError message={t("web.admin.stats.sessions.loadFailed")} />
+      ) : sessions.length === 0 ? (
+        <div className="surface-panel text-muted-foreground rounded-2xl py-12 text-center text-sm">
+          {t("web.admin.stats.sessions.empty")}
+        </div>
+      ) : (
+        <div className="surface-panel overflow-x-auto rounded-2xl border-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>{t("web.admin.stats.sessions.sessionId")}</TableHead>
+                <TableHead>{t("web.admin.stats.sessions.userId")}</TableHead>
+                <TableHead>{t("web.admin.stats.sessions.fileId")}</TableHead>
+                <TableHead>{t("web.admin.stats.sessions.method")}</TableHead>
+                <TableHead>{t("web.admin.stats.sessions.client")}</TableHead>
+                <TableHead>{t("web.admin.stats.sessions.started")}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sessions.map((s) => (
+                <TableRow key={s.session_id}>
+                  <TableCell className="font-mono text-xs">
+                    {t("web.admin.stats.sessions.shortSessionId", { id: s.session_id.slice(0, 8) })}
+                  </TableCell>
+                  <TableCell>{s.user_id}</TableCell>
+                  <TableCell>{s.media_file_id}</TableCell>
+                  <TableCell>{activityMethodMeta(classifyActivityMethod(s)).label}</TableCell>
+                  <TableCell>
+                    <span className="inline-flex items-center gap-1.5">
+                      {getSessionClientLabel(s) || EM_DASH}
+                      <JellyfinSessionPill session={s} />
+                    </span>
+                  </TableCell>
+                  <TableCell className="text-xs">{formatDateTime(s.started_at)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatCard({ title, value, icon }: { title: string; value: number; icon: ReactNode }) {
+  return (
+    <Card className="surface-panel rounded-2xl border-0 shadow-none">
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle className="text-muted-foreground text-sm font-medium">{title}</CardTitle>
+        <div className="text-muted-foreground">{icon}</div>
+      </CardHeader>
+      <CardContent>
+        <div className="text-3xl font-semibold tracking-tight">
+          {value.toLocaleString(formatLocale())}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function SectionError({ message }: { message: string }) {
+  return (
+    <div className="surface-panel text-destructive rounded-2xl py-6 text-center text-sm">
+      {message}
+    </div>
+  );
+}

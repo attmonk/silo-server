@@ -1,0 +1,91 @@
+{
+  "items": [
+    {
+      "item": {
+        "content_id": "series:andor",
+        "type": "series",
+        "title": "Title series:andor",
+        "genres": [],
+        "keywords": [],
+        "status": "matched"
+      },
+      "reasons": {
+        "next_up": true
+      },
+      "active_reasons": {
+        "next_up": true
+      },
+      "notifies": true,
+      "muted": false,
+      "next_up_after": {
+        "season_number": 2,
+        "episode_number": 8
+      }
+    },
+    {
+      "item": {
+        "content_id": "series:bear",
+        "type": "series",
+        "title": "Title series:bear",
+        "genres": [],
+        "keywords": [],
+        "status": "matched"
+      },
+      "reasons": {
+        "next_up": true
+      },
+      "active_reasons": {
+        "next_up": true
+      },
+      "notifies": false,
+      "muted": false,
+      "next_up_after": {
+        "season_number": 2,
+        "episode_number": 8
+      }
+    },
+    {
+      "item": {
+        "content_id": "series:slow-horses",
+        "type": "series",
+        "title": "Title series:slow-horses",
+        "genres": [],
+        "keywords": [],
+        "status": "matched"
+      },
+      "reasons": {
+        "next_up": true
+      },
+      "active_reasons": {
+        "next_up": false
+      },
+      "notifies": false,
+      "muted": false
+    },
+    {
+      "item": {
+        "content_id": "series:wire",
+        "type": "series",
+        "title": "Title series:wire",
+        "genres": [],
+        "keywords": [],
+        "status": "matched"
+      },
+      "reasons": {
+        "next_up": true
+      },
+      "active_reasons": {
+        "next_up": true
+      },
+      "notifies": false,
+      "muted": true,
+      "next_up_after": {
+        "season_number": 2,
+        "episode_number": 8
+      }
+    }
+  ],
+  "page": {
+    "has_more": false
+  }
+}

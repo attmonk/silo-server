@@ -1,0 +1,224 @@
+# Outbound address guard
+
+Some features make Silo send HTTP requests to an address a user typed or a
+third party supplied: history import, webhook sync, notification webhooks,
+collection posters set from a URL, artwork URLs from metadata providers,
+subtitle file links from OpenSubtitles, catalog seed imports from a URL, and
+plugin repository catalogs and packages.
+The server sits on a network the user may not: a household LAN, or a cluster
+with its database, cache, transcode nodes, and a cloud metadata endpoint. An
+unchecked address lets anyone who can sign in probe that network from the
+server's position. `internal/netguard` is the one place that decides which
+addresses those requests may reach.
+
+## Address classes
+
+`netguard.Classify` puts every IP address in one class:
+
+- **Public**: reachable by anyone on the internet.
+- **Private**: the server's own network. Loopback, RFC 1918, CGNAT
+  (`100.64.0.0/10`, which includes Tailscale), IPv6 ULA and site-local, and the
+  special-use unicast ranges (TEST-NETs, benchmarking, documentation). A
+  well-known NAT64 address (`64:ff9b::/96`) is private too, or blocked when the
+  IPv4 address it embeds is blocked, since a NAT64 gateway translates to it.
+- **Blocked**: never dialed by anyone. Unspecified (`0.0.0.0` dials loopback on
+  Linux), link-local (`169.254.0.0/16`, `fe80::/10`, where cloud metadata
+  services live), known metadata addresses outside link-local
+  (`100.100.100.200`, `fd00:ec2::254`), multicast, reserved ranges, the
+  deprecated IPv4-compatible IPv6 form (`::a.b.c.d`), and local-use NAT64
+  (`64:ff9b:1::/48`), whose embedded IPv4 destination cannot be read reliably.
+
+IPv4-mapped IPv6 addresses are classified as their IPv4 form, and zones are
+ignored, so `::ffff:127.0.0.1` and `fe80::1%eth0` cannot slip through.
+
+A request is either untrusted (Public only) or trusted with the local network
+(Public and Private). Untrusted requests also may not reach the server's own
+interface addresses, because a service bound to a public interface can be
+hidden from the internet by a cloud firewall but still answer the host itself.
+
+## Enforcement
+
+The check runs in the HTTP client's dialer, on the address actually being
+connected to. That covers redirect hops, hostnames that resolve to private
+addresses, and DNS answers that change between a check and the connection.
+The guarded transport ignores proxy environment variables: behind a proxy the
+dialer would only see the proxy's address.
+
+`netguard.Transport` keeps two connection pools and picks one per request from
+the request context (`netguard.WithPrivateAccess`). The pools never share
+connections, so an idle keep-alive connection a trusted request opened to a
+LAN server cannot be reused by an untrusted request to the same address.
+
+`netguard.CheckURL` resolves an address up front so a caller can refuse it
+before queueing work or storing credentials. It is advisory: an address that
+does not parse or does not resolve within two seconds passes, and the dialer
+decides when the request is made.
+
+## Media server addresses
+
+History import and webhook sync share one policy,
+`historyimport.LocalNetworkAccess`:
+
+- A server an admin configured as an import source is trusted.
+- Any other address is the user's input. That includes a typed URL and the
+  server addresses Emby Connect or plex.tv list for the user's account, since
+  the user's own server reports those. It is trusted only when the account is
+  an enabled admin, or when an admin turned on
+  `media_servers.allow_private_destinations` (Sign-in & Security > Security >
+  Local network).
+- The setting is off by default, so a server with only an admin account works
+  as before. Turning it on lets every account reach the server's local
+  network; the admin page says so.
+
+The policy is read again when a queued run starts and on every webhook sync
+call, so turning the setting off or demoting an account also stops work that
+was already accepted. A refused address fails with a message that tells the
+user what to change (`historyimport.PrivateAddressMessage`), never as an
+unreachable server.
+
+A Plex run carries every address plex.tv advertised for the server and races
+them. Admission checks each one and drops those the account may not reach,
+refusing the run only when none remain. A session-backed run may name only
+addresses the stored session advertised; the enqueue transaction recomputes
+that list rather than trusting the queued credential. The Plex client removes
+`X-Plex-Token` from any redirect that leaves the first request's host or
+downgrades from HTTPS to HTTP, which `net/http` does not do for custom headers.
+
+Run monitors, run responses, and realtime history-import events carry only
+the fixed summaries from `historyimport.PublicRun`; stored diagnostics can hold
+an upstream response body and stay on the server.
+
+## Notification webhooks
+
+Webhook destinations use the same classes with a stricter rule: Public only,
+HTTPS only, checked at registration and at every connection. The admin-only
+`notifications.webhooks.allow_private_destinations` development switch also
+permits Private addresses; Blocked addresses stay refused at registration and
+on every connection, including redirects. Registration requires resolution to
+allowed addresses in both modes, with a two-second lookup deadline. See
+[Notifications](notifications.md#trust-model-and-ssrf-guard).
+
+## Artwork downloads
+
+Artwork Silo downloads on its own (metadata refresh, image-cache jobs, person
+images) comes from Public addresses only (`imagecache`). Provider artwork URLs
+are untrusted, so these downloads use the netguard transport too, checked on
+every dial and redirect; the cache keeps no address list of its own. An image
+an admin applies through `POST /api/v2/admin/items/{id}/images/apply` is
+trusted with the local network, like the import sources an admin configures. That covers a URL the admin typed and one picked from the
+provider list, since the server cannot tell them apart. The handler marks the
+request with `netguard.WithPrivateAccess`, and the download uses the netguard
+transport, which still refuses Blocked addresses on every dial and redirect.
+Only acting admins reach that route, so this does not widen what any other
+account can make the server request.
+
+## Subtitle downloads
+
+An OpenSubtitles download answers with a link to the subtitle file, and the
+provider chooses that address. The file is fetched from Public addresses only,
+through the netguard transport, checked on every dial and redirect; a refused
+link fails the download and stores nothing. The provider's own API calls go to
+its fixed host and are not guarded. Because the guarded transport ignores proxy
+environment variables, a server whose only route to the internet is a proxy can
+search OpenSubtitles but not download from it. SubDL fetches files only from its
+download host and refuses redirects to another host.
+
+## Serving catalog artwork
+
+Catalog artwork is not always in Silo's own storage. A provider URL stays on
+the item until its image-cache job succeeds, and stays for good when caching
+fails, so an address the cache refused can still be served. Three places fetch
+catalog artwork themselves instead of handing the URL to the client: the
+jellycompat image proxy (Infuse, and requests with a proxy tag), offline
+download artwork, and collection collages. Each uses a netguard transport, and
+`artworkurl.FetchContext` decides the trust per URL:
+
+- A direct URL to the artwork store is trusted with the local network, where
+  S3-compatible storage often runs. It must match the scheme, host, and path
+  prefix (bucket and key prefix, or the read endpoint's path) of the URLs the
+  store's `DirectURL` issues, with no dot segments in its path.
+- Any other URL is Public only. A refused proxy request answers 502 and a
+  refused download asset reports the asset not found, so clients don't retry
+  it; neither returns anything from the refused address.
+
+Local artwork storage serves signed `/api/` routes on this server, which the
+proxy redirects to and downloads read from the store, so neither goes over
+HTTP. A provider URL under the artwork store's own prefix is trusted like a
+store URL. Trust carries across redirects, as for every netguard request, so
+the store is relied on not to redirect into the local network.
+
+## Collection artwork
+
+Collection artwork downloads use the netguard transport with no fallback
+client (`newCollectionImageClient` in `internal/api/handlers`):
+
+- **Personal collection posters.** Any profile, including a child's, can set
+  one from a URL: `poster_source_url` on `createCollection`, and `source_url`
+  on `uploadCollectionPoster`. These are Public only. Every refused address fails with the same error
+  (`errCollectionImageSourceNotAllowed`), whether something listens there or
+  not, so the answer cannot be used to map the server's network.
+- **Library collection artwork.** The poster and backdrop source URLs on the
+  admin collection routes (create, update, list imports, and the v2 artwork
+  operations) are trusted with the local network, like an image an admin
+  applies to an item. Only acting admins reach those routes.
+- **Collages.** A collage fetches its titles' posters as the server resolved
+  them. Those are artwork store URLs or uncached provider URLs, trusted as
+  described in [Serving catalog artwork](#serving-catalog-artwork).
+
+Blocked addresses stay refused in all three cases, on every dial and redirect.
+
+## Catalog seed imports
+
+An admin can import a catalog seed from a remote `.json.gz` URL, either
+directly or as a queued import job, which checks the URL by downloading it and
+then downloads it again when the job runs. Both downloads go through
+`catalogseed.DownloadRemoteBundle`: a netguard transport, with the request
+trusted with the local network (`netguard.WithPrivateAccess`), since only
+admins reach these routes and a seed is often published by another server on
+the same LAN. Blocked addresses stay refused on every dial and redirect; the
+API answers a refused address with the same 400 as any source it cannot load,
+and a failed import job records the refusal in its error. The download is
+capped at `catalogseed.MaxRemoteBundleBytes` (2 GiB compressed) and keeps its
+ten-minute timeout. A body is refused as soon as it passes the limit, or up
+front when its declared length does, with a message that names the limit, so
+a body without end cannot exhaust the server's memory.
+
+## Plugin repositories
+
+Repository catalog indexes, checksum files and plugin packages are all fetched
+by `fetchPackageResource` in `internal/plugins`, through the client from
+`newPackageFetchClient`. An admin adds the repository, but the catalog JSON is
+published by a third party and chooses the package and checksum addresses.
+The client uses a netguard transport, keeping its per-phase timeouts (dial,
+TLS handshake, response headers, and the body read-idle timeout) and no
+whole-request deadline. Requests are trusted with the local network so
+LAN-hosted repositories keep working. A blocked address, reached directly or by
+redirect, fails as a permanent `PackageError`, not a transient one, because a
+retry cannot change it. A release's Sigstore bundle (`bundle_url`) comes the
+same way, capped at 256 KiB.
+
+The Sigstore TUF metadata that release signatures are checked against
+([plugin trust](plugin-trust.md#release-signatures)) is fetched through the
+same netguard transport, but without the local-network trust: the mirror is
+Sigstore's public CDN, so those requests reach public addresses only. Each
+TUF download has a 30-second limit, because go-tuf's fetcher takes no context.
+
+## Limits
+
+The guard cannot tell a friendly public host from a hostile one: any account
+can still make the server request public addresses and learn whether they
+answer, as it could from its own machine. In a container with bridge
+networking the server cannot see the host's public address, so a request to
+it is not recognized as the server's own. Run the container behind a firewall
+that also applies to traffic from the container if that matters.
+
+Because guarded transports ignore proxy environment variables, a server whose
+only route to the internet is an HTTP proxy cannot download remote catalog
+seeds, plugin repository catalogs, plugin packages, or the Sigstore TUF
+metadata, so it cannot verify plugin release signatures either.
+
+A resolver that answers public names with addresses netguard classes as
+Private makes those hosts unreachable for untrusted requests, provider artwork
+and OpenSubtitles file downloads included. Two setups do this: proxy routers in
+fake-IP DNS mode, which answer from `198.18.0.0/15`, and DNS64 on an IPv6-only
+network, which answers IPv4-only hosts with `64:ff9b::/96` addresses.

@@ -1,0 +1,522 @@
+import { Lock, RotateCcw } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { LanguageSelect } from "@/components/settings/LanguageSelect";
+import { SettingSlider } from "@/components/settings/SettingSlider";
+import { SettingsGroup } from "@/components/settings/SettingsGroup";
+import { useAppLanguage, useT, type Translate } from "@/i18n";
+import { groupDeviceSettings } from "@/lib/deviceSettingGroups";
+import type { EffectiveSetting } from "@/hooks/queries/settingValues";
+import { SETTING_DEFINITIONS, SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
+import { bitrateSelectChoices } from "@/lib/bitrateOptions";
+import { namedLanguageOptionsFor } from "@/lib/languageOptions";
+import { controlKindFor, formatSettingValue, optionsFor } from "@/lib/settingsDisplay";
+import { settingDescription, settingLabel, settingUnsetLabel } from "@/lib/settingsText";
+import { cn } from "@/lib/utils";
+import { normalizeQualityPreferenceV3 } from "@/player/protocol-v3";
+
+const EMPTY_SELECT_VALUE = "__empty__";
+
+/**
+ * Whose settings these are: the viewer's own (`self`), or the named profile's
+ * when the household parent is acting for someone else.
+ */
+export interface DeviceSettingsOwner {
+  self: boolean;
+  name: string;
+}
+
+/** The select and placeholder values for the "your" / "Sam's" messages. */
+function ownerValues(owner: DeviceSettingsOwner) {
+  return { owner: owner.self ? "self" : "other", name: owner.name };
+}
+
+export interface DeviceSettingGroupsProps {
+  /** Effective values resolved for the device being edited. */
+  settings: Partial<Record<SettingKey, EffectiveSetting>>;
+  /** Definitions supported by the connected server contract. */
+  keys?: readonly SettingKey[];
+  /** Whose settings these are, for the reset label and the source note. */
+  owner: DeviceSettingsOwner;
+  /**
+   * The target device's self-reported platform string. When given, settings
+   * the manifest marks as not applying to that platform are hidden — unless
+   * the device already stores a value, which must stay clearable.
+   */
+  devicePlatform?: string;
+  /**
+   * Values the device stores for keys whose profile value outranks the
+   * device's own (ui.title_art's "apply to all devices"). The effective answer
+   * names only the profile row then, so a retained device row needs this to
+   * stay visible and resettable.
+   */
+  storedOnDevice?: Partial<Record<SettingKey, unknown>>;
+  disabled?: boolean;
+  onChange: (key: SettingKey, value: unknown) => void;
+  onReset: (key: SettingKey) => void;
+  /** Opens the subtitle appearance panel, which is not an inline control. */
+  onOpenPanel?: (key: SettingKey) => void;
+}
+
+export function DeviceSettingGroups({
+  settings,
+  keys,
+  owner,
+  devicePlatform,
+  storedOnDevice,
+  disabled = false,
+  onChange,
+  onReset,
+  onOpenPanel,
+}: DeviceSettingGroupsProps) {
+  // Group titles come from groupDeviceSettings; re-render when the language changes.
+  useAppLanguage();
+  const storedHere = new Set([
+    ...(Object.keys(settings) as SettingKey[]).filter(
+      (key) => settings[key]?.scope === "profile_device",
+    ),
+    ...(Object.keys(storedOnDevice ?? {}) as SettingKey[]),
+  ]);
+  return (
+    <div className="space-y-4">
+      {groupDeviceSettings(keys, {
+        devicePlatform,
+        keysWithStoredValues: storedHere,
+      }).map((group) => (
+        <SettingsGroup key={group.id} title={group.title} description={group.description}>
+          {group.keys.map((key) => (
+            <DeviceSettingRow
+              key={key}
+              settingKey={key}
+              effective={settings[key]}
+              storedOnDevice={storedOnDevice}
+              owner={owner}
+              disabled={disabled}
+              onChange={onChange}
+              onReset={onReset}
+              onOpenPanel={onOpenPanel}
+            />
+          ))}
+        </SettingsGroup>
+      ))}
+    </div>
+  );
+}
+
+interface DeviceSettingRowProps {
+  settingKey: SettingKey;
+  effective: EffectiveSetting | undefined;
+  storedOnDevice: Partial<Record<SettingKey, unknown>> | undefined;
+  owner: DeviceSettingsOwner;
+  disabled: boolean;
+  onChange: (key: SettingKey, value: unknown) => void;
+  onReset: (key: SettingKey) => void;
+  onOpenPanel?: (key: SettingKey) => void;
+}
+
+function DeviceSettingRow({
+  settingKey,
+  effective,
+  storedOnDevice,
+  owner,
+  disabled,
+  onChange,
+  onReset,
+  onOpenPanel,
+}: DeviceSettingRowProps) {
+  const t = useT();
+  const definition = SETTING_DEFINITIONS[settingKey];
+  if (!definition) return null;
+
+  // A key that resolves its profile value first (ui.title_art's "apply to all
+  // devices") ignores device values while one is set, so a device edit here
+  // would save without effect.
+  const profileWide =
+    effective?.source === "profile" && definition.resolutionOrder[0] === "profile";
+  // The device row the profile value passes over is still stored, still
+  // counted as a change, and still this device's choice once the profile
+  // value goes.
+  const retainedHere = profileWide && storedOnDevice !== undefined && settingKey in storedOnDevice;
+  // "Changed here" means a row exists at this exact device, which is also what
+  // makes the reset meaningful — reset clears that row rather than copying the
+  // profile value into it.
+  const changedHere = effective?.scope === "profile_device" || retainedHere;
+  const locked = effective?.constraint_kind === "locked";
+  const constrained = Boolean(effective?.constrained);
+  // Where an unchanged row's value comes from. Skipped when the profile-wide
+  // note already says so, and under a household limit, where the value shown
+  // is the limit's (the badge names it) while `source` still names the choice
+  // the limit capped.
+  const inheritedFrom =
+    changedHere || profileWide || constrained
+      ? null
+      : sourceLabel(t, effective, owner, definition.adminDefault === true);
+  // A stored null is a value ("No limit"), not a missing one, so only a
+  // missing answer falls back to the default.
+  const value = displayedValue(settingKey, effective ? effective.value : definition.defaultValue);
+  const inlineControl = controlKindFor(definition) === "switch";
+
+  return (
+    // The row sizes itself by its own width, not the viewport's: from xl up the
+    // settings sit in a pane beside the device list, so a 1440px window leaves
+    // a row about 360px wide. Measured against the viewport, the label column
+    // shrank to a few words per line beside a 220px select.
+    <div className="border-border/50 @container border-t pt-4 first:border-t-0 first:pt-0">
+      <div
+        className={cn(
+          "grid gap-3 @lg:grid-cols-[minmax(0,1fr)_auto] @lg:items-center",
+          // A switch fits beside its label even at 360px, and keeping it there
+          // saves a whole row on each of the ~18 toggles this screen renders.
+          // Wider controls drop below until the row has room for both.
+          inlineControl && "grid-cols-[minmax(0,1fr)_auto] items-center",
+        )}
+      >
+        <div className="min-w-0 space-y-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium">{settingLabel(definition)}</span>
+            {changedHere ? (
+              <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-px text-xs font-semibold tracking-[0.04em] text-amber-300 uppercase">
+                {t("web.settings.deviceSettingGroups.changedHere")}
+              </span>
+            ) : null}
+            {inheritedFrom ? (
+              <span className="text-muted-foreground text-xs">{inheritedFrom}</span>
+            ) : null}
+            {constrained ? (
+              <span className="border-info/30 bg-info/10 text-info inline-flex items-center gap-1 rounded-full border px-1.5 py-px text-xs font-semibold tracking-[0.04em] uppercase">
+                <Lock className="h-2.5 w-2.5" />
+                {t("web.settings.deviceSettingGroups.householdLimit")}
+              </span>
+            ) : null}
+          </div>
+          <p className="text-muted-foreground text-[13px] leading-relaxed">
+            {settingDescription(definition)}
+          </p>
+          {constrained ? (
+            <p className="text-[13px] leading-relaxed text-amber-300/90">
+              {constraintExplanation(t, effective)}
+            </p>
+          ) : null}
+          {profileWide ? (
+            <p className="text-muted-foreground text-[13px] leading-relaxed">
+              {retainedHere
+                ? t("web.settings.deviceSettingGroups.profileWideRetained", {
+                    value: retainedValueLabel(settingKey, storedOnDevice?.[settingKey]),
+                  })
+                : t("web.settings.deviceSettingGroups.profileWide")}
+            </p>
+          ) : null}
+          {/* Under the description rather than beside the control, so it never
+              takes width from either. */}
+          {changedHere && !locked ? (
+            <button
+              type="button"
+              onClick={() => onReset(settingKey)}
+              disabled={disabled}
+              className="text-muted-foreground hover:text-foreground inline-flex min-h-11 items-center gap-1 text-[13px] transition-colors disabled:opacity-50 sm:min-h-0 sm:pt-0.5 sm:text-xs"
+            >
+              <RotateCcw className="h-3.5 w-3.5 sm:h-3 sm:w-3" />
+              {t("web.settings.deviceSettingGroups.useOwnerSetting", ownerValues(owner))}
+            </button>
+          ) : null}
+        </div>
+
+        <div className={cn("flex items-center", inlineControl ? "justify-end" : "@lg:justify-end")}>
+          <DeviceSettingControl
+            settingKey={settingKey}
+            effective={effective}
+            value={value}
+            disabled={disabled || locked || profileWide}
+            onChange={onChange}
+            onOpenPanel={onOpenPanel}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The value the control shows. A stored "original" quality is a deprecated
+ * alias of Auto that the select no longer offers, so it shows as Auto.
+ */
+function displayedValue(settingKey: SettingKey, value: unknown): unknown {
+  return settingKey === SETTING_KEYS.PLAYBACK_PREFERRED_QUALITY && typeof value === "string"
+    ? normalizeQualityPreferenceV3(value)
+    : value;
+}
+
+/**
+ * Names where a value not stored on this device comes from.
+ *
+ * Asked for one device without a library or series, the server can only
+ * answer from the profile or the default for the keys this screen shows.
+ * Anything else it might name is left unlabelled rather than guessed at.
+ */
+function sourceLabel(
+  t: Translate,
+  effective: EffectiveSetting | undefined,
+  owner: DeviceSettingsOwner,
+  adminDefault: boolean,
+): string | null {
+  switch (effective?.source) {
+    case "profile":
+      return t("web.settings.deviceSettingGroups.fromOwnerProfile", ownerValues(owner));
+    case "default":
+      // An administrator may have replaced this one's default for the server.
+      return adminDefault
+        ? t("web.settings.deviceSettingGroups.serverDefault")
+        : t("web.settings.deviceSettingGroups.appDefault");
+    default:
+      return null;
+  }
+}
+
+function retainedValueLabel(settingKey: SettingKey, value: unknown): string {
+  return formatSettingValue(
+    settingKey,
+    value === null || value === undefined ? null : String(value),
+  );
+}
+
+function constraintExplanation(t: Translate, effective: EffectiveSetting | undefined): string {
+  if (!effective) return "";
+  const permitted = effective.value;
+  if (effective.constraint_kind === "locked") {
+    return t("web.settings.deviceSettingGroups.constraintLocked");
+  }
+  // The stored preference is still theirs; it is just capped today. Saying so
+  // beats silently showing a value they did not choose.
+  if (effective.stored_value !== undefined && effective.stored_value !== permitted) {
+    return t("web.settings.deviceSettingGroups.constraintCapped", {
+      permitted: String(permitted),
+      stored: String(effective.stored_value),
+    });
+  }
+  return t("web.settings.deviceSettingGroups.constraintLimited");
+}
+
+interface DeviceSettingControlProps {
+  settingKey: SettingKey;
+  effective: EffectiveSetting | undefined;
+  value: unknown;
+  disabled: boolean;
+  onChange: (key: SettingKey, value: unknown) => void;
+  onOpenPanel?: (key: SettingKey) => void;
+}
+
+/**
+ * The control for one device setting.
+ *
+ * Values are typed JSON here, not strings: a slider round-tripping through
+ * text is a hazard on a screen a viewer uses, and the contract already knows
+ * every value's type. When policy narrows the choices, the select renders the
+ * permitted list rather than the manifest's.
+ */
+function DeviceSettingControl({
+  settingKey,
+  effective,
+  value,
+  disabled,
+  onChange,
+  onOpenPanel,
+}: DeviceSettingControlProps) {
+  const t = useT();
+  const definition = SETTING_DEFINITIONS[settingKey];
+  const control = controlKindFor(definition);
+
+  if (control === "panel" || definition.type === "object") {
+    return (
+      <Button
+        variant="outline"
+        disabled={disabled}
+        onClick={() => onOpenPanel?.(settingKey)}
+        className="min-h-11 w-full sm:h-8 sm:min-h-0 sm:px-3 sm:text-sm @lg:w-auto"
+      >
+        {t("web.settings.deviceSettingGroups.changeAppearance")}
+      </Button>
+    );
+  }
+
+  if (control === "switch") {
+    return (
+      <span className="flex min-h-11 items-center sm:min-h-0">
+        <Switch
+          aria-label={settingLabel(definition)}
+          checked={value === true}
+          disabled={disabled}
+          onCheckedChange={(checked) => onChange(settingKey, checked)}
+        />
+      </span>
+    );
+  }
+
+  if (control === "slider" || control === "stepper") {
+    const numeric = typeof value === "number" ? value : Number(definition.defaultValue ?? 0);
+    return (
+      <SettingSlider
+        className="flex w-full items-center gap-3 @lg:w-[260px]"
+        value={numeric}
+        min={definition.minimum}
+        max={definition.maximum}
+        step={definition.step}
+        unit={definition.unit}
+        disabled={disabled}
+        aria-label={settingLabel(definition)}
+        onCommit={(next) => onChange(settingKey, next)}
+      />
+    );
+  }
+
+  const options = permittedOptions(settingKey, effective);
+  const asString = value === null || value === undefined ? "" : String(value);
+
+  // Open language values get the shared picker with "Other…" free entry —
+  // the contract floor is a short authored list, and any tag beyond it is
+  // typed rather than fetched from the catalog. A permitted_values constraint
+  // pins the list closed, so the free entry disappears with it.
+  if (definition.type === "language_tag") {
+    const permitted = (effective as { permitted_values?: unknown[] } | undefined)?.permitted_values;
+    const languageOptions = namedLanguageOptionsFor(settingKey, asString || undefined).filter(
+      (option) => !permitted?.length || permitted.some((entry) => String(entry) === option.value),
+    );
+    return (
+      <div className="w-full @lg:w-[220px]">
+        <LanguageSelect
+          aria-label={settingLabel(definition)}
+          value={asString === "" ? EMPTY_SELECT_VALUE : asString}
+          options={languageOptions}
+          disabled={disabled}
+          allowOther={!permitted?.length}
+          className="h-11 w-full text-base sm:h-9 sm:text-sm"
+          onValueChange={(next) => onChange(settingKey, next === EMPTY_SELECT_VALUE ? null : next)}
+        >
+          {definition.nullable && (
+            <SelectItem value={EMPTY_SELECT_VALUE}>{settingUnsetLabel(definition)}</SelectItem>
+          )}
+        </LanguageSelect>
+      </div>
+    );
+  }
+
+  // A numeric "select" the manifest gives no members — the bandwidth cap is
+  // declared as a range, not a list — would render as a one-entry dropdown
+  // showing nothing at all. Present the range as bandwidth choices people
+  // recognise instead, and keep the stored value visible if it is not one of
+  // them.
+  const numericChoices = numericSelectChoices(t, definition, options, asString);
+  if (numericChoices) {
+    return (
+      <Select
+        value={asString === "" ? EMPTY_SELECT_VALUE : asString}
+        disabled={disabled}
+        onValueChange={(next) =>
+          onChange(settingKey, next === EMPTY_SELECT_VALUE ? null : Number(next))
+        }
+      >
+        <SelectTrigger
+          aria-label={settingLabel(definition)}
+          className={cn("h-11 w-full text-base sm:h-9 sm:text-sm @lg:w-[220px]")}
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {numericChoices.map((choice) => (
+            <SelectItem
+              key={choice.value || EMPTY_SELECT_VALUE}
+              value={choice.value === "" ? EMPTY_SELECT_VALUE : choice.value}
+            >
+              {choice.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    );
+  }
+
+  return (
+    <Select
+      value={asString === "" ? EMPTY_SELECT_VALUE : asString}
+      disabled={disabled}
+      onValueChange={(next) =>
+        onChange(
+          settingKey,
+          next === EMPTY_SELECT_VALUE ? null : typedSelectValue(settingKey, next),
+        )
+      }
+    >
+      <SelectTrigger
+        aria-label={settingLabel(definition)}
+        className={cn("h-11 w-full text-base sm:h-9 sm:text-sm @lg:w-[220px]")}
+      >
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {options.map((option) => (
+          <SelectItem
+            key={option.value || EMPTY_SELECT_VALUE}
+            value={option.value === "" ? EMPTY_SELECT_VALUE : option.value}
+          >
+            {option.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
+/**
+ * The options this viewer may actually pick. `permitted_values` narrows the
+ * manifest's list for a viewer under a policy cap, so a child's quality picker
+ * shows what they can have rather than offering 4K and delivering 1080p.
+ */
+function permittedOptions(settingKey: SettingKey, effective: EffectiveSetting | undefined) {
+  const definition = SETTING_DEFINITIONS[settingKey];
+  const all = optionsFor(definition);
+  const permitted = (effective as { permitted_values?: unknown[] } | undefined)?.permitted_values;
+  if (!permitted?.length) return all;
+  const allowed = new Set(permitted.map((entry) => String(entry)));
+  const narrowed = all.filter((option) => option.value === "" || allowed.has(option.value));
+  return narrowed.length > 0 ? narrowed : all;
+}
+
+/**
+ * Bandwidth caps people recognise, bounded by the definition's own range.
+ *
+ * Returns null for any select the manifest actually gives members, which is
+ * every other one — this exists only for a numeric range declared with a
+ * select control. The ladder itself lives in lib/bitrateOptions so the
+ * profile Defaults screen offers the same choices.
+ */
+function numericSelectChoices(
+  t: Translate,
+  definition: (typeof SETTING_DEFINITIONS)[SettingKey],
+  options: { value: string; label: string }[],
+  currentValue: string,
+): { value: string; label: string }[] | null {
+  const isNumeric = definition.type === "integer" || definition.type === "number";
+  const hasMembers = options.some((option) => option.value !== "");
+  if (!isNumeric || hasMembers) return null;
+
+  const unsetLabel =
+    definition.unit === "kbps" ? t("web.settings.value.noLimit") : t("web.settings.value.unset");
+  return bitrateSelectChoices(definition, currentValue, unsetLabel);
+}
+
+/** Selects edit strings; integers travel back as numbers. */
+function typedSelectValue(settingKey: SettingKey, raw: string): unknown {
+  const definition = SETTING_DEFINITIONS[settingKey];
+  if (definition.type === "integer" || definition.type === "number") {
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : raw;
+  }
+  return raw;
+}

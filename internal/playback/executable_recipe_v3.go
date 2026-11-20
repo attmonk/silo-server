@@ -1,0 +1,297 @@
+package playback
+
+import (
+	"slices"
+
+	"github.com/Silo-Server/silo-server/internal/tonemap"
+)
+
+// ExecutableRecipeV3 is the frozen operational half of a protocol-v3 plan.
+// PlanV3 describes the client-visible route identity; these fields are the
+// additional inputs needed to open another transport for that same route.
+// Keeping them with the durable attempt prevents seek reanchoring from
+// reverse-engineering execution details from presentation fields or mutable
+// planner inputs.
+type ExecutableRecipeV3 struct {
+	Version        int        `json:"version"`
+	PlanID         string     `json:"plan_id"`
+	PlayMethod     PlayMethod `json:"play_method"`
+	TranscodeAudio bool       `json:"transcode_audio"`
+	// RemuxResumeLeadingPictureDrop is best effort, so a binary that predates
+	// it may ignore it without a recipe version change.
+	RemuxResumeLeadingPictureDrop bool `json:"remux_resume_leading_picture_drop,omitempty"`
+	// AdaptationReasons affects no bytes. It rides on the recipe so a seek
+	// reanchor, which rebuilds the session from it, keeps reporting why the
+	// route adapts; a binary that predates it ignores it.
+	AdaptationReasons           []string               `json:"adaptation_reasons,omitempty"`
+	TargetVideoCodec            string                 `json:"target_video_codec,omitempty"`
+	TargetAudioCodec            string                 `json:"target_audio_codec,omitempty"`
+	TargetAudioChannels         int                    `json:"target_audio_channels,omitempty"`
+	TargetAudioBitrateKbps      int                    `json:"target_audio_bitrate_kbps,omitempty"`
+	TargetResolution            string                 `json:"target_resolution,omitempty"`
+	TargetBitrateKbps           int                    `json:"target_bitrate_kbps,omitempty"`
+	SourceVideoCodec            string                 `json:"source_video_codec,omitempty"`
+	SourceVideoProfile          string                 `json:"source_video_profile,omitempty"`
+	SourceVideoBitDepth         int                    `json:"source_video_bit_depth,omitempty"`
+	SourceAudioChannels         int                    `json:"source_audio_channels,omitempty"`
+	SoftwareVideoDecode         bool                   `json:"software_video_decode,omitempty"`
+	SourceDurationSeconds       float64                `json:"source_duration_seconds,omitempty"`
+	ToneMapPolicy               tonemap.Policy         `json:"tone_map_policy,omitempty"`
+	ToneMapMode                 tonemap.Mode           `json:"tone_map_mode,omitempty"`
+	ToneMapSourceKind           tonemap.SourceKind     `json:"tone_map_source_kind,omitempty"`
+	ToneMapRecipeVersion        string                 `json:"tone_map_recipe_version,omitempty"`
+	ToneMapPreflightRequired    bool                   `json:"tone_map_preflight_required,omitempty"`
+	ToneMapSourceRevision       tonemap.SourceRevision `json:"tone_map_source_revision,omitzero"`
+	ToneMapDVConfigPresent      bool                   `json:"tone_map_dv_config_present,omitempty"`
+	ToneMapDVBLCompatIDPresent  bool                   `json:"tone_map_dv_bl_compat_id_present,omitempty"`
+	ToneMapDVBLPresent          bool                   `json:"tone_map_dv_bl_present,omitempty"`
+	ToneMapDVRPUPresent         bool                   `json:"tone_map_dv_rpu_present,omitempty"`
+	SubtitleTrackIndex          int                    `json:"subtitle_track_index"`
+	SubtitleTransportTrackIndex int                    `json:"subtitle_transport_track_index"`
+	SubtitleBurnIn              bool                   `json:"subtitle_burn_in"`
+	SubtitleCodec               string                 `json:"subtitle_codec,omitempty"`
+	// SubtitleSource pins which sidecar inventory segment SubtitleTrackIndex
+	// pointed into when the plan was accepted, and the identity fields below
+	// pin the exact entry. The combined index space (externals, then embedded,
+	// then downloaded) shifts when any segment grows or shrinks; a seek
+	// reanchor must detect that drift and fail rather than silently resolve
+	// the frozen index to a different artifact.
+	SubtitleSource       string `json:"subtitle_source,omitempty"`
+	ExternalSubtitlePath string `json:"external_subtitle_path,omitempty"`
+	EmbeddedStreamIndex  int    `json:"embedded_stream_index,omitempty"`
+	DownloadedSubtitleID int    `json:"downloaded_subtitle_id,omitempty"`
+	// SubtitleRendition emits the selected subtitle as the HLS stream's
+	// subtitle rendition: a transcode's, or an HLS copy remux's. It needs
+	// version 4 so a binary that predates it rejects the recipe instead of
+	// reopening the transport without one. A copy remux's needs no later
+	// version: binaries from before copy remux renditions read version 4 and
+	// reject a rendition outside a transcode.
+	SubtitleRendition bool `json:"subtitle_rendition,omitempty"`
+	// SubtitleRenditionTracks lists every embedded text track the stream
+	// publishes as an on-demand rendition, with SubtitleRendition. It needs
+	// version 6 so a binary that predates it rejects the recipe instead of
+	// reopening the transport with the selected track alone.
+	SubtitleRenditionTracks []SubtitleRenditionTrack `json:"subtitle_rendition_tracks,omitempty"`
+	// SubtitleRenditionSource is the source version the tracks were chosen
+	// from, which their segments are read from (version 6).
+	SubtitleRenditionSource SubtitleRenditionSource `json:"subtitle_rendition_source,omitzero"`
+	// CopyVideoMPEGTS mirrors the plan's MPEG-TS segment container. It needs
+	// version 5 so a binary that predates it rejects the recipe instead of
+	// reopening the transport as fMP4.
+	CopyVideoMPEGTS bool `json:"copy_video_mpegts,omitempty"`
+}
+
+const (
+	executableRecipeVersionLegacyV3            = 1
+	executableRecipeVersionV3                  = 2
+	executableRecipeVersionSourceAudioV3       = 3
+	executableRecipeVersionSubtitleRenditionV3 = 4
+	executableRecipeVersionCopyMPEGTSV3        = 5
+	executableRecipeVersionRenditionTracksV3   = 6
+)
+
+// FreezeExecutableRecipeV3 captures the byte-affecting facts from a planner result.
+func FreezeExecutableRecipeV3(result PlannerResultV3) ExecutableRecipeV3 {
+	planID := ""
+	copyVideoMPEGTS := false
+	if result.Plan != nil {
+		planID = result.Plan.PlanID
+		copyVideoMPEGTS = PlanCopiesVideoAsMPEGTSV3(*result.Plan)
+	}
+	sourceMetadata := SourceExecutionMetadataV3{}
+	if result.FrozenSourceMetadata != nil {
+		sourceMetadata = *result.FrozenSourceMetadata
+	}
+	recipe := ExecutableRecipeV3{
+		Version:                       executableRecipeVersionLegacyV3,
+		PlanID:                        planID,
+		PlayMethod:                    result.PlayMethod,
+		TranscodeAudio:                result.TranscodeAudio,
+		RemuxResumeLeadingPictureDrop: result.RemuxResumeLeadingPictureDrop,
+		AdaptationReasons:             result.AdaptationReasons,
+		TargetVideoCodec:              result.TargetVideoCodec,
+		TargetAudioCodec:              result.TargetAudioCodec,
+		TargetAudioChannels:           result.TargetAudioChannels,
+		TargetAudioBitrateKbps:        result.TargetAudioBitrateKbps,
+		TargetResolution:              result.TargetResolution,
+		TargetBitrateKbps:             result.TargetBitrateKbps,
+		SourceVideoCodec:              sourceMetadata.VideoCodec,
+		SourceVideoProfile:            sourceMetadata.VideoProfile,
+		SourceVideoBitDepth:           sourceMetadata.VideoBitDepth,
+		SourceAudioChannels:           result.SourceAudioChannels,
+		SoftwareVideoDecode:           sourceMetadata.SoftwareVideoDecode,
+		SourceDurationSeconds:         sourceMetadata.DurationSeconds,
+		ToneMapPolicy:                 result.ToneMapPolicy,
+		ToneMapMode:                   result.ToneMapMode,
+		ToneMapSourceKind:             result.ToneMapSourceKind,
+		ToneMapRecipeVersion:          result.ToneMapRecipeVersion,
+		ToneMapPreflightRequired:      result.ToneMapPreflightRequired,
+		ToneMapSourceRevision:         result.ToneMapSourceRevision,
+		ToneMapDVConfigPresent:        sourceMetadata.ToneMapDVConfigPresent,
+		ToneMapDVBLCompatIDPresent:    sourceMetadata.ToneMapDVBLCompatIDPresent,
+		ToneMapDVBLPresent:            sourceMetadata.ToneMapDVBLPresent,
+		ToneMapDVRPUPresent:           sourceMetadata.ToneMapDVRPUPresent,
+		SubtitleTrackIndex:            result.SubtitleTrackIndex,
+		SubtitleTransportTrackIndex:   result.SubtitleTransportTrackIndex,
+		SubtitleBurnIn:                result.SubtitleBurnIn,
+		SubtitleCodec:                 result.SubtitleCodec,
+		DownloadedSubtitleID:          result.DownloadedSubtitleID,
+		SubtitleRendition:             result.SubtitleRendition,
+		SubtitleRenditionTracks:       slices.Clone(result.SubtitleRenditionTracks),
+		SubtitleRenditionSource:       result.SubtitleRenditionSource,
+		CopyVideoMPEGTS:               copyVideoMPEGTS,
+	}
+	if recipe.hasVersion2Fields() {
+		recipe.Version = executableRecipeVersionV3
+	}
+	if recipe.hasVersion3Fields() {
+		recipe.Version = executableRecipeVersionSourceAudioV3
+	}
+	if recipe.hasVersion4Fields() {
+		recipe.Version = executableRecipeVersionSubtitleRenditionV3
+	}
+	if recipe.hasVersion5Fields() {
+		recipe.Version = executableRecipeVersionCopyMPEGTSV3
+	}
+	if recipe.hasVersion6Fields() {
+		recipe.Version = executableRecipeVersionRenditionTracksV3
+	}
+	return recipe
+}
+
+func (r ExecutableRecipeV3) hasVersion2Fields() bool {
+	return r.ToneMapPolicy != "" ||
+		r.ToneMapMode != "" ||
+		r.ToneMapSourceKind != "" ||
+		r.ToneMapRecipeVersion != "" ||
+		r.ToneMapPreflightRequired ||
+		!r.ToneMapSourceRevision.IsZero() ||
+		r.ToneMapDVConfigPresent ||
+		r.ToneMapDVBLCompatIDPresent ||
+		r.ToneMapDVBLPresent ||
+		r.ToneMapDVRPUPresent
+}
+
+func (r ExecutableRecipeV3) hasVersion3Fields() bool {
+	return r.SourceAudioChannels != 0
+}
+
+func (r ExecutableRecipeV3) hasVersion4Fields() bool {
+	return r.SubtitleRendition
+}
+
+func (r ExecutableRecipeV3) hasVersion5Fields() bool {
+	return r.CopyVideoMPEGTS
+}
+
+func (r ExecutableRecipeV3) hasVersion6Fields() bool {
+	return len(r.SubtitleRenditionTracks) > 0 || !r.SubtitleRenditionSource.IsZero()
+}
+
+// Valid reports whether an executable recipe is complete and internally consistent.
+func (r ExecutableRecipeV3) Valid() bool {
+	if r.Version < executableRecipeVersionLegacyV3 || r.Version > executableRecipeVersionRenditionTracksV3 || r.PlanID == "" || r.SourceAudioChannels < 0 {
+		return false
+	}
+	if (r.Version == executableRecipeVersionLegacyV3 && r.hasVersion2Fields()) ||
+		(r.Version < executableRecipeVersionSourceAudioV3 && r.hasVersion3Fields()) ||
+		(r.Version < executableRecipeVersionSubtitleRenditionV3 && r.hasVersion4Fields()) ||
+		(r.Version < executableRecipeVersionCopyMPEGTSV3 && r.hasVersion5Fields()) ||
+		(r.Version < executableRecipeVersionRenditionTracksV3 && r.hasVersion6Fields()) {
+		return false
+	}
+	if r.CopyVideoMPEGTS && (r.PlayMethod != PlayRemux || r.TargetVideoCodec != codecCopyV3) {
+		return false
+	}
+	hlsRemux := r.PlayMethod == PlayRemux && r.TargetVideoCodec == codecCopyV3
+	onDemand := len(r.SubtitleRenditionTracks) > 0
+	if r.SubtitleRendition && ((r.PlayMethod != PlayTranscode && !hlsRemux) || r.SubtitleBurnIn || r.SubtitleTransportTrackIndex < 0 && !onDemand) ||
+		onDemand && (!r.SubtitleRendition || !validSubtitleRenditionTracks(r.SubtitleRenditionTracks)) {
+		return false
+	}
+	hasToneMapField := r.ToneMapPolicy != "" || r.ToneMapMode != "" || r.ToneMapSourceKind != "" || r.ToneMapRecipeVersion != "" || r.ToneMapPreflightRequired || !r.ToneMapSourceRevision.IsZero()
+	validToneMapSource := tonemap.ValidSourceKind(r.ToneMapSourceKind)
+	if hasToneMapField && (r.PlayMethod != PlayTranscode || !r.ToneMapPolicy.Allows(r.ToneMapMode) || !validToneMapSource || r.ToneMapRecipeVersion != TransformationHDRToSDRToneMapRecipeVersionV3 || r.ToneMapSourceRevision.IsZero()) {
+		return false
+	}
+	switch r.PlayMethod {
+	case PlayDirect, PlayRemux, PlayTranscode:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r ExecutableRecipeV3) ValidFor(plan PlanV3) bool {
+	return r.Valid() && r.PlanID == plan.PlanID && r.CopyVideoMPEGTS == PlanCopiesVideoAsMPEGTSV3(plan)
+}
+
+// PlanCopiesVideoAsMPEGTSV3 reports whether an HLS copy-remux plan is packaged
+// as MPEG-TS (TranscodeOpts.CopyVideoMPEGTS) rather than fMP4.
+func PlanCopiesVideoAsMPEGTSV3(plan PlanV3) bool {
+	return plan.Delivery == DeliveryRemuxHLSV3 && plan.EffectiveRecipe.SegmentContainer == SegmentContainerMPEGTSV3
+}
+
+// PlannerResult restores a planner result from the frozen executable recipe.
+func (r ExecutableRecipeV3) PlannerResult(plan *PlanV3) PlannerResultV3 {
+	return PlannerResultV3{
+		Plan:                          plan,
+		PlayMethod:                    r.PlayMethod,
+		TranscodeAudio:                r.TranscodeAudio,
+		RemuxResumeLeadingPictureDrop: r.RemuxResumeLeadingPictureDrop,
+		AdaptationReasons:             NormalizeAdaptationReasons(r.AdaptationReasons),
+		TargetVideoCodec:              r.TargetVideoCodec,
+		TargetAudioCodec:              r.TargetAudioCodec,
+		SourceAudioChannels:           r.SourceAudioChannels,
+		TargetAudioChannels:           r.TargetAudioChannels,
+		TargetAudioBitrateKbps:        r.TargetAudioBitrateKbps,
+		TargetResolution:              r.TargetResolution,
+		TargetBitrateKbps:             r.TargetBitrateKbps,
+		ToneMapPolicy:                 r.ToneMapPolicy,
+		ToneMapMode:                   r.ToneMapMode,
+		ToneMapSourceKind:             r.ToneMapSourceKind,
+		ToneMapRecipeVersion:          r.ToneMapRecipeVersion,
+		ToneMapPreflightRequired:      r.ToneMapPreflightRequired,
+		ToneMapSourceRevision:         r.ToneMapSourceRevision,
+		FrozenSourceMetadata: &SourceExecutionMetadataV3{
+			VideoCodec:                 r.SourceVideoCodec,
+			VideoProfile:               r.SourceVideoProfile,
+			VideoBitDepth:              r.SourceVideoBitDepth,
+			SoftwareVideoDecode:        r.SoftwareVideoDecode,
+			DurationSeconds:            r.SourceDurationSeconds,
+			ToneMapSourceKind:          r.ToneMapSourceKind,
+			ToneMapPreflightRequired:   r.ToneMapPreflightRequired,
+			ToneMapSourceRevision:      r.ToneMapSourceRevision,
+			ToneMapDVConfigPresent:     r.ToneMapDVConfigPresent,
+			ToneMapDVBLCompatIDPresent: r.ToneMapDVBLCompatIDPresent,
+			ToneMapDVBLPresent:         r.ToneMapDVBLPresent,
+			ToneMapDVRPUPresent:        r.ToneMapDVRPUPresent,
+		},
+		SubtitleTrackIndex:          r.SubtitleTrackIndex,
+		SubtitleTransportTrackIndex: r.SubtitleTransportTrackIndex,
+		SubtitleBurnIn:              r.SubtitleBurnIn,
+		SubtitleCodec:               r.SubtitleCodec,
+		SubtitleRendition:           r.SubtitleRendition,
+		SubtitleRenditionTracks:     slices.Clone(r.SubtitleRenditionTracks),
+		SubtitleRenditionSource:     r.SubtitleRenditionSource,
+		DownloadedSubtitleID:        r.DownloadedSubtitleID,
+	}
+}
+
+// validSubtitleRenditionTracks reports whether on-demand rendition tracks can
+// be served: each names a container track, once, and at most one is the
+// default.
+func validSubtitleRenditionTracks(tracks []SubtitleRenditionTrack) bool {
+	seen := make(map[uint64]bool, len(tracks))
+	defaults := 0
+	for _, track := range tracks {
+		if track.TrackNumber == 0 || seen[track.TrackNumber] {
+			return false
+		}
+		seen[track.TrackNumber] = true
+		if track.Default {
+			defaults++
+		}
+	}
+	return defaults <= 1
+}

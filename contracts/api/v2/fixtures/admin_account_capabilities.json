@@ -1,0 +1,23 @@
+{
+  "revision": "2abe3d7a286c970d2cb2d73918fca1583fd349ad6b8849686017077de46f2a71",
+  "state": "available",
+  "allowed": true,
+  "available": true,
+  "guarded_configuration": true,
+  "default_profile": true,
+  "exact_identity_filter": true,
+  "access_groups": true,
+  "profile_limits": true,
+  "password_reset_link": true,
+  "password_reset_email": true,
+  "ownership_transfer": true,
+  "account_devices": true,
+  "login_sessions": true,
+  "watch_summary": true,
+  "account_downloads": true,
+  "request_usage": true,
+  "policy_defaults": true,
+  "profile_avatars": true,
+  "profile_sections": true,
+  "profile_management": true
+}

@@ -1,0 +1,1703 @@
+package catalog
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/models"
+)
+
+// Retry parameters for transient serialization/deadlock failures. They are
+// package vars (not consts) only so tests can shrink them; production code
+// never mutates them.
+var (
+	deadlockMaxAttempts = 5
+	deadlockBaseBackoff = 50 * time.Millisecond
+)
+
+const (
+	// orphanDeleteBatch is small because each media_items row cascades across
+	// ~15 child tables.
+	orphanDeleteBatch = 1000
+	// folderChildDeleteBatch covers the lighter folder-scoped media_files and
+	// junction deletes.
+	folderChildDeleteBatch = 5000
+)
+
+// retryOnDeadlock runs op, retrying when Postgres reports a deadlock (40P01) or
+// serialization failure (40001), with exponential backoff. It returns
+// immediately for any other error, and honors context cancellation between
+// attempts.
+func retryOnDeadlock(ctx context.Context, op func() error) error {
+	backoff := deadlockBaseBackoff
+	for attempt := 1; ; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		var pgErr *pgconn.PgError
+		if attempt < deadlockMaxAttempts && errors.As(err, &pgErr) &&
+			(pgErr.Code == "40P01" || pgErr.Code == "40001") {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			continue
+		}
+		return err
+	}
+}
+
+// RetryOnDeadlock is retryOnDeadlock for catalog writers outside this package.
+// op must run a whole transaction, so a retry starts it again.
+func RetryOnDeadlock(ctx context.Context, op func() error) error {
+	return retryOnDeadlock(ctx, op)
+}
+
+// deleteInBatches repeatedly runs deleteBatch (each a single autocommit
+// statement) until a batch removes fewer than batchSize rows. Each batch is
+// retried on deadlock. It returns the total number of rows deleted.
+func deleteInBatches(
+	ctx context.Context,
+	batchSize int,
+	deleteBatch func(ctx context.Context) (int64, error),
+) (int64, error) {
+	var total int64
+	for {
+		var affected int64
+		if err := retryOnDeadlock(ctx, func() error {
+			n, e := deleteBatch(ctx)
+			affected = n
+			return e
+		}); err != nil {
+			return total, err
+		}
+		total += affected
+		if affected < int64(batchSize) {
+			return total, nil
+		}
+	}
+}
+
+// Sentinel errors for folder repository operations.
+var (
+	ErrFolderNotFound = errors.New("folder not found")
+	ErrDuplicatePath  = errors.New("duplicate folder path")
+)
+
+// CreateFolderInput contains the fields required to create a new media folder.
+type CreateFolderInput struct {
+	Paths                    []string
+	Type                     string
+	Name                     string
+	MetadataLanguage         string // ISO 639-1 code; defaults to "en" if empty
+	ChapterThumbnailsEnabled bool
+	IntroDetectionEnabled    bool
+	TrickplayEnabled         bool
+	BoxSetsEnabled           bool
+	// BoxSetMinMovies is the fewest library movies that make a box set;
+	// zero applies the default.
+	BoxSetMinMovies int
+	// BoxSetsInSearch nil means on.
+	BoxSetsInSearch *bool
+	// TrailerKinds is the allow-list of remote video kinds fetched during
+	// metadata refresh; nil applies the default (all provider kinds), an
+	// empty slice disables remote videos.
+	TrailerKinds []string
+	// RealtimeMonitoring is the library's real-time monitoring switch; nil
+	// means on.
+	RealtimeMonitoring *bool
+
+	// The fields below restore a library from a backup; the library editor
+	// leaves them zero.
+
+	// ID is an id reserved with ReserveFolderID; zero assigns one.
+	ID int
+	// Disabled creates the library disabled.
+	Disabled                     bool
+	AutoTranslateMetadata        bool
+	PosterPath                   string
+	CollectionUngroupedSortOrder *int
+}
+
+// FolderReorderEntry carries a folder ID and its new sort position.
+type FolderReorderEntry struct {
+	ID       int `json:"id"`
+	Position int `json:"position"`
+}
+
+// UpdateFolderInput contains optional fields for a partial update. Only non-nil
+// fields are written to the database.
+type UpdateFolderInput struct {
+	Paths                    *[]string // nil = no change, non-nil = replace all paths
+	Type                     *string
+	Name                     *string
+	Enabled                  *bool
+	MetadataLanguage         *string
+	AutoTranslateMetadata    *bool
+	ChapterThumbnailsEnabled *bool
+	IntroDetectionEnabled    *bool
+	TrickplayEnabled         *bool
+	BoxSetsEnabled           *bool
+	BoxSetMinMovies          *int
+	BoxSetsInSearch          *bool
+	TrailerKinds             *[]string // nil = no change; empty slice disables remote videos
+	// RealtimeMonitoring is nil on the frozen /api/v1 update path, which
+	// never sets it, so the column stays unchanged there.
+	RealtimeMonitoring *bool
+}
+
+// FolderRepository provides CRUD operations for the media_folders table.
+type FolderRepository struct {
+	pool *pgxpool.Pool
+}
+
+type DeleteFolderStats struct {
+	LibraryName       string
+	MediaFiles        int
+	MediaItemLinks    int
+	OrphanedItems     int
+	OrphanedImageDirs []string // S3 base paths (directories) for orphaned images needing cleanup
+}
+
+// NewFolderRepository creates a new FolderRepository backed by the given pool.
+func NewFolderRepository(pool *pgxpool.Pool) *FolderRepository {
+	return &FolderRepository{pool: pool}
+}
+
+// Pool returns the underlying pgxpool.Pool. This is useful when other
+// repositories need the same pool for cross-repo operations.
+func (r *FolderRepository) Pool() *pgxpool.Pool {
+	return r.pool
+}
+
+// defaultTrailerKinds mirrors the media_folders.trailer_kinds column default:
+// every provider-reported kind (deleted_scene is local-only and never comes
+// from providers).
+func defaultTrailerKinds() []string {
+	kinds := make([]string, 0, len(models.AllExtraKinds))
+	for _, k := range models.AllExtraKinds {
+		if k == models.ExtraKindDeletedScene {
+			continue
+		}
+		kinds = append(kinds, string(k))
+	}
+	return kinds
+}
+
+// normalizeTrailerKindsInput canonicalizes an allow-list from the API:
+// trim/lowercase, drop values outside the known vocabulary (rather than
+// folding them to "other", which would silently widen the allow-list), and
+// dedupe while preserving order.
+func normalizeTrailerKindsInput(kinds []string) []string {
+	normalized := make([]string, 0, len(kinds))
+	seen := make(map[string]bool, len(kinds))
+	for _, raw := range kinds {
+		kind := strings.ToLower(strings.TrimSpace(raw))
+		if kind == "" || seen[kind] {
+			continue
+		}
+		if string(models.NormalizeExtraKind(kind)) != kind {
+			// Unknown value: NormalizeExtraKind would fold it to "other".
+			continue
+		}
+		seen[kind] = true
+		normalized = append(normalized, kind)
+	}
+	return normalized
+}
+
+// folderColumns is the list of columns returned by all SELECT queries.
+// Kept in one place so scanFolder stays in sync.
+const folderColumns = `id, type, name, enabled, metadata_language, auto_translate_metadata, chapter_thumbnails_enabled, intro_detection_enabled, trickplay_enabled, box_sets_enabled, box_set_min_movies, box_sets_in_search, realtime_monitoring, trailer_kinds, poster_path, last_scanned_at,
+	scan_warning_code, scan_warning_message, scan_warning_at, allow_empty_cleanup_once, sort_order`
+
+// scanFolder scans a single row into a *models.MediaFolder.
+func scanFolder(row pgx.Row) (*models.MediaFolder, error) {
+	var f models.MediaFolder
+
+	err := row.Scan(
+		&f.ID,
+		&f.Type,
+		&f.Name,
+		&f.Enabled,
+		&f.MetadataLanguage,
+		&f.AutoTranslateMetadata,
+		&f.ChapterThumbnailsEnabled,
+		&f.IntroDetectionEnabled,
+		&f.TrickplayEnabled,
+		&f.BoxSetsEnabled,
+		&f.BoxSetMinMovies,
+		&f.BoxSetsInSearch,
+		&f.RealtimeMonitoring,
+		&f.TrailerKinds,
+		&f.PosterPath,
+		&f.LastScannedAt,
+		&f.ScanWarningCode,
+		&f.ScanWarningMessage,
+		&f.ScanWarningAt,
+		&f.AllowEmptyCleanupOnce,
+		&f.SortOrder,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrFolderNotFound
+		}
+		return nil, fmt.Errorf("scanning folder: %w", err)
+	}
+
+	return &f, nil
+}
+
+// scanFolders scans multiple rows into a []*models.MediaFolder slice.
+func scanFolders(rows pgx.Rows) ([]*models.MediaFolder, error) {
+	var folders []*models.MediaFolder
+	for rows.Next() {
+		var f models.MediaFolder
+
+		err := rows.Scan(
+			&f.ID,
+			&f.Type,
+			&f.Name,
+			&f.Enabled,
+			&f.MetadataLanguage,
+			&f.AutoTranslateMetadata,
+			&f.ChapterThumbnailsEnabled,
+			&f.IntroDetectionEnabled,
+			&f.TrickplayEnabled,
+			&f.BoxSetsEnabled,
+			&f.BoxSetMinMovies,
+			&f.BoxSetsInSearch,
+			&f.RealtimeMonitoring,
+			&f.TrailerKinds,
+			&f.PosterPath,
+			&f.LastScannedAt,
+			&f.ScanWarningCode,
+			&f.ScanWarningMessage,
+			&f.ScanWarningAt,
+			&f.AllowEmptyCleanupOnce,
+			&f.SortOrder,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning folder row: %w", err)
+		}
+
+		folders = append(folders, &f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating folder rows: %w", err)
+	}
+	return folders, nil
+}
+
+// loadPaths bulk-loads paths from media_folder_paths for the given folders
+// and populates each folder's Paths field.
+func (r *FolderRepository) loadPaths(ctx context.Context, folders []*models.MediaFolder) error {
+	if len(folders) == 0 {
+		return nil
+	}
+
+	ids := make([]int, len(folders))
+	folderByID := make(map[int]*models.MediaFolder, len(folders))
+	for i, f := range folders {
+		ids[i] = f.ID
+		folderByID[f.ID] = f
+		f.Paths = []string{} // initialize to empty slice
+	}
+
+	rows, err := r.pool.Query(ctx,
+		`SELECT media_folder_id, path FROM media_folder_paths WHERE media_folder_id = ANY($1) ORDER BY id ASC`,
+		ids,
+	)
+	if err != nil {
+		return fmt.Errorf("loading folder paths: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var folderID int
+		var path string
+		if err := rows.Scan(&folderID, &path); err != nil {
+			return fmt.Errorf("scanning folder path row: %w", err)
+		}
+		if f, ok := folderByID[folderID]; ok {
+			f.Paths = append(f.Paths, path)
+		}
+	}
+	return rows.Err()
+}
+
+// Create inserts a new media folder with its paths and returns the created row.
+func (r *FolderRepository) Create(ctx context.Context, input CreateFolderInput) (*models.MediaFolder, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning create transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	folder, err := CreateFolderInTx(ctx, tx, input)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing create transaction: %w", err)
+	}
+	return folder, nil
+}
+
+// ReserveFolderID takes the next library id without creating the library,
+// so objects keyed by it (the library poster) can be written before the
+// transaction that creates it.
+func (r *FolderRepository) ReserveFolderID(ctx context.Context) (int, error) {
+	var id int
+	if err := r.pool.QueryRow(ctx, `SELECT nextval(pg_get_serial_sequence('public.media_folders', 'id'))`).Scan(&id); err != nil {
+		return 0, fmt.Errorf("reserving a library id: %w", err)
+	}
+	return id, nil
+}
+
+// CreateFolderInTx inserts a media folder with its paths in the caller's
+// transaction: the library editor's create, for a caller that commits it
+// with other writes.
+func CreateFolderInTx(ctx context.Context, tx pgx.Tx, input CreateFolderInput) (*models.MediaFolder, error) {
+	metaLang := input.MetadataLanguage
+	if metaLang == "" {
+		metaLang = "en"
+	}
+	trailerKinds := input.TrailerKinds
+	if trailerKinds == nil {
+		trailerKinds = defaultTrailerKinds()
+	} else {
+		trailerKinds = normalizeTrailerKindsInput(trailerKinds)
+	}
+	realtimeMonitoring := true
+	if input.RealtimeMonitoring != nil {
+		realtimeMonitoring = *input.RealtimeMonitoring
+	}
+
+	boxSetMinMovies := input.BoxSetMinMovies
+	if boxSetMinMovies <= 0 {
+		boxSetMinMovies = DefaultBoxSetMinMovies
+	}
+	boxSetsInSearch := true
+	if input.BoxSetsInSearch != nil {
+		boxSetsInSearch = *input.BoxSetsInSearch
+	}
+	ungroupedOrder := 9999
+	if input.CollectionUngroupedSortOrder != nil {
+		ungroupedOrder = *input.CollectionUngroupedSortOrder
+	}
+	query := `INSERT INTO media_folders (id, type, name, metadata_language, chapter_thumbnails_enabled, intro_detection_enabled, realtime_monitoring, trailer_kinds, trickplay_enabled,
+			box_sets_enabled, box_set_min_movies, box_sets_in_search,
+			enabled, auto_translate_metadata, poster_path, collection_ungrouped_sort_order, sort_order)
+		OVERRIDING SYSTEM VALUE
+		VALUES (COALESCE($9::bigint, nextval(pg_get_serial_sequence('public.media_folders', 'id'))), $1, $2, $3, $4, $5, $6, $7, $8,
+			$14, $15, $16,
+			$10, $11, $12, $13, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM media_folders))
+		RETURNING ` + folderColumns
+
+	var id *int
+	if input.ID > 0 {
+		id = &input.ID
+	}
+	row := tx.QueryRow(ctx, query,
+		input.Type,
+		input.Name,
+		metaLang,
+		input.ChapterThumbnailsEnabled,
+		input.IntroDetectionEnabled,
+		realtimeMonitoring,
+		trailerKinds,
+		input.TrickplayEnabled,
+		id,
+		!input.Disabled,
+		input.AutoTranslateMetadata,
+		input.PosterPath,
+		ungroupedOrder,
+		input.BoxSetsEnabled,
+		boxSetMinMovies,
+		boxSetsInSearch,
+	)
+
+	folder, err := scanFolder(row)
+	if err != nil {
+		return nil, fmt.Errorf("creating folder: %w", err)
+	}
+
+	// Insert paths into child table.
+	for _, p := range input.Paths {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO media_folder_paths (media_folder_id, path) VALUES ($1, $2)`,
+			folder.ID, p,
+		)
+		if err != nil {
+			if isDuplicateKeyError(err) {
+				return nil, fmt.Errorf("%w: %s", ErrDuplicatePath, extractConstraint(err))
+			}
+			return nil, fmt.Errorf("inserting folder path %q: %w", p, err)
+		}
+	}
+
+	if err := seedCanonicalUserCollectionsGroup(ctx, tx, folder.ID); err != nil {
+		return nil, err
+	}
+
+	folder.Paths = input.Paths
+	return folder, nil
+}
+
+// GetByID retrieves a media folder by its numeric ID.
+func (r *FolderRepository) GetByID(ctx context.Context, id int) (*models.MediaFolder, error) {
+	query := `SELECT ` + folderColumns + ` FROM media_folders WHERE id = $1`
+	folder, err := scanFolder(r.pool.QueryRow(ctx, query, id))
+	if err != nil {
+		return nil, err
+	}
+	if err := r.loadPaths(ctx, []*models.MediaFolder{folder}); err != nil {
+		return nil, fmt.Errorf("loading paths for folder %d: %w", id, err)
+	}
+	return folder, nil
+}
+
+// List returns all media folders ordered by ID ascending.
+func (r *FolderRepository) List(ctx context.Context) ([]*models.MediaFolder, error) {
+	query := `SELECT ` + folderColumns + ` FROM media_folders ORDER BY sort_order ASC, id ASC`
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("listing folders: %w", err)
+	}
+	defer rows.Close()
+
+	folders, err := scanFolders(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.loadPaths(ctx, folders); err != nil {
+		return nil, fmt.Errorf("loading paths for list: %w", err)
+	}
+	return folders, nil
+}
+
+// GetEnabled returns all enabled media folders ordered by ID ascending.
+func (r *FolderRepository) GetEnabled(ctx context.Context) ([]*models.MediaFolder, error) {
+	query := `SELECT ` + folderColumns + ` FROM media_folders WHERE enabled = true ORDER BY sort_order ASC, id ASC`
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("listing enabled folders: %w", err)
+	}
+	defer rows.Close()
+
+	folders, err := scanFolders(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.loadPaths(ctx, folders); err != nil {
+		return nil, fmt.Errorf("loading paths for enabled: %w", err)
+	}
+	return folders, nil
+}
+
+// ExistingIDs returns the subset of ids that name a media folder, enabled or
+// not, in ascending order. It answers referential questions (may this id be
+// stored in a library allowlist?) without loading the rows.
+func (r *FolderRepository) ExistingIDs(ctx context.Context, ids []int) ([]int, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := r.pool.Query(ctx, `SELECT id FROM media_folders WHERE id = ANY($1) ORDER BY id ASC`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("checking folder IDs: %w", err)
+	}
+	defer rows.Close()
+	var out []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scanning folder ID: %w", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("checking folder IDs: %w", err)
+	}
+	return out, nil
+}
+
+// ListByIDs returns enabled media folders matching the given IDs, ordered by ID ascending.
+func (r *FolderRepository) ListByIDs(ctx context.Context, ids []int) ([]*models.MediaFolder, error) {
+	query := `SELECT ` + folderColumns + ` FROM media_folders WHERE id = ANY($1) AND enabled = true ORDER BY sort_order ASC, id ASC`
+	rows, err := r.pool.Query(ctx, query, ids)
+	if err != nil {
+		return nil, fmt.Errorf("listing folders by IDs: %w", err)
+	}
+	defer rows.Close()
+
+	folders, err := scanFolders(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.loadPaths(ctx, folders); err != nil {
+		return nil, fmt.Errorf("loading paths for IDs: %w", err)
+	}
+	return folders, nil
+}
+
+// Update modifies a folder's fields. Only non-nil fields in the input are updated.
+func (r *FolderRepository) Update(ctx context.Context, id int, input UpdateFolderInput) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning update transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	setClauses := []string{}
+	args := []any{}
+	argIndex := 1
+
+	if input.Type != nil {
+		setClauses = append(setClauses, fmt.Sprintf("type = $%d", argIndex))
+		args = append(args, *input.Type)
+		argIndex++
+	}
+	if input.Name != nil {
+		setClauses = append(setClauses, fmt.Sprintf("name = $%d", argIndex))
+		args = append(args, *input.Name)
+		argIndex++
+	}
+	if input.Enabled != nil {
+		setClauses = append(setClauses, fmt.Sprintf("enabled = $%d", argIndex))
+		args = append(args, *input.Enabled)
+		argIndex++
+	}
+	if input.MetadataLanguage != nil {
+		setClauses = append(setClauses, fmt.Sprintf("metadata_language = $%d", argIndex))
+		args = append(args, *input.MetadataLanguage)
+		argIndex++
+	}
+	if input.AutoTranslateMetadata != nil {
+		setClauses = append(setClauses, fmt.Sprintf("auto_translate_metadata = $%d", argIndex))
+		args = append(args, *input.AutoTranslateMetadata)
+		argIndex++
+	}
+	if input.ChapterThumbnailsEnabled != nil {
+		setClauses = append(setClauses, fmt.Sprintf("chapter_thumbnails_enabled = $%d", argIndex))
+		args = append(args, *input.ChapterThumbnailsEnabled)
+		argIndex++
+	}
+	if input.TrickplayEnabled != nil {
+		setClauses = append(setClauses, fmt.Sprintf("trickplay_enabled = $%d", argIndex))
+		args = append(args, *input.TrickplayEnabled)
+		argIndex++
+	}
+	if input.BoxSetsEnabled != nil {
+		setClauses = append(setClauses, fmt.Sprintf("box_sets_enabled = $%d", argIndex))
+		args = append(args, *input.BoxSetsEnabled)
+		argIndex++
+	}
+	if input.BoxSetMinMovies != nil {
+		setClauses = append(setClauses, fmt.Sprintf("box_set_min_movies = $%d", argIndex))
+		args = append(args, *input.BoxSetMinMovies)
+		argIndex++
+	}
+	if input.BoxSetsInSearch != nil {
+		setClauses = append(setClauses, fmt.Sprintf("box_sets_in_search = $%d", argIndex))
+		args = append(args, *input.BoxSetsInSearch)
+		argIndex++
+	}
+	if input.IntroDetectionEnabled != nil {
+		setClauses = append(setClauses, fmt.Sprintf("intro_detection_enabled = $%d", argIndex))
+		args = append(args, *input.IntroDetectionEnabled)
+		argIndex++
+	}
+	if input.TrailerKinds != nil {
+		setClauses = append(setClauses, fmt.Sprintf("trailer_kinds = $%d", argIndex))
+		args = append(args, normalizeTrailerKindsInput(*input.TrailerKinds))
+		argIndex++
+	}
+	if input.RealtimeMonitoring != nil {
+		setClauses = append(setClauses, fmt.Sprintf("realtime_monitoring = $%d", argIndex))
+		args = append(args, *input.RealtimeMonitoring)
+		argIndex++
+	}
+	if len(setClauses) > 0 {
+		query := fmt.Sprintf("UPDATE media_folders SET %s WHERE id = $%d",
+			strings.Join(setClauses, ", "), argIndex)
+		args = append(args, id)
+
+		tag, execErr := tx.Exec(ctx, query, args...)
+		if execErr != nil {
+			return fmt.Errorf("updating folder: %w", execErr)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrFolderNotFound
+		}
+	} else if input.Paths == nil {
+		// Nothing to update; still verify the folder exists.
+		var exists bool
+		err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM media_folders WHERE id = $1)", id).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("checking folder existence: %w", err)
+		}
+		if !exists {
+			return ErrFolderNotFound
+		}
+	}
+
+	// Replace paths if provided.
+	if input.Paths != nil {
+		// Verify folder exists if we haven't already via SET clauses.
+		if len(setClauses) == 0 {
+			var exists bool
+			err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM media_folders WHERE id = $1)", id).Scan(&exists)
+			if err != nil {
+				return fmt.Errorf("checking folder existence: %w", err)
+			}
+			if !exists {
+				return ErrFolderNotFound
+			}
+		}
+
+		_, err := tx.Exec(ctx, "DELETE FROM media_folder_paths WHERE media_folder_id = $1", id)
+		if err != nil {
+			return fmt.Errorf("deleting old paths: %w", err)
+		}
+
+		for _, p := range *input.Paths {
+			_, err := tx.Exec(ctx,
+				`INSERT INTO media_folder_paths (media_folder_id, path) VALUES ($1, $2)`,
+				id, p,
+			)
+			if err != nil {
+				if isDuplicateKeyError(err) {
+					return fmt.Errorf("%w: %s", ErrDuplicatePath, extractConstraint(err))
+				}
+				return fmt.Errorf("inserting folder path %q: %w", p, err)
+			}
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing update transaction: %w", err)
+	}
+	return nil
+}
+
+// Delete removes a media folder by its ID and cleans up any media items that
+// were exclusively associated with this library (orphaned items).
+func (r *FolderRepository) Delete(ctx context.Context, id int) error {
+	_, err := r.DeleteWithStats(ctx, id, nil)
+	return err
+}
+
+func (r *FolderRepository) DeleteWithStats(
+	ctx context.Context,
+	id int,
+	progress func(current, total int, message string),
+) (*DeleteFolderStats, error) {
+	stats := &DeleteFolderStats{}
+
+	// Phase 0: preflight reads (no long-lived transaction).
+	if err := r.pool.QueryRow(ctx, `SELECT name FROM media_folders WHERE id = $1`, id).Scan(&stats.LibraryName); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrFolderNotFound
+		}
+		return nil, fmt.Errorf("loading folder before delete: %w", err)
+	}
+	if err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM media_files WHERE media_folder_id = $1`, id).Scan(&stats.MediaFiles); err != nil {
+		return nil, fmt.Errorf("counting media files: %w", err)
+	}
+	if err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM media_item_libraries WHERE media_folder_id = $1`, id).Scan(&stats.MediaItemLinks); err != nil {
+		return nil, fmt.Errorf("counting media item links: %w", err)
+	}
+	var orphanTotal int
+	if err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM media_item_libraries mil
+		WHERE mil.media_folder_id = $1
+		AND NOT EXISTS (
+			SELECT 1 FROM media_item_libraries other
+			WHERE other.content_id = mil.content_id
+			AND other.media_folder_id <> $1
+		)`, id).Scan(&orphanTotal); err != nil {
+		return nil, fmt.Errorf("counting orphaned items: %w", err)
+	}
+
+	// Phase 1: delete orphaned media_items in detect-then-delete batches.
+	// Cascade removes their junctions, provider IDs, episodes, seasons, etc.
+	if progress != nil {
+		progress(0, orphanTotal, "Deleting orphaned items")
+	}
+	rawDirs := make(map[string]struct{})
+	for {
+		ids, err := r.collectOrphanBatch(ctx, id, orphanDeleteBatch)
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) == 0 {
+			break
+		}
+		dirs, err := collectRawImageDirs(ctx, r.pool, ids)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range dirs {
+			rawDirs[d] = struct{}{}
+		}
+		var deletedContentIDs []string
+		if err := retryOnDeadlock(ctx, func() error {
+			tx, e := r.pool.Begin(ctx)
+			if e != nil {
+				return e
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+
+			// Re-check the orphan invariant inside the delete. A concurrent
+			// scan/import may have attached one of these content IDs to another
+			// library after collectOrphanBatch returned; without this guard the
+			// cascade would delete the shared media_items row (and the
+			// newly-added membership), dropping the item from the other library.
+			rows, e := tx.Query(ctx, `
+				DELETE FROM media_items
+				WHERE content_id = ANY($1)
+				AND NOT EXISTS (
+					SELECT 1 FROM media_item_libraries other
+					WHERE other.content_id = media_items.content_id
+					AND other.media_folder_id <> $2
+				)
+				RETURNING content_id`, ids, id)
+			if e != nil {
+				return e
+			}
+			attemptDeletedIDs, e := pgx.CollectRows(rows, pgx.RowTo[string])
+			if e != nil {
+				return fmt.Errorf("collecting deleted orphaned item IDs: %w", e)
+			}
+			if err := EnqueueSearchIndexDeletes(ctx, tx, attemptDeletedIDs); err != nil {
+				return fmt.Errorf("enqueueing catalog search orphan deletes: %w", err)
+			}
+			if e := tx.Commit(ctx); e != nil {
+				return e
+			}
+			deletedContentIDs = attemptDeletedIDs
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("deleting orphaned items: %w", err)
+		}
+		stats.OrphanedItems += len(deletedContentIDs)
+		if progress != nil {
+			progress(stats.OrphanedItems, orphanTotal, "Deleting orphaned items")
+		}
+	}
+
+	// Phase 2: delete this folder's media_files (folder-tied, not item-tied).
+	if progress != nil {
+		progress(orphanTotal, orphanTotal, "Deleting media files")
+	}
+	// An extra whose parent survives in another library loses its image with
+	// its last file.
+	if _, err := deleteInBatches(ctx, folderChildDeleteBatch, func(ctx context.Context) (int64, error) {
+		var deleted int64
+		e := r.pool.QueryRow(ctx, `
+			WITH deleted AS (
+				DELETE FROM media_files
+				WHERE id IN (
+					SELECT id FROM media_files WHERE media_folder_id = $1 LIMIT $2
+				)
+				RETURNING id, extra_id
+			)`+ClearEmptiedExtraStillsCTE+`
+			SELECT count(*) FROM deleted`, id, folderChildDeleteBatch).Scan(&deleted)
+		return deleted, e
+	}); err != nil {
+		return nil, fmt.Errorf("deleting media files: %w", err)
+	}
+
+	// Phase 3: delete remaining folder memberships (shared items kept; only the
+	// membership in this folder is removed). Deleting the memberships with
+	// RETURNING lets us catch skeleton items that a matcher created after the
+	// phase-1 orphan sweep but before the delete job reached this phase.
+	if progress != nil {
+		progress(orphanTotal, orphanTotal, "Removing library memberships")
+	}
+	lateOrphans, lateImageDirs, err := r.deleteFolderMemberships(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("deleting media item links: %w", err)
+	}
+	stats.OrphanedItems += lateOrphans
+	for _, d := range lateImageDirs {
+		rawDirs[d] = struct{}{}
+	}
+
+	// Filter accumulated image dirs once, now that all item orphans are gone,
+	// against any surviving content. Empty deleting-set means "exclude nothing".
+	if len(rawDirs) > 0 {
+		filtered, err := filterUnreferencedImageDirs(ctx, r.pool, dirSetToSlice(rawDirs), []string{})
+		if err != nil {
+			return nil, err
+		}
+		stats.OrphanedImageDirs = filtered
+	}
+
+	// Phase 4: delete the now-lightweight folder row. Tolerate 0 rows so a
+	// resumed run that already removed it still succeeds.
+	deleteFolder := func() error {
+		tx, e := r.pool.Begin(ctx)
+		if e != nil {
+			return e
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if e := moveCollectionsOffFolder(ctx, tx, id); e != nil {
+			return e
+		}
+		// The folder's episode memberships cascade with it; series that
+		// survive in other libraries recompute the denorms read from them.
+		var seriesIDs []string
+		if e := tx.QueryRow(ctx, `
+			SELECT COALESCE(array_agg(DISTINCT e.series_id), ARRAY[]::text[])
+			FROM episode_libraries el
+			JOIN episodes e ON e.content_id = el.episode_id
+			WHERE el.media_folder_id = $1`, id).Scan(&seriesIDs); e != nil {
+			return e
+		}
+		if _, e := tx.Exec(ctx, `DELETE FROM media_folders WHERE id = $1`, id); e != nil {
+			return e
+		}
+		if e := RecomputeSeriesEpisodeMembershipDenorms(ctx, tx, seriesIDs); e != nil {
+			return e
+		}
+		return tx.Commit(ctx)
+	}
+	err = retryOnDeadlock(ctx, deleteFolder)
+	for attempt := 1; errors.Is(err, errFolderCollectionsChanged) && attempt < 5; attempt++ {
+		err = retryOnDeadlock(ctx, deleteFolder)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("deleting folder: %w", err)
+	}
+
+	if progress != nil {
+		progress(orphanTotal, orphanTotal, "Library deletion completed")
+	}
+	return stats, nil
+}
+
+// errFolderCollectionsChanged reports that a collection started using a folder
+// while its delete waited for the folder lock.
+var errFolderCollectionsChanged = errors.New("collections changed while locking the folder")
+
+// moveCollectionsOffFolder keeps admin collections that cover other libraries
+// when folderID is deleted. library_collections.library_id still holds the
+// first library an admin picked and cascades with it, so a collection whose
+// library_id is folderID moves to another library it covers. Collections that
+// cover only folderID are left for the cascade.
+func moveCollectionsOffFolder(ctx context.Context, tx pgx.Tx, folderID int) error {
+	// Collection writers lock collections in ID order
+	// (lockLibraryCollectionParents) before their foreign keys lock the folder,
+	// so take the collections the cascade touches first, then hold the folder so
+	// no writer adds a reference to it. A collection that gained a reference in
+	// between can't be locked now without breaking the ID order, so the caller
+	// starts over.
+	const touchedCollections = `
+		SELECT c.id FROM library_collections c
+		WHERE c.library_id = $1
+		   OR EXISTS (SELECT 1 FROM library_collection_libraries l WHERE l.collection_id = c.id AND l.library_id = $1)
+		ORDER BY c.id`
+	rows, err := tx.Query(ctx, touchedCollections+` FOR UPDATE OF c`, folderID)
+	if err != nil {
+		return fmt.Errorf("locking folder collections: %w", err)
+	}
+	locked, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("locking folder collections: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM media_folders WHERE id = $1 FOR UPDATE`, folderID); err != nil {
+		return fmt.Errorf("locking folder: %w", err)
+	}
+	rows, err = tx.Query(ctx, touchedCollections, folderID)
+	if err != nil {
+		return fmt.Errorf("listing folder collections: %w", err)
+	}
+	touched, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("listing folder collections: %w", err)
+	}
+	for _, id := range touched {
+		if !slices.Contains(locked, id) {
+			return errFolderCollectionsChanged
+		}
+	}
+
+	rows, err = tx.Query(ctx, `
+		SELECT c.id, c.slug, array_agg(l.library_id ORDER BY l.library_id)
+		FROM library_collections c
+		JOIN library_collection_libraries l ON l.collection_id = c.id AND l.library_id <> $1
+		WHERE c.library_id = $1
+		GROUP BY c.id
+		ORDER BY c.id`, folderID)
+	if err != nil {
+		return fmt.Errorf("listing collections to move: %w", err)
+	}
+	type sharedCollection struct {
+		id, slug  string
+		libraries []int32
+	}
+	shared, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (sharedCollection, error) {
+		var c sharedCollection
+		err := row.Scan(&c.id, &c.slug, &c.libraries)
+		return c, err
+	})
+	if err != nil {
+		return fmt.Errorf("listing collections to move: %w", err)
+	}
+	for _, c := range shared {
+		if err := moveCollectionToLibrary(ctx, tx, c.id, c.slug, c.libraries); err != nil {
+			return fmt.Errorf("moving collection %s: %w", c.id, err)
+		}
+	}
+	return nil
+}
+
+// moveCollectionToLibrary points a collection at the lowest of libraries where
+// its slug is free, keeping links that name the slug working. When every
+// library already has the slug, it takes the lowest library and the first free
+// "<slug>-<n>". A writer that claims the slug first is retried.
+func moveCollectionToLibrary(ctx context.Context, tx pgx.Tx, collectionID, slug string, libraries []int32) error {
+	for range 5 {
+		var libraryID int32
+		target := slug
+		err := tx.QueryRow(ctx, `
+			SELECT lib FROM unnest($2::int[]) lib
+			WHERE NOT EXISTS (SELECT 1 FROM library_collections WHERE library_id = lib AND slug = $1)
+			ORDER BY lib LIMIT 1`, slug, libraries).Scan(&libraryID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			libraryID = libraries[0]
+			err = tx.QueryRow(ctx, `
+				SELECT candidate FROM (
+					SELECT n, $1 || '-' || n AS candidate FROM generate_series(2, 10000) n
+				) s
+				WHERE NOT EXISTS (SELECT 1 FROM library_collections WHERE library_id = $2 AND slug = s.candidate)
+				ORDER BY n LIMIT 1`, slug, libraryID).Scan(&target)
+		}
+		if err != nil {
+			return fmt.Errorf("choosing library and slug: %w", err)
+		}
+
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = sp.Exec(ctx, `UPDATE library_collections SET library_id = $2, slug = $3 WHERE id = $1`, collectionID, libraryID, target)
+		if err == nil {
+			return sp.Commit(ctx)
+		}
+		_ = sp.Rollback(ctx)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != "library_collections_library_slug_unique" {
+			return err
+		}
+	}
+	return errors.New("slug kept being claimed by other writers")
+}
+
+// collectOrphanBatch returns up to limit content IDs whose only library
+// membership is the given folder.
+func (r *FolderRepository) collectOrphanBatch(ctx context.Context, folderID, limit int) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT mil.content_id
+		FROM media_item_libraries mil
+		WHERE mil.media_folder_id = $1
+		AND NOT EXISTS (
+			SELECT 1 FROM media_item_libraries other
+			WHERE other.content_id = mil.content_id
+			AND other.media_folder_id <> $1
+		)
+		LIMIT $2`, folderID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("finding orphaned items: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var contentID string
+		if err := rows.Scan(&contentID); err != nil {
+			return nil, fmt.Errorf("scanning orphan content_id: %w", err)
+		}
+		ids = append(ids, contentID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating orphan rows: %w", err)
+	}
+	return ids, nil
+}
+
+// deleteFolderMemberships removes this folder's remaining item memberships and
+// deletes any content that becomes orphaned as a result. This is intentionally
+// separate from the phase-1 orphan sweep because in-flight matchers can create
+// new skeleton memberships after phase 1 has already drained.
+func (r *FolderRepository) deleteFolderMemberships(ctx context.Context, folderID int) (int, []string, error) {
+	var orphaned int
+	var imageDirs []string
+	for {
+		var contentIDs []string
+		if err := retryOnDeadlock(ctx, func() error {
+			ids, err := r.deleteFolderMembershipBatch(ctx, folderID, folderChildDeleteBatch)
+			if err != nil {
+				return err
+			}
+			contentIDs = ids
+			return nil
+		}); err != nil {
+			return orphaned, imageDirs, err
+		}
+		if len(contentIDs) > 0 {
+			deleted, dirs, err := r.deleteOrphanedItemsByContentID(ctx, contentIDs)
+			if err != nil {
+				return orphaned, imageDirs, err
+			}
+			orphaned += deleted
+			imageDirs = append(imageDirs, dirs...)
+		}
+		if len(contentIDs) < folderChildDeleteBatch {
+			return orphaned, imageDirs, nil
+		}
+	}
+}
+
+func (r *FolderRepository) deleteFolderMembershipBatch(ctx context.Context, folderID, limit int) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+		DELETE FROM media_item_libraries
+		WHERE ctid IN (
+			SELECT ctid FROM media_item_libraries WHERE media_folder_id = $1 LIMIT $2
+		)
+		RETURNING content_id`, folderID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var contentIDs []string
+	for rows.Next() {
+		var contentID string
+		if err := rows.Scan(&contentID); err != nil {
+			return nil, fmt.Errorf("scanning deleted membership content_id: %w", err)
+		}
+		contentIDs = append(contentIDs, contentID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return contentIDs, nil
+}
+
+const collectOrphanedProvisionalIDsByContentIDSQL = `
+	SELECT mi.content_id
+	FROM public.media_items mi
+	WHERE mi.content_id = ANY($1)
+	  AND ` + orphanedProvisionalMediaItemConditions
+
+const deleteOrphanedProvisionalIDsByContentIDSQL = `
+	DELETE FROM public.media_items mi
+	WHERE mi.content_id = ANY($1)
+	  AND ` + orphanedProvisionalMediaItemConditions + `
+	RETURNING mi.content_id`
+
+func (r *FolderRepository) deleteOrphanedItemsByContentID(ctx context.Context, contentIDs []string) (int, []string, error) {
+	if len(contentIDs) == 0 {
+		return 0, nil, nil
+	}
+
+	orphanIDs, err := r.collectOrphanedProvisionalIDsByContentID(ctx, contentIDs)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(orphanIDs) == 0 {
+		return 0, nil, nil
+	}
+
+	rawImageDirs, err := collectRawImageDirs(ctx, r.pool, orphanIDs)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	var deletedIDs []string
+	var imageDirs []string
+	if err := retryOnDeadlock(ctx, func() error {
+		tx, err := r.pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+
+		rows, err := tx.Query(ctx, deleteOrphanedProvisionalIDsByContentIDSQL, orphanIDs)
+		if err != nil {
+			return err
+		}
+		attemptDeletedIDs, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return fmt.Errorf("collecting deleted late orphan IDs: %w", err)
+		}
+		var attemptImageDirs []string
+		if len(attemptDeletedIDs) > 0 {
+			attemptImageDirs, err = filterUnreferencedImageDirs(ctx, tx, rawImageDirs, attemptDeletedIDs)
+			if err != nil {
+				return err
+			}
+		}
+		if err := EnqueueSearchIndexDeletes(ctx, tx, attemptDeletedIDs); err != nil {
+			return fmt.Errorf("enqueueing catalog search late orphan deletes: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		deletedIDs = attemptDeletedIDs
+		imageDirs = attemptImageDirs
+		return nil
+	}); err != nil {
+		return 0, nil, err
+	}
+	return len(deletedIDs), imageDirs, nil
+}
+
+func (r *FolderRepository) collectOrphanedProvisionalIDsByContentID(ctx context.Context, contentIDs []string) ([]string, error) {
+	rows, err := r.pool.Query(ctx, collectOrphanedProvisionalIDsByContentIDSQL, contentIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var orphanIDs []string
+	for rows.Next() {
+		var contentID string
+		if err := rows.Scan(&contentID); err != nil {
+			return nil, fmt.Errorf("scanning orphan content_id: %w", err)
+		}
+		orphanIDs = append(orphanIDs, contentID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return orphanIDs, nil
+}
+
+// dirSetToSlice returns the keys of set as a slice (nil if empty).
+func dirSetToSlice(set map[string]struct{}) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	dirs := make([]string, 0, len(set))
+	for d := range set {
+		dirs = append(dirs, d)
+	}
+	return dirs
+}
+
+// imageDeletePrefix returns the S3 prefix to sweep when deleting the content
+// that owns the cached image at path. Local artwork keys carry a content-hash
+// segment (local/{contentType}/{contentID}/{hash8}/{imageType}/...), so local
+// paths trim to local/{contentType}/{contentID}/ — deleting every stale hash
+// prefix, not just the live one. Other keys keep the per-image-type dir.
+func imageDeletePrefix(path string) string {
+	if !strings.HasPrefix(path, "local/") {
+		return pathDir(path)
+	}
+	segments := strings.SplitN(path, "/", 4)
+	if len(segments) < 4 {
+		return pathDir(path)
+	}
+	return segments[0] + "/" + segments[1] + "/" + segments[2] + "/"
+}
+
+// pathDir extracts the directory portion of an S3 image path.
+// e.g. "tmdb/movies/550/poster/original.webp" → "tmdb/movies/550/poster/"
+func pathDir(path string) string {
+	return artworkkey.Directory(path)
+}
+
+// rowQuerier is satisfied by both *pgxpool.Pool and pgx.Tx, letting read
+// helpers run inside or outside an explicit transaction.
+type rowQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// collectOrphanIDs returns content IDs from the given set that have no
+// remaining library memberships. Must be called within a transaction.
+func collectOrphanIDs(ctx context.Context, tx pgx.Tx, contentIDs []string) ([]string, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT cid FROM unnest($1::text[]) AS cid
+		WHERE NOT EXISTS (
+			SELECT 1 FROM media_item_libraries mil WHERE mil.content_id = cid
+		)
+	`, contentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("finding orphaned items: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scanning orphan id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// collectRawImageDirs returns the deduped S3 directory prefixes referenced by
+// the given content IDs (items, their seasons, episodes and local extras), without
+// filtering out dirs still used by other content.
+func collectRawImageDirs(ctx context.Context, q rowQuerier, contentIDs []string) ([]string, error) {
+	imgRows, err := q.Query(ctx, `
+		SELECT poster_path, backdrop_path, logo_path FROM media_items WHERE content_id = ANY($1)
+		UNION ALL
+		SELECT banner_path, thumb_path, clearart_path FROM media_items WHERE content_id = ANY($1)
+		UNION ALL
+		SELECT disc_path, '', '' FROM media_items WHERE content_id = ANY($1)
+		UNION ALL
+		SELECT path, '', '' FROM media_item_backdrops WHERE content_id = ANY($1)
+		UNION ALL
+		SELECT poster_path, backdrop_path, '' FROM seasons WHERE series_id = ANY($1)
+		UNION ALL
+		SELECT still_path, '', '' FROM episodes WHERE series_id = ANY($1)
+		UNION ALL
+		SELECT still_path, '', '' FROM media_extras WHERE parent_id = ANY($1)
+	`, contentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("collecting image paths: %w", err)
+	}
+	defer imgRows.Close()
+	dirSet := make(map[string]struct{})
+	for imgRows.Next() {
+		var p1, p2, p3 string
+		if err := imgRows.Scan(&p1, &p2, &p3); err != nil {
+			return nil, fmt.Errorf("scanning image path: %w", err)
+		}
+		for _, p := range []string{p1, p2, p3} {
+			if p != "" && !strings.Contains(p, "://") {
+				if dir := imageDeletePrefix(p); dir != "" {
+					dirSet[dir] = struct{}{}
+				}
+			}
+		}
+	}
+	if err := imgRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating image paths: %w", err)
+	}
+	dirs := make([]string, 0, len(dirSet))
+	for dir := range dirSet {
+		dirs = append(dirs, dir)
+	}
+	return dirs, nil
+}
+
+// filterUnreferencedImageDirs returns the candidate directories that no
+// surviving row still has artwork under: no item artwork slot, extra backdrop,
+// season poster or backdrop, or episode still outside deletingContentIDs has a path that
+// starts with the directory.
+//
+// The obvious form is a correlated `path LIKE candidate || '%'` per candidate,
+// and that is what this used to run. A pattern built from a column cannot be
+// turned into range quals, so it cost one sequential scan of media_items,
+// seasons and episodes per candidate. Reconcile runs it inside the scan's
+// transaction, and on a large catalog a big delete held that transaction open
+// long enough to block vacuum.
+//
+// This reads each table once instead. Every candidate ends in '/', so "path
+// starts with candidate" holds exactly when the candidate equals the path cut
+// just after one of its own '/' separators. The query cuts each surviving path
+// at the candidate lengths where it has a '/' and looks each cut up among the
+// candidates. Work grows with the number of distinct candidate lengths, which
+// the shape of artwork keys keeps small, not with the number of candidates.
+// Matching is literal, so '%' and '_' in a directory name no longer act as
+// wildcards.
+//
+// The lookup is a jsonb key test rather than a join on purpose. The planner
+// cannot estimate how many cuts end in '/', and with a generic plan (pgx caches
+// statements) and no parallel workers it underestimated that count badly and
+// chose a nested-loop anti join over the cuts, which brought back the
+// per-candidate scaling this replaces. A per-row lookup leaves it no join to get wrong, and
+// the only set that reaches the final anti join is the referenced candidates,
+// which cannot outnumber the candidates.
+//
+// lookup is deliberately not MATERIALIZED. Inlined, its aggregate still runs
+// once per process (the leader and each parallel worker), never per path row;
+// a materialized CTE scan is parallel-restricted and pins the whole per-row
+// lookup to the leader, which measured about 4x slower.
+//
+// Candidates come from imageDeletePrefix, which always ends a directory in '/'.
+// Anything else is reported as referenced rather than guessed at: keeping a
+// directory costs storage, deleting a live one loses artwork.
+func filterUnreferencedImageDirs(ctx context.Context, q rowQuerier, dirs, deletingContentIDs []string) ([]string, error) {
+	candidates := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		if strings.HasSuffix(dir, "/") {
+			candidates = append(candidates, dir)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	// pgx sends a nil slice as NULL, and NOT (x = ANY(NULL)) is NULL, which
+	// would drop every surviving row and report every candidate unreferenced.
+	if deletingContentIDs == nil {
+		deletingContentIDs = []string{}
+	}
+
+	rows, err := q.Query(ctx, `
+		WITH lookup AS (
+			SELECT jsonb_object_agg(dir, true) AS keys, array_agg(DISTINCT length(dir)) AS lens
+			FROM unnest($1::text[]) AS t(dir)
+		), referenced_path AS (
+			SELECT a.path FROM media_items mi
+				CROSS JOIN LATERAL (VALUES (mi.poster_path), (mi.backdrop_path), (mi.logo_path),
+					(mi.banner_path), (mi.thumb_path), (mi.clearart_path), (mi.disc_path)) AS a(path)
+				WHERE NOT (mi.content_id = ANY($2::text[])) AND a.path <> ''
+			UNION ALL
+			SELECT b.path FROM media_item_backdrops b
+				WHERE NOT (b.content_id = ANY($2::text[])) AND b.path <> ''
+			UNION ALL
+			SELECT a.path FROM seasons s
+				CROSS JOIN LATERAL (VALUES (s.poster_path), (s.backdrop_path)) AS a(path)
+				WHERE NOT (s.series_id = ANY($2::text[])) AND a.path <> ''
+			UNION ALL
+			SELECT e.still_path FROM episodes e
+				WHERE NOT (e.series_id = ANY($2::text[])) AND e.still_path <> ''
+			UNION ALL
+			SELECT x.still_path FROM media_extras x
+				WHERE NOT (x.parent_id = ANY($2::text[])) AND x.still_path <> ''
+		), referenced AS (
+			SELECT DISTINCT left(p.path, n) AS dir
+			FROM referenced_path p
+			CROSS JOIN lookup
+			CROSS JOIN LATERAL unnest(lookup.lens) AS n
+			WHERE substr(p.path, n, 1) = '/' AND lookup.keys ? left(p.path, n)
+		)
+		SELECT DISTINCT c.dir
+		FROM unnest($1::text[]) AS c(dir)
+		WHERE NOT EXISTS (SELECT 1 FROM referenced r WHERE r.dir = c.dir)
+		ORDER BY c.dir
+	`, candidates, deletingContentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("filtering referenced image dirs: %w", err)
+	}
+	defer rows.Close()
+
+	var unreferenced []string
+	for rows.Next() {
+		var dir string
+		if err := rows.Scan(&dir); err != nil {
+			return nil, fmt.Errorf("scanning unreferenced image dir: %w", err)
+		}
+		unreferenced = append(unreferenced, dir)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating unreferenced image dirs: %w", err)
+	}
+	return unreferenced, nil
+}
+
+// DistinctLibraryPaths returns every configured library folder path, once each
+// and in a stable order.
+//
+// media_folder_paths is the authoritative list of roots the server was told
+// about; a folder can have several. Host resource sampling uses this to decide
+// which mounts to report free space on, which is why it reads paths only and
+// deliberately does not care which library owns them.
+func (r *FolderRepository) DistinctLibraryPaths(ctx context.Context) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `SELECT DISTINCT path FROM media_folder_paths ORDER BY path`)
+	if err != nil {
+		return nil, fmt.Errorf("querying library paths: %w", err)
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("scanning library path: %w", err)
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
+// DistinctTypes returns the media_folders.type value of every library, once
+// each, whether or not the library is enabled.
+func (r *FolderRepository) DistinctTypes(ctx context.Context) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `SELECT DISTINCT type FROM media_folders`)
+	if err != nil {
+		return nil, fmt.Errorf("querying library types: %w", err)
+	}
+	defer rows.Close()
+	var types []string
+	for rows.Next() {
+		var libraryType string
+		if err := rows.Scan(&libraryType); err != nil {
+			return nil, fmt.Errorf("scanning library type: %w", err)
+		}
+		types = append(types, libraryType)
+	}
+	return types, rows.Err()
+}
+
+// UpdateLastScanned sets the last_scanned_at timestamp for the given folder.
+// LibraryRootsForContent returns the media folder root paths the given
+// content belongs to, resolved through media_item_libraries. The metadata
+// image-cache processor uses this to confine local file:// artwork sources
+// (metadata.LibraryRootResolver).
+func (r *FolderRepository) LibraryRootsForContent(ctx context.Context, contentID string) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT mfp.path
+		FROM media_folder_paths mfp
+		JOIN media_item_libraries mil ON mil.media_folder_id = mfp.media_folder_id
+		WHERE mil.content_id = $1
+	`, contentID)
+	if err != nil {
+		return nil, fmt.Errorf("querying library roots for content %q: %w", contentID, err)
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("scanning library root path: %w", err)
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
+// CatalogedFilesUnder returns up to limit present media file paths of
+// contentID under dir that sort after after, in path order, as the scanner
+// recorded them; pass the last path of a page to read the next one. An
+// episode's file carries its series' content ID, so a series lists its
+// episodes' files. The metadata image-cache processor uses this to accept
+// local artwork in a title folder that is a symlink out of the library
+// (metadata.catalogedFileLister).
+func (r *FolderRepository) CatalogedFilesUnder(ctx context.Context, contentID, dir, after string, limit int) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT file_path
+		FROM media_files
+		WHERE content_id = $1
+		  AND missing_since IS NULL
+		  AND starts_with(file_path, $2)
+		  AND file_path > $3
+		ORDER BY file_path
+		LIMIT $4
+	`, contentID, strings.TrimSuffix(dir, "/")+"/", after, limit)
+	if err != nil {
+		return nil, fmt.Errorf("querying cataloged files of %q under %q: %w", contentID, dir, err)
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+func (r *FolderRepository) UpdateLastScanned(ctx context.Context, id int, scannedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx,
+		"UPDATE media_folders SET last_scanned_at = $1 WHERE id = $2",
+		scannedAt, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating last_scanned_at: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return ErrFolderNotFound
+	}
+
+	return nil
+}
+
+// SetScanWarning records a non-fatal scan warning on the folder.
+func (r *FolderRepository) SetScanWarning(ctx context.Context, id int, code, message string, warnedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE media_folders
+		SET scan_warning_code = $1,
+			scan_warning_message = $2,
+			scan_warning_at = $3
+		WHERE id = $4`,
+		code, message, warnedAt, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating scan warning: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrFolderNotFound
+	}
+
+	return nil
+}
+
+// ScanWarning identifies the warning observed by a scan before it walks a folder.
+type ScanWarning struct {
+	Code    *string
+	Message *string
+	At      *time.Time
+}
+
+// GetScanWarning captures warning identity, including the absence of a warning.
+func (r *FolderRepository) GetScanWarning(ctx context.Context, id int) (ScanWarning, error) {
+	var warning ScanWarning
+	err := r.pool.QueryRow(ctx, `
+		SELECT scan_warning_code, scan_warning_message, scan_warning_at
+		FROM media_folders WHERE id = $1`, id).Scan(&warning.Code, &warning.Message, &warning.At)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ScanWarning{}, ErrFolderNotFound
+	}
+	if err != nil {
+		return ScanWarning{}, fmt.Errorf("reading scan warning: %w", err)
+	}
+	return warning, nil
+}
+
+// UpdateScanWarningIfUnchanged leaves warnings from overlapping scans untouched.
+// An empty replacement clears the warning and its one-shot cleanup allowance;
+// changing a message retains that allowance. Identity avoids relying on clocks
+// being synchronized between scanning nodes. A changed warning is a normal no-op.
+func (r *FolderRepository) UpdateScanWarningIfUnchanged(ctx context.Context, id int, expected, replacement ScanWarning) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE media_folders
+		SET scan_warning_code = $2,
+			scan_warning_message = $3,
+			scan_warning_at = $4,
+			allow_empty_cleanup_once = CASE WHEN $2::text IS NULL THEN false ELSE allow_empty_cleanup_once END
+		WHERE id = $1
+			AND scan_warning_code IS NOT DISTINCT FROM $5::text
+			AND scan_warning_message IS NOT DISTINCT FROM $6::text
+			AND scan_warning_at IS NOT DISTINCT FROM $7::timestamptz`,
+		id, replacement.Code, replacement.Message, replacement.At, expected.Code, expected.Message, expected.At)
+	if err != nil {
+		return fmt.Errorf("updating unchanged scan warning: %w", err)
+	}
+	return nil
+}
+
+// ClearScanWarning clears any scan warning state and resets one-shot cleanup confirmation.
+func (r *FolderRepository) ClearScanWarning(ctx context.Context, id int) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE media_folders
+		SET scan_warning_code = NULL,
+			scan_warning_message = NULL,
+			scan_warning_at = NULL,
+			allow_empty_cleanup_once = false
+		WHERE id = $1`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("clearing scan warning: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrFolderNotFound
+	}
+
+	return nil
+}
+
+// AllowEmptyCleanupOnce arms a single destructive empty-root cleanup pass.
+func (r *FolderRepository) AllowEmptyCleanupOnce(ctx context.Context, id int) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE media_folders
+		SET allow_empty_cleanup_once = true
+		WHERE id = $1`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("arming empty cleanup confirmation: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrFolderNotFound
+	}
+
+	return nil
+}
+
+// ConsumeEmptyCleanupAllowance returns whether a destructive empty-root cleanup
+// has been approved and clears the one-shot flag.
+func (r *FolderRepository) ConsumeEmptyCleanupAllowance(ctx context.Context, id int) (bool, error) {
+	var allowed bool
+	err := r.pool.QueryRow(ctx,
+		`WITH current_state AS (
+			SELECT allow_empty_cleanup_once
+			FROM media_folders
+			WHERE id = $1
+		)
+		UPDATE media_folders
+		SET allow_empty_cleanup_once = false
+		WHERE id = $1
+		RETURNING (SELECT allow_empty_cleanup_once FROM current_state)`,
+		id,
+	).Scan(&allowed)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, ErrFolderNotFound
+		}
+		return false, fmt.Errorf("consuming empty cleanup confirmation: %w", err)
+	}
+
+	return allowed, nil
+}
+
+// SetPosterPath stores the S3 key of the library poster image.
+func (r *FolderRepository) SetPosterPath(ctx context.Context, id int, posterPath string) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE media_folders SET poster_path = $1 WHERE id = $2`,
+		posterPath, id,
+	)
+	if err != nil {
+		return fmt.Errorf("setting poster path: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrFolderNotFound
+	}
+	return nil
+}
+
+// ClearPosterPath removes the library poster path.
+func (r *FolderRepository) ClearPosterPath(ctx context.Context, id int) error {
+	return r.SetPosterPath(ctx, id, "")
+}
+
+// Reorder batch-updates sort_order for the given folders in a transaction.
+func (r *FolderRepository) Reorder(ctx context.Context, entries []FolderReorderEntry) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning reorder transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, e := range entries {
+		if _, err := tx.Exec(ctx,
+			"UPDATE media_folders SET sort_order = $1 WHERE id = $2",
+			e.Position, e.ID,
+		); err != nil {
+			return fmt.Errorf("reordering folder %d: %w", e.ID, err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// isDuplicateKeyError checks if the error is a PostgreSQL unique_violation (code 23505).
+func isDuplicateKeyError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
+}
+
+// extractConstraint extracts the constraint name from a PgError for diagnostic messages.
+func extractConstraint(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.ConstraintName
+	}
+	return "unknown"
+}

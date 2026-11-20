@@ -1,0 +1,178 @@
+package historyimport
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/netguard"
+)
+
+type staticSettings map[string]string
+
+func (s staticSettings) Get(_ context.Context, key string) (string, error) { return s[key], nil }
+
+type failingSettings struct{}
+
+func (failingSettings) Get(context.Context, string) (string, error) {
+	return "true", errors.New("settings unavailable")
+}
+
+// allowLocalNetworkForEveryone is the policy with the admin setting on.
+func allowLocalNetworkForEveryone() *LocalNetworkAccess {
+	return NewLocalNetworkAccess(staticSettings{SettingAllowPrivateDestinations: "true"}, nil)
+}
+
+func TestLocalNetworkAccessIsOffUnlessTheSettingIsOn(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		access *LocalNetworkAccess
+		want   bool
+	}{
+		{"no policy", nil, false},
+		{"setting absent", NewLocalNetworkAccess(staticSettings{}, nil), false},
+		{"setting off", NewLocalNetworkAccess(staticSettings{SettingAllowPrivateDestinations: "false"}, nil), false},
+		{"setting unreadable", NewLocalNetworkAccess(failingSettings{}, nil), false},
+		{"setting on", allowLocalNetworkForEveryone(), true},
+	}
+	for _, tc := range cases {
+		if got := tc.access.Allowed(ctx, 7); got != tc.want {
+			t.Errorf("%s: Allowed = %v, want %v", tc.name, got, tc.want)
+		}
+		if got := netguard.PrivateAccess(tc.access.Context(ctx, 7)); got != tc.want {
+			t.Errorf("%s: Context private access = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestLocalNetworkSettingIsARegisteredAdminBoolDefaultingOff(t *testing.T) {
+	if got := config.EffectiveAdminSettings(nil)[SettingAllowPrivateDestinations]; got != "false" {
+		t.Fatalf("default = %q, want false", got)
+	}
+	if got, err := config.NormalizeAdminSetting(SettingAllowPrivateDestinations, " true "); err != nil || got != "true" {
+		t.Fatalf("NormalizeAdminSetting(true) = %q, %v", got, err)
+	}
+	if _, err := config.NormalizeAdminSetting(SettingAllowPrivateDestinations, "sometimes"); err == nil {
+		t.Fatal("a non-boolean value was accepted")
+	}
+}
+
+// The advisory's case: a non-admin points a Jellyfin import at an address on
+// the server's network. Nothing may reach it, and the refusal must read as a
+// policy decision, not an unreachable server.
+func TestPersonalJellyfinImportRefusesLocalAddressWithoutTrust(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
+	defer upstream.Close()
+	svc := &Service{jellyfin: NewJellyfinClient(), localNetwork: NewLocalNetworkAccess(staticSettings{}, nil)}
+
+	_, err := svc.preparePersonalRun(t.Context(), 7, CreateRunInput{
+		Source: SourceTypeJellyfin, ProfileID: "target",
+		JellyfinBaseURL: upstream.URL, JellyfinUsername: "x", JellyfinPassword: "x",
+	})
+	if !errors.Is(err, netguard.ErrPrivateDestination) {
+		t.Fatalf("error = %v, want ErrPrivateDestination", err)
+	}
+	if hits.Load() != 0 {
+		t.Fatal("the refused server received a request")
+	}
+	if message, ok := ServerAddressMessage(err); !ok || message != PrivateAddressMessage {
+		t.Fatalf("ServerAddressMessage = %q, %v", message, ok)
+	}
+	if errors.Is(tagUnreachable(err), ErrSourceUnreachable) {
+		t.Fatal("a refused address was reported as unreachable")
+	}
+}
+
+// The transport refuses on its own too: a server that passes the admission
+// check but later resolves locally, or a request that bypasses admission,
+// still cannot connect.
+func TestJellyfinClientRefusesLocalAddressWithoutTrust(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
+	defer upstream.Close()
+
+	_, err := NewJellyfinClient().AuthenticateServerUser(context.Background(), upstream.URL, "x", "x")
+	if !errors.Is(err, netguard.ErrPrivateDestination) {
+		t.Fatalf("error = %v, want ErrPrivateDestination", err)
+	}
+	if hits.Load() != 0 {
+		t.Fatal("the refused server received a request")
+	}
+}
+
+func TestPersonalPlexImportChecksAddressAtAdmission(t *testing.T) {
+	input := CreateRunInput{Source: SourceTypePlex, ProfileID: "target", PlexBaseURL: "http://192.168.1.10:32400", PlexToken: "token"}
+
+	untrusted := &Service{localNetwork: NewLocalNetworkAccess(staticSettings{}, nil)}
+	if _, err := untrusted.preparePersonalRun(t.Context(), 7, input); !errors.Is(err, netguard.ErrPrivateDestination) {
+		t.Fatalf("setting off: error = %v, want ErrPrivateDestination", err)
+	}
+
+	trusted := &Service{localNetwork: allowLocalNetworkForEveryone()}
+	if _, err := trusted.preparePersonalRun(t.Context(), 7, input); err != nil {
+		t.Fatalf("setting on: %v", err)
+	}
+}
+
+// Metadata and other blocked addresses stay refused with the setting on.
+func TestPersonalImportRefusesMetadataAddressEvenWhenTrusted(t *testing.T) {
+	svc := &Service{jellyfin: NewJellyfinClient(), localNetwork: allowLocalNetworkForEveryone()}
+	inputs := []CreateRunInput{
+		{Source: SourceTypeJellyfin, ProfileID: "target", JellyfinBaseURL: "http://169.254.169.254", JellyfinUsername: "x", JellyfinPassword: "x"},
+		{Source: SourceTypePlex, ProfileID: "target", PlexBaseURL: "http://169.254.169.254", PlexToken: "token"},
+		{Source: SourceTypePlex, ProfileID: "target", PlexBaseURL: "http://[fd00:ec2::254]", PlexToken: "token"},
+	}
+	for _, input := range inputs {
+		_, err := svc.preparePersonalRun(t.Context(), 7, input)
+		if !errors.Is(err, netguard.ErrBlockedDestination) {
+			t.Fatalf("%s %s: error = %v, want ErrBlockedDestination", input.Source, input.JellyfinBaseURL+input.PlexBaseURL, err)
+		}
+		if message, _ := ServerAddressMessage(err); message != BlockedAddressMessage {
+			t.Fatalf("message = %q", message)
+		}
+	}
+}
+
+// Runs fetch through privateNetworkProvider only when the server was admin
+// configured or the user is trusted; otherwise the fetch is refused and the
+// run fails with the address message.
+func TestRunFetchNeedsTrustForLocalServer(t *testing.T) {
+	server := newJellyfinFetchServer(t, map[string][]jellyfinItem{"IsPlayed": nil, "IsFavorite": nil}, map[string]jellyfinItem{})
+	provider := NewJellyfinProvider(newUnthrottledJellyfinClient(), jellyfinLocalAuth{BaseURL: server.URL, UserID: "user-1", AccessToken: "token-1"})
+
+	_, _, err := provider.Fetch(context.Background())
+	if !errors.Is(err, netguard.ErrPrivateDestination) {
+		t.Fatalf("untrusted fetch error = %v, want ErrPrivateDestination", err)
+	}
+	if got := userFacingRunError(ExecutionSummary{}, err); got != PrivateAddressMessage {
+		t.Fatalf("run error = %q, want the address message", got)
+	}
+
+	if _, _, err := (privateNetworkProvider{provider}).Fetch(context.Background()); err != nil {
+		t.Fatalf("trusted fetch: %v", err)
+	}
+}
+
+// addUserRoles gives the personal queue fixture's users table the columns the
+// local network policy reads; every account starts as an enabled non-admin.
+func addUserRoles(t *testing.T, repo *Repository) {
+	t.Helper()
+	if _, err := repo.pool.Exec(t.Context(), `ALTER TABLE users ADD COLUMN role text NOT NULL DEFAULT 'user',
+ ADD COLUMN enabled boolean NOT NULL DEFAULT true`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func makeUserOneAdmin(t *testing.T, repo *Repository) {
+	t.Helper()
+	addUserRoles(t, repo)
+	if _, err := repo.pool.Exec(t.Context(), `UPDATE users SET role = 'admin' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+}

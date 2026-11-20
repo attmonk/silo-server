@@ -1,0 +1,102 @@
+package apiv2
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+
+	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
+)
+
+type fakeSubtitleUploads struct {
+	calls   int
+	access  catalogpkg.AccessFilter
+	request subtitles.UploadRequest
+}
+
+func (f *fakeSubtitleUploads) UploadStoredSubtitle(_ context.Context, access catalogpkg.AccessFilter, req subtitles.UploadRequest) (*subtitles.DownloadedSubtitle, error) {
+	f.calls++
+	f.access = access
+	f.request = req
+	return &subtitles.DownloadedSubtitle{ID: 7, MediaFileID: req.MediaFileID, Provider: subtitles.ProviderUpload, Language: req.Language, Format: subtitles.FormatSRT, CreatedAt: fixedTime(), S3Key: "PRIVATE_OBJECT", DownloadedBy: new(99)}, nil
+}
+func subtitleMultipart(t *testing.T, h http.Handler, path, filename string, data []byte, fields map[string]string, authenticated bool) *httptest.ResponseRecorder {
+	t.Helper()
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	for key, value := range fields {
+		if err := form.WriteField(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	part, err := form.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = part.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err = form.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, Prefix+path, &body)
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	if authenticated {
+		for key, value := range viewerHeaders() {
+			req.Header.Set(key, value)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// heldBody is a request body that signals its first read and then blocks, so
+// a request stays in flight inside its operation until release closes.
+type heldBody struct {
+	reading chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *heldBody) Read([]byte) (int, error) {
+	b.once.Do(func() { close(b.reading) })
+	<-b.release
+	return 0, io.ErrUnexpectedEOF
+}
+
+func TestSubtitleDetectV2RefusesBeyondAnAccountsConcurrentDetections(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	h := newTestHandler(t, deps)
+	detect := func() *httptest.ResponseRecorder {
+		return subtitleMultipart(t, h, "/subtitles/detect-language", "synthetic.en.srt", []byte("synthetic bytes"), nil, true)
+	}
+	release := make(chan struct{})
+	var done sync.WaitGroup
+	for range 2 {
+		body := &heldBody{reading: make(chan struct{}), release: release}
+		req := httptest.NewRequest(http.MethodPost, Prefix+"/subtitles/detect-language", body)
+		req.Header.Set("Content-Type", "multipart/form-data; boundary=held")
+		for key, value := range viewerHeaders() {
+			req.Header.Set(key, value)
+		}
+		done.Go(func() { h.ServeHTTP(httptest.NewRecorder(), req) })
+		<-body.reading
+	}
+	rec := detect()
+	requireProblem(t, rec, TypeRateLimited)
+	if rec.Header().Get("Retry-After") != "1" {
+		t.Fatalf("refused detection carries Retry-After %q", rec.Header().Get("Retry-After"))
+	}
+	close(release)
+	done.Wait()
+	if rec = detect(); rec.Code != http.StatusOK {
+		t.Fatalf("detection after the slots were released: %d %s", rec.Code, rec.Body.String())
+	}
+}

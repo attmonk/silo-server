@@ -1,0 +1,210 @@
+# Developing Silo
+
+How to build, run, and test the Silo server from source. To run Silo without
+building it, see the [README](README.md). Contribution rules and the
+pre-submission gate are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Prerequisites
+
+- Git, Make, and OpenSSL
+- Docker Engine or Docker Desktop with Docker Compose 2.24+ (local services and `make verify-prometheus-rules`)
+- Go 1.27.4+
+- Node.js 24+ with pnpm 10.32.1. The managed Jellyfin Web installer (`make jellyfin-web`,
+  `silo compat-web install`, or the admin settings) also needs Node.js 24+ for Jellyfin Web 12.x.
+- PostgreSQL 18 with pgvector, and the PostgreSQL 18 client tools (`pg_dump`, `pg_restore`)
+  for backups, including the one taken before startup migrations
+- Redis
+- FFmpeg (transcoding). On macOS, install Homebrew's keg-only full build so
+  text-subtitle burn-in and the complete filter set are available alongside
+  VideoToolbox: `brew install ffmpeg-full`. Silo discovers the Apple Silicon
+  and Intel keg paths automatically when the FFmpeg Path setting is blank; a
+  custom build can be selected explicitly in Admin Settings.
+- A C compiler and build toolchain (CGO dependencies)
+- pkg-config and the libvips development headers (image processing through bimg)
+
+## Local development
+
+Source builds use only the PostgreSQL and Redis services of
+[dev/compose.yml](dev/compose.yml); the README's `docker-compose.yml`
+runs the published omnibus image instead.
+
+```sh
+# Create the local bootstrap configuration
+cp .env.example .env
+chmod 600 .env
+printf '\nSECRET_KEY=%s\nDATABASE_URL=%s\nREDIS_URL=%s\n' \
+  "$(openssl rand -base64 48)" \
+  'postgres://silo:silo@localhost:5432/silo?sslmode=disable' \
+  'redis://localhost:6379' >> .env
+
+# Start local PostgreSQL and Redis
+docker compose -f dev/compose.yml up -d postgres redis
+
+# Install frontend dependencies and create the embedded-frontend test stub
+cd web
+pnpm install --frozen-lockfile
+cd ..
+make embed-stub
+```
+
+`dev/compose.yml` runs as the `silo-dev` Compose project with named
+volumes, so it does not reuse a development database that the earlier
+`docker compose up -d postgres redis` kept under `SILO_DATA_ROOT/postgres`.
+Stop those containers first (`docker compose down` with the earlier file), since
+they hold ports 5432 and 6379, and restore a `pg_dump` of the old database into
+the new one if you need its data.
+
+Run the backend and frontend in separate terminals, backend first:
+
+```sh
+make dev-backend
+```
+
+When a migration is pending, the backend backs up the database before applying
+it and refuses to start if it cannot, for example when `pg_dump` 18 is not
+installed (the dev Compose file runs PostgreSQL in a container, so the host may
+have no client). For local development, add `SILO_SKIP_BACKUP_BEFORE_MIGRATE=true`
+to `.env`, or turn off backups (`backup.enabled=false`) on the Backups page. See
+[backups](docs/architecture/backups.md#before-upgrades).
+
+The source-built backend listens on `:8080`, while the Vite proxy defaults to
+the Compose port `8090`. Point it at the source backend in `web/.env.local`:
+
+```dotenv
+VITE_API_PROXY_TARGET=http://localhost:8080
+```
+
+Then:
+
+```sh
+make dev-frontend
+```
+
+`.env.example` ships a non-empty `MEDIA_ROOT` because Compose validates the
+whole file even when you only start PostgreSQL and Redis. Change it before
+testing libraries against real media.
+
+### Working on the plugin SDK at the same time
+
+If a change spans Silo and `silo-plugin-sdk`, use an untracked local `go.work`
+workspace. `go.work` and `go.work.sum` are gitignored developer conveniences: CI
+runs from a clean checkout without them, and release builds set `GOWORK=off`.
+Any SDK package or symbol this repository uses must therefore be pushed and
+tagged in `silo-plugin-sdk` before the change here can merge.
+
+Plugin authors should start in the `silo-plugin-sdk` repository, usually checked
+out beside this one. It owns the plugin package format, protobuf contracts,
+generated plugin API, import paths, and manifest helpers.
+
+## Build and run from source
+
+With `.env` created and PostgreSQL and Redis running:
+
+```sh
+make build
+./silo
+```
+
+The server listens at <http://localhost:8080>. Complete onboarding and manage
+the remaining settings in the web interface.
+
+## Make targets
+
+| Target | Description |
+|---|---|
+| `make build` | Build frontend + Go binary |
+| `make frontend` | Build frontend only |
+| `make dev-frontend` | Vite dev server with HMR |
+| `make dev-backend` | Run Go backend (integrated mode) |
+| `make dev-proxy` | Run a standalone proxy node |
+| `make dev-transcode` | Run a transcode node against a running server (needs `SILO_CORE_URL` and `SILO_NODE_KEY`) |
+| `make migrate-create NAME=add_thing` | Create a timestamped Goose SQL migration |
+| `make migrate-validate` | Validate Goose migration files without touching a database |
+| `make migrate-status` | Show Goose migration status using Silo's bootstrapping runner |
+| `make migrate-up` | Apply pending Goose migrations using Silo's bootstrapping runner |
+| `make clean` | Remove build artifacts |
+
+## Database migrations
+
+Goose manages the PostgreSQL schema. Migration SQL lives in `migrations/sql/`
+with Goose annotations. Create new migrations with timestamped filenames:
+
+```sh
+make migrate-create NAME=add_thing
+make migrate-validate
+```
+
+Never run `goose fix`. Timestamped names avoid version collisions across
+parallel PRs; the `001`-style files are converted legacy migrations that keep
+their original numbers so existing `schema_versions` rows bootstrap into Goose
+without replaying old SQL. Do not renumber them.
+
+Only the integrated/API server applies migrations at runtime. A proxy node
+reads the database but never changes the schema; a transcode node has no
+database connection at all.
+
+For existing installs, use `make migrate-status` and `make migrate-up` rather
+than the Goose CLI: those targets copy legacy `schema_versions` rows into
+`public.goose_db_version` under the migration lock before reading or applying
+anything. Set `ENV_FILE=path/to/.env` to read the database URL from a different
+env file.
+
+### Keep migrations online
+
+Migrations run at startup while other API replicas keep serving, against tables
+that can hold millions of rows. Keep locks on existing tables short:
+
+- Create and drop indexes on existing tables with `CONCURRENTLY`, in a file
+  marked `-- +goose NO TRANSACTION`. Run `DROP INDEX CONCURRENTLY IF EXISTS`
+  before creating a new index: a copy left by an interrupted run is invalid, and
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would keep it, so the planner would
+  never use the index.
+- When a migration replaces one index with another, a retry must not drop the
+  replacement: goose records the version only after the last statement, so a
+  run that already dropped the old index can run again. Use a Go migration
+  that builds through `ensureIndexConcurrently` in `internal/database`, which
+  drops only an invalid copy (`internal/database/push_attempt_key_migration.go`).
+- Add foreign keys and `CHECK` constraints to existing tables as `NOT VALID`,
+  and run `VALIDATE CONSTRAINT` only after that commits: in a later migration,
+  or as a separate statement in a `NO TRANSACTION` file. Inside one
+  transaction, validation keeps the lock the `ADD` took. A `CHECK` attached to
+  `ADD COLUMN` scans the whole table under an `ACCESS EXCLUSIVE` lock.
+- Backfill large tables in batches that commit as they go, through a procedure
+  or a Go migration, rather than one statement over every row.
+- Scope session settings to the transaction with `SET LOCAL` or
+  `set_config(..., true)`. Compute partition bounds and dates in UTC, not in the
+  server's `TimeZone`.
+
+`20260914145000_index_artwork_reference_paths.sql` shows the index pattern, and
+`20260930130041_store_media_search_fields.sql` the batched backfill.
+
+## Tests and lint
+
+While iterating:
+
+```sh
+go test ./internal/<package>/...                 # DB-backed tests skip without a test database URL
+cd web && pnpm exec vitest run path/to/test.tsx
+```
+
+The full pre-submission gate (build, format, vet, lint, both test suites, and
+the verify targets) is listed once, in
+[CONTRIBUTING.md](CONTRIBUTING.md#validate-your-change).
+
+## Project structure
+
+```
+cmd/silo/       Entry point
+internal/
+  api/               HTTP router, handlers, middleware
+  auth/              JWT authentication and sessions
+  catalog/           Media item, episode, season repositories
+  config/            .env and env var bootstrap, database-backed server settings
+  jellycompat/       Jellyfin/Emby protocol compatibility
+  metadata/          Plugin-driven metadata matching and enrichment
+  playback/          Direct play, remux, transcode session management
+  scanner/           Media file discovery and FFProbe
+  worker/            Background jobs (scan, match, reconcile)
+web/                 React + TypeScript frontend (Vite, Tailwind, shadcn/ui)
+migrations/sql/      Goose-managed PostgreSQL schema migrations
+```

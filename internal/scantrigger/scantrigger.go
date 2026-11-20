@@ -1,0 +1,659 @@
+package scantrigger
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/fspath"
+	"github.com/Silo-Server/silo-server/internal/librarykind"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/themesongs"
+)
+
+const (
+	ModeLibrary = "library"
+	ModeSubtree = "subtree"
+	ModeFile    = "file"
+)
+
+// Triggers recorded for an admin's scan request that names a path, without
+// and with a library ID.
+const (
+	TriggerPath          = "path"
+	TriggerLibraryIDPath = "library_id_path"
+)
+
+// ExplicitPathTrigger reports whether trigger records an admin's scan request
+// that names a path.
+func ExplicitPathTrigger(trigger string) bool {
+	return trigger == TriggerPath || trigger == TriggerLibraryIDPath
+}
+
+// FileScanContext returns the context for running a file scan recorded with
+// trigger. Only an admin's request for the exact path scans a file that the
+// library's ignore files exclude; a scan Silo starts on its own honors them
+// even if they changed after the request was resolved.
+func FileScanContext(ctx context.Context, trigger string) context.Context {
+	if ExplicitPathTrigger(trigger) {
+		return scanner.WithExplicitFileRequest(ctx)
+	}
+	return ctx
+}
+
+type FolderRepository interface {
+	GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
+	List(ctx context.Context) ([]*models.MediaFolder, error)
+}
+
+type Queuer interface {
+	EnqueueScan(ctx context.Context, folderID int, mode, path, trigger string) (bool, error)
+	EnqueueScans(ctx context.Context, targets []Target) error
+}
+
+type Request struct {
+	LibraryID *int
+	Path      string
+	Trigger   string
+	// SidecarFolder resolves a local metadata sidecar (an .nfo document or
+	// sidecar artwork) in a video library to a subtree scan of its folder
+	// instead of rejecting it. File-change sources set it; the scan API does
+	// not.
+	SidecarFolder bool
+}
+
+// Target is a fully-resolved scan request. Folder is always non-nil for
+// targets returned by Resolver; callers should read the library ID via
+// target.Folder.ID rather than tracking it separately.
+type Target struct {
+	Folder  *models.MediaFolder
+	Mode    string
+	Path    string
+	Trigger string
+}
+
+// EnqueueOutcome reports what enqueueing one Target did: RunID names the scan
+// run the request was created as or coalesced into, and Created is false when
+// a run for the same scope was already queued or running. FollowUp is true when
+// that run was already running: it may have walked the scope before the change,
+// so a follow-up scan of the same scope, queued when it finishes, covers the
+// request instead of RunID.
+type EnqueueOutcome struct {
+	RunID    string
+	Created  bool
+	FollowUp bool
+}
+
+// Reason identifies why a request was rejected, independently of the prose in
+// Message. Callers that need to branch on a specific rejection match on this:
+// Message is written for the client reading the response, and rewording it
+// silently broke every caller comparing the string. Status and Code are too
+// coarse to tell two bad requests apart.
+type Reason string
+
+const (
+	ReasonScannerUnavailable    Reason = "scanner_unavailable"
+	ReasonPathRequired          Reason = "path_required"
+	ReasonLibraryOrPathRequired Reason = "library_or_path_required"
+	ReasonSubtreeOutsideLibrary Reason = "subtree_outside_library"
+	ReasonLibraryDisabled       Reason = "library_disabled"
+	ReasonLibraryNotFound       Reason = "library_not_found"
+	ReasonLibraryRootOffline    Reason = "library_root_offline"
+	ReasonPathMissing           Reason = "path_missing"
+	ReasonPathStillExists       Reason = "path_still_exists"
+	ReasonPathNotInspectable    Reason = "path_not_inspectable"
+	ReasonPathNotFileOrDir      Reason = "path_not_file_or_dir"
+	ReasonPathPermissionDenied  Reason = "path_permission_denied"
+	ReasonPathOutsideLibrary    Reason = "path_outside_library"
+	ReasonPathAmbiguous         Reason = "path_ambiguous"
+	ReasonNoLibraryMatch        Reason = "no_library_match"
+	ReasonUnsupportedExtension  Reason = "unsupported_extension"
+	ReasonPathIgnored           Reason = "path_ignored"
+)
+
+// Error codes and the messages repeated across more than one rejection site.
+// Keeping them named means the same condition cannot end up worded two ways
+// depending on which branch produced it.
+const (
+	codeBadRequest  = "bad_request"
+	codeConflict    = "conflict"
+	codeNotFound    = "not_found"
+	codeUnavailable = "unavailable"
+
+	msgScannerUnavailable = "Scanner not available"
+	msgLibraryDisabled    = "Library is disabled"
+	msgPathRequired       = "Path is required"
+	msgUnsupportedExt     = "Unsupported media file extension for library type"
+	msgPathNotInspectable = "Path could not be inspected"
+)
+
+type RequestError struct {
+	Status  int
+	Code    string
+	Message string
+	Reason  Reason
+}
+
+func (e *RequestError) Error() string {
+	return e.Message
+}
+
+type Resolver struct {
+	folders FolderRepository
+}
+
+func NewResolver(folders FolderRepository) *Resolver {
+	return &Resolver{folders: folders}
+}
+
+func (r *Resolver) ResolveAll(ctx context.Context, requests []Request) ([]Target, error) {
+	targets := make([]Target, 0, len(requests))
+	var pathFolders []*models.MediaFolder
+	pathFoldersLoaded := false
+	for _, req := range requests {
+		usePathFolders := req.LibraryID == nil && strings.TrimSpace(req.Path) != ""
+		if usePathFolders && !pathFoldersLoaded {
+			if r == nil || r.folders == nil {
+				return nil, &RequestError{Status: http.StatusServiceUnavailable, Code: codeUnavailable, Message: msgScannerUnavailable, Reason: ReasonScannerUnavailable}
+			}
+			folders, listErr := r.folders.List(ctx)
+			if listErr != nil {
+				return nil, fmt.Errorf("listing libraries for scan: %w", listErr)
+			}
+			pathFolders = folders
+			pathFoldersLoaded = true
+		}
+
+		target, err := r.resolve(ctx, req, pathFolders, usePathFolders)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, *target)
+	}
+	return targets, nil
+}
+
+func (r *Resolver) Resolve(ctx context.Context, req Request) (*Target, error) {
+	return r.resolve(ctx, req, nil, false)
+}
+
+// ResolveMissingSubtree resolves a subtree path that may no longer exist on
+// disk. This is intentionally narrower than Resolve: it never stats the path
+// and only returns ModeSubtree for paths below a configured library root.
+func (r *Resolver) ResolveMissingSubtree(ctx context.Context, subtreePath, trigger string) (*Target, error) {
+	if r == nil || r.folders == nil {
+		return nil, &RequestError{Status: http.StatusServiceUnavailable, Code: codeUnavailable, Message: msgScannerUnavailable, Reason: ReasonScannerUnavailable}
+	}
+	cleanPath := filepath.Clean(subtreePath)
+	if strings.TrimSpace(subtreePath) == "" || cleanPath == "." {
+		return nil, &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: msgPathRequired, Reason: ReasonPathRequired}
+	}
+	folder, matchedRoot, err := r.matchEnabledFolder(ctx, cleanPath)
+	if err != nil {
+		return nil, err
+	}
+	if filepath.Clean(cleanPath) == filepath.Clean(matchedRoot) {
+		return nil, &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Subtree path must be below a library root", Reason: ReasonSubtreeOutsideLibrary}
+	}
+	return &Target{Folder: folder, Mode: ModeSubtree, Path: subtitleFolderScope(cleanPath, matchedRoot, folder.Type), Trigger: normalizeTrigger(trigger)}, nil
+}
+
+// matchEnabledFolder lists the configured libraries and returns the enabled
+// folder (and its matched root) that owns the given path. Shared by the
+// resolvers that accept paths which may no longer exist on disk.
+func (r *Resolver) matchEnabledFolder(ctx context.Context, cleanPath string) (*models.MediaFolder, string, error) {
+	folders, err := r.folders.List(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing libraries for scan: %w", err)
+	}
+	folder, matchedRoot, err := MatchFolderForPath(cleanPath, folders)
+	if err != nil {
+		return nil, "", err
+	}
+	if folder != nil && !folder.Enabled {
+		return nil, "", &RequestError{Status: http.StatusConflict, Code: codeConflict, Message: msgLibraryDisabled, Reason: ReasonLibraryDisabled}
+	}
+	return folder, matchedRoot, nil
+}
+
+func normalizeTrigger(trigger string) string {
+	if trigger = strings.TrimSpace(trigger); trigger == "" {
+		return TriggerPath
+	}
+	return trigger
+}
+
+// ResolveVanishedPath resolves a change for a path that no longer exists on
+// disk (a file deleted by an upgrade/replacement, or a removed directory) to a
+// reconciling scan target. Paths with a supported extension for their library
+// map to a media-file scan (see mediaFileTarget); paths with a media extension
+// the library type does not support are rejected; remaining paths map to a
+// subtree scan of the path itself. The scoped scan marks vanished files
+// missing so stale versions stop being offered for playback.
+//
+// Two guards keep this from turning transient storage loss into cleanup:
+// the path must actually be gone (a still-existing path is rejected — use
+// Resolve), and the matched library root must still exist on disk so an
+// unmounted share never resolves to a reconciling scan.
+func (r *Resolver) ResolveVanishedPath(ctx context.Context, path, trigger string) (*Target, error) {
+	return r.resolveVanished(ctx, path, trigger, false)
+}
+
+// ResolveVanishedFile is ResolveVanishedPath for a path the caller knows was
+// a file. A file that is neither media nor a sidecar of the library's videos
+// (a tool's temp or backup copy, such as Tdarr's *.partial.old) is rejected
+// with ReasonUnsupportedExtension: no scan catalogs it, and a subtree scan of
+// a file that is gone only fails to read its own root and warns that the
+// scan was partial.
+func (r *Resolver) ResolveVanishedFile(ctx context.Context, path, trigger string) (*Target, error) {
+	return r.resolveVanished(ctx, path, trigger, true)
+}
+
+func (r *Resolver) resolveVanished(ctx context.Context, path, trigger string, file bool) (*Target, error) {
+	if r == nil || r.folders == nil {
+		return nil, &RequestError{Status: http.StatusServiceUnavailable, Code: codeUnavailable, Message: msgScannerUnavailable, Reason: ReasonScannerUnavailable}
+	}
+	cleanPath := filepath.Clean(path)
+	if strings.TrimSpace(path) == "" || cleanPath == "." {
+		return nil, &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: msgPathRequired, Reason: ReasonPathRequired}
+	}
+	if _, err := fspath.Lstat(cleanPath); err == nil {
+		return nil, &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Path still exists", Reason: ReasonPathStillExists}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		// Only a confirmed ENOENT counts as vanished. Permission or other
+		// stat failures must not reconcile still-existing files as missing.
+		return nil, &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: msgPathNotInspectable, Reason: ReasonPathNotInspectable}
+	}
+	folder, matchedRoot, err := r.matchEnabledFolder(ctx, cleanPath)
+	if err != nil {
+		return nil, err
+	}
+	if info, statErr := fspath.Stat(matchedRoot); statErr != nil || !info.IsDir() {
+		return nil, &RequestError{Status: http.StatusConflict, Code: codeConflict, Message: "Library root is not available", Reason: ReasonLibraryRootOffline}
+	}
+	trigger = normalizeTrigger(trigger)
+
+	if supportsLibraryMediaFile(cleanPath, folder.Type) {
+		mode, targetPath, err := mediaFileTarget(cleanPath, matchedRoot, folder.Type)
+		if err != nil {
+			return nil, err
+		}
+		return &Target{Folder: folder, Mode: mode, Path: targetPath, Trigger: trigger}, nil
+	}
+	if supportsMediaFile(cleanPath) {
+		return nil, &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: msgUnsupportedExt, Reason: ReasonUnsupportedExtension}
+	}
+	if dir, ok := localSidecarScope(cleanPath, matchedRoot, folder.Type); ok {
+		return &Target{Folder: folder, Mode: ModeSubtree, Path: dir, Trigger: trigger}, nil
+	}
+	if file {
+		return nil, &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: msgUnsupportedExt, Reason: ReasonUnsupportedExtension}
+	}
+	scope := subtitleFolderScope(cleanPath, matchedRoot, folder.Type)
+	if filepath.Clean(scope) == filepath.Clean(matchedRoot) {
+		// A vanished entry directly under the root reconciles via a full
+		// library scan, which keeps the empty-root guard in play.
+		return &Target{Folder: folder, Mode: ModeLibrary, Trigger: trigger}, nil
+	}
+	return &Target{Folder: folder, Mode: ModeSubtree, Path: scope, Trigger: trigger}, nil
+}
+
+func (r *Resolver) resolve(ctx context.Context, req Request, pathFolders []*models.MediaFolder, usePathFolders bool) (*Target, error) {
+	if r == nil || r.folders == nil {
+		return nil, &RequestError{Status: http.StatusServiceUnavailable, Code: codeUnavailable, Message: msgScannerUnavailable, Reason: ReasonScannerUnavailable}
+	}
+	if req.LibraryID == nil && strings.TrimSpace(req.Path) == "" {
+		return nil, &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Either library_id or path is required", Reason: ReasonLibraryOrPathRequired}
+	}
+
+	var folder *models.MediaFolder
+	var err error
+	if req.LibraryID != nil {
+		folder, err = r.folders.GetByID(ctx, *req.LibraryID)
+		if err != nil {
+			if errors.Is(err, catalog.ErrFolderNotFound) {
+				return nil, &RequestError{Status: http.StatusNotFound, Code: codeNotFound, Message: "Library not found", Reason: ReasonLibraryNotFound}
+			}
+			return nil, fmt.Errorf("fetching library for scan: %w", err)
+		}
+	}
+
+	trigger := strings.TrimSpace(req.Trigger)
+	if trigger == "" {
+		trigger = "manual"
+	}
+	if strings.TrimSpace(req.Path) == "" {
+		if folder != nil && !folder.Enabled {
+			return nil, &RequestError{Status: http.StatusConflict, Code: codeConflict, Message: msgLibraryDisabled, Reason: ReasonLibraryDisabled}
+		}
+		return &Target{Folder: folder, Mode: ModeLibrary, Trigger: trigger}, nil
+	}
+
+	cleanPath := filepath.Clean(req.Path)
+	var matchedRoot string
+	if folder != nil {
+		matchedRoot, err = LongestMatchingRoot(cleanPath, folder.Paths)
+		if err != nil {
+			return nil, err
+		}
+		if matchedRoot == "" {
+			return nil, &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Path does not belong to the specified library", Reason: ReasonPathOutsideLibrary}
+		}
+	} else {
+		folders := pathFolders
+		if !usePathFolders {
+			var listErr error
+			folders, listErr = r.folders.List(ctx)
+			if listErr != nil {
+				return nil, fmt.Errorf("listing libraries for scan: %w", listErr)
+			}
+		}
+		folder, matchedRoot, err = MatchFolderForPath(cleanPath, folders)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if folder != nil && !folder.Enabled {
+		return nil, &RequestError{Status: http.StatusConflict, Code: codeConflict, Message: msgLibraryDisabled, Reason: ReasonLibraryDisabled}
+	}
+
+	mode, err := ClassifyLibraryPath(cleanPath, matchedRoot, folder.Type)
+	if reqErr, ok := errors.AsType[*RequestError](err); ok && reqErr.Reason == ReasonUnsupportedExtension && req.SidecarFolder {
+		if dir, ok := localSidecarScope(cleanPath, matchedRoot, folder.Type); ok {
+			mode, cleanPath, err = ModeSubtree, dir, nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	// An admin who names a path asks for that file explicitly, so only the
+	// scans Silo starts on its own honor the library's ignore files here.
+	explicit := trigger == "manual"
+	if trigger == "manual" {
+		trigger = TriggerPath
+		if req.LibraryID != nil {
+			trigger = TriggerLibraryIDPath
+		}
+	}
+
+	targetPath := cleanPath
+	switch mode {
+	case ModeLibrary:
+		targetPath = ""
+	case ModeSubtree:
+		targetPath = subtitleFolderScope(cleanPath, matchedRoot, folder.Type)
+	case ModeFile:
+		mode, targetPath, err = mediaFileTarget(cleanPath, matchedRoot, folder.Type)
+		if err != nil {
+			return nil, err
+		}
+		if mode == ModeFile && !explicit {
+			if err := requireFileNotIgnored(ctx, cleanPath, folder.Paths); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return &Target{Folder: folder, Mode: mode, Path: targetPath, Trigger: trigger}, nil
+}
+
+// requireFileNotIgnored rejects a file target that the library walk would
+// skip. A file scan reads no ignore files, so a watcher or autoscan event for
+// such a file (one in a flat library root, or any audiobook, ebook, or manga
+// file) would import what the next library scan retires again. Directory
+// targets need no check: a subtree scan applies the rules itself.
+//
+// An ignore file that cannot be read lets the file through, as before the
+// check existed. Rejecting it would lose the change for good, since the
+// monitor and autoscan do not retry a rejected path, and a library walk that
+// meets the same unreadable file protects the rows below it instead of
+// retiring them.
+func requireFileNotIgnored(ctx context.Context, path string, libraryRoots []string) error {
+	ignored, err := scanner.FileIgnored(path, libraryRoots)
+	switch {
+	case err != nil:
+		slog.WarnContext(ctx, "scantrigger: could not read ignore files; scanning the file anyway", "component", "scantrigger",
+			"path", path, "error", err)
+	case ignored:
+		return &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Path is excluded by the library's ignore files", Reason: ReasonPathIgnored}
+	}
+	return nil
+}
+
+// mediaFileTarget widens a video file request to a subtree scan of the file's
+// directory. Automation (Sonarr, Radarr, watchers) reports the one path it
+// knows about, but a release lands as a directory's worth of changes: the
+// replaced version is deleted, sidecars (.nfo, posters, subtitles) are
+// rewritten, and change publishers batch per directory so not every event
+// arrives. Scanning the directory picks all of that up; scanning the exact
+// file leaves the replaced version in the catalog until the next full scan.
+//
+// The widening stops at the library root: a file directly under the root
+// keeps its exact-file scan so a flat library never turns one file event into
+// a full library scan. Audiobook, ebook, and manga files also keep the
+// exact-file scan; their kinds group files differently and the video
+// replacement pattern does not apply to them.
+//
+// The directory may already be gone (a removed movie folder reported through
+// its file). A subtree scan of a missing directory cannot see anything and
+// protects its rows instead of marking them missing, so the exact-file scan,
+// which reconciles a vanished file by path, stays the target in that case.
+// Any other failure to inspect the directory is reported rather than quietly
+// narrowed to the file: a permission error would otherwise skip the directory
+// scan and leave the replaced version and sidecars unreconciled.
+func mediaFileTarget(cleanPath, matchedRoot, folderType string) (string, string, error) {
+	if !scansVideoFiles(folderType) {
+		return ModeFile, cleanPath, nil
+	}
+	if owner, ok := themesongs.OwnerDirectory(cleanPath); ok {
+		if !PathWithinRoot(owner, matchedRoot) {
+			return "", "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Theme owner is outside the library", Reason: ReasonPathOutsideLibrary}
+		}
+		// ScanFile reconciles only the theme owner's audio, even at the root.
+		return ModeFile, cleanPath, nil
+	}
+	dir := filepath.Dir(cleanPath)
+	if filepath.Clean(dir) == filepath.Clean(matchedRoot) {
+		return ModeFile, cleanPath, nil
+	}
+	info, err := fspath.Stat(dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return ModeFile, cleanPath, nil
+	case errors.Is(err, os.ErrPermission):
+		return "", "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Permission denied for path", Reason: ReasonPathPermissionDenied}
+	case err != nil:
+		return "", "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: msgPathNotInspectable, Reason: ReasonPathNotInspectable}
+	case !info.IsDir():
+		return "", "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Path must be a file or directory", Reason: ReasonPathNotFileOrDir}
+	}
+	return ModeSubtree, dir, nil
+}
+
+// localSidecarScope maps a local metadata sidecar (an .nfo document or sidecar
+// artwork) or a subtitle in a video library to a subtree scan of the directory
+// of the videos it belongs to: the scan lists the directory's sidecars, and
+// metadata re-applies the items there whose sidecars changed. A subtitle in a
+// Subs/ folder belongs to the videos beside that folder. A sidecar directly
+// under the library root is not mapped, so one edit in a flat library never
+// becomes a full library scan; the next library scan picks it up.
+func localSidecarScope(cleanPath, matchedRoot, folderType string) (string, bool) {
+	if !scansVideoFiles(folderType) {
+		return "", false
+	}
+	dir := filepath.Dir(cleanPath)
+	switch {
+	case scanner.IsLocalMetadataSidecar(cleanPath):
+	case scanner.IsSubtitleSidecar(cleanPath):
+		if owner, ok := scanner.SubtitleFolderOwner(dir); ok {
+			dir = owner
+		}
+	default:
+		return "", false
+	}
+	if filepath.Clean(dir) == filepath.Clean(matchedRoot) || !PathWithinRoot(dir, matchedRoot) {
+		return "", false
+	}
+	return dir, true
+}
+
+// subtitleFolderScope widens a subtree scan of a Subs/ or Subtitles/ folder,
+// or of a folder inside one, to the directory of the videos that read it: the
+// subtitle folder holds no video, so scanning it alone changes nothing. The
+// widening stops below the library root, as localSidecarScope does.
+func subtitleFolderScope(dir, matchedRoot, folderType string) string {
+	if !scansVideoFiles(folderType) {
+		return dir
+	}
+	owner, ok := scanner.SubtitleFolderOwner(dir)
+	if !ok || filepath.Clean(owner) == filepath.Clean(matchedRoot) || !PathWithinRoot(owner, matchedRoot) {
+		return dir
+	}
+	return owner
+}
+
+// scansVideoFiles reports whether a library kind is served by the video
+// scanner; it mirrors the default branch of supportsLibraryMediaFile.
+func scansVideoFiles(folderType string) bool {
+	return !librarykind.IsAudiobook(folderType) &&
+		!librarykind.IsEbook(folderType) &&
+		!librarykind.IsManga(folderType) &&
+		!librarykind.IsPodcast(folderType)
+}
+
+func EnqueueAll(ctx context.Context, queue Queuer, targets []Target) error {
+	if queue == nil {
+		return &RequestError{Status: http.StatusServiceUnavailable, Code: codeUnavailable, Message: msgScannerUnavailable, Reason: ReasonScannerUnavailable}
+	}
+	if err := queue.EnqueueScans(ctx, targets); err != nil {
+		return fmt.Errorf("queueing library scans: %w", err)
+	}
+	return nil
+}
+
+func LongestMatchingRoot(targetPath string, roots []string) (string, error) {
+	bestRoot := ""
+	bestLen := -1
+	for _, root := range roots {
+		if !PathWithinRoot(targetPath, root) {
+			continue
+		}
+		cleanRoot := filepath.Clean(root)
+		rootLen := len(cleanRoot)
+		if rootLen > bestLen {
+			bestRoot = cleanRoot
+			bestLen = rootLen
+		}
+	}
+	return bestRoot, nil
+}
+
+func MatchFolderForPath(targetPath string, folders []*models.MediaFolder) (*models.MediaFolder, string, error) {
+	var bestFolder *models.MediaFolder
+	bestRoot := ""
+	bestLen := -1
+	ambiguous := false
+
+	for _, folder := range folders {
+		if folder == nil {
+			continue
+		}
+		root, err := LongestMatchingRoot(targetPath, folder.Paths)
+		if err != nil {
+			return nil, "", err
+		}
+		if root == "" {
+			continue
+		}
+		rootLen := len(root)
+		if rootLen > bestLen {
+			bestFolder = folder
+			bestRoot = root
+			bestLen = rootLen
+			ambiguous = false
+			continue
+		}
+		if rootLen == bestLen && bestFolder != nil && folder.ID != bestFolder.ID {
+			ambiguous = true
+		}
+	}
+
+	if ambiguous {
+		return nil, "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Path matches multiple libraries", Reason: ReasonPathAmbiguous}
+	}
+	if bestFolder == nil {
+		return nil, "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "No library matches the given path", Reason: ReasonNoLibraryMatch}
+	}
+	return bestFolder, bestRoot, nil
+}
+
+func ClassifyPath(targetPath, matchedRoot string) (string, error) {
+	return ClassifyLibraryPath(targetPath, matchedRoot, "")
+}
+
+func ClassifyLibraryPath(targetPath, matchedRoot, folderType string) (string, error) {
+	if filepath.Clean(targetPath) == filepath.Clean(matchedRoot) {
+		return ModeLibrary, nil
+	}
+
+	info, err := fspath.Stat(targetPath)
+	if err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Path does not exist", Reason: ReasonPathMissing}
+		case errors.Is(err, os.ErrPermission):
+			return "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Permission denied for path", Reason: ReasonPathPermissionDenied}
+		default:
+			return "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: msgPathNotInspectable, Reason: ReasonPathNotInspectable}
+		}
+	}
+	if info.IsDir() {
+		return ModeSubtree, nil
+	}
+	if !info.Mode().IsRegular() {
+		return "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Path must be a file or directory", Reason: ReasonPathNotFileOrDir}
+	}
+	if !supportsLibraryMediaFile(targetPath, folderType) {
+		return "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: msgUnsupportedExt, Reason: ReasonUnsupportedExtension}
+	}
+	return ModeFile, nil
+}
+
+func supportsLibraryMediaFile(path, folderType string) bool {
+	switch {
+	case librarykind.IsAudiobook(folderType):
+		return scanner.SupportsAudioFile(path)
+	case librarykind.IsEbook(folderType), librarykind.IsManga(folderType):
+		return scanner.SupportsEbookFile(path)
+	case librarykind.IsPodcast(folderType):
+		return false
+	default:
+		_, theme := themesongs.OwnerDirectory(path)
+		return scanner.SupportsVideoFile(path) || theme
+	}
+}
+
+func supportsMediaFile(path string) bool {
+	return scanner.SupportsVideoFile(path) ||
+		scanner.SupportsAudioFile(path) ||
+		scanner.SupportsEbookFile(path)
+}
+
+func PathWithinRoot(targetPath, rootPath string) bool {
+	cleanTarget := filepath.Clean(targetPath)
+	cleanRoot := filepath.Clean(rootPath)
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == "" {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}

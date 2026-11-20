@@ -1,0 +1,469 @@
+import { useEffect, useRef, useState } from "react";
+import { parseVTT, type ParsedCue } from "../utils/parseVTT";
+import type { PlayerSubtitleInfo } from "../types";
+import { isASSCodec, isBitmapCodec } from "../utils/subtitleCodecs";
+import {
+  createSubtitleWindowFetcher,
+  subtitlePlayheadSeconds,
+  subtitleWindowUrl,
+} from "../utils/subtitleWindows";
+
+// Pull back this many seconds from the current position when starting
+// a fresh fetch, so a quick scrub back still lands inside the window.
+const SEEK_BACKOFF = 2;
+
+/**
+ * Cues (in source time) and window coverage snapshotted from a track that is
+ * being torn down, so a rebuild against a reloaded <video> element (stream
+ * restart) can restore them instead of refetching — window extraction costs
+ * a multi-second ffmpeg run per request.
+ */
+interface SubtitleTrackCarryover {
+  url: string | null;
+  cueRevision: number;
+  cues: ParsedCue[];
+  coverageStart: number;
+  windowEnd: number;
+  atEOF: boolean;
+  hasFetched: boolean;
+}
+
+/** Strip VTT formatting tags, keeping only the text content. */
+function stripVTTTags(text: string): string {
+  return text.replace(/<[^>]+>/g, "");
+}
+
+/**
+ * Add parsed cues to a TextTrack, applying the stream origin and user delay and
+ * deduping against `seen`. Shared by the URL fetcher and the live-cue path.
+ */
+function addCuesToTrack(
+  track: TextTrack,
+  cues: ParsedCue[],
+  origin: number,
+  delaySec: number,
+  seen: Set<string>,
+): void {
+  for (const parsed of cues) {
+    if (parsed.end <= parsed.start) continue;
+    const startTime = Math.max(0, parsed.start - origin + delaySec);
+    const endTime = parsed.end - origin + delaySec;
+    if (endTime <= 0) continue;
+    // Key on the source cue times, not the delay-shifted display times: the
+    // delay can change between overlapping fetch windows, and a delay-relative
+    // key would let the same source cue re-add itself after a shift.
+    const key = `${parsed.start}|${parsed.end}|${parsed.text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    track.addCue(new VTTCue(startTime, endTime, parsed.text));
+  }
+}
+
+/**
+ * Manages subtitle display by delegating cue-against-time matching to the
+ * browser's TextTrack, while keeping render control on our side for the
+ * subtitle appearance panel.
+ *
+ * We create a programmatic TextTrack in `hidden` mode, stream WebVTT from
+ * the server incrementally, and push each parsed cue as a `VTTCue` onto
+ * the track. The browser then fires `cuechange` in sync with the media
+ * clock — the same clock that dictates which video frame is on screen —
+ * so subtitles display exactly when they should regardless of any PTS
+ * normalization hls.js has applied to the underlying segments.
+ *
+ * A sliding-window fetcher prefetches the next window as playback nears
+ * the tail of the current one and aborts in-flight fetches on seeks
+ * outside coverage. The fetch scheduling is independent from cue display.
+ *
+ * `subtitleDelayMs` lets the user nudge sync without a refetch: new cues
+ * are added with the current delay baked in, and existing cues are shifted
+ * in place whenever the value changes. Positive = show subtitles later.
+ * `streamOriginSeconds` changes (a copy-mode session restarting at a new
+ * position) are handled the same way: existing cues shift in place onto
+ * the new timeline instead of tearing down the track.
+ */
+export function useSubtitleTracks(
+  videoRef: React.RefObject<HTMLVideoElement | null>,
+  subtitleUrls: PlayerSubtitleInfo[],
+  activeSubtitleIndex: number | null,
+  streamOriginSeconds: number,
+  subtitleDelayMs: number,
+  // Known media duration in source-time seconds (0 when unknown). Used to
+  // decide when a fetch window has reached end-of-input.
+  durationRef: React.RefObject<number>,
+  // Media-time position playback is heading to (pending seek target, or the
+  // session's start position). While the element has no media loaded yet
+  // (session start or a stream restart), `video.currentTime` still reads 0
+  // rather than the resume/seek target — fetching the window at 0 wastes an
+  // ffmpeg run and, because only one fetch is in flight at a time, blocks
+  // the correct window until it completes.
+  fetchAnchorRef: React.RefObject<number>,
+  liveCues?: ParsedCue[] | null,
+  // Identifies the current live translation job. Changing it (a new job) rebuilds
+  // the track and resets the dedup set so cues from a prior run never linger.
+  liveTrackKey?: string | null,
+  // Bumped whenever the underlying media stream is (re)started — a quality,
+  // audio, or subtitle-burn-in switch tears down the <video> element and
+  // reloads it. A programmatic TextTrack built moments before that reload is
+  // orphaned by the browser (it survives quality switches only because it was
+  // built against an already-stable stream). Changing this rebuilds the track
+  // against the settled new stream, so selecting a text track in the same
+  // action that restarts the transcode (turning off bitmap burn-in) still
+  // renders. Initial media loading also bumps it because HLS can clear cues
+  // fetched before the first media metadata arrives.
+  streamGeneration = 0,
+  // "refreshing" is a reload of the track on screen for new timing: its
+  // current cues stay up meanwhile, so it is not announced as loading.
+  onLoadState?: (state: "idle" | "loading" | "refreshing" | "ready" | "error") => void,
+  // Bumped when the server retimed the active track's content (subtitle sync
+  // or a timing reset) behind an unchanged URL. Changing it refetches the cues
+  // instead of restoring the carried-over ones.
+  cueRevision = 0,
+): string[] {
+  const [activeCueTexts, setActiveCueTexts] = useState<string[]>([]);
+  const onLoadStateRef = useRef(onLoadState);
+  onLoadStateRef.current = onLoadState;
+
+  // Latest stream origin, readable from stable callbacks (maybeFetch) without
+  // retriggering the main effect.
+  const streamOriginRef = useRef(streamOriginSeconds);
+  streamOriginRef.current = streamOriginSeconds;
+  // Origin currently baked into the track's VTTCue times. Cue-add paths read
+  // this (not the live origin) so the track never mixes bases; the rebase
+  // effect below is the only place it advances, shifting existing cues along.
+  const appliedOriginRef = useRef(streamOriginSeconds);
+
+  const activeSub =
+    activeSubtitleIndex !== null
+      ? (subtitleUrls.find((s) => s.index === activeSubtitleIndex) ?? null)
+      : null;
+  const activeUrl = activeSub?.url ?? null;
+  const activeCodec = activeSub?.codec;
+  const activeLang = activeSub?.language ?? "";
+  // A live track's cues arrive over the websocket (liveCues) instead of from a
+  // URL; the main effect builds the track but skips the sliding-window fetcher.
+  const activeIsLive = activeSub?.live === true;
+
+  // Track which delay is currently baked into the VTTCues on the active track,
+  // so the delay-update effect below can compute the exact shift to apply.
+  // Cue-add paths also read this to keep new cues aligned with existing ones.
+  const appliedDelayMsRef = useRef(0);
+  const trackRef = useRef<TextTrack | null>(null);
+  // Cue dedup set, held in a ref so the live-cue effect and the URL fetcher
+  // share it. Reset whenever a fresh track is built.
+  const seenCueKeysRef = useRef<Set<string>>(new Set());
+  // How many of `liveCues` have already been pushed onto the live track. Lets the
+  // live-cue effect add only the new tail each batch instead of rescanning the
+  // whole (growing) array. Reset on every track rebuild.
+  const processedLiveCuesRef = useRef(0);
+  // Snapshot of the previous track's cues and coverage, written by the main
+  // effect's cleanup and consumed by the next build when the subtitle URL is
+  // unchanged (a rebuild forced by a stream reload rather than a track switch).
+  const carryoverRef = useRef<SubtitleTrackCarryover | null>(null);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const videoEl: HTMLVideoElement = video;
+
+    // A retime of the track on screen (same URL, new cue revision) swaps its
+    // cues in place: the current ones stay up until the corrected ones arrive.
+    const previous = carryoverRef.current;
+    const retiming =
+      previous !== null &&
+      previous.url === activeUrl &&
+      previous.cueRevision !== cueRevision &&
+      previous.hasFetched &&
+      !activeIsLive;
+    if (!retiming) {
+      setActiveCueTexts([]);
+      onLoadStateRef.current?.("idle");
+    }
+
+    // Skip entirely for ASS/SSA (JASSUB renders those via useASSSubtitles)
+    // and bitmap codecs (usePGSSubtitles draws PGS; DVD/DVB are burned into
+    // the video server-side), which carry no text cues to show.
+    if (isASSCodec(activeCodec) || isBitmapCodec(activeCodec)) {
+      return;
+    }
+    // Need either a URL to stream from or a live cue source.
+    if (!activeUrl && !activeIsLive) {
+      return;
+    }
+
+    // Programmatic TextTrack. `hidden` mode still maintains activeCues
+    // and fires `cuechange` synchronously with the media clock, but
+    // suppresses the browser's built-in cue renderer so the appearance
+    // panel stays in charge of styling.
+    const track = videoEl.addTextTrack("subtitles", "Silo", activeLang || undefined);
+    track.mode = "hidden";
+    trackRef.current = track;
+    seenCueKeysRef.current = new Set();
+    processedLiveCuesRef.current = 0;
+    // Fresh track has no cues, so it trivially carries the current origin.
+    appliedOriginRef.current = streamOriginRef.current;
+
+    // Restore cues and coverage carried over from the previous track when the
+    // URL is unchanged — i.e. this rebuild replaces a track orphaned by a
+    // stream reload, not a track switch. Cue times were snapshotted in source
+    // time and are re-derived against the current origin/delay here, so an
+    // origin change across the reload lands correctly. Rebuild dedup keys for
+    // every restored cue, including cues newly visible after an origin change.
+    const carried = carryoverRef.current;
+    carryoverRef.current = null;
+    const restored =
+      carried && carried.url === activeUrl && carried.cueRevision === cueRevision && !activeIsLive
+        ? carried
+        : null;
+    // HLS clears every native TextTrack when it attaches a new stream. Keep
+    // source cues independently so that cleanup after that clear can still
+    // restore the fetched window, rather than marking an empty track covered.
+    const sourceCues = new Map<string, ParsedCue>();
+    for (const cue of restored?.cues ?? []) {
+      sourceCues.set(`${cue.start}|${cue.end}|${cue.text}`, cue);
+    }
+    if (restored) {
+      const origin = appliedOriginRef.current;
+      const delaySec = appliedDelayMsRef.current / 1000;
+      addCuesToTrack(track, restored.cues, origin, delaySec, seenCueKeysRef.current);
+    }
+    // While retiming, the previous cues hold the screen as placeholders until
+    // the first corrected window replaces them.
+    let placeholders = false;
+    if (retiming && carried && carried.cues.length > 0) {
+      const origin = appliedOriginRef.current;
+      const delaySec = appliedDelayMsRef.current / 1000;
+      addCuesToTrack(track, carried.cues, origin, delaySec, seenCueKeysRef.current);
+      placeholders = true;
+    }
+
+    if (restored?.hasFetched) onLoadStateRef.current?.("ready");
+
+    function handleCueChange() {
+      const active = track.activeCues;
+      if (!active || active.length === 0) {
+        setActiveCueTexts([]);
+        return;
+      }
+      setActiveCueTexts(Array.from(active).map((c) => stripVTTTags((c as VTTCue).text)));
+    }
+
+    track.addEventListener("cuechange", handleCueChange);
+
+    function clearCues() {
+      sourceCues.clear();
+      seenCueKeysRef.current.clear();
+      const cues = track.cues;
+      if (!cues) return;
+      // Snapshot first: removeCue mutates the live list, and indexing into
+      // a shifting list on each iteration is O(n²).
+      for (const cue of Array.from(cues)) {
+        track.removeCue(cue);
+      }
+    }
+
+    function dropPlaceholders() {
+      if (!placeholders) return;
+      placeholders = false;
+      clearCues();
+    }
+
+    function addParsedCues(newCues: ParsedCue[]) {
+      if (newCues.length === 0) return;
+      dropPlaceholders();
+      // Cue timestamps come from ffmpeg in source-PTS. For copy-mode HLS
+      // the player timeline is rebased to start at `streamOriginSeconds`,
+      // so subtract it. For regular transcodes origin is 0 and the
+      // subtraction is a no-op. Use the origin already baked into the
+      // track (not the live one) so cues added while an origin change is
+      // still propagating stay consistent with the existing cues — the
+      // rebase effect shifts everything to the new origin in one pass.
+      // Any active user-facing sync delay gets baked in here so new cues
+      // line up with existing ones.
+      for (const cue of newCues) {
+        if (cue.end > cue.start) sourceCues.set(`${cue.start}|${cue.end}|${cue.text}`, cue);
+      }
+      const origin = appliedOriginRef.current;
+      const delaySec = appliedDelayMsRef.current / 1000;
+      addCuesToTrack(track, newCues, origin, delaySec, seenCueKeysRef.current);
+    }
+
+    // The WebVTT muxer ends each cue with a blank line, so each chunk parses
+    // up to the last complete cue and keeps the rest for the next one.
+    let decoder = new TextDecoder();
+    let buffered = "";
+    function addParsedText(text: string) {
+      const cues = parseVTT(text);
+      if (cues.length === 0) return;
+      addParsedCues(cues);
+      onLoadStateRef.current?.("ready");
+    }
+
+    const fetcher = createSubtitleWindowFetcher({
+      windowUrl: (start) => subtitleWindowUrl(activeUrl ?? "", start),
+      playhead: () =>
+        subtitlePlayheadSeconds(videoEl, streamOriginRef.current ?? 0, fetchAnchorRef.current),
+      duration: () => durationRef.current ?? 0,
+      seekBackoffSeconds: SEEK_BACKOFF,
+      initial: restored ?? undefined,
+      logTag: "useSubtitleTracks",
+      onWindowStart: (fresh) => {
+        decoder = new TextDecoder();
+        buffered = "";
+        if (!fresh) return;
+        onLoadStateRef.current?.(placeholders ? "refreshing" : "loading");
+        if (!placeholders) clearCues();
+      },
+      onChunk: (chunk) => {
+        buffered += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
+        const split = buffered.lastIndexOf("\n\n");
+        if (split < 0) return;
+        const safe = buffered.slice(0, split);
+        buffered = buffered.slice(split + 2);
+        addParsedText(safe);
+      },
+      onResponseEnd: () => {
+        // Flush any tail the muxer didn't end with a blank line.
+        buffered += decoder.decode();
+        if (buffered.trim()) addParsedText(buffered);
+        buffered = "";
+      },
+      onWindowCommitted: () => {
+        // A corrected window without cues still replaces the placeholders.
+        dropPlaceholders();
+        onLoadStateRef.current?.("ready");
+      },
+      onWindowFailed: () => onLoadStateRef.current?.("error"),
+    });
+    const maybeFetch = fetcher.maybeFetch;
+
+    // URL-backed tracks run the sliding-window fetcher; live tracks receive
+    // their cues from the liveCues effect below instead.
+    if (!activeIsLive) {
+      // Kick off the first window before any player event fires so cues
+      // are already in flight for the current position.
+      maybeFetch();
+
+      // Cue activation is driven by the browser via `cuechange`; these
+      // listeners exist only to keep the sliding-window fetcher scheduled.
+      videoEl.addEventListener("timeupdate", maybeFetch);
+      videoEl.addEventListener("seeking", maybeFetch);
+      videoEl.addEventListener("seeked", maybeFetch);
+    }
+
+    return () => {
+      fetcher.dispose();
+      videoEl.removeEventListener("timeupdate", maybeFetch);
+      videoEl.removeEventListener("seeking", maybeFetch);
+      videoEl.removeEventListener("seeked", maybeFetch);
+      track.removeEventListener("cuechange", handleCueChange);
+      // Snapshot source cues and coverage independently of native tracks so
+      // a rebuild against a reloaded <video> element can restore them without
+      // refetching after the HLS controller has cleared the native cue list.
+      {
+        carryoverRef.current = {
+          url: activeUrl,
+          cueRevision,
+          cues: Array.from(sourceCues.values()),
+          ...fetcher.coverage(),
+        };
+      }
+      clearCues();
+      // Tracks added via addTextTrack can't be removed from the element;
+      // setting `disabled` makes it inert so a subsequent language change
+      // cleanly creates a fresh track without stacking live listeners.
+      track.mode = "disabled";
+      if (trackRef.current === track) {
+        trackRef.current = null;
+      }
+    };
+    // `subtitleDelayMs` and `streamOriginSeconds` are intentionally excluded —
+    // nudging delay or remapping the timeline must not tear down and refetch
+    // the track. The update effects below shift existing cues in place instead.
+    // `streamGeneration` IS included: a stream restart reloads the <video>
+    // element and orphans the current track, so it must be rebuilt.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- delay and timeline changes shift cues in place instead
+  }, [
+    activeUrl,
+    activeCodec,
+    activeLang,
+    activeIsLive,
+    liveTrackKey,
+    streamGeneration,
+    cueRevision,
+    videoRef,
+  ]);
+
+  // Re-base already-loaded cues when the media timeline remaps — e.g. a
+  // copy-mode session restarting at a new position after an out-of-window
+  // seek changes `streamOriginSeconds`. Cue times are player-local
+  // (`source - origin + delay`), so a larger origin moves every cue earlier.
+  // Without this shift, cues loaded under the old origin display offset by
+  // exactly the origin delta after the restart.
+  useEffect(() => {
+    const deltaSec = streamOriginSeconds - appliedOriginRef.current;
+    appliedOriginRef.current = streamOriginSeconds;
+    if (deltaSec === 0) return;
+    const cues = trackRef.current?.cues;
+    if (!cues) return;
+    for (const cue of Array.from(cues)) {
+      const vc = cue as VTTCue;
+      vc.startTime = Math.max(0, vc.startTime - deltaSec);
+      vc.endTime = vc.endTime - deltaSec;
+    }
+  }, [streamOriginSeconds]);
+
+  // Apply delay changes to already-loaded cues without rebuilding the track.
+  // Runs after the main effect, so trackRef is current.
+  useEffect(() => {
+    const track = trackRef.current;
+    if (!track) {
+      appliedDelayMsRef.current = subtitleDelayMs;
+      return;
+    }
+    const deltaSec = (subtitleDelayMs - appliedDelayMsRef.current) / 1000;
+    appliedDelayMsRef.current = subtitleDelayMs;
+    if (deltaSec === 0) return;
+    const cues = track.cues;
+    if (!cues) return;
+    for (const cue of Array.from(cues)) {
+      const vc = cue as VTTCue;
+      vc.startTime = Math.max(0, vc.startTime + deltaSec);
+      vc.endTime = vc.endTime + deltaSec;
+    }
+  }, [subtitleDelayMs]);
+
+  // Feed websocket-pushed cues into the active live track as they arrive. Only
+  // the new tail since the last push is added (liveCues is append-only within a
+  // job), so ingestion stays O(batch) rather than O(total) per push. When the
+  // job restarts liveCues is replaced with a shorter array, which the length
+  // check below detects to start over (the track itself is rebuilt via
+  // liveTrackKey, so a fresh seen-set and pointer are already in place).
+  useEffect(() => {
+    if (!activeIsLive) return;
+    const track = trackRef.current;
+    if (!track || !liveCues) return;
+    if (liveCues.length < processedLiveCuesRef.current) {
+      processedLiveCuesRef.current = 0;
+    }
+    const fresh = liveCues.slice(processedLiveCuesRef.current);
+    if (fresh.length === 0) return;
+    processedLiveCuesRef.current = liveCues.length;
+    const origin = appliedOriginRef.current;
+    const delaySec = appliedDelayMsRef.current / 1000;
+    addCuesToTrack(track, fresh, origin, delaySec, seenCueKeysRef.current);
+    // While paused, adding a cue over the playhead doesn't reliably fire
+    // `cuechange`, so refresh the on-screen text by hand. While playing the
+    // browser drives `cuechange`, so skip the redundant state update.
+    if (videoRef.current?.paused) {
+      const active = track.activeCues;
+      setActiveCueTexts(
+        active && active.length > 0
+          ? Array.from(active).map((c) => stripVTTTags((c as VTTCue).text))
+          : [],
+      );
+    }
+  }, [liveCues, activeIsLive, activeSubtitleIndex, liveTrackKey, videoRef]);
+
+  return activeCueTexts;
+}

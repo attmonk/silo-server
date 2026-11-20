@@ -1,0 +1,160 @@
+import type { QueryClient } from "@tanstack/react-query";
+import type { EpisodesResponse, ItemDetail, SeasonsResponse } from "@/api/types";
+import { catalogKeys, ebookKeys, episodeKeys, itemKeys, progressKeys } from "@/hooks/queries/keys";
+import { t } from "@/i18n";
+
+type WatchedStateItem = Pick<
+  ItemDetail,
+  "content_id" | "type" | "series_id" | "season_number" | "user_data"
+>;
+
+function appendUniqueKey(keys: Array<readonly unknown[]>, nextKey: readonly unknown[]) {
+  if (
+    keys.some(
+      (existingKey) =>
+        existingKey.length === nextKey.length &&
+        existingKey.every((part, index) => Object.is(part, nextKey[index])),
+    )
+  ) {
+    return;
+  }
+  keys.push(nextKey);
+}
+
+export function getWatchedActionLabel(item: Pick<ItemDetail, "type" | "user_data">): string {
+  const played = item.user_data?.played === true;
+
+  switch (item.type) {
+    case "series":
+      return played
+        ? t("web.detail.actions.markSeriesUnwatched")
+        : t("web.detail.actions.markSeriesWatched");
+    case "season":
+      return played
+        ? t("web.detail.actions.markSeasonUnwatched")
+        : t("web.detail.actions.markSeasonWatched");
+    case "audiobook":
+      return played ? t("web.detail.actions.markUnlistened") : t("web.detail.actions.markListened");
+    case "ebook":
+    case "manga":
+      return played ? t("web.detail.actions.markUnread") : t("web.detail.actions.markRead");
+    case "episode":
+      return played ? t("web.detail.actions.markUnwatched") : t("web.detail.actions.markWatched");
+    default:
+      return played ? t("web.detail.actions.markUnwatched") : t("web.detail.actions.markWatched");
+  }
+}
+
+export function getWatchedToastMessage(item: Pick<ItemDetail, "type">, played: boolean): string {
+  switch (item.type) {
+    case "audiobook":
+      return played
+        ? t("web.detail.actions.markedListened")
+        : t("web.detail.actions.markedUnlistened");
+    case "ebook":
+    case "manga":
+      return played ? t("web.detail.actions.markedRead") : t("web.detail.actions.markedUnread");
+    default:
+      return played
+        ? t("web.detail.actions.markedWatched")
+        : t("web.detail.actions.markedUnwatched");
+  }
+}
+
+export function getWatchedInvalidationKeys(item: WatchedStateItem) {
+  const keys: Array<readonly unknown[]> = [
+    catalogKeys.itemDetail(item.content_id),
+    itemKeys.detail(item.content_id),
+    progressKeys.all,
+  ];
+
+  if (item.series_id) {
+    keys.push(catalogKeys.itemDetail(item.series_id));
+    keys.push(itemKeys.detail(item.series_id));
+  }
+
+  if (item.type === "series") {
+    keys.push(catalogKeys.seriesSeasons(item.content_id));
+    keys.push(episodeKeys.seasons(item.content_id));
+  }
+
+  if (item.type === "season" && item.series_id) {
+    keys.push(catalogKeys.seriesSeasons(item.series_id));
+    keys.push(episodeKeys.seasons(item.series_id));
+  }
+
+  if (item.series_id && item.season_number != null) {
+    keys.push(catalogKeys.seasonDetail(item.series_id, item.season_number));
+    keys.push(catalogKeys.seasonEpisodes(item.series_id, item.season_number));
+    keys.push(episodeKeys.seasonDetail(item.series_id, item.season_number));
+    keys.push(episodeKeys.bySeason(item.series_id, item.season_number));
+  }
+
+  if (item.type === "episode" || item.type === "season" || item.type === "series") {
+    keys.push(itemKeys.details());
+    keys.push(episodeKeys.all);
+  }
+
+  if (item.type === "season") {
+    keys.push(catalogKeys.itemEpisodes(item.content_id));
+    keys.push(episodeKeys.byItem(item.content_id));
+  }
+
+  if (item.type === "ebook") {
+    keys.push(ebookKeys.readerProgress(item.content_id));
+  }
+
+  return keys;
+}
+
+// cachedListsInEveryLibrary returns a cached list for each library it was read
+// in. The key's last segment is the library, and a series page opened from a
+// library caches its season and episode lists under that library's ID.
+function cachedListsInEveryLibrary<T>(queryClient: QueryClient, key: readonly unknown[]): T[] {
+  return queryClient
+    .getQueriesData<T>({ queryKey: key.slice(0, -1) })
+    .filter(([queryKey]) => queryKey.length === key.length)
+    .flatMap(([, data]) => (data ? [data] : []));
+}
+
+export function getCachedWatchedInvalidationKeys(queryClient: QueryClient, item: WatchedStateItem) {
+  const keys = [...getWatchedInvalidationKeys(item)];
+
+  if (item.type !== "series") {
+    return keys;
+  }
+
+  const seasons = cachedListsInEveryLibrary<SeasonsResponse>(
+    queryClient,
+    catalogKeys.seriesSeasons(item.content_id),
+  ).flatMap((data) => data.seasons ?? []);
+
+  for (const season of seasons) {
+    appendUniqueKey(keys, catalogKeys.itemDetail(season.content_id));
+    appendUniqueKey(keys, itemKeys.detail(season.content_id));
+    appendUniqueKey(keys, catalogKeys.itemEpisodes(season.content_id));
+    appendUniqueKey(keys, episodeKeys.byItem(season.content_id));
+    appendUniqueKey(keys, catalogKeys.seasonDetail(item.content_id, season.season_number));
+    appendUniqueKey(keys, catalogKeys.seasonEpisodes(item.content_id, season.season_number));
+    appendUniqueKey(keys, episodeKeys.seasonDetail(item.content_id, season.season_number));
+    appendUniqueKey(keys, episodeKeys.bySeason(item.content_id, season.season_number));
+
+    const episodeLists = [
+      ...cachedListsInEveryLibrary<EpisodesResponse>(
+        queryClient,
+        catalogKeys.itemEpisodes(season.content_id),
+      ),
+      ...cachedListsInEveryLibrary<EpisodesResponse>(
+        queryClient,
+        catalogKeys.seasonEpisodes(item.content_id, season.season_number),
+      ),
+    ];
+
+    for (const episode of episodeLists.flatMap((data) => data.episodes ?? [])) {
+      appendUniqueKey(keys, catalogKeys.itemDetail(episode.content_id));
+      appendUniqueKey(keys, itemKeys.detail(episode.content_id));
+    }
+  }
+
+  return keys;
+}

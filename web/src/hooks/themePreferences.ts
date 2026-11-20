@@ -1,0 +1,75 @@
+import { useOptionalAuth } from "@/hooks/useAuth";
+
+export type TextScale = "default" | "large" | "x-large";
+export type TextWeight = "default" | "strong";
+
+export interface AppearanceAuth {
+  loading: boolean;
+  user: { id: number } | null;
+  profile: { id: string } | null;
+}
+
+/**
+ * The namespace that owns the device-local appearance caches, or null while
+ * auth is bootstrapping, nobody is signed in, or no profile has been selected
+ * yet.
+ *
+ * Appearance settings are profile-scoped in the settings contract (`ui.text_scale`
+ * lives at `profile`, with an optional `profile_device` override), and several
+ * profiles on one account share a user id — so the owner token is the user id
+ * plus the active profile id. Every cache read and write in the app resolves
+ * its namespace through this function, so no call site can be left behind.
+ *
+ * On the profile picker (user signed in, no profile chosen) the owner is null,
+ * which falls back to the last profile that wrote here — the same "keep the
+ * last look" behavior as the login screen — and gates off the settings request,
+ * which cannot resolve profile scope without an active profile anyway.
+ */
+function appearanceCacheOwner({ loading, user, profile }: AppearanceAuth): string | null {
+  return !loading && user && profile ? `${user.id}:${profile.id}` : null;
+}
+
+/**
+ * `appearanceCacheOwner` for the currently authenticated session.
+ *
+ * The three appearance providers each need the same owner token, and each was
+ * adapting the auth context to `AppearanceAuth` itself with identical code.
+ * That put the shape of auth back in three places, which is the duplication the
+ * doc comment above argues against: widening ownership has to be a change to
+ * this file alone.
+ */
+export function useAppearanceCacheOwner(): string | null {
+  const auth = useOptionalAuth();
+  return appearanceCacheOwner({
+    loading: auth?.loading ?? false,
+    user: auth?.user ? { id: auth.user.id } : null,
+    profile: auth?.profile ? { id: auth.profile.id } : null,
+  });
+}
+
+export function parseTextScale(value: string | null | undefined): TextScale {
+  return value === "large" || value === "x-large" ? value : "default";
+}
+
+export function parseTextWeight(value: string | null | undefined): TextWeight {
+  return value === "strong" ? "strong" : "default";
+}
+
+/**
+ * A stored "true" or "false" is the user's own choice and always wins. With
+ * nothing stored, high contrast follows the system's "increase contrast"
+ * setting (`prefers-contrast: more`). themeBoot.js repeats this rule.
+ */
+export function parseHighContrast(value: string | null | undefined): boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return prefersMoreContrast();
+}
+
+function prefersMoreContrast(): boolean {
+  try {
+    return window.matchMedia("(prefers-contrast: more)").matches;
+  } catch {
+    return false;
+  }
+}

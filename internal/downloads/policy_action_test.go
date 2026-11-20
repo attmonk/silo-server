@@ -1,0 +1,227 @@
+package downloads
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	policyengine "github.com/Silo-Server/silo-server/internal/policy"
+)
+
+func TestPolicyActionDeciderMatchesLegacyCapability(t *testing.T) {
+	ctx := context.Background()
+	pdp := newDownloadPolicyPDP(t)
+
+	for _, downloadsEnabled := range []bool{false, true} {
+		for _, transcodeEnabled := range []bool{false, true} {
+			for _, downloadAllowed := range []bool{false, true} {
+				for _, downloadTranscodeAllowed := range []bool{false, true} {
+					for _, artifactsAvailable := range []bool{false, true} {
+						cfg := config.DownloadConfig{Enabled: downloadsEnabled, TranscodeEnabled: transcodeEnabled}
+						user := &models.User{ID: 9, DownloadAllowed: ptrBool(downloadAllowed), DownloadTranscodeAllowed: ptrBool(downloadTranscodeAllowed)}
+						legacy := newPolicyActionTestService(user, cfg, artifactsAvailable, nil)
+						withPolicy := newPolicyActionTestService(user, cfg, artifactsAvailable, pdp)
+
+						legacyCap, err := legacy.Capability(ctx, user.ID)
+						if err != nil {
+							t.Fatalf("legacy Capability error: %v", err)
+						}
+						policyCap, err := withPolicy.Capability(ctx, user.ID)
+						if err != nil {
+							t.Fatalf("policy Capability error: %v", err)
+						}
+						if !reflect.DeepEqual(policyCap, legacyCap) {
+							t.Fatalf("policy capability = %+v, want legacy %+v for cfg=%+v user=%+v artifacts=%v",
+								policyCap, legacyCap, cfg, user, artifactsAvailable)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestPolicyActionDeciderUsesGroupDownloadFlags(t *testing.T) {
+	ctx := context.Background()
+	// Grouped account: the group policy layer only applies to a member.
+	groupID := int64(4)
+	user := &models.User{ID: 9, AccessGroupID: &groupID, DownloadTranscodeAllowed: ptrBool(true)}
+	svc := newPolicyActionTestService(
+		user,
+		config.DownloadConfig{Enabled: true, TranscodeEnabled: true},
+		true,
+		newDownloadPolicyPDP(t),
+	)
+	svc.SetGroupPolicyProvider(downloadGroupProvider{group: &access.GroupPolicy{
+		DownloadAllowed:          false,
+		DownloadTranscodeAllowed: true,
+		RequestsAllowed:          true,
+	}})
+
+	_, _, err := svc.downloadConfigForUser(ctx, user.ID, "device-1")
+	if !errors.Is(err, ErrDownloadNotAllowed) {
+		t.Fatalf("downloadConfigForUser() error = %v, want ErrDownloadNotAllowed", err)
+	}
+}
+
+func TestResolveTranscodePassesDeviceQualityFactsAndAppliesCeiling(t *testing.T) {
+	decider := &capturingActionDecider{decision: policyengine.ActionDecision{Allowed: true, QualityCeiling: "1080p"}}
+	resolver := DownloadQualityResolver{actionDecider: decider}
+	user := &PolicyUser{ID: 9, Policy: access.EffectiveUserPolicy{DownloadAllowed: true, DownloadTranscodeAllowed: true}}
+	cfg := config.DownloadConfig{Enabled: true, TranscodeEnabled: true}
+	file := &models.MediaFile{ID: 3, Resolution: "2160p"}
+
+	got, err := resolver.Resolve(
+		context.Background(), Quality10Mbps, user, cfg, file,
+		playback.ClientCapabilities{}, true, "device-9",
+	)
+	if err != nil {
+		t.Fatalf("Resolve() error: %v", err)
+	}
+	if len(decider.inputs) != 1 {
+		t.Fatalf("decider calls = %d, want 1", len(decider.inputs))
+	}
+	in := decider.inputs[0]
+	if in.Action != policyengine.ActionDownloadTranscode ||
+		in.DeviceID != "device-9" ||
+		in.RequestedQuality != Quality10Mbps {
+		t.Fatalf("action input = %+v, want download_transcode facts with device and requested quality", in)
+	}
+	if got.PrepareTarget.Resolution != "1080p" {
+		t.Fatalf("PrepareTarget.Resolution = %q, want %q (policy ceiling applied)",
+			got.PrepareTarget.Resolution, "1080p")
+	}
+}
+
+// The capability labels presets with the same transcode ceiling Resolve
+// applies, so an override that narrows downloads to 1080p never advertises
+// "up to 4K".
+func TestCapabilityQualityOptionsHonorOverrideCeiling(t *testing.T) {
+	decider := &capturingActionDecider{decision: policyengine.ActionDecision{Allowed: true, QualityCeiling: "1080p"}}
+	user := &models.User{ID: 9, DownloadAllowed: ptrBool(true), DownloadTranscodeAllowed: ptrBool(true)}
+	svc := newPolicyActionTestService(user, config.DownloadConfig{Enabled: true, TranscodeEnabled: true, Allow4KTranscode: true}, true, decider)
+	capability, err := svc.Capability(context.Background(), user.ID)
+	if err != nil {
+		t.Fatalf("Capability error: %v", err)
+	}
+	var heights []int
+	for _, option := range capability.QualityOptions {
+		heights = append(heights, option.MaxHeight)
+	}
+	if want := []int{0, 1080, 1080, 1080, 720, 480}; !slices.Equal(heights, want) {
+		t.Fatalf("max heights = %v, want %v", heights, want)
+	}
+}
+
+type capturingActionDecider struct {
+	inputs   []policyengine.ActionInput
+	decision policyengine.ActionDecision
+}
+
+func (d *capturingActionDecider) CheckAction(_ context.Context, in policyengine.ActionInput) (policyengine.ActionDecision, policyengine.Meta, error) {
+	d.inputs = append(d.inputs, in)
+	return d.decision, policyengine.Meta{}, nil
+}
+
+func newPolicyActionTestService(
+	user *models.User,
+	cfg config.DownloadConfig,
+	artifactsAvailable bool,
+	decider ActionDecider,
+) *Service {
+	svc := NewService(nil, nil, nil, nil, nil, nil, fakeUserRepo{user}, nil, nil, &cfg)
+	if artifactsAvailable {
+		svc.SetArtifactManager(&ArtifactManager{})
+	}
+	if decider != nil {
+		svc.SetActionDecider(decider)
+	}
+	return svc
+}
+
+func newDownloadPolicyPDP(t *testing.T) *policyengine.PDP {
+	t.Helper()
+	engine, err := policyengine.NewEngine(context.Background(), policyengine.WithEvalTimeout(time.Minute))
+	if err != nil {
+		t.Fatalf("NewEngine() error: %v", err)
+	}
+	return policyengine.NewPDP(engine)
+}
+
+type downloadGroupProvider struct {
+	group *access.GroupPolicy
+	err   error
+}
+
+func (p downloadGroupProvider) GetPolicyForUser(context.Context, int) (*access.GroupPolicy, error) {
+	return p.group, p.err
+}
+
+// ceilingOverrideSource is a custom action override that keeps every grant
+// but narrows the download quality ceiling to 1080p, the shape vendor test
+// test_quality_ceiling_override_tightens pins.
+const ceilingOverrideSource = `package silo_custom.action
+
+import rego.v1
+
+override(_, _) := {"allowed": true, "quality_ceiling": "1080p"}
+`
+
+// TestResolveDirectFileHonorsOverrideQualityCeiling is the #2234 regression.
+// A direct download serves the original unchanged, so an override that
+// narrows the download ceiling below the file's resolution refuses it, as a
+// managed original download of the same file is refused. The direct route has
+// no other quality to offer, so the refusal is a policy denial (403), not
+// quality_unavailable.
+func TestResolveDirectFileHonorsOverrideQualityCeiling(t *testing.T) {
+	ctx := context.Background()
+	engine, err := policyengine.NewEngineWithCustom(ctx, map[string]policyengine.ActiveSource{
+		policyengine.DomainAction: {DocumentID: 1, VersionID: 1, Source: ceilingOverrideSource},
+	})
+	if err != nil {
+		t.Fatalf("NewEngineWithCustom() error: %v", err)
+	}
+	if skipped := engine.SkippedSources(); len(skipped) != 0 {
+		t.Fatalf("override was skipped: %+v", skipped)
+	}
+	pdp := policyengine.NewPDP(engine)
+	user := &models.User{ID: 9, DownloadAllowed: ptrBool(true)}
+	cfg := config.DownloadConfig{Enabled: true}
+	resolveDirect := func(file *models.MediaFile, filter catalog.AccessFilter) (*FileTarget, error) {
+		svc := NewService(nil, nil, nil, fakeFileResolver{file: file}, nil, nil, fakeUserRepo{user}, &syncAccess{}, nil, &cfg)
+		svc.SetActionDecider(pdp)
+		return svc.ResolveDirectFile(ctx, user.ID, file.ID, "", filter)
+	}
+
+	uhd := &models.MediaFile{ID: 3, ContentID: "movie", FilePath: "/media/movie-2160p.mkv", Resolution: "2160p"}
+	if _, err := resolveDirect(uhd, catalog.AccessFilter{}); !errors.Is(err, ErrDownloadNotAllowed) {
+		t.Fatalf("ResolveDirectFile(2160p under a 1080p override) error = %v, want ErrDownloadNotAllowed", err)
+	}
+	policyUser := &PolicyUser{ID: user.ID, Policy: access.EffectiveUserPolicy{DownloadAllowed: true}}
+	if _, err := (DownloadQualityResolver{actionDecider: pdp}).Resolve(ctx, QualityOriginal, policyUser, cfg, uhd, playback.ClientCapabilities{}, false, ""); !errors.Is(err, ErrQualityUnavailable) {
+		t.Fatalf("managed Resolve(2160p original) error = %v, want ErrQualityUnavailable", err)
+	}
+
+	// A file the profile cannot see stays 404: the quality check runs after
+	// catalog access, so a refusal never confirms the file exists.
+	if _, err := resolveDirect(uhd, catalog.AccessFilter{MaxPlaybackQuality: "1080p"}); !errors.Is(err, catalog.ErrItemNotFound) {
+		t.Fatalf("ResolveDirectFile(out-of-scope 2160p) error = %v, want catalog.ErrItemNotFound", err)
+	}
+
+	hd := &models.MediaFile{ID: 4, ContentID: "movie", FilePath: "/media/movie-1080p.mkv", Resolution: "1080p"}
+	target, err := resolveDirect(hd, catalog.AccessFilter{})
+	if err != nil {
+		t.Fatalf("ResolveDirectFile(1080p under a 1080p override) error: %v", err)
+	}
+	if target.MediaFileID != hd.ID || target.Path != hd.FilePath {
+		t.Fatalf("target = %+v, want file %d at %s", target, hd.ID, hd.FilePath)
+	}
+}

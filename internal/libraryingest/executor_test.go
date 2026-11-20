@@ -1,0 +1,406 @@
+package libraryingest
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/scanner"
+)
+
+type skippedRootMemoryRepo struct {
+	roots map[string]models.SkippedMediaRoot
+}
+
+func newSkippedRootMemoryRepo(roots ...models.SkippedMediaRoot) *skippedRootMemoryRepo {
+	repo := &skippedRootMemoryRepo{roots: make(map[string]models.SkippedMediaRoot, len(roots))}
+	for _, root := range roots {
+		repo.roots[skippedRootKey(root.MediaFolderID, root.RootPath)] = root
+	}
+	return repo
+}
+
+func TestThemeFileDoesNotCreateSkippedVideoRoot(t *testing.T) {
+	repo := newSkippedRootMemoryRepo()
+	e := &Executor{scanner: &finalizeRecordingScanner{}, skippedRootRepo: repo}
+	path := "/movies/Title (2020)/theme-music/opening.mp3"
+	if err := e.reconcileSkippedRoots(t.Context(), 1, "movies", scopeModeFile, path, []string{path}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.roots) != 0 {
+		t.Fatalf("theme audio became a skipped video root: %+v", repo.roots)
+	}
+}
+
+func skippedRootKey(folderID int, rootPath string) string {
+	return fmt.Sprintf("%d:%s", folderID, filepath.Clean(rootPath))
+}
+
+func (r *skippedRootMemoryRepo) Upsert(_ context.Context, root models.SkippedMediaRoot) error {
+	root.RootPath = filepath.Clean(root.RootPath)
+	r.roots[skippedRootKey(root.MediaFolderID, root.RootPath)] = root
+	return nil
+}
+
+func (r *skippedRootMemoryRepo) Delete(_ context.Context, folderID int, rootPath string) error {
+	delete(r.roots, skippedRootKey(folderID, rootPath))
+	return nil
+}
+
+func (r *skippedRootMemoryRepo) DeleteMissingByFolder(_ context.Context, folderID int, seenRoots []string) error {
+	seen := make(map[string]struct{}, len(seenRoots))
+	for _, rootPath := range seenRoots {
+		seen[filepath.Clean(rootPath)] = struct{}{}
+	}
+	for key, root := range r.roots {
+		if root.MediaFolderID != folderID {
+			continue
+		}
+		if _, ok := seen[filepath.Clean(root.RootPath)]; !ok {
+			delete(r.roots, key)
+		}
+	}
+	return nil
+}
+
+func (r *skippedRootMemoryRepo) DeleteMissingInScope(_ context.Context, folderID int, scopePath string, seenRoots []string) error {
+	scopePath = filepath.Clean(scopePath)
+	seen := make(map[string]struct{}, len(seenRoots))
+	for _, rootPath := range seenRoots {
+		seen[filepath.Clean(rootPath)] = struct{}{}
+	}
+	for key, root := range r.roots {
+		if root.MediaFolderID != folderID || !isSameOrDescendant(scopePath, root.RootPath) {
+			continue
+		}
+		if _, ok := seen[filepath.Clean(root.RootPath)]; !ok {
+			delete(r.roots, key)
+		}
+	}
+	return nil
+}
+
+func (r *skippedRootMemoryRepo) has(folderID int, rootPath string) bool {
+	_, ok := r.roots[skippedRootKey(folderID, rootPath)]
+	return ok
+}
+
+// settleControlledMatcher simulates a TV match drainer whose provider lookup is
+// still in flight when the settle window expires. The batch only returns once
+// the test releases it, so the test can catch stopDrainers cancelling the active
+// batch context instead of only stopping the drainer loop.
+type settleControlledMatcher struct {
+	batchCalls            atomic.Int64
+	batchCompleted        atomic.Bool
+	batchCtxCanceled      atomic.Bool
+	processAllBeforeBatch atomic.Bool
+	batchStarted          chan struct{}
+	releaseBatch          chan struct{}
+	closeBatchStartedOnce sync.Once
+}
+
+func newSettleControlledMatcher() *settleControlledMatcher {
+	return &settleControlledMatcher{
+		batchStarted: make(chan struct{}),
+		releaseBatch: make(chan struct{}),
+	}
+}
+
+func (m *settleControlledMatcher) ProcessBatchByFolderAndPathPrefix(ctx context.Context, _ int, _ string, _ time.Time) (int, error) {
+	m.batchCalls.Add(1)
+	m.closeBatchStartedOnce.Do(func() {
+		close(m.batchStarted)
+	})
+	select {
+	case <-ctx.Done():
+		m.batchCtxCanceled.Store(true)
+		return 0, ctx.Err()
+	case <-m.releaseBatch:
+		m.batchCompleted.Store(true)
+		return 1, nil
+	}
+}
+
+func (m *settleControlledMatcher) ProcessAllByFolderAndPathPrefix(context.Context, int, string, time.Time) (int, error) {
+	if !m.batchCompleted.Load() {
+		m.processAllBeforeBatch.Store(true)
+	}
+	return 0, nil
+}
+
+func (m *settleControlledMatcher) RetryUnmatchedItemsByFolderAndPathPrefix(context.Context, int, string) (int, int, error) {
+	return 0, 0, nil
+}
+
+// settleStubScanner returns a scan result that triggers the TV settle window
+// (a series library with new items) and accepts the post-match finalize call.
+type settleStubScanner struct {
+	result *scanner.ScanResult
+}
+
+func (s *settleStubScanner) ScanFolder(context.Context, *models.MediaFolder) (*scanner.ScanResult, error) {
+	return s.result, nil
+}
+
+func (s *settleStubScanner) ScanSubtree(context.Context, *models.MediaFolder, string) (*scanner.ScanResult, error) {
+	return s.result, nil
+}
+
+func (s *settleStubScanner) ScanFile(context.Context, string, *models.MediaFolder) error {
+	return nil
+}
+
+func (s *settleStubScanner) ObserveFileRoot(_ context.Context, _ int, filePath, libraryType string, libraryRoots ...string) (scanner.RootObservation, bool, error) {
+	observation, ok := scanner.ObserveRoot(filePath, libraryType, libraryRoots...)
+	return observation, ok, nil
+}
+
+func (s *settleStubScanner) FinalizeVariantsByPathPrefix(context.Context, *models.MediaFolder, string) error {
+	return nil
+}
+
+type retryRecordingMatcher struct {
+	processAllCalls atomic.Int64
+	retryCalls      atomic.Int64
+}
+
+func (m *retryRecordingMatcher) ProcessBatchByFolderAndPathPrefix(context.Context, int, string, time.Time) (int, error) {
+	return 0, nil
+}
+
+func (m *retryRecordingMatcher) ProcessAllByFolderAndPathPrefix(context.Context, int, string, time.Time) (int, error) {
+	m.processAllCalls.Add(1)
+	return 0, nil
+}
+
+func (m *retryRecordingMatcher) RetryUnmatchedItemsByFolderAndPathPrefix(context.Context, int, string) (int, int, error) {
+	m.retryCalls.Add(1)
+	return 0, 0, nil
+}
+
+type finalizeRecordingScanner struct {
+	finalizeCalls atomic.Int64
+}
+
+func (s *finalizeRecordingScanner) ScanFolder(context.Context, *models.MediaFolder) (*scanner.ScanResult, error) {
+	return &scanner.ScanResult{}, nil
+}
+
+func (s *finalizeRecordingScanner) ScanSubtree(context.Context, *models.MediaFolder, string) (*scanner.ScanResult, error) {
+	return &scanner.ScanResult{}, nil
+}
+
+func (s *finalizeRecordingScanner) ScanFile(context.Context, string, *models.MediaFolder) error {
+	return nil
+}
+
+func (s *finalizeRecordingScanner) ObserveFileRoot(_ context.Context, _ int, filePath, libraryType string, libraryRoots ...string) (scanner.RootObservation, bool, error) {
+	observation, ok := scanner.ObserveRoot(filePath, libraryType, libraryRoots...)
+	return observation, ok, nil
+}
+
+func (s *finalizeRecordingScanner) FinalizeVariantsByPathPrefix(context.Context, *models.MediaFolder, string) error {
+	s.finalizeCalls.Add(1)
+	return nil
+}
+
+// TestIngestFolderLetsActiveDrainerBatchFinishAfterSettleWindow is a regression
+// test for the settle-window cancellation bug: a TV library full scan was
+// recorded as "cancelled" because stopDrainers cancelled a drainer batch that
+// was already in flight. The active batch must be allowed to finish; otherwise
+// rows it already claimed can be excluded from the final scoped matcher by the
+// runStartedAt attempt window.
+func TestIngestFolderLetsActiveDrainerBatchFinishAfterSettleWindow(t *testing.T) {
+	const settleWindow = 25 * time.Millisecond
+
+	matcher := newSettleControlledMatcher()
+	exec := &Executor{
+		scanner:             &settleStubScanner{result: &scanner.ScanResult{New: 1}},
+		matcher:             matcher,
+		now:                 time.Now,
+		tvDrainSettleWindow: settleWindow,
+	}
+	folder := &models.MediaFolder{ID: 5, Type: "series", Paths: []string{"/tv"}}
+
+	type ingestResult struct {
+		result *Result
+		err    error
+	}
+	done := make(chan ingestResult, 1)
+	go func() {
+		result, err := exec.IngestFolder(context.Background(), folder)
+		done <- ingestResult{result: result, err: err}
+	}()
+
+	select {
+	case <-matcher.batchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("drainer never started a batch")
+	}
+	time.Sleep(2 * settleWindow)
+	close(matcher.releaseBatch)
+
+	var got ingestResult
+	select {
+	case got = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ingest did not complete after releasing the active drainer batch")
+	}
+	if got.err != nil {
+		t.Fatalf("expected ingest to complete, got error: %v", got.err)
+	}
+	if got.result == nil || got.result.ScanResult == nil {
+		t.Fatalf("expected a scanned result, got %+v", got.result)
+	}
+	if matcher.batchCalls.Load() == 0 {
+		t.Fatal("drainer never ran a batch; test did not exercise the settle-window shutdown path")
+	}
+	if matcher.batchCtxCanceled.Load() {
+		t.Fatal("settle-window shutdown cancelled the active drainer batch context")
+	}
+	if matcher.processAllBeforeBatch.Load() {
+		t.Fatal("final scoped matcher ran before the active drainer batch completed")
+	}
+}
+
+func TestReconcileSkippedRootsFullLibraryPrunesRemovedRoot(t *testing.T) {
+	const folderID = 42
+	const removedRoot = "/old-library/Movie"
+	const currentRoot = "/new-library/Movie"
+
+	repo := newSkippedRootMemoryRepo(models.SkippedMediaRoot{
+		MediaFolderID: folderID,
+		RootPath:      removedRoot,
+		Reason:        scanner.RootObservationReasonMissingFolderIDs,
+	})
+	exec := &Executor{skippedRootRepo: repo}
+	scanResult := &scanner.ScanResult{RootObservations: []scanner.RootObservation{
+		{
+			RootPath:       currentRoot,
+			SampleFilePath: filepath.Join(currentRoot, "movie.mkv"),
+			FileCount:      1,
+			Reason:         scanner.RootObservationReasonMissingFolderIDs,
+		},
+	}}
+
+	err := exec.reconcileSkippedRoots(
+		context.Background(),
+		folderID,
+		"movies",
+		scopeModeLibrary,
+		"",
+		[]string{"/new-library"},
+		scanResult,
+	)
+	if err != nil {
+		t.Fatalf("reconcile skipped roots: %v", err)
+	}
+	if repo.has(folderID, removedRoot) {
+		t.Fatalf("removed library root %q remains after authoritative full-library reconcile", removedRoot)
+	}
+	if !repo.has(folderID, currentRoot) {
+		t.Fatalf("current skipped root %q was not retained", currentRoot)
+	}
+}
+
+func TestReconcileSkippedRootsSubtreeKeepsRootsOutsideScope(t *testing.T) {
+	const folderID = 42
+	const outsideRoot = "/other-library/Movie"
+	const staleScopedRoot = "/current-library/Old Movie"
+
+	repo := newSkippedRootMemoryRepo(
+		models.SkippedMediaRoot{MediaFolderID: folderID, RootPath: outsideRoot},
+		models.SkippedMediaRoot{MediaFolderID: folderID, RootPath: staleScopedRoot},
+	)
+	exec := &Executor{skippedRootRepo: repo}
+
+	err := exec.reconcileSkippedRoots(
+		context.Background(),
+		folderID,
+		"movies",
+		scopeModeSubtree,
+		"/current-library",
+		[]string{"/current-library"},
+		&scanner.ScanResult{},
+	)
+	if err != nil {
+		t.Fatalf("reconcile skipped roots: %v", err)
+	}
+	if repo.has(folderID, staleScopedRoot) {
+		t.Fatalf("stale scoped root %q remains after subtree reconcile", staleScopedRoot)
+	}
+	if !repo.has(folderID, outsideRoot) {
+		t.Fatalf("subtree reconcile removed out-of-scope root %q", outsideRoot)
+	}
+}
+
+// sidecarRecordingChecker records the local sidecar checks a scan asks for.
+type sidecarRecordingChecker struct {
+	mu         sync.Mutex
+	scopes     []string
+	listings   []scanner.SidecarListing
+	reapplied  []string
+	matched    *retryRecordingMatcher
+	afterMatch bool
+}
+
+func (c *sidecarRecordingChecker) CheckLocalSidecars(_ context.Context, _ int, scopePath string, listing scanner.SidecarListing) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.scopes = append(c.scopes, scopePath)
+	c.listings = append(c.listings, listing)
+	if c.matched != nil {
+		c.afterMatch = c.matched.processAllCalls.Load() > 0
+	}
+	return c.reapplied, nil
+}
+
+func TestIngestChecksLocalSidecarsAfterMatchingVideoScopes(t *testing.T) {
+	listing := scanner.SidecarListing{"/library/Film": {"movie.nfo"}}
+	for _, tt := range []struct {
+		folderType string
+		wantCheck  bool
+	}{
+		{folderType: "movies", wantCheck: true},
+		{folderType: "series", wantCheck: true},
+		{folderType: "mixed", wantCheck: true},
+		{folderType: "ebooks", wantCheck: false},
+	} {
+		t.Run(tt.folderType, func(t *testing.T) {
+			matcher := &retryRecordingMatcher{}
+			checker := &sidecarRecordingChecker{reapplied: []string{"movie-1", "movie-2"}, matched: matcher}
+			exec := &Executor{
+				scanner:       &settleStubScanner{result: &scanner.ScanResult{Sidecars: listing}},
+				matcher:       matcher,
+				localSidecars: checker,
+				now:           time.Now,
+			}
+			folder := &models.MediaFolder{ID: 5, Type: tt.folderType, Paths: []string{"/library"}}
+
+			result, err := exec.IngestSubtree(context.Background(), folder, "/library/Film")
+			if err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if !tt.wantCheck {
+				if len(checker.scopes) != 0 {
+					t.Fatalf("checked %v in a %s library", checker.scopes, tt.folderType)
+				}
+				return
+			}
+			if len(checker.scopes) != 1 || checker.scopes[0] != "/library/Film" || len(checker.listings[0]) != 1 {
+				t.Fatalf("checks = %v listings = %v, want the scanned scope with the scan's listing", checker.scopes, checker.listings)
+			}
+			if !checker.afterMatch {
+				t.Fatal("checked local sidecars before matching the scope")
+			}
+			if result.LocalMetadataReapplied != 2 || !shouldPublish(result) {
+				t.Fatalf("result = %+v, want the re-applied count reported and published", result)
+			}
+		})
+	}
+}

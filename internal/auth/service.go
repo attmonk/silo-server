@@ -1,0 +1,1641 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/Silo-Server/silo-server/internal/auditmutation"
+	"github.com/Silo-Server/silo-server/internal/auth/passwordhash"
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+// Sentinel errors for service operations.
+var (
+	ErrSessionRevoked          = errors.New("session has been revoked")
+	ErrSetupAlreadyComplete    = errors.New("initial setup already complete")
+	ErrSignupDisabled          = errors.New("public signups are not enabled")
+	ErrImpersonationNotAllowed = errors.New("impersonation not allowed")
+	ErrAlreadyImpersonating    = errors.New("already impersonating")
+	ErrNotImpersonating        = errors.New("not impersonating")
+	ErrPasswordLoginDisabled   = errors.New("local password login is disabled")
+	ErrCurrentPasswordInvalid  = errors.New("current password is invalid")
+	ErrPasswordTooShort        = errors.New("password is too short")
+	ErrPasswordTooLong         = errors.New("password is too long")
+	// ErrPasswordUnchanged refuses replacing a temporary password with itself.
+	ErrPasswordUnchanged = errors.New("new password matches the temporary password")
+	// ErrPasswordChangeRequired refuses a sign-in surface that cannot offer
+	// the password change a temporary password requires.
+	ErrPasswordChangeRequired = errors.New("password change required")
+	// ErrSessionCheckUnavailable is a refresh that could not read the state
+	// it judges (the login session, the account, or the provider re-check's
+	// records) because the store failed or timed out. The refresh token was
+	// not judged: the session stays valid and the caller retries later.
+	ErrSessionCheckUnavailable = errors.New("login session could not be checked")
+	// ErrSignupSessionStart reports a signup whose account was created but
+	// whose sign-in failed: repeating the signup cannot succeed.
+	ErrSignupSessionStart = errors.New("account created but login failed")
+)
+
+// SessionCheckRetryAfterSeconds is the Retry-After of every answer to a
+// session or credential check that failed in the store (the v1 and v2 auth
+// gate, refresh, the proxy media grant, Jellyfin compat): long enough not to
+// hammer a recovering database, short enough that a brief outage does not
+// stall playback for long.
+const SessionCheckRetryAfterSeconds = 5
+
+// sessionCheckUnavailable wraps a store failure met while judging a refresh,
+// so callers can tell it from a refused session with errors.Is.
+func sessionCheckUnavailable(op string, err error) error {
+	return fmt.Errorf("%s: %w: %w", op, ErrSessionCheckUnavailable, err)
+}
+
+const (
+	MinimumPasswordLength = 8
+	MaximumPasswordBytes  = 72
+)
+
+// TokenPair holds the access and refresh tokens returned after login or refresh.
+type TokenPair struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresIn    int // seconds until access token expires
+	// SessionID is the login session the pair authenticates.
+	SessionID string
+	// User is the account read while an OAuth completion opens its session.
+	// Other token-pair paths return their account separately.
+	User *models.User
+}
+
+// SettingsGetter retrieves server settings by key.
+// Implemented by catalog.ServerSettingsRepo.
+type SettingsGetter interface {
+	Get(ctx context.Context, key string) (string, error)
+}
+
+type claimsContextKey struct{}
+
+// WithClaims stores auth claims on the context for auth-owned flows.
+func WithClaims(ctx context.Context, claims *Claims) context.Context {
+	return context.WithValue(ctx, claimsContextKey{}, claims)
+}
+
+// ClaimsFromContext retrieves auth claims previously stored with WithClaims.
+func ClaimsFromContext(ctx context.Context) *Claims {
+	claims, _ := ctx.Value(claimsContextKey{}).(*Claims)
+	return claims
+}
+
+// Service orchestrates authentication operations using an AuthProvider,
+// JWTService, and session/user repositories.
+type Service struct {
+	provider    AuthProvider
+	jwt         *JWTService
+	sessions    *SessionRepository
+	users       *UserRepository
+	inviteCodes *InviteCodeRepository
+	settings    SettingsGetter
+	// providers are registered once at start (the built-in local provider,
+	// test doubles); pluginSource supplies the auth-plugin providers, which
+	// change without a restart.
+	providers    map[string]AuthProvider
+	metadata     map[string]LoginProviderInfo
+	order        []string
+	pluginSource PluginProviderSource
+	accounts     *AccountProvisioner
+	// recheck re-checks sessions opened through an external provider at
+	// refresh; nil skips it.
+	recheck *ProviderRecheck
+	// previews caches network providers' answers about request peers for
+	// discovery (networkPreview).
+	previews networkPreviews
+	// signInAttempts bounds password attempts per sign-in name; nil allows
+	// every attempt (SetSignInAttempts).
+	signInAttempts SignInAttemptLimiter
+	// sessionsRevoked runs after a password change signed the account out
+	// of its other sessions; see OnSessionsRevoked.
+	sessionsRevoked func(ctx context.Context, userID int)
+}
+
+// PluginProviderSource supplies the current auth-plugin providers. The
+// registry rebuilds its list when bindings, plugin configuration or
+// installations change, on every node.
+type PluginProviderSource interface {
+	Providers() []RegisteredProvider
+}
+
+// LocalProviderID is the id of the built-in username/password provider.
+const LocalProviderID = "local"
+
+type LoginProviderInfo struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	Mode        string `json:"mode"`
+	Default     bool   `json:"default"`
+	// IconURL is rendered next to the "Sign in with X" button. Set for
+	// auth_provider.v1 plugins that ship an icon (icon_url manifest field).
+	IconURL string `json:"icon_url,omitempty"`
+	// InstallationID is non-zero when the provider is backed by a plugin.
+	// The login UI uses it to build /api/v1/auth/oauth/{install_id}/init URLs.
+	InstallationID int `json:"installation_id,omitempty"`
+	// NetworkIdentity is who a network provider says the peer of the
+	// discovery request is; set only by DiscoverProviders.
+	NetworkIdentity *NetworkIdentityPreview `json:"network_identity,omitempty"`
+}
+
+type RegisteredProvider struct {
+	Info     LoginProviderInfo
+	Provider AuthProvider
+}
+
+// NewService creates a new auth Service with the given dependencies.
+func NewService(
+	provider AuthProvider,
+	jwt *JWTService,
+	sessions *SessionRepository,
+	users *UserRepository,
+	inviteCodes *InviteCodeRepository,
+	settings SettingsGetter,
+	storeProvider userstore.UserStoreProvider,
+) *Service {
+	service := &Service{
+		provider:    provider,
+		jwt:         jwt,
+		sessions:    sessions,
+		users:       users,
+		inviteCodes: inviteCodes,
+		settings:    settings,
+		providers:   map[string]AuthProvider{},
+		metadata:    map[string]LoginProviderInfo{},
+		accounts:    NewAccountProvisioner(users, storeProvider),
+	}
+	if provider != nil {
+		service.RegisterProvider(LoginProviderInfo{
+			ID:          LocalProviderID,
+			DisplayName: "Local",
+			Mode:        "credentials",
+			Default:     true,
+		}, provider)
+	}
+	return service
+}
+
+// Login authenticates the user with the given credentials and creates a new
+// session. Returns a TokenPair containing the access and refresh tokens.
+func (s *Service) Login(ctx context.Context, username, password, deviceName, ip string) (*TokenPair, *models.User, error) {
+	return s.loginWithProvider(ctx, LocalProviderID, username, password, deviceName, ip, false)
+}
+
+// CompatLogin is Login for sign-in surfaces that cannot run the forced
+// password change (Jellyfin and Audiobookshelf compatibility). An account
+// holding a temporary password gets ErrPasswordChangeRequired and no session:
+// its holder must sign in to Silo and choose a new password first.
+//
+// Compatibility clients cannot pick a provider, so the name is routed like
+// a login without a provider (see routePasswordLogin): directory users of a
+// credentials plugin sign in with their directory password.
+func (s *Service) CompatLogin(ctx context.Context, username, password, deviceName, ip string) (*TokenPair, *models.User, error) {
+	pair, user, _, err := s.CompatLoginWithLocalFallback(ctx, username, password, "", deviceName, ip, "")
+	return pair, user, err
+}
+
+// CompatLoginWithLocalFallback selects a provider once and retries a rejected
+// password only with that local provider. It reports whether fallback succeeded
+// so the caller can verify the PIN it split from the original password.
+//
+// A local password longer than MaximumPasswordBytes cannot be the account's
+// own, and bcrypt compares only its first 72 bytes, so such a password goes
+// straight to the fallback: otherwise a 72-byte password followed by "#pin"
+// would match as the full password and lose its PIN.
+//
+// The call spends one attempt of a name's budget, as LoginWithProvider does,
+// and a second one when it has a fallback to try. The name is budgetName, or
+// username when budgetName is empty: a caller that resolved username from
+// what was typed by looking accounts up passes a name that depends only on
+// the typed text, so the budget cannot tell a stranger what the lookup
+// found. A success clears the same budget.
+func (s *Service) CompatLoginWithLocalFallback(ctx context.Context, username, password, fallback, deviceName, ip, budgetName string) (pair *TokenPair, user *models.User, usedFallback bool, err error) {
+	if budgetName == "" {
+		budgetName = username
+	}
+	if err = s.reserveSignIn(ctx, budgetName); err != nil {
+		return nil, nil, false, err
+	}
+	defer func() { s.finishSignIn(ctx, budgetName, err) }()
+	if fallback != "" {
+		// A fallback is a second password that may be checked, so it spends a
+		// second attempt up front, for every name: charging it only where the
+		// fallback runs (local accounts) would tell names apart by how soon
+		// they lock.
+		if err = s.reserveSignIn(ctx, budgetName); err != nil {
+			return nil, nil, false, err
+		}
+	}
+	providerID, err := s.routePasswordLogin(ctx, username)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if providerID == LocalProviderID && fallback != "" && len(password) > MaximumPasswordBytes {
+		pair, user, err := s.loginWithProvider(ctx, LocalProviderID, username, fallback, deviceName, ip, true)
+		return pair, user, err == nil, err
+	}
+	pair, user, err = s.loginWithProvider(ctx, providerID, username, password, deviceName, ip, true)
+	if providerID != LocalProviderID || fallback == "" || !errors.Is(err, ErrInvalidCredentials) {
+		return pair, user, false, err
+	}
+	pair, user, err = s.loginWithProvider(ctx, LocalProviderID, username, fallback, deviceName, ip, true)
+	return pair, user, err == nil, err
+}
+
+// SplitPasswordPIN splits the compatibility sign-ins' "password#pin" at the
+// last '#', giving the fallback password for CompatLoginWithLocalFallback and
+// the profile PIN to check when that fallback is what matched. Returns
+// ("", "") if there is no '#' or the split would produce empty parts.
+func SplitPasswordPIN(password string) (basePw, pin string) {
+	idx := strings.LastIndex(password, "#")
+	if idx <= 0 || idx >= len(password)-1 {
+		return "", ""
+	}
+	return password[:idx], password[idx+1:]
+}
+
+// LoginWithProvider is a password sign-in through providerID, or the
+// provider routePasswordLogin picks for the name when it is empty. Every call
+// spends one attempt of the name's budget (SetSignInAttempts) before any
+// lookup or password check; a locked name is a *SignInThrottledError. A
+// successful sign-in clears the count.
+func (s *Service) LoginWithProvider(
+	ctx context.Context,
+	providerID string,
+	username string,
+	password string,
+	deviceName string,
+	ip string,
+) (pair *TokenPair, user *models.User, err error) {
+	if err = s.reserveSignIn(ctx, username); err != nil {
+		return nil, nil, err
+	}
+	defer func() { s.finishSignIn(ctx, username, err) }()
+	if providerID == "" {
+		routed, err := s.routePasswordLogin(ctx, username)
+		if err != nil {
+			return nil, nil, err
+		}
+		providerID = routed
+	}
+	return s.loginWithProvider(ctx, providerID, username, password, deviceName, ip, false)
+}
+
+// routePasswordLogin picks the provider for a password sign-in that named
+// none. An account with local password sign-in signs in locally only, even
+// while the server turns local sign-in off, so a local password is never
+// sent to a directory. Any other name goes to the enabled credentials plugin
+// (LDAP), which may link or create the account; without one it is local.
+func (s *Service) routePasswordLogin(ctx context.Context, username string) (string, error) {
+	directory, ok := s.directoryProvider()
+	if !ok || s.users == nil {
+		return LocalProviderID, nil
+	}
+	user, err := LookupLogin(ctx, s.users, username)
+	if err != nil {
+		if IsNotFound(err) {
+			return directory.Info.ID, nil
+		}
+		return "", fmt.Errorf("looking up user: %w", err)
+	}
+	return passwordRoute(user, directory.Info.ID), nil
+}
+
+// directoryProvider is the enabled credentials plugin (LDAP), if any.
+func (s *Service) directoryProvider() (RegisteredProvider, bool) {
+	for _, registered := range s.pluginProviders() {
+		if registered.Info.Mode == ProviderModeCredentials {
+			return registered, true
+		}
+	}
+	return RegisteredProvider{}, false
+}
+
+// passwordRoute is routePasswordLogin's choice for an existing account,
+// with directory the enabled credentials plugin's provider ID or empty.
+func passwordRoute(user *models.User, directory string) string {
+	if directory == "" || user.LocalPasswordLoginEnabled {
+		// Whatever the server-wide switch says: with it off the local
+		// provider refuses with local_login_disabled, but the password never
+		// reaches the directory.
+		return LocalProviderID
+	}
+	return directory
+}
+
+// PasswordSignIn is how a password sign-in that names no provider (a
+// Jellyfin or Audiobookshelf client, an app's password form) goes for one
+// account. At most one of Local and Directory is set; neither means no
+// password signs the account in.
+type PasswordSignIn struct {
+	// Local: the account's own Silo password signs in.
+	Local bool
+	// Directory: the name and password go to the directory (LDAP), which
+	// answers for the account through the identity linked there.
+	Directory bool
+	// DirectoryUsername is the username of that identity, the name to sign
+	// in with.
+	DirectoryUsername string
+}
+
+// PasswordSignInFor answers PasswordSignIn for userID from the decisions a
+// sign-in makes (routePasswordLogin, then LocalProvider.Authenticate's
+// policy), without a password. The directory's own answer, such as its group
+// rules, is not known until it is asked.
+func (s *Service) PasswordSignInFor(ctx context.Context, userID int) (PasswordSignIn, error) {
+	if s.users == nil {
+		return PasswordSignIn{}, errors.New("auth service has no user repository")
+	}
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return PasswordSignIn{}, err
+	}
+	// Compatibility sign-ins refuse a temporary password's holder whichever
+	// provider answers (loginWithProvider, OpenIdentitySession).
+	if !user.Enabled || user.PasswordChangeRequired {
+		return PasswordSignIn{}, nil
+	}
+	directory, hasDirectory := s.directoryProvider()
+	directoryID := ""
+	if hasDirectory {
+		directoryID = directory.Info.ID
+	}
+	if passwordRoute(user, directoryID) == LocalProviderID && user.LocalPasswordLoginEnabled && user.PasswordHash != "" {
+		err = localPasswordPolicy(ctx, s.users.pool, user)
+		if err == nil {
+			return PasswordSignIn{Local: true}, nil
+		}
+		if !errors.Is(err, ErrLocalLoginDisabled) && !errors.Is(err, ErrNotPermitted) {
+			return PasswordSignIn{}, err
+		}
+	}
+	// The account's own name does not sign it in. A directory identity
+	// linked under another name is routed by that name, so it may still.
+	if !hasDirectory {
+		return PasswordSignIn{}, nil
+	}
+	return s.directorySignIn(ctx, user.ID, directory)
+}
+
+// directorySignIn is PasswordSignInFor for an account whose own name and
+// password do not sign it in. The directory answers for the account through
+// an identity linked there. Account resolution never matches a directory person to an
+// account by name, so without one (an OIDC account, say) there is no
+// directory username known to sign in with.
+func (s *Service) directorySignIn(ctx context.Context, userID int, directory RegisteredProvider) (PasswordSignIn, error) {
+	identities, err := listIdentitiesForUser(ctx, s.users.pool, userID)
+	if err != nil {
+		return PasswordSignIn{}, err
+	}
+	for _, identity := range identities {
+		if identity.InstallationID != directory.Info.InstallationID {
+			continue
+		}
+		// An administrator's link may record no username until the
+		// directory signs the person in: there is no name to offer.
+		if strings.TrimSpace(identity.Username) == "" {
+			return PasswordSignIn{}, nil
+		}
+		// The sign-in routes the typed name, which is the directory
+		// username: another account holding that name with a local password
+		// takes it.
+		route, err := s.routePasswordLogin(ctx, identity.Username)
+		if err != nil {
+			return PasswordSignIn{}, err
+		}
+		if route != directory.Info.ID {
+			return PasswordSignIn{}, nil
+		}
+		return PasswordSignIn{Directory: true, DirectoryUsername: identity.Username}, nil
+	}
+	return PasswordSignIn{}, nil
+}
+
+// HasLoginName reports whether a password sign-in with name would find an
+// existing account (see LookupLogin).
+func (s *Service) HasLoginName(ctx context.Context, name string) (bool, error) {
+	if s.users == nil {
+		return false, nil
+	}
+	if _, err := LookupLogin(ctx, s.users, name); err != nil {
+		if IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("looking up user: %w", err)
+	}
+	return true, nil
+}
+
+// PasswordLoginUsesDirectory reports whether a password sign-in with
+// username would go to the directory (LDAP) instead of a local account (see
+// routePasswordLogin).
+func (s *Service) PasswordLoginUsesDirectory(ctx context.Context, username string) (bool, error) {
+	providerID, err := s.routePasswordLogin(ctx, username)
+	if err != nil {
+		return false, err
+	}
+	return providerID != LocalProviderID, nil
+}
+
+func (s *Service) RegisterProvider(info LoginProviderInfo, provider AuthProvider) {
+	if provider == nil || info.ID == "" {
+		return
+	}
+	if info.DisplayName == "" {
+		info.DisplayName = info.ID
+	}
+	if info.Mode == "" {
+		info.Mode = "credentials"
+	}
+
+	if _, exists := s.providers[info.ID]; !exists {
+		s.order = append(s.order, info.ID)
+	}
+	s.providers[info.ID] = provider
+	s.metadata[info.ID] = info
+}
+
+// SetProviderRecheck makes Refresh re-check sessions opened through an
+// external sign-in provider with that provider.
+func (s *Service) SetProviderRecheck(r *ProviderRecheck) {
+	s.recheck = r
+}
+
+// SetPluginProviderSource makes the auth-plugin providers of src available
+// to sign-in, discovery and the OAuth handshake.
+func (s *Service) SetPluginProviderSource(src PluginProviderSource) {
+	s.pluginSource = src
+}
+
+// OnSessionsRevoked registers fn to run after ChangePassword signed the
+// account out of its other sessions, so every replica drops the
+// Jellyfin-compatible sessions it holds in memory.
+func (s *Service) OnSessionsRevoked(fn func(ctx context.Context, userID int)) {
+	s.sessionsRevoked = fn
+}
+
+func (s *Service) pluginProviders() []RegisteredProvider {
+	if s.pluginSource == nil {
+		return nil
+	}
+	return s.pluginSource.Providers()
+}
+
+// registeredProviders lists the static providers in registration order,
+// then the plugin providers. The default is the last one marked default,
+// else the first.
+func (s *Service) registeredProviders() ([]RegisteredProvider, string) {
+	all := make([]RegisteredProvider, 0, len(s.order))
+	for _, id := range s.order {
+		all = append(all, RegisteredProvider{Info: s.metadata[id], Provider: s.providers[id]})
+	}
+	for _, registered := range s.pluginProviders() {
+		if registered.Provider == nil || registered.Info.ID == "" {
+			continue
+		}
+		if _, static := s.providers[registered.Info.ID]; static {
+			continue
+		}
+		all = append(all, registered)
+	}
+	defaultID := ""
+	for _, registered := range all {
+		if registered.Info.Mode == ProviderModeNetwork {
+			// Never the default: it takes no password.
+			continue
+		}
+		if defaultID == "" || registered.Info.Default {
+			defaultID = registered.Info.ID
+		}
+	}
+	return all, defaultID
+}
+
+// passwordProviderByID returns the provider a password sign-in that names
+// id goes to: a built-in provider or a credentials (directory) plugin. An
+// OAuth plugin takes no password, so naming one finds nothing and the
+// password never reaches it.
+func (s *Service) passwordProviderByID(id string) AuthProvider {
+	if provider := s.providers[id]; provider != nil {
+		return provider
+	}
+	for _, registered := range s.pluginProviders() {
+		if registered.Info.ID == id && registered.Info.Mode == ProviderModeCredentials {
+			return registered.Provider
+		}
+	}
+	return nil
+}
+
+// FindOAuthInstallation returns the PluginProvider registered for the given
+// plugin installation when it is an OAuth provider; nil otherwise. Only
+// OAuth providers take part in the /oauth routes and link tickets: a
+// credentials (LDAP) installation is not found there.
+func (s *Service) FindOAuthInstallation(installationID int) *PluginProvider {
+	if installationID <= 0 {
+		return nil
+	}
+	all, _ := s.registeredProviders()
+	for _, registered := range all {
+		pp, ok := registered.Provider.(*PluginProvider)
+		if !ok || pp == nil || pp.InstallationID() != installationID || registered.Info.Mode != ProviderModeOAuth {
+			continue
+		}
+		return pp
+	}
+	return nil
+}
+
+// ResolveOAuthLogin runs the account half of an OAuth sign-in: the handler
+// has already called the plugin's ExchangeCode RPC and is passing the
+// AuthenticateResponse back. Service finds the matching PluginProvider and
+// looks up or auto-provisions the account. It opens no session: the
+// completion code does when it is redeemed (OpenOAuthSession).
+func (s *Service) ResolveOAuthLogin(ctx context.Context, in OAuthLoginInput) (*models.User, int64, error) {
+	provider := s.FindOAuthInstallation(in.InstallationID)
+	if provider == nil {
+		return nil, 0, ErrInvalidCredentials
+	}
+	// A linking flow (LinkingUserID > 0) links the identity to that account
+	// or refuses one linked elsewhere; see AccountResolver.
+	return provider.CompleteOAuth(ctx, in.Response, in.LinkingUserID, in.AnswerFence)
+}
+
+// ProviderAnswerFence takes the answer fence of an OAuth sign-in, which the
+// handler passes back in OAuthLoginInput.AnswerFence (takeAnswerFence).
+func (s *Service) ProviderAnswerFence(ctx context.Context) (int64, error) {
+	return takeAnswerFence(ctx, s.sessions.pool)
+}
+
+// OpenOAuthSession opens the login session of a completion code being
+// redeemed, on db (nil: a new transaction), and mints its token pair
+// (OpenIdentitySession).
+func (s *Service) OpenOAuthSession(ctx context.Context, db OAuthSessionDB, c OAuthCompletion) (*TokenPair, error) {
+	return s.OpenIdentitySession(ctx, db, IdentitySession{
+		UserID: c.UserID, IdentityID: c.IdentityID, DeviceName: c.DeviceName, IP: c.IP,
+	})
+}
+
+// IdentitySession is a login session to open for an account that signed in
+// through a provider identity.
+type IdentitySession struct {
+	UserID     int
+	IdentityID int64
+	DeviceName string
+	IP         string
+	// Network: the identity is a network provider's, refused while the
+	// account's primary provider refuses the account (primaryAuthority).
+	Network bool
+	// RefusePasswordChange: the sign-in surface cannot run the forced
+	// password change (CompatLogin), so an account holding a temporary
+	// password is refused.
+	RefusePasswordChange bool
+}
+
+// OpenIdentitySession opens the login session of an account that signed in
+// through a provider identity, on db (nil: a new transaction), and mints its
+// token pair. The account is locked and read again, so one disabled since
+// the provider answered is refused and account changes serialize with the
+// session's creation; the identity and its enabled installation are locked
+// too, and an identity a re-check has refused since is not signed in. A network identity's primary-provider refusal is read again under the
+// account lock, which a re-check that refuses the account also holds.
+func (s *Service) OpenIdentitySession(ctx context.Context, db OAuthSessionDB, c IdentitySession) (*TokenPair, error) {
+	if db == nil {
+		var pair *TokenPair
+		err := pgx.BeginFunc(ctx, s.sessions.pool, func(tx pgx.Tx) error {
+			var err error
+			pair, err = s.OpenIdentitySession(ctx, tx, c)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		return pair, nil
+	}
+	user, err := lockUser(ctx, db, c.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("load provider account: %w", err)
+	}
+	if !user.Enabled {
+		return nil, ErrUserDisabled
+	}
+	if c.RefusePasswordChange && user.PasswordChangeRequired {
+		return nil, ErrPasswordChangeRequired
+	}
+	installationID, err := lockOAuthIdentity(ctx, db, user.ID, c.IdentityID)
+	if err != nil {
+		return nil, err
+	}
+	if c.Network {
+		authority, err := primaryAuthorityOf(ctx, db, user.ID, installationID)
+		if err != nil {
+			return nil, err
+		}
+		if authority.refused {
+			return nil, ErrNotPermitted
+		}
+	}
+	sessionID := uuid.New().String()
+	session := models.AuthSession{
+		ID:         sessionID,
+		UserID:     user.ID,
+		DeviceName: c.DeviceName,
+		IPAddress:  c.IP,
+		ExpiresAt:  time.Now().Add(s.jwt.RefreshExpiry()),
+		IdentityID: identityRef(c.IdentityID),
+	}
+	if err := s.sessions.createWithQuerier(ctx, db, session); err != nil {
+		return nil, fmt.Errorf("creating session: %w", err)
+	}
+	pair, err := s.generateTokenPair(Claims{
+		UserID:                 user.ID,
+		Role:                   user.Role,
+		SessionID:              sessionID,
+		PasswordChangeRequired: user.PasswordChangeRequired,
+	})
+	if err != nil {
+		return nil, err
+	}
+	pair.User = user
+	return pair, nil
+}
+
+// lockOAuthIdentity checks the identity and enabled installation after the
+// account is locked, and answers the installation. Lock the installation
+// before the identity so an uninstall, which deletes identities by cascade,
+// cannot deadlock with us.
+func lockOAuthIdentity(ctx context.Context, db OAuthSessionDB, userID int, identityID int64) (int, error) {
+	var installationID int
+	err := db.QueryRow(ctx, `SELECT plugin_installation_id FROM plugin_auth_identities
+		WHERE id = $1 AND user_id = $2`, identityID, userID).Scan(&installationID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrNotPermitted
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read oauth identity: %w", err)
+	}
+	var enabled bool
+	err = db.QueryRow(ctx, `SELECT enabled FROM plugin_installations WHERE id = $1 FOR SHARE`, installationID).Scan(&enabled)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrNotPermitted
+	}
+	if err != nil {
+		return 0, fmt.Errorf("lock oauth installation: %w", err)
+	}
+	if !enabled {
+		return 0, ErrProviderUnavailable
+	}
+	// The provider answered active when the sign-in resolved. A refusal on
+	// record now was committed by a re-check since then, under the account
+	// lock held here, and it ended the account's sessions: this one must not
+	// open after it.
+	var refused bool
+	err = db.QueryRow(ctx, `SELECT last_check_status = ANY($4) OR pending_refusal = ANY($4) FROM plugin_auth_identities
+		WHERE id = $1 AND user_id = $2 AND plugin_installation_id = $3 FOR UPDATE`,
+		identityID, userID, installationID, refusalStatuses).Scan(&refused)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrNotPermitted
+	}
+	if err != nil {
+		return 0, fmt.Errorf("lock oauth identity: %w", err)
+	}
+	if refused {
+		return 0, ErrNotPermitted
+	}
+	return installationID, nil
+}
+
+// LinkOAuthIdentity finishes a linking flow: the identity the plugin
+// answered is linked to the signed-in account that requested the link
+// ticket, or refused when another account holds it
+// (ErrIdentityLinkedElsewhere). No session is opened; the account keeps the
+// sessions it has.
+func (s *Service) LinkOAuthIdentity(ctx context.Context, in OAuthLoginInput) (*models.User, error) {
+	if in.LinkingUserID <= 0 {
+		return nil, ErrNotPermitted
+	}
+	provider := s.FindOAuthInstallation(in.InstallationID)
+	if provider == nil {
+		return nil, ErrProviderUnavailable
+	}
+	user, _, err := provider.CompleteOAuth(ctx, in.Response, in.LinkingUserID, 0)
+	return user, err
+}
+
+// ProviderLogoutURL is the end-session URL of the OAuth provider an account
+// is linked to, for the web client to visit after the Silo session ends.
+// It is empty unless the account has an identity at an enabled OAuth
+// provider and that plugin answers EndSessionUrl with a URL. The plugin's
+// own configuration is the only switch: a plugin whose operator turned
+// provider logout off answers empty. A plugin failure is logged and answers
+// empty: the Silo sign-out never depends on the provider.
+func (s *Service) ProviderLogoutURL(ctx context.Context, userID int, postLogoutRedirectURI string) (string, error) {
+	for _, registered := range s.pluginProviders() {
+		pp, ok := registered.Provider.(*PluginProvider)
+		if !ok || pp == nil || registered.Info.Mode != ProviderModeOAuth {
+			continue
+		}
+		endURL, err := pp.EndSessionURL(ctx, userID, postLogoutRedirectURI)
+		if err != nil {
+			slog.WarnContext(ctx, "provider logout url unavailable", "component", "auth",
+				"installation_id", pp.InstallationID(), "user_id", userID, "error", err)
+			continue
+		}
+		if endURL != "" {
+			return endURL, nil
+		}
+	}
+	return "", nil
+}
+
+func (s *Service) ListProviders() []LoginProviderInfo {
+	all, defaultID := s.registeredProviders()
+	providers := make([]LoginProviderInfo, 0, len(all))
+	for _, registered := range all {
+		info := registered.Info
+		info.Default = info.ID == defaultID
+		providers = append(providers, info)
+	}
+	sortProviders(providers)
+	return providers
+}
+
+func sortProviders(providers []LoginProviderInfo) {
+	sort.Slice(providers, func(i, j int) bool {
+		if providers[i].Default != providers[j].Default {
+			return providers[i].Default
+		}
+		return providers[i].DisplayName < providers[j].DisplayName
+	})
+}
+
+// ProviderDiscovery is the sign-in discovery apps read: the providers a
+// client may offer and whether any of them takes a password. While the
+// server turns local password sign-in off, the local provider is left out
+// (break-glass admins sign in on the web's local form); a credentials
+// plugin (LDAP) still takes passwords.
+type ProviderDiscovery struct {
+	Providers     []LoginProviderInfo
+	PasswordLogin bool
+}
+
+// DiscoverProviders answers ProviderDiscovery for the current settings.
+func (s *Service) DiscoverProviders(ctx context.Context) (ProviderDiscovery, error) {
+	localAllowed := true
+	if s.users != nil {
+		allowed, err := s.users.LocalPasswordLoginAllowed(ctx)
+		if err != nil {
+			return ProviderDiscovery{}, err
+		}
+		localAllowed = allowed
+	}
+	all, defaultID := s.registeredProviders()
+	listed := make([]LoginProviderInfo, 0, len(all))
+	defaultListed := false
+	for _, registered := range all {
+		if registered.Info.ID == LocalProviderID && !localAllowed {
+			continue
+		}
+		info := registered.Info
+		if info.Mode == ProviderModeNetwork {
+			// Offered only to a request its own overlay listener proxied, from
+			// a peer the plugin will sign in.
+			provider, ok := registered.Provider.(*PluginProvider)
+			if !ok || provider == nil {
+				continue
+			}
+			if info.NetworkIdentity = s.networkPreview(ctx, provider); info.NetworkIdentity == nil {
+				continue
+			}
+		}
+		listed = append(listed, info)
+		defaultListed = defaultListed || info.ID == defaultID
+	}
+	discovery := ProviderDiscovery{Providers: listed}
+	firstPrimary := true
+	for i := range listed {
+		// Without the configured default, the first provider that is not a
+		// network one is the default: a network provider takes no password.
+		fallback := !defaultListed && firstPrimary && listed[i].Mode != ProviderModeNetwork
+		if listed[i].Mode != ProviderModeNetwork {
+			firstPrimary = false
+		}
+		listed[i].Default = listed[i].ID == defaultID || fallback
+		if listed[i].Mode == ProviderModeCredentials {
+			discovery.PasswordLogin = true
+		}
+	}
+	sortProviders(listed)
+	return discovery, nil
+}
+
+func (s *Service) loginWithProvider(
+	ctx context.Context,
+	providerID string,
+	username string,
+	password string,
+	deviceName string,
+	ip string,
+	refusePasswordChange bool,
+) (*TokenPair, *models.User, error) {
+	provider := s.passwordProviderByID(providerID)
+	if provider == nil {
+		return nil, nil, ErrInvalidCredentials
+	}
+
+	creds := Credentials{Username: username, Password: password}
+	var (
+		user       *models.User
+		identityID int64
+		err        error
+	)
+	if plugin, ok := provider.(*PluginProvider); ok {
+		// A name without a local account goes to the directory and costs no
+		// hash, so take a turn anyway: under load, every name answers
+		// passwordhash.ErrBusy, not only those with local accounts.
+		var permit *passwordhash.Permit
+		if permit, err = passwordhash.Admit(ctx); err != nil {
+			return nil, nil, err
+		}
+		permit.Release()
+		user, identityID, err = plugin.authenticateCredentials(ctx, creds, 0)
+	} else {
+		user, err = provider.Authenticate(ctx, creds)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if refusePasswordChange && user.PasswordChangeRequired {
+		return nil, nil, ErrPasswordChangeRequired
+	}
+
+	// Create a new session with a pre-generated ID to avoid the race condition
+	// of looking up the session after creation.
+	sessionID := uuid.New().String()
+	session := models.AuthSession{
+		ID:         sessionID,
+		UserID:     user.ID,
+		DeviceName: deviceName,
+		IPAddress:  ip,
+		ExpiresAt:  time.Now().Add(s.jwt.RefreshExpiry()),
+	}
+
+	if providerID == LocalProviderID {
+		// Linking and account changes hold this row lock while retiring local
+		// credentials. Recheck the authenticated snapshot before inserting a
+		// session so an in-flight login cannot outlive their revocation.
+		err = pgx.BeginFunc(ctx, s.users.pool, func(tx pgx.Tx) error {
+			current, err := lockUser(ctx, tx, user.ID)
+			if IsNotFound(err) {
+				return ErrInvalidCredentials
+			}
+			if err != nil {
+				return err
+			}
+			if !current.LocalPasswordLoginEnabled || current.PasswordHash != user.PasswordHash {
+				return ErrInvalidCredentials
+			}
+			if !current.Enabled {
+				return ErrUserDisabled
+			}
+			if refusePasswordChange && current.PasswordChangeRequired {
+				return ErrPasswordChangeRequired
+			}
+			if !current.BreakGlass {
+				if err := lockServerSettings(ctx, tx); err != nil {
+					return err
+				}
+			}
+			// A re-check refusing the person holds the account row lock too,
+			// so a refusal cannot land between this check and the session.
+			if err := localPasswordPolicy(ctx, tx, current); err != nil {
+				return err
+			}
+			if err := s.sessions.createWithQuerier(ctx, tx, session); err != nil {
+				return err
+			}
+			user = current
+			return nil
+		})
+	} else {
+		// Account resolution committed in its own transaction. Open the
+		// session as an OAuth sign-in does, under the account lock, so a
+		// disable or unlink that committed meanwhile refuses the sign-in
+		// instead of missing its session.
+		pair, err := s.OpenIdentitySession(ctx, nil, IdentitySession{
+			UserID:               user.ID,
+			IdentityID:           identityID,
+			DeviceName:           deviceName,
+			IP:                   ip,
+			RefusePasswordChange: refusePasswordChange,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return pair, pair.User, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating session: %w", err)
+	}
+
+	pair, err := s.generateTokenPair(Claims{
+		UserID:                 user.ID,
+		Role:                   user.Role,
+		SessionID:              sessionID,
+		PasswordChangeRequired: user.PasswordChangeRequired,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return pair, user, nil
+}
+
+// NeedsSetup reports whether the system still needs its initial user account.
+func (s *Service) NeedsSetup(ctx context.Context) (bool, error) {
+	count, err := s.users.Count(ctx)
+	if err != nil {
+		return false, fmt.Errorf("counting users: %w", err)
+	}
+	return count == 0, nil
+}
+
+// SetupInitialUser creates the first admin account and signs it in.
+//
+// The emptiness check, account, optional profile, and login session share one
+// transaction under the database-wide setup lock (UserRepository.ClaimInitialSetup),
+// so competing callers on any replica see exactly one winner; every other
+// caller gets ErrSetupAlreadyComplete. The session and token pair match what
+// Login would issue for the new account.
+func (s *Service) SetupInitialUser(
+	ctx context.Context,
+	username, email, password string,
+	createDefaultProfile bool,
+	defaultProfileName string,
+	deviceName, ip string,
+) (*TokenPair, *models.User, error) {
+	if err := ValidateNewPassword(password); err != nil {
+		return nil, nil, err
+	}
+
+	var (
+		user *models.User
+		pair *TokenPair
+	)
+	err := s.users.ClaimInitialSetup(ctx, func(tx pgx.Tx) error {
+		created, err := s.accounts.CreateInitialAccountInTransaction(ctx, tx, CreateAccountInput{
+			User: models.CreateUserInput{
+				Username: username,
+				Email:    email,
+				Password: password,
+				Role:     models.RoleAdmin,
+			},
+			DefaultProfile: DefaultProfileOptions{
+				Enabled: createDefaultProfile,
+				Name:    defaultProfileName,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("creating initial user: %w", err)
+		}
+
+		sessionID := uuid.New().String()
+		session := models.AuthSession{
+			ID:         sessionID,
+			UserID:     created.ID,
+			DeviceName: deviceName,
+			IPAddress:  ip,
+			ExpiresAt:  time.Now().Add(s.jwt.RefreshExpiry()),
+		}
+		if err := s.sessions.createWithQuerier(ctx, tx, session); err != nil {
+			return err
+		}
+		tokens, err := s.generateTokenPair(Claims{
+			UserID:    created.ID,
+			Role:      created.Role,
+			SessionID: sessionID,
+		})
+		if err != nil {
+			return err
+		}
+		user, pair = created, tokens
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return pair, user, nil
+}
+
+// Signup creates a new user account using an invite code. Requires that
+// public signups are enabled via the "signup.enabled" server setting.
+func (s *Service) Signup(
+	ctx context.Context,
+	username, email, password, code string,
+	createDefaultProfile bool,
+	defaultProfileName string,
+	deviceName, ip string,
+) (*TokenPair, *models.User, error) {
+	if err := ValidateNewPassword(password); err != nil {
+		return nil, nil, err
+	}
+	// Check global signup toggle.
+	if s.settings != nil {
+		enabled, err := s.settings.Get(ctx, "signup.enabled")
+		if err != nil {
+			return nil, nil, fmt.Errorf("checking signup setting: %w", err)
+		}
+		if enabled != "true" {
+			return nil, nil, ErrSignupDisabled
+		}
+	} else {
+		return nil, nil, ErrSignupDisabled
+	}
+	// A signup creates a local-password account, which cannot sign in while
+	// the server turns local password sign-in off; refuse before the invite
+	// code is spent.
+	if allowed, err := s.LocalPasswordLoginAllowed(ctx); err != nil {
+		return nil, nil, err
+	} else if !allowed {
+		return nil, nil, ErrLocalLoginDisabled
+	}
+
+	// Create the user with standard role and access to all libraries.
+	if _, err := s.accounts.CreateInvitedAccount(ctx, CreateAccountInput{
+		User: models.CreateUserInput{
+			Username: username,
+			Email:    email,
+			Password: password,
+			Role:     "user",
+		},
+		DefaultProfile: DefaultProfileOptions{
+			Enabled: createDefaultProfile,
+			Name:    defaultProfileName,
+		},
+	}, code); err != nil {
+		return nil, nil, fmt.Errorf("creating user: %w", err)
+	}
+
+	// Log them in to create a session and return tokens.
+	pair, user, err := s.Login(ctx, username, password, deviceName, ip)
+	if err != nil {
+		return nil, nil, errors.Join(ErrSignupSessionStart, err)
+	}
+	return pair, user, nil
+}
+
+// SetupWizardCompleted reports whether the first-run setup wizard recorded
+// its completion. It is meaningful only once an account exists; before that
+// there is nothing to have completed.
+func (s *Service) SetupWizardCompleted(ctx context.Context) (bool, error) {
+	if s.settings == nil {
+		return false, nil
+	}
+	value, err := s.settings.Get(ctx, config.SetupCompletedSettingKey)
+	if err != nil {
+		return false, fmt.Errorf("checking setup completion: %w", err)
+	}
+	return value == "true", nil
+}
+
+// IsSignupEnabled reports whether public signups are enabled: the
+// signup.enabled setting is on and local password sign-in, which a new
+// account needs, is not turned off.
+func (s *Service) IsSignupEnabled(ctx context.Context) (bool, error) {
+	if s.settings == nil {
+		return false, nil
+	}
+	enabled, err := s.settings.Get(ctx, "signup.enabled")
+	if err != nil {
+		return false, fmt.Errorf("checking signup setting: %w", err)
+	}
+	if enabled != "true" {
+		return false, nil
+	}
+	return s.LocalPasswordLoginAllowed(ctx)
+}
+
+// LocalPasswordLoginAllowed reports the server-wide local password switch
+// (auth.local_password_login); true without account storage.
+func (s *Service) LocalPasswordLoginAllowed(ctx context.Context) (bool, error) {
+	if s.users == nil {
+		return true, nil
+	}
+	return s.users.LocalPasswordLoginAllowed(ctx)
+}
+
+// Logout revokes the session identified by sessionID.
+func (s *Service) Logout(ctx context.Context, sessionID string) error {
+	return s.sessions.Revoke(ctx, sessionID)
+}
+
+// StartImpersonation creates a new target-user session with admin provenance.
+// Account locks serialize creation with revocation and authority changes; the
+// originating login session must still be live when the new session is inserted.
+func (s *Service) StartImpersonation(ctx context.Context, adminUserID, targetUserID int, deviceName, ip string) (*TokenPair, *models.User, *models.User, error) {
+	claims := ClaimsFromContext(ctx)
+	if claims != nil {
+		if claims.TokenType == TokenTypeAPIKey || claims.SessionID == "" {
+			return nil, nil, nil, ErrImpersonationNotAllowed
+		}
+	}
+	if adminUserID == targetUserID {
+		return nil, nil, nil, ErrImpersonationNotAllowed
+	}
+	tx, err := s.sessions.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	// Match revocation and ownership transfers: lock both accounts in ID
+	// order before taking session locks or inserting rows with user FKs.
+	ids := []int{adminUserID, targetUserID}
+	sort.Ints(ids)
+	var admin, target *models.User
+	for _, id := range ids {
+		user, err := lockUser(ctx, tx, id)
+		if err != nil {
+			if id == adminUserID && IsNotFound(err) {
+				return nil, nil, nil, ErrImpersonationNotAllowed
+			}
+			return nil, nil, nil, fmt.Errorf("getting impersonation account: %w", err)
+		}
+		if id == adminUserID {
+			admin = user
+		} else {
+			target = user
+		}
+	}
+	// An already active View as user answers 409 before the account checks,
+	// whose outcome would depend on the account being viewed.
+	if claims != nil {
+		currentSession, err := scanSession(tx.QueryRow(ctx, `SELECT `+sessionColumns+` FROM auth_sessions WHERE id=$1 FOR UPDATE`, claims.SessionID))
+		if IsSessionNotFound(err) {
+			return nil, nil, nil, ErrSessionRevoked
+		}
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("getting current session: %w", err)
+		}
+		if currentSession.RevokedAt != nil || !currentSession.ExpiresAt.After(time.Now()) {
+			return nil, nil, nil, ErrSessionRevoked
+		}
+		if currentSession.ImpersonatorUserID != nil {
+			return nil, nil, nil, ErrAlreadyImpersonating
+		}
+		if currentSession.UserID != admin.ID {
+			return nil, nil, nil, ErrSessionRevoked
+		}
+	}
+	if admin.Role != "admin" || !admin.Enabled {
+		return nil, nil, nil, ErrImpersonationNotAllowed
+	}
+	// Admins may not act as another admin; only the server Owner may, and
+	// nobody may act as the Owner.
+	if !target.Enabled || target.IsOwner || (target.Role == "admin" && !admin.IsOwner) {
+		return nil, nil, nil, ErrImpersonationNotAllowed
+	}
+
+	sessionID := uuid.New().String()
+	impersonatorUserID := admin.ID
+	startedAt := time.Now()
+	session := models.AuthSession{
+		ID:                     sessionID,
+		UserID:                 target.ID,
+		DeviceName:             deviceName,
+		IPAddress:              ip,
+		ExpiresAt:              startedAt.Add(s.jwt.RefreshExpiry()),
+		ImpersonatorUserID:     &impersonatorUserID,
+		ImpersonationStartedAt: &startedAt,
+	}
+
+	if err := s.sessions.createWithQuerier(ctx, tx, session); err != nil {
+		return nil, nil, nil, fmt.Errorf("creating session: %w", err)
+	}
+	audit, err := auditmutation.RecordMutation(ctx, tx, auditmutation.ActionImpersonationStarted, auditmutation.TargetUser,
+		strconv.Itoa(target.ID), http.StatusOK, auditmutation.Created(auditFieldImpersonationSession, sessionID))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, nil, err
+	}
+	auditmutation.CommitMutation(ctx, audit)
+
+	pair, err := s.generateTokenPair(Claims{
+		UserID:             target.ID,
+		Role:               target.Role,
+		SessionID:          sessionID,
+		ImpersonatorUserID: &impersonatorUserID,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	return pair, admin, target, nil
+}
+
+// auditFieldImpersonationSession names the login session a View as user
+// runs in. A session ID identifies the session; it is not a credential.
+const auditFieldImpersonationSession = "impersonation_session_id"
+
+// auditFieldLoginSession names a login session one revocation ended.
+const auditFieldLoginSession = "login_session_id"
+
+// EndImpersonation revokes an impersonated session without affecting the original admin session.
+func (s *Service) EndImpersonation(ctx context.Context, sessionID string, impersonatorUserID int) error {
+	return s.sessions.revokeChecked(ctx, sessionID, func(session *models.AuthSession) error {
+		if session.ImpersonatorUserID == nil {
+			return ErrNotImpersonating
+		}
+		if *session.ImpersonatorUserID != impersonatorUserID {
+			return ErrImpersonationNotAllowed
+		}
+		return nil
+	}, func(tx pgx.Tx, session *models.AuthSession) (*auditmutation.Entry, error) {
+		return auditmutation.RecordMutation(ctx, tx, auditmutation.ActionImpersonationEnded, auditmutation.TargetUser,
+			strconv.Itoa(session.UserID), http.StatusNoContent, auditmutation.Removed(auditFieldImpersonationSession, session.ID))
+	})
+}
+
+// Refresh validates the refresh token, checks that the associated session is
+// still valid, and issues a new token pair. A token that does not verify is
+// an invalid-token error and a session or account that no longer holds is
+// ErrSessionRevoked; a store failure while checking either is
+// ErrSessionCheckUnavailable, which ends nothing. A provider answer the
+// re-check received but could not apply (errAnswerNotApplied) refuses the
+// token: the store answered, so a retry would only repeat the failure.
+func (s *Service) Refresh(ctx context.Context, refreshToken string) (*TokenPair, error) {
+	claims, err := s.jwt.ValidateToken(refreshToken)
+	if err != nil {
+		return nil, fmt.Errorf("invalid refresh token: %w", err)
+	}
+	if claims.TokenType != TokenTypeRefresh {
+		return nil, fmt.Errorf("invalid refresh token: %w", ErrInvalidToken)
+	}
+
+	standing, err := s.checkSessionStanding(ctx, claims.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	session, user := standing.session, standing.user
+
+	// Slide the session window forward so an active client never hits the
+	// hard expires_at set at login. A failure here is non-fatal: the refresh
+	// still returns fresh tokens; the session just keeps its prior expiry.
+	if err := s.sessions.ExtendExpiresAt(ctx, session.ID, standing.expiry); err != nil {
+		switch {
+		case !IsSessionNotFound(err):
+			return nil, sessionCheckUnavailable("extending session", err)
+		case standing.rechecked:
+			// A check on another node (a role change, a refused account)
+			// revoked the session while this refresh waited for it.
+			return nil, ErrSessionRevoked
+		}
+	}
+
+	// An impersonating administrator is not the one who must change the
+	// password, so only the account's own sessions are restricted.
+	refreshed := Claims{
+		UserID:                 user.ID,
+		Role:                   user.Role,
+		SessionID:              session.ID,
+		ImpersonatorUserID:     session.ImpersonatorUserID,
+		PasswordChangeRequired: user.PasswordChangeRequired && session.ImpersonatorUserID == nil,
+	}
+	if session.IsRemotePlayback() {
+		refreshed = remotePlaybackClaims(refreshed, session)
+	}
+	return s.generateTokenPair(refreshed)
+}
+
+// sessionStanding is what checkSessionStanding establishes about a login
+// session before tokens are issued from it.
+type sessionStanding struct {
+	session *models.AuthSession
+	user    *models.User
+	// expiry is the furthest the session may now run: Refresh slides it
+	// there, and a token that does not slide it ends no later.
+	expiry time.Time
+	// rechecked is set when the external provider was consulted.
+	rechecked bool
+}
+
+// checkSessionStanding applies the checks a login session must pass before
+// tokens are issued from it: the session and account are live, an
+// impersonating administrator still holds the role, and a session opened
+// through an external provider passes the provider re-check under its outage
+// policy. Errors follow Refresh's contract.
+func (s *Service) checkSessionStanding(ctx context.Context, sessionID string) (*sessionStanding, error) {
+	session, err := s.sessions.GetByID(ctx, sessionID)
+	if err != nil {
+		if IsSessionNotFound(err) {
+			return nil, ErrSessionRevoked
+		}
+		return nil, sessionCheckUnavailable("getting session", err)
+	}
+	if session.RevokedAt != nil || !session.ExpiresAt.After(time.Now()) {
+		return nil, ErrSessionRevoked
+	}
+	if session.IsRemotePlayback() && (session.BoundProfileID == "" || session.AbsoluteExpiresAt == nil) {
+		// The schema refuses such a row; fail closed rather than refresh a
+		// handoff that names no profile or no end.
+		return nil, ErrSessionRevoked
+	}
+
+	user, err := s.users.GetByID(ctx, session.UserID)
+	if err != nil {
+		if IsNotFound(err) {
+			return nil, ErrSessionRevoked
+		}
+		return nil, sessionCheckUnavailable("getting user", err)
+	}
+	if !user.Enabled {
+		return nil, ErrSessionRevoked
+	}
+	if err := s.validateImpersonator(ctx, session.ImpersonatorUserID); err != nil {
+		if errors.Is(err, ErrSessionRevoked) {
+			return nil, err
+		}
+		return nil, sessionCheckUnavailable("checking impersonator", err)
+	}
+
+	now := time.Now()
+	newExpiry := now.Add(s.jwt.RefreshExpiry())
+
+	// A session opened through an external provider is re-checked with the
+	// provider once its identity's last answer is older than the re-check
+	// interval (docs/architecture/external-sign-in.md). One whose identity is
+	// gone (unlinked, plugin removed) can no longer be re-checked at all.
+	absoluteAge := session.IdentityID == nil && session.ProviderSince != nil && session.ImpersonatorUserID == nil
+	rechecked := session.IdentityID != nil && session.ImpersonatorUserID == nil && s.recheck != nil
+	if rechecked {
+		verdict, err := s.recheck.check(ctx, session)
+		if err != nil {
+			if errors.Is(err, ErrSessionRevoked) || errors.Is(err, ErrProviderUnavailable) {
+				return nil, err
+			}
+			if errors.Is(err, errAnswerNotApplied) {
+				// Not an outage: retrying would ask the provider again and
+				// fail the same way, so the token is refused as before.
+				return nil, fmt.Errorf("re-checking provider identity: %w", err)
+			}
+			return nil, sessionCheckUnavailable("re-checking provider identity", err)
+		}
+		absoluteAge = verdict == verdictAbsoluteAge
+	}
+	if absoluteAge {
+		// The provider cannot vouch for the session any more: it ends an
+		// absolute age (auth.refresh_token_expiry) after the provider last
+		// did, and refresh no longer slides it.
+		limit := providerAnchor(session).Add(s.jwt.RefreshExpiry())
+		if !limit.After(now) {
+			return nil, ErrSessionRevoked
+		}
+		newExpiry = limit
+		if session.ExpiresAt.Before(limit) {
+			newExpiry = session.ExpiresAt
+		}
+	}
+	// A session with an absolute end (a remote-playback handoff) never
+	// slides past it; the database trigger holds the same limit for every
+	// other writer.
+	if session.AbsoluteExpiresAt != nil && session.AbsoluteExpiresAt.Before(newExpiry) {
+		newExpiry = *session.AbsoluteExpiresAt
+	}
+	return &sessionStanding{session: session, user: user, expiry: newExpiry, rechecked: rechecked}, nil
+}
+
+// RenewPluginAccess re-issues a plugin access token from claims, a valid
+// plugin token, for the same session and profile. The session must pass the
+// checks Refresh applies, so an open plugin page stops renewing exactly when
+// the session could no longer refresh. Renewal never slides the session, and
+// the new token ends no later than the session does. Errors follow Refresh's
+// contract.
+func (s *Service) RenewPluginAccess(ctx context.Context, claims *Claims, ttl time.Duration) (string, error) {
+	if claims == nil || claims.TokenType != TokenTypePluginAccess || claims.SessionID == "" {
+		return "", ErrInvalidToken
+	}
+	standing, err := s.checkSessionStanding(ctx, claims.SessionID)
+	if err != nil {
+		return "", err
+	}
+	session, user := standing.session, standing.user
+	// Plugins are not part of a remote-playback handoff, and a session that
+	// must change its password may only do that.
+	if session.UserID != claims.UserID || session.IsRemotePlayback() ||
+		(user.PasswordChangeRequired && session.ImpersonatorUserID == nil) {
+		return "", ErrSessionRevoked
+	}
+	ends := standing.expiry
+	if session.ExpiresAt.Before(ends) {
+		ends = session.ExpiresAt
+	}
+	return s.jwt.generateToken(Claims{
+		UserID:             user.ID,
+		Role:               user.Role,
+		SessionID:          session.ID,
+		ProfileID:          claims.ProfileID,
+		ProfilePINRevision: claims.ProfilePINRevision,
+		SessionEndsAt:      ends,
+	}, TokenTypePluginAccess, ttl)
+}
+
+func (s *Service) validateImpersonator(ctx context.Context, impersonatorUserID *int) error {
+	if impersonatorUserID == nil {
+		return nil
+	}
+
+	impersonator, err := s.users.GetByID(ctx, *impersonatorUserID)
+	if err != nil {
+		if IsNotFound(err) {
+			return ErrSessionRevoked
+		}
+		return fmt.Errorf("getting impersonator user: %w", err)
+	}
+	if !impersonator.Enabled || impersonator.Role != "admin" {
+		return ErrSessionRevoked
+	}
+	return nil
+}
+
+// GetCurrentUser retrieves the user associated with the given JWT claims.
+func (s *Service) GetCurrentUser(ctx context.Context, claims *Claims) (*models.User, error) {
+	user, err := s.users.GetByID(ctx, claims.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("getting user: %w", err)
+	}
+	return user, nil
+}
+
+// PasswordChangeAvailable reports whether the account has a local password
+// that can be verified and replaced through the self-service password flow.
+// OAuth-only accounts keep their provider-managed credential boundary.
+func (s *Service) PasswordChangeAvailable(ctx context.Context, userID int) (bool, error) {
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("getting user: %w", err)
+	}
+	return user.LocalPasswordLoginEnabled && user.PasswordHash != "", nil
+}
+
+// ChangePassword verifies the existing local credential before replacing it.
+// Profile authorization and impersonation checks belong to the HTTP boundary;
+// this method owns only the account credential transition. sessionID is the
+// login session making the change: when it replaces a temporary password,
+// every other login session of the account is revoked. signOutOtherSessions
+// also signs the account out everywhere else, as a password reset does,
+// except sessionID.
+func (s *Service) ChangePassword(ctx context.Context, userID int, sessionID, currentPassword, newPassword string, signOutOtherSessions bool) error {
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("getting user: %w", err)
+	}
+	if err := validatePasswordChange(ctx, user, currentPassword, newPassword); err != nil {
+		return err
+	}
+
+	switch {
+	case signOutOtherSessions:
+		err = s.users.ReplacePasswordSigningOutOthers(ctx, userID, user.PasswordHash, newPassword, sessionID)
+	case user.PasswordChangeRequired:
+		err = s.users.ReplaceTemporaryPassword(ctx, userID, user.PasswordHash, newPassword, sessionID)
+	default:
+		err = s.users.CompareAndSwapPassword(ctx, userID, user.PasswordHash, newPassword)
+	}
+	if err != nil {
+		return fmt.Errorf("updating password: %w", err)
+	}
+	if signOutOtherSessions && s.sessionsRevoked != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		s.sessionsRevoked(cleanupCtx, userID)
+	}
+	return nil
+}
+
+func validatePasswordChange(ctx context.Context, user *models.User, currentPassword, newPassword string) error {
+	if !user.LocalPasswordLoginEnabled || user.PasswordHash == "" {
+		return ErrPasswordLoginDisabled
+	}
+	ok, err := CheckPassword(ctx, user, currentPassword)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrCurrentPasswordInvalid
+	}
+	if err := ValidateNewPassword(newPassword); err != nil {
+		return err
+	}
+	if user.PasswordChangeRequired && newPassword == currentPassword {
+		return ErrPasswordUnchanged
+	}
+	return nil
+}
+
+// ValidateNewPassword applies the shared local credential policy before a new
+// account or password is persisted. The minimum counts characters; bcrypt
+// limits the UTF-8 encoding to 72 bytes.
+func ValidateNewPassword(password string) error {
+	if utf8.RuneCountInString(password) < MinimumPasswordLength {
+		return ErrPasswordTooShort
+	}
+	if len(password) > MaximumPasswordBytes {
+		return ErrPasswordTooLong
+	}
+	return nil
+}
+
+// GetSessionsPage returns one keyset page of the user's live sessions; see
+// SessionRepository.ListByUserPage.
+func (s *Service) GetSessionsPage(ctx context.Context, userID int, after *SessionKey, limit int) ([]*models.AuthSession, error) {
+	return s.sessions.ListByUserPage(ctx, userID, after, limit)
+}
+
+// CurrentLoginSession returns the caller's live session independently of the
+// page position, so an older current session need not be paged into view.
+func (s *Service) CurrentLoginSession(ctx context.Context, userID int, sessionID string) (*models.AuthSession, error) {
+	session, err := s.sessions.GetByID(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if session.UserID != userID || session.RevokedAt != nil || !session.ExpiresAt.After(time.Now()) {
+		return nil, ErrSessionNotFound
+	}
+	return session, nil
+}
+
+// LoginSessionActive reports whether a login session is live: not revoked
+// and not expired. An error means the store could not be read.
+func (s *Service) LoginSessionActive(ctx context.Context, sessionID string) (bool, error) {
+	return s.sessions.IsValid(ctx, sessionID)
+}
+
+// RevokeSession revokes a specific session. It verifies the session belongs
+// to the given user before revoking.
+func (s *Service) RevokeSession(ctx context.Context, sessionID string, userID int) error {
+	return s.sessions.revokeChecked(ctx, sessionID, func(session *models.AuthSession) error {
+		if session.UserID != userID {
+			return ErrSessionNotFound
+		}
+		return nil
+	}, func(tx pgx.Tx, session *models.AuthSession) (*auditmutation.Entry, error) {
+		return auditmutation.RecordMutation(ctx, tx, auditmutation.ActionLoginSessionRevoked, auditmutation.TargetUser,
+			strconv.Itoa(session.UserID), http.StatusNoContent, auditmutation.Removed(auditFieldLoginSession, session.ID))
+	})
+}
+
+// generateTokenPair creates a new access/refresh token pair for the given
+// claims.
+func (s *Service) generateTokenPair(claims Claims) (*TokenPair, error) {
+	accessToken, err := s.jwt.generateAccessToken(claims)
+	if err != nil {
+		return nil, fmt.Errorf("generating access token: %w", err)
+	}
+
+	refreshToken, err := s.jwt.generateRefreshToken(claims)
+	if err != nil {
+		return nil, fmt.Errorf("generating refresh token: %w", err)
+	}
+
+	return &TokenPair{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresIn:    s.jwt.accessExpiresIn(claims),
+		SessionID:    claims.SessionID,
+	}, nil
+}
+
+// providerAnchor is when the provider last vouched for session's chain: its
+// provider_since, or its creation for a session that predates it.
+func providerAnchor(session *models.AuthSession) time.Time {
+	if session.ProviderSince != nil && session.ProviderSince.Before(session.CreatedAt) {
+		return *session.ProviderSince
+	}
+	return session.CreatedAt
+}
+
+// identityRef is the IdentityID of a session opened through identityID; nil
+// for 0 (no identity).
+func identityRef(identityID int64) *int64 {
+	if identityID == 0 {
+		return nil
+	}
+	return &identityID
+}
