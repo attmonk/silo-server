@@ -662,8 +662,8 @@ func compatVideoRange(track models.VideoTrack, versionHDR bool) string {
 	switch rangeType {
 	case "SDR":
 		return "SDR"
-	case compatRangeUnknown:
-		return compatRangeUnknown
+	case "Unknown":
+		return "Unknown"
 	default:
 		return "HDR"
 	}

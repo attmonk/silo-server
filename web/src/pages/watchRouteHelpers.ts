@@ -408,7 +408,6 @@ export function buildWatchPageProps({
     contentId: request.contentId,
     title: item.title,
     year: item.year,
-    backdrop: { url: item.backdrop_url, thumbhash: item.backdrop_thumbhash },
     fileId: request.fileId,
     versionPicked: request.versionPicked,
     libraryId: request.libraryId,

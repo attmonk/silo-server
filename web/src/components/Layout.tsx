@@ -26,8 +26,10 @@ import { prefetchCatalog } from "@/pages/catalogRoute";
 import type { ReactNode, TransitionEvent as ReactTransitionEvent } from "react";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { useAudiobookPlaybackController } from "@/pages/audiobooks/player/audiobookPlaybackContext";
-import { useImmediateSidebarCollapse } from "@/hooks/useImmediateSidebarCollapse";
-import { prefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
+import {
+  prefersReducedMotion,
+  useImmediateSidebarCollapse,
+} from "@/hooks/useImmediateSidebarCollapse";
 import SidebarItemNavigationProvider from "@/components/SidebarItemNavigationProvider";
 import {
   hasRunningSidebarTransition,
@@ -404,20 +406,14 @@ export default function Layout({ children }: LayoutProps) {
         <div className="hidden lg:block" onTransitionEnd={handleSidebarTransitionEnd}>
           {isSettingsRoute ? (
             // Settings take over the sidebar column rather than adding a
-            // second one beside it. The placeholder holds the column's place
-            // while the chunk loads; if it fails to load, the app sidebar
-            // stands in so the page stays usable.
-            <LocalErrorBoundary
-              fallback={<AppSidebar collapsed={visualDetailImmersion} swap={sidebarSwap} />}
+            // second one beside it. The fallback holds the column's place.
+            <Suspense
+              fallback={
+                <div className="border-sidebar-border/70 bg-sidebar/92 fixed start-0 top-0 bottom-0 z-40 w-[260px] border-e" />
+              }
             >
-              <Suspense
-                fallback={
-                  <div className="border-sidebar-border/70 bg-sidebar/92 fixed start-0 top-0 bottom-0 z-40 w-[260px] border-e" />
-                }
-              >
-                <UserSettingsSidebar backTo={settingsReturnPath} swap={sidebarSwap} />
-              </Suspense>
-            </LocalErrorBoundary>
+              <UserSettingsSidebar backTo={settingsReturnPath} swap={sidebarSwap} />
+            </Suspense>
           ) : (
             <AppSidebar collapsed={visualDetailImmersion} swap={sidebarSwap} />
           )}
@@ -428,7 +424,7 @@ export default function Layout({ children }: LayoutProps) {
         <div
           ref={mobileHeaderRef}
           data-sticky-header
-          className={`mobile-header glass-dark border-border/70 sticky top-0 z-30 mx-3 mt-3 flex items-center justify-between rounded-2xl border px-4 py-3 transition-transform duration-200 ease-out motion-reduce:transition-none lg:hidden ${
+          className={`mobile-header glass-dark border-border/70 sticky top-0 z-30 mx-3 mt-3 flex items-center justify-between rounded-2xl border px-4 py-3 transition-transform duration-200 ease-out lg:hidden ${
             mobileHeaderHidden ? "-translate-y-[140%]" : "translate-y-0"
           }`}
         >
@@ -449,7 +445,6 @@ export default function Layout({ children }: LayoutProps) {
               to={buildQueryCatalogHref()}
               onPointerDown={prefetchCatalog}
               onFocus={prefetchCatalog}
-              aria-label={t("web.shell.sidebar.search")}
               className="text-muted-foreground hover:text-foreground hover:bg-accent/60 flex h-10 w-10 items-center justify-center rounded-xl transition-all active:scale-[0.98]"
             >
               <Search className="h-5 w-5" />
@@ -497,10 +492,9 @@ export default function Layout({ children }: LayoutProps) {
         {/* Main content — offset by sidebar width on desktop */}
         <main
           id="main-content"
-          tabIndex={-1}
           data-sidebar-target-collapsed={targetDetailImmersion ? "true" : undefined}
           data-sidebar-visual-collapsed={visualDetailImmersion ? "true" : undefined}
-          className={`sidebar-main-stage relative min-h-screen outline-none ${
+          className={`sidebar-main-stage relative min-h-screen ${
             targetDetailImmersion ? "lg:ms-16" : "lg:ms-[260px]"
           } ${hasBackgroundBar ? "pb-32 sm:pb-36" : ""}`}
           style={{ viewTransitionName: "main-content" }}

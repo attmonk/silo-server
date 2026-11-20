@@ -4,8 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"strings"
-
-	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
 const (
@@ -61,8 +59,7 @@ func (s *SlogFFmpegLogSink) WriteLine(ctx context.Context, sessionID string, att
 		return
 	}
 	args := s.baseArgs(sessionID, attrs)
-	// FFmpeg names its input in its output; a relayed input is a capability.
-	args = append(args, ffmpegLineKey, fspath.RedactRelayed(line))
+	args = append(args, ffmpegLineKey, line)
 	if attrs.LineIndex > 0 {
 		args = append(args, ffmpegLineIndexKey, attrs.LineIndex)
 	}
@@ -77,9 +74,9 @@ func (s *SlogFFmpegLogSink) WriteEvent(ctx context.Context, sessionID string, at
 		return
 	}
 	args := s.baseArgs(sessionID, attrs)
-	args = append(args, ffmpegEventKey, fspath.RedactRelayed(message))
+	args = append(args, ffmpegEventKey, message)
 	if attrs.ExitError != "" {
-		args = append(args, "exit_error", fspath.RedactRelayed(attrs.ExitError))
+		args = append(args, "exit_error", attrs.ExitError)
 	}
 	if attrs.DroppedLines > 0 {
 		args = append(args, ffmpegDroppedLinesKey, attrs.DroppedLines)
@@ -103,7 +100,7 @@ func (s *SlogFFmpegLogSink) baseArgs(sessionID string, attrs FFmpegLogAttrs) []a
 		"start_segment_number", attrs.StartSegmentNumber,
 	}
 	if v := strings.TrimSpace(attrs.InputPath); v != "" {
-		args = append(args, "input_path", fspath.RedactRelayed(v))
+		args = append(args, "input_path", v)
 	}
 	if v := strings.TrimSpace(attrs.OutputDir); v != "" {
 		args = append(args, "output_dir", v)

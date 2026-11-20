@@ -5,7 +5,6 @@ import {
   type QueryGroup,
   type QueryRule,
 } from "@/api/types";
-import { parseRuleValueParam } from "@/components/collections/collectionBuilderFields";
 import {
   normalizeQuerySortField,
   normalizeQuerySortForScope,
@@ -59,8 +58,8 @@ interface GroupBuilder {
 interface RuleBuilder {
   field?: string;
   op?: string;
-  value?: string;
-  values?: Map<number, string>;
+  value?: unknown;
+  values?: Map<number, unknown>;
 }
 
 function createDefaultLibraryQueryDefinition(): QueryDefinition {
@@ -150,6 +149,19 @@ function parsePositiveInt(value: string | null): number | null {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+function parseScalar(value: string): string | number | boolean {
+  if (value === "true") {
+    return true;
+  }
+  if (value === "false") {
+    return false;
+  }
+  if (/^-?\d+$/.test(value)) {
+    return Number(value);
+  }
+  return value;
+}
+
 function ensureGroup(groups: Map<number, GroupBuilder>, index: number): GroupBuilder {
   let group = groups.get(index);
   if (!group) {
@@ -195,7 +207,7 @@ function parseGroups(searchParams: URLSearchParams): QueryGroup[] {
       } else if (fieldName === "op") {
         rule.op = rawValue;
       } else {
-        rule.value = rawValue;
+        rule.value = parseScalar(rawValue);
       }
       return;
     }
@@ -206,8 +218,8 @@ function parseGroups(searchParams: URLSearchParams): QueryGroup[] {
       const ruleIndex = Number(indexedValueMatch[2]);
       const valueIndex = Number(indexedValueMatch[3]);
       const rule = ensureRule(groups, groupIndex, ruleIndex);
-      rule.values ??= new Map<number, string>();
-      rule.values.set(valueIndex, rawValue);
+      rule.values ??= new Map<number, unknown>();
+      rule.values.set(valueIndex, parseScalar(rawValue));
     }
   });
 
@@ -217,21 +229,16 @@ function parseGroups(searchParams: URLSearchParams): QueryGroup[] {
       match: group.match ?? "all",
       rules: Array.from(group.rules.entries())
         .sort(([left], [right]) => left - right)
-        .map(([, rule]) => {
-          // The field may follow its value in the URL, so values are typed
-          // once the whole rule is read.
-          const field = rule.field ?? "genre";
-          return {
-            field,
-            op: rule.op ?? "is",
-            value:
-              rule.values && rule.values.size > 0
-                ? (Array.from(rule.values.entries())
-                    .sort(([left], [right]) => left - right)
-                    .map(([, value]) => parseRuleValueParam(field, value)) as QueryRule["value"])
-                : (parseRuleValueParam(field, rule.value ?? "") as QueryRule["value"]),
-          };
-        }),
+        .map(([, rule]) => ({
+          field: rule.field ?? "genre",
+          op: rule.op ?? "is",
+          value:
+            rule.values && rule.values.size > 0
+              ? (Array.from(rule.values.entries())
+                  .sort(([left], [right]) => left - right)
+                  .map(([, value]) => value) as QueryRule["value"])
+              : ((rule.value ?? "") as QueryRule["value"]),
+        })),
     }))
     .filter((group) => group.rules.length > 0);
 }

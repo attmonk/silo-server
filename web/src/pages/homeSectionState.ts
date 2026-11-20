@@ -1,5 +1,4 @@
 import type { ResolvedSection, ResolvedSectionLayout } from "@/api/types";
-import { holdsCollections } from "@/lib/sectionTypes";
 
 export type HomeSectionSlotState = "loading" | "ready" | "empty" | "error";
 
@@ -19,10 +18,7 @@ export function buildHomeSectionViewModel(input: {
   loadedSections: Map<string, ResolvedSection>;
   failedIds: Set<string>;
 }): HomeSectionViewModel {
-  // A row of collections has no title to show as the hero.
-  const heroLayout =
-    input.layout.find((section) => section.featured && !holdsCollections(section.section_type)) ??
-    null;
+  const heroLayout = input.layout.find((section) => section.featured) ?? null;
   const rowLayouts = input.layout.filter((section) => section !== heroLayout);
 
   return {
@@ -40,7 +36,7 @@ function toSlot(
 ): HomeSectionSlot {
   const section = input.loadedSections.get(layout.id);
   if (section) {
-    if (section.items.length === 0 && !section.collections?.length) {
+    if (section.items.length === 0) {
       return { layout, state: "empty", section };
     }
     return { layout, state: "ready", section };

@@ -64,118 +64,70 @@ func validateInstanceStateScope(installationID int, scope string) error {
 	return nil
 }
 
-// Read returns the value stored under key for the installation in scope and
-// its version. Version 0 means no value is stored.
-func (s *InstanceStateStore) Read(ctx context.Context, installationID int, scope, key string) ([]byte, int64, error) {
+// Read returns the value stored under key for the installation in scope.
+func (s *InstanceStateStore) Read(ctx context.Context, installationID int, scope, key string) ([]byte, bool, error) {
 	if err := validateInstanceStateScope(installationID, scope); err != nil {
-		return nil, 0, err
+		return nil, false, err
 	}
 	if err := pluginhost.ValidateInstanceStateKey(key); err != nil {
-		return nil, 0, err
+		return nil, false, err
 	}
 	if s == nil || s.pool == nil {
-		return nil, 0, errors.New("instance state store is not configured")
+		return nil, false, errors.New("instance state store is not configured")
 	}
 	var stored []byte
-	var version int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT state_value, version
+		SELECT state_value
 		FROM plugin_instance_state
 		WHERE plugin_installation_id = $1 AND host_scope = $2 AND state_key = $3
-	`, installationID, scope, key).Scan(&stored, &version)
+	`, installationID, scope, key).Scan(&stored)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, 0, nil
+			return nil, false, nil
 		}
-		return nil, 0, fmt.Errorf("reading plugin instance state: %w", err)
+		return nil, false, fmt.Errorf("reading plugin instance state: %w", err)
 	}
 	value, err := s.open(installationID, scope, key, stored)
 	if err != nil {
-		return nil, 0, err
+		return nil, false, err
 	}
-	return value, version, nil
+	return value, true, nil
 }
 
-// Write stores value under key for the installation in scope and returns the
-// version it wrote. A nil expectedVersion replaces any previous value. A
-// non-nil one writes only while the key is at that version, 0 meaning the
-// key must not exist, and otherwise fails with
-// pluginhost.ErrInstanceStateVersionConflict. A new key fails with
-// pluginhost.ErrInstanceStateTooManyKeys when the scope already holds
-// InstanceStateMaxKeys other keys.
-func (s *InstanceStateStore) Write(ctx context.Context, installationID int, scope, key string, value []byte, expectedVersion *int64) (int64, error) {
+// Write stores value under key for the installation in scope, replacing any
+// previous value. It fails with pluginhost.ErrInstanceStateTooManyKeys when
+// the scope already holds InstanceStateMaxKeys other keys.
+func (s *InstanceStateStore) Write(ctx context.Context, installationID int, scope, key string, value []byte) error {
 	if err := validateInstanceStateScope(installationID, scope); err != nil {
-		return 0, err
+		return err
 	}
 	if err := pluginhost.ValidateInstanceStateKey(key); err != nil {
-		return 0, err
+		return err
 	}
 	if len(value) > pluginhost.InstanceStateMaxValueBytes {
-		return 0, pluginhost.ErrInstanceStateValueTooLarge
+		return pluginhost.ErrInstanceStateValueTooLarge
 	}
 	if s == nil || s.pool == nil {
-		return 0, errors.New("instance state store is not configured")
+		return errors.New("instance state store is not configured")
 	}
 	sealed, err := s.seal(installationID, scope, key, value)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	// Writers to one scope are serialized by a transaction-scoped advisory
-	// lock so two concurrent new keys cannot both observe the same count and
-	// overshoot the key budget. Each statement below checks the version in
-	// its own WHERE, so the condition and the write are one step. A trigger
-	// advances the version on every update, including an older release's
-	// during a rolling deploy, so the statements leave the column alone.
+	// The key budget is checked in the same statement as the upsert: an
+	// existing key always updates, a new key only lands while the scope has
+	// room. Zero affected rows means the budget refused it. Writers to one
+	// scope are serialized by a transaction-scoped advisory lock so two
+	// concurrent new keys cannot both observe the same count and overshoot.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("writing plugin instance state: %w", err)
+		return fmt.Errorf("writing plugin instance state: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('plugin_instance_state'), hashtext($1::text || ':' || $2))`, strconv.Itoa(installationID), scope); err != nil {
-		return 0, fmt.Errorf("writing plugin instance state: %w", err)
+		return fmt.Errorf("writing plugin instance state: %w", err)
 	}
-	var version int64
-	if expectedVersion != nil && *expectedVersion != 0 {
-		version, err = replaceInstanceState(ctx, tx, installationID, scope, key, sealed, *expectedVersion)
-	} else {
-		version, err = upsertInstanceState(ctx, tx, installationID, scope, key, sealed, expectedVersion == nil)
-	}
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("writing plugin instance state: %w", err)
-	}
-	return version, nil
-}
-
-// replaceInstanceState overwrites a key that is still at expectedVersion. It
-// never adds a key, so the key budget does not apply. A negative version
-// matches no row.
-func replaceInstanceState(ctx context.Context, tx pgx.Tx, installationID int, scope, key string, sealed []byte, expectedVersion int64) (int64, error) {
-	var version int64
-	err := tx.QueryRow(ctx, `
-		UPDATE plugin_instance_state
-		SET state_value = $4, updated_at = NOW()
-		WHERE plugin_installation_id = $1 AND host_scope = $2 AND state_key = $3 AND version = $5
-		RETURNING version
-	`, installationID, scope, key, sealed, expectedVersion).Scan(&version)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, pluginhost.ErrInstanceStateVersionConflict
-	}
-	if err != nil {
-		return 0, fmt.Errorf("writing plugin instance state: %w", err)
-	}
-	return version, nil
-}
-
-// upsertInstanceState inserts a key while the scope has room in its key
-// budget. When the key already exists it overwrites it if overwrite is set
-// and otherwise leaves it alone, which is a version conflict for a
-// create-only write.
-func upsertInstanceState(ctx context.Context, tx pgx.Tx, installationID int, scope, key string, sealed []byte, overwrite bool) (int64, error) {
-	var version int64
-	err := tx.QueryRow(ctx, `
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO plugin_instance_state (plugin_installation_id, host_scope, state_key, state_value)
 		SELECT $1, $2, $3, $4
 		WHERE (
@@ -186,33 +138,17 @@ func upsertInstanceState(ctx context.Context, tx pgx.Tx, installationID int, sco
 		ON CONFLICT (plugin_installation_id, host_scope, state_key) DO UPDATE SET
 			state_value = EXCLUDED.state_value,
 			updated_at = NOW()
-		WHERE $6::boolean
-		RETURNING version
-	`, installationID, scope, key, sealed, pluginhost.InstanceStateMaxKeys, overwrite).Scan(&version)
-	if err == nil {
-		return version, nil
+	`, installationID, scope, key, sealed, pluginhost.InstanceStateMaxKeys)
+	if err != nil {
+		return fmt.Errorf("writing plugin instance state: %w", err)
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("writing plugin instance state: %w", err)
+	if tag.RowsAffected() == 0 {
+		return pluginhost.ErrInstanceStateTooManyKeys
 	}
-	// No row: the budget refused a new key, or a create-only write found the
-	// key present. The advisory lock keeps the key as the statement saw it.
-	if overwrite {
-		return 0, pluginhost.ErrInstanceStateTooManyKeys
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("writing plugin instance state: %w", err)
 	}
-	var exists bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM plugin_instance_state
-			WHERE plugin_installation_id = $1 AND host_scope = $2 AND state_key = $3
-		)
-	`, installationID, scope, key).Scan(&exists); err != nil {
-		return 0, fmt.Errorf("writing plugin instance state: %w", err)
-	}
-	if exists {
-		return 0, pluginhost.ErrInstanceStateVersionConflict
-	}
-	return 0, pluginhost.ErrInstanceStateTooManyKeys
+	return nil
 }
 
 // Keys lists the keys stored for the installation in scope, in key order.
@@ -305,13 +241,13 @@ type ScopedInstanceStateStore struct {
 func (s *ScopedInstanceStateStore) Scope() string { return s.scope }
 
 // ReadInstanceState implements pluginhost.InstanceStateStore.
-func (s *ScopedInstanceStateStore) ReadInstanceState(ctx context.Context, installationID int, key string) ([]byte, int64, error) {
+func (s *ScopedInstanceStateStore) ReadInstanceState(ctx context.Context, installationID int, key string) ([]byte, bool, error) {
 	return s.store.Read(ctx, installationID, s.scope, key)
 }
 
 // WriteInstanceState implements pluginhost.InstanceStateStore.
-func (s *ScopedInstanceStateStore) WriteInstanceState(ctx context.Context, installationID int, key string, value []byte, expectedVersion *int64) (int64, error) {
-	return s.store.Write(ctx, installationID, s.scope, key, value, expectedVersion)
+func (s *ScopedInstanceStateStore) WriteInstanceState(ctx context.Context, installationID int, key string, value []byte) error {
+	return s.store.Write(ctx, installationID, s.scope, key, value)
 }
 
 var _ pluginhost.InstanceStateStore = (*ScopedInstanceStateStore)(nil)

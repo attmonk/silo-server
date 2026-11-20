@@ -3,17 +3,6 @@ import { t as appT, type MessageKey, type TextValues } from "@/i18n";
 
 export type SchemaOption = { value: string; label: string };
 
-/**
- * record[key] when key is the record's own property. A plugin's field key
- * such as "constructor" would otherwise read Object.prototype.
- */
-export function ownValue<T>(
-  record: Readonly<Record<string, T>> | undefined,
-  key: string,
-): T | undefined {
-  return record !== undefined && Object.hasOwn(record, key) ? record[key] : undefined;
-}
-
 function stringify(value: unknown): string {
   if (typeof value === "boolean") return value ? "true" : "false";
   if (value === null || value === undefined) return "";
@@ -36,8 +25,7 @@ function conditionValue(
   values: Record<string, unknown>,
   fields?: PluginAdminFormField[],
 ): unknown {
-  const value = ownValue(values, key);
-  if (value !== undefined) return value;
+  if (values[key] !== undefined) return values[key];
   return fields?.find((field) => field.key === key)?.default_value;
 }
 
@@ -136,8 +124,8 @@ function coerceBoolean(value: unknown): boolean {
 
 /**
  * A declared field type, derived from the plugin's json_schema. For arrays the
- * suffix `:int` / `:num` / `:bool` records the item type; plain `array` holds
- * string items or items of unknown type, and passes them through unchanged.
+ * suffix `:int` / `:num` records the item type so MULTI_SELECT elements coerce
+ * to numbers only when the json_schema says they are numeric.
  */
 export type FieldType =
   | "string"
@@ -148,44 +136,6 @@ export type FieldType =
   | "array:bool"
   | "array:int"
   | "array:num";
-
-type ItemType = "string" | "integer" | "number" | "boolean";
-
-/**
- * The schema a local `#/$defs/<name>` or `#/definitions/<name>` reference
- * points at, or the schema itself when it isn't one.
- */
-function resolveLocalRef(schema: unknown, root: object): unknown {
-  const ref = (schema as { $ref?: unknown } | null)?.$ref;
-  if (typeof ref !== "string") return schema;
-  const [, section, name] = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(ref) ?? [];
-  if (!section || !name) return undefined;
-  const defs = (root as Record<string, unknown>)[section];
-  if (!defs || typeof defs !== "object") return undefined;
-  // JSON Pointer escapes "/" as "~1" and "~" as "~0" (RFC 6901).
-  return (defs as Record<string, unknown>)[name.replaceAll("~1", "/").replaceAll("~0", "~")];
-}
-
-/**
- * The type of an array's items: a plain `type`, a nullable type list such as
- * `["string", "null"]`, or the type every `enum` value shares, following a
- * local `$ref` first.
- */
-function arrayItemType(itemSchema: unknown, root: object): ItemType | undefined {
-  const items = resolveLocalRef(itemSchema, root);
-  if (!items || typeof items !== "object") return undefined;
-  const { type, enum: values } = items as { type?: unknown; enum?: unknown };
-  const types = Array.isArray(type) ? type.filter((t) => t !== "null") : [type];
-  if (types.length === 1 && ["string", "integer", "number", "boolean"].includes(types[0])) {
-    return types[0] as ItemType;
-  }
-  if (!Array.isArray(values) || values.length === 0) return undefined;
-  if (values.every((v) => typeof v === "string")) return "string";
-  if (values.every((v) => typeof v === "boolean")) return "boolean";
-  if (values.every((v) => Number.isInteger(v))) return "integer";
-  if (values.every((v) => typeof v === "number")) return "number";
-  return undefined;
-}
 
 /**
  * Parse the declared property types out of a plugin's (object) json_schema.
@@ -209,7 +159,9 @@ export function parseFieldTypes(jsonSchema: string | undefined | null): Record<s
     if (!value || typeof value !== "object") continue;
     const type = (value as { type?: unknown }).type;
     if (type === "array") {
-      const itemType = arrayItemType((value as { items?: unknown }).items, parsed);
+      const items = (value as { items?: unknown }).items;
+      const itemType =
+        items && typeof items === "object" ? (items as { type?: unknown }).type : undefined;
       if (itemType === "integer") out[key] = "array:int";
       else if (itemType === "number") out[key] = "array:num";
       else if (itemType === "boolean") out[key] = "array:bool";
@@ -259,8 +211,7 @@ export function coerceFieldValue(
       case "array:num": {
         const arr = Array.isArray(raw) ? raw : [];
         if (fieldType === "array") return arr;
-        // A saved list loads as is, so keep a null item a nullable type allows.
-        if (fieldType === "array:bool") return arr.map((v) => (v === null ? v : coerceBoolean(v)));
+        if (fieldType === "array:bool") return arr.map((v) => coerceBoolean(v));
         if (fieldType === "array:int") return arr.map((v) => coerceNumericString(v));
         return arr.map((v) => coerceNumberString(v));
       }
@@ -300,8 +251,7 @@ export function effectiveValue(
   field: PluginAdminFormField,
   values: Record<string, unknown>,
 ): unknown {
-  const value = ownValue(values, field.key);
-  return value !== undefined ? value : field.default_value;
+  return values[field.key] !== undefined ? values[field.key] : field.default_value;
 }
 
 export function fieldIsVisible(
@@ -353,12 +303,11 @@ export function buildSchemaValues(
     if (!fieldIsVisible(descriptor, field, draft)) continue; // don't persist hidden fields' stale values
     // Fall back to the declared default for untouched fields so an unmodified
     // default persists exactly as it is displayed.
-    const rawSource = effectiveValue(field, draft);
-    const fieldType = ownValue(fieldTypes, field.key);
-    const coerced = coerceFieldValue(field, rawSource, fieldType);
+    const rawSource = draft[field.key] !== undefined ? draft[field.key] : field.default_value;
+    const coerced = coerceFieldValue(field, rawSource, fieldTypes?.[field.key]);
     if (coerced === undefined) {
       if (options?.explicitClears && !field.secret && field.control !== "PASSWORD") {
-        out[field.key] = clearedFieldValue(field, fieldType);
+        out[field.key] = clearedFieldValue(field, fieldTypes?.[field.key]);
       }
       continue;
     }

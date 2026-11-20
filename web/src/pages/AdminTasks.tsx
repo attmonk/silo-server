@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { joinList } from "@/lib/appLocale";
 import { Link } from "react-router";
 import { useEventChannel } from "@/components/realtimeEventsContext";
 import { AlertTriangle, Loader2, Play, Square } from "lucide-react";
@@ -17,13 +16,11 @@ import {
 import { usePageActivity } from "@/hooks/usePageActivity";
 import { cn } from "@/lib/utils";
 import type { TaskCategory, TaskInfo, TriggerConfig } from "@/api/types";
-
 import { describeTrigger } from "@/lib/taskTrigger";
 import { formatRelativeTime } from "@/lib/date";
 import { formatDateTime as formatPreferredDateTime } from "@/lib/datetime";
 import { clampTaskProgress, formatTaskProgress } from "@/lib/taskProgress";
-import { useServerText, useT, type MessageKey, type Translate } from "@/i18n";
-import { taskText } from "@/lib/taskText";
+import { useT, type MessageKey, type Translate } from "@/i18n";
 
 const CATEGORY_ORDER: TaskCategory[] = ["library", "metadata", "system"];
 const RUN_BUTTON_MIN_VISIBLE_MS = 1_000;
@@ -37,7 +34,6 @@ const CATEGORY_LABELS: Record<TaskCategory, MessageKey> = {
 const REFRESH_REASON_LABELS: Record<string, MessageKey> = {
   episode_incomplete: "web.admin.tasks.refreshReason.episodeIncomplete",
   stale_provider_id: "web.admin.tasks.refreshReason.staleProviderId",
-  provider_id_incomplete: "web.admin.tasks.refreshReason.providerIdIncomplete",
   refresh_failure: "web.admin.tasks.refreshReason.refreshFailure",
   core_metadata_incomplete: "web.admin.tasks.refreshReason.coreMetadataIncomplete",
   trailers_requested: "web.admin.tasks.refreshReason.trailersRequested",
@@ -86,7 +82,7 @@ function formatDuration(t: Translate, ms: number): string {
 
 function describeSchedule(triggers: TriggerConfig[]): string | null {
   if (triggers.length === 0) return null;
-  return joinList(triggers.map((trigger) => describeTrigger(trigger, "short")));
+  return triggers.map((trigger) => describeTrigger(trigger, "short")).join(", ");
 }
 
 function isOverdue(dateStr: string, now: number): boolean {
@@ -187,7 +183,6 @@ function TaskRow({
   now: number;
 }) {
   const t = useT();
-  const serverText = useServerText();
   const runTask = useRunTask();
   const cancelTask = useCancelTask();
   const runFeedbackStartedAtRef = useRef<number | null>(null);
@@ -222,7 +217,7 @@ function TaskRow({
           to={`/admin/tasks/${task.key}`}
           className="text-foreground hover:text-primary text-sm font-medium transition-colors"
         >
-          {taskText(serverText, task, "name")}
+          {task.name}
         </Link>
 
         <div className="text-muted-foreground mt-0.5 text-xs">

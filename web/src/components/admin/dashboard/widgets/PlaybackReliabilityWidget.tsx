@@ -9,9 +9,7 @@ import { useWidgetRange } from "../widgetChrome";
 import { WidgetHeader } from "../WidgetHeader";
 import { WidgetRangePicker } from "../WidgetRangePicker";
 import { formatLocale } from "@/lib/appLocale";
-import { formatDecimal } from "@/lib/numberFormat";
 import { useT } from "@/i18n";
-import { formatPercentLabel } from "../format";
 
 /**
  * Coarse playback health for the chosen window.
@@ -102,5 +100,5 @@ function formatCompletionRate(rate: number, finalizedSessions: number): string {
   if (finalizedSessions <= 0 || !Number.isFinite(rate)) {
     return "—";
   }
-  return formatPercentLabel(formatDecimal(Math.min(Math.max(rate, 0), 1) * 100, 0));
+  return `${Math.round(Math.min(Math.max(rate, 0), 1) * 100)}%`;
 }

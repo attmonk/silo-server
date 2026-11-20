@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path"
 	"strings"
 
 	"github.com/google/uuid"
@@ -37,15 +36,6 @@ func (BackupData) Tables() []string {
 // posterPrefix is where uploaded personal collection images live, one
 // directory per collection id.
 const posterPrefix = "user-collection-images/"
-
-// OwnsPosterKey reports whether key names an object inside the image
-// directory of the personal collection collectionID, where its uploaded
-// poster and its collages are stored. A collection's poster may name no other
-// stored object: listings sign the key they find, so any other key would hand
-// its reader an object the collection does not own.
-func OwnsPosterKey(collectionID, key string) bool {
-	return collectionID != "" && key == path.Clean(key) && strings.HasPrefix(key, posterPrefix+collectionID+"/")
-}
 
 type collectionsDocument struct {
 	Collections []personalCollection `json:"collections"`
@@ -206,7 +196,7 @@ func (BackupData) Export(ctx context.Context, tx pgx.Tx, owner userdata.Owner, k
 // uploadedPoster reports whether the collection's poster is an image
 // uploaded for it, stored under its own id.
 func uploadedPoster(c personalCollection) bool {
-	return OwnsPosterKey(c.ID, c.Poster)
+	return strings.HasPrefix(c.Poster, posterPrefix+c.ID+"/")
 }
 
 func decodeCollections(data json.RawMessage) (collectionsDocument, userdata.Summary, error) {
@@ -556,7 +546,7 @@ func canonicalDefinition(query, display, sort, source json.RawMessage) (definiti
 	}
 	def := definition{query: "{}", sort: "{}", source: "{}"}
 	if trimmed := strings.TrimSpace(string(query)); trimmed != "" && trimmed != "{}" && trimmed != "null" {
-		normalized, err := catalog.NormalizeSmartCollectionQueryJSON(query, true, true)
+		normalized, err := catalog.NormalizeSmartCollectionQueryJSON(query, true, true, false)
 		if err != nil {
 			return definition{}, "its rules are not ones this server accepts"
 		}
@@ -662,11 +652,12 @@ func importedSchedule(c personalCollection, dropped *int) *string {
 // copyPoster returns the poster a new collection stores: an uploaded poster
 // copied under the new id, or dropped (and counted) when there is no file to
 // copy; an image URL or a bundled path as it is. Any other value is dropped
-// and counted: a collection's poster names no stored object but its own
-// (OwnsPosterKey).
+// and counted:
+// listings sign a bare key as a stored object (presignUserCollectionPoster),
+// so an imported document must not name one outside the collection images.
 func copyPoster(ctx context.Context, target userdata.Target, c personalCollection, id string, missing *int) (string, error) {
 	switch {
-	case uploadedPoster(c):
+	case strings.HasPrefix(c.Poster, posterPrefix):
 	case strings.HasPrefix(c.Poster, "https://"), strings.HasPrefix(c.Poster, "http://"), strings.HasPrefix(c.Poster, "/"):
 		return c.Poster, nil
 	default:

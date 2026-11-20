@@ -16,9 +16,8 @@ import (
 // filter: profile-level gating happens before dispatch.
 type OperationalDispatch struct {
 	WebhookFilter func(Webhook) bool
-	// PluginDestinationFilter does for plugin destinations what
-	// WebhookFilter does for webhooks; nil keeps the delivery off them.
-	PluginDestinationFilter func(PluginDestination) bool
+	// admit runs event admission under the insertion transaction.
+	admit func(context.Context, pgx.Tx) error
 }
 
 // DispatchOperational durably creates one operational delivery. The inbox row
@@ -46,58 +45,26 @@ func (s *System) DispatchOperational(ctx context.Context, delivery Delivery, opt
 			return nil, err
 		}
 	}
-	channels := s.operationalChannels(ctx)
+	// Resolve settings before taking a pool connection. Concurrent admissions
+	// can wait on event locks while holding every other connection; a settings
+	// read through the pool inside this transaction would then deadlock.
+	webhooksEnabled := opts.WebhookFilter != nil && s.webhookRepo != nil && s.Settings.WebhooksEnabled(ctx)
+	webPushEnabled := s.webPushRepo != nil && s.Settings.WebPushEnabled(ctx)
+	var pushPlatforms []string
+	if s.pushDeviceRepo != nil {
+		pushPlatforms = s.Settings.EnabledPushPlatforms(ctx)
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin operational dispatch tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if opts.admit != nil {
+		if err := opts.admit(ctx, tx); err != nil {
+			return nil, err
+		}
+	}
 
-	row, err := s.insertOperational(ctx, tx, delivery, opts, recipient, channels)
-	if err != nil || row == nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit operational dispatch: %w", err)
-	}
-	s.dispatchOperationalRow(ctx, *row)
-	return row, nil
-}
-
-// operationalChannelSettings is which channels the administrator has on,
-// read before a delivery's transaction: the settings are read through the
-// pool, and a caller holding a transaction must not wait for a second
-// connection, which a busy pool may never give it.
-type operationalChannelSettings struct {
-	webhooks      bool
-	webPush       bool
-	pushPlatforms []string
-}
-
-func (s *System) operationalChannels(ctx context.Context) operationalChannelSettings {
-	var out operationalChannelSettings
-	if s.webhookRepo != nil {
-		out.webhooks = s.Settings.WebhooksEnabled(ctx)
-	}
-	if s.webPushRepo != nil {
-		out.webPush = s.Settings.WebPushEnabled(ctx)
-	}
-	if s.pushDeviceRepo != nil {
-		out.pushPlatforms = s.Settings.EnabledPushPlatforms(ctx)
-	}
-	return out
-}
-
-// insertOperational is DispatchOperational's transaction: the inbox row and
-// its outbox rows, written through tx, which the caller commits before
-// dispatchOperationalRow. recipient is the resolved access of a delivery
-// that names a catalog item, and nil otherwise; channels is
-// operationalChannels, read before tx began. Everything here reads through
-// tx.
-func (s *System) insertOperational(ctx context.Context, tx pgx.Tx, delivery Delivery, opts OperationalDispatch, recipient *recipientAccess, channels operationalChannelSettings) (*InsertedDelivery, error) {
-	if recipient == nil && delivery.SeriesID != nil && *delivery.SeriesID != "" {
-		return nil, fmt.Errorf("operational delivery %s names a catalog item without the recipient's access", delivery.ID)
-	}
 	if recipient != nil {
 		allowed, err := recipient.canOpen(ctx, tx, delivery.UserID, delivery.ProfileID, *delivery.SeriesID, 0)
 		if err != nil {
@@ -118,7 +85,7 @@ func (s *System) insertOperational(ctx context.Context, tx pgx.Tx, delivery Deli
 	row := inserted[0]
 	owner := profileKey{delivery.UserID, delivery.ProfileID}
 
-	if opts.WebhookFilter != nil && s.webhookRepo != nil && channels.webhooks {
+	if webhooksEnabled {
 		hooksByProfile, err := s.webhookRepo.ListEnabledByProfiles(ctx, tx, []profileKey{owner})
 		if err != nil {
 			return nil, err
@@ -138,10 +105,7 @@ func (s *System) insertOperational(ctx context.Context, tx pgx.Tx, delivery Deli
 			return nil, err
 		}
 	}
-	if err := s.enqueueOperationalPluginDestinations(ctx, tx, &row, opts.PluginDestinationFilter); err != nil {
-		return nil, err
-	}
-	if s.webPushRepo != nil && channels.webPush {
+	if webPushEnabled {
 		subsByProfile, err := s.webPushRepo.ListEnabledByProfiles(ctx, tx, []profileKey{owner})
 		if err != nil {
 			return nil, err
@@ -159,8 +123,8 @@ func (s *System) insertOperational(ctx context.Context, tx pgx.Tx, delivery Deli
 		}
 	}
 	if s.pushDeviceRepo != nil {
-		if platforms := channels.pushPlatforms; len(platforms) > 0 {
-			devicesByProfile, err := s.pushDeviceRepo.ListEnabledPushByProfiles(ctx, tx, []profileKey{owner}, platforms)
+		if len(pushPlatforms) > 0 {
+			devicesByProfile, err := s.pushDeviceRepo.ListEnabledPushByProfiles(ctx, tx, []profileKey{owner}, pushPlatforms)
 			if err != nil {
 				return nil, err
 			}
@@ -170,50 +134,21 @@ func (s *System) insertOperational(ctx context.Context, tx pgx.Tx, delivery Deli
 			}
 		}
 	}
-	return &row, nil
-}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit operational dispatch: %w", err)
+	}
 
-// enqueueOperationalPluginDestinations queues an operational delivery for
-// the owner's plugin destinations that filter selects; a nil filter keeps
-// it off them. It marks row when an attempt was inserted.
-func (s *System) enqueueOperationalPluginDestinations(ctx context.Context, tx pgx.Tx, row *InsertedDelivery, filter func(PluginDestination) bool) error {
-	if filter == nil || s.pluginDestinationSender == nil {
-		return nil
-	}
-	owner := row.key()
-	byProfile, err := s.pluginDestinationSender.enqueueable(ctx, tx, []profileKey{owner})
-	if err != nil {
-		return err
-	}
-	attempts := make([]DeliveryAttempt, 0, 2)
-	for _, destination := range byProfile[owner] {
-		if !filter(destination) {
-			continue
-		}
-		attempts = append(attempts, DeliveryAttempt{
-			ID:                     ulid.Make().String(),
-			NotificationDeliveryID: row.ID,
-			TargetID:               destination.ID,
-		})
-	}
-	queued, err := s.pluginDestinationSender.repo.EnqueueAttempts(ctx, tx, attempts)
-	row.pluginAttempts = queued[row.ID]
-	return err
-}
-
-// dispatchOperationalRow hands a committed operational delivery to realtime
-// and the channel dispatchers. It is best-effort: the durable inbox row
-// covers websocket reconnect, and the retry workers recover the outbox rows.
-func (s *System) dispatchOperationalRow(ctx context.Context, row InsertedDelivery) {
+	// Post-commit dispatch is best-effort: the durable inbox row covers
+	// websocket reconnect, and the retry workers recover the outbox rows.
 	full, err := s.Deliveries.GetRowByID(ctx, row.ID)
 	if err != nil || full == nil {
 		s.logger.WarnContext(ctx, "operational delivery reload failed",
 			"delivery_id", row.ID, "error", err)
-		return
+		return &row, nil
 	}
-	full.pluginAttempts = row.pluginAttempts
 	if err := s.dispatcher.Dispatch(ctx, *full); err != nil {
 		s.logger.WarnContext(ctx, "operational delivery dispatch failed",
 			"delivery_id", row.ID, "error", err)
 	}
+	return &row, nil
 }

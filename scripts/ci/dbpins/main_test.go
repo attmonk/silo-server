@@ -36,14 +36,10 @@ func TestParseList(t *testing.T) {
 }
 
 func TestGoTestArgsAnchorsEveryName(t *testing.T) {
-	pins := []pin{{"./internal/b", "TestOne"}, {"./internal/a", "TestOne"}, {"./internal/a", "TestTwo"}}
-	got := goTestArgs(pins, false)
+	got := goTestArgs([]pin{{"./internal/a", "TestOne"}, {"./internal/b", "TestOne"}, {"./internal/a", "TestTwo"}})
 	want := []string{"test", "-count=1", "-json", "-run", "^(TestOne|TestTwo)$", "./internal/a", "./internal/b"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %q, want %q", got, want)
-	}
-	if got := goTestArgs(pins, true); !reflect.DeepEqual(got[len(got)-2:], []string{"./internal/b", "./internal/a"}) {
-		t.Fatalf("shared database package order changed: %q", got)
 	}
 }
 

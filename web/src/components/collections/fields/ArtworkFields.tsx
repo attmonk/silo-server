@@ -29,7 +29,6 @@ import {
   useArtworkPreview,
   type ArtworkFallback,
 } from "./artworkPreview";
-import { isImeComposing } from "@/lib/imeComposition";
 
 const ACCEPT = "image/jpeg,image/png,image/webp";
 /** The link field's placeholder: a URL's start, not text to translate. */
@@ -280,7 +279,6 @@ function PasteLinkBox({
         value={link}
         onChange={(event) => setLink(event.target.value)}
         onKeyDown={(event) => {
-          if (isImeComposing(event)) return;
           if (event.key === "Enter") {
             event.preventDefault();
             use();

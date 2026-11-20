@@ -99,7 +99,6 @@ export default function LoggingSettings() {
               { value: "warn", label: t("web.admin.settings.logging.server.level.warn") },
               { value: "error", label: t("web.admin.settings.logging.server.level.error") },
             ]}
-            managedByEnv={form.envVar("server.log_level")}
           />
           <AdvancedSection
             id="logging.server"
@@ -137,7 +136,7 @@ export default function LoggingSettings() {
             label={t("web.admin.settings.logging.retention.maxSize.label")}
             dirty={form.isDirty(OPSLOG_MAX_SIZE_MB_KEY)}
             type="number"
-            unit={t("web.admin.common.units.megabytes")}
+            unit="MB"
             value={form.getValue(OPSLOG_MAX_SIZE_MB_KEY)}
             onChange={(v) => form.setValue(OPSLOG_MAX_SIZE_MB_KEY, v)}
             restartRequired={restartKeys.has(OPSLOG_MAX_SIZE_MB_KEY)}

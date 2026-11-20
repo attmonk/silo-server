@@ -7,8 +7,6 @@ import { PlatformTile, classifyPlatform, platformLabel } from "@/components/admi
 import { Button } from "@/components/ui/button";
 import { useAdminUserDevices } from "@/hooks/queries/admin/userActivity";
 import { useT } from "@/i18n";
-import { TOUCH_HIT_AREA } from "@/lib/touchTargets";
-import { cn } from "@/lib/utils";
 
 import { formatLastSeen } from "../format";
 import { deviceLevelId } from "../preferences/levels";
@@ -101,10 +99,7 @@ export function DevicesCard({ userId }: { userId: number }) {
                       {" · "}
                       <Link
                         to={{ search: preferencesSearch(device) }}
-                        className={cn(
-                          "hover:text-foreground underline-offset-2 hover:underline",
-                          TOUCH_HIT_AREA,
-                        )}
+                        className="hover:text-foreground underline-offset-2 hover:underline"
                       >
                         {t("web.admin.users.detail.activity.devices.savedSettings", {
                           count: device.override_count,

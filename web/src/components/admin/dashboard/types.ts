@@ -48,16 +48,6 @@ export interface WidgetRangeOptions {
 }
 
 /**
- * The alternative presentations a widget offers (for example Egress's
- * Total/Nodes switch), and the one it starts on. Stored per placement like the
- * window, so the admin finds the chart the way they left it.
- */
-export interface WidgetViewOptions {
-  allowed: readonly string[];
-  default: string;
-}
-
-/**
  * A widget's identity and the box it is allowed to occupy.
  *
  * Columns and rows are independent axes: `minSpan === maxSpan` pins the width,
@@ -94,7 +84,6 @@ export interface DashboardWidgetDefinition {
    */
   collapsedRows?: number;
   ranges?: WidgetRangeOptions;
-  views?: WidgetViewOptions;
   Component: React.ComponentType;
 }
 
@@ -123,9 +112,4 @@ export interface DashboardLayoutEntry {
   rows: number;
   /** Absent for widgets without `ranges`; otherwise one of that widget's allowed values. */
   range?: WidgetRange;
-  /**
-   * Present only once the admin has picked a view; otherwise the grid hands the
-   * widget its `views.default`. Always one of that widget's allowed values.
-   */
-  view?: string;
 }

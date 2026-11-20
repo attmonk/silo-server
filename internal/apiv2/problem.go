@@ -176,10 +176,6 @@ type Problem struct {
 	headers http.Header
 }
 
-// validationSummary is the detail of a validation failure whose reasons are
-// only in its field errors.
-const validationSummary = "The request did not pass validation; see errors."
-
 // NewProblem builds an application problem of type t.
 func NewProblem(t ProblemType, detail string) *Problem {
 	return &Problem{Type: t.URI(), Title: t.Title, Status: t.Status, Detail: detail}
@@ -189,15 +185,6 @@ func NewProblem(t ProblemType, detail string) *Problem {
 func (p *Problem) WithErrors(errs ...ProblemError) *Problem {
 	p.Errors = append(p.Errors, errs...)
 	return p
-}
-
-// promoteSoleFieldDetail gives a validation failure that says only "see
-// errors" its one field error's reason as the detail, so a client that shows
-// the detail (as English clients do) tells the user what to fix.
-func (p *Problem) promoteSoleFieldDetail() {
-	if p.Detail == validationSummary && len(p.Errors) == 1 && p.Errors[0].Detail != "" {
-		p.Detail = p.Errors[0].Detail
-	}
 }
 
 // WithHeader adds a response header (Retry-After, Location, ...).
@@ -371,7 +358,7 @@ func humaStatusType(status int, msg string) ProblemType {
 func humaDetail(t ProblemType, msg string, bodyLimit int64) string {
 	switch t.ID {
 	case TypeValidationFailed.ID:
-		return validationSummary
+		return "The request did not pass validation; see errors."
 	case TypeMalformedRequest.ID:
 		return "The request could not be parsed."
 	case TypeNotAcceptable.ID:
@@ -394,21 +381,15 @@ func humaDetail(t ProblemType, msg string, bodyLimit int64) string {
 // Error codes carried in Problem.errors[].code. They are contract values
 // (docs/architecture/api-contract.md, "Problem Details"); add, never rename.
 const (
-	codeInvalid     = "invalid"
-	codeInvalidType = "invalid_type"
-	codeInvalidEnum = "invalid_enum"
-	codeRequired    = "required"
-	codeOutOfRange  = "out_of_range"
-	// codeDuplicate: the value, such as a name, is already taken by another
-	// item of the same kind.
-	codeDuplicate        = "duplicate"
+	codeInvalid          = "invalid"
+	codeInvalidType      = "invalid_type"
+	codeInvalidEnum      = "invalid_enum"
+	codeRequired         = "required"
+	codeOutOfRange       = "out_of_range"
 	codeUnknownField     = "unknown_field"
 	codeUnknownParameter = "unknown_parameter"
 	codeMalformedJSON    = "malformed_json"
 	codeMalformedForm    = "malformed_form"
-	// codeManagedByEnvironment refuses a change to a field a stream node
-	// declares from its own environment (env_managed on an admin node).
-	codeManagedByEnvironment = "managed_by_environment"
 
 	locationBody     = "body"
 	locationBodyFile = "body.file"
@@ -528,7 +509,6 @@ func problemTransformer(ctx huma.Context, _ string, v any) (any, error) {
 	if p.Instance == "" {
 		p.Instance = requestInstance(requestIDFrom(ctx.Context()))
 	}
-	p.promoteSoleFieldDetail()
 	noteProblem(ctx.Context(), p)
 	return p, nil
 }
@@ -539,7 +519,6 @@ func writeProblem(w http.ResponseWriter, r *http.Request, p *Problem) {
 	if p.Instance == "" {
 		p.Instance = requestInstance(requestIDFrom(r.Context()))
 	}
-	p.promoteSoleFieldDetail()
 	noteProblem(r.Context(), p)
 	h := w.Header()
 	for name, values := range p.GetHeaders() {

@@ -41,8 +41,6 @@ export interface SecretFieldProps {
   status?: ReactNode;
   disabled?: boolean;
   restartRequired?: boolean;
-  /** The environment variable that sets this secret; disables the control. */
-  managedByEnv?: string;
 }
 
 /**
@@ -67,12 +65,10 @@ export function SecretField({
   cleared = false,
   hint,
   status,
-  disabled: disabledProp = false,
+  disabled = false,
   restartRequired = false,
-  managedByEnv,
 }: SecretFieldProps) {
   const t = useT();
-  const disabled = disabledProp || managedByEnv != null;
   const controlId = useId();
   const hintId = useId();
 
@@ -108,7 +104,6 @@ export function SecretField({
       descriptionId={hintId}
       status={status}
       restartRequired={restartRequired}
-      managedByEnv={managedByEnv}
     >
       {/* The action sits ahead of the input, as in LimitField: the row's unit
           slot is to the right of the control edge, so anything between the

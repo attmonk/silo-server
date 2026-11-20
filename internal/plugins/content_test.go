@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -86,6 +88,47 @@ func TestContentHandlerProxyAndAccess(t *testing.T) {
 	}
 }
 
+func TestContentHandlerCanonicalAndAssets(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "asset.txt")
+	if err := os.WriteFile(file, []byte("0123456789"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	service := &contentTestService{access: "authenticated", file: file}
+	proxy := NewHTTPProxy(service, profileTestInstallationStore{})
+	assetAccess := ContentAccess{}
+	h := NewContentHandler(proxy, func(*http.Request) ContentAccess { return ContentAccess{Authenticated: true} }, func(*http.Request) ContentAccess { return assetAccess })
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, ContentPrefix+"/plugins/%31?x=%2F", nil))
+	if rec.Code != 308 || rec.Header().Get("Location") != ContentPrefix+"/plugins/%31/?x=%2F" || service.request != nil {
+		t.Fatal(rec.Code, rec.Header())
+	}
+	req := httptest.NewRequest(http.MethodGet, ContentPrefix+"/plugin-assets/1/asset.txt", nil)
+	req.Header.Set("Range", "bytes=2-4")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Fatal("route access leaked to assets", rec.Code)
+	}
+	assetAccess.Authenticated = true
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 206 || rec.Body.String() != "234" {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	for _, tc := range []struct {
+		path   string
+		status int
+	}{
+		{"/plugin-assets/1", 404}, {"/plugins/bad/", 400}, {"/unknown/1", 404},
+	} {
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, ContentPrefix+tc.path, nil))
+		if rec.Code != tc.status {
+			t.Fatal(tc, rec.Code)
+		}
+	}
+}
+
 // TestContentHandlerRefusesOffOriginRedirects: a plugin redirect relayed on
 // the v2 mount stays on the origin the request arrived on; one that leaves
 // it, a scheme downgrade included, is a 502.
@@ -141,5 +184,3 @@ func TestContentHandlerRefusesOffOriginRedirects(t *testing.T) {
 		t.Fatalf("two Location spellings: status = %d, Location = %q; want 502 and none", rec.Code, rec.Header().Get("Location"))
 	}
 }
-
-func (*contentTestService) Retain() (func(), error) { return func() {}, nil }

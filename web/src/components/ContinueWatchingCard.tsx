@@ -15,17 +15,12 @@ import { parseWatchHref } from "@/pages/watchRouteHelpers";
 import { buildItemHref, buildMediaPlayHref, isVideoWatchHref } from "@/lib/mediaNavigation";
 import { type EpisodeSpoilerPrefs, useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useUICustomization } from "@/hooks/useUICustomization";
-import {
-  carouselCardWidthClasses,
-  squareCarouselCardWidthClasses,
-  WIDE_CAROUSEL_CARD_WIDTH_CLASSES,
-} from "@/lib/uiCustomization";
+import { carouselCardWidthClasses, WIDE_CAROUSEL_CARD_WIDTH_CLASSES } from "@/lib/uiCustomization";
 import CardPlayOverlay from "@/components/CardPlayOverlay";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import { isEpisodeStill, isEpisodeUnwatched, SPOILER_IMAGE_CLASS } from "@/lib/episodeSpoilers";
 import { cn } from "@/lib/utils";
 import { useAppLanguage, useT } from "@/i18n";
-import WatchProgressBar from "@/components/WatchProgressBar";
 
 type ContinueWatchingCardProps = (
   | {
@@ -231,9 +226,7 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   const isPoster = variant === "poster";
   const playableContentId = card.contentId ?? "";
   const containerWidth = isPoster
-    ? card.type === "audiobook"
-      ? squareCarouselCardWidthClasses(cardPresentation.poster_size)
-      : carouselCardWidthClasses(cardPresentation.poster_size)
+    ? carouselCardWidthClasses(cardPresentation.poster_size)
     : WIDE_CAROUSEL_CARD_WIDTH_CLASSES;
   // Audiobook covers are square (Audible-style); use 1:1 for the poster
   // variant so they don't get top/bottom-cropped into a 2:3 frame.
@@ -262,7 +255,7 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   return (
     <div ref={cardRef} className={`media-card-longpress group/card ${containerWidth}`}>
       <div className="group/media relative">
-        <ViewTransitionLink to={detailHref} prefetchOn="intent" className="block">
+        <ViewTransitionLink to={detailHref} className="block">
           <div className={`media-card-image relative ${imageAspect} overflow-hidden rounded-xl`}>
             {imageSrc ? (
               <img
@@ -294,7 +287,19 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
             {/* Hover dim behind the play button */}
             <div className="media-card-hover-dim absolute inset-0 bg-black/0 transition-colors duration-150" />
 
-            {showProgressBar && <WatchProgressBar percent={progressPercent} animate />}
+            {/* Progress bar — inset pill so a full bar doesn't read as a
+                stray edge along the artwork */}
+            {showProgressBar && (
+              <div className="absolute inset-x-2.5 bottom-2 h-[3px] overflow-hidden rounded-full bg-black/40">
+                <div
+                  className="h-full rounded-full transition-all duration-300"
+                  style={{
+                    width: `${Math.min(progressPercent, 100)}%`,
+                    background: "var(--primary)",
+                  }}
+                />
+              </div>
+            )}
           </div>
         </ViewTransitionLink>
         {isPoster && playableContentId && isVideoWatchHref(card.watchHref) ? (

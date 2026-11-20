@@ -27,12 +27,8 @@ export function partRange(part: number, partSize: number, size: number): [number
 
 /** "41 of 63 MB": both sizes in the unit the total reads best in. */
 export function progressLabel(sent: number, total: number): string {
-  const [unit, label, digits]: [number, MessageKey, number] =
-    total >= GB
-      ? [GB, "web.admin.common.units.gigabytes", 1]
-      : total >= MB
-        ? [MB, "web.admin.common.units.megabytes", 0]
-        : [KB, "web.admin.common.units.kilobytes", 0];
+  const [unit, label, digits] =
+    total >= GB ? [GB, "GB", 1] : total >= MB ? [MB, "MB", 0] : [KB, "KB", 0];
   const show = (bytes: number, round: (n: number) => number) => {
     const scale = 10 ** digits;
     return formatDecimal(round((bytes / unit) * scale) / scale, digits);
@@ -40,11 +36,7 @@ export function progressLabel(sent: number, total: number): string {
   const totalText = show(total, Math.round);
   // Never show the total before the last byte arrived.
   const sentText = sent >= total ? totalText : show(sent, Math.floor);
-  return t("web.admin.backups.upload.progress", {
-    sent: sentText,
-    total: totalText,
-    unit: t(label),
-  });
+  return t("web.admin.backups.upload.progress", { sent: sentText, total: totalText, unit: label });
 }
 
 export function progressPercent(sent: number, total: number): number {

@@ -25,7 +25,6 @@ import { useDiscoverRowPreview } from "@/hooks/queries/admin/requestDiscover";
 import { RowRefusedError, type DiscoverRowsAdapter } from "@/hooks/queries/admin/useDiscoverRows";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useT, type Translate } from "@/i18n";
-import { useHomeRowTitle } from "@/lib/sectionTitle";
 import { RowChangedError } from "@/lib/homeRows/types";
 import { useCollectionTemplates } from "@/lib/collectionTemplates";
 import {
@@ -61,7 +60,6 @@ import {
   rowKindLabel,
   rowKindSentence,
   savedTitle,
-  toHomeRow,
   toTMDBChart,
 } from "./discoverLayoutModel";
 
@@ -95,7 +93,6 @@ function KindPicker({
   onPick: (row: DiscoverRowBody) => void;
 }) {
   const t = useT();
-  const rowTitle = useHomeRowTitle();
   const grid = cn("grid gap-2.5", !narrow && "grid-cols-2");
   return (
     <div className="grid content-start gap-6 overflow-y-auto px-5 pt-[18px] pb-6 sm:px-7">
@@ -125,7 +122,7 @@ function KindPicker({
               <KindCard
                 key={row.id}
                 {...kindCard(row.type)}
-                label={rowTitle(toHomeRow(row))}
+                label={row.title}
                 sentence={stockSentence(t, row)}
                 compact={narrow}
                 onPick={() => onPick({ ...row })}

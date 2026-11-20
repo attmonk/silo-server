@@ -13,7 +13,6 @@ import {
 import { useT } from "@/i18n";
 import { canonicalLanguageTag, getLanguageName } from "@/lib/languageNames";
 import type { SettingOption } from "@/lib/languageOptions";
-import { isImeComposing } from "@/lib/imeComposition";
 
 const OTHER_VALUE = "__other__";
 
@@ -136,7 +135,6 @@ export function LanguageSelect({
               className="h-9 flex-1"
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={(event) => {
-                if (isImeComposing(event)) return;
                 if (event.key === "Enter") {
                   event.preventDefault();
                   commitDraft();

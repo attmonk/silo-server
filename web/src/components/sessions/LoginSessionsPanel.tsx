@@ -3,7 +3,6 @@ import { Link, useNavigate } from "react-router";
 import { Loader2, RefreshCw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
@@ -242,7 +241,6 @@ export function LoginSessionsPanel({
         }}
       >
         <AlertDialogContent
-          className={TOUCH_TARGETS}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
             const target =

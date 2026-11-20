@@ -270,7 +270,8 @@ export function RuleBuilder({
         {groups.length === 0 ? (
           <p className="text-muted-foreground text-sm">
             {context === "collection"
-              ? t("web.home.addRow.rules.noRulesCollectionYet")
+              ? // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- reworded on main; its catalog key is a follow-up
+                "No rules yet. Add one to choose which titles it holds."
               : t("web.home.addRow.rules.noRulesRow")}
           </p>
         ) : null}

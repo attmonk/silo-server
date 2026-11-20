@@ -6,7 +6,6 @@ import {
 } from "@/api/client";
 import type { AdminPlaybackHistoryItem } from "@/api/types";
 import { v2, type V2Query, type V2Result } from "./request";
-import { t } from "@/i18n";
 
 export type AdminPlaybackHistoryQuery = V2Query<"GET /api/v2/admin/playback-history">;
 export type AdminPlaybackHistoryEntry =
@@ -117,7 +116,7 @@ export async function listAdminPlaybackHistory(
     (!body.page.has_more && !!body.page.next_cursor) ||
     !body.items.every(isEntry)
   )
-    throw new Error(t("web.admin.errors.playbackHistoryInvalid"));
+    throw new Error("Invalid playback history page. Reload the page.");
   return {
     items: body.items.map(adminPlaybackHistoryItemFromV2),
     hasMore: body.page.has_more,

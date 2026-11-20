@@ -131,11 +131,6 @@ type SeasonRecord struct {
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 	LockedFields    []int      `json:"locked_fields,omitempty"`
-	OriginalTitle   string     `json:"original_title,omitempty"`
-	Tagline         string     `json:"tagline,omitempty"`
-	ImdbID          string     `json:"imdb_id,omitempty"`
-	TmdbID          string     `json:"tmdb_id,omitempty"`
-	TvdbID          string     `json:"tvdb_id,omitempty"`
 }
 
 type EpisodeRecord struct {
@@ -157,9 +152,6 @@ type EpisodeRecord struct {
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
 	LockedFields   []int      `json:"locked_fields,omitempty"`
-	SortTitle      string     `json:"sort_title,omitempty"`
-	OriginalTitle  string     `json:"original_title,omitempty"`
-	Tagline        string     `json:"tagline,omitempty"`
 }
 
 type VideoTrackRecord struct {

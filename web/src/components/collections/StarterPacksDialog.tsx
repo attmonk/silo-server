@@ -25,7 +25,7 @@ import {
 
 import type { Library } from "@/api/types";
 import { templateResultFromV2 } from "@/api/adminCollections";
-import { numberText, useT, type Translate } from "@/i18n";
+import { useT, type Translate } from "@/i18n";
 import { StepDialog } from "@/components/calm/StepDialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -690,9 +690,7 @@ function WhatWillHappen({
                         ) : null}
                       </span>
                     </td>
-                    <td className="px-3.5 py-2.5 tabular-nums">
-                      {numberText(row.existing.length)}
-                    </td>
+                    <td className="px-3.5 py-2.5 tabular-nums">{row.existing.length}</td>
                     <td className="text-muted-foreground px-3.5 py-2.5">
                       {row.notForLibrary || t("web.collections.starterPacks.none")}
                     </td>

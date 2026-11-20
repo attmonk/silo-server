@@ -16,7 +16,6 @@ import {
   type RequestLimitDraft,
   type RequestLimitErrors,
 } from "@/lib/requestAccess";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
 import { cn } from "@/lib/utils";
 import { useT } from "@/i18n";
 
@@ -107,7 +106,7 @@ export function RequestLimitFields({
           >
             <SelectValue />
           </SelectTrigger>
-          <SelectContent className={TOUCH_TARGETS}>
+          <SelectContent>
             <SelectItem value="inherit">{inheritLabel}</SelectItem>
             <SelectItem value="manual">
               {t("web.admin.common.requestLimits.approvalManual")}
@@ -136,7 +135,7 @@ export function RequestLimitFields({
           >
             <SelectValue />
           </SelectTrigger>
-          <SelectContent className={TOUCH_TARGETS}>
+          <SelectContent>
             <SelectItem value="inherit">{inheritLabel}</SelectItem>
             <SelectItem value="custom">
               {t("web.admin.common.requestLimits.limitCustom")}

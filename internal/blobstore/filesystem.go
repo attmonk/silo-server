@@ -79,24 +79,8 @@ func temporaryStorageError(err error) bool {
 	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS) || errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESTALE) || errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) || errors.Is(err, syscall.ETIMEDOUT)
 }
 
-// CheckLocalRoot reports whether a filesystem store could open root, without
-// creating anything: it applies NewFilesystem's checks to the components that
-// exist and tolerates the same temporary errors. Settings saves call it so a
-// root that would stop the server at startup is refused before it is stored.
-func CheckLocalRoot(root string) error {
-	abs, err := resolveRoot(root)
-	if err != nil {
-		return err
-	}
-	if err = checkRootComponents(abs); err != nil && !temporaryStorageError(err) {
-		return err
-	}
-	return nil
-}
-
-// checkRootComponents rejects symlinks and non-directories among the existing
-// components of dir, even when a later component is absent.
-func checkRootComponents(dir string) error {
+func ensureRoot(dir string) error {
+	// Reject symlinks and non-directories even when a later component is absent.
 	current := string(filepath.Separator)
 	for _, component := range strings.Split(strings.TrimPrefix(dir, current), string(filepath.Separator)) {
 		current = filepath.Join(current, component)
@@ -110,13 +94,6 @@ func checkRootComponents(dir string) error {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("artwork root component is not a directory: %s", current)
 		}
-	}
-	return nil
-}
-
-func ensureRoot(dir string) error {
-	if err := checkRootComponents(dir); err != nil {
-		return err
 	}
 	return os.MkdirAll(dir, 0755)
 }

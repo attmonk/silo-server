@@ -1,7 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
-import { v2ErrorText } from "@/api/v2/request";
 import { PageHeader } from "@/components/page/PageHeader";
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
 import { Button } from "@/components/ui/button";
@@ -77,7 +76,9 @@ export default function AccountSettings() {
           : t("web.settings.account.password.changed"),
       );
     } catch (error) {
-      setFormError(v2ErrorText(error, t("web.settings.account.password.error.failed")));
+      setFormError(
+        error instanceof Error ? error.message : t("web.settings.account.password.error.failed"),
+      );
     }
   }
 

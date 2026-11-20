@@ -36,11 +36,8 @@ import WatchedActionBar from "./components/WatchedActionBar";
 import DetailBreadcrumb from "./components/DetailBreadcrumb";
 import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
-import {
-  selectDefaultPlaybackVariantVersion,
-  selectedDownloadVersions,
-  selectedStartVersion,
-} from "./components/versionRankingUtils";
+import { sortByResolution } from "./components/VersionFlyout";
+import { selectDefaultPlaybackVariantVersion } from "./components/versionRankingUtils";
 import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { EpisodeCarouselSkeleton } from "./components/SectionSkeletons";
 import {
@@ -54,10 +51,11 @@ import {
   canEditMarkers as canEditMarkersForUser,
 } from "@/lib/permissions";
 import { isEpisodeUnwatched } from "@/lib/episodeSpoilers";
+import PremiereShortcut from "@/components/calendar/PremiereShortcut";
 import { buildItemHref } from "@/lib/mediaNavigation";
 import { formatDate } from "@/lib/datetime";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
-import { useQualityPreferenceState } from "@/hooks/queries/qualityPreference";
+import { useQualityPreference } from "@/hooks/queries/qualityPreference";
 import { hasMachineTranslation } from "./components/machineTranslation";
 import { useT } from "@/i18n";
 
@@ -83,9 +81,7 @@ export default function EpisodeContent({
   // The resolution cap comes from the settings contract, where the quality
   // picker writes; the profile column it falls back to is only the pre-cutover
   // choice, since that picker no longer mirrors into it.
-  const { preference: qualityPreference, settled: qualitySettled } = useQualityPreferenceState(
-    currentProfile?.quality_preference,
-  );
+  const qualityPreference = useQualityPreference(currentProfile?.quality_preference);
   const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
   const [editOpen, setEditOpen] = useState(false);
@@ -107,6 +103,7 @@ export default function EpisodeContent({
   const setSubtitlePreference = useSetSubtitlePreference();
 
   // Version selection state — drives the Play button and inline stream popovers.
+  const sortedVersions = useMemo(() => sortByResolution(item.versions ?? []), [item.versions]);
   const userData = leafUserData(item.user_data);
   const { hideOverviews } = useEpisodeSpoilerPrefs();
   // Keyed by episode so a reveal survives an on-view translation of the same
@@ -129,25 +126,30 @@ export default function EpisodeContent({
     hideOverviews &&
     isEpisodeUnwatched(item.user_data) &&
     revealedOverviewId !== item.content_id;
-  const [selectedEditionKey, setSelectedEditionKey] = useState<string | undefined>(undefined);
   const defaultSelectedVersion = useMemo(
     () =>
       selectDefaultPlaybackVariantVersion(
-        item.versions ?? [],
+        sortedVersions,
         item.playback_variants,
         userData,
         qualityPreference,
-        selectedEditionKey,
+        item.effective_version_edition_key,
       ),
-    [qualityPreference, selectedEditionKey, item.playback_variants, item.versions, userData],
+    [
+      qualityPreference,
+      item.effective_version_edition_key,
+      item.playback_variants,
+      sortedVersions,
+      userData,
+    ],
   );
   const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
   const pickedVersion = useMemo(
     () =>
       manualSelectedFileId != null
-        ? (item.versions?.find((version) => version.file_id === manualSelectedFileId) ?? null)
+        ? (sortedVersions.find((version) => version.file_id === manualSelectedFileId) ?? null)
         : null,
-    [manualSelectedFileId, item.versions],
+    [manualSelectedFileId, sortedVersions],
   );
   const selectedVersion = pickedVersion ?? defaultSelectedVersion;
   const selectedMediaSummary = useMemo(
@@ -171,48 +173,22 @@ export default function EpisodeContent({
 
   // Reset selection when navigating to a different episode (adjust state during render).
   const [prevContentId, setPrevContentId] = useState(item.content_id);
-  const [prevSelectedFileId, setPrevSelectedFileId] = useState(selectedVersion?.file_id);
   if (prevContentId !== item.content_id) {
     setPrevContentId(item.content_id);
     setManualSelectedFileId(null);
-    setSelectedEditionKey(undefined);
-    setSubtitleSelectionMode("auto");
-    setExplicitSubtitleSelection(null);
-  } else if (selectedEditionKey === undefined && qualitySettled && defaultSelectedVersion) {
-    setSelectedEditionKey(defaultSelectedVersion.edition_key ?? "");
-  }
-  if (prevSelectedFileId !== selectedVersion?.file_id) {
-    setPrevSelectedFileId(selectedVersion?.file_id);
     setSubtitleSelectionMode("auto");
     setExplicitSubtitleSelection(null);
   }
 
   const handleSelectVersion = useCallback(
-    (version: FileVersion | null) => {
-      setManualSelectedFileId(version?.file_id ?? null);
-      if (version) setSelectedEditionKey(version.edition_key ?? "");
+    (version: FileVersion) => {
+      setManualSelectedFileId(version.file_id);
       // Track indexes belong to a file, so another version starts from Auto.
       clearAudioSelection();
       setSubtitleSelectionMode("auto");
       setExplicitSubtitleSelection(null);
     },
     [clearAudioSelection],
-  );
-
-  const handleSelectEdition = useCallback(
-    (key: string) => {
-      setSelectedEditionKey(key);
-      handleSelectVersion(null);
-    },
-    [handleSelectVersion],
-  );
-  const downloadVersions = useMemo(
-    () => selectedDownloadVersions(selectedVersion, item.playback_variants, qualityPreference),
-    [selectedVersion, item.playback_variants, qualityPreference],
-  );
-  const restartVersion = useMemo(
-    () => selectedStartVersion(selectedVersion, item.playback_variants, qualityPreference),
-    [selectedVersion, item.playback_variants, qualityPreference],
   );
 
   const handleSelectSubtitle = (selection: PrePlaySubtitleSelection) => {
@@ -289,7 +265,7 @@ export default function EpisodeContent({
     initialSeasonNumber: item.season_number ?? undefined,
   });
   const restartHref =
-    primaryAction.resuming && (item.versions?.length ?? 0) > 0
+    primaryAction.label === t("web.detail.actions.resume") && (item.versions?.length ?? 0) > 0
       ? `/watch/${item.content_id}?restart=1`
       : undefined;
 
@@ -446,14 +422,16 @@ export default function EpisodeContent({
               canEditMarkers={canEditMarkers}
               canManageTrickplay={canManageTrickplay}
               onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
-              onShowMediaInfo={(item.versions?.length ?? 0) > 0 ? () => openMediaInfo() : undefined}
+              onShowMediaInfo={
+                canCurateMetadata && (item.versions?.length ?? 0) > 0
+                  ? () => openMediaInfo()
+                  : undefined
+              }
               versions={item.versions ?? []}
               playbackVariants={item.playback_variants}
               selectedVersion={selectedVersion}
-              restartVersion={restartVersion}
               versionPicked={pickedVersion != null}
               onSelectVersion={handleSelectVersion}
-              onSelectEdition={handleSelectEdition}
               onDownload={
                 user?.download_allowed && (item.versions ?? []).length > 0
                   ? () => setDownloadOpen(true)
@@ -480,6 +458,12 @@ export default function EpisodeContent({
           }
         />
 
+        <div className="page-shell py-3">
+          <PremiereShortcut
+            itemId={item.content_id}
+            explainExpired={new URLSearchParams(window.location.search).get("premiere") === "1"}
+          />
+        </div>
         {(siblingsLoading || siblingEpisodes.length > 1) && (
           <section
             className="page-shell episode-detail-navigation"
@@ -531,8 +515,7 @@ export default function EpisodeContent({
       <DownloadVersionPicker
         open={downloadOpen}
         onOpenChange={setDownloadOpen}
-        versions={downloadVersions}
-        partsInOrder
+        versions={item.versions ?? []}
         title={title}
       />
       <SubtitleSearchDialog
@@ -541,13 +524,15 @@ export default function EpisodeContent({
         version={selectedVersion}
         title={title}
       />
-      <MediaInfoDialog
-        open={mediaInfoOpen}
-        onOpenChange={setMediaInfoOpen}
-        versions={item.versions ?? []}
-        title={title}
-        initialFileId={mediaInfoFileId}
-      />
+      {canCurateMetadata && (
+        <MediaInfoDialog
+          open={mediaInfoOpen}
+          onOpenChange={setMediaInfoOpen}
+          versions={item.versions ?? []}
+          title={title}
+          initialFileId={mediaInfoFileId}
+        />
+      )}
       {watchTogether.sheet}
     </div>
   );

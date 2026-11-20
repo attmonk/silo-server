@@ -10,6 +10,8 @@ import CardOverlays from "@/components/overlays/CardOverlays";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { useEpisodeSpoilerPrefs, type EpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
+import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
 import { useGridRowCap } from "@/hooks/useGridRowCap";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import { buildItemHref } from "@/lib/mediaNavigation";
@@ -20,7 +22,6 @@ import { EpisodeGridSkeleton } from "./SectionSkeletons";
 import { useT } from "@/i18n";
 import EpisodeCardCaption from "./EpisodeCardCaption";
 import { episodeLinkLibraryId, type EpisodeNavigationState } from "../itemDetailLayout";
-import WatchProgressBar from "@/components/WatchProgressBar";
 
 /**
  * How much of a season stays visible before the section scrolls, so a long one
@@ -57,6 +58,8 @@ export default function SeasonEpisodeGrid({
   const t = useT();
   const { prefs: overlayPrefs, quickActionMode } = useOverlayPrefs();
   const spoilerPrefs = useEpisodeSpoilerPrefs();
+  const prefetchScopedEpisode = usePrefetchCatalogItemDetail(libraryId);
+  const prefetchEpisode = usePrefetchCatalogItemDetail();
   const setGridRef = useGridRowCap<HTMLDivElement>(VISIBLE_EPISODE_ROWS, episodes.length);
   const playbackById = useMemo(
     () => new Map((playbackEpisodes ?? []).map((episode) => [episode.content_id, episode])),
@@ -92,6 +95,11 @@ export default function SeasonEpisodeGrid({
           overlayPrefs={overlayPrefs}
           quickActionMode={quickActionMode}
           spoilerPrefs={spoilerPrefs}
+          onPrefetch={() =>
+            (episodeLinkLibraryId(episode, libraryId) === undefined
+              ? prefetchEpisode
+              : prefetchScopedEpisode)(episode.content_id)
+          }
         />
       ))}
     </div>
@@ -106,6 +114,7 @@ function SeasonEpisodeCard({
   overlayPrefs,
   quickActionMode,
   spoilerPrefs,
+  onPrefetch,
 }: {
   episode: EpisodeListItem;
   playbackEpisode: EpisodeListItem;
@@ -114,9 +123,11 @@ function SeasonEpisodeCard({
   overlayPrefs: CardOverlayPrefs | null;
   quickActionMode: CardQuickActionMode;
   spoilerPrefs: EpisodeSpoilerPrefs;
+  onPrefetch: () => void;
 }) {
   const t = useT();
   const cardRef = useRef<HTMLDivElement>(null);
+  const prefetchHandlers = useDwellPrefetch(onPrefetch);
   const hasPartialProgress =
     !episode.user_data?.played &&
     (episode.user_data?.position_seconds ?? 0) > 0 &&
@@ -135,14 +146,9 @@ function SeasonEpisodeCard({
   const playable = (playbackEpisode.files ?? []).some((file) => !file.unreadable);
 
   return (
-    <div ref={cardRef} className="group/card media-card media-card-longpress">
+    <div ref={cardRef} className="group/card media-card media-card-longpress" {...prefetchHandlers}>
       <div className="group/media relative">
-        <ViewTransitionLink
-          to={episodeHref}
-          state={episodeLinkState}
-          prefetchOn="intent"
-          className="group block"
-        >
+        <ViewTransitionLink to={episodeHref} state={episodeLinkState} className="group block">
           <div className="media-card-image relative aspect-video">
             {episode.still_url ? (
               <img
@@ -165,20 +171,28 @@ function SeasonEpisodeCard({
                 data={overlayDataFromEpisodeListItem(episode)}
                 prefs={overlayPrefs}
                 variant="wide"
-                hasProgressBar={hasPartialProgress}
               />
             )}
             {/* Hover dim behind the play button */}
             {playable && <div className="media-card-hover-dim absolute inset-0" />}
             {hasPartialProgress && (
-              <WatchProgressBar
-                percent={
-                  ((episode.user_data?.position_seconds ?? 0) /
-                    (episode.user_data?.duration_seconds ?? 1)) *
-                  100
-                }
-                animate
-              />
+              <div className="absolute inset-x-2 bottom-1.5 h-[3px] overflow-hidden rounded-full bg-black/40">
+                <div
+                  className="progress-fill h-full rounded-full"
+                  style={{
+                    width: `${Math.max(
+                      0,
+                      Math.min(
+                        100,
+                        ((episode.user_data?.position_seconds ?? 0) /
+                          (episode.user_data?.duration_seconds ?? 1)) *
+                          100,
+                      ),
+                    )}%`,
+                    background: "var(--primary)",
+                  }}
+                />
+              </div>
             )}
           </div>
         </ViewTransitionLink>

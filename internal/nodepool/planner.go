@@ -136,10 +136,6 @@ type Planner struct {
 	// health checker can recheck the node and tell other API servers. Without
 	// it a report only marks the pool.
 	unreachable atomic.Pointer[func(nodeURL string) bool]
-	// atCapacity records, by normalized URL, when a transcode node last
-	// refused new work at its own job cap. Guarded by mu. See
-	// ReportAtCapacity.
-	atCapacity map[string]time.Time
 }
 
 // NewPlanner creates a planner over the given pools.
@@ -213,16 +209,15 @@ func (p *Planner) ProxyNodeByURL(nodeURL string) (*Node, bool) {
 }
 
 // TranscodeNodeHealthy reports whether the pooled transcode node serving a URL
-// is currently healthy, enabled, and has a key to sign requests to it with.
-// Remote-start adoption gates its redirect on this: a recipe another API
-// server published is only trustworthy while its node still serves. A dead-node
-// move asks it too, and a node nothing can sign for serves nothing.
+// is currently healthy and enabled. Remote-start adoption gates its redirect
+// on this: a recipe another API server published is only trustworthy while
+// its node still serves.
 func (p *Planner) TranscodeNodeHealthy(nodeURL string) bool {
 	if p == nil || p.transcodes == nil || nodeURL == "" {
 		return false
 	}
 	node := p.transcodes.FindByURL(normalizeNodeURL(nodeURL))
-	return node != nil && node.Healthy && node.Enabled && p.transcodes.HasKey(node)
+	return node != nil && node.Healthy && node.Enabled
 }
 
 // PlanDownload picks a healthy proxy for an unbounded file transfer. A
@@ -565,7 +560,7 @@ func (p *Planner) ReserveTranscodeWorkWith(workID string, eligible func(*Node) b
 
 	var best *Node
 	for _, node := range p.transcodes.Nodes() {
-		if !node.TakesNewWork() || !p.transcodes.HasKey(node) || !p.underCap(node, now) {
+		if !node.TakesNewWork() || !p.underCap(node, now) {
 			continue
 		}
 		if eligible != nil && !eligible(node) {
@@ -599,7 +594,7 @@ func (p *Planner) TranscodeWorkAvailableWith(eligible func(*Node) bool) bool {
 	defer p.mu.Unlock()
 	now := p.now()
 	for _, node := range p.transcodes.Nodes() {
-		if !node.TakesNewWork() || !p.transcodes.HasKey(node) || !p.underCap(node, now) {
+		if !node.TakesNewWork() || !p.underCap(node, now) {
 			continue
 		}
 		if eligible == nil || eligible(node) {
@@ -619,7 +614,7 @@ func (p *Planner) TranscodeNodeWith(eligible func(*Node) bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, node := range p.transcodes.Nodes() {
-		if node.TakesNewWork() && p.transcodes.HasKey(node) && (eligible == nil || eligible(node)) {
+		if node.TakesNewWork() && (eligible == nil || eligible(node)) {
 			return true
 		}
 	}
@@ -894,7 +889,7 @@ func (p *Planner) pickLocalEgressTranscode(transcodes, pool []*Node, groupHealth
 }
 
 // transcodeEligible reports whether a transcode node may take a new session:
-// it must be healthy, have a key, and be under cap, and a grouped node additionally requires
+// it must be healthy and under cap, and a grouped node additionally requires
 // its whole group healthy and — when the group contains proxies — at least
 // one of them with job and bandwidth headroom (a group's capacity is bounded
 // by its proxies).
@@ -905,7 +900,7 @@ func (p *Planner) pickLocalEgressTranscode(transcodes, pool []*Node, groupHealth
 // directly (ReserveTranscodeWorkWith's non-streaming reservations) intentionally
 // keep the historical behavior.
 func (p *Planner) transcodeEligible(n *Node, proxies []*Node, groupHealthy map[string]bool, estKbps int, now time.Time) bool {
-	if !n.Healthy || !n.Enabled || !p.transcodes.HasKey(n) || !p.underCap(n, now) {
+	if !n.Healthy || !n.Enabled || !p.underCap(n, now) {
 		return false
 	}
 	if n.Group == nil {
@@ -977,12 +972,7 @@ func (p *Planner) pickProxy(proxies []*Node, groupHealthy map[string]bool, group
 }
 
 // underCap reports whether a node can take one more job.
-// A node that refused new work at its own cap is not, until its next health
-// check (ReportAtCapacity).
 func (p *Planner) underCap(n *Node, now time.Time) bool {
-	if p.heldAtCapacity(n, now) {
-		return false
-	}
 	return n.MaxJobs == nil || p.effectiveJobs(n, now) < *n.MaxJobs
 }
 
@@ -1042,5 +1032,4 @@ func (p *Planner) pruneReservations(now time.Time) {
 			delete(p.reserved, id)
 		}
 	}
-	p.pruneAtCapacity(now)
 }

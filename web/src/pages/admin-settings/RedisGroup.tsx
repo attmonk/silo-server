@@ -22,7 +22,7 @@ const REDIS_URL_EXAMPLE = "redis://host:6379";
 
 export interface RedisUrlEditors {
   keepSaved: (key: string) => void;
-  setSecret: (key: string, value: string, options?: { stage?: boolean }) => void;
+  setSecret: (key: string, value: string) => void;
   disabled: boolean;
 }
 
@@ -39,7 +39,7 @@ export function RedisGroup({
   const checkConnection = useCheckAdminSettingsConnection();
   const [connectionResult, setConnectionResult] = useState<ConnectionCheckResponse | null>(null);
   const redisUrl = form.getValue("redis.url");
-  const urlEnv = form.envVar("redis.url");
+  const managedByEnv = form.sensitiveManagedByEnv.includes("redis.url");
   const configured = form.sensitiveConfigured.includes("redis.url");
   const [enabledOverride, setEnabledOverride] = useState<boolean | null>(null);
   // Saving or discarding clears the toggle override so it follows the stored
@@ -83,7 +83,11 @@ export function RedisGroup({
       <SettingField
         label={t("web.admin.settings.redis.enabled.label")}
         type="toggle"
-        description={t("web.admin.settings.redis.enabled.description")}
+        description={
+          managedByEnv
+            ? t("web.admin.settings.redis.setByEnv")
+            : t("web.admin.settings.redis.enabled.description")
+        }
         value={enabled ? "true" : "false"}
         onChange={(value) => {
           // The switch stages or takes back the credential, so it holds still
@@ -99,9 +103,8 @@ export function RedisGroup({
           setEnabledOverride(false);
           stageRedisUrl(form, "");
         }}
-        disabled={secrets.disabled}
+        disabled={managedByEnv || secrets.disabled}
         restartRequired={restartKeys.has("redis.url")}
-        managedByEnv={urlEnv}
       />
       {enabled && (
         <>
@@ -115,10 +118,9 @@ export function RedisGroup({
             configured={configured}
             onKeep={() => keepSavedRedisUrl(urlDraft)}
             onChange={(v) => stageRedisUrl(urlDraft, v)}
-            hint={REDIS_URL_EXAMPLE}
-            disabled={secrets.disabled}
+            hint={managedByEnv ? t("web.admin.settings.redis.url.managed") : REDIS_URL_EXAMPLE}
+            disabled={managedByEnv || secrets.disabled}
             restartRequired={restartKeys.has("redis.url")}
-            managedByEnv={urlEnv}
           />
           {/*
             The server reports the number in use here while none is saved: the
@@ -128,14 +130,17 @@ export function RedisGroup({
             label={t("web.admin.settings.redis.db.label")}
             dirty={form.isDirty("redis.db")}
             type="number"
-            description={t("web.admin.settings.redis.db.description")}
+            description={
+              managedByEnv
+                ? t("web.admin.settings.redis.setByEnv")
+                : t("web.admin.settings.redis.db.description")
+            }
             value={form.getValue("redis.db")}
             onChange={(v) => {
               if (!secrets.disabled) form.setValue("redis.db", v);
             }}
-            disabled={secrets.disabled}
+            disabled={managedByEnv || secrets.disabled}
             restartRequired={restartKeys.has("redis.db")}
-            managedByEnv={form.envVar("redis.db")}
           />
           {/*
             Env-managed URLs stay checkable: the field is read-only so nothing

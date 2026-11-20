@@ -18,7 +18,6 @@ import { useT } from "@/i18n";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
 import { useUICustomization } from "@/hooks/useUICustomization";
-import { cn } from "@/lib/utils";
 import { CARD_TEXT_AREA_HEIGHT, cardGridClasses } from "@/lib/uiCustomization";
 import {
   awaitingGridRestore,
@@ -43,11 +42,6 @@ interface SharedItemGridProps {
   gridRef?: Ref<ItemGridHandle>;
   /** The first and last item index of the top row the viewer can see. */
   onTopRowChange?: (firstIndex: number, lastIndex: number) => void;
-  /**
-   * The poster shape the grid's items use. Rows are sized for it, so a grid of
-   * square audiobook covers doesn't reserve 2:3 poster height under each row.
-   */
-  posterAspect?: "portrait" | "square";
 }
 
 export interface ItemGridHandle {
@@ -154,13 +148,11 @@ export default function ItemGrid(props: ItemGridProps) {
     emptyState,
     gridRef,
     onTopRowChange,
-    posterAspect = "portrait",
   } = props;
   const { prefs: overlayPrefs, quickActionMode } = useOverlayPrefs();
   const { cardPresentation } = useUICustomization();
   const gridGap = cardPresentation.poster_size === "large" ? 16 : 12;
   const gridClasses = cardGridClasses(cardPresentation.poster_size);
-  const skeletonAspect = posterAspect === "square" ? "aspect-square" : "aspect-[2/3]";
   const totalItems = hasStaticItems(props) ? props.items.length : props.totalItems;
   const pages = hasStaticItems(props)
     ? new Map<number, BrowseItem[]>([[0, props.items]])
@@ -170,7 +162,6 @@ export default function ItemGrid(props: ItemGridProps) {
   const { containerRef, layout } = useGridLayout({
     gap: gridGap,
     textAreaHeight: CARD_TEXT_AREA_HEIGHT,
-    posterRatio: posterAspect === "square" ? 1 : 1.5,
     layoutKey: cardPresentation.poster_size,
   });
   const [anchorEl, setAnchorEl] = useState<HTMLDivElement | null>(null);
@@ -641,7 +632,7 @@ export default function ItemGrid(props: ItemGridProps) {
         <div ref={containerRef} role="list" className={gridClasses}>
           {Array.from({ length: 24 }).map((_, i) => (
             <div key={i} role="listitem">
-              <Skeleton className={cn(skeletonAspect, "rounded-lg")} />
+              <Skeleton className="aspect-[2/3] rounded-lg" />
               <Skeleton className="mt-2 h-4 w-3/4" />
             </div>
           ))}
@@ -692,7 +683,7 @@ export default function ItemGrid(props: ItemGridProps) {
                 if (!item) {
                   cells.push(
                     <div key={`skeleton-${globalIndex}`} role="listitem">
-                      <Skeleton className={cn(skeletonAspect, "rounded-lg")} />
+                      <Skeleton className="aspect-[2/3] rounded-lg" />
                       <Skeleton className="mt-2 h-4 w-3/4" />
                     </div>,
                   );

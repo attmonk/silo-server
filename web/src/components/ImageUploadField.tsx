@@ -67,7 +67,6 @@ export function ImageUploadField({
                 className="h-6 w-6"
                 onClick={() => onFileChange(null)}
                 title={t("web.common.ui.imageUpload.removeSelected")}
-                aria-label={t("web.common.ui.imageUpload.removeSelected")}
               >
                 <X className="h-3 w-3" />
               </Button>
@@ -80,7 +79,6 @@ export function ImageUploadField({
                 className="h-6 w-6"
                 onClick={onDelete}
                 title={t("web.common.ui.imageUpload.delete")}
-                aria-label={t("web.common.ui.imageUpload.delete")}
               >
                 <X className="h-3 w-3" />
               </Button>

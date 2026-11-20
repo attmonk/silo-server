@@ -1,5 +1,4 @@
 {
-  "id": "/",
   "name": "Silo",
   "short_name": "Silo",
   "icons": [
@@ -22,7 +21,5 @@
   ],
   "theme_color": "#1718c9",
   "background_color": "#1718c9",
-  "display": "standalone",
-  "start_url": "/",
-  "scope": "/"
+  "display": "standalone"
 }

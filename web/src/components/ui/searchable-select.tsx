@@ -4,9 +4,7 @@ import { Check, ChevronsUpDown } from "lucide-react";
 
 import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { joinList } from "@/lib/appLocale";
 import { PortalContainerContext } from "./portal-container-context";
-import { isImeComposing } from "@/lib/imeComposition";
 
 interface SearchableSelectProps {
   /** The full list of available options. */
@@ -56,7 +54,6 @@ export function SearchableSelect({
   }, [open]);
 
   function handleSearchKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (isImeComposing(e)) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
       setFocusedIndex((prev) => (prev < allItems.length - 1 ? prev + 1 : prev));
@@ -256,7 +253,6 @@ export function SearchableMultiSelect({
   }
 
   function handleSearchKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (isImeComposing(e)) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
       setFocusedIndex((prev) => (prev < allItems.length - 1 ? prev + 1 : prev));
@@ -280,7 +276,7 @@ export function SearchableMultiSelect({
     value.length === 0
       ? (placeholder ?? t("web.ui.select.placeholder"))
       : value.length <= 3
-        ? joinList(value.map(labelOf))
+        ? value.map(labelOf).join(", ")
         : t("web.ui.selectedCount", { count: value.length, shown: value.length });
 
   return (

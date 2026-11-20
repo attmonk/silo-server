@@ -13,16 +13,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
-func requireDownloadedSubtitleOutageV3(t *testing.T, response playback.DecisionResponseV3) {
-	t.Helper()
-	if response.PlaybackPlan != nil || response.Terminal == nil {
-		t.Fatalf("plan = %#v terminal = %#v, want a retryable refusal instead of a plan without the subtitle", response.PlaybackPlan, response.Terminal)
-	}
-	if response.Terminal.Reason != subtitleUnavailableReasonV3 || !response.Terminal.Retryable {
-		t.Fatalf("terminal = %#v, want retryable %s", response.Terminal, subtitleUnavailableReasonV3)
-	}
-}
-
 // downloadedSubtitleSessionV3 starts playback of a file with one downloaded
 // English SRT selected.
 func downloadedSubtitleSessionV3(t *testing.T) (*PlaybackHandler, *handlerMockSubtitleRepo, *models.MediaFile, playback.StartRequestV3, playback.DecisionResponseV3, int) {
@@ -33,7 +23,7 @@ func downloadedSubtitleSessionV3(t *testing.T) (*PlaybackHandler, *handlerMockSu
 	repo.list = []subtitles.DownloadedSubtitle{downloaded}
 	repo.subtitles[downloaded.ID] = &downloaded
 
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	handler.SubtitleRepo = repo
@@ -43,12 +33,22 @@ func downloadedSubtitleSessionV3(t *testing.T) (*PlaybackHandler, *handlerMockSu
 	startRequest.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", downloadedIndex)
 
 	rec := httptest.NewRecorder()
-	serveStartPlaybackV2(t, handler, rec, httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	handler.HandleStartPlayback(rec, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
 	var started playback.DecisionResponseV3
 	if rec.Code != http.StatusCreated || json.Unmarshal(rec.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil || started.PlaybackPlan.SelectedTracks.Subtitle == nil {
 		t.Fatalf("start with the downloaded subtitle: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	return handler, repo, file, startRequest, started, downloadedIndex
+}
+
+func requireDownloadedSubtitleOutageV3(t *testing.T, response playback.DecisionResponseV3) {
+	t.Helper()
+	if response.PlaybackPlan != nil || response.Terminal == nil {
+		t.Fatalf("plan = %#v terminal = %#v, want a retryable refusal instead of a plan without the subtitle", response.PlaybackPlan, response.Terminal)
+	}
+	if response.Terminal.Reason != subtitleUnavailableReasonV3 || !response.Terminal.Retryable {
+		t.Fatalf("terminal = %#v, want retryable %s", response.Terminal, subtitleUnavailableReasonV3)
+	}
 }
 
 // A downloaded subtitle that cannot be looked up for a moment is not a
@@ -57,12 +57,12 @@ func downloadedSubtitleSessionV3(t *testing.T) (*PlaybackHandler, *handlerMockSu
 // the store recovers still shows it. Planning it as subtitles off would keep
 // it off for the rest of the session, because replans start from the current
 // plan's tracks.
-func TestReplanPlaybackV2DownloadedSubtitleLookupOutageKeepsTheSubtitle(t *testing.T) {
+func TestHandleReplanPlaybackV3DownloadedSubtitleLookupOutageKeepsTheSubtitle(t *testing.T) {
 	handler, repo, file, startRequest, started, downloadedIndex := downloadedSubtitleSessionV3(t)
 	qualityChange := func(id string) playback.DecisionResponseV3 {
 		t.Helper()
 		current := started.PlaybackPlan
-		return replanPlaybackDecisionV2(t, handler, started.SessionID, playback.ReplanRequestV3{
+		return postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
 			ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationQualityChangeV3,
 			PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "downloaded-outage-" + id,
 			FailedPlanID: current.PlanID, PlanAttemptID: "downloaded-outage-attempt-" + id,
@@ -92,11 +92,11 @@ func TestReplanPlaybackV2DownloadedSubtitleLookupOutageKeepsTheSubtitle(t *testi
 // A start has no playing plan to fall back on, so it still plays without the
 // downloaded subtitle and says so, as before; refusing it would leave the
 // viewer with nothing.
-func TestStartPlaybackV2DownloadedSubtitleLookupOutageStillStarts(t *testing.T) {
+func TestHandleStartPlaybackV3DownloadedSubtitleLookupOutageStillStarts(t *testing.T) {
 	file := v3HandlerFixtureFile(t)
 	repo := newMockSubtitleRepoForHandler()
 	repo.listErr = errors.New("database unavailable")
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	handler.SubtitleRepo = repo
@@ -105,7 +105,7 @@ func TestStartPlaybackV2DownloadedSubtitleLookupOutageStillStarts(t *testing.T) 
 	request.SubtitleTrackIndex = &downloadedIndex
 	request.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", downloadedIndex)
 
-	response := startPlayableDecisionV2(t, handler, marshalV3StartRequest(t, request))
+	response := startPlayablePlaybackV3(t, handler, marshalV3StartRequest(t, request))
 	if response.PlaybackPlan.SelectedTracks.Subtitle != nil {
 		t.Fatalf("subtitle = %#v, want playback without the unreadable subtitle", response.PlaybackPlan.SelectedTracks.Subtitle)
 	}
@@ -114,7 +114,7 @@ func TestStartPlaybackV2DownloadedSubtitleLookupOutageStillStarts(t *testing.T) 
 // The same outage during a quality change made on a lower alternate, where
 // the server first maps the subtitle back to the requested edition, is
 // refused as retryable too rather than as a permanent track_unavailable.
-func TestReplanPlaybackV2DownloadedSubtitleLookupOutageOnAnAlternateIsRetryable(t *testing.T) {
+func TestHandleReplanPlaybackV3DownloadedSubtitleLookupOutageOnAnAlternateIsRetryable(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.Resolution = "2160p"
 	source.Bitrate = 32_000
@@ -133,7 +133,7 @@ func TestReplanPlaybackV2DownloadedSubtitleLookupOutageOnAnAlternateIsRetryable(
 	repo.list = []subtitles.DownloadedSubtitle{downloaded}
 	repo.subtitles[downloaded.ID] = &downloaded
 	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
 	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{source.ContentID: {source, alternate}}}
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
@@ -149,14 +149,14 @@ func TestReplanPlaybackV2DownloadedSubtitleLookupOutageOnAnAlternateIsRetryable(
 		}
 	}
 	rec := httptest.NewRecorder()
-	serveStartPlaybackV2(t, handler, rec, httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	handler.HandleStartPlayback(rec, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
 	var started playback.DecisionResponseV3
 	if json.Unmarshal(rec.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil || started.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
 		t.Fatalf("start did not land on the alternate: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 
 	downloadedIndex := len(alternate.ExternalSubtitles) + len(alternate.SubtitleTracks)
-	subtitled := replanPlaybackDecisionV2(t, handler, started.SessionID, playback.ReplanRequestV3{
+	subtitled := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
 		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationTrackChangeV3,
 		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "alternate-outage-track-0001",
 		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: "alternate-outage-track-attempt-0001",
@@ -173,7 +173,7 @@ func TestReplanPlaybackV2DownloadedSubtitleLookupOutageOnAnAlternateIsRetryable(
 
 	repo.listErr = errors.New("database unavailable")
 	currentKey := playback.PlanAttemptKeyV3(*subtitled.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
-	requireDownloadedSubtitleOutageV3(t, replanPlaybackDecisionV2(t, handler, started.SessionID, playback.ReplanRequestV3{
+	requireDownloadedSubtitleOutageV3(t, postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
 		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationQualityChangeV3,
 		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "alternate-outage-quality-0001",
 		FailedPlanID: subtitled.PlaybackPlan.PlanID, PlanAttemptID: "alternate-outage-quality-attempt-0001",

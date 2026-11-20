@@ -6,7 +6,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import WatchlistTitleCard from "@/components/watchlist/WatchlistTitleCard";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
-import { useAppLanguage, useT } from "@/i18n";
+import { useT } from "@/i18n";
 import { useSubmitMediaRequest } from "@/hooks/useSubmitMediaRequest";
 import { useWatchlistTitleToggle } from "@/hooks/useWatchlistTitleToggle";
 import { cardGridClasses } from "@/lib/uiCustomization";
@@ -38,8 +38,6 @@ export default function WatchlistTitlesTab({
   watchlistRequests: boolean;
 }) {
   const t = useT();
-  // The status text is built by a plain helper, so a language change rebuilds it.
-  const language = useAppLanguage();
   const { prefs: overlayPrefs } = useOverlayPrefs();
   const { submit, isSubmitting } = useSubmitMediaRequest();
   const watchlist = useWatchlistTitleToggle();
@@ -49,8 +47,7 @@ export default function WatchlistTitlesTab({
       title,
       status: watchlistTitleStatus(title, now),
     }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `language` changes what t() returns inside.
-  }, [titles, language]);
+  }, [titles]);
 
   if (isError) {
     return (

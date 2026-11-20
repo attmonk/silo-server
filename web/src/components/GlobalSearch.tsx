@@ -1,4 +1,3 @@
-import { joinList } from "@/lib/appLocale";
 import {
   lazy,
   Suspense,
@@ -45,10 +44,8 @@ import { cn } from "@/lib/utils";
 import { Search } from "lucide-react";
 import { EnterKeyHint, Kbd } from "@/components/ui/kbd";
 import CardPlayOverlay from "./CardPlayOverlay";
-import { numberText, useT, type MessageKey } from "@/i18n";
-
+import { useT, type MessageKey } from "@/i18n";
 import { LocalErrorBoundary } from "./LocalErrorBoundary";
-import { isImeComposing } from "@/lib/imeComposition";
 
 // The request suggestions show only once a search has run, so their cards stay
 // out of the launch bundle.
@@ -155,11 +152,9 @@ function GlobalSearchResultRow({
         id={searchResultOptionId(index)}
         role="option"
         aria-selected={isSelected}
-        aria-label={joinList(
-          [item.title, item.year > 0 ? numberText(item.year) : null, typeLabel].filter(
-            (part): part is string => Boolean(part),
-          ),
-        )}
+        aria-label={[item.title, item.year > 0 ? String(item.year) : null, typeLabel]
+          .filter(Boolean)
+          .join(", ")}
         onClick={() => onPick(item.content_id)}
         className={ROW_LAYOUT_CLASSES}
       >
@@ -683,7 +678,6 @@ export function GlobalSearch({
                 selectedIndex >= 0 ? searchResultOptionId(selectedIndex) : undefined
               }
               onKeyDown={(e) => {
-                if (isImeComposing(e)) return;
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
                   moveResultFocus(selectedIndex + 1);

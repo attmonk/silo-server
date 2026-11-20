@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/config"
-	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -90,9 +89,8 @@ func TestPrepareRemoteTransportV3VersionsOnlyExactAACStereoDownmix(t *testing.T)
 			}))
 			defer node.Close()
 
-			handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 			handler.JWTSecret = "test-secret"
-			handler.NodeKeys = nodeauthtest.SameKey("test-secret")
 			result := remoteHLSResultV3()
 			if test.mutate != nil {
 				test.mutate(&result)
@@ -140,9 +138,8 @@ func TestPrepareRemoteTransportV3RejectsOldNodeAfterStaleAudioCapabilityProbe(t 
 	}))
 	defer node.Close()
 
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.JWTSecret = "test-secret"
-	handler.NodeKeys = nodeauthtest.SameKey("test-secret")
 	handler.NodePlanner = &recordingNodePlannerV3{plan: nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}}}
 	policy := config.DefaultPlaybackRoutingPolicy()
 	// This test exercises the stale worker's start receipt, not fallback to the
@@ -182,9 +179,8 @@ func TestPrepareTransportV3HeaderAuthStoresTheNodeRecipeForRestartRecovery(t *te
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			node := remoteTranscodeNodeStubV3(t)
-			handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 			handler.JWTSecret = "test-secret"
-			handler.NodeKeys = nodeauthtest.SameKey("test-secret")
 			handler.NodePlanner = &recordingNodePlannerV3{plan: nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}, ProxyNode: &nodepool.Node{URL: "http://proxy-1"}}}
 			handler.ProxyGrantStore = &recordingRecipeCardStoreV3{}
 			recipes := &recordingRecipeCardStoreV3{}
@@ -243,9 +239,8 @@ func TestPrepareProgressiveTransportRollbackStopsAdmittedRemoteJob(t *testing.T)
 	t.Cleanup(node.Close)
 	proxy := capableProxyStubV3(t)
 
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.JWTSecret = "test-secret"
-	handler.NodeKeys = nodeauthtest.SameKey("test-secret")
 	handler.NodeRecipeStore = &recordingRecipeCardStoreV3{}
 	handler.NodePlanner = &recordingNodePlannerV3{plan: nodepool.Plan{
 		TranscodeNode: &nodepool.Node{ID: 84, URL: node.URL},
@@ -315,9 +310,8 @@ func TestPrepareProgressiveTransportRequiredRollbackPreservesRetryableRoute(t *t
 		"predecessor-transport": {},
 	}}
 
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.JWTSecret = "test-secret"
-	handler.NodeKeys = nodeauthtest.SameKey("test-secret")
 	handler.NodeRecipeStore = recipes
 	handler.NodePlanner = &recordingNodePlannerV3{plan: nodepool.Plan{
 		TranscodeNode: &nodepool.Node{ID: 84, URL: node.URL},
@@ -378,9 +372,8 @@ func TestPrepareProgressiveTransportRequiredRollbackPreservesRetryableRoute(t *t
 // the transport the replan just retired.
 func TestPrepareTransportV3RemoteCommitDropsThePreviousTransportRecipe(t *testing.T) {
 	node := remoteTranscodeNodeStubV3(t)
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.JWTSecret = "test-secret"
-	handler.NodeKeys = nodeauthtest.SameKey("test-secret")
 	handler.NodePlanner = &recordingNodePlannerV3{plan: nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}}}
 	const previousTransportID = "session-node-replan-plan0001-aaaabbbb"
 	recipes := &recordingRecipeCardStoreV3{cards: map[string]playback.RecipeCard{
@@ -414,7 +407,7 @@ func TestPrepareTransportV3RemoteCommitDropsThePreviousTransportRecipe(t *testin
 // A stopped session's node job is gone, so its stored recipe must be too, and a
 // stopped session is over, so its API recovery card goes with it.
 func TestFinalizeSessionStopDropsTheNodeRecipe(t *testing.T) {
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	const transportID = "session-node-stop-plan0001-aaaabbbb"
 	requests := make(chan string, 1)
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -435,7 +428,7 @@ func TestFinalizeSessionStopDropsTheNodeRecipe(t *testing.T) {
 		TranscodeNodeURL: node.URL, TranscodeTransportID: transportID,
 	}
 
-	handler.finalizeSessionStopWithResult(context.Background(), session, false, "", PlaybackEndStopped)
+	handler.finalizeSessionStop(context.Background(), session, false, "", PlaybackEndStopped)
 
 	select {
 	case request := <-requests:
@@ -480,7 +473,7 @@ func TestStopPlaybackRetainsProgressiveSessionUntilAuthorityRevocationSucceeds(t
 		t.Fatal(err)
 	}
 
-	handler := newKeyedPlaybackHandler(manager)
+	handler := NewPlaybackHandler(manager)
 	recipes := &recordingRecipeCardStoreV3{deleteErr: errors.New("redis is down")}
 	handler.NodeRecipeStore = recipes
 	if err := handler.stopPlaybackSession(t.Context(), session, PlaybackEndStopped); err == nil {
@@ -537,7 +530,7 @@ func TestStopPlaybackRetainsProgressiveSessionUntilRemoteCancellationSucceeds(t 
 		t.Fatal(err)
 	}
 
-	handler := newKeyedPlaybackHandler(manager)
+	handler := NewPlaybackHandler(manager)
 	recipes := &recordingRecipeCardStoreV3{cards: map[string]playback.RecipeCard{
 		transportID: {SessionID: session.ID, TranscodeTransportID: transportID},
 	}}
@@ -594,7 +587,7 @@ func TestStopPlaybackWaitsForReplacementAndRevokesItsCurrentAuthority(t *testing
 		t.Fatal(err)
 	}
 
-	handler := newKeyedPlaybackHandler(manager)
+	handler := NewPlaybackHandler(manager)
 	recipes := &recordingRecipeCardStoreV3{cards: map[string]playback.RecipeCard{
 		oldTransportID: {SessionID: session.ID, TranscodeTransportID: oldTransportID},
 		newTransportID: {SessionID: session.ID, TranscodeTransportID: newTransportID},
@@ -657,7 +650,7 @@ func TestPrepareProgressiveTransportPublishesAuthorityInsideLifecycleBoundary(t 
 
 	proxy := capableProxyStubV3(t)
 	transcode := progressiveRemuxExecutionStubV3(t)
-	handler := newKeyedPlaybackHandler(manager)
+	handler := NewPlaybackHandler(manager)
 	handler.NodePlanner = &recordingNodePlannerV3{plan: nodepool.Plan{
 		ProxyNode:     &nodepool.Node{ID: 42, URL: proxy.URL},
 		TranscodeNode: &nodepool.Node{ID: 84, URL: transcode.URL},
@@ -749,7 +742,7 @@ func TestPrepareTransportV3ReleasesTheProxyHalfWhenTheManifestIsNotProxyServed(t
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			node := remoteTranscodeNodeStubV3(t)
-			handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 			handler.JWTSecret = test.jwtSecret
 			planner := &recordingNodePlannerV3{plan: nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}, ProxyNode: &nodepool.Node{URL: "http://proxy-1"}}}
 			handler.NodePlanner = planner
@@ -787,9 +780,8 @@ func TestPrepareTransportV3ReleasesTheProxyHalfWhenTheManifestIsNotProxyServed(t
 // are going to cross it.
 func TestPrepareTransportV3KeepsTheProxyReservationWhenTheProxyServes(t *testing.T) {
 	node := remoteTranscodeNodeStubV3(t)
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.JWTSecret = "test-secret"
-	handler.NodeKeys = nodeauthtest.SameKey("test-secret")
 	planner := &recordingNodePlannerV3{plan: nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}, ProxyNode: &nodepool.Node{URL: "http://proxy-1"}}}
 	handler.NodePlanner = planner
 	handler.ProxyGrantStore = &recordingRecipeCardStoreV3{}

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { ArrowDown, ArrowUp, X } from "lucide-react";
 import { toast } from "sonner";
 
-import { v2ErrorText } from "@/api/v2/request";
 import { PageHeader } from "@/components/page/PageHeader";
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
 import { Button } from "@/components/ui/button";
@@ -15,7 +14,6 @@ import {
 } from "@/components/ui/select";
 import { useUICustomization } from "@/hooks/useUICustomization";
 import { useUserLibraries } from "@/hooks/queries/libraries";
-import { menuItemPinRef, usePinLabel, type PinRef } from "@/hooks/queries/pinLabels";
 import { useClearSettingValue, useSetSettingValue } from "@/hooks/queries/settingValues";
 import { useT, type MessageKey, type Translate } from "@/i18n";
 import { SETTING_KEYS } from "@/lib/settingsContract";
@@ -64,20 +62,18 @@ const POSTER_SIZES: readonly { value: PosterSize; labelKey: MessageKey }[] = [
   { value: "large", labelKey: "web.settings.interface.posterLarge" },
 ];
 
-function menuItemLabel(
-  t: Translate,
-  item: PrimaryMenuItem,
-  pinLabel: (pin: PinRef) => string,
-): string {
+function menuItemLabel(t: Translate, item: PrimaryMenuItem): string {
   if (item.type === "builtin") {
     const key = BUILTIN_LABELS[item.destination];
     return key ? t(key) : item.destination;
   }
   if (item.type === "library") return t("web.settings.interface.menuLibrary", { name: item.label });
-  // Named like the sidebar names the link: by the row's or collection's current title.
-  const name = pinLabel(menuItemPinRef(item));
-  if (item.type === "section") return t("web.settings.interface.menuSection", { name });
-  return t("web.settings.interface.menuCollection", { name });
+  if (item.type === "section") return t("web.settings.interface.menuSection", { name: item.label });
+  return t("web.settings.interface.menuCollection", { name: item.label });
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
 }
 
 export default function InterfaceSettings() {
@@ -192,7 +188,7 @@ function PosterSettings() {
         identity: CLIENT_SCOPE,
       });
     } catch (error) {
-      toast.error(v2ErrorText(error, t("web.settings.interface.posterSaveFailed")));
+      toast.error(errorMessage(error, t("web.settings.interface.posterSaveFailed")));
     }
   }
 
@@ -200,7 +196,7 @@ function PosterSettings() {
     try {
       await clearValue.mutateAsync({ key: SETTING_KEYS.UI_CARD_PRESENTATION, identity });
     } catch (error) {
-      toast.error(v2ErrorText(error, t("web.settings.interface.posterResetFailed")));
+      toast.error(errorMessage(error, t("web.settings.interface.posterResetFailed")));
     }
   }
 
@@ -295,11 +291,6 @@ function MenuSettings() {
     }
     return [...unique.values()];
   }, [customization.shortcuts.items, libraries, menuItems]);
-  const pinRefs = useMemo(
-    () => [...menuItems, ...availableItems].flatMap((item) => menuItemPinRef(item) ?? []),
-    [availableItems, menuItems],
-  );
-  const pinLabel = usePinLabel(pinRefs);
 
   async function saveMenu(next: PrimaryMenuItem[]) {
     setSaved({ items: next, overBaselineKey: baselineKey });
@@ -311,7 +302,7 @@ function MenuSettings() {
       });
     } catch (error) {
       setSaved(null);
-      toast.error(v2ErrorText(error, t("web.settings.interface.menuSaveFailed")));
+      toast.error(errorMessage(error, t("web.settings.interface.menuSaveFailed")));
     }
   }
 
@@ -320,7 +311,7 @@ function MenuSettings() {
       await clearValue.mutateAsync({ key: SETTING_KEYS.NAV_PRIMARY_MENU, identity });
       setSaved(null);
     } catch (error) {
-      toast.error(v2ErrorText(error, t("web.settings.interface.menuResetFailed")));
+      toast.error(errorMessage(error, t("web.settings.interface.menuResetFailed")));
     }
   }
 
@@ -353,7 +344,7 @@ function MenuSettings() {
         ) : null}
         <ol className="space-y-2" aria-label={t("web.settings.interface.menuLinks")}>
           {menuItems.map((item, index) => {
-            const label = menuItemLabel(t, item, pinLabel);
+            const label = menuItemLabel(t, item);
             const home = item.type === "builtin" && item.destination === "home";
             return (
               <li
@@ -421,7 +412,7 @@ function MenuSettings() {
             <SelectContent>
               {availableItems.map((item) => (
                 <SelectItem key={menuItemKey(item)} value={menuItemKey(item)}>
-                  {menuItemLabel(t, item, pinLabel)}
+                  {menuItemLabel(t, item)}
                 </SelectItem>
               ))}
             </SelectContent>

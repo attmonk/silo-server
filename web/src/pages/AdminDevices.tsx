@@ -47,9 +47,6 @@ import { AdminSubtitleAppearanceDialog } from "@/components/admin/AdminSubtitleA
 import { cn } from "@/lib/utils";
 import { numberText, useT, type MessageKey, type Translate } from "@/i18n";
 import { formatDecimal } from "@/lib/numberFormat";
-import { joinList } from "@/lib/appLocale";
-import { formatDate } from "@/lib/datetime";
-import { useDateTimeFormat } from "@/hooks/useDateTimeFormat";
 
 // ─────────────────────────────────────────────────────────────────────
 // types & constants
@@ -668,9 +665,7 @@ function DeviceScopeControl({
         )}
       >
         <span>{t("web.admin.devices.scope.allDevices")}</span>
-        <span className="font-mono text-[11.5px] tabular-nums opacity-70">
-          {numberText(totalDevices)}
-        </span>
+        <span className="font-mono text-[11.5px] tabular-nums opacity-70">{totalDevices}</span>
       </button>
       <button
         type="button"
@@ -739,9 +734,7 @@ function SettingsScopeControl({
         )}
       >
         <span>{t("web.admin.devices.settingsScope.allSettings")}</span>
-        <span className="font-mono text-[10.5px] tabular-nums opacity-70">
-          {numberText(totalSettings)}
-        </span>
+        <span className="font-mono text-[10.5px] tabular-nums opacity-70">{totalSettings}</span>
       </button>
       <button
         type="button"
@@ -758,9 +751,7 @@ function SettingsScopeControl({
         )}
       >
         <span>{t("web.admin.devices.settingsScope.overrides")}</span>
-        <span className="font-mono text-[10.5px] tabular-nums opacity-70">
-          {numberText(overrideCount)}
-        </span>
+        <span className="font-mono text-[10.5px] tabular-nums opacity-70">{overrideCount}</span>
       </button>
     </div>
   );
@@ -1077,7 +1068,7 @@ function SavedViewRow({
           active ? "text-foreground/80" : "text-muted-foreground/60",
         )}
       >
-        {numberText(count)}
+        {count}
       </span>
     </button>
   );
@@ -1118,7 +1109,7 @@ function FacetCheckbox({
           checked ? "text-foreground/80" : "text-muted-foreground/60",
         )}
       >
-        {numberText(count)}
+        {count}
       </span>
     </label>
   );
@@ -1396,7 +1387,7 @@ function OverrideGauge({ count, active }: { count: number; active: boolean }) {
               : "text-muted-foreground/85",
         )}
       >
-        {numberText(count)}
+        {count}
       </span>
     </div>
   );
@@ -1462,7 +1453,6 @@ function DeviceDetailPanel({
   defaultShowAllSettings: boolean;
 }) {
   const t = useT();
-  useDateTimeFormat();
   const isAnomaly = anomaly !== null;
   // The detail endpoint supplies registration metadata — device name, owner,
   // which profiles have ever used it — which is not a setting and has no
@@ -1698,7 +1688,7 @@ function DeviceDetailPanel({
             </p>
             <textarea
               spellCheck={false}
-              className="border-input bg-background focus:border-foreground/40 min-h-[260px] w-full rounded-md border px-3 py-2 font-mono text-[13px] leading-relaxed transition-colors outline-none"
+              className="border-border bg-background focus:border-foreground/40 min-h-[260px] w-full rounded-md border px-3 py-2 font-mono text-[13px] leading-relaxed transition-colors outline-none"
               value={jsonValue}
               onChange={(event) => setJsonValue(event.target.value)}
             />
@@ -1807,7 +1797,12 @@ function DeviceDetailPanel({
         />
         <ReadoutCell
           label={t("web.admin.devices.readout.profilesTouched")}
-          value={joinList(profileTabs.slice(0, 2).map((p) => p.profileName)) || "—"}
+          value={
+            profileTabs
+              .slice(0, 2)
+              .map((p) => p.profileName)
+              .join(", ") || "—"
+          }
           sub={
             profileTabs.length > 2
               ? t("web.admin.devices.readout.moreProfiles", {
@@ -1836,7 +1831,7 @@ function DeviceDetailPanel({
         <ReadoutCell
           label={t("web.admin.devices.readout.lastUpdate")}
           value={formatRelative(lastUpdate || data.last_updated)}
-          sub={lastUpdate ? formatDate(lastUpdate) : "—"}
+          sub={lastUpdate ? lastUpdate.split("T")[0] : "—"}
         />
       </div>
 

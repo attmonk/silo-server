@@ -183,6 +183,7 @@ func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]s
 			Downloads:       s.Downloads,
 			HearingImpaired: s.HearingImpaired,
 		}
+		result.SetRawLanguageForBridge(lang)
 		results = append(results, result)
 	}
 	return results, nil

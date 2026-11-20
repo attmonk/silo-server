@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/auth"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
 )
 
@@ -25,13 +24,12 @@ const adminCatalogItemsMaxContentIDs = 200
 // AdminCatalogItemsInput is the listAdminCatalogItems query.
 type AdminCatalogItemsInput struct {
 	LimitParam
-	Cursor           string   `query:"cursor" maxLength:"8192" doc:"Opaque cursor from page.next_cursor; valid only with the filters that produced it"`
-	LibraryID        ID       `query:"library_id" doc:"Only items present in this library; added_at and added_after then use the item's first-seen time in this library" example:"1"`
-	Type             string   `query:"type" enum:"movie,series,episode" doc:"Only items of this type"`
-	AddedAfter       string   `query:"added_after" format:"date-time" doc:"Only items whose added_at is at or after this instant"`
-	ContentIDs       []string `query:"content_ids,explode" maxItems:"200" doc:"Only these items, one content_ids parameter per id; ids that are not present movies, series or episodes are left out" example:"[\"movie-tmdb-949\"]"`
-	IncludePeople    bool     `query:"include_people" doc:"Also return cast and crew on movies and series. Send it only when getAdminCatalogCapabilities reports item_metadata"`
-	IncludeFilePaths bool     `query:"include_file_paths" doc:"Also return each version's file_path. Send it only when getAdminCatalogCapabilities reports item_file_paths; a key whose scopes lack admin:catalog:paths receives 403"`
+	Cursor        string   `query:"cursor" maxLength:"8192" doc:"Opaque cursor from page.next_cursor; valid only with the filters that produced it"`
+	LibraryID     ID       `query:"library_id" doc:"Only items present in this library; added_at and added_after then use the item's first-seen time in this library" example:"1"`
+	Type          string   `query:"type" enum:"movie,series,episode" doc:"Only items of this type"`
+	AddedAfter    string   `query:"added_after" format:"date-time" doc:"Only items whose added_at is at or after this instant"`
+	ContentIDs    []string `query:"content_ids,explode" maxItems:"200" doc:"Only these items, one content_ids parameter per id; ids that are not present movies, series or episodes are left out" example:"[\"movie-tmdb-949\"]"`
+	IncludePeople bool     `query:"include_people" doc:"Also return cast and crew on movies and series. Send it only when getAdminCatalogCapabilities reports item_metadata"`
 }
 
 // AdminCatalogItem is one movie, series or episode present in an enabled
@@ -84,7 +82,6 @@ type AdminCatalogItemVersion struct {
 	BitrateKbps   int    `json:"bitrate_kbps,omitempty" doc:"Overall file bitrate in kilobits per second"`
 	FileSize      int64  `json:"file_size" doc:"Bytes"`
 	Edition       string `json:"edition,omitempty" doc:"Edition label, such as Director's Cut" example:"Extended"`
-	FilePath      string `json:"file_path,omitempty" doc:"The file's path as the scanning server stores it, only with include_file_paths. Map it to another host's mounts through the library's paths. Bytes of a name that are not UTF-8 are stored as private-use code points" example:"/media/movies/Heat (1995)/Heat.mkv"`
 }
 
 // AdminCatalogItemCollection is the named envelope the contract carries.
@@ -104,8 +101,6 @@ type AdminCatalogCapabilities struct {
 	ItemChangeEvents      bool `json:"item_change_events" doc:"catalog.item.changed on the v2 events socket also carries change added, removed and files_changed to administrators"`
 	ItemMatchHints        bool `json:"item_match_hints" doc:"getAdminItemMatchHints is served: the title, year and provider IDs the scanner parsed from an item's folder and file names"`
 	ItemMetadata          bool `json:"item_metadata" doc:"listAdminCatalogItems returns genres, content_rating, studios, networks, ratings and dates on movies and series and air_date on episodes, and accepts include_people"`
-	ItemMetadataReset     bool `json:"item_metadata_reset" doc:"refreshAdminItemMetadata accepts mode reset, which resets an item, season or episode to its providers"`
-	ItemFilePaths         bool `json:"item_file_paths" doc:"listAdminCatalogItems accepts include_file_paths from this caller: a login session, an unscoped key, or a key holding admin:catalog:paths"`
 }
 type AdminCatalogCapabilitiesOutput struct {
 	Status       int
@@ -117,7 +112,7 @@ type AdminCatalogCapabilitiesOutput struct {
 const opListAdminCatalogItems = "listAdminCatalogItems"
 
 func registerAdminCatalogItems(reg *Registry) {
-	Register(reg, Operation{Operation: humaOp(http.MethodGet, Prefix+"/admin/catalog/capabilities", "getAdminCatalogCapabilities", "admin-catalog", "Discover the administrator catalog reads this server offers."), Class: ClassActingAdmin}, func(ctx context.Context, _ *CapabilityInput) (*AdminCatalogCapabilitiesOutput, error) {
+	Register(reg, Operation{Operation: humaOp(http.MethodGet, Prefix+"/admin/catalog/capabilities", "getAdminCatalogCapabilities", "admin-catalog", "Discover the administrator catalog reads this server offers."), Class: ClassActingAdmin}, func(context.Context, *CapabilityInput) (*AdminCatalogCapabilitiesOutput, error) {
 		served := reg.deps.AdminCatalogItems != nil
 		return &AdminCatalogCapabilitiesOutput{Body: AdminCatalogCapabilities{
 			Capability:            Capability{State: configuredCapabilityState(served)},
@@ -126,8 +121,6 @@ func registerAdminCatalogItems(reg *Registry) {
 			ItemChangeEvents:      served,
 			ItemMatchHints:        reg.deps.AdminCatalogMatch != nil,
 			ItemMetadata:          served,
-			ItemMetadataReset:     reg.deps.AdminItemMetadata != nil,
-			ItemFilePaths:         served && adminCatalogFilePathsAllowed(ctx),
 		}}, nil
 	})
 
@@ -137,10 +130,7 @@ func registerAdminCatalogItems(reg *Registry) {
 		if reg.deps.AdminCatalogItems == nil {
 			return nil, unavailable("catalog listing")
 		}
-		if in.IncludeFilePaths && !adminCatalogFilePathsAllowed(ctx) {
-			return nil, NewProblem(TypePermissionDenied, "This API key needs the admin:catalog:paths scope to read file paths.")
-		}
-		filter := catalogpkg.AdminCatalogItemFilter{Type: in.Type, People: in.IncludePeople, FilePaths: in.IncludeFilePaths}
+		filter := catalogpkg.AdminCatalogItemFilter{Type: in.Type, People: in.IncludePeople}
 		if in.LibraryID != "" {
 			n, err := intOfID(in.LibraryID)
 			if err != nil || n <= 0 || n > math.MaxInt32 {
@@ -206,7 +196,7 @@ func registerAdminCatalogItems(reg *Registry) {
 					FileID: IDFromInt(int64(v.FileID)), LibraryID: IDFromInt(int64(v.LibraryID)),
 					Resolution: v.Resolution, CodecVideo: v.CodecVideo, DynamicRange: v.DynamicRange,
 					CodecAudio: v.CodecAudio, AudioChannels: v.AudioChannels, Atmos: v.Atmos, Container: v.Container,
-					BitrateKbps: v.BitrateKbps, FileSize: v.FileSize, Edition: v.Edition, FilePath: v.FilePath,
+					BitrateKbps: v.BitrateKbps, FileSize: v.FileSize, Edition: v.Edition,
 				})
 			}
 			items = append(items, item)
@@ -223,13 +213,4 @@ func registerAdminCatalogItems(reg *Registry) {
 		}
 		return &AdminCatalogItemCollectionOutput{Body: AdminCatalogItemCollection{Collection: Paginated(items, next)}}, nil
 	})
-}
-
-// adminCatalogFilePathsAllowed reports whether the caller may read file paths
-// from listAdminCatalogItems. The route already requires an acting
-// administrator; a scoped key also needs admin:catalog:paths, because the
-// admin:monitor:read scope that admits the route never returns paths.
-func adminCatalogFilePathsAllowed(ctx context.Context) bool {
-	claims := claimsFrom(ctx)
-	return claims != nil && (len(claims.APIKeyScopes) == 0 || slices.Contains(claims.APIKeyScopes, auth.ScopeAdminCatalogPaths))
 }

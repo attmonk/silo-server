@@ -1,3 +1,4 @@
+/* eslint-disable formatjs/no-literal-string-in-jsx -- rewritten on main (#3623) after the catalog was cut; its new strings are a catalog follow-up */
 import type { ReactNode } from "react";
 import { Link } from "react-router";
 import {
@@ -286,41 +287,24 @@ function transcodeDirectoryWarning(node: StreamNode): ResourceMetric | null {
  * egress chart does: a disabled node keeps its last reported counts forever.
  */
 function FleetSummary({ nodes }: { nodes: StreamNode[] }) {
-  const t = useT();
   const enabled = nodes.filter((node) => node.enabled);
   const live = enabled.filter((node) => node.healthy);
   const healthy = live.length;
   const egressKbps = live.reduce((sum, node) => sum + node.egress_kbps, 0);
-  const work = (
-    id:
-      | "web.admin.dashboard.widgets.transcodeNodes.streamCount"
-      | "web.admin.dashboard.widgets.transcodeNodes.transcodeCount",
-    list: StreamNode[],
-  ) => {
+  const work = (unit: string, list: StreamNode[]) => {
     const active = list
       .filter((node) => live.includes(node))
       .reduce((sum, node) => sum + node.active_jobs, 0);
-    return t(id, { count: active, count_text: active.toLocaleString(formatLocale()) });
+    return `${active.toLocaleString(formatLocale())} ${unit}${active === 1 ? "" : "s"}`;
   };
   const proxies = nodes.filter((node) => node.type === "proxy");
   const others = nodes.filter((node) => node.type !== "proxy");
   const groups = new Set(nodes.map(nodeGroupOf).filter(Boolean)).size;
   const parts = [
-    groups > 0
-      ? t("web.admin.dashboard.widgets.transcodeNodes.groupCount", { count: groups })
-      : null,
-    enabled.length > 0
-      ? t("web.admin.dashboard.widgets.transcodeNodes.healthyCount", {
-          healthy,
-          enabled: enabled.length,
-        })
-      : null,
-    proxies.length > 0
-      ? work("web.admin.dashboard.widgets.transcodeNodes.streamCount", proxies)
-      : null,
-    others.length > 0
-      ? work("web.admin.dashboard.widgets.transcodeNodes.transcodeCount", others)
-      : null,
+    groups > 0 ? `${groups} ${groups === 1 ? "group" : "groups"}` : null,
+    enabled.length > 0 ? `${healthy}/${enabled.length} healthy` : null,
+    proxies.length > 0 ? work("stream", proxies) : null,
+    others.length > 0 ? work("transcode", others) : null,
     formatMbps(egressKbps / 1_000),
   ];
 
@@ -333,8 +317,6 @@ function FleetSummary({ nodes }: { nodes: StreamNode[] }) {
 
 /** Where a CPU, RAM or GPU reading turns amber. */
 const HIGH_LOAD_PERCENT = 90;
-// Between a count and its "/ cap", so the cell's text reads "3 / 8".
-const SPACE = " ";
 
 const COLUMN_HEADING =
   "bg-card text-muted-foreground border-border sticky top-0 z-10 border-b pb-1 ps-2.5 text-end text-[11px] font-medium whitespace-nowrap";
@@ -352,42 +334,27 @@ const GPU_COLUMN =
 const CHECKED_COLUMN = "hidden w-[86px] @min-[1200px]/nodes:table-cell";
 const BUILD_COLUMN = "hidden w-[150px] @min-[1200px]/nodes:table-cell";
 
-function dataColumns(t: Translate, showsGPU: boolean) {
+function dataColumns(showsGPU: boolean) {
   return [
-    {
-      id: "active",
-      label: t("web.admin.dashboard.widgets.transcodeNodes.column.active"),
-      className: ACTIVE_COLUMN,
-    },
-    {
-      id: "mbps",
-      label: t("web.admin.dashboard.widgets.transcodeNodes.column.mbps"),
-      className: EGRESS_COLUMN,
-    },
-    { id: "cpu", label: t("web.admin.nodes.metric.cpu"), className: CPU_COLUMN },
-    { id: "ram", label: t("web.admin.nodes.metric.memory"), className: RAM_COLUMN },
-    ...(showsGPU
-      ? [{ id: "gpu", label: t("web.admin.nodes.metric.gpu"), className: GPU_COLUMN }]
-      : []),
-    { id: "checked", label: t("web.admin.nodes.unit.checked"), className: CHECKED_COLUMN },
-    {
-      id: "build",
-      label: t("web.admin.dashboard.widgets.transcodeNodes.column.build"),
-      className: BUILD_COLUMN,
-    },
+    { label: "Active", className: ACTIVE_COLUMN },
+    { label: "Mbps", className: EGRESS_COLUMN },
+    { label: "CPU", className: CPU_COLUMN },
+    { label: "RAM", className: RAM_COLUMN },
+    ...(showsGPU ? [{ label: "GPU", className: GPU_COLUMN }] : []),
+    { label: "Checked", className: CHECKED_COLUMN },
+    { label: "Build", className: BUILD_COLUMN },
   ];
 }
 
 function ColumnHeadings({ showsGPU }: { showsGPU: boolean }) {
-  const t = useT();
   return (
     <thead>
       <tr>
         <th scope="col" className={cn(COLUMN_HEADING, "ps-0 text-start")}>
-          {t("web.admin.dashboard.widgets.transcodeNodes.column.node")}
+          Node
         </th>
-        {dataColumns(t, showsGPU).map(({ id, label, className }) => (
-          <th key={id} scope="col" className={cn(COLUMN_HEADING, className)}>
+        {dataColumns(showsGPU).map(({ label, className }) => (
+          <th key={label} scope="col" className={cn(COLUMN_HEADING, className)}>
             {label}
           </th>
         ))}
@@ -468,7 +435,6 @@ function GroupRows({
   showsGPU: boolean;
   serverRevision: string | null;
 }) {
-  const t = useT();
   return (
     <tbody>
       {showHeading ? (
@@ -483,8 +449,8 @@ function GroupRows({
               </span>
             </div>
           </th>
-          {dataColumns(t, showsGPU).map(({ id, className }) => (
-            <td key={id} className={className} />
+          {dataColumns(showsGPU).map(({ label, className }) => (
+            <td key={label} className={className} />
           ))}
         </tr>
       ) : null}
@@ -518,7 +484,7 @@ function NodeRow({
   const readings = nodeReadings(node);
   const build = node.last_stats?.build;
   const storage = transcodeDirectoryWarning(node);
-  const noCountsTitle = staleCountsTitle(t, state);
+  const noCountsTitle = staleCountsTitle(state);
 
   return (
     <tr className={state === "disabled" ? "text-muted-foreground" : undefined}>
@@ -534,26 +500,19 @@ function NodeRow({
           {storage ? (
             <NodeFlag
               icon={HardDrive}
-              title={t("web.admin.dashboard.widgets.transcodeNodes.storageTitle", {
-                fill: storage.fill ?? 0,
-                detail: storage.title,
-              })}
+              title={`Transcode directory ${storage.fill}% full. ${storage.title}`}
               labelClassName="@max-[719px]/nodes:sr-only"
             >
-              {t("web.admin.dashboard.widgets.transcodeNodes.storageFlag", {
-                fill: storage.fill ?? 0,
-              })}
+              Storage {storage.fill}%
             </NodeFlag>
           ) : null}
           {buildDiffers(node, serverRevision) ? (
             <NodeFlag
               icon={AlertTriangle}
-              title={t("web.admin.dashboard.widgets.transcodeNodes.buildDiffersTitle", {
-                detail: buildTitle(t, node) ?? "",
-              })}
+              title={`Build differs from the server. ${buildTitle(t, node)}`}
               labelClassName={storage ? "@max-[999px]/nodes:sr-only" : "@max-[719px]/nodes:sr-only"}
             >
-              {t("web.admin.dashboard.widgets.transcodeNodes.buildDiffersFlag")}
+              Build differs
             </NodeFlag>
           ) : null}
         </div>
@@ -568,33 +527,16 @@ function NodeRow({
         {noCountsTitle ? <NoReading /> : <EgressValue node={node} />}
       </td>
       <td className={cn(CELL, CPU_COLUMN)}>
-        <LoadReading
-          name={t("web.admin.dashboard.widgets.transcodeNodes.meterLabel", {
-            node: node.name,
-            metric: t("web.admin.nodes.metric.cpu"),
-          })}
-          metric={readings.cpu}
-          missing={readings.missing}
-        />
+        <LoadReading name={`${node.name} CPU`} metric={readings.cpu} missing={readings.missing} />
       </td>
       <td className={cn(CELL, RAM_COLUMN)}>
-        <LoadReading
-          name={t("web.admin.dashboard.widgets.transcodeNodes.meterLabel", {
-            node: node.name,
-            metric: t("web.admin.nodes.metric.memory"),
-          })}
-          metric={readings.ram}
-          missing={readings.missing}
-        />
+        <LoadReading name={`${node.name} RAM`} metric={readings.ram} missing={readings.missing} />
       </td>
       {showsGPU ? (
         <td className={cn(CELL, GPU_COLUMN)}>
           {nodeReportsAcceleration(node) ? (
             <LoadReading
-              name={t("web.admin.dashboard.widgets.transcodeNodes.meterLabel", {
-                node: node.name,
-                metric: t("web.admin.nodes.metric.gpu"),
-              })}
+              name={`${node.name} GPU`}
               metric={readings.gpu}
               missing={readings.missing}
             />
@@ -620,24 +562,22 @@ function NodeRow({
  * leaves the pool and is never checked again, so it keeps whatever its last
  * check reported.
  */
-function staleCountsTitle(t: Translate, state: NodeState): string | null {
+function staleCountsTitle(state: NodeState): string | null {
   if (state === "unhealthy") {
-    return t("web.admin.dashboard.widgets.transcodeNodes.staleUnreachableTitle");
+    return "The last health check did not reach this node.";
   }
   if (state === "disabled") {
-    return t("web.admin.dashboard.widgets.transcodeNodes.staleDisabledTitle");
+    return "This node is switched off, so health checks no longer update it.";
   }
   return null;
 }
 
 function NoReading() {
-  // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an en dash for "no reading", not text
   return <span className="text-muted-foreground">–</span>;
 }
 
 /** One "Active" column holds both kinds of work, so each count names its unit. */
 function ActiveCount({ node }: { node: StreamNode }) {
-  const t = useT();
   const active = node.active_jobs.toLocaleString(formatLocale());
   const cap = positiveCap(node.max_jobs);
   const proxy = node.type === "proxy";
@@ -647,26 +587,16 @@ function ActiveCount({ node }: { node: StreamNode }) {
         {active}
         {cap !== null ? (
           <span className="text-muted-foreground font-normal">
-            {SPACE}
-            {t("web.admin.dashboard.widgets.transcodeNodes.capSeparator", {
-              max: cap.toLocaleString(formatLocale()),
-            })}
+            {" "}
+            / {cap.toLocaleString(formatLocale())}
           </span>
         ) : null}
       </span>{" "}
       <abbr
-        title={t(
-          proxy
-            ? "web.admin.dashboard.widgets.transcodeNodes.streamsTitle"
-            : "web.admin.dashboard.widgets.transcodeNodes.transcodesTitle",
-        )}
+        title={proxy ? "streams" : "transcodes"}
         className="text-muted-foreground text-[10px] no-underline"
       >
-        {t(
-          proxy
-            ? "web.admin.dashboard.widgets.transcodeNodes.streamsAbbr"
-            : "web.admin.dashboard.widgets.transcodeNodes.transcodesAbbr",
-        )}
+        {proxy ? "strm" : "trns"}
       </abbr>
     </>
   );
@@ -674,7 +604,6 @@ function ActiveCount({ node }: { node: StreamNode }) {
 
 /** The cap is the first thing to go when the column is tight; the use stays. */
 function EgressValue({ node }: { node: StreamNode }) {
-  const t = useT();
   const cap = positiveCap(node.max_bandwidth_kbps);
   return (
     <>
@@ -688,10 +617,8 @@ function EgressValue({ node }: { node: StreamNode }) {
       </span>
       {cap !== null ? (
         <span className="text-muted-foreground hidden @min-[620px]/nodes:inline">
-          {SPACE}
-          {t("web.admin.dashboard.widgets.transcodeNodes.capSeparator", {
-            max: formatMbpsValue(cap / 1_000),
-          })}
+          {" "}
+          / {formatMbpsValue(cap / 1_000)}
         </span>
       ) : null}
     </>
@@ -728,12 +655,10 @@ function LoadReading({
   metric: ResourceMetric | null;
   missing?: string;
 }) {
-  const t = useT();
   if (!metric || metric.fill === null) {
     return (
       <span className="text-muted-foreground block w-8 text-end" title={metric?.title ?? missing}>
-        {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an en dash for "no reading", not text */}
-        {"–"}
+        –
       </span>
     );
   }
@@ -741,7 +666,7 @@ function LoadReading({
   return (
     <div className="flex items-center gap-1.5" title={metric.title}>
       <span className={cn("w-8 flex-shrink-0 text-end", high && "text-warning font-semibold")}>
-        {t("web.admin.dashboard.widgets.transcodeNodes.loadPercent", { percent: metric.fill })}
+        {metric.fill}%
       </span>
       <div className="bg-foreground/15 hidden h-1 max-w-[90px] min-w-5 flex-1 overflow-hidden rounded-sm @min-[620px]/nodes:block">
         <div
@@ -785,7 +710,7 @@ function lastCheckLabel(t: Translate, node: StreamNode): string {
     formatRelativeTime(node.last_health_check, {
       rounding: "floor",
       justNowLabel: t("web.admin.dashboard.widgets.transcodeNodes.justNow"),
-    }) ?? t("web.admin.nodes.unit.never")
+    }) ?? "Never"
   );
 }
 

@@ -1,5 +1,4 @@
 import { useId, useRef, useState, type ReactNode } from "react";
-import { joinList } from "@/lib/appLocale";
 import { useIsMutating } from "@tanstack/react-query";
 import { Link } from "react-router";
 import { ArrowUpRight, Check, Copy, KeyRound, Loader2, X } from "lucide-react";
@@ -809,7 +808,7 @@ function ProviderPanel({
               ? "web.admin.settings.signIn.provider.missing.enabled"
               : "web.admin.settings.signIn.provider.missing.disabled",
             {
-              fields: joinList(missing),
+              fields: missing.join(", "),
             },
           )}
         </p>

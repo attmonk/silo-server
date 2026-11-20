@@ -1,8 +1,6 @@
 import { useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
-import { t } from "@/i18n";
-
 import {
   captureProfileRequestContext,
   StaleApiRequestContextError,
@@ -71,13 +69,9 @@ export function useSetAudioPreference() {
           profileContext,
         }),
       ),
-    // Not awaited: the write has landed, and a caller waiting on mutateAsync
-    // to learn that should not also wait for these refetches.
-    onSuccess: () => {
-      void invalidateItemDetails(queryClient);
-    },
+    onSuccess: () => invalidateItemDetails(queryClient),
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : t("web.player.tracks.saveAudioFailed"));
+      toast.error(err instanceof Error ? err.message : "Failed to save audio preference");
     },
   });
 }
@@ -98,12 +92,9 @@ export function useDeleteAudioPreference() {
           profileContext,
         }),
       ),
-    // Not awaited, as in useSetAudioPreference.
-    onSuccess: () => {
-      void invalidateItemDetails(queryClient);
-    },
+    onSuccess: () => invalidateItemDetails(queryClient),
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : t("web.player.tracks.resetAudioFailed"));
+      toast.error(err instanceof Error ? err.message : "Failed to reset audio preference");
     },
   });
 }

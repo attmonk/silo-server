@@ -4,7 +4,7 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
-    branches: [main, apiv2, feat/web-premiere-deploy]
+    branches: [main, apiv2]
   workflow_dispatch:
 
 concurrency:
@@ -13,11 +13,11 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository == 'attmonk/silo-server' && 'attmonk/attmonk-server' || github.repository }}
+  IMAGE_NAME: ${{ github.repository }}
   # Published build numbers belong to this workflow. Keep it as the sole owner
   # of the sequence; raise the offset if the workflow counter ever loses
   # continuity so a new build remains greater than every existing build tag.
-  BUILD_NUMBER_OFFSET: ${{ github.repository == 'attmonk/silo-server' && '37' || '0' }}
+  BUILD_NUMBER_OFFSET: 0
   GOPROXY: https://proxy.golang.org,direct
   GOPRIVATE: github.com/Silo-Server/*
   GONOSUMDB: github.com/Silo-Server/*
@@ -32,15 +32,13 @@ jobs:
       built_at: ${{ steps.identity.outputs.built_at }}
       image_version: ${{ steps.identity.outputs.image_version }}
     if: >-
-      (github.repository != 'attmonk/silo-server' ||
-       (github.event.workflow_run.head_branch || github.ref_name) == 'feat/web-premiere-deploy') &&
-      ((github.event_name == 'workflow_dispatch' &&
-       contains(fromJSON('["refs/heads/main","refs/heads/apiv2","refs/heads/feat/web-premiere-deploy"]'), github.ref)) ||
+      (github.event_name == 'workflow_dispatch' &&
+       contains(fromJSON('["refs/heads/main","refs/heads/apiv2"]'), github.ref)) ||
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_repository.full_name == github.repository &&
-       contains(fromJSON('["main","apiv2","feat/web-premiere-deploy"]'), github.event.workflow_run.head_branch)))
+       contains(fromJSON('["main","apiv2"]'), github.event.workflow_run.head_branch))
     steps:
       - name: Resolve build identity
         id: identity
@@ -48,7 +46,6 @@ jobs:
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           TARGET_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
-          FORK_DEPLOYMENT: ${{ github.repository == 'attmonk/silo-server' }}
         run: |
           if [[ -z "$DEFAULT_BRANCH" ]]; then
             echo "::error::Repository default branch is unavailable."
@@ -57,7 +54,7 @@ jobs:
 
           build_number=""
           image_version="${GITHUB_SHA::7}"
-          if [[ "$TARGET_BRANCH" == "$DEFAULT_BRANCH" || ( "$FORK_DEPLOYMENT" == "true" && "$TARGET_BRANCH" == "feat/web-premiere-deploy" ) ]]; then
+          if [[ "$TARGET_BRANCH" == "$DEFAULT_BRANCH" ]]; then
             build_number=$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))
             if (( build_number <= 0 )); then
               echo "::error::Build number must be positive."
@@ -114,21 +111,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The standalone server is also the omnibus build's starting point.
-      # Its stable tags are server and server-build-N; latest, build-N,
-      # apiv2, and the bare SHA belong to the omnibus image.
+      # The base image is the omnibus build's starting point, not a published
+      # image: its only tag is the commit SHA with -base added. latest,
+      # build-N, apiv2, and the bare SHA belong to the omnibus image.
       - name: Create and push manifest list
         working-directory: ${{ runner.temp }}/digests
         env:
           BASE_TAG: ${{ github.event.workflow_run.head_sha || github.sha }}-base
-          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
         run: |
-          tags=(-t "${REGISTRY}/${IMAGE_LC}:${BASE_TAG}")
-          if [[ -n "$BUILD_NUMBER" ]]; then
-            tags+=(-t "${REGISTRY}/${IMAGE_LC}:server" -t "${REGISTRY}/${IMAGE_LC}:server-build-${BUILD_NUMBER}")
-          fi
           # shellcheck disable=SC2046
-          docker buildx imagetools create "${tags[@]}" \
+          docker buildx imagetools create -t "${REGISTRY}/${IMAGE_LC}:${BASE_TAG}" \
             $(printf "${REGISTRY}/${IMAGE_LC}@sha256:%s " *)
           docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:${BASE_TAG}"
 
@@ -187,8 +179,8 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=latest,enable=${{ needs.prepare.outputs.build_number != '' }}
-            type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ needs.prepare.outputs.build_number != '' }}
+            type=raw,value=latest,enable=${{ github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch) }}
+            type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch) }}
             type=raw,value=apiv2,enable=${{ github.event.workflow_run.head_branch == 'apiv2' || (github.event_name == 'workflow_dispatch' && github.ref_name == 'apiv2') }}
             type=raw,value=${{ (github.event.workflow_run.head_sha || github.sha) }}
 
@@ -206,6 +198,6 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:${{ github.event.workflow_run.head_sha || github.sha }}"
-          if [[ -n "$BUILD_NUMBER" ]]; then
+          if [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" || "${{ github.event.workflow_run.head_branch }}" == "${DEFAULT_BRANCH}" ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:build-${BUILD_NUMBER}"
           fi

@@ -15,7 +15,6 @@ import type {
 import { v2, type V2Body, type V2Query, problemFieldDetail, V2ProblemError } from "./request";
 import { mediaRequestFromV2 } from "./requests";
 import type { components } from "./schema";
-import { t } from "@/i18n";
 
 type Schemas = components["schemas"];
 
@@ -38,7 +37,7 @@ export type RequestRouteTitle = Schemas["AdminRequestRouteTitle"];
 export type RequestRoute = Schemas["AdminRequestRoute"] & { etag: string };
 
 function requireETag(etag?: string) {
-  if (!etag) throw new Error(t("web.admin.errors.requestsEditorReload"));
+  if (!etag) throw new Error("Reload this editor before saving.");
   return etag;
 }
 export const isRequestEditorConflict = (error: unknown) =>
@@ -326,7 +325,8 @@ export async function listAdminRequestIntegrationsV2(): Promise<RequestIntegrati
     ids.push(...page.items.map((i) => i.id));
     const next = page.page?.has_more ? page.page.next_cursor : undefined;
     if (!page.page?.has_more) break;
-    if (!next || seen.has(next)) throw new Error(t("web.admin.errors.integrationPageIncomplete"));
+    if (!next || seen.has(next))
+      throw new Error("Incomplete integration page. Reload to try again.");
     seen.add(next);
     cursor = next;
   } while (cursor);
@@ -379,7 +379,7 @@ export async function listAdminRequestQueuePageV2(
   });
   if (!isProfileRequestContextCurrent(profileContext)) throw new StaleApiRequestContextError();
   if (page.page?.has_more && !page.page.next_cursor) {
-    throw new Error(t("web.admin.errors.requestPageIncomplete"));
+    throw new Error("Incomplete request page. Reload to try again.");
   }
   return {
     items: page.items.map(mediaRequestFromV2),

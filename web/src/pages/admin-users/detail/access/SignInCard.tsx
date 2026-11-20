@@ -18,7 +18,6 @@ import { useAdminPolicyDefaults, useViewerIsOwner } from "@/hooks/queries/admin/
 import { useAuth } from "@/hooks/useAuth";
 import { useT, type MessageKey, type Translate } from "@/i18n";
 import { invalidEmailMessage, isValidEmail } from "@/lib/email";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
 
 import { KeyValueRow } from "../ui";
 import { EditableCard, type AccessCardProps } from "./EditableCard";
@@ -261,7 +260,7 @@ export function SignInCard({
                 <SelectTrigger id={roleId} className="w-40">
                   <SelectValue />
                 </SelectTrigger>
-                <SelectContent className={TOUCH_TARGETS}>
+                <SelectContent>
                   {base.is_owner ? (
                     <SelectItem value="owner">
                       {t("web.admin.users.detail.access.role.owner")}

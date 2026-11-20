@@ -161,6 +161,10 @@ const (
 	// viewer's instead of pulling every other viewer to it. Only a jump far
 	// beyond what a correction would fix is taken as the host's choice.
 	hostAuthorityDriftSeconds = 10.0
+	// legacyHostAuthorityDriftSeconds keeps the frozen /api/v1 room socket's
+	// host band. Its clients may report a host's scrub instead of requesting
+	// it, which the wider v2 band would correct away.
+	legacyHostAuthorityDriftSeconds = 2.0
 	// roomIdleTTL is how long a room may go without any playback-anchor
 	// activity before the janitor closes it.
 	roomIdleTTL = 24 * time.Hour
@@ -181,6 +185,15 @@ func closeReplacedConnection(conn RoomConnection) {
 		return
 	}
 	_ = conn.Close()
+}
+
+// hostAuthorityDrift is the host band for member's socket. A connection on
+// the /api/v1 room socket reports itself as legacy.
+func hostAuthorityDrift(member *memberState) float64 {
+	if legacy, ok := member.connection.(interface{ LegacyRoomProtocol() bool }); ok && legacy.LegacyRoomProtocol() {
+		return legacyHostAuthorityDriftSeconds
+	}
+	return hostAuthorityDriftSeconds
 }
 
 type RoomStore interface {
@@ -503,6 +516,49 @@ func (s *Service) SetClusterEventBus(bus cache.EventBus) error {
 		oldCancel()
 	}
 	return nil
+}
+
+func (s *Service) CreateRoom(ctx context.Context, input CreateRoomInput) (*Room, error) {
+	if s == nil || s.repo == nil {
+		return nil, fmt.Errorf("watch together service unavailable")
+	}
+
+	now := s.now()
+	selectionMode := input.SelectionMode
+	if selectionMode != RoomSelectionModeVote {
+		selectionMode = RoomSelectionModeHostPick
+	}
+	room := Room{
+		ID:                    uuid.NewString(),
+		Code:                  randomToken(8),
+		JoinToken:             randomToken(24),
+		HostUserID:            input.HostUserID,
+		HostProfileID:         input.HostProfileID,
+		Phase:                 RoomPhaseLobby,
+		PlaybackState:         RoomPlaybackStateIdle,
+		ResumeOnReady:         false,
+		SelectionMode:         selectionMode,
+		SelectionRevision:     0,
+		GuestControlPolicy:    GuestControlPolicyHostOnly,
+		AnchorPositionSeconds: 0,
+		IsPaused:              true,
+		AnchorUpdatedAt:       now,
+		Generation:            1,
+		CreatedAt:             now,
+	}
+
+	created, err := s.repo.CreateRoom(ctx, room)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.rooms[created.ID] = &liveRoom{
+		room:    *created,
+		members: make(map[string]*memberState),
+	}
+	s.mu.Unlock()
+	return created, nil
 }
 
 func (s *Service) JoinRoom(ctx context.Context, input JoinInput) (*Room, error) {
@@ -917,9 +973,10 @@ func (s *Service) handleStateReportForConnection(
 	// not enough: a player whose play was refused (a browser blocking
 	// autoplay after a reload) or whose correction never loaded names it
 	// too, and its report would pause or rewind everyone.
+	hostBand := hostAuthorityDrift(member)
 	if isHost && member.syncingToRoom {
 		ranSync := report.CommandID != "" && report.CommandID == member.lastSentCommandID &&
-			report.IsPaused == member.lastSentPaused && drift <= hostAuthorityDriftSeconds
+			report.IsPaused == member.lastSentPaused && drift <= hostBand
 		if ranSync || (!pauseMismatch && drift <= 1.5) {
 			member.syncingToRoom = false
 		} else {
@@ -929,7 +986,7 @@ func (s *Service) handleStateReportForConnection(
 	// A host who is buffering or catching up reports a stalled stream, and a
 	// host inside the catch-up band has only drifted. Neither is a decision
 	// the room should follow.
-	if isHost && (member.ignoreWait || member.isBuffering || (!pauseMismatch && drift <= hostAuthorityDriftSeconds)) {
+	if isHost && (member.ignoreWait || member.isBuffering || (!pauseMismatch && drift <= hostBand)) {
 		isHost = false
 	}
 	// A stalled stream cannot apply a target; recovery is acknowledged with

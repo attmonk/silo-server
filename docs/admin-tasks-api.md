@@ -3,7 +3,7 @@
 The v2 administrator task surface uses generated web bindings. Apple and Android
 have no task or administrator-job HTTP calls in their checked source trees; the
 migration inventory also records only web consumers. Jellyfin compatibility has
-no equivalent management surface.
+no equivalent management surface. Legacy routes remain available during migration.
 
 ## Execution and schedules
 
@@ -12,7 +12,8 @@ By default it omits hidden tasks: queue workers, pollers, and repairs that run
 without an administrator, such as `match_media` or `cache_metadata_images`. It
 also omits tasks that serve one library kind, such as `sync_ebook_metadata`,
 while no library of that kind exists. `include_hidden=true` returns every
-registered task. `GET /api/v2/admin/tasks/{key}` reads runtime state on the
+registered task. The frozen v1 list applies the hidden flags only, not library
+scoping. `GET /api/v2/admin/tasks/{key}` reads runtime state on the
 responding process for any registered task, hidden or not. Both require
 acting-administrator access, as do task mutations and history.
 
@@ -22,10 +23,6 @@ but does not create a durable job or promise execution after a process failure.
 Concurrent local starts conflict. Another server has its own worker state.
 `POST /api/v2/admin/tasks/{key}/cancel` requests cancellation of the current local
 execution; completed effects remain. Neither operation automatically retries.
-While a task is `running` or `cancelling` on the responding process, its
-`started_at` reports when that run started; `last_execution` still describes
-the previous finished run. The realtime `task.updated` event and the events
-WebSocket's task snapshot do not carry it; refetch the task to read it.
 
 The `refresh_all_library_metadata` task runs a `full` library metadata refresh
 (see [libraries-api.md](libraries-api.md)) for each enabled library in turn,
@@ -76,17 +73,10 @@ ignored at startup. The web page lists them in a separate "On demand" group.
 `GET /api/v2/admin/tasks/{key}/triggers` reads persisted schedule configuration
 and a strong caller-bound ETag. `PUT` on that resource requires `If-Match` and a
 `triggers` array, including an empty array to disable scheduling. The database
-compares the original revision under the schedule parent lock, and every
-schedule writer advances the revision. A mismatch returns 412 with the
+compares the original revision under the schedule parent lock. Legacy writers
+use that same lock and advance the revision. A mismatch returns 412 with the
 observed validator, without rereading or retrying the write. An empty schedule
-remains configured across restarts rather than restoring task defaults. A plugin
-task without a persisted schedule reports the default it runs (binding trigger,
-else manifest default, else startup) at revision zero, under a validator that
-also changes when that default changes; the first `PUT` saves a schedule that
-then outranks the default. Only an administrator's edit saves one now, but a
-plugin task can still hold a schedule an earlier release saved from a binding
-trigger, which `GET` reports with its nonzero revision
-([plugin-scheduled-tasks.md](architecture/plugin-scheduled-tasks.md)).
+remains configured across restarts rather than restoring task defaults.
 
 Successful edits apply to the responding process. Other running processes load
 the persisted configuration when they restart. Runtime state and persisted
@@ -153,7 +143,7 @@ objects whose destination content was checked in the current copy pass, and
 bucket names, object keys, or local paths. The count can restart when an
 interrupted pass resumes. A completed copy reports `restart_pending` until the
 new storage is active after restart. The job's raw message and error remain
-available only to internal diagnostics. Administrator-job responses and
+available only to internal diagnostics. Legacy administrator-job responses and
 the jobs realtime channel use the same safe storage-transition receipt,
 including the websocket snapshot; they omit the raw request and result
 documents for this job type.

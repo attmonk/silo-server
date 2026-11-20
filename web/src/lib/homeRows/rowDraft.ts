@@ -4,7 +4,6 @@ import type { GalleryPreset, RecipeCatalogResponse, RecipeDefinition } from "@/l
 import { FILTER_SECTION_TYPES } from "@/lib/sectionTypes";
 import { t, type MessageKey } from "@/i18n";
 import { rowKindName } from "./catalog";
-import { canSaveCollectionRefs, collectionRefsOf } from "./collectionList";
 import { collectionIdOf, withPickedCollection, withQueryDefinition } from "./payloads";
 import {
   customHolidayProblem,
@@ -63,14 +62,9 @@ function presetName(def: RecipeDefinition | undefined, presetKey: string | null)
 export function draftForPreset(def: RecipeDefinition, preset: GalleryPreset | undefined): RowDraft {
   const params = { ...(preset?.default_params ?? {}) };
   const collection = def.type === "collection";
-  // A row of collections starts as "Collections", its kind's own name.
-  const name =
-    def.type === "collection_posters"
-      ? rowKindName(def.type)
-      : (preset?.display_name ?? rowKindName(def.type));
   return {
     sectionType: def.type,
-    title: collection ? "" : name,
+    title: collection ? "" : (preset?.display_name ?? rowKindName(def.type)),
     titleFollowsVariant: collection || variantFamily(def.type) !== undefined,
     config: FILTER_SECTION_TYPES.has(def.type)
       ? withQueryDefinition(params, queryDefinitionFromSectionConfig(params))
@@ -182,8 +176,6 @@ export function canSaveDraft(draft: RowDraft, surface: Surface = "profile"): boo
     }
     case "collection":
       return collectionIdOf(config, surface) !== "";
-    case "collection_posters":
-      return canSaveCollectionRefs(collectionRefsOf(config), surface);
     case "admin_curated_list":
       return Array.isArray(config.item_ids) && config.item_ids.length > 0;
     default:
@@ -201,8 +193,6 @@ export function previewWaitText(draft: RowDraft, surface: Surface = "profile"): 
     return t("web.home.rows.draft.pickCollection");
   if (draft.sectionType === "admin_curated_list" && !canSaveDraft(draft))
     return t("web.home.rows.draft.addTitles");
-  if (draft.sectionType === "collection_posters" && collectionRefsOf(draft.config).length === 0)
-    return t("web.home.rows.draft.addCollection");
   return null;
 }
 

@@ -4,9 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/jackc/pgx/v5"
 )
 
 // ListItemsPage checks the persisted membership witness and reads only limit+1

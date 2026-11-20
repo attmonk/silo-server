@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { createPortal } from "react-dom";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
 import { playerV2 } from "../player-v2";
 import type { SubtitleLanguageDetection, SubtitleResult } from "@/api/types";
@@ -8,7 +9,6 @@ import { canonicalLanguageWireValue } from "@/lib/languageNames";
 import type { StoredSubtitle } from "../utils/subtitleSync";
 import { formatLocale } from "@/lib/appLocale";
 import { useT } from "@/i18n";
-import { PlayerModalDialog } from "./PlayerModalDialog";
 
 /** Glyph on the close button, which carries a translated label. */
 const CLOSE_GLYPH = "✕";
@@ -69,6 +69,8 @@ export function SubtitleSearchModal({
   const [downloading, setDownloading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const modalRef = useRef<HTMLDivElement>(null);
+  const previousActiveElementRef = useRef<HTMLElement | null>(null);
+  const searchInputRef = useRef<HTMLSelectElement>(null);
   const downloadGeneration = useRef(0);
   const uploadedSubtitle = useRef<StoredSubtitle | undefined>(undefined);
   useEffect(() => {
@@ -79,6 +81,23 @@ export function SubtitleSearchModal({
     };
   }, [playerConfig, mediaFileId, isOpen]);
 
+  const handleClose = useCallback(() => {
+    previousActiveElementRef.current?.focus();
+    onClose();
+  }, [onClose]);
+
+  // Focus the search input on open and save the trigger element.
+  useEffect(() => {
+    if (!isOpen) return;
+    previousActiveElementRef.current = document.activeElement as HTMLElement;
+    // Delay to allow the modal to render before focusing.
+    const timer = setTimeout(() => {
+      // Without online search there is no search input; keep focus in the modal.
+      (searchInputRef.current ?? modalRef.current?.querySelector<HTMLElement>("button"))?.focus();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [isOpen]);
+
   // The provider probe can resolve after the modal opened. If it hides online
   // search, the focused language select unmounts; keep focus inside the modal.
   useEffect(() => {
@@ -88,6 +107,48 @@ export function SubtitleSearchModal({
       modal.querySelector<HTMLElement>("button")?.focus();
     }
   }, [isOpen, onlineSearchEnabled]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        handleClose();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isOpen, handleClose]);
+
+  // Focus trap.
+  const handleFocusTrap = useCallback((e: React.KeyboardEvent) => {
+    if (e.key !== "Tab") return;
+    const modal = modalRef.current;
+    if (!modal) return;
+
+    const focusable = modal.querySelectorAll<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    );
+    if (focusable.length === 0) return;
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+
+    if (e.shiftKey) {
+      if (document.activeElement === first && last) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else {
+      if (document.activeElement === last && first) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  }, []);
 
   const handleSearch = useCallback(async () => {
     setSearching(true);
@@ -168,8 +229,8 @@ export function SubtitleSearchModal({
 
   const handleUploadSuccess = useCallback(() => {
     onSubtitleDownloaded(uploadedSubtitle.current, "upload");
-    onClose();
-  }, [onSubtitleDownloaded, onClose]);
+    handleClose();
+  }, [onSubtitleDownloaded, handleClose]);
 
   const handleDownload = useCallback(
     async (result: SubtitleResult) => {
@@ -201,7 +262,7 @@ export function SubtitleSearchModal({
         });
         if (!current()) return;
         onSubtitleDownloaded(response?.subtitle, "download");
-        onClose();
+        handleClose();
       } catch (err) {
         if (current())
           setError(err instanceof Error ? err.message : t("web.subtitles.search.downloadFailed"));
@@ -209,25 +270,32 @@ export function SubtitleSearchModal({
         if (current()) setDownloading(null);
       }
     },
-    [playerConfig, mediaFileId, onSubtitleDownloaded, onDownloadStarted, onClose, t],
+    [playerConfig, mediaFileId, onSubtitleDownloaded, onDownloadStarted, handleClose, t],
   );
 
   if (!isOpen) return null;
 
-  return (
-    <PlayerModalDialog
-      label={t("web.subtitles.search.title")}
-      className="w-full max-w-[480px] rounded-lg bg-neutral-900 text-white shadow-xl"
-      onClose={onClose}
+  const modal = (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80"
+      onClick={handleClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label={t("web.subtitles.search.title")}
+      onKeyDown={handleFocusTrap}
     >
-      <div ref={modalRef}>
+      <div
+        ref={modalRef}
+        className="w-full max-w-[480px] rounded-lg bg-neutral-900 text-white shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
           <h2 className="text-sm font-semibold">{t("web.subtitles.search.title")}</h2>
           <button
             type="button"
             className="rounded text-white/60 hover:text-white focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
-            onClick={onClose}
+            onClick={handleClose}
             aria-label={t("web.subtitles.closeDialog")}
           >
             {CLOSE_GLYPH}
@@ -255,7 +323,7 @@ export function SubtitleSearchModal({
         {onlineSearchEnabled && (
           <div className="flex gap-2 px-4 py-3">
             <select
-              data-autofocus
+              ref={searchInputRef}
               aria-label={t("web.subtitles.search.language")}
               className="flex-1 rounded bg-neutral-800 px-2 py-1.5 text-sm text-white focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
               value={selectedLang}
@@ -377,6 +445,8 @@ export function SubtitleSearchModal({
           </div>
         )}
       </div>
-    </PlayerModalDialog>
+    </div>
   );
+
+  return createPortal(modal, document.body);
 }

@@ -8,9 +8,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
 	"github.com/Silo-Server/silo-server/internal/events"
+	"github.com/redis/go-redis/v9"
 )
 
 const RoomSocketTicketTTL = 30 * time.Second

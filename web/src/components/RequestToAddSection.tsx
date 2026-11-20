@@ -1,5 +1,4 @@
 import { useRef } from "react";
-import { joinList } from "@/lib/appLocale";
 import type { MouseEvent } from "react";
 import { Film, RefreshCw, Tv } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -22,8 +21,7 @@ import { EnterKeyHint } from "@/components/ui/kbd";
 import ViewTransitionLink from "./ViewTransitionLink";
 import { RequestStatusBadge } from "./RequestStatusBadge";
 import RequestResultsGrid, { RequestResultsPager } from "./RequestResultsGrid";
-import { numberText, useT, type Translate } from "@/i18n";
-import { motionScrollBehavior } from "@/hooks/usePrefersReducedMotion";
+import { useT, type Translate } from "@/i18n";
 
 function cardKey(item: Pick<RequestMediaResult, "media_type" | "tmdb_id">): string {
   return `${item.media_type}-${item.tmdb_id}`;
@@ -66,7 +64,7 @@ type RequestToAddSectionCommonProps = {
   libraryResultsKnown?: boolean;
 };
 
-type RequestToAddSectionProps = RequestToAddSectionCommonProps &
+export type RequestToAddSectionProps = RequestToAddSectionCommonProps &
   (
     | { variant: "dialog"; combobox?: RequestSuggestionCombobox }
     | {
@@ -249,14 +247,14 @@ function DialogRow({
       id={optionId}
       role="option"
       aria-selected={isSelected}
-      aria-label={joinList(
-        [
-          item.title,
-          item.year ? numberText(item.year) : null,
-          formatMediaType(item.media_type),
-          state ? formatRequestDisplayState(state) : reasonLabel,
-        ].filter((part): part is string => Boolean(part)),
-      )}
+      aria-label={[
+        item.title,
+        item.year ? String(item.year) : null,
+        formatMediaType(item.media_type),
+        state ? formatRequestDisplayState(state) : reasonLabel,
+      ]
+        .filter(Boolean)
+        .join(", ")}
       data-selected={isSelected || undefined}
       onMouseMove={isSelected ? undefined : onSelect}
       tabIndex={-1}
@@ -334,7 +332,7 @@ function GridVariant({
     // The pager sits below the grid; bring the new page's first row into view.
     const section = sectionRef.current;
     if (section && section.getBoundingClientRect().top < 0) {
-      section.scrollIntoView?.({ block: "start", behavior: motionScrollBehavior() });
+      section.scrollIntoView?.({ block: "start", behavior: "smooth" });
     }
   }
 

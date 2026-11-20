@@ -10,30 +10,17 @@ interface ErrorBoundaryProps {
 
 interface ErrorBoundaryState {
   hasError: boolean;
-  chunkLoadFailed: boolean;
   prevResetKeys: unknown[];
-}
-
-// A route's code failed to download: the browser's failed dynamic import
-// (Chromium and Firefox say "dynamically imported module", Safari "Importing a
-// module script failed") or Vite's preload of the chunk's CSS. React keeps a
-// failed lazy import failed and browsers remember a failed module fetch for the
-// life of the page, so only a reload can recover.
-const CHUNK_LOAD_ERROR =
-  /dynamically imported module|Importing a module script failed|Unable to preload CSS/i;
-
-function isChunkLoadError(error: unknown): boolean {
-  return error instanceof Error && CHUNK_LOAD_ERROR.test(error.message);
 }
 
 class ErrorBoundaryInner extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   constructor(props: ErrorBoundaryProps) {
     super(props);
-    this.state = { hasError: false, chunkLoadFailed: false, prevResetKeys: props.resetKeys ?? [] };
+    this.state = { hasError: false, prevResetKeys: props.resetKeys ?? [] };
   }
 
-  static getDerivedStateFromError(error: unknown): Partial<ErrorBoundaryState> {
-    return { hasError: true, chunkLoadFailed: isChunkLoadError(error) };
+  static getDerivedStateFromError(): Partial<ErrorBoundaryState> {
+    return { hasError: true };
   }
 
   static getDerivedStateFromProps(
@@ -66,28 +53,15 @@ class ErrorBoundaryInner extends Component<ErrorBoundaryProps, ErrorBoundaryStat
 
   override render() {
     if (this.state.hasError) {
-      return (
-        <ErrorFallback
-          onRetry={
-            this.state.chunkLoadFailed ? undefined : () => this.setState({ hasError: false })
-          }
-        />
-      );
+      return <ErrorFallback onRetry={() => this.setState({ hasError: false })} />;
     }
 
     return this.props.children;
   }
 }
 
-const PRIMARY_BUTTON =
-  "bg-primary text-primary-foreground hover:bg-primary/90 rounded-md px-4 py-2";
-const SECONDARY_BUTTON = "border-border hover:bg-muted/40 rounded-md border px-4 py-2";
-
-/**
- * The full-page error screen; a function component so its text follows the language.
- * Without `onRetry` it offers only the reload.
- */
-function ErrorFallback({ onRetry }: { onRetry?: () => void }) {
+/** The full-page error screen; a function component so its text follows the language. */
+function ErrorFallback({ onRetry }: { onRetry: () => void }) {
   const t = useT();
   return (
     <div className="bg-background flex min-h-screen items-center justify-center p-8">
@@ -97,15 +71,17 @@ function ErrorFallback({ onRetry }: { onRetry?: () => void }) {
         </h1>
         <p className="text-muted-foreground mb-6">{t("web.shell.errorBoundary.description")}</p>
         <div className="flex items-center justify-center gap-3">
-          {onRetry && (
-            <button type="button" onClick={onRetry} className={PRIMARY_BUTTON}>
-              {t("common.tryAgain")}
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onRetry}
+            className="bg-primary text-primary-foreground hover:bg-primary/90 rounded-md px-4 py-2"
+          >
+            {t("common.tryAgain")}
+          </button>
           <button
             type="button"
             onClick={() => window.location.reload()}
-            className={onRetry ? SECONDARY_BUTTON : PRIMARY_BUTTON}
+            className="border-border hover:bg-muted/40 rounded-md border px-4 py-2"
           >
             {t("web.shell.errorBoundary.refresh")}
           </button>

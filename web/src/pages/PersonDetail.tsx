@@ -10,7 +10,6 @@ import type { CatalogSearchState } from "@/pages/catalogSearchParams";
 import EditPersonDialog from "@/components/EditPersonDialog";
 import ItemGrid from "@/components/ItemGrid";
 import PageBack from "@/components/PageBack";
-import { loadErrorDescription } from "@/components/loadErrorDescription";
 import PageUnavailable from "@/components/PageUnavailable";
 import { Button } from "@/components/ui/button";
 import { useCatalogWindow } from "@/hooks/queries/catalog";
@@ -127,7 +126,7 @@ export default function PersonDetail() {
       return (
         <PageUnavailable
           title={t("web.person.loadFailedTitle")}
-          description={loadErrorDescription(personError, t("web.person.loadFailedBody"))}
+          description={t("web.person.loadFailedBody")}
           onRetry={() => void refetchPerson()}
           retrying={personFetching}
         />

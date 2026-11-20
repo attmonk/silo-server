@@ -19,7 +19,6 @@ import { useAdminUserDevices } from "@/hooks/queries/admin/userActivity";
 import { useAdminUserCapabilities, useAdminUserSettings } from "@/hooks/queries/admin/users";
 import { useAppLanguage, useT } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
 
 import { userDetailTabSearch } from "../userDetailTabs";
 import { buildPreferenceLevels, type PreferenceLevel } from "./levels";
@@ -126,7 +125,7 @@ export function PreferencesTab({ user }: { user: AdminUser }) {
         >
           <SelectValue />
         </SelectTrigger>
-        <SelectContent className={TOUCH_TARGETS}>
+        <SelectContent>
           {groups.map((group) => (
             <SelectGroup key={group.key}>
               <SelectLabel>{group.title}</SelectLabel>
@@ -169,7 +168,7 @@ export function PreferencesTab({ user }: { user: AdminUser }) {
                   aria-current={active ? "true" : undefined}
                   onClick={() => select(level.id)}
                   className={cn(
-                    "flex w-full items-center gap-2.5 rounded-lg py-1.5 pe-3 text-start text-sm transition-colors max-lg:min-h-11",
+                    "flex w-full items-center gap-2.5 rounded-lg py-1.5 pe-3 text-start text-sm transition-colors",
                     top ? "ps-3" : "ps-7",
                     active
                       ? "bg-accent text-foreground font-medium"

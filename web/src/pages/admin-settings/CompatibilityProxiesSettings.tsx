@@ -41,7 +41,6 @@ const JELLYFIN_ADVANCED_KEYS = [
   "jellyfin_compat.emulated_server_version",
   "jellyfin_compat.session_ttl",
   "jellyfin_compat.playback_session_ttl",
-  "jellyfin_compat.address_stream_grant_enabled",
   "jellyfin_compat.web_version",
   "jellyfin_compat.web_install_dir",
 ];
@@ -245,7 +244,6 @@ export default function CompatibilityProxiesSettings() {
             onChange={setJellyfinAPIEnabled}
             disabled={form.isSaving}
             restartRequired={restartKeys.has("jellyfin_compat.enabled")}
-            managedByEnv={form.envVar("jellyfin_compat.enabled")}
           />
 
           <SettingField
@@ -261,7 +259,6 @@ export default function CompatibilityProxiesSettings() {
               ) : undefined
             }
             restartRequired={restartKeys.has("jellyfin_compat.public_url")}
-            managedByEnv={form.envVar("jellyfin_compat.public_url")}
           />
 
           {status?.last_error && (
@@ -512,7 +509,6 @@ export default function CompatibilityProxiesSettings() {
               value={form.getValue("jellyfin_compat.server_name")}
               onChange={(v) => form.setValue("jellyfin_compat.server_name", v)}
               restartRequired={restartKeys.has("jellyfin_compat.server_name")}
-              managedByEnv={form.envVar("jellyfin_compat.server_name")}
             />
             <SettingFieldRow
               label={t("web.admin.settings.compatibilityProxies.advanced.serverId")}
@@ -554,16 +550,6 @@ export default function CompatibilityProxiesSettings() {
               restartRequired={restartKeys.has("jellyfin_compat.playback_session_ttl")}
             />
             <SettingField
-              label={t("web.admin.settings.compatibilityProxies.advanced.addressStreamGrant")}
-              type="toggle"
-              description={t(
-                "web.admin.settings.compatibilityProxies.advanced.addressStreamGrantDescription",
-              )}
-              value={form.getValue("jellyfin_compat.address_stream_grant_enabled")}
-              onChange={(v) => form.setValue("jellyfin_compat.address_stream_grant_enabled", v)}
-              restartRequired={restartKeys.has("jellyfin_compat.address_stream_grant_enabled")}
-            />
-            <SettingField
               label={t("web.admin.settings.compatibilityProxies.advanced.webVersion")}
               // The effective default (DefaultJellyfinWebVersion) refills an
               // emptied field, and Install sends what the field shows, so
@@ -598,7 +584,6 @@ export default function CompatibilityProxiesSettings() {
             value={form.getValue("audiobookshelf_compat.enabled")}
             onChange={(v) => form.setValue("audiobookshelf_compat.enabled", v)}
             restartRequired={restartKeys.has("audiobookshelf_compat.enabled")}
-            managedByEnv={form.envVar("audiobookshelf_compat.enabled")}
           />
         </FieldGroup>
       </div>

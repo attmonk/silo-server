@@ -23,20 +23,13 @@ import {
   SortableSectionCardRow,
   type EditableSectionViewModel,
 } from "@/components/sections/EditableSectionRows";
-import { useSortableAccessibility } from "@/hooks/useSortableAccessibility";
 import { useT } from "@/i18n";
 import type { RecipeCatalogResponse } from "@/lib/recipes";
-import { useSectionTitle } from "@/lib/sectionTitle";
-import { useMotionScrollBehavior } from "@/hooks/usePrefersReducedMotion";
-import { useMotionSafeOverlay } from "@/hooks/useSortableList";
 
-function toEditableSection(
-  section: SettingsSectionEntry,
-  sectionTitle: (section: SettingsSectionEntry) => string,
-): EditableSectionViewModel {
+function toEditableSection(section: SettingsSectionEntry): EditableSectionViewModel {
   return {
     id: section.id,
-    title: sectionTitle(section),
+    title: section.title,
     sectionType: section.section_type,
     itemLimit: section.item_limit,
     featured: section.featured,
@@ -70,20 +63,11 @@ export function SectionOrderList({
   onDelete?: (section: SettingsSectionEntry) => void;
 }) {
   const t = useT();
-  const sectionTitle = useSectionTitle();
   const [activeId, setActiveId] = useState<string | null>(null);
-  const sortableAccessibility = useSortableAccessibility(
-    sections.map((section) => ({ id: section.id, name: sectionTitle(section) })),
-  );
-  const scrollBehavior = useMotionScrollBehavior();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-      scrollBehavior,
-    }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
-  const overlayMotion = useMotionSafeOverlay();
 
   function handleDragStart(event: DragStartEvent) {
     if (disabled) return;
@@ -107,7 +91,6 @@ export function SectionOrderList({
     <DndContext
       sensors={disabled ? [] : sensors}
       collisionDetection={closestCenter}
-      accessibility={sortableAccessibility}
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
       onDragCancel={() => setActiveId(null)}
@@ -117,7 +100,7 @@ export function SectionOrderList({
           {sections.map((section) => (
             <SortableSectionCardRow
               key={section.id}
-              section={toEditableSection(section, sectionTitle)}
+              section={toEditableSection(section)}
               catalog={catalog}
               onToggleHidden={() => onToggleHidden(section)}
               onEdit={onEdit ? () => onEdit(section) : undefined}
@@ -132,12 +115,9 @@ export function SectionOrderList({
           )}
         </div>
       </SortableContext>
-      <DragOverlay {...overlayMotion}>
+      <DragOverlay>
         {activeSection ? (
-          <SectionDragOverlay
-            section={toEditableSection(activeSection, sectionTitle)}
-            catalog={catalog}
-          />
+          <SectionDragOverlay section={toEditableSection(activeSection)} catalog={catalog} />
         ) : null}
       </DragOverlay>
     </DndContext>

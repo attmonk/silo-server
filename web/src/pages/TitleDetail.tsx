@@ -1,7 +1,6 @@
 import { Navigate, useParams } from "react-router";
 import type { RequestMediaType } from "@/api/types";
 import { isNotFoundProblem } from "@/api/v2/request";
-import { loadErrorDescription } from "@/components/loadErrorDescription";
 import PageUnavailable from "@/components/PageUnavailable";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useRequestMediaDetail } from "@/hooks/queries/useRequests";
@@ -56,7 +55,7 @@ function TitlePage({ mediaType, tmdbID }: { mediaType: RequestMediaType; tmdbID:
     return (
       <PageUnavailable
         title={t("web.detail.page.titleLoadFailed")}
-        description={loadErrorDescription(detail.error, t("web.detail.page.loadFailedBody"))}
+        description={t("web.detail.page.loadFailedBody")}
         onRetry={() => void detail.refetch()}
         retrying={detail.isFetching}
       />

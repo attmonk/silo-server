@@ -36,8 +36,8 @@ func (s *MetadataService) SetFallbackLanguage(language string) {
 	s.fallbackLanguage.Store(baseMetadataLanguage(language))
 }
 
-// FallbackLanguage is metadata.fallback_language, empty when off.
-func (s *MetadataService) FallbackLanguage() string {
+// configuredFallbackLanguage is metadata.fallback_language, empty when off.
+func (s *MetadataService) configuredFallbackLanguage() string {
 	language, _ := s.fallbackLanguage.Load().(string)
 	return language
 }
@@ -45,7 +45,7 @@ func (s *MetadataService) FallbackLanguage() string {
 // fallbackLanguageFor is the language a refresh in requested fetches gaps in,
 // or empty when the fallback is off or is the requested language itself.
 func (s *MetadataService) fallbackLanguageFor(requested string) string {
-	fallback := s.FallbackLanguage()
+	fallback := s.configuredFallbackLanguage()
 	requested = baseMetadataLanguage(requested)
 	if fallback == "" || requested == "" || fallback == requested {
 		return ""
@@ -284,9 +284,7 @@ func (f *fallbackText) fetchedChildGaps(seasonGaps []SeasonResult, episodeGaps [
 // fetchFallbackText fetches, in the fallback language, the text this refresh
 // is missing in req.Language. It returns nil when there is nothing to fetch:
 // the fallback is off, nothing is missing, or the write will not reach the
-// base row. Fetch failures only leave gaps unfilled, except in a Reset to
-// Provider, which empties the text a failed fetch would have filled: there a
-// lookup that didn't answer (resetProviderFailure) fails the reset.
+// base row. Fetch failures only leave gaps unfilled.
 func (s *MetadataService) fetchFallbackText(
 	ctx context.Context,
 	req ProcessRequest,
@@ -296,16 +294,16 @@ func (s *MetadataService) fetchFallbackText(
 	seasons []SeasonResult,
 	episodes []EpisodeResult,
 	sources fallbackSources,
-) (*fallbackText, error) {
+) *fallbackText {
 	language := s.fallbackLanguageFor(req.Language)
 	if language == "" || req.writesFieldsOnly() || item == nil {
-		return nil, nil
+		return nil
 	}
 	titleMissing := itemTitleMissing(item, req.Language)
 	overviewMissing := textMissing(item.Overview, item.OverviewLanguage, req.Language)
 	seasonGaps, episodeGaps := childGaps(seasons, episodes, req.Language)
 	if !titleMissing && !overviewMissing && len(seasonGaps) == 0 && len(episodeGaps) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	var existing *models.MediaItem
@@ -315,17 +313,12 @@ func (s *MetadataService) fetchFallbackText(
 		if err != nil {
 			// Persistence loads it again and decides; without it the gaps
 			// cannot be measured against stored text.
-			return nil, nil
+			return nil
 		}
 		existing, locked = stored, intSliceToFields(stored.LockedFields)
-		// A Reset to Provider drops the locks in its write (mergeAndPersist),
-		// so a locked field is a gap to fill like any other.
-		if req.resetToProvider {
-			locked = nil
-		}
 	}
 	if _, canonical := canonicalMetadataLanguage(req, existing, locked); !canonical {
-		return nil, nil
+		return nil
 	}
 
 	fetched := &fallbackText{
@@ -352,28 +345,21 @@ func (s *MetadataService) fetchFallbackText(
 	if !itemGap && !seasonGap && len(episodeSeasons) == 0 {
 		// Nothing to fetch; the policy may still keep stored text over
 		// original-language text.
-		return fetched, nil
+		return fetched
 	}
 
 	fetchCtx, cancel := fallbackFetchContext(ctx)
 	defer cancel()
-	var err error
 	if itemGap {
-		if fetched.item, err = fetchFallbackItem(fetchCtx, sources.item, providerIDs, contentType, language, req.resetToProvider); err != nil {
-			return nil, err
-		}
+		fetched.item = fetchFallbackItem(fetchCtx, sources.item, providerIDs, contentType, language)
 	}
 	if seasonGap {
-		if fetched.seasons, err = fetchFallbackSeasons(fetchCtx, sources.season, providerIDs, contentType, language, req.resetToProvider); err != nil {
-			return nil, err
-		}
+		fetched.seasons = fetchFallbackSeasons(fetchCtx, sources.season, providerIDs, contentType, language)
 	}
 	if len(episodeSeasons) > 0 {
-		if fetched.episodes, err = fetchFallbackEpisodes(fetchCtx, sources.episode, providerIDs, language, episodeSeasons, req.resetToProvider); err != nil {
-			return nil, err
-		}
+		fetched.episodes = fetchFallbackEpisodes(fetchCtx, sources.episode, providerIDs, language, episodeSeasons)
 	}
-	return fetched, nil
+	return fetched
 }
 
 // fallbackFetchContext bounds the fallback fetches of one refresh to
@@ -446,9 +432,7 @@ func logFallbackFetchError(ctx context.Context, p Provider, language, what strin
 		"error", logredact.RedactSecretAssignments(logredact.SanitizeURLError(err).Error()))
 }
 
-// fetchFallbackItem fails only for a Reset to Provider (resetProviderFailure);
-// otherwise a failed fetch leaves its gaps unfilled.
-func fetchFallbackItem(ctx context.Context, chain []Provider, providerIDs map[string]string, contentType, language string, reset bool) (*MetadataResult, error) {
+func fetchFallbackItem(ctx context.Context, chain []Provider, providerIDs map[string]string, contentType, language string) *MetadataResult {
 	out := &MetadataResult{}
 	for _, p := range remoteTextProviders(chain) {
 		mp, ok := p.(MetadataProvider)
@@ -457,9 +441,6 @@ func fetchFallbackItem(ctx context.Context, chain []Provider, providerIDs map[st
 		}
 		result, err := mp.GetMetadata(ctx, MetadataRequest{ProviderIDs: providerIDs, ContentType: contentType, Language: language})
 		if err != nil {
-			if failure := resetProviderFailure(reset, p, language+" fallback metadata", err); failure != nil {
-				return nil, failure
-			}
 			logFallbackFetchError(ctx, p, language, "item", err)
 			continue
 		}
@@ -482,10 +463,10 @@ func fetchFallbackItem(ctx context.Context, chain []Provider, providerIDs map[st
 			break
 		}
 	}
-	return out, nil
+	return out
 }
 
-func fetchFallbackSeasons(ctx context.Context, chain []Provider, providerIDs map[string]string, contentType, language string, reset bool) (map[int]SeasonResult, error) {
+func fetchFallbackSeasons(ctx context.Context, chain []Provider, providerIDs map[string]string, contentType, language string) map[int]SeasonResult {
 	out := make(map[int]SeasonResult)
 	for _, p := range remoteTextProviders(chain) {
 		ep, ok := p.(EpisodeProvider)
@@ -494,15 +475,12 @@ func fetchFallbackSeasons(ctx context.Context, chain []Provider, providerIDs map
 		}
 		seasons, err := ep.GetSeasons(ctx, SeasonsRequest{ProviderIDs: providerIDs, ContentType: contentType, Language: language})
 		if err != nil {
-			if failure := resetProviderFailure(reset, p, language+" fallback seasons", err); failure != nil {
-				return nil, failure
-			}
 			logFallbackFetchError(ctx, p, language, "seasons", err)
 			continue
 		}
 		collectFallbackSeasons(out, seasons, language)
 	}
-	return out, nil
+	return out
 }
 
 // collectFallbackSeasons keeps, per season, the first title and overview in
@@ -520,7 +498,7 @@ func collectFallbackSeasons(out map[int]SeasonResult, seasons []SeasonResult, la
 	}
 }
 
-func fetchFallbackEpisodes(ctx context.Context, chain []Provider, providerIDs map[string]string, language string, seasonNumbers []int, reset bool) (map[episodeResultKey]EpisodeResult, error) {
+func fetchFallbackEpisodes(ctx context.Context, chain []Provider, providerIDs map[string]string, language string, seasonNumbers []int) map[episodeResultKey]EpisodeResult {
 	out := make(map[episodeResultKey]EpisodeResult)
 	for _, seasonNumber := range seasonNumbers {
 		for _, p := range remoteTextProviders(chain) {
@@ -530,16 +508,13 @@ func fetchFallbackEpisodes(ctx context.Context, chain []Provider, providerIDs ma
 			}
 			episodes, err := ep.GetEpisodes(ctx, EpisodesRequest{ProviderIDs: providerIDs, SeasonNumber: seasonNumber, Language: language})
 			if err != nil {
-				if failure := resetProviderFailure(reset, p, language+" fallback episodes", err); failure != nil {
-					return nil, failure
-				}
 				logFallbackFetchError(ctx, p, language, "episodes", err)
 				continue
 			}
 			collectFallbackEpisodes(out, episodes, language)
 		}
 	}
-	return out, nil
+	return out
 }
 
 // collectFallbackEpisodes keeps, per episode, the first title and overview in
@@ -561,10 +536,7 @@ func collectFallbackEpisodes(out map[episodeResultKey]EpisodeResult, episodes []
 // fillTargetChildText fills the gaps a targeted season or episode refresh in
 // its series' base language left, fetching the same target in the fallback
 // language. It reads only remote providers: the local sidecar provider has no
-// other language. A Reset to Provider calls it before it empties its target,
-// so a fallback lookup that didn't answer fails the reset with the target
-// unchanged, and the target's stored text, which the reset replaces, is never
-// kept over the fetched or original-language text.
+// other language.
 func (s *MetadataService) fillTargetChildText(
 	ctx context.Context,
 	series *models.MediaItem,
@@ -577,53 +549,36 @@ func (s *MetadataService) fillTargetChildText(
 	episodes []EpisodeResult,
 	mode RefreshMode,
 	mergeMode MergeMode,
-	reset *childReset,
-) error {
+) {
 	fallback := s.fallbackLanguageFor(language)
 	if fallback == "" {
-		return nil
+		return
 	}
 	seasonGaps, episodeGaps := childGaps(seasons, episodes, language)
 	if len(seasonGaps) == 0 && len(episodeGaps) == 0 {
-		return nil
+		return
 	}
 	fetched := &fallbackText{
 		language: fallback, policy: fallbackPolicyFor(mode),
 		fillEmpty: mergeMode == MergeFillEmpty, childrenOf: series.ContentID,
 	}
 	fetched.storedSeasons, fetched.storedEpisodes = s.storedChildren(ctx, series.ContentID, seasonGaps, episodeGaps)
-	if reset != nil {
-		if reset.episode {
-			delete(fetched.storedEpisodes, episodeResultKey{seasonNumber: seasonNumber, episodeNumber: episodeNumber})
-		} else {
-			delete(fetched.storedSeasons, seasonNumber)
-		}
-	}
 	seasonGap, episodeSeasons := fetched.fetchedChildGaps(seasonGaps, episodeGaps, language)
 	fetchCtx, cancel := fallbackFetchContext(ctx)
 	defer cancel()
 	if seasonGap {
-		found, _, _, err := s.fetchTargetSeasonResults(fetchCtx, providerIDs, folderID, fallback, seasonNumber, childCtx, true, reset != nil)
-		switch {
-		case err == nil:
+		if found, _, _, err := s.fetchTargetSeasonResults(fetchCtx, providerIDs, folderID, fallback, seasonNumber, childCtx, true); err == nil {
 			fetched.seasons = make(map[int]SeasonResult)
 			collectFallbackSeasons(fetched.seasons, found, fallback)
-		case reset != nil:
-			return err
 		}
 	}
 	if len(episodeSeasons) > 0 {
-		found, _, err := s.fetchTargetEpisodeResults(fetchCtx, providerIDs, folderID, fallback, seasonNumber, episodeNumber, childCtx, true, reset != nil)
-		switch {
-		case err == nil:
+		if found, _, err := s.fetchTargetEpisodeResults(fetchCtx, providerIDs, folderID, fallback, seasonNumber, episodeNumber, childCtx, true); err == nil {
 			fetched.episodes = make(map[episodeResultKey]EpisodeResult)
 			collectFallbackEpisodes(fetched.episodes, found, fallback)
-		case reset != nil:
-			return err
 		}
 	}
 	fetched.applyToChildren(seasons, episodes, language, series.ContentID)
-	return nil
 }
 
 // applyToItem fills the item's gaps with fallback text. When the policy keeps

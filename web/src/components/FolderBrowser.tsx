@@ -16,7 +16,6 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import PathAutocompleteInput from "@/components/PathAutocompleteInput";
 import { useT, type MessageKey } from "@/i18n";
-import { isImeComposing } from "@/lib/imeComposition";
 
 interface FolderBrowserProps {
   open: boolean;
@@ -175,7 +174,6 @@ export default function FolderBrowser({
               }}
               placeholder={PATH_PLACEHOLDER}
               onKeyDown={(event) => {
-                if (isImeComposing(event)) return;
                 if (event.key === "Enter") {
                   event.preventDefault();
                   void handleBrowseSubmit();
@@ -217,13 +215,7 @@ export default function FolderBrowser({
                   <ArrowUp className="me-1 h-3.5 w-3.5" />
                   {t("web.admin.common.folderBrowser.up")}
                 </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  aria-label={t("web.admin.activity.page.refresh")}
-                  onClick={() => refetch()}
-                >
+                <Button type="button" variant="ghost" size="icon" onClick={() => refetch()}>
                   <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? "animate-spin" : ""}`} />
                 </Button>
               </div>

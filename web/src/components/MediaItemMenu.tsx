@@ -194,7 +194,7 @@ function isInProgressVideo(mediaType: MediaItemType, hasResumePosition: boolean)
   return (mediaType === "movie" || mediaType === "episode") && hasResumePosition;
 }
 
-function buildMediaItemMenuModel({
+export function buildMediaItemMenuModel({
   mediaType,
   userState,
   hasPartialProgress = false,
@@ -304,7 +304,7 @@ function buildMediaItemMenuModel({
         label: t("web.item.menu.refreshMetadata"),
       });
 
-      if (mediaType === "movie" || mediaType === "series" || mediaType === "audiobook") {
+      if (mediaType === "movie" || mediaType === "series") {
         entries.push(
           {
             kind: "action",

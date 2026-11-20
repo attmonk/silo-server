@@ -21,7 +21,7 @@ env:
   # commit. Built from source below rather than downloaded: a released binary
   # refuses to run against a Go version newer than the one it was built with,
   # and go.mod tracks Go closely enough that this repo is regularly ahead.
-  GOLANGCI_LINT_VERSION: v2.15.0
+  GOLANGCI_LINT_VERSION: v2.12.2
 
 
 jobs:
@@ -224,14 +224,11 @@ jobs:
           sparse-checkout-cone-mode: false
           persist-credentials: false
       # The checker uses only the standard library, so it needs a toolchain
-      # but no module cache. The version comes from the checkout's go.mod so
-      # that a branch raising the Go version still gets a toolchain: setup-go
-      # turns toolchain switching off, and a range pinned here would come from
-      # main.
+      # but no module cache.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: '>=1.26 <1.27'
           cache: false
       # Equivalent to make verify-case-collisions with main's checker. It
       # lists the files tracked in the PR checkout; .ci-tools is untracked.
@@ -638,9 +635,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: &no-assets
-          # Fetch small files in the first pack. Checkout then requests only
-          # the remaining large files it needs, excluding the source artwork.
-          filter: blob:limit=1m
+          filter: blob:none
           sparse-checkout: |
             /*
             !/web/assets-source/
@@ -684,7 +679,7 @@ jobs:
         run: |
           : "${SILO_TEST_DATABASE_URL:?A disposable PG17 database is required}"
           for package in migrations internal/historyimport internal/api/handlers; do
-            (cd "$package" && "$RUNNER_TEMP/race/${package##*/}.test" -test.run='^(TestHistoryImportCancellation.*|TestQueue.*|TestHistoryImportProfileAuthorizationDB)$' -test.count=1 -test.timeout=10m)
+            (cd "$package" && "$RUNNER_TEMP/race/${package##*/}.test" -test.run='^(TestHistoryImportCancellation.*|TestQueue.*|TestHistoryImportV1ProfileAuthorization)$' -test.count=1 -test.timeout=10m)
           done
 
       # 20260925144545 moves marker claims between rows that share a payload
@@ -900,7 +895,7 @@ jobs:
       # a database that already holds a break-glass account.
       - name: Test external sign-in against Postgres
         run: |
-          (cd internal/api/handlers && "$RUNNER_TEMP/race/handlers.test" -test.run='^(TestLocalLoginSettingRequiresBreakGlassDB|TestDeviceApprovalInheritsSessionProviderChainDB|TestExternalSignInAdminIdentityGuardsDB)$' -test.count=1 -test.timeout=10m)
+          (cd internal/api/handlers && "$RUNNER_TEMP/race/handlers.test" -test.run='^(TestLocalLoginSettingRequiresBreakGlassDB|TestV1AdminUserChangesKeepBreakGlassDB|TestDeviceApprovalInheritsSessionProviderChainDB|TestExternalSignInAdminIdentityGuardsDB)$' -test.count=1 -test.timeout=10m)
           (cd internal/auth && "$RUNNER_TEMP/race/auth.test" -test.run='^(TestExternalSignIn|TestProviderRecheck|TestPGOAuthStore|TestOAuthNativeFlowAcrossNodes|TestOAuthNativeStartOrigin|TestOAuthWebFlowBrowserBinding|TestOAuthUnredeemedCode|TestOAuthLinkFlow|TestOAuthForcedLink|TestLinkCredentialsIdentity|TestNetworkSignIn|TestNetworkIdentity|TestLinkNetworkIdentity|TestLocalPasswordPolicy|TestPasswordLoginRouting|TestIdentityService|TestConcurrentFirstSignInCreatesOneAccount|TestEnableAccountLocalLogin|TestSignupRefusedWhileLocalLoginIsOff|TestSignupRechecksLocalPolicyBeforeSpendingInvite).*DB$' -test.count=1 -test.timeout=10m)
           (cd internal/jellycompat && "$RUNNER_TEMP/race/jellycompat.test" -test.run='^TestLoginPINConventionStaysLocalDB$' -test.count=1 -test.timeout=10m)
           (cd internal/plugins && "$RUNNER_TEMP/race/plugins.test" -test.run='^TestUpsertAuthBindingAllows(OneEnabledProvider|NetworkProviderBesidePrimary)$' -test.count=1 -test.timeout=10m)
@@ -988,15 +983,7 @@ jobs:
 
       - name: Audit the pinned dependency lockfile
         if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref_name == 'main')
-        run: |
-          pnpm audit --prod --audit-level=high
-          # Picomatch is used by development tools, and npm has no patched release.
-          # Remove this exception once the lockfile uses a fixed version.
-          audit_dir=$(mktemp -d)
-          trap 'rm -rf "$audit_dir"' EXIT
-          cp pnpm-lock.yaml "$audit_dir/"
-          jq '.pnpm.auditConfig.ignoreGhsas += ["GHSA-fc5q-39xc-vjpf"]' package.json > "$audit_dir/package.json"
-          pnpm --dir "$audit_dir" audit --audit-level=high
+        run: pnpm audit --audit-level=high
       # - name: Check JSX accessibility
       #   run: pnpm exec eslint . --config eslint-a11y.config.js
       # Not measured; needs a prototype grounded in rendered tests.
@@ -1033,13 +1020,12 @@ jobs:
 
       # The generated web binding is compared after prettier, so this half of
       # the bindings check lives here rather than in a Go job, which has no
-      # pnpm. It needs Go to run the generator, at the version the checkout's
-      # go.mod asks for.
+      # pnpm. It needs Go to run the generator.
       - name: Set up Go
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: '>=1.26 <1.27'
           cache: ${{ runner.environment == 'github-hosted' }}
 
       - name: Verify the generated web settings binding is current

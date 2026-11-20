@@ -14,13 +14,13 @@
   <a href="https://github.com/Silo-Server/silo-server/releases"><img alt="Latest GitHub release" src="https://img.shields.io/github/v/release/Silo-Server/silo-server?include_prereleases&amp;sort=semver&amp;display_name=tag&amp;style=flat-square&amp;label=release"></a>
   <a href="https://github.com/orgs/Silo-Server/packages/container/package/silo-server"><img alt="Container image on GHCR" src="https://img.shields.io/badge/container-GHCR-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
   <a href="https://github.com/Silo-Server/silo-server/actions/workflows/ci.yml"><img alt="Continuous integration" src="https://img.shields.io/github/actions/workflow/status/Silo-Server/silo-server/ci.yml?branch=main&amp;style=flat-square&amp;label=CI"></a>
-  <img alt="Go 1.27" src="https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&amp;logo=go&amp;logoColor=white">
+  <img alt="Go 1.26" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&amp;logo=go&amp;logoColor=white">
   <img alt="React 19" src="https://img.shields.io/badge/React-19-149ECA?style=flat-square&amp;logo=react&amp;logoColor=white">
   <a href="LICENSE"><img alt="AGPL-3.0-or-later license" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-555555?style=flat-square"></a>
 </p>
 
 <p align="center">
-  <a href="#build-attmonk-server">Build ATTMonk Server</a>
+  <a href="#attmonk-server-builds">Build ATTMonk Server</a>
   · <a href="https://siloserver.org/docs">Documentation</a>
   · <a href="docs/release-versioning.md">Builds &amp; releases</a>
   · <a href="https://discord.gg/siloserver">Discord</a>
@@ -31,7 +31,7 @@
 ---
 
 > [!WARNING]
-> ATTMonk Server is pre-release. APIs, configuration, and database migrations may change
+> Silo is pre-release. APIs, configuration, and database migrations may change
 > before the first stable release. Back up your deployment before updating.
 
 ## 1.0 release scope
@@ -79,16 +79,15 @@ Existing library data is preserved when upgrading.
     </td>
     <td width="33%" valign="top">
       <strong>Scale</strong><br><br>
-      Start with one integrated server; add transcode nodes that need only its
-      URL and a key, or proxy nodes that share its PostgreSQL and Redis, when
-      you need to.
+      Start with one integrated server; split proxy and transcode roles across
+      shared PostgreSQL and Redis when you need to.
     </td>
   </tr>
 </table>
 
 ## ATTMonk Server web premiere reminders
 
-ATTMonk Server adds metadata-driven reminders with IPTV channel shortcuts to the web
+This fork adds metadata-driven reminders with IPTV channel shortcuts to the web
 calendar and series/episode details. It requires a compatible Dispatcharr, XC,
 or HDHomeRun adapter advertising an optional channel `watchPath`.
 
@@ -109,26 +108,17 @@ Mappings, preferences, and notification receipts use the server's existing
 PostgreSQL database and its normal startup migration. The new controls are
 web-only. Older plugins keep working without shortcuts, and the updated adapters
 retain ordinary guide/playback compatibility with servers lacking this extension.
-See [the premiere API and delivery rules](docs/notifications-api.md#metadata-premiere-reminders-attmonk-server-extension)
+See [the premiere API and delivery rules](docs/notifications-api.md#metadata-premiere-reminders-attmonk-extension)
 for profile scope, timing, deduplication, and capability discovery.
 
 
-## Build ATTMonk Server
+## ATTMonk Server builds
 
-The deployed build is maintained on [`feat/web-premiere-deploy`](https://github.com/attmonk/silo-server/tree/feat/web-premiere-deploy);
-`main` tracks upstream integration and can differ from the deployed fork.
-
-The product name is ATTMonk Server; repository, executable, API and plugin IDs
-retain their Silo-compatible names. Build from this fork with the root Dockerfile
-for an existing PostgreSQL/Redis deployment.
-
-The fork publishes `ghcr.io/attmonk/attmonk-server`. `server` is the standalone
-server for existing PostgreSQL/Redis deployments; `latest` bundles PostgreSQL and
-Redis. Immutable tags are `<commit>-base` for the standalone server and `<commit>`
-for the bundled image. CI publishes from `feat/web-premiere-deploy` after its
-checks pass. Do not use the bundled image as a drop-in for the standalone server.
-
-To build the bundled image:
+The deployed ATTMonk Server build is maintained on
+[`feat/web-premiere-deploy`](https://github.com/attmonk/silo-server/tree/feat/web-premiere-deploy).
+`main` tracks upstream integration and can differ from the deployed fork. The
+product name is ATTMonk Server; repository, executable, protocol, and plugin IDs
+retain their existing Silo-compatible identities.
 
 ```sh
 git clone --branch feat/web-premiere-deploy https://github.com/attmonk/silo-server.git
@@ -137,12 +127,13 @@ docker build -t attmonk-server:base .
 docker build -f omnibus/Dockerfile --build-arg SILO_IMAGE=attmonk-server:base -t attmonk-server:local .
 ```
 
-See [ATTMonk Server branding and compatibility](docs/attmonk-server.md).
+Use the root image with an existing PostgreSQL/Redis stack, or the bundled image
+with the documented omnibus configuration. See [branding and compatibility](docs/attmonk-server.md).
 
 ## Upstream installation reference
 
 The following is the upstream Silo installation reference. For ATTMonk Server,
-build this fork and choose that image in your deployment configuration.
+build the deployment branch above and select that image in your configuration.
 
 Requires Docker Compose 2.24 or newer. The default Compose file runs the
 omnibus image: Silo with a bundled PostgreSQL (with pgvector) and Redis, plus
@@ -164,9 +155,9 @@ docker compose up -d
 
 Open <http://localhost:8090> and complete onboarding.
 
-Hardware transcoding (VA-API or NVIDIA) and PostgreSQL and Redis access for
-proxy nodes on other hosts are commented out in `docker-compose.yml`; uncomment
-the lines you need. Transcode nodes reach the server on its web port.
+Hardware transcoding (VA-API or NVIDIA) and access for proxy or transcode
+nodes on other hosts are commented out in `docker-compose.yml`; uncomment the
+lines you need.
 
 ### Updating an install from before the omnibus image
 
@@ -216,25 +207,44 @@ implement and review changes through our own workflow, and pull request volume
 has outgrown what we can review carefully, so a good issue usually helps us
 more than a pull request.
 
+Feature ideas go in
+[Discussions → Ideas](https://github.com/Silo-Server/silo-server/discussions/categories/ideas),
+not issues.
+
 Pull requests are still welcome from contributors who've had one merged in a
-Silo repository, or when a maintainer asks for one. We close other pull
-requests without review. [CONTRIBUTING.md](CONTRIBUTING.md) explains what makes
-an issue useful.
+Silo repository, or when a maintainer asks for one; a feature pull request also
+needs an issue in this repository that a maintainer has labeled `accepted`.
+Other pull requests are closed automatically without review; when a maintainer
+asked for one, they reopen it. [CONTRIBUTING.md](CONTRIBUTING.md) explains what
+makes an issue useful.
 
 ## Supporting Silo
 
-Silo is developed in spare time and funded out of pocket, and will stay free and
-open source. [GitHub Sponsors](https://github.com/sponsors/quick104) covers AI
-development tooling (Claude, Codex), push-notification relay infrastructure, and
-future project costs. Bug reports, code, and documentation help just as much.
+Silo is free and open source, and it will stay that way. It's built in spare
+time and paid for out of pocket.
 
-Code review is supported by [Macroscope](https://macroscope.com) through its
-open source program.
+<p align="center">
+  <a href="https://github.com/sponsors/quick104"><img alt="Sponsor Silo on GitHub" src="https://img.shields.io/badge/sponsor-GitHub%20Sponsors-EA4AAA?style=for-the-badge&amp;logo=githubsponsors&amp;logoColor=white"></a>
+</p>
 
-<p>
+Sponsorship pays for AI development tooling (Claude, Codex), the
+push-notification relay, and future project costs. You can help just as much
+without spending anything:
+
+- **Report bugs** with steps to reproduce on
+  [GitHub Issues](https://github.com/Silo-Server/silo-server/issues).
+- **Help other users** on [Discord](https://discord.gg/siloserver).
+- **Improve the docs** at [siloserver.org](https://siloserver.org/docs).
+- **Contribute code** by following [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Sponsors
+
+<p align="center">
   <a href="https://macroscope.com">
     <img alt="Sponsored by Macroscope" src="assets/macroscope-banner.png" width="400">
   </a>
+  <br>
+  <sub>Code review is supported by <a href="https://macroscope.com">Macroscope</a> through its open source program.</sub>
 </p>
 
 ## License and trademarks

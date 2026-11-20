@@ -90,7 +90,12 @@ func scopeMutation(scope string, library *int) sectionMutation {
 func referencesOf(sections []*PageSection) []string {
 	ids := []string{}
 	for _, section := range sections {
-		ids = append(ids, LibraryCollectionIDsOf(section.Config)...)
+		var cfg struct {
+			ID string `json:"library_collection_id"`
+		}
+		if json.Unmarshal(section.Config, &cfg) == nil && cfg.ID != "" {
+			ids = append(ids, cfg.ID)
+		}
 	}
 	return ids
 }
@@ -304,6 +309,14 @@ func (r *Repository) RenameLibraryCollectionRows(ctx context.Context, collection
 			SectionCollection, collectionID, oldTitle, newTitle)
 		return err
 	})
+}
+func (r *Repository) Reorder(ctx context.Context, entries []ReorderEntry) error {
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.ID)
+	}
+	m := sectionMutation{where: "id=ANY($1)", args: []any{ids}}
+	return r.mutate(ctx, m, func(ctx context.Context) error { return r.reorder(ctx, entries) })
 }
 func (r *Repository) ReorderScopeIfRevision(ctx context.Context, scope string, library *int, ids []string, expected int64) error {
 	m := scopeMutation(scope, library)

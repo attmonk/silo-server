@@ -16,7 +16,6 @@ import type {
 } from "@/api/types";
 import { webhookSyncKeys } from "./keys";
 import { toast } from "sonner";
-import { v2ErrorText } from "@/api/v2/request";
 import { t } from "@/i18n";
 
 export function useWebhookSyncConnections() {
@@ -40,7 +39,9 @@ export function useCreateWebhookSyncConnection() {
       });
     },
     onError: (err) => {
-      toast.error(v2ErrorText(err, t("web.common.toast.webhookSync.createFailed")));
+      toast.error(
+        err instanceof Error ? err.message : t("web.common.toast.webhookSync.createFailed"),
+      );
     },
   });
 }
@@ -64,7 +65,9 @@ export function useUpdateWebhookSyncConnection() {
       });
     },
     onError: (err) => {
-      toast.error(v2ErrorText(err, t("web.common.toast.webhookSync.updateFailed")));
+      toast.error(
+        err instanceof Error ? err.message : t("web.common.toast.webhookSync.updateFailed"),
+      );
     },
   });
 }
@@ -79,7 +82,9 @@ export function useDeleteWebhookSyncConnection() {
       queryClient.invalidateQueries({ queryKey: webhookSyncKeys.connections() });
     },
     onError: (err) => {
-      toast.error(v2ErrorText(err, t("web.common.toast.webhookSync.deleteFailed")));
+      toast.error(
+        err instanceof Error ? err.message : t("web.common.toast.webhookSync.deleteFailed"),
+      );
     },
   });
 }
@@ -95,7 +100,9 @@ export function useRotateWebhookSyncWebhook() {
       queryClient.invalidateQueries({ queryKey: webhookSyncKeys.connection(connectionId) });
     },
     onError: (err) => {
-      toast.error(v2ErrorText(err, t("web.common.toast.webhookSync.rotateFailed")));
+      toast.error(
+        err instanceof Error ? err.message : t("web.common.toast.webhookSync.rotateFailed"),
+      );
     },
   });
 }
@@ -138,7 +145,9 @@ export function useUpdateWebhookSyncProfileMappings() {
       queryClient.invalidateQueries({ queryKey: webhookSyncKeys.connections() });
     },
     onError: (err) => {
-      toast.error(v2ErrorText(err, t("web.common.toast.webhookSync.mappingsSaveFailed")));
+      toast.error(
+        err instanceof Error ? err.message : t("web.common.toast.webhookSync.mappingsSaveFailed"),
+      );
     },
   });
 }

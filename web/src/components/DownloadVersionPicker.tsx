@@ -21,8 +21,6 @@ interface DownloadVersionPickerProps {
   versions: FileVersion[];
   title?: string;
   summaryBuilder?: (version: FileVersion) => string;
-  /** The versions are one presentation's parts in play order; list them as given. */
-  partsInOrder?: boolean;
 }
 
 export default function DownloadVersionPicker({
@@ -31,10 +29,9 @@ export default function DownloadVersionPicker({
   versions,
   title,
   summaryBuilder,
-  partsInOrder = false,
 }: DownloadVersionPickerProps) {
   const t = useT();
-  const sorted = partsInOrder ? versions : sortByResolution(versions);
+  const sorted = sortByResolution(versions);
   const [downloading, setDownloading] = useState<number | null>(null);
 
   const active = useRef<symbol | null>(null);

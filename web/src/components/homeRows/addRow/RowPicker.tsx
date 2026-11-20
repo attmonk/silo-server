@@ -6,7 +6,6 @@ import { cn } from "@/lib/utils";
 import { PickerRail } from "./PickerRail";
 import { groupPanelId, groupTabId } from "./pickerIds";
 import { RowCard } from "./RowCard";
-import { motionScrollBehavior } from "@/hooks/usePrefersReducedMotion";
 
 /** Ignore scroll-spy updates this long after a tab click starts a smooth scroll. */
 const TAB_SCROLL_LOCK_MS = 700;
@@ -45,7 +44,7 @@ export function RowPicker({
     lockedUntil.current = Date.now() + TAB_SCROLL_LOCK_MS;
     document
       .getElementById(groupPanelId(baseId, group))
-      ?.scrollIntoView?.({ block: "start", behavior: motionScrollBehavior() });
+      ?.scrollIntoView?.({ block: "start", behavior: "smooth" });
   }
 
   function followScroll() {

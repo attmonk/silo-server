@@ -30,6 +30,15 @@ func BuildNotificationDisplay(row DeliveryRow) NotificationDisplay {
 		URL:        "/notifications",
 	}
 	switch row.Type {
+	case DeliveryTypeIncoming, DeliveryTypePremiere:
+		flags := incomingFlags(row)
+		display.Title = flags.Title
+		display.Body = truncateDisplayText(flags.Message, displayBodyMaxLen)
+		display.ThreadID = "external:" + flags.Source
+		display.Category = "external_notification"
+		if flags.URL != "" && validIncomingURL(flags.URL) {
+			display.URL = flags.URL
+		}
 	case DeliveryTypeEpisodeAvailable:
 		display.Category = "episode_available"
 		display.Title = episodeDisplayTitle(row)
@@ -60,17 +69,6 @@ func BuildNotificationDisplay(row DeliveryRow) NotificationDisplay {
 		if row.SeriesID != nil && *row.SeriesID != "" {
 			display.URL = "/item/" + *row.SeriesID
 		}
-	case DeliveryTypeWatchlistAvailable:
-		display.Category = "watchlist_available"
-		display.Title = watchlistTitleAvailable
-		display.Body = "A title on your watchlist has arrived in the library."
-		if row.SeriesTitle != "" {
-			display.Title = row.SeriesTitle + " is now available"
-		}
-		if row.SeriesID != nil && *row.SeriesID != "" {
-			display.ThreadID = "item:" + *row.SeriesID
-			display.URL = "/item/" + *row.SeriesID
-		}
 	case DeliveryTypeRequestApproved:
 		flags := parseRequestFlags(row.ReasonFlags)
 		display.Category = "request_approved"
@@ -97,12 +95,6 @@ func BuildNotificationDisplay(row DeliveryRow) NotificationDisplay {
 	case DeliveryTypeWebhookAutoDisabled:
 		display.Category = "webhook_auto_disabled"
 		display.Title = "A webhook stopped working"
-		display.Body = "Open notification settings to fix it."
-		display.ThreadID = "settings:notifications"
-		display.URL = "/settings/notifications"
-	case DeliveryTypePluginDestinationAutoDisabled:
-		display.Category = "plugin_destination_auto_disabled"
-		display.Title = "A notification destination stopped working"
 		display.Body = "Open notification settings to fix it."
 		display.ThreadID = "settings:notifications"
 		display.URL = "/settings/notifications"

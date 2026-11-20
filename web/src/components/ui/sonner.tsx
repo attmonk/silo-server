@@ -1,31 +1,10 @@
-import { useLayoutEffect, useState, type CSSProperties } from "react";
-import { createPortal } from "react-dom";
+import type { CSSProperties } from "react";
 import { Direction } from "radix-ui";
 import { Toaster as SonnerToaster, type ToasterProps } from "sonner";
 
-/**
- * Only the fullscreen element and its descendants show while the page is
- * fullscreen, so the toaster's host moves into it and back out. Moving the host
- * node keeps the toaster mounted, so toasts already on screen stay.
- */
-function useToasterHost() {
-  const [host] = useState(() => document.createElement("div"));
-  useLayoutEffect(() => {
-    const place = () => (document.fullscreenElement ?? document.body).append(host);
-    place();
-    document.addEventListener("fullscreenchange", place);
-    return () => {
-      document.removeEventListener("fullscreenchange", place);
-      host.remove();
-    };
-  }, [host]);
-  return host;
-}
-
 const Toaster = ({ ...props }: ToasterProps) => {
   const dir = Direction.useDirection();
-  const host = useToasterHost();
-  return createPortal(
+  return (
     <SonnerToaster
       theme="dark"
       dir={dir}
@@ -47,8 +26,7 @@ const Toaster = ({ ...props }: ToasterProps) => {
         } as CSSProperties
       }
       {...props}
-    />,
-    host,
+    />
   );
 };
 

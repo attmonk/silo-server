@@ -298,7 +298,6 @@ func (h *AdminHandler) DeleteAdminAccount(ctx context.Context, id int, revision,
 	if err != nil {
 		return err
 	}
-	var collections []string
 	_, err = repo.MutateAdminAccount(ctx, id, revision, nil, func(current *models.User, tx pgx.Tx) (bool, error) {
 		if revision != -1 {
 			_, actual, err := adminAccountTransactionGroup(ctx, tx, current)
@@ -315,9 +314,7 @@ func (h *AdminHandler) DeleteAdminAccount(ctx context.Context, id int, revision,
 		if err := auth.EnsureBreakGlassAfterAdminChange(ctx, tx, current, nil); err != nil {
 			return false, breakGlassError(err)
 		}
-		ids, err := h.deletedAccountCollections(ctx, tx, id)
-		collections = ids
-		return true, err
+		return true, nil
 	})
 	if err != nil {
 		return err
@@ -325,7 +322,6 @@ func (h *AdminHandler) DeleteAdminAccount(ctx context.Context, id int, revision,
 	if h.OnUserSessionsRevoked != nil {
 		h.OnUserSessionsRevoked(ctx, id)
 	}
-	removeDeletedCollectionArtwork(ctx, h.ArtworkStore, userCollectionImagePrefix, collections...)
 	h.sweepWatchlistTitles(ctx, id)
 	h.invalidateStats(ctx, cache.ChannelAdmin, cache.EventAdminStatsInvalidated, strconv.Itoa(id))
 	return nil

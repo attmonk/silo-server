@@ -245,7 +245,6 @@ export function buildBulkCopyPayload(
 /** Kinds whose form edits the config itself: the picked collection's id key, the rules. */
 const FORM_OWNED_CONFIG_TYPES: ReadonlySet<string> = new Set([
   "collection",
-  "collection_posters",
   ...FILTER_SECTION_TYPES,
 ]);
 

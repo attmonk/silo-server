@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"testing"
 
@@ -23,24 +21,12 @@ func TestDownloadRemoteBundleFetchesFromLocalNetwork(t *testing.T) {
 	}))
 	defer server.Close()
 
-	download, err := DownloadRemoteBundle(context.Background(), server.URL+"/seed.json.gz")
+	got, err := DownloadRemoteBundle(context.Background(), server.URL+"/seed.json.gz")
 	if err != nil {
 		t.Fatalf("DownloadRemoteBundle: %v", err)
 	}
-	got, err := io.ReadAll(download)
-	if err != nil {
-		t.Fatalf("reading download: %v", err)
-	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("DownloadRemoteBundle = %q, want %q", got, want)
-	}
-	// A seed can be gigabytes, so the temporary file must not outlive it.
-	path := download.(*removeOnClose).Name()
-	if err := download.Close(); err != nil {
-		t.Fatalf("closing download: %v", err)
-	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("temporary download %s still exists after Close: %v", path, err)
 	}
 }
 
@@ -92,14 +78,9 @@ func TestDownloadRemoteBundleAcceptsBodyAtCap(t *testing.T) {
 	}))
 	defer server.Close()
 
-	download, err := downloadRemoteBundle(context.Background(), remoteBundleClient, server.URL+"/seed.json.gz", maxBytes)
+	got, err := downloadRemoteBundle(context.Background(), remoteBundleClient, server.URL+"/seed.json.gz", maxBytes)
 	if err != nil {
 		t.Fatalf("body at cap: %v", err)
-	}
-	defer func() { _ = download.Close() }()
-	got, err := io.ReadAll(download)
-	if err != nil {
-		t.Fatalf("reading download: %v", err)
 	}
 	if len(got) != maxBytes {
 		t.Fatalf("body at cap = %d bytes, want %d", len(got), maxBytes)

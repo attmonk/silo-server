@@ -17,7 +17,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository == 'attmonk/silo-server' && 'attmonk/attmonk-server' || github.repository }}
+  IMAGE_NAME: ${{ github.repository }}
   GOPROXY: https://proxy.golang.org,direct
   GOPRIVATE: github.com/Silo-Server/*
   GONOSUMDB: github.com/Silo-Server/*
@@ -29,12 +29,12 @@ jobs:
       contains(fromJSON('["Silo-Server/silo-server","attmonk/silo-server"]'), github.repository) &&
       contains(fromJSON('["linux/amd64","linux/arm64"]'), inputs.platform) &&
       ((github.event_name == 'workflow_dispatch' &&
-        contains(fromJSON('["refs/heads/main","refs/heads/apiv2","refs/heads/feat/web-premiere-deploy"]'), github.ref)) ||
+        contains(fromJSON('["refs/heads/main","refs/heads/apiv2"]'), github.ref)) ||
        (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_repository.full_name == github.repository &&
-        contains(fromJSON('["main","apiv2","feat/web-premiere-deploy"]'), github.event.workflow_run.head_branch)))
+        contains(fromJSON('["main","apiv2"]'), github.event.workflow_run.head_branch)))
     runs-on: ${{ inputs.platform == 'linux/amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     timeout-minutes: 90
     permissions:

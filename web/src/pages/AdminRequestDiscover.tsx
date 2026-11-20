@@ -22,7 +22,6 @@ import { useAdminRequestCapabilities } from "@/hooks/queries/admin/requests";
 import { useDiscoverRows } from "@/hooks/queries/admin/useDiscoverRows";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useT, type MessageKey } from "@/i18n";
-import { useHomeRowTitle } from "@/lib/sectionTitle";
 import type { HomeRow } from "@/lib/homeRows/types";
 import { EmptyPanel, RowsSkeleton } from "@/pages/admin-requests/queueParts";
 import { DiscoverRowDialog } from "@/pages/admin-requests/DiscoverRowDialog";
@@ -31,7 +30,6 @@ import {
   isBrandRow,
   isBuiltInRow,
   ROW_KINDS,
-  toHomeRow,
 } from "@/pages/admin-requests/discoverLayoutModel";
 
 /**
@@ -114,7 +112,6 @@ function RestoreDefaultsDialog({
 
 function DiscoverLayoutEditor() {
   const t = useT();
-  const rowTitle = useHomeRowTitle();
   const adapter = useDiscoverRows();
   const { layout, discoverRows } = adapter;
   const navigate = useNavigate();
@@ -236,7 +233,7 @@ function DiscoverLayoutEditor() {
       }
     >
       <DeleteRowDialog
-        rowTitle={deleting ? rowTitle(toHomeRow(deleting)) : ""}
+        rowTitle={deleting?.title ?? ""}
         pageLabel={t("web.admin.requests.discover.pageName")}
         description={
           stockRow

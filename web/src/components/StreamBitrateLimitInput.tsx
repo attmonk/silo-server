@@ -18,7 +18,6 @@ import {
   parseStreamBitrateMbps,
   streamBitrateLimitMbpsText,
 } from "@/lib/streamBitrateLimit";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
 
 const UNLIMITED = "0";
 const CUSTOM = "custom";
@@ -105,7 +104,7 @@ export function StreamBitrateLimitInput({
           <SelectTrigger id={id} className={custom ? "w-32 shrink-0" : "w-full"}>
             <SelectValue placeholder={t("web.player.bitrateLimit.choosePlaceholder")} />
           </SelectTrigger>
-          <SelectContent className={TOUCH_TARGETS}>
+          <SelectContent>
             <SelectItem value={UNLIMITED}>{t("web.player.bitrateLimit.unlimited")}</SelectItem>
             {STREAM_BITRATE_LIMIT_PRESETS_KBPS.map((kbps) => (
               <SelectItem key={kbps} value={String(kbps)}>

@@ -1,5 +1,4 @@
 import { useState, useCallback, useMemo, useRef, type ChangeEvent } from "react";
-import { joinList } from "@/lib/appLocale";
 import { Copy, Folder, Plus, Search, X } from "lucide-react";
 import { Direction } from "radix-ui";
 import { toast } from "sonner";
@@ -21,7 +20,6 @@ import {
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { useT } from "@/i18n";
-
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { libraryIdsOfFiles } from "@/lib/itemLibraries";
 import { cn } from "@/lib/utils";
@@ -545,11 +543,9 @@ export default function MatchItemDialog({
                           {candidate.match_reasons?.length ? (
                             <div className="text-muted-foreground mt-1 text-xs">
                               {t("web.item.match.matchReasons", {
-                                reasons: joinList(
-                                  candidate.match_reasons.map((reason) =>
-                                    reason.replace(/_/g, " "),
-                                  ),
-                                ),
+                                reasons: candidate.match_reasons
+                                  .map((reason) => reason.replace(/_/g, " "))
+                                  .join(", "),
                               })}
                             </div>
                           ) : null}

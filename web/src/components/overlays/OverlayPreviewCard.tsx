@@ -8,7 +8,6 @@ import {
   type CardOverlayPrefs,
   type OverlayPreviewVariant,
 } from "@/lib/overlays";
-import { useT, type MessageKey } from "@/i18n";
 import { carouselCardWidthClasses, type PosterSize } from "@/lib/uiCustomization";
 
 /**
@@ -18,10 +17,10 @@ import { carouselCardWidthClasses, type PosterSize } from "@/lib/uiCustomization
  */
 export type { OverlayPreviewVariant };
 
-const PLACEHOLDER_LABEL: Record<OverlayPreviewVariant, MessageKey> = {
-  movie: "web.common.overlays.previewPlaceholder.movie",
-  show: "web.common.overlays.previewPlaceholder.show",
-  requested: "web.common.overlays.previewPlaceholder.requested",
+const PLACEHOLDER_LABEL: Record<OverlayPreviewVariant, string> = {
+  movie: "Movie preview",
+  show: "Show preview",
+  requested: "Requested preview",
 };
 
 interface OverlayPreviewCardProps {
@@ -42,14 +41,13 @@ export function OverlayPreviewCard({
   posterSize = "standard",
   showPosterOverlays = true,
 }: OverlayPreviewCardProps) {
-  const t = useT();
   const data = OVERLAY_PREVIEW_SAMPLES[variant];
   const downloadPercent = showPosterOverlays ? requestDownloadBarPercent(data, prefs) : null;
   return (
     <div className={`mx-auto ${carouselCardWidthClasses(posterSize)}`}>
       <div className="bg-muted/40 relative aspect-[2/3] overflow-hidden rounded-xl border">
         <div className="text-muted-foreground/30 flex h-full items-center justify-center text-xs font-medium tracking-wider uppercase">
-          {t(PLACEHOLDER_LABEL[variant])}
+          {PLACEHOLDER_LABEL[variant]}
         </div>
         {downloadPercent !== null ? <RequestDownloadBar percent={downloadPercent} /> : null}
         {showPosterOverlays ? (

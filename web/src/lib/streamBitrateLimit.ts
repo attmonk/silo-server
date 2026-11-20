@@ -6,7 +6,6 @@
  */
 
 import { t } from "@/i18n";
-import { formatDecimal } from "@/lib/numberFormat";
 
 /** Preset caps offered ahead of a custom value, highest first. */
 export const STREAM_BITRATE_LIMIT_PRESETS_KBPS = [
@@ -32,7 +31,7 @@ export function streamBitrateLimitMbpsText(kbps: number): string {
 export function formatStreamBitrateLimit(kbps: number): string {
   return kbps === 0
     ? t("web.player.bitrateLimit.unlimited")
-    : t("web.player.bitrateLimit.value", { mbps: formatDecimal(kbps / 1000, 3, 0) });
+    : t("web.player.bitrateLimit.value", { mbps: streamBitrateLimitMbpsText(kbps) });
 }
 
 // What the custom Mbps box accepts: up to three decimals, "." or "," as separator.

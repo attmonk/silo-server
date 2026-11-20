@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 
-import { prefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
+export function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
 
 /**
  * Chromium user agents also contain "AppleWebKit", so exclude the Blink

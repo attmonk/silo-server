@@ -40,6 +40,8 @@ import { cn } from "@/lib/utils";
 import { hasMachineTranslation } from "./components/machineTranslation";
 import EpisodesTranslationAction from "./components/EpisodesTranslationAction";
 import { useT } from "@/i18n";
+import PremiereShortcut from "@/components/calendar/PremiereShortcut";
+import PremiereSettings from "@/components/calendar/PremiereSettings";
 
 /** Series lead with their creators; one without Creator credits keeps showing its directors. */
 const SERIES_LEAD_JOBS = ["Creator", "Director"] as const;
@@ -206,37 +208,45 @@ export default function SeriesContent({
               />
             }
             actions={
-              <MediaUserActionBar
-                compactMobile
-                item={item}
-                contentId={item.content_id}
-                watchTogether={watchTogether.menu}
-                playHref={primaryAction.href}
-                playLabel={primaryAction.label}
-                onRefresh={
-                  canCurateMetadata
-                    ? (mode) =>
-                        refreshMetadataMutation.mutate({
-                          item,
-                          mode,
-                          onReplaced: followReplacedItem,
-                        })
-                    : undefined
-                }
-                isRefreshing={refreshMetadataMutation.isPending}
-                isAdmin={isAdmin}
-                canManageTrickplay={canManageTrickplay}
-                canCurateMetadata={canCurateMetadata}
-                onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
-                onMatchItem={canCurateMetadata ? () => setMatchOpen(true) : undefined}
-                onSplitItem={canCurateMetadata ? () => setSplitOpen(true) : undefined}
-                onRequestSeasons={canRequestSeasons ? () => setRequestSeasonsOpen(true) : undefined}
-                onShuffle={
-                  episodeCount > 1
-                    ? () => startShuffle({ kind: "series", id: item.content_id })
-                    : undefined
-                }
-              />
+              <>
+                <MediaUserActionBar
+                  compactMobile
+                  item={item}
+                  contentId={item.content_id}
+                  watchTogether={watchTogether.menu}
+                  playHref={primaryAction.href}
+                  playLabel={primaryAction.label}
+                  onRefresh={
+                    canCurateMetadata
+                      ? (mode) =>
+                          refreshMetadataMutation.mutate({
+                            item,
+                            mode,
+                            onReplaced: followReplacedItem,
+                          })
+                      : undefined
+                  }
+                  isRefreshing={refreshMetadataMutation.isPending}
+                  isAdmin={isAdmin}
+                  canManageTrickplay={canManageTrickplay}
+                  canCurateMetadata={canCurateMetadata}
+                  onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
+                  onMatchItem={canCurateMetadata ? () => setMatchOpen(true) : undefined}
+                  onSplitItem={canCurateMetadata ? () => setSplitOpen(true) : undefined}
+                  onRequestSeasons={
+                    canRequestSeasons ? () => setRequestSeasonsOpen(true) : undefined
+                  }
+                  onShuffle={
+                    episodeCount > 1
+                      ? () => startShuffle({ kind: "series", id: item.content_id })
+                      : undefined
+                  }
+                />
+                <div className="flex flex-wrap items-center gap-2 pt-2">
+                  <PremiereShortcut itemId={item.content_id} series />
+                  <PremiereSettings seriesId={item.content_id} broadcaster={item.networks?.[0]} />
+                </div>
+              </>
             }
           />
           {canRequestSeasons ? (

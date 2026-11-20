@@ -6,12 +6,8 @@ import { useCarouselEmbla } from "@/hooks/useCarouselEmbla";
 import { buildItemHref } from "@/lib/mediaNavigation";
 import { formatSeasonMeta, formatSeasonProgress, getSeasonDisplayTitle } from "./itemDetailLayout";
 import CardPlayOverlay from "@/components/CardPlayOverlay";
-import CardOverlays from "@/components/overlays/CardOverlays";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
-import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
 import { useAppLanguage, useT } from "@/i18n";
-import { overlayDataFromSeason } from "@/lib/overlays";
-import WatchProgressBar from "@/components/WatchProgressBar";
 
 interface SeasonCarouselProps {
   seasons: Season[];
@@ -23,7 +19,6 @@ export default function SeasonCarousel({ seasons, libraryId }: SeasonCarouselPro
   useAppLanguage();
   const sorted = seasons.slice().sort((a, b) => a.season_number - b.season_number);
   const prefetchSeason = usePrefetchCatalogSeason(libraryId);
-  const { prefs: overlayPrefs } = useOverlayPrefs();
 
   if (sorted.length === 0) {
     return null;
@@ -46,13 +41,16 @@ export default function SeasonCarousel({ seasons, libraryId }: SeasonCarouselPro
 
         return (
           <li key={season.content_id} className="embla__slide shrink-0">
-            <div className="group/season w-[160px] sm:w-[170px]">
+            <div
+              className="group/season w-[160px] sm:w-[170px]"
+              onMouseEnter={() => prefetchSeason(season.content_id)}
+              onFocus={() => prefetchSeason(season.content_id)}
+              onTouchStart={() => prefetchSeason(season.content_id)}
+            >
               {/* Poster */}
               <div className="group/media relative">
                 <ViewTransitionLink
                   to={seasonHref}
-                  prefetchOn="intent"
-                  onPrefetch={() => prefetchSeason(season.content_id)}
                   className="media-card-image relative block aspect-[2/3] overflow-hidden rounded-xl"
                 >
                   {season.poster_url ? (
@@ -69,28 +67,25 @@ export default function SeasonCarousel({ seasons, libraryId }: SeasonCarouselPro
                     </div>
                   )}
 
-                  {overlayPrefs && (
-                    <CardOverlays
-                      data={overlayDataFromSeason(season)}
-                      prefs={overlayPrefs}
-                      hasProgressBar={isCompleted || hasProgress}
-                    />
-                  )}
-
                   {/* Completed checkmark */}
                   {isCompleted && (
-                    // eslint-disable-next-line silo/no-physical-direction -- on the poster artwork, which doesn't mirror; matches CardOverlays and CardWatchStatus
-                    <div className="absolute top-2.5 right-2.5 z-20 rounded-full bg-green-500/90 p-1 text-white shadow-sm">
+                    <div className="absolute end-2.5 top-2.5 rounded-full bg-green-500/90 p-1 text-white shadow-sm">
                       <Check className="size-3.5" strokeWidth={3} />
                     </div>
                   )}
 
+                  {/* Progress bar — inset pill so a full bar doesn't read
+                      as a stray edge along the artwork */}
                   {(isCompleted || hasProgress) && (
-                    <WatchProgressBar
-                      percent={isCompleted ? 100 : progressPercent}
-                      fillColor={isCompleted ? "#4caf50" : undefined}
-                      animate
-                    />
+                    <div className="absolute inset-x-2.5 bottom-2 h-[3px] overflow-hidden rounded-full bg-black/40">
+                      <div
+                        className="h-full rounded-full transition-all duration-300"
+                        style={{
+                          width: isCompleted ? "100%" : `${progressPercent}%`,
+                          background: isCompleted ? "#4caf50" : "var(--primary)",
+                        }}
+                      />
+                    </div>
                   )}
                 </ViewTransitionLink>
                 {season.play_content_id ? (
@@ -103,11 +98,7 @@ export default function SeasonCarousel({ seasons, libraryId }: SeasonCarouselPro
               </div>
 
               {/* Info — always the same height */}
-              <ViewTransitionLink
-                to={seasonHref}
-                onPrefetch={() => prefetchSeason(season.content_id)}
-                className="block px-0.5 pt-2.5"
-              >
+              <ViewTransitionLink to={seasonHref} className="block px-0.5 pt-2.5">
                 <div className="truncate text-[0.8125rem] font-semibold">
                   {getSeasonDisplayTitle(season)}
                 </div>

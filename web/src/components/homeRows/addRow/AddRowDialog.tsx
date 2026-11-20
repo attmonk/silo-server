@@ -8,7 +8,6 @@ import { Input } from "@/components/ui/input";
 import { useRowPreview } from "@/hooks/queries/homeRows/useRowPreview";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useAppLanguage, useT } from "@/i18n";
-import { joinList } from "@/lib/appLocale";
 import {
   isPersonalRowKind,
   pickerGroups,
@@ -19,7 +18,6 @@ import {
 import { canCopyToLibraries, copyTargetPages, libraryCopyIds } from "@/lib/homeRows/bulkCopy";
 import { pageLabel as labelOfPage, libraryPagesOf } from "@/lib/homeRows/pages";
 import { collectionIdOf } from "@/lib/homeRows/payloads";
-import { holdsCollections } from "@/lib/sectionTypes";
 import {
   canSaveDraft,
   DRAFT_FIELD_LABELS,
@@ -219,8 +217,7 @@ export function AddRowDialog({
             title: draft.titleFollowsVariant ? fresh.title : draft.title,
             titleFollowsVariant: draft.titleFollowsVariant,
             itemLimit: draft.itemLimit,
-            // A row of collections can't be the hero.
-            hero: draft.hero && !holdsCollections(fresh.sectionType),
+            hero: draft.hero,
             webOnly: draft.webOnly,
           }
         : fresh,
@@ -418,7 +415,7 @@ export function AddRowDialog({
               {conflict
                 ? t("web.home.addRow.conflict")
                 : t("web.home.addRow.changedElsewhere", {
-                    fields: joinList(changedUpstream.map((field) => t(DRAFT_FIELD_LABELS[field]))),
+                    fields: changedUpstream.map((field) => t(DRAFT_FIELD_LABELS[field])).join(", "),
                   })}
             </p>
             {conflict ? (

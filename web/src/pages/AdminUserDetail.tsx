@@ -37,8 +37,6 @@ import {
   canViewAsAccount,
 } from "@/lib/accountOwner";
 import { guardRedirectTarget } from "@/lib/authRedirect";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
-import { cn } from "@/lib/utils";
 
 import { AccessTab } from "./admin-users/detail/access/AccessTab";
 import { ActivityTab } from "./admin-users/detail/activity/ActivityTab";
@@ -207,7 +205,7 @@ function AdminUserDetailPage() {
 
   return (
     <CardEditingProvider>
-      <div className={cn("min-w-0 space-y-6 pb-4 sm:pb-6", TOUCH_TARGETS)}>
+      <div className="min-w-0 space-y-6 pb-4 sm:pb-6">
         {actionError && <p role="alert">{actionError}</p>}
         {!available && <p role="status">{t("web.admin.users.list.unavailable")}</p>}
         {available && manageable && !editor && (
@@ -282,7 +280,6 @@ function AdminUserDetailPage() {
             username: account.username,
           })}
           confirmLabel={t("web.admin.users.page.transferConfirm")}
-          className={TOUCH_TARGETS}
           onConfirm={handleTransfer}
           isPending={transferOwnership.isPending}
         />
@@ -292,7 +289,6 @@ function AdminUserDetailPage() {
           title={t("web.admin.users.page.disableTitle", { username: account.username })}
           description={t("web.admin.users.page.disableDescription")}
           confirmLabel={t("web.admin.users.page.disableConfirm")}
-          className={TOUCH_TARGETS}
           variant="destructive"
           onConfirm={() => void setEnabled(false)}
         />

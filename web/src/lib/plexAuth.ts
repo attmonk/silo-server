@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import { randomUUID } from "./uuid";
 
 const PLEX_TV_BASE_URL = "https://plex.tv";
@@ -92,7 +91,7 @@ function buildPlexHeaders(token?: string): HeadersInit {
 async function readJSON<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const body = (await response.text()).trim();
-    throw new Error(body || t("web.settings.plexAuth.requestFailed", { status: response.status }));
+    throw new Error(body || `Plex request failed with status ${response.status}`);
   }
   return (await response.json()) as T;
 }
@@ -108,7 +107,7 @@ export async function createPlexPin(): Promise<PlexPinResponse> {
   });
   const pin = await readJSON<PlexPinResponse>(response);
   if (!pin.id || !pin.code) {
-    throw new Error(t("web.settings.plexAuth.invalidPinResponse"));
+    throw new Error("Plex sign-in returned an invalid PIN response.");
   }
   return pin;
 }
@@ -208,7 +207,7 @@ async function listPlexHomeUsers(token: string): Promise<PlexHomeUser[]> {
       .filter((user) => !!user.uuid)
       .map((user) => ({
         uuid: user.uuid as string,
-        title: user.title || user.username || t("web.settings.plexAuth.homeUserFallbackName"),
+        title: user.title || user.username || "Plex user",
         protected: user.protected === true,
         restricted: user.restricted === true,
       }));
@@ -244,13 +243,13 @@ async function switchPlexHomeUser(token: string, userUUID: string, pin?: string)
   if (response.status === 401 || response.status === 403) {
     throw new Error(
       pin
-        ? t("web.settings.plexAuth.homeUserPinRejected")
-        : t("web.settings.plexAuth.homeUserPinRequired"),
+        ? "Plex did not accept that PIN. Check the PIN for this Plex Home user and try again."
+        : "This Plex Home user is protected by a PIN. Enter their PIN and try again.",
     );
   }
   const user = await readJSON<{ authToken?: string }>(response);
   if (!user.authToken) {
-    throw new Error(t("web.settings.plexAuth.homeUserNoSignIn"));
+    throw new Error("Plex did not return a sign-in for this Plex Home user.");
   }
   return user.authToken;
 }
@@ -269,7 +268,9 @@ export async function resolvePlexHomeUserServer(
   const servers = await listPlexResources(userToken);
   const server = servers.find((candidate) => candidate.clientIdentifier === serverIdentifier);
   if (!server) {
-    throw new Error(t("web.settings.plexAuth.homeUserNoServerAccess", { name: user.title }));
+    throw new Error(
+      `${user.title} does not have access to this Plex server. Share the server with them in Plex, or choose another server.`,
+    );
   }
   return { accountToken: userToken, server };
 }
@@ -304,7 +305,7 @@ export async function completePlexAuthentication(
 ): Promise<PlexAuthenticationResult> {
   const authToken = await checkPlexPin(pinID, pinCode);
   if (!authToken) {
-    throw new Error(t("web.settings.plexAuth.signInIncomplete"));
+    throw new Error("Plex sign-in was not completed. Please try again.");
   }
   const servers = await listPlexResources(authToken);
   return { accountToken: authToken, servers };

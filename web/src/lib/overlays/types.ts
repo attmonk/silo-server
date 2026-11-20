@@ -48,7 +48,6 @@ export type OverlayId =
   // ribbons (status / awards)
   | "show_status"
   | "request_status"
-  | "availability"
   | "imdb_top_250"
   | "rt_certified_fresh";
 
@@ -81,10 +80,6 @@ export interface OverlayData {
   network?: string;
   // ribbons
   show_status?: string;
-  // Series: complete released seasons / released seasons.
-  // Season: episodes in the library / known episodes.
-  availability_have?: number | null;
-  availability_total?: number | null;
   imdb_top_250?: number | null;
   rt_certified_fresh?: boolean | null;
   // request status: only titles outside the library carry these, so library
@@ -248,7 +243,6 @@ export type OverlayIconId =
   | "download"
   | "hourglass"
   | "alert"
-  | "check"
   // brand marks (inline SVG)
   | "hdr10"
   | "hdr"

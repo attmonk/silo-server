@@ -23,7 +23,6 @@ import type { CollectionView } from "@/lib/collections/scope";
 import { formatDateTime } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
 import { useT } from "@/i18n";
-import { formatLocale } from "@/lib/appLocale";
 
 type SyncState = NonNullable<CollectionView["sync"]>;
 
@@ -89,10 +88,7 @@ export function SyncStatusBlock({
         />
         <b className="font-semibold">{syncedAgo(sync.lastAt)}</b>
         <span className="text-muted-foreground text-[12.5px]">
-          {t("web.collections.metaLine.titleCount", {
-            count: itemCount,
-            shown: itemCount.toLocaleString(formatLocale()),
-          })}
+          {t("web.collections.metaLine.titleCount", { count: itemCount, shown: itemCount })}
         </span>
       </>
     );

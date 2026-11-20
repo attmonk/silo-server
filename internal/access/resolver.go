@@ -123,14 +123,13 @@ func (r *Resolver) Resolve(ctx context.Context, input ResolveInput) (Scope, erro
 		scope.NextUpMode = preferences.NextUpMode
 		scope.NextUpNewReleasesFirst = preferences.NextUpNewReleasesFirst
 		scope.HideWatchedItemsOnHome = preferences.HideWatchedItemsOnHome
-		scope.CardAvailability = preferences.CardAvailability
 		scope.AllowedLibraryIDs, scope.LibrariesRestricted = ProfileLibraries(effective.LibraryIDs, profile)
-		verified, pinSkipped, err := VerifyProfileForRequest(profile, input, user.ID, r.tokens)
+		verified, err := VerifyProfileForRequest(profile, input, user.ID, r.tokens)
 		if err != nil {
 			return Scope{}, err
 		}
 		scope.ProfileVerified = verified
-		scope.PINVerificationSkipped = pinSkipped
+		scope.PINVerificationSkipped = verified && profile.PINHash != "" && input.SkipPINVerification
 		scope.ProfilePINRevision = profile.PINRevision
 	}
 
@@ -156,37 +155,27 @@ func (r *Resolver) Resolve(ctx context.Context, input ResolveInput) (Scope, erro
 	return scope, nil
 }
 
-// VerifyProfileForRequest applies the profile PIN/token verification checks
-// for a resolved profile. It reports whether the profile is verified for the
-// request and whether that verification was only skipped: a PIN-locked
-// profile accepted through input.SkipPINVerification without a valid profile
-// token. A valid token bound to a login session counts as a real proof even
-// when the PIN could be skipped, so a view-as session that did enter the PIN
-// can still manage the household. A sessionless credential (an API key) stays
-// skipped whatever token it sends: its token is bound to no login session and
-// outlives the key.
+// VerifyProfileForRequest applies the legacy profile PIN/token verification
+// checks for a resolved profile and returns whether the profile is verified for
+// the request.
 func VerifyProfileForRequest(
 	profile *userstore.Profile,
 	input ResolveInput,
 	userID int,
 	tokens ProfileTokenValidator,
-) (verified, pinSkipped bool, err error) {
+) (bool, error) {
 	if profile == nil {
-		return input.ProfileID == "", false, nil
+		return input.ProfileID == "", nil
 	}
-	if profile.PINHash == "" {
-		return true, false, nil
-	}
-	if input.SkipPINVerification && (input.ProfileToken == "" || input.SessionID == "") {
-		return true, true, nil
-	}
-	if err := CheckProfileToken(tokens, input.ProfileToken, userID, input.SessionID, profile); err != nil {
-		if input.SkipPINVerification {
-			return true, true, nil
+
+	profileVerified := profile.PINHash == "" || input.SkipPINVerification
+	if profile.PINHash != "" && !input.SkipPINVerification {
+		if err := CheckProfileToken(tokens, input.ProfileToken, userID, input.SessionID, profile); err != nil {
+			return false, err
 		}
-		return false, false, err
+		profileVerified = true
 	}
-	return true, false, nil
+	return profileVerified, nil
 }
 
 // CheckProfileToken reports whether token proves the caller entered profile's

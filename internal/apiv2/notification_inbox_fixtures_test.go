@@ -26,3 +26,10 @@ func notificationInboxFixtureCases() []fixtureCase {
 	}
 	return cases
 }
+
+func notificationIncomingFixtureCases() []fixtureCase {
+	return []fixtureCase{
+		{name: "notification_incoming", operationID: "receiveIncomingNotification", scenario: "Authenticated external event accepted into the acting profile inbox.", method: "POST", path: "/api/v2/notifications/incoming", headers: profileOwner(), status: 200, schema: "#/components/schemas/NotificationIncomingResult", body: `{"source":"integration","event_id":"one","title":"Reminder"}`, assertHeaders: []string{"Cache-Control", "Content-Type"}},
+		{name: "notification_incoming_capabilities", operationID: "getIncomingNotificationCapabilities", scenario: "Incoming notification feature discovery.", method: "GET", path: "/api/v2/notifications/incoming/capabilities", headers: profileOwner(), status: 200, schema: "#/components/schemas/NotificationIncomingCapability", assertHeaders: []string{"Cache-Control", "Content-Type"}},
+	}
+}

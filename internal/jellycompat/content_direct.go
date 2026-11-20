@@ -443,7 +443,6 @@ func (s *directContentService) BrowseItems(ctx context.Context, session *Session
 		Studios:                 splitNonemptyGenres(params.Get("studios")),
 		OfficialRatings:         splitNonemptyGenres(params.Get("official_ratings")),
 		MinCommunityRating:      parseFloatParam(params.Get("min_community_rating")),
-		MinCriticRating:         parseFloatParam(params.Get("min_critic_rating")),
 		MinPremiereDate:         params.Get("min_premiere_date"),
 		MaxPremiereDate:         params.Get("max_premiere_date"),
 		LibraryID:               catalog.ParseIntParam(params.Get("library_id")),
@@ -1529,7 +1528,6 @@ func mediaItemToListItem(mi *models.MediaItem) upstreamListItem {
 		Status:            mi.Status,
 		RatingIMDB:        mi.RatingIMDB,
 		RatingTMDB:        mi.RatingTMDB,
-		RatingRTCritic:    mi.RatingRTCritic,
 		ImdbID:            mi.ImdbID,
 		TmdbID:            mi.TmdbID,
 		TvdbID:            mi.TvdbID,
@@ -1561,30 +1559,19 @@ func mediaItemToListItem(mi *models.MediaItem) upstreamListItem {
 
 func itemDetailToUpstream(d *catalog.ItemDetail) upstreamItemDetail {
 	versions := append([]catalog.FileVersion(nil), d.Versions...)
-	// applyListFileFields picks the same first version in SQL (widest first
-	// track, ties in file id order); keep the two orders in step. The catalog
-	// ranks movie, episode and extra versions best first, so those break ties
-	// by file id here. Other types arrive in their builder's order (an
-	// audiobook's or ebook's parts in sequence), which ties keep.
-	idTieBreak := d.Type == compatMovieType || d.Type == compatEpisodeType || d.Type == "extra"
+	// applyListFileFields picks the same first version in SQL; keep the two
+	// orders in step.
 	sort.SliceStable(versions, func(i, j int) bool {
 		wi, wj := compatPrimaryVideoTrack(versions[i]).Width, compatPrimaryVideoTrack(versions[j]).Width
-		if wi != wj {
+		if wi != wj || !locationpref.Configured() {
 			return wi > wj
 		}
 		// attmonk fork: among equal widths, HDR then preferred storage,
-		// matching the catalog's default-version order. Equal ranks retain
-		// upstream's file-id tie break for video and part order for books.
-		if locationpref.Configured() {
-			if versions[i].HDR != versions[j].HDR {
-				return versions[i].HDR
-			}
-			ri, rj := locationpref.Rank(versions[i].FilePath), locationpref.Rank(versions[j].FilePath)
-			if ri != rj {
-				return ri < rj
-			}
+		// matching the catalog's default-version order.
+		if versions[i].HDR != versions[j].HDR {
+			return versions[i].HDR
 		}
-		return idTieBreak && versions[i].FileID < versions[j].FileID
+		return locationpref.Rank(versions[i].FilePath) < locationpref.Rank(versions[j].FilePath)
 	})
 	detail := upstreamItemDetail{
 		ContentID:        d.ContentID,
@@ -1601,7 +1588,6 @@ func itemDetailToUpstream(d *catalog.ItemDetail) upstreamItemDetail {
 		Genres:           d.Genres,
 		RatingIMDB:       d.RatingIMDB,
 		RatingTMDB:       d.RatingTMDB,
-		RatingRTCritic:   d.RatingRTCritic,
 		ImdbID:           d.ImdbID,
 		TmdbID:           d.TmdbID,
 		TvdbID:           d.TvdbID,

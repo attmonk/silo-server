@@ -1,7 +1,6 @@
 import { Fragment } from "react";
 import { ChevronLeft, ChevronRight, type LucideIcon } from "lucide-react";
 import { edgeMask, useScrollStrip } from "@/hooks/useScrollStrip";
-import { numberText, useAppLanguage } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 export interface PillOption {
@@ -40,8 +39,6 @@ export function PillSwitcher({
   disabled?: boolean;
   summary?: string;
 }) {
-  // Counts print in the language's digits, so re-render when it changes.
-  useAppLanguage();
   // The pressed pill stops clear of the fade (4rem).
   const { ref, edges, measure, page } = useScrollStrip<HTMLDivElement>(
     `[aria-pressed="true"]`,
@@ -91,7 +88,7 @@ export function PillSwitcher({
                       // The space keeps "Movies 14" two words for a screen reader; flex hides it.
                       <>
                         {" "}
-                        <span className="text-[12.5px] opacity-60">{numberText(option.count)}</span>
+                        <span className="text-[12.5px] opacity-60">{option.count}</span>
                       </>
                     ) : null}
                   </button>

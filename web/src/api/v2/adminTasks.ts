@@ -2,7 +2,6 @@ import { v2 } from "@/api/v2/request";
 import { adminJobFromV2 } from "@/api/v2/libraries";
 import type { components } from "@/api/v2/schema";
 import type { AdminJob } from "@/api/types";
-import { t } from "@/i18n";
 
 export function adminTaskJobFromV2(job: components["schemas"]["AdminTaskJob"]): AdminJob {
   const base = adminJobFromV2(job);
@@ -26,7 +25,7 @@ export function adminTaskJobFromV2(job: components["schemas"]["AdminTaskJob"]): 
             ...job.item_result,
             scan_result: { new: job.item_result.new_files },
             artwork_cache_warning: job.item_result.artwork_cache_incomplete
-              ? t("web.admin.errors.artworkCacheIncomplete")
+              ? "Artwork caching did not finish. Inspect administrator diagnostics for details."
               : undefined,
           }
         : undefined) ??

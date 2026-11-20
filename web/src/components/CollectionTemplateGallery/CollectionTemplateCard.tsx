@@ -4,7 +4,6 @@ import { RadioGroup as RadioGroupPrimitive } from "radix-ui";
 import { RadioDot } from "@/components/ui/radio-group";
 import { mediaKindLabel, type CollectionTemplate } from "@/lib/collectionTemplates";
 import { useT, type Translate } from "@/i18n";
-import { formatLocale } from "@/lib/appLocale";
 
 const SOURCE_TAG: Partial<Record<CollectionTemplate["source"], string>> = {
   mdblist: "MDBList",
@@ -92,7 +91,7 @@ export function CollectionTemplateCard({ template }: { template: CollectionTempl
     template.default_limit
       ? t("web.collections.metaLine.titleCount", {
           count: template.default_limit,
-          shown: template.default_limit.toLocaleString(formatLocale()),
+          shown: template.default_limit,
         })
       : null,
     template.default_sync_schedule ? scheduleDescription(t, template.default_sync_schedule) : null,

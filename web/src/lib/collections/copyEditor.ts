@@ -41,13 +41,11 @@ export function previewFailed() {
   return t("web.collections.copy.previewFailed");
 }
 
+// New on main and not yet in the catalog (a follow-up), so these stay English.
 /** The preview of a Smart collection with no complete rule, which would match every title. */
-export function previewNeedsRule() {
-  return t("web.collections.copy.previewNeedsRule");
-}
-export function previewNeedsRuleHelp() {
-  return t("web.collections.copy.previewNeedsRuleHelp");
-}
+export const PREVIEW_NEEDS_RULE = "Add a rule to see what it matches";
+export const PREVIEW_NEEDS_RULE_HELP =
+  "A smart collection needs at least one rule. Without one it would hold every title.";
 
 export function previewMatches(total: number): string {
   return t("web.collections.copy.previewMatches", {
@@ -209,8 +207,7 @@ export function artworkSlotLabel(slot: ArtworkSlot): string {
  * What a slot will show after Save: a chosen image not saved yet, the saved
  * one, the collage the server made of the collection's titles, no collage yet
  * (none of its titles has a poster, or the collage is still being made), or
- * nothing at all (a backdrop, or a personal collection's poster on a server
- * that makes no personal collages).
+ * nothing at all (a backdrop, or a server Smart collection's poster).
  */
 export type ArtworkState = "none" | "awaiting-collage" | "collage" | "new" | "saved";
 
@@ -252,10 +249,6 @@ export function titlesAlreadySaved() {
 export function saveFailed() {
   return t("web.collections.copy.saveFailed");
 }
-/** `saveFailed` followed by the server's reason. */
-export function saveFailedWithError(error: string) {
-  return t("web.collections.copy.saveFailedWithError", { error });
-}
 
 /** Why Create waits on a server collection with no library yet. */
 export function pickLibrariesFirst() {
@@ -271,15 +264,10 @@ export function nameItThenCreate() {
   return t("web.collections.copy.nameItThenCreate");
 }
 
+// New on main and not yet in the catalog (a follow-up), so these stay English.
 /** Why Create waits on a server Smart collection that shows in no library yet. */
-export function pickWhereItShowsFirst() {
-  return t("web.collections.copy.pickWhereItShowsFirst");
-}
+export const PICK_WHERE_IT_SHOWS_FIRST = "Pick the libraries it shows in, then create it.";
 /** Why Create waits on a Smart collection with no complete rule. */
-export function addARuleThenCreate() {
-  return t("web.collections.copy.addRuleThenCreate");
-}
+export const ADD_A_RULE_THEN_CREATE = "Add a rule, then create it.";
 /** Why Save waits on a saved Smart collection whose last rule was removed. */
-export function addAtLeastOneRule() {
-  return t("web.collections.copy.addAtLeastOneRule");
-}
+export const ADD_A_RULE = "Add at least one rule.";

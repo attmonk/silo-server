@@ -2,7 +2,6 @@ import type { ProfileRequestContextSnapshot } from "@/api/client";
 import type { AdminDeviceSummary, AdminDeviceDetail } from "@/api/types";
 import { requireAdminUserAuthority } from "./adminUsers";
 import { v2, type V2Result } from "./request";
-import { t } from "@/i18n";
 
 type Device = V2Result<"GET /api/v2/admin/devices">["items"][number];
 function userID(raw: string) {
@@ -40,7 +39,7 @@ export async function listAdminDevices(
     seen.add(next);
     cursor = next;
   }
-  throw new Error(t("web.admin.errors.devicesTooMany"));
+  throw new Error("Too many devices to display. Reload the list.");
 }
 export async function getAdminDevice(
   user: number,

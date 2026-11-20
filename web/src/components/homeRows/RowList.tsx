@@ -1,15 +1,25 @@
 import { useMemo, useRef, useState, type ReactNode } from "react";
 import {
   DndContext,
+  KeyboardSensor,
+  MouseSensor,
+  TouchSensor,
   closestCenter,
+  useSensor,
+  useSensors,
   type Announcements,
   type DragEndEvent,
   type DragStartEvent,
   type UniqueIdentifier,
 } from "@dnd-kit/core";
-import { SortableContext, arrayMove, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { useGripDragSensors, useMotionSafeSortable } from "@/hooks/useSortableList";
 import type { HomeRow } from "@/lib/homeRows/types";
 import type { ListRowProps } from "@/components/calm/ListRow";
 import { useT } from "@/i18n";
@@ -17,6 +27,8 @@ import { useHomeRowTitle } from "@/lib/sectionTitle";
 
 /** What the list hands each row so it can be dragged by its grip only. */
 export type SortableRowProps = Pick<ListRowProps, "handleProps" | "ref" | "style" | "dragging">;
+
+const TOUCH_DRAG_DELAY_MS = 200;
 
 function SortableRow({
   id,
@@ -35,7 +47,7 @@ function SortableRow({
     transform,
     transition,
     isDragging,
-  } = useMotionSafeSortable({ id, disabled });
+  } = useSortable({ id, disabled });
   return children({
     ref: setNodeRef,
     style: { transform: CSS.Transform.toString(transform), transition },
@@ -73,7 +85,11 @@ export function RowList({
   // would talk over "Picked up". Only a change of position is announced.
   const lastOver = useRef<UniqueIdentifier | null>(null);
   const shownRows = drag?.rows ?? rows;
-  const sensors = useGripDragSensors();
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: TOUCH_DRAG_DELAY_MS, tolerance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
 
   const announcements = useMemo<Announcements>(() => {
     const titleOf = (id: UniqueIdentifier) => {

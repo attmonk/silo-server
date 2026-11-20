@@ -550,7 +550,7 @@ function DiagnosticReportRow({
         <StateBadge state={report.state} />
       </TableCell>
       <TableCell className="text-end font-mono text-xs tabular-nums">
-        {formatBytes(t, report.blob_bytes)}
+        {formatBytes(report.blob_bytes)}
       </TableCell>
     </TableRow>
   );
@@ -647,11 +647,11 @@ function DiagnosticReportDetail({
         />
         <DetailField
           label={t("web.admin.diagnostics.detail.compressed")}
-          value={formatBytes(t, report.blob_bytes)}
+          value={formatBytes(report.blob_bytes)}
         />
         <DetailField
           label={t("web.admin.diagnostics.detail.uncompressed")}
-          value={formatBytes(t, report.uncompressed_bytes)}
+          value={formatBytes(report.uncompressed_bytes)}
         />
         <DetailField label={t("web.admin.diagnostics.detail.reportId")} value={report.id} mono />
       </div>
@@ -740,23 +740,17 @@ function formatDateTime(value: string) {
   return Number.isNaN(date.getTime()) ? value : formatPreferredDateTime(date);
 }
 
-const BINARY_SIZE_KEYS: MessageKey[] = [
-  "web.common.format.size.kib",
-  "web.common.format.size.mib",
-  "web.common.format.size.gib",
-  "web.common.format.size.tib",
-];
-
-function formatBytes(t: Translate, value?: number) {
+function formatBytes(value?: number) {
   if (value === undefined || value === null) return EM_DASH;
-  if (value < 1024) return t("web.common.format.size.bytes", { size: value });
+  if (value < 1024) return `${value} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
   let size = value / 1024;
-  let key = BINARY_SIZE_KEYS[0]!;
-  for (let index = 1; index < BINARY_SIZE_KEYS.length && size >= 1024; index += 1) {
+  let unit = units[0];
+  for (let index = 1; index < units.length && size >= 1024; index += 1) {
     size /= 1024;
-    key = BINARY_SIZE_KEYS[index]!;
+    unit = units[index];
   }
-  return t(key, { size: formatDecimal(size, size >= 10 ? 0 : 1) });
+  return `${formatDecimal(size, size >= 10 ? 0 : 1)} ${unit}`;
 }
 
 function formatPlatform(value: string) {

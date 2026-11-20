@@ -1,7 +1,5 @@
 import { catalogItemFromV2, type CatalogCardItem } from "@/api/v2/catalog";
 import type { components } from "@/api/v2/schema";
-import type { SectionTitleKey } from "@/api/types";
-import { sectionTitleKey } from "@/lib/sectionTitle";
 
 /**
  * Recommendation reads as the Discover and For You screens still model them.
@@ -13,9 +11,8 @@ import { sectionTitleKey } from "@/lib/sectionTitle";
 type RecommendationRowV2 = components["schemas"]["RecommendationRow"];
 
 /** A recommendation row as the Discover and For You screens render it. */
-export interface DiscoverRow extends SectionTitleKey {
+export interface DiscoverRow {
   type: string;
-  /** The server's title; display it through `useSectionTitle` with the key fields. */
   label: string;
   /** URL kind for the dedicated "see all" page (e.g. "for-you-main", "cluster", "genre"). */
   section_kind?: string;
@@ -28,7 +25,7 @@ export interface DiscoverResponse {
   rows: DiscoverRow[];
 }
 
-export interface RecommendationSectionResponse extends SectionTitleKey {
+export interface RecommendationSectionResponse {
   kind: string;
   key?: string;
   type: string;
@@ -40,7 +37,6 @@ export function discoverRowFromV2(row: RecommendationRowV2): DiscoverRow {
   return {
     type: row.type,
     label: row.title,
-    ...sectionTitleKey(row),
     section_kind: row.kind,
     section_key: row.key,
     items: row.items.map(catalogItemFromV2),
@@ -59,7 +55,6 @@ export function recommendationSectionFromV2(
     key: row.key,
     type: row.type,
     label: row.title,
-    ...sectionTitleKey(row),
     items: row.items.map(catalogItemFromV2),
   };
 }

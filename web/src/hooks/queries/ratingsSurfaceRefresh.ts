@@ -1,5 +1,4 @@
 import type { QueryClient } from "@tanstack/react-query";
-import { isLibraryLayoutQueryKey } from "@/lib/queryInvalidation";
 import { adminKeys, catalogKeys, ratingKeys, recKeys, sectionKeys } from "./keys";
 
 export async function invalidateRatingSurfaceQueries(queryClient: QueryClient, itemId: string) {
@@ -19,7 +18,7 @@ export async function invalidateRatingSurfaceQueries(queryClient: QueryClient, i
         startsWith(key, ratingKeys.item(itemId)) ||
         startsWith(key, catalogKeys.all) ||
         startsWith(key, recKeys.all) ||
-        isRatedSectionQuery(key)
+        startsWith(key, sectionKeys.all)
       );
     },
   });
@@ -34,13 +33,8 @@ export async function invalidateAllRatingSurfaceQueries(queryClient: QueryClient
       startsWith(query.queryKey, ratingKeys.all) ||
       startsWith(query.queryKey, catalogKeys.all) ||
       startsWith(query.queryKey, recKeys.all) ||
-      isRatedSectionQuery(query.queryKey),
+      startsWith(query.queryKey, sectionKeys.all),
   });
-}
-
-// A rating can change a section's cards, never a library's layout of rows.
-function isRatedSectionQuery(key: readonly unknown[]) {
-  return startsWith(key, sectionKeys.all) && !isLibraryLayoutQueryKey(key);
 }
 
 /**

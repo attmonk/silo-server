@@ -19,7 +19,7 @@ import (
 // or re-analysis cannot overwrite markers the old version wrote.
 const (
 	AlgorithmVersion            = 1
-	AnalysisBehaviorVersion     = 6
+	AnalysisBehaviorVersion     = 5
 	ChapterAlgorithm            = "chapter:v1"
 	ChapterSilenceAlgorithm     = "chapter:silence:v2"
 	EpisodeVersionCopyAlgorithm = "episode-version-copy:v1"
@@ -30,17 +30,12 @@ const (
 	// Credits algorithm identifiers. Credits season comparisons are keyed by
 	// CreditsAnalysisConfigHash; bump CreditsBehaviorVersion to re-run them
 	// over cached credits fingerprints.
-	CreditsBehaviorVersion      = 3
+	CreditsBehaviorVersion      = 2
 	CreditsChapterAlgorithm     = "credits-chapter:v1"
 	CreditsVersionCopyAlgorithm = "credits-version-copy:v1"
 	CreditsAudioAlgorithm       = "credits-audio:v1"
 	CreditsAudioVideoAlgorithm  = "credits-audio:video:v1"
 	CreditsVideoAlgorithm       = "credits-video:v1"
-
-	// chromaprintAlgorithmFamily prefixes every Chromaprint intro identifier
-	// local analysis has stored, current and superseded, including the
-	// subtitle-refined ones markers.scannerAlgorithmPriority ranks.
-	chromaprintAlgorithmFamily = "chromaprint:"
 
 	// legacyChapterSilenceAlgorithm extended chapter ends by up to 30 seconds.
 	// The silence backfill revisits its markers under the current limit.
@@ -429,8 +424,6 @@ type RunSummary struct {
 	FingerprintExtractionErrors int      `json:"fingerprint_extraction_errors"`
 	ChapterMarkersWritten       int      `json:"chapter_markers_written"`
 	ChromaprintMarkersWritten   int      `json:"chromaprint_markers_written"`
-	ChromaprintMarkersWithdrawn int      `json:"chromaprint_markers_withdrawn"`
-	ChapterMarkersWithdrawn     int      `json:"chapter_markers_withdrawn"`
 	GroupsNotFound              int      `json:"groups_not_found"`
 	GroupsSkipped               int      `json:"groups_skipped"`
 	Errors                      []string `json:"errors,omitempty"`
@@ -471,8 +464,4 @@ type RunSummary struct {
 	// MovieBudgetExhausted reports that the run stopped starting movies
 	// when the movie budget ran out; the rest wait for the next run.
 	MovieBudgetExhausted bool `json:"movie_budget_exhausted"`
-	// EpisodeBudgetExhausted reports that the episodes stopped early to
-	// leave the movies their share of the run's time limit; the rest wait
-	// for the next run.
-	EpisodeBudgetExhausted bool `json:"episode_budget_exhausted"`
 }

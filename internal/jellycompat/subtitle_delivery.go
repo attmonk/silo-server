@@ -108,7 +108,7 @@ func (h *PlaybackHandler) deliverSubtitle(w http.ResponseWriter, r *http.Request
 			writeError(w, 406, "NotSupported", "ASS requires original timestamps and an ASS source")
 			return
 		}
-		playback.ServeSubtitle(w, data, requested)
+		writeSubtitleResponse(w, requested, data)
 		return
 	}
 	// Text written for left-to-right players gets its right-to-left lines
@@ -117,7 +117,7 @@ func (h *PlaybackHandler) deliverSubtitle(w http.ResponseWriter, r *http.Request
 		data = subtitles.MarkLTRAuthoredLines(data)
 	}
 	if requested == format && start == 0 && end == 0 && !timeMap {
-		playback.ServeSubtitle(w, data, requested)
+		writeSubtitleResponse(w, requested, data)
 		return
 	}
 	if format != compatSubtitleVTT {
@@ -147,7 +147,7 @@ func (h *PlaybackHandler) deliverSubtitle(w http.ResponseWriter, r *http.Request
 		}
 		return
 	}
-	playback.ServeSubtitle(w, result, requested)
+	writeSubtitleResponse(w, requested, result)
 }
 
 func subtitleTicks(value string) (int64, error) {

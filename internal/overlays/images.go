@@ -122,7 +122,7 @@ func (l *ImageLibrary) Upload(ctx context.Context, name, declaredType string, da
 	}
 	out, width, height, err := imageutil.EncodeWebPWithin(data, maxImageWidth, maxImageHeight)
 	if err != nil {
-		if imageutil.SourceUnusable(err, data) {
+		if errors.Is(err, imageutil.ErrInvalidImage) || imageutil.PixelDataUndecodable(data) {
 			return Image{}, ErrUnsupportedImage
 		}
 		return Image{}, fmt.Errorf("encoding overlay image: %w", err)

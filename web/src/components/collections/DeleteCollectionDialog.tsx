@@ -21,13 +21,7 @@ import {
   deleteWithRowsLabel,
   serverDeleteDescription,
 } from "@/lib/collections/copy";
-import {
-  deleteWithRowChangesLabel,
-  keepsRowWithoutCollection,
-  openRowPath,
-  removedFromRow,
-  type RowsState,
-} from "@/lib/collections/rows";
+import { openRowPath, type RowsState } from "@/lib/collections/rows";
 
 import { CollectionRowSummary } from "./CollectionRowSummary";
 import { useT } from "@/i18n";
@@ -80,8 +74,6 @@ export function DeleteCollectionDialog({
     );
   }
   const listed = rows.status === "ready" ? rows.rows : [];
-  // A row of collections that lists others too stays, without this one.
-  const keepsSome = listed.some(keepsRowWithoutCollection);
   return (
     <AlertDialog
       open={open}
@@ -116,11 +108,7 @@ export function DeleteCollectionDialog({
             <ul className="border-border/80 divide-border/70 grid divide-y rounded-xl border">
               {listed.map((row) => (
                 <li key={row.id} className="flex items-center gap-3 px-3 py-2.5">
-                  <CollectionRowSummary
-                    row={row}
-                    libraryNames={rowLibraryNames}
-                    note={keepsRowWithoutCollection(row) ? removedFromRow(row.title) : undefined}
-                  />
+                  <CollectionRowSummary row={row} libraryNames={rowLibraryNames} />
                   <Link
                     to={openRowPath(row)}
                     aria-label={t("web.collections.deleteDialog.openRowNamed", {
@@ -158,11 +146,9 @@ export function DeleteCollectionDialog({
                   className="me-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent"
                 />
               ) : null}
-              {rows.status !== "ready"
-                ? t("web.collections.deleteDialog.delete")
-                : keepsSome
-                  ? deleteWithRowChangesLabel(listed.length)
-                  : deleteWithRowsLabel(listed.length)}
+              {rows.status === "ready"
+                ? deleteWithRowsLabel(listed.length)
+                : t("web.collections.deleteDialog.delete")}
             </Button>
           </div>
         </AlertDialogFooter>

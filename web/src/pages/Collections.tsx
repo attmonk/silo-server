@@ -66,7 +66,6 @@ import { cardGridClasses } from "@/lib/uiCustomization";
 import { cn } from "@/lib/utils";
 import { useT, type MessageKey, type Translate } from "@/i18n";
 import { SharedCards, SortableCollectionCard } from "./Collections.cards";
-import { useMotionScrollBehavior } from "@/hooks/usePrefersReducedMotion";
 
 /** Under this width New collection moves to a bar docked at the bottom. */
 const NARROW_QUERY = "(max-width: 1023px)";
@@ -163,7 +162,7 @@ export default function Collections() {
   // only once what it shows has loaded: a slow or failed request isn't "none".
   let emptyMessage: string | undefined;
   if (show === "mine" && personalLoaded && own.length === 0)
-    emptyMessage = t("web.collections.page.emptyMine");
+    emptyMessage = "You haven't made any collections yet.";
   else if (
     show === "all" &&
     personalLoaded &&
@@ -171,7 +170,7 @@ export default function Collections() {
     server.isSuccess &&
     own.length + sharedCards.length + libraries.length === 0
   )
-    emptyMessage = t("web.collections.page.emptyAll");
+    emptyMessage = "There are no collections yet.";
 
   function changeShow(next: string) {
     setSearchParams(
@@ -532,13 +531,9 @@ function SortableCollectionGrid({
 }) {
   const t = useT();
   const ids = collections.map((collection) => collection.id);
-  const scrollBehavior = useMotionScrollBehavior();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-      scrollBehavior,
-    }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
   const blockClicks = useClickBlockAfterPointerDrag();
   function handleDragStart(event: DragStartEvent) {
@@ -558,11 +553,7 @@ function SortableCollectionGrid({
       sensors={sensors}
       collisionDetection={closestCenter}
       // In the body, not inline: inline it would put divs inside the wall's list.
-      accessibility={{
-        announcements: moveAnnouncements(t, collections),
-        screenReaderInstructions: { draggable: t("web.common.sortable.instructions") },
-        container: document.body,
-      }}
+      accessibility={{ announcements: moveAnnouncements(t, collections), container: document.body }}
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
       onDragCancel={blockClicks.settle}

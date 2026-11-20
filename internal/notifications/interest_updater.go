@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -125,7 +124,7 @@ func NewInterestUpdater(
 }
 
 // QueueItemMutation records that a profile's relationship to a media item
-// (watch progress, watch history, Home removal) changed. The item is
+// (favorite, watchlist, watch progress, Home removal) changed. The item is
 // resolved to its parent series asynchronously; movie targets are ignored.
 // Safe to call from hot request paths.
 func (u *InterestUpdater) QueueItemMutation(userID int, profileID, itemID string) {
@@ -208,8 +207,7 @@ func (u *InterestUpdater) QueueItemMutationAfter(userID int, profileID, itemID s
 	u.mu.Unlock()
 }
 
-// noteHomeChange records a change to what Home shows the profile: a removal
-// or restore, or a finished episode, which moves the Next Up anchor.
+// noteHomeChange records a Home removal or restore of the profile.
 func (u *InterestUpdater) noteHomeChange(userID int, profileID string, at time.Time) {
 	if u == nil {
 		return
@@ -427,7 +425,7 @@ func (u *InterestUpdater) RecomputeSeries(ctx context.Context, userID int, profi
 		return fmt.Errorf("open user store: %w", err)
 	}
 
-	episodeKeys, err := u.loadSeriesEpisodeKeys(ctx, seriesID)
+	episodeKeys, seasonIDs, err := u.loadSeriesStructure(ctx, seriesID)
 	if err != nil {
 		return err
 	}
@@ -436,8 +434,29 @@ func (u *InterestUpdater) RecomputeSeries(ctx context.Context, userID int, profi
 		episodeIDs = append(episodeIDs, id)
 	}
 
+	// Favorites/watchlist against episode or season items resolve to the
+	// series, so the membership check spans the series and its children.
+	interestTargets := append([]string{seriesID}, seasonIDs...)
+	interestTargets = append(interestTargets, episodeIDs...)
+
+	favorite, err := anyInBatches(interestTargets, func(chunk []string) (bool, error) {
+		matches, err := store.ListFavoritesByMediaItems(ctx, profileID, chunk)
+		return anyTrue(matches), err
+	})
+	if err != nil {
+		return fmt.Errorf("load favorites: %w", err)
+	}
+	watchlist, err := anyInBatches(interestTargets, func(chunk []string) (bool, error) {
+		matches, err := store.ListWatchlistByMediaItems(ctx, profileID, chunk)
+		return anyTrue(matches), err
+	})
+	if err != nil {
+		return fmt.Errorf("load watchlist: %w", err)
+	}
+
 	var inProgress []userstore.WatchProgress
 	started := make([]string, 0, 16)
+	var completedEpisodes []completedEpisode
 	// Home anchors Next Up on the most recently completed episode, ties going
 	// to the later episode. A special anchor moves to the most recent regular
 	// one; see below.
@@ -473,9 +492,8 @@ func (u *InterestUpdater) RecomputeSeries(ctx context.Context, userID int, profi
 			if entry.Completed {
 				markCompleted(episodeID)
 				if key, ok := episodeKeys[episodeID]; ok {
-					// Next Up orders completions by the full timestamp, so two
-					// within one second keep their order for the anchor (#2878).
-					at := progressTime(entry)
+					at, _ := time.Parse(time.RFC3339, entry.UpdatedAt)
+					completedEpisodes = append(completedEpisodes, completedEpisode{key: key, at: at})
 					if !hasAnchor || completedLater(at, key, anchorAt, anchorKey) {
 						anchorKey, anchorAt, hasAnchor = key, at, true
 					}
@@ -489,87 +507,80 @@ func (u *InterestUpdater) RecomputeSeries(ctx context.Context, userID int, profi
 	// Specials carry no airing position, so Home doesn't let one anchor a
 	// series that has regular seasons: it resumes after the most recent
 	// regular episode, or at the first one (catalog's nextUpAnchorsCTE).
-	var anchor *nextUpAnchor
-	if hasAnchor {
-		anchor = &nextUpAnchor{key: anchorKey, at: anchorAt}
-		if anchorKey < firstRegularEpisodeKey && hasRegularEpisodes(episodeKeys) {
-			anchor.moved = true
-			anchor.key = firstRegularEpisodeKey - 1
-			if hasRegularAnchor {
-				anchor.key, anchor.regularAt, anchor.hasRegularAt = regularAnchorKey, regularAnchorAt, true
-			}
+	if hasAnchor && anchorKey < firstRegularEpisodeKey && hasRegularEpisodes(episodeKeys) {
+		anchorKey = firstRegularEpisodeKey - 1
+		if hasRegularAnchor {
+			anchorKey = regularAnchorKey
 		}
 	}
-	// Home keeps a partly watched series off Next Up while that progress is
-	// newer than the anchor; so do notifications.
-	partlyWatched := partlyWatchedSinceAnchor(anchor, inProgress, episodeKeys)
 
 	// Completed watch history counts too: history imports and watch-provider
 	// syncs may record a watched-at fact without ever writing a progress row,
-	// and those episodes must still advance the progression cursor. A
-	// completed history entry also counts as started for the cursor walk.
+	// and those episodes must still advance the progression cursor.
 	for start := 0; start < len(episodeIDs); start += interestQueryChunk {
 		end := min(start+interestQueryChunk, len(episodeIDs))
-		items, err := store.ListCompletedHistoryItems(ctx, userstore.CompletedHistoryItemQuery{
-			ProfileID:    profileID,
-			MediaItemIDs: episodeIDs[start:end],
-		})
-		if err != nil {
-			return fmt.Errorf("load completed history: %w", err)
-		}
-		for _, item := range items {
-			markCompleted(item.MediaItemID)
-			started = append(started, item.MediaItemID)
+		chunk := episodeIDs[start:end]
+		for offset := 0; ; {
+			entries, err := store.ListCompletedHistory(ctx, userstore.CompletedHistoryQuery{
+				ProfileID:    profileID,
+				MediaItemIDs: chunk,
+				Limit:        interestQueryChunk,
+				Offset:       offset,
+			})
+			if err != nil {
+				return fmt.Errorf("load completed history: %w", err)
+			}
+			for _, entry := range entries {
+				markCompleted(entry.MediaItemID)
+			}
+			if len(entries) < interestQueryChunk {
+				break
+			}
+			offset += len(entries)
 		}
 	}
 
-	// The Next Up cursor (next_expected_episode_key) starts after Home's
-	// anchor. A profile with completed history but no completed progress row
-	// (an import, a watch-provider sync) has no Home anchor; it anchors on
-	// the highest completed episode instead, so notifications still follow
-	// it although Home shows no Next Up card. From there the cursor walks past
-	// the listed episodes the profile has started (nextUpCursor).
+	// Conservative progression cursor: next_expected = last completed key + 1.
+	// When the profile has gaps (completed E10 with E05 unwatched), a late-
+	// arriving E05 will not match next_up (it may still match favorite /
+	// watchlist / continue_watching). The plan explicitly prefers this
+	// under-notify tradeoff over per-episode gap scans at recompute time.
 	var lastCompleted, nextExpected *int
-	cursorAnchor := lastCompletedKey
-	if anchor != nil {
-		cursorAnchor = anchor.key
-	}
 	if hasCompleted {
 		completed := lastCompletedKey
+		expected := lastCompletedKey + 1
 		lastCompleted = &completed
-		// Home counts a progress row a history hide covers as started; the
-		// store's listing above leaves those out.
-		postgresStarted, err := u.postgresStartedEpisodes(ctx, userID, profileID, seriesID)
-		if err != nil {
-			return err
-		}
-		cursor := nextUpCursor(cursorAnchor, episodeKeys, slices.Concat(started, postgresStarted))
-		nextExpected = &cursor
+		nextExpected = &expected
 	}
 
-	// Notifications follow Home: a series the profile dropped, whose Next Up
-	// card it removed, or that it is partway through stops notifying. The
-	// progression cursor is kept, so next_up resumes from the right episode
-	// once the removal lapses or the episode is finished.
-	nextUpCandidate := false
+	// Notifications follow Home: a series the profile removed from Continue
+	// Watching or Next Up stops notifying for that reason. The progression
+	// cursor is kept, so next_up resumes from the right episode once the
+	// removal lapses.
+	continueWatching, nextUpCandidate := false, false
+	inProgress = catalog.FilterSupersededProgress(inProgress,
+		supersededInProgress(inProgress, completedEpisodes, episodeKeys))
 	if hasProgression {
+		inProgressIDs := make([]string, len(inProgress))
+		for i, entry := range inProgress {
+			inProgressIDs[i] = entry.MediaItemID
+		}
 		var nextUpItems []string
 		if hasAnchor {
 			nextUpItems = episodeIDs
 		}
-		hides, err := u.loadHomeHides(ctx, store, userID, profileID, seriesID, nextUpItems)
+		hides, err := u.loadHomeHides(ctx, store, userID, profileID, seriesID, inProgressIDs, nextUpItems)
 		if err != nil {
 			return err
 		}
-		nextUpCandidate = !hides.dropped && !partlyWatched
+		continueWatching = hides.continueWatchingVisible(inProgress)
+		nextUpCandidate = !hides.dropped
 		if nextUpCandidate && len(hides.nextUp) > 0 {
-			// A dismissal hides the card only while its episode is the one
-			// Home shows, so read Home's Next Up card for the series.
-			card, err := u.nextUpEpisode(ctx, userID, profileID, seriesID, cursorAnchor+1, started)
+			next, err := u.nextUpEpisode(ctx, userID, profileID, seriesID, anchorKey+1, started)
 			if err != nil {
 				return err
 			}
-			nextUpCandidate = hides.nextUpVisible(card)
+			nextUpCandidate = hides.nextUpVisible(next)
 		}
 	}
 
@@ -577,12 +588,15 @@ func (u *InterestUpdater) RecomputeSeries(ctx context.Context, userID int, profi
 		UserID:                  userID,
 		ProfileID:               profileID,
 		SeriesID:                seriesID,
+		Favorite:                favorite,
+		Watchlist:               watchlist,
+		ContinueWatching:        continueWatching,
 		NextUpCandidate:         nextUpCandidate,
 		LastCompletedEpisodeKey: lastCompleted,
 		NextExpectedEpisodeKey:  nextExpected,
 	}
 
-	if !nextUpCandidate && lastCompleted == nil {
+	if !flags.HasAnyInterest() && lastCompleted == nil {
 		// Nothing can ever notify: drop all rows for the pair.
 		return u.interests.DeleteStaleForProfileSeries(ctx, userID, profileID, seriesID, []int{})
 	}
@@ -613,29 +627,49 @@ func completedLater(at time.Time, key int, currentAt time.Time, currentKey int) 
 	return at.After(currentAt) || (at.Equal(currentAt) && key > currentKey)
 }
 
-// loadSeriesEpisodeKeys returns the series' episode keys (content_id ->
-// episode_key).
-func (u *InterestUpdater) loadSeriesEpisodeKeys(ctx context.Context, seriesID string) (map[string]int, error) {
+// loadSeriesStructure returns the series' episode keys (content_id ->
+// episode_key) and season content IDs.
+func (u *InterestUpdater) loadSeriesStructure(ctx context.Context, seriesID string) (map[string]int, []string, error) {
 	rows, err := u.pool.Query(ctx,
 		`SELECT content_id, season_number, episode_number FROM episodes WHERE series_id = $1`,
 		seriesID)
 	if err != nil {
-		return nil, fmt.Errorf("load series episodes: %w", err)
+		return nil, nil, fmt.Errorf("load series episodes: %w", err)
 	}
-	defer rows.Close()
 	episodeKeys := make(map[string]int, 64)
 	for rows.Next() {
 		var contentID string
 		var seasonNumber, episodeNumber int
 		if err := rows.Scan(&contentID, &seasonNumber, &episodeNumber); err != nil {
-			return nil, fmt.Errorf("scan series episode: %w", err)
+			rows.Close()
+			return nil, nil, fmt.Errorf("scan series episode: %w", err)
 		}
 		if !ValidEpisodeOrdinals(seasonNumber, episodeNumber) {
 			continue
 		}
 		episodeKeys[contentID] = EpisodeKey(seasonNumber, episodeNumber)
 	}
-	return episodeKeys, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	seasonRows, err := u.pool.Query(ctx,
+		`SELECT content_id FROM seasons WHERE series_id = $1`, seriesID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load series seasons: %w", err)
+	}
+	seasonIDs := make([]string, 0, 8)
+	for seasonRows.Next() {
+		var contentID string
+		if err := seasonRows.Scan(&contentID); err != nil {
+			seasonRows.Close()
+			return nil, nil, fmt.Errorf("scan series season: %w", err)
+		}
+		seasonIDs = append(seasonIDs, contentID)
+	}
+	seasonRows.Close()
+	return episodeKeys, seasonIDs, seasonRows.Err()
 }
 
 // visibleSeriesLibraries intersects the series' library memberships with the
@@ -695,4 +729,27 @@ func (u *InterestUpdater) visibleSeriesLibraries(ctx context.Context, userID int
 		visible = append(visible, libraryID)
 	}
 	return visible, nil
+}
+
+func anyInBatches(ids []string, check func(chunk []string) (bool, error)) (bool, error) {
+	for start := 0; start < len(ids); start += interestQueryChunk {
+		end := min(start+interestQueryChunk, len(ids))
+		found, err := check(ids[start:end])
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func anyTrue(values map[string]bool) bool {
+	for _, v := range values {
+		if v {
+			return true
+		}
+	}
+	return false
 }

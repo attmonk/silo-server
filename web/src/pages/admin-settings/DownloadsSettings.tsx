@@ -118,7 +118,6 @@ export default function DownloadsSettings() {
           <SettingField
             label={t("web.admin.settings.downloads.enabled.label")}
             type="toggle"
-            description={t("web.admin.settings.downloads.enabled.description")}
             value={form.getValue("download.enabled")}
             onChange={(v) => form.setValue("download.enabled", v)}
             restartRequired={restartKeys.has("download.enabled")}
@@ -148,14 +147,13 @@ export default function DownloadsSettings() {
             value={form.getValue("download.artifact_dir")}
             onChange={(v) => form.setValue("download.artifact_dir", v)}
             restartRequired={restartKeys.has("download.artifact_dir")}
-            managedByEnv={form.envVar("download.artifact_dir")}
           />
           {/* Stored as raw bytes (download.artifact_max_bytes); typed in GB
               because nobody sizes a disk budget in bytes. Unlimited stays
               the default and still writes the 0 sentinel. */}
           <LimitField
             label={t("web.admin.settings.downloads.budget.label")}
-            unit={t("web.admin.common.units.gigabytes")}
+            unit="GB"
             scale={BYTES_PER_GB}
             hint={t("web.admin.settings.downloads.budget.hint")}
             value={form.getValue("download.artifact_max_bytes")}
@@ -172,7 +170,7 @@ export default function DownloadsSettings() {
           />
           <LimitField
             label={t("web.admin.settings.downloads.serverBandwidth.label")}
-            unit={t("web.admin.common.units.megabitsPerSecond")}
+            unit="Mbps"
             hint={t("web.admin.settings.downloads.serverBandwidth.hint")}
             value={form.getValue("download.server_bandwidth_mbps")}
             onChange={(v) => form.setValue("download.server_bandwidth_mbps", v)}
@@ -189,7 +187,7 @@ export default function DownloadsSettings() {
             </SettingsSubheading>
             <LimitField
               label={t("web.admin.settings.downloads.perUser.bandwidth.label")}
-              unit={t("web.admin.common.units.megabitsPerSecond")}
+              unit="Mbps"
               value={form.getValue("download.user_bandwidth_mbps")}
               onChange={(v) => form.setValue("download.user_bandwidth_mbps", v)}
               restartRequired={restartKeys.has("download.user_bandwidth_mbps")}

@@ -178,7 +178,7 @@ func overrideEntry(ctx context.Context, tx pgx.Tx, o userstore.SectionOverride) 
 		}
 		e.Section = &ref
 	}
-	for _, config := range []*string{&e.Config, &e.UserConfig} {
+	for _, config := range []string{o.Config, o.UserConfig} {
 		here, err := collectionsHere(ctx, tx, config)
 		if err != nil || !here {
 			return e, false, err
@@ -206,37 +206,22 @@ func configCollection(config, field string) string {
 }
 
 // collectionsHere reports whether every collection a configuration names
-// is on this server. A row of collections' list instead loses the entries
-// whose collection is gone, written back to config, and is here while one
-// is left.
-func collectionsHere(ctx context.Context, tx pgx.Tx, config *string) (bool, error) {
-	exists := func(field, id string) (bool, error) {
-		var here bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM `+collectionTables[field]+` WHERE id = $1)`, id).Scan(&here); err != nil {
-			return false, fmt.Errorf("reading collections: %w", err)
-		}
-		return here, nil
-	}
-	for field := range collectionTables {
-		id := configCollection(*config, field)
+// is on this server.
+func collectionsHere(ctx context.Context, tx pgx.Tx, config string) (bool, error) {
+	for field, table := range collectionTables {
+		id := configCollection(config, field)
 		if id == "" {
 			continue
 		}
-		if here, err := exists(field, id); err != nil || !here {
-			return false, err
+		var here bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM `+table+` WHERE id = $1)`, id).Scan(&here); err != nil {
+			return false, fmt.Errorf("reading collections: %w", err)
+		}
+		if !here {
+			return false, nil
 		}
 	}
-	pruned, total, kept, err := userdata.RemapCollectionList(json.RawMessage(*config), func(field, id string) (string, bool, error) {
-		here, err := exists(field, id)
-		return id, here, err
-	})
-	if err != nil || total == 0 {
-		return err == nil, err
-	}
-	if kept < total {
-		*config = string(pruned)
-	}
-	return kept > 0, nil
+	return true, nil
 }
 
 // remapCollections maps the collection ids a configuration names to the
@@ -261,22 +246,11 @@ func remapCollections(ctx context.Context, target userdata.Target, config string
 			changed = true
 		}
 	}
-	if changed {
-		out, err := json.Marshal(doc)
-		if err != nil {
-			return "", false, err
-		}
-		config = string(out)
+	if !changed {
+		return config, true, nil
 	}
-	// A row of collections keeps the entries whose collection maps, and
-	// maps while one is left.
-	listed, total, kept, err := userdata.RemapCollectionList(json.RawMessage(config), func(field, id string) (string, bool, error) {
-		return target.MapCollection(ctx, field, id)
-	})
-	if err != nil || total == 0 {
-		return config, err == nil, err
-	}
-	return string(listed), kept > 0, nil
+	out, err := json.Marshal(doc)
+	return string(out), err == nil, err
 }
 
 // carried keeps the overrides an export carries, so a page compares equal
@@ -284,13 +258,11 @@ func remapCollections(ctx context.Context, target userdata.Target, config string
 func carried(ctx context.Context, tx pgx.Tx, list []userstore.SectionOverride) ([]userstore.SectionOverride, error) {
 	out := make([]userstore.SectionOverride, 0, len(list))
 	for _, o := range list {
-		e, ok, err := overrideEntry(ctx, tx, o)
+		_, ok, err := overrideEntry(ctx, tx, o)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
-			// As carried: without the collections a row lost.
-			o.Config, o.UserConfig = e.Config, e.UserConfig
 			out = append(out, o)
 		}
 	}

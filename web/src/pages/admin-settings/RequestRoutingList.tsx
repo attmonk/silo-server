@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { DndContext, type Announcements, type UniqueIdentifier } from "@dnd-kit/core";
-import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { AlertTriangle, GripVertical, MoreHorizontal, Plus } from "lucide-react";
 
@@ -29,7 +29,7 @@ import {
   useRequestIntegrationOptions,
   useUpdateRequestRoute,
 } from "@/hooks/queries/admin/requests";
-import { useMotionSafeSortable, useSortableList } from "@/hooks/useSortableList";
+import { useSortableList } from "@/hooks/useSortableList";
 import { useAppLanguage, useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 
@@ -149,11 +149,10 @@ function RuleRow({
   onFix: (fix: RoutingWarningFix) => void;
 }) {
   const t = useT();
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useMotionSafeSortable({
-      id: rule.id,
-      disabled: busy,
-    });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: rule.id,
+    disabled: busy,
+  });
   const fallback = scope.fallback;
   const below = scope.rules.slice(index + 1);
   const fourK: ReactNode = rule.skip_uhd
@@ -520,10 +519,7 @@ export function RequestRoutingList({
           sensors={sortable.sensors}
           collisionDetection={sortable.collisionDetection}
           onDragEnd={sortable.handleDragEnd}
-          accessibility={{
-            announcements,
-            screenReaderInstructions: { draggable: t("web.common.sortable.instructions") },
-          }}
+          accessibility={{ announcements }}
         >
           <SortableContext items={ids} strategy={verticalListSortingStrategy}>
             <ol

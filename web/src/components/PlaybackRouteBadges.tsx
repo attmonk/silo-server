@@ -37,23 +37,13 @@ function NetworkBadge({ name, title }: { name: string; title: string }) {
   );
 }
 
-/**
- * The selected access network and serving nodes, shared by all activity views.
- * showLocation={false} leaves out the Local/Remote badge for a view that shows
- * the location next to the client address instead.
- */
-export function PlaybackRouteBadges({
-  session,
-  showLocation = true,
-}: {
-  session: AdminSession;
-  showLocation?: boolean;
-}) {
+/** The selected access network and serving nodes, shared by all activity views. */
+export function PlaybackRouteBadges({ session }: { session: AdminSession }) {
   const t = useT();
   const provider = session.routing_network_provider;
   return (
     <>
-      {showLocation && session.stream_location && (
+      {session.stream_location && (
         <span
           title={t("web.player.routeBadge.locationTitle", { location: session.stream_location })}
           aria-label={t("web.player.routeBadge.locationAria", {

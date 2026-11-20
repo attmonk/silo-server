@@ -340,9 +340,9 @@ func (p *PluginProvider) PollDeviceAuth(ctx context.Context, _ ServerConfig, ses
 		}
 		return TokenSet{}, deviceAuthorizationPendingError{session: updated}
 	case pluginv1.WatchSyncDeviceAuthorizationStatus_WATCH_SYNC_DEVICE_AUTHORIZATION_STATUS_DENIED:
-		return TokenSet{}, fmt.Errorf("watch sync plugin: %w", ErrDeviceAuthDenied)
+		return TokenSet{}, errors.New("watch sync plugin device authorization was denied")
 	case pluginv1.WatchSyncDeviceAuthorizationStatus_WATCH_SYNC_DEVICE_AUTHORIZATION_STATUS_EXPIRED:
-		return TokenSet{}, fmt.Errorf("watch sync plugin: %w", ErrAuthSessionExpired)
+		return TokenSet{}, errors.New("watch sync plugin device authorization expired")
 	case pluginv1.WatchSyncDeviceAuthorizationStatus_WATCH_SYNC_DEVICE_AUTHORIZATION_STATUS_AUTHORIZED:
 		return tokenSetFromProto(response.GetCredentials())
 	default:

@@ -98,12 +98,6 @@ func ResolveLibraryCollectionMembership(c *models.LibraryCollection, access Acce
 // keeps the titles its own sort ranks first. The members never depend on the
 // viewer's profile, because library collections are shared.
 func PreviewLiveLibraryCollection(ctx context.Context, pool *pgxpool.Pool, m LibraryCollectionMembership, access AccessFilter, limit int) ([]*models.MediaItem, int, error) {
-	return previewLiveLibraryCollection(ctx, pool, m, access, limit, true)
-}
-
-// previewLiveLibraryCollection is PreviewLiveLibraryCollection, counting the
-// members only when includeTotal is set.
-func previewLiveLibraryCollection(ctx context.Context, pool *pgxpool.Pool, m LibraryCollectionMembership, access AccessFilter, limit int, includeTotal bool) ([]*models.MediaItem, int, error) {
 	if !m.Live || m.OutOfScope {
 		return []*models.MediaItem{}, 0, nil
 	}
@@ -118,6 +112,5 @@ func previewLiveLibraryCollection(ctx context.Context, pool *pgxpool.Pool, m Lib
 		executor.SourceWhere, executor.SourceArgs = predicate, args
 		def = QueryDefinition{Sort: m.Sort}
 	}
-	items, total, _, err := executor.PreviewPage(ctx, def, access, limit, 0, includeTotal)
-	return items, total, err
+	return executor.Preview(ctx, def, access, limit)
 }

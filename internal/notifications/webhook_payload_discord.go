@@ -7,11 +7,13 @@ import (
 	"time"
 )
 
-// Discord embed accent colors (decimal RGB): the Next Up reason's, and the
-// default for an embed with no reason, such as a request notice.
+// Discord embed accent colors per reason (decimal RGB), in reason precedence
+// order: favorite, watchlist, continue_watching, next_up.
 const (
-	discordColorDefault = 5814783
-	discordColorNextUp  = 15158332
+	discordColorFavorite         = 5814783
+	discordColorWatchlist        = 3066993
+	discordColorContinueWatching = 15844367
+	discordColorNextUp           = 15158332
 )
 
 // Discord embed limits (enforced by the builder).
@@ -132,8 +134,6 @@ func discordEmbedAuthorLine(row DeliveryRow) string {
 			return "Now available on Silo"
 		}
 		return "Your request is now available on Silo"
-	case DeliveryTypeWatchlistAvailable:
-		return "Now available on Silo"
 	case DeliveryTypeRequestApproved:
 		return "Your request was approved on Silo"
 	case DeliveryTypeRequestDeclined:
@@ -168,6 +168,9 @@ func buildDiscordDigestEntry(row DeliveryRow, test bool) discordDigestEntry {
 	title := truncateWithEllipsis(discordEmbedTitle(row), discordTitleLimit)
 
 	overview := row.SeriesOverview
+	if row.Type == DeliveryTypeIncoming || row.Type == DeliveryTypePremiere {
+		overview = incomingFlags(row).Message
+	}
 	if row.Type == DeliveryTypeEpisodeAvailable && row.EpisodeOverview != "" {
 		overview = row.EpisodeOverview
 	}
@@ -239,16 +242,13 @@ func buildDiscordDigestEntry(row DeliveryRow, test bool) discordDigestEntry {
 
 func discordEmbedTitle(row DeliveryRow) string {
 	switch row.Type {
+	case DeliveryTypeIncoming, DeliveryTypePremiere:
+		return incomingFlags(row).Title
 	case DeliveryTypeRequestFulfilled:
 		if row.SeriesTitle != "" {
 			return titleWithYear(row.SeriesTitle, row.Year)
 		}
 		return "Request fulfilled"
-	case DeliveryTypeWatchlistAvailable:
-		if row.SeriesTitle != "" {
-			return titleWithYear(row.SeriesTitle, row.Year)
-		}
-		return "Watchlist title available"
 	case DeliveryTypeRequestApproved, DeliveryTypeRequestDeclined:
 		// No catalog join exists for an unfulfilled request; the title rides
 		// in the reason flags.
@@ -281,10 +281,18 @@ func discordEmbedTitle(row DeliveryRow) string {
 }
 
 func discordEmbedColor(flags ReasonFlags) int {
-	if flags.NextUp {
+	switch {
+	case flags.Favorite:
+		return discordColorFavorite
+	case flags.Watchlist:
+		return discordColorWatchlist
+	case flags.ContinueWatching:
+		return discordColorContinueWatching
+	case flags.NextUp:
 		return discordColorNextUp
+	default:
+		return discordColorFavorite
 	}
-	return discordColorDefault
 }
 
 // discordEmbedTotal counts the embed text Discord's 6,000-character limit

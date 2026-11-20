@@ -32,6 +32,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/literaryworks"
 	"github.com/Silo-Server/silo-server/internal/metadata/translation"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 	"github.com/Silo-Server/silo-server/internal/ratingsources"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
@@ -146,68 +147,67 @@ type Dependencies struct {
 	AdminDownloadStorage             AdminDownloadStorageService
 	AdminDownloadDevices             AdminDownloadDeviceService
 	// DownloadPrepareAgain prepares a finished download's expired file again.
-	DownloadPrepareAgain           DownloadPrepareAgainService
-	AdminNodeSessions              AdminNodeSessionService
-	AdminPlaybackCommands          AdminPlaybackCommandService
-	AdminPlaybackTerminate         AdminPlaybackTerminateService
-	AdminAutoscanConnections       AdminAutoscanConnectionsService
-	AdminAutoscanInspection        AdminAutoscanInspectionService
-	AdminAutoscanSources           AdminAutoscanSourcesService
-	AutoscanDelivery               AutoscanDeliveryService
-	Onboarding                     OnboardingService
-	DownloadCreation               DownloadCreationService
-	AdminJellyfinCompatStatus      AdminJellyfinCompatStatusService
-	AdminSettingRead               AdminSettingReadService
-	AdminJellyfinCompatWeb         AdminJellyfinCompatWebService
-	AdminRateLimitsWrite           AdminRateLimitWriteService
-	AdminRateLimits                AdminRateLimitReadService
-	DownloadSubscriptionMutations  DownloadSubscriptionMutationService
-	DownloadSubscriptionSync       DownloadSubscriptionSyncService
-	DiagnosticsChunks              DiagnosticsChunksService
-	DiagnosticsIngress             DiagnosticsIngressService
-	EventsSocket                   EventsSocketService
-	AdminLogsSocket                AdminLogsSocketService
-	PlaybackControlSocket          PlaybackControlSocketService
-	EventsCapability               EventsCapabilityService
-	NetworkAccess                  NetworkAccessService
-	ServerIdentity                 ServerIdentityService
-	ServerConnections              ServerConnections
-	NotificationDestinationCreate  NotificationDestinationCreateService
-	AdminUnmatchedFiles            AdminUnmatchedFilesService
-	AdminCatalogItems              AdminCatalogItemsService
-	AdminCatalogImages             AdminCatalogImagesService
-	AdminCatalogMatch              AdminCatalogMatchService
-	AdminCatalogSplit              AdminCatalogSplitService
-	AdminMarkerContributions       AdminMarkerContributionsService
-	AdminMarkerProviders           AdminMarkerProvidersService
-	AdminMarkerHistory             AdminMarkerHistoryService
-	AdminEpisodeMarkers            AdminEpisodeMarkersService
-	DownloadSubscriptions          DownloadSubscriptionService
-	DownloadManifests              DownloadManifestService
-	DownloadDelivery               DownloadDeliveryService
-	Downloads                      DownloadRegistryService
-	DownloadProxyDelivery          func() bool
-	WebhookReceiver                WebhookReceiverService
-	SubtitleAIReads                SubtitleAIReadService
-	NotificationDiscordLinks       NotificationDiscordLinkService
-	NotificationEmailLinks         NotificationEmailLinkService
-	NotificationDestinationTests   NotificationDestinationTestService
-	AdminDevices                   AdminDeviceService
-	UserLibraries                  UserLibraryService
-	EbookAnnotations               EbookAnnotationService
-	AdminNotificationDiscord       AdminNotificationDiscordService
-	NotificationDestinations       NotificationDestinationService
-	NotificationPluginDestinations NotificationPluginDestinationService
-	EbookFiles                     EbookFileService
-	EbookConfig                    EbookConfigService
-	EbookProgress                  EbookProgressService
-	AdminItemMetadata              AdminItemMetadataService
-	AdminMetadataTranslation       AdminMetadataTranslationService
-	AdminPeople                    AdminPeopleService
-	AdminDiagnosticDownloads       AdminDiagnosticDownloadService
-	AdminJobArtifacts              AdminJobArtifactService
-	AdminJobArtifactSigner         *artworkurl.Signer
-	AdminBackups                   AdminBackupService
+	DownloadPrepareAgain          DownloadPrepareAgainService
+	AdminNodeSessions             AdminNodeSessionService
+	AdminPlaybackCommands         AdminPlaybackCommandService
+	AdminPlaybackTerminate        AdminPlaybackTerminateService
+	AdminAutoscanConnections      AdminAutoscanConnectionsService
+	AdminAutoscanInspection       AdminAutoscanInspectionService
+	AdminAutoscanSources          AdminAutoscanSourcesService
+	AutoscanDelivery              AutoscanDeliveryService
+	Onboarding                    OnboardingService
+	DownloadCreation              DownloadCreationService
+	AdminJellyfinCompatStatus     AdminJellyfinCompatStatusService
+	AdminSettingRead              AdminSettingReadService
+	AdminJellyfinCompatWeb        AdminJellyfinCompatWebService
+	AdminRateLimitsWrite          AdminRateLimitWriteService
+	AdminRateLimits               AdminRateLimitReadService
+	DownloadSubscriptionMutations DownloadSubscriptionMutationService
+	DownloadSubscriptionSync      DownloadSubscriptionSyncService
+	DiagnosticsChunks             DiagnosticsChunksService
+	DiagnosticsIngress            DiagnosticsIngressService
+	EventsSocket                  EventsSocketService
+	AdminLogsSocket               AdminLogsSocketService
+	PlaybackControlSocket         PlaybackControlSocketService
+	EventsCapability              EventsCapabilityService
+	NetworkAccess                 NetworkAccessService
+	ServerIdentity                ServerIdentityService
+	ServerConnections             ServerConnections
+	NotificationDestinationCreate NotificationDestinationCreateService
+	AdminUnmatchedFiles           AdminUnmatchedFilesService
+	AdminCatalogItems             AdminCatalogItemsService
+	AdminCatalogImages            AdminCatalogImagesService
+	AdminCatalogMatch             AdminCatalogMatchService
+	AdminCatalogSplit             AdminCatalogSplitService
+	AdminMarkerContributions      AdminMarkerContributionsService
+	AdminMarkerProviders          AdminMarkerProvidersService
+	AdminMarkerHistory            AdminMarkerHistoryService
+	AdminEpisodeMarkers           AdminEpisodeMarkersService
+	DownloadSubscriptions         DownloadSubscriptionService
+	DownloadManifests             DownloadManifestService
+	DownloadDelivery              DownloadDeliveryService
+	Downloads                     DownloadRegistryService
+	DownloadProxyDelivery         func() bool
+	WebhookReceiver               WebhookReceiverService
+	SubtitleAIReads               SubtitleAIReadService
+	NotificationDiscordLinks      NotificationDiscordLinkService
+	NotificationEmailLinks        NotificationEmailLinkService
+	NotificationDestinationTests  NotificationDestinationTestService
+	AdminDevices                  AdminDeviceService
+	UserLibraries                 UserLibraryService
+	EbookAnnotations              EbookAnnotationService
+	AdminNotificationDiscord      AdminNotificationDiscordService
+	NotificationDestinations      NotificationDestinationService
+	EbookFiles                    EbookFileService
+	EbookConfig                   EbookConfigService
+	EbookProgress                 EbookProgressService
+	AdminItemMetadata             AdminItemMetadataService
+	AdminMetadataTranslation      AdminMetadataTranslationService
+	AdminPeople                   AdminPeopleService
+	AdminDiagnosticDownloads      AdminDiagnosticDownloadService
+	AdminJobArtifacts             AdminJobArtifactService
+	AdminJobArtifactSigner        *artworkurl.Signer
+	AdminBackups                  AdminBackupService
 	// AdminBackupSigner signs backup object links for destinations that
 	// cannot presign.
 	AdminBackupSigner *artworkurl.Signer
@@ -220,7 +220,6 @@ type Dependencies struct {
 	AdminNodeCommands             AdminNodeCommandsService
 	AdminNodeDrain                AdminNodeDrainService
 	AdminNodeReload               AdminNodeReloadService
-	AdminNodeKeys                 AdminNodeKeysService
 	AdminNodeConfiguration        AdminNodeConfigurationService
 	AdminServerStatus             AdminServerStatusService
 	AdminServerRestart            AdminServerRestartService
@@ -247,6 +246,7 @@ type Dependencies struct {
 	NotificationRelay             NotificationRelayService
 	AdminNotificationPush         AdminNotificationPushService
 	NotificationInbox             NotificationInboxService
+	NotificationIncoming          NotificationIncomingService
 	CompatConnectInfo             CompatConnectInfoService
 	AdminCatalogTransfer          AdminCatalogTransferService
 	AdminCatalogSearch            AdminCatalogSearchService
@@ -274,7 +274,6 @@ type Dependencies struct {
 	AdminCollections      AdminCollectionService
 	AdminCollectionGroups AdminCollectionGroupService
 	WebhookSync           WebhookSyncService
-	WebhookSyncManagement WebhookSyncManagementService
 	SubtitleProviders     SubtitleProviderStatusService
 	SubtitleAI            SubtitleAIStatusService
 	SubtitleReads         SubtitleReadService
@@ -403,6 +402,8 @@ type Dependencies struct {
 	LibraryCollections LibraryCollectionService
 	// Calendar answers the airing calendar (*handlers.CalendarHandler).
 	Calendar CalendarService
+	// Premieres is ATTMonk metadata-driven channel shortcut extension.
+	Premieres *notifications.PremiereService
 	// HomeDismissals records and clears home-card dismissals
 	// (*handlers.HomeDismissalHandler).
 	HomeDismissals HomeDismissalService
@@ -583,7 +584,7 @@ func humaConfig() huma.Config {
 					securitySchemeBearer: {
 						Type:        "http",
 						Scheme:      "bearer",
-						Description: bearerAuthDescription,
+						Description: "A session token or an API key in the Authorization header. The server decides which it holds.",
 					},
 				},
 			},
@@ -1087,9 +1088,9 @@ type RatingService interface {
 	// admits; found is false when the profile has not rated it, and an item
 	// outside the filter is a 404 error.
 	GetRating(ctx context.Context, userID int, profileID, itemID string, access mediacatalog.AccessFilter) (rating mediacatalog.UserRating, found bool, err error)
-	// SetRating records a validated score (1 to 10) of an item the access filter
+	// SetRating records a validated rating of an item the access filter
 	// admits; an item outside it is a 404 error.
-	SetRating(ctx context.Context, userID int, profileID, itemID string, access mediacatalog.AccessFilter, score int) error
+	SetRating(ctx context.Context, userID int, profileID, itemID string, access mediacatalog.AccessFilter, rating int) error
 	DeleteRating(ctx context.Context, userID int, profileID, itemID string) error
 }
 

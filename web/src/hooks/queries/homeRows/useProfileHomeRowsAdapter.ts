@@ -156,8 +156,8 @@ export function useProfileHomeRowsAdapter(): ProfileHomeRowsAdapter {
   );
 
   const assertEditable = useCallback(() => {
-    if (!canEdit) throw new Error(t("web.home.rows.links.pageLocked"));
-  }, [canEdit, t]);
+    if (!canEdit) throw new Error("This page can't change right now.");
+  }, [canEdit]);
 
   const { saveSection, setHidden, move, lastWriteAt } = homeRows;
 
@@ -178,11 +178,11 @@ export function useProfileHomeRowsAdapter(): ProfileHomeRowsAdapter {
   const openEdit = useCallback(
     async (id: string): Promise<EditSession> => {
       const section = sectionFor(id);
-      if (!section) throw new Error(t("web.home.rows.links.rowMissing"));
+      if (!section) throw new Error("This row is no longer on this page.");
       // A profile changes how a server row looks, never what it shows.
       return { row: toHomeRow(section), token: section, kindLocked: !section.is_custom };
     },
-    [sectionFor, t],
+    [sectionFor],
   );
 
   const save = useCallback(

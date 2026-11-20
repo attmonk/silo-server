@@ -1,7 +1,7 @@
 import type { ScopeKind } from "./scope";
 import type { CollectionKind } from "./types";
 import { t, type MessageKey } from "@/i18n";
-import { appLanguage, formatLocale } from "@/lib/appLocale";
+import { appLanguage } from "@/lib/appLocale";
 import { titlesAlreadySaved } from "./copyEditor";
 
 export * from "./copyEditor";
@@ -16,9 +16,23 @@ export * from "./copyArrange";
  * so call it while rendering, never at module scope.
  */
 
-import { joinNames } from "./nameList";
+/** "Movies", "Movies and Kids", "Movies, Kids and 4K Movies", in the interface language. */
+export function joinNames(names: readonly string[]): string {
+  if (names.length <= 1) return names[0] ?? "";
+  const language = appLanguage();
+  let format = listFormats.get(language);
+  if (!format) {
+    // English keeps its list without the serial comma, as en-GB writes it.
+    format = new Intl.ListFormat(language === "en" ? "en-GB" : language, {
+      style: "long",
+      type: "conjunction",
+    });
+    listFormats.set(language, format);
+  }
+  return format.format(names);
+}
 
-export { joinNameParts, joinNames } from "./nameList";
+const listFormats = new Map<string, Intl.ListFormat>();
 
 /** "Movies › Collections": a library's Collections tab. */
 function collectionsTabOf(libraryName: string): string {
@@ -134,10 +148,12 @@ export function showToOtherProfilesShortHelp() {
 export function librariesNotPicked() {
   return t("web.collections.copy.librariesNotPicked");
 }
-/** A server Smart collection's Libraries row: where it shows, not where its titles come from. */
-export function smartLibrariesHelp() {
-  return t("web.collections.copy.smartLibrariesHelp");
-}
+/**
+ * A server Smart collection's Libraries row: where it shows, not where its titles come from.
+ * English until the catalog has a key for it (a follow-up).
+ */
+export const SMART_LIBRARIES_HELP =
+  "Their Collections tabs list it. Its rules pick where titles come from.";
 /** The Shelf row of a collection that isn't created yet, after "No heading". */
 export function shelfAfterCreate() {
   return t("web.collections.copy.shelfAfterCreate");
@@ -530,10 +546,7 @@ export function addToCollectionFootnote() {
 
 /** "Manual · 15 titles": a manual collection's line in a picker. */
 export function manualTitleCount(count: number): string {
-  return t("web.collections.copy.manualTitleCount", {
-    count,
-    count_text: count.toLocaleString(formatLocale()),
-  });
+  return t("web.collections.copy.manualTitleCount", { count, count_text: count });
 }
 
 /** The Add to collection footer: how many of the profile's collections hold the title. */

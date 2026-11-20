@@ -20,9 +20,6 @@ const (
 	SectionCustomFilter     SectionType = "custom_filter"
 	SectionRandom           SectionType = "random"
 	SectionCollection       SectionType = "collection"
-	// SectionCollectionPosters is a row whose cards are collections rather
-	// than titles (see collection_posters.go).
-	SectionCollectionPosters SectionType = "collection_posters"
 
 	SectionRecommendedForYou   SectionType = "recommended_for_you"
 	SectionBecauseYouWatched   SectionType = "because_you_watched"
@@ -65,7 +62,6 @@ var ValidSectionTypes = map[SectionType]bool{
 	SectionCustomFilter:        true,
 	SectionRandom:              true,
 	SectionCollection:          true,
-	SectionCollectionPosters:   true,
 	SectionRecommendedForYou:   true,
 	SectionBecauseYouWatched:   true,
 	SectionSimilarUsersLiked:   true,
@@ -229,19 +225,7 @@ type SectionCollectionConfig struct {
 	UserCollectionID    string `json:"user_collection_id,omitempty"`
 }
 
-// The single-type media_scope values a row's type filter covers.
-const (
-	mediaScopeMovie     = "movie"
-	mediaScopeSeries    = "series"
-	mediaScopeAudiobook = "audiobook"
-	mediaScopeEbook     = "ebook"
-	mediaScopeManga     = "manga"
-)
-
 // ParseConfigFilters extracts filter_type and filter_library_id from config JSON.
-// A structured config's single-type media_scope becomes FilterType, so a row
-// keeps to the same type as its See All page. The group scope "video" spans
-// two types and is left to the callers that handle it.
 func ParseConfigFilters(config json.RawMessage) SectionConfigFilters {
 	var f SectionConfigFilters
 	if len(config) > 0 {
@@ -251,7 +235,7 @@ func ParseConfigFilters(config json.RawMessage) SectionConfigFilters {
 		def, err := ParseQueryDefinition(config)
 		if err == nil {
 			switch def.MediaScope {
-			case mediaScopeMovie, mediaScopeSeries, mediaScopeAudiobook, mediaScopeEbook, mediaScopeManga:
+			case "movie", "series", "audiobook":
 				f.FilterType = def.MediaScope
 			}
 			if len(def.LibraryIDs) > 0 {

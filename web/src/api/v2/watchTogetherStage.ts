@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import {
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
@@ -11,7 +10,7 @@ import { v2 } from "./request";
 function optionalID(value: number | undefined) {
   if (value === undefined) return undefined;
   if (!Number.isSafeInteger(value) || value <= 0)
-    throw new Error(t("web.common.errors.roomSelectionIdentityInvalid"));
+    throw new Error("Invalid room selection identity.");
   return String(value);
 }
 

@@ -50,7 +50,6 @@ export { OverlayIcon } from "./icons";
 export {
   overlayDataFromBrowseItem,
   overlayDataFromEpisodeListItem,
-  overlayDataFromSeason,
   overlayDataFromSectionItem,
   overlayDataFromWatchlistTitle,
 } from "./extractors";

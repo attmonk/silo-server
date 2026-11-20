@@ -9,7 +9,6 @@ import {
   getCarouselWheelGestureOptions,
   wheelGesturesForDirection,
 } from "@/lib/carouselEmbla";
-import { prefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
 
 interface UseCarouselEmblaOptions {
   options?: EmblaOptionsType;
@@ -78,13 +77,12 @@ export function useCarouselEmbla({ options }: UseCarouselEmblaOptions = {}) {
     };
   }, [emblaApi, updateScrollState]);
 
-  // Under reduced motion a page turn jumps instead of sliding a row of slides.
   const scrollPrev = useCallback(() => {
-    emblaApi?.scrollPrev(prefersReducedMotion());
+    emblaApi?.scrollPrev();
   }, [emblaApi]);
 
   const scrollNext = useCallback(() => {
-    emblaApi?.scrollNext(prefersReducedMotion());
+    emblaApi?.scrollNext();
   }, [emblaApi]);
 
   return {

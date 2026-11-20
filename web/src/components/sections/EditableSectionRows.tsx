@@ -6,12 +6,11 @@ import { queryDefinitionFromSectionConfig } from "@/api/types";
 import type { Library } from "@/api/types";
 import { matchRecipePreset, presetLabel, type RecipeCatalogResponse } from "@/lib/recipes";
 import { Eye, EyeOff, GripVertical, Pencil, Star, Trash2 } from "lucide-react";
+import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { useMotionSafeSortable } from "@/hooks/useSortableList";
 import { TableCell, TableRow } from "@/components/ui/table";
 import { BulkSelectionCheckbox } from "@/components/BulkSelectionCheckbox";
 import { useT, type MessageKey } from "@/i18n";
-import { cn } from "@/lib/utils";
 
 export interface EditableSectionViewModel {
   id: string;
@@ -168,11 +167,10 @@ export function SortableSectionTableRow({
   onDelete: () => void;
 }) {
   const t = useT();
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useMotionSafeSortable({
-      id: section.id,
-      disabled: !canReorder,
-    });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: section.id,
+    disabled: !canReorder,
+  });
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -267,10 +265,9 @@ export function SortableSectionCardRow({
   actions?: ReactNode;
 }) {
   const t = useT();
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useMotionSafeSortable({
-      id: section.id,
-    });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: section.id,
+  });
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -286,12 +283,7 @@ export function SortableSectionCardRow({
       <button
         type="button"
         aria-label={t("web.home.rows.sections.drag", { section: section.title })}
-        className={cn(
-          "hover:bg-surface-hover mt-0.5 cursor-grab touch-none rounded-md p-1 transition-colors",
-          // Below `lg`, a 44px-tall hit area reaching into the row's padding and
-          // up to the middle of the gap, so it doesn't overlap its neighbor.
-          "max-lg:relative max-lg:after:absolute max-lg:after:inset-y-[calc(50%-1.375rem)] max-lg:after:-start-2.5 max-lg:after:-end-1.5",
-        )}
+        className="hover:bg-surface-hover mt-0.5 cursor-grab touch-none rounded-md p-1 transition-colors"
         disabled={disabled}
         {...attributes}
         {...listeners}
@@ -305,10 +297,7 @@ export function SortableSectionCardRow({
           { section: section.title },
         )}
         aria-pressed={!section.hidden}
-        className={cn(
-          "hover:bg-surface-hover mt-0.5 rounded-md p-1 transition-colors",
-          "max-lg:relative max-lg:after:absolute max-lg:after:inset-y-[calc(50%-1.375rem)] max-lg:after:-start-1.5 max-lg:after:-end-2.5",
-        )}
+        className="hover:bg-surface-hover mt-0.5 rounded-md p-1 transition-colors"
         disabled={disabled}
         onClick={onToggleHidden}
       >

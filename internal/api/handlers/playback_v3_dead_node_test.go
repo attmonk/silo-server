@@ -8,10 +8,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
-	"github.com/Silo-Server/silo-server/internal/nodepool/nodepooltest"
-	"github.com/Silo-Server/silo-server/internal/nodesource/nodesourcetest"
-
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
@@ -47,7 +43,6 @@ func TestPrepareTransportV3MovesOnFromANodeThatStopsAccepting(t *testing.T) {
 	defer dead.Close()
 
 	var liveStarts atomic.Int32
-	var liveGrant atomic.Value
 	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/hw-capabilities":
@@ -58,7 +53,6 @@ func TestPrepareTransportV3MovesOnFromANodeThatStopsAccepting(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Errorf("decode remote start: %v", err)
 			}
-			liveGrant.Store(request.SourceGrant)
 			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{SessionID: request.SessionID, Status: "started"})
 		case r.Method == http.MethodDelete:
 			w.WriteHeader(http.StatusNoContent)
@@ -68,25 +62,22 @@ func TestPrepareTransportV3MovesOnFromANodeThatStopsAccepting(t *testing.T) {
 	}))
 	defer live.Close()
 
-	transcodes := nodepooltest.NewTranscodePool()
+	transcodes := nodepool.NewTranscodePool()
 	transcodes.SetNodes([]*nodepool.Node{
 		{ID: 1, URL: dead.URL, Type: nodepool.NodeTypeTranscode, Enabled: true, Healthy: true},
 		{ID: 2, URL: live.URL, Type: nodepool.NodeTypeTranscode, Enabled: true, Healthy: true, ActiveJobs: 2},
 	})
 	planner := nodepool.NewPlanner(nodepool.NewProxyPool(), transcodes)
-	handler := newKeyedPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.JWTSecret = "test-secret"
-	handler.NodeKeys = nodeauthtest.SameKey("test-secret")
 	handler.NodePlanner = planner
-	handler.SourceGrants = nodesourcetest.Granter{}
 	requireWorkerRoutingV3(handler)
 	plan := &playback.PlanV3{PlanID: "plan:dead-node", Delivery: playback.DeliveryTranscodeHLSV3, Transformations: transformations}
 
-	file := v3HandlerFixtureFile(t)
 	transport, transportErr := handler.prepareTransportV3(
 		httptest.NewRequest(http.MethodPost, "/", nil),
 		&playback.Session{ID: "session-dead-node", UserID: 7, ProfileID: "profile-1"},
-		file,
+		v3HandlerFixtureFile(t),
 		playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayTranscode, TargetVideoCodec: "h264", TargetAudioCodec: "aac"},
 		mediaAuthModeV3{},
 	)
@@ -99,11 +90,6 @@ func TestPrepareTransportV3MovesOnFromANodeThatStopsAccepting(t *testing.T) {
 	}
 	if transport.nodeURL != live.URL || liveStarts.Load() != 1 {
 		t.Fatalf("transport node = %q with %d live starts, want the live node", transport.nodeURL, liveStarts.Load())
-	}
-	// The start that reached the live node carries a grant naming it, not
-	// the node the route left.
-	if got, want := liveGrant.Load(), nodesourcetest.Grant(2, file.ID, file.FilePath); got != want {
-		t.Fatalf("live start source grant = %v, want %q", got, want)
 	}
 	if planner.TranscodeNodeHealthy(dead.URL) {
 		t.Fatal("the planner still offers the node whose connect was refused")

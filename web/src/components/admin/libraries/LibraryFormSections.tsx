@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useState } from "react";
 import type { ReactNode } from "react";
 import {
   ArrowDown,
@@ -51,13 +51,6 @@ function libraryMetadataLanguages() {
   return languageOptions().filter((lang) => /^[a-z]{2}$/.test(lang.code));
 }
 
-// Widens a switch's hit area to 44px on a phone without changing how it looks.
-const SWITCH_TOUCH_TARGET =
-  "relative max-sm:after:absolute max-sm:after:-inset-x-2 max-sm:after:-inset-y-3.5";
-
-// Grows a native checkbox to a comfortable tap size on a phone.
-const CHECKBOX_SIZE = "size-5 shrink-0 sm:size-3.5";
-
 function SettingCard({
   htmlFor,
   title,
@@ -74,7 +67,7 @@ function SettingCard({
   return (
     <div className="border-border bg-surface rounded-xl border p-3.5">
       <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 space-y-1">
+        <div className="space-y-1">
           <Label htmlFor={htmlFor}>{title}</Label>
           <p className="text-muted-foreground text-xs leading-relaxed">{description}</p>
           {footer}
@@ -103,14 +96,13 @@ export function GeneralFields({
           onChange={(e) => form.setName(e.target.value)}
           placeholder={t("web.admin.common.libraryEditor.general.namePlaceholder")}
           aria-invalid={form.errors.name ? true : undefined}
-          className="h-11 sm:h-9"
         />
         {form.errors.name ? <p className="text-destructive text-xs">{form.errors.name}</p> : null}
       </div>
       <div className="space-y-1.5">
         <Label>{t("web.admin.common.libraryEditor.general.type")}</Label>
         <div
-          className="grid grid-cols-2 gap-2 sm:grid-cols-5"
+          className="grid grid-cols-3 gap-2 sm:grid-cols-5"
           role="radiogroup"
           aria-label={t("web.admin.common.libraryEditor.general.typeGroup")}
         >
@@ -124,7 +116,7 @@ export function GeneralFields({
                 aria-checked={selected}
                 onClick={() => form.handleTypeChange(value)}
                 className={cn(
-                  "flex min-w-0 flex-col items-center gap-1.5 rounded-xl border px-2 py-3 transition-colors duration-150",
+                  "flex flex-col items-center gap-1.5 rounded-xl border px-2 py-3 transition-colors duration-150",
                   selected
                     ? "border-primary/50 bg-primary/10 text-foreground"
                     : "border-border bg-surface text-muted-foreground hover:bg-surface-hover hover:text-foreground",
@@ -133,9 +125,7 @@ export function GeneralFields({
                 <Icon
                   className={cn("size-5", selected ? "text-primary" : "text-muted-foreground")}
                 />
-                <span className="text-center text-xs font-medium break-words sm:text-[11px]">
-                  {label}
-                </span>
+                <span className="text-[11px] font-medium">{label}</span>
               </button>
             );
           })}
@@ -153,7 +143,6 @@ export function GeneralFields({
       >
         <Switch
           id="library-enabled-switch"
-          className={SWITCH_TOUCH_TARGET}
           checked={form.enabled}
           onCheckedChange={form.setEnabled}
         />
@@ -165,7 +154,6 @@ export function GeneralFields({
 
 export function FolderFields({ form }: { form: LibraryFormController }) {
   const t = useT();
-  const pathIdBase = useId();
   const [browserOpen, setBrowserOpen] = useState(false);
   const browseLabel = t("web.admin.common.libraryEditor.folders.browse");
   const addPathLabel = t("web.admin.common.libraryEditor.folders.addPath");
@@ -177,23 +165,19 @@ export function FolderFields({ form }: { form: LibraryFormController }) {
           <div key={i} className="flex items-center gap-1.5">
             <FolderOpen className="text-muted-foreground/60 size-4 shrink-0" />
             <PathAutocompleteInput
-              id={`${pathIdBase}-${i}`}
               value={path}
               onValueChange={(value) => form.updatePath(i, value)}
               placeholder={FOLDER_PATH_PLACEHOLDER}
               aria-invalid={form.errors.paths ? true : undefined}
-              className="h-11 sm:h-9"
             />
             {form.paths.length > 1 && (
               <Button
                 type="button"
                 variant="ghost"
                 size="icon"
-                className="text-muted-foreground hover:text-destructive size-11 shrink-0 sm:size-9"
+                className="text-muted-foreground hover:text-destructive size-9 shrink-0"
                 onClick={() => form.removePath(i)}
                 title={t("web.admin.common.libraryEditor.folders.remove")}
-                aria-label={t("web.admin.common.libraryEditor.folders.remove")}
-                aria-describedby={`${pathIdBase}-${i}`}
               >
                 <Trash2 className="size-3.5" />
               </Button>
@@ -202,23 +186,11 @@ export function FolderFields({ form }: { form: LibraryFormController }) {
         ))}
       </div>
       {form.errors.paths ? <p className="text-destructive text-xs">{form.errors.paths}</p> : null}
-      <div className="flex flex-wrap gap-1.5">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="h-11 flex-1 sm:h-8 sm:flex-none"
-          onClick={() => setBrowserOpen(true)}
-        >
+      <div className="flex gap-1.5">
+        <Button type="button" variant="outline" size="sm" onClick={() => setBrowserOpen(true)}>
           <FolderSearch className="me-1 size-3.5" /> {browseLabel}
         </Button>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="h-11 flex-1 sm:h-8 sm:flex-none"
-          onClick={form.addPath}
-        >
+        <Button type="button" variant="outline" size="sm" onClick={form.addPath}>
           <Plus className="me-1 size-3.5" /> {addPathLabel}
         </Button>
       </div>
@@ -292,7 +264,6 @@ export function RealtimeMonitoringFields({ form }: { form: LibraryFormController
     >
       <Switch
         id="realtime-monitoring-switch"
-        className={SWITCH_TOUCH_TARGET}
         checked={form.realtimeMonitoring}
         disabled={serverOff}
         onCheckedChange={form.setRealtimeMonitoring}
@@ -314,7 +285,6 @@ function ProviderLevelSection({
 }) {
   // contentLevelLabel reads the interface language.
   useAppLanguage();
-  const t = useT();
   const [collapsed, setCollapsed] = useState(false);
 
   const moveItem = (index: number, direction: -1 | 1) => {
@@ -330,8 +300,7 @@ function ProviderLevelSection({
       <button
         type="button"
         onClick={() => setCollapsed(!collapsed)}
-        aria-expanded={!collapsed}
-        className="text-primary hover:text-primary/80 mb-1.5 flex min-h-11 items-center gap-1.5 text-start text-xs font-semibold tracking-wider uppercase sm:min-h-0"
+        className="text-primary hover:text-primary/80 mb-1.5 flex items-center gap-1.5 text-xs font-semibold tracking-wider uppercase"
       >
         {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
         {contentLevelLabel(level)}
@@ -342,44 +311,40 @@ function ProviderLevelSection({
             <div
               key={`${item.plugin_installation_id}:${item.capability_id}`}
               className={cn(
-                "flex items-center gap-2 rounded-md border px-2.5 py-0.5 text-sm sm:py-1.5",
+                "flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm",
                 item.enabled
                   ? "border-border bg-muted text-foreground"
                   : "border-border/50 bg-muted/30 text-muted-foreground",
               )}
             >
-              <label className="flex min-h-11 min-w-0 flex-1 cursor-pointer items-center gap-2 sm:min-h-0">
-                <input
-                  type="checkbox"
-                  checked={item.enabled}
-                  onChange={() => onToggleEnabled(i)}
-                  className={CHECKBOX_SIZE}
-                  style={{ accentColor: "var(--primary)" }}
-                />
-                <span className="min-w-0 font-mono text-xs break-all">{item.provider_slug}</span>
-              </label>
+              <input
+                type="checkbox"
+                checked={item.enabled}
+                onChange={() => onToggleEnabled(i)}
+                className="h-3.5 w-3.5"
+                style={{ accentColor: "var(--primary)" }}
+              />
+              <span className="flex-1 font-mono text-xs">{item.provider_slug}</span>
               <div className="flex gap-0.5">
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon"
-                  className="size-11 sm:size-5"
+                  className="h-5 w-5"
                   disabled={i === 0}
                   onClick={() => moveItem(i, -1)}
-                  aria-label={t("web.settings.interface.moveUp", { label: item.provider_slug })}
                 >
-                  <ArrowUp className="size-4 sm:size-2.5" />
+                  <ArrowUp className="h-2.5 w-2.5" />
                 </Button>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon"
-                  className="size-11 sm:size-5"
+                  className="h-5 w-5"
                   disabled={i === items.length - 1}
                   onClick={() => moveItem(i, 1)}
-                  aria-label={t("web.settings.interface.moveDown", { label: item.provider_slug })}
                 >
-                  <ArrowDown className="size-4 sm:size-2.5" />
+                  <ArrowDown className="h-2.5 w-2.5" />
                 </Button>
               </div>
               <span className="text-muted-foreground/70 font-mono text-[10px]">{i + 1}</span>
@@ -396,12 +361,12 @@ function boxSetMinMovieOptions(current: number): number[] {
   return [...new Set<number>([...BOX_SET_MIN_MOVIE_OPTIONS, current])].sort((a, b) => a - b);
 }
 
-function BoxSetFields({ form }: { form: LibraryFormController }) {
+export function BoxSetFields({ form }: { form: LibraryFormController }) {
   const t = useT();
   return (
     <div className="border-border bg-surface rounded-xl border p-3.5">
       <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 space-y-1">
+        <div className="space-y-1">
           <Label htmlFor="box-sets-enabled">
             {t("web.admin.common.libraryEditor.boxSets.title")}
           </Label>
@@ -411,7 +376,6 @@ function BoxSetFields({ form }: { form: LibraryFormController }) {
         </div>
         <Switch
           id="box-sets-enabled"
-          className={SWITCH_TOUCH_TARGET}
           checked={form.boxSetsEnabled}
           onCheckedChange={form.setBoxSetsEnabled}
         />
@@ -437,7 +401,7 @@ function BoxSetFields({ form }: { form: LibraryFormController }) {
                     aria-checked={selected}
                     onClick={() => form.setBoxSetMinMovies(count)}
                     className={cn(
-                      "min-h-11 min-w-11 rounded-full px-3 py-0.5 text-xs font-medium transition-colors sm:min-h-0 sm:min-w-0",
+                      "rounded-full px-3 py-0.5 text-xs font-medium transition-colors",
                       selected
                         ? "bg-primary text-primary-foreground"
                         : "text-muted-foreground hover:text-foreground",
@@ -453,7 +417,7 @@ function BoxSetFields({ form }: { form: LibraryFormController }) {
             </p>
           </div>
           <div className="flex items-start justify-between gap-4">
-            <div className="min-w-0 space-y-0.5">
+            <div className="space-y-0.5">
               <Label htmlFor="box-sets-in-search">
                 {t("web.admin.common.libraryEditor.boxSets.inSearch")}
               </Label>
@@ -463,7 +427,6 @@ function BoxSetFields({ form }: { form: LibraryFormController }) {
             </div>
             <Switch
               id="box-sets-in-search"
-              className={SWITCH_TOUCH_TARGET}
               checked={form.boxSetsInSearch}
               onCheckedChange={form.setBoxSetsInSearch}
             />
@@ -484,7 +447,7 @@ export function MetadataFields({ form }: { form: LibraryFormController }) {
       <div className="space-y-1.5">
         <Label>{t("web.admin.common.libraryEditor.metadata.language")}</Label>
         <Select value={form.metadataLanguage} onValueChange={form.setMetadataLanguage}>
-          <SelectTrigger className="w-full data-[size=default]:h-11 sm:w-64 sm:data-[size=default]:h-9">
+          <SelectTrigger className="w-full sm:w-64">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -500,7 +463,7 @@ export function MetadataFields({ form }: { form: LibraryFormController }) {
         </p>
       </div>
       <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 space-y-0.5">
+        <div className="space-y-0.5">
           <Label htmlFor="auto-translate-metadata">
             {t("web.admin.common.libraryEditor.metadata.autoTranslate")}
           </Label>
@@ -510,7 +473,6 @@ export function MetadataFields({ form }: { form: LibraryFormController }) {
         </div>
         <Switch
           id="auto-translate-metadata"
-          className={SWITCH_TOUCH_TARGET}
           checked={form.autoTranslateMetadata}
           onCheckedChange={form.setAutoTranslateMetadata}
         />
@@ -534,7 +496,7 @@ export function MetadataFields({ form }: { form: LibraryFormController }) {
                 <label
                   key={kind}
                   className={cn(
-                    "flex min-h-11 cursor-pointer items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm sm:min-h-0",
+                    "flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm",
                     checked
                       ? "border-border bg-muted text-foreground"
                       : "border-border/50 bg-muted/30 text-muted-foreground",
@@ -544,7 +506,7 @@ export function MetadataFields({ form }: { form: LibraryFormController }) {
                     type="checkbox"
                     checked={checked}
                     onChange={() => form.toggleTrailerKind(kind)}
-                    className={CHECKBOX_SIZE}
+                    className="h-3.5 w-3.5"
                     style={{ accentColor: "var(--primary)" }}
                   />
                   {extraKindGroupLabel(kind)}
@@ -578,7 +540,6 @@ export function MetadataFields({ form }: { form: LibraryFormController }) {
                   >
                     <Switch
                       id="local-metadata-switch"
-                      className={SWITCH_TOUCH_TARGET}
                       checked={form.localMetadataEnabled}
                       onCheckedChange={form.toggleLocalMetadata}
                     />
@@ -640,7 +601,6 @@ export function AdvancedFields({
         >
           <Switch
             id="chapter-thumbnails-switch"
-            className={SWITCH_TOUCH_TARGET}
             checked={form.chapterThumbnailsEnabled}
             disabled={!chapterThumbnailsSupported}
             onCheckedChange={form.setChapterThumbnailsEnabled}
@@ -662,7 +622,6 @@ export function AdvancedFields({
         >
           <Switch
             id="trickplay-switch"
-            className={SWITCH_TOUCH_TARGET}
             checked={form.trickplayEnabled}
             disabled={!trickplaySupported && !form.trickplayEnabled}
             onCheckedChange={form.setTrickplayEnabled}
@@ -676,7 +635,6 @@ export function AdvancedFields({
         >
           <Switch
             id="intro-detection-switch"
-            className={SWITCH_TOUCH_TARGET}
             checked={form.introDetectionEnabled}
             onCheckedChange={form.setIntroDetectionEnabled}
           />

@@ -1,7 +1,7 @@
 import type { ScanRun } from "@/api/types";
 import { formatActiveScanMode, formatActiveScanProgress } from "@/lib/scanRuns";
 import { formatLocale } from "@/lib/appLocale";
-import { t, type MessageKey } from "@/i18n";
+import { t } from "@/i18n";
 
 export function formatFileCount(count: number | null | undefined) {
   if (count == null) {
@@ -19,17 +19,13 @@ export function formatFileCount(count: number | null | undefined) {
  */
 export function formatWatchTime(totalSeconds: number | null | undefined) {
   if (totalSeconds == null || !Number.isFinite(totalSeconds) || totalSeconds <= 0) {
-    return t("web.admin.dashboard.format.duration.minutes", { minutes: 0 });
+    return "0m";
   }
   if (totalSeconds < 3600) {
-    return t("web.admin.dashboard.format.duration.minutes", {
-      minutes: Math.max(1, Math.round(totalSeconds / 60)),
-    });
+    return `${Math.max(1, Math.round(totalSeconds / 60))}m`;
   }
   const hours = totalSeconds / 3600;
-  return t("web.admin.dashboard.format.watchTimeHours", {
-    hours: hours.toLocaleString(formatLocale(), { maximumFractionDigits: 1 }),
-  });
+  return `${hours.toLocaleString(formatLocale(), { maximumFractionDigits: 1 })}h`;
 }
 
 /**
@@ -51,17 +47,10 @@ export function formatMbps(mbps: number) {
   if (!Number.isFinite(mbps)) {
     return "—";
   }
-  return t("web.common.format.bitrate.mbps", { rate: formatMbpsValue(mbps) });
+  return `${formatMbpsValue(mbps)} Mbps`;
 }
 
-const DATA_TOTAL_UNIT_KEYS: readonly MessageKey[] = [
-  "web.common.format.size.bytes",
-  "web.common.format.size.kb",
-  "web.common.format.size.mb",
-  "web.common.format.size.gb",
-  "web.common.format.size.tb",
-  "web.common.format.size.pb",
-];
+const DATA_TOTAL_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"] as const;
 
 /**
  * Data transferred over a window. Decimal (1000-based) units, matching the
@@ -81,18 +70,16 @@ export function formatDataTotal(bytes: number | null | undefined) {
   for (;;) {
     const decimals = unit > 0 && value < 100 ? 1 : 0;
     const rounded = Number(value.toFixed(decimals));
-    if (rounded >= 1000 && unit < DATA_TOTAL_UNIT_KEYS.length - 1) {
+    if (rounded >= 1000 && unit < DATA_TOTAL_UNITS.length - 1) {
       value /= 1000;
       unit += 1;
       continue;
     }
     const shown = unit > 0 && rounded < 100 ? 1 : 0;
-    return t(DATA_TOTAL_UNIT_KEYS[unit] ?? "web.common.format.size.pb", {
-      size: rounded.toLocaleString(formatLocale(), {
-        minimumFractionDigits: shown,
-        maximumFractionDigits: shown,
-      }),
-    });
+    return `${rounded.toLocaleString(formatLocale(), {
+      minimumFractionDigits: shown,
+      maximumFractionDigits: shown,
+    })} ${DATA_TOTAL_UNITS[unit]}`;
   }
 }
 
@@ -142,20 +129,16 @@ export function formatScanDuration(
 
 function formatDurationSeconds(totalSeconds: number): string {
   if (totalSeconds < 60) {
-    return t("web.admin.dashboard.format.duration.seconds", { seconds: totalSeconds });
+    return `${totalSeconds}s`;
   }
   if (totalSeconds < 3600) {
     const minutes = Math.floor(totalSeconds / 60);
     const seconds = totalSeconds % 60;
-    return seconds === 0
-      ? t("web.admin.dashboard.format.duration.minutes", { minutes })
-      : t("web.admin.dashboard.format.duration.minutesSeconds", { minutes, seconds });
+    return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
   }
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
-  return minutes === 0
-    ? t("web.admin.dashboard.format.duration.hours", { hours })
-    : t("web.admin.dashboard.format.duration.hoursMinutes", { hours, minutes });
+  return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}m`;
 }
 
 /**
@@ -176,9 +159,7 @@ export function formatUptime(startedAt: string | null | undefined, now: number =
   }
   const days = Math.floor(seconds / 86_400);
   const hours = Math.floor((seconds % 86_400) / 3600);
-  return hours === 0
-    ? t("web.admin.dashboard.format.duration.days", { days })
-    : t("web.admin.dashboard.format.duration.daysHours", { days, hours });
+  return hours === 0 ? `${days}d` : `${days}d ${hours}h`;
 }
 
 /** Sub-10ms round trips keep their decimals; anything slower does not need them. */
@@ -186,14 +167,7 @@ export function formatLatency(latencyMs: number) {
   if (!Number.isFinite(latencyMs)) {
     return "—";
   }
-  return t("web.admin.dashboard.format.latencyMs", {
-    value: latencyMs.toLocaleString(formatLocale(), {
-      maximumFractionDigits: latencyMs < 10 ? 2 : 0,
-    }),
-  });
-}
-
-/** A whole or one-decimal percentage, already formatted, as a label. */
-export function formatPercentLabel(percent: string): string {
-  return t("web.common.format.percent", { percent });
+  return `${latencyMs.toLocaleString(formatLocale(), {
+    maximumFractionDigits: latencyMs < 10 ? 2 : 0,
+  })} ms`;
 }

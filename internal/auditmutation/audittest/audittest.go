@@ -137,10 +137,7 @@ func Value(side *string) string {
 	return *side
 }
 
-// AssertNoSecrets fails when any secret appears in the row. It searches the
-// whole row, so each secret must be a value nothing else in the row can hold
-// by chance: a short digit string such as a PIN turns up in the node id,
-// timestamps, and ids now and then.
+// AssertNoSecrets fails when any secret appears in the row.
 func (r Row) AssertNoSecrets(t *testing.T, secrets ...string) {
 	t.Helper()
 	for _, secret := range secrets {

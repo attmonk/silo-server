@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -22,7 +21,7 @@ import (
 
 type ArtifactStore interface {
 	Bucket() string
-	GetObjectStream(ctx context.Context, bucket, key string) (io.ReadCloser, error)
+	GetObject(ctx context.Context, bucket, key string) ([]byte, error)
 	UploadFile(ctx context.Context, bucket, key, path, contentType string) (int64, error)
 	DeleteObject(ctx context.Context, bucket, key string) error
 }
@@ -1089,10 +1088,10 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 		r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
 	}
 
-	var data io.ReadCloser
+	var data []byte
 	if req.LocalPath != "" {
 		var err error
-		data, err = os.Open(req.LocalPath)
+		data, err = os.ReadFile(req.LocalPath)
 		if err != nil {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", fmt.Sprintf("reading local file: %v", err))
 			return
@@ -1122,7 +1121,7 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 			return
 		}
 		var err error
-		data, err = r.store.GetObjectStream(ctx, req.SourceBucket, req.SourceKey)
+		data, err = r.store.GetObject(ctx, req.SourceBucket, req.SourceKey)
 		if err != nil {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", err.Error())
 			return
@@ -1136,14 +1135,11 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 		}
 	}
 
-	// Deferred after the staged-object cleanup, so the source closes first.
-	defer func() { _ = data.Close() }()
-
 	var (
 		lastProgressUpdate time.Time
 		lastProgress       catalogseed.ImportProgress
 	)
-	result, importErr := r.exporter.ImportReader(ctx, data, req.Options, func(progress catalogseed.ImportProgress) {
+	result, importErr := r.exporter.ImportWithProgress(ctx, data, req.Options, func(progress catalogseed.ImportProgress) {
 		lastProgress = progress
 		if time.Since(lastProgressUpdate) < time.Second && progress.Current != progress.Total {
 			return

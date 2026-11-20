@@ -9,6 +9,7 @@ import {
   upcomingBadgeLabel,
 } from "@/lib/upcomingEventPresentation";
 import type { CalendarEvent } from "@/hooks/queries/calendar";
+import PremiereShortcut from "./PremiereShortcut";
 import { useAppLanguage, useT } from "@/i18n";
 
 export default function CalendarEventCard({ event }: { event: CalendarEvent }) {
@@ -104,6 +105,11 @@ export default function CalendarEventCard({ event }: { event: CalendarEvent }) {
           <div className="text-muted-foreground mt-0.5 text-[11px] font-medium">{airTime}</div>
         ) : null}
       </ViewTransitionLink>
+      {event.type === "episode" && (
+        <div className="px-1 pt-2">
+          <PremiereShortcut itemId={event.content_id} />
+        </div>
+      )}
     </div>
   );
 }

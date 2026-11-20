@@ -7,7 +7,6 @@ import type {
   AdminUserEffectivePolicy,
   Library,
 } from "@/api/types";
-import { DownloadsServerNotice } from "@/components/admin/DownloadsServerNotice";
 import { LibraryAccessSelector } from "@/components/LibraryAccessSelector";
 import { StreamBitrateLimitInput } from "@/components/StreamBitrateLimitInput";
 import { Input } from "@/components/ui/input";
@@ -541,7 +540,6 @@ export function PolicyAccessFields({
                 }),
         )}
       />
-      <DownloadsServerNotice />
       <div className="grid gap-2 sm:grid-cols-2">
         <BooleanPolicyRow
           label={t("web.profiles.userPolicy.downloads")}

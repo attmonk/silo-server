@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"slices"
 	"testing"
 	"time"
 
@@ -13,9 +12,7 @@ import (
 
 // TestLibraryRefreshSkipsIgnoredItemsDB covers issue #2392: a library
 // refresh leaves out an item an admin marked as intentionally unmatched, in
-// both modes, while it still lists the library's other unmatched items. An
-// ignored audiobook is listed for a tags-only re-read; the executor drops it
-// from a quick refresh.
+// both modes, while it still lists the library's other unmatched items.
 func TestLibraryRefreshSkipsIgnoredItemsDB(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -31,14 +28,13 @@ func TestLibraryRefreshSkipsIgnoredItemsDB(t *testing.T) {
 	suffix := time.Now().UnixNano()
 	ignoredID := fmt.Sprintf("local-refresh-ignored-%d", suffix)
 	unmatchedID := fmt.Sprintf("local-refresh-unmatched-%d", suffix)
-	audiobookID := fmt.Sprintf("local-refresh-ignored-audiobook-%d", suffix)
 	var folderID int
 	if err := pool.QueryRow(ctx, `INSERT INTO media_folders (type, name, enabled) VALUES ('movies', $1, true) RETURNING id`,
 		fmt.Sprintf("Refresh ignore %d", suffix)).Scan(&folderID); err != nil {
 		t.Fatalf("seed folder: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id = ANY($1)`, []string{ignoredID, unmatchedID, audiobookID})
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id = ANY($1)`, []string{ignoredID, unmatchedID})
 		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id = $1`, folderID)
 	})
 	for _, row := range []struct {
@@ -56,38 +52,18 @@ func TestLibraryRefreshSkipsIgnoredItemsDB(t *testing.T) {
 		}
 	}
 
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO media_items (content_id, type, title, status, genres, match_ignored_at)
-		VALUES ($1, 'audiobook', 'Bonus Disc', '', '{}'::text[], NOW())
-	`, audiobookID); err != nil {
-		t.Fatalf("seed audiobook: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO media_item_libraries (content_id, media_folder_id) VALUES ($1, $2)`, audiobookID, folderID); err != nil {
-		t.Fatalf("link audiobook: %v", err)
-	}
-
 	lister := NewPGLibraryRefreshItemLister(pool)
-	for _, tc := range []struct {
-		mode LibraryRefreshMode
-		want []string
-	}{
-		{LibraryRefreshModeQuick, []string{unmatchedID}},
-		{LibraryRefreshModeFull, []string{audiobookID + " audiobook", unmatchedID}},
-	} {
-		items, err := lister.ListLibraryItems(ctx, folderID, tc.mode)
+	for _, mode := range []LibraryRefreshMode{LibraryRefreshModeQuick, LibraryRefreshModeFull} {
+		items, err := lister.ListLibraryItems(ctx, folderID, mode)
 		if err != nil {
-			t.Fatalf("ListLibraryItems(%s): %v", tc.mode, err)
+			t.Fatalf("ListLibraryItems(%s): %v", mode, err)
 		}
-		var got []string
+		var ids []string
 		for _, item := range items {
-			if item.Audiobook {
-				got = append(got, item.ContentID+" audiobook")
-			} else {
-				got = append(got, item.ContentID)
-			}
+			ids = append(ids, item.ContentID)
 		}
-		if !slices.Equal(got, tc.want) {
-			t.Fatalf("ListLibraryItems(%s) = %v, want %v", tc.mode, got, tc.want)
+		if len(ids) != 1 || ids[0] != unmatchedID {
+			t.Fatalf("ListLibraryItems(%s) = %v, want only %s", mode, ids, unmatchedID)
 		}
 	}
 }

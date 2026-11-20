@@ -295,7 +295,7 @@ export async function fetchPluginCatalogSettings(): Promise<PluginCatalogSetting
   ]);
   if (!isCapturedProfileAuthorityActive(profileContext)) throw new StaleApiRequestContextError();
   if (!etag || etag === "*" || etag.startsWith("W/"))
-    throw new Error(t("web.admin.errors.catalogRevisionMissing"));
+    throw new Error("Catalog revision unavailable. Reload before editing.");
   return {
     ...status,
     ...settings,
@@ -541,13 +541,6 @@ function lifecycleFailure(error: unknown, fallback: string): string {
     ? error.message
     : fallback;
 }
-// A 409 means the installation is no longer what the page shows: another
-// install replaced it, or the update no longer applies. Refresh the lists so
-// the admin sees the installed version the message asks them to check.
-function refreshAfterConflict(error: unknown, queryClient: ReturnType<typeof useQueryClient>) {
-  if (error instanceof V2ProblemError && error.status === 409)
-    void invalidatePluginQueries(queryClient);
-}
 
 export function useInstallPlugin() {
   const queryClient = useQueryClient();
@@ -577,7 +570,6 @@ export function useInstallPlugin() {
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      refreshAfterConflict(error, queryClient);
       toast.error(
         lifecycleFailure(error, t("web.admin.plugins.hooks.plugins.install.unconfirmed")),
       );
@@ -617,7 +609,6 @@ export function useUploadPlugin() {
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      refreshAfterConflict(error, queryClient);
       toast.error(lifecycleFailure(error, t("web.admin.plugins.hooks.plugins.upload.unconfirmed")));
     },
   });
@@ -736,7 +727,6 @@ export function useApplyPluginUpdate() {
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      refreshAfterConflict(error, queryClient);
       toast.error(
         lifecycleFailure(error, t("web.admin.plugins.hooks.plugins.applyUpdate.unconfirmed")),
       );

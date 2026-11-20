@@ -89,10 +89,6 @@ func (p *PluginProvider) peerResponse(ctx context.Context, peer netip.Addr) (*pl
 // sign-in when linkingUserID is 0, otherwise a link to that signed-in
 // account. It also answers the identity, for the login session it opens.
 func (p *PluginProvider) authenticatePeer(ctx context.Context, peer netip.Addr, linkingUserID int) (*models.User, int64, error) {
-	fence, err := p.signInFence(ctx, linkingUserID)
-	if err != nil {
-		return nil, 0, err
-	}
 	response, err := p.peerResponse(ctx, peer)
 	if err != nil {
 		return nil, 0, err
@@ -103,7 +99,7 @@ func (p *PluginProvider) authenticatePeer(ctx context.Context, peer netip.Addr, 
 	if response != nil {
 		response.EmailVerified = nil
 	}
-	return p.resolve(ctx, response, linkingUserID, true, fence)
+	return p.resolve(ctx, response, linkingUserID, true)
 }
 
 // findNetworkInstallation returns the PluginProvider registered for the

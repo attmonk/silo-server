@@ -10,15 +10,12 @@ import { TagInput } from "@/components/TagInput";
 import ImageSelectorTab from "@/components/ImageSelectorTab";
 import type { ItemDetail } from "@/api/types";
 import {
-  useItemImageWritePending,
-  useItemMetadataResetPending,
-  useItemMetadataSavePending,
   useUpdateItemMetadata,
   useRefreshItemMetadata,
   type UpdateItemMetadataRequest,
 } from "@/hooks/queries/items";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
-import { useT, type MessageKey } from "@/i18n";
+import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 import {
   AIR_TIMEZONES,
@@ -47,24 +44,18 @@ const EPISODE_FIELD_LOCK_MAP: Record<string, number> = {
   runtime: FIELD_RUNTIME,
 };
 
-const TYPE_LABEL_KEYS: Partial<Record<ItemDetail["type"], MessageKey>> = {
-  movie: "web.item.editMetadata.typeMovie",
-  series: "web.item.editMetadata.typeSeries",
-  season: "web.item.editMetadata.typeSeason",
-  episode: "web.item.editMetadata.typeEpisode",
-  audiobook: "web.detail.hero.typeAudiobook",
-};
-
-const RESET_DESCRIPTION_KEYS: Partial<Record<ItemDetail["type"], MessageKey>> = {
-  series: "web.item.editMetadata.resetDescriptionSeries",
-  season: "web.item.editMetadata.resetDescriptionSeason",
-  episode: "web.item.editMetadata.resetDescriptionEpisode",
+const RESET_DESCRIPTIONS: Partial<Record<ItemDetail["type"], string>> = {
+  series:
+    "This will unlock all fields on this series and refresh metadata from your providers. Any manual edits to the series will be overwritten. Locked seasons and episodes keep their edits.",
+  season:
+    "This will unlock this season's title, overview and air date and refresh metadata from your providers. Any manual edits to them will be overwritten. Artwork you picked stays locked on the series; reset the series to replace it.",
+  episode:
+    "This will unlock this episode's title, overview, runtime and air date and refresh metadata from your providers. Any manual edits to them will be overwritten.",
 };
 
 const FIELD_LOCK_MAPS: Partial<Record<ItemDetail["type"], Record<string, number>>> = {
   movie: FIELD_LOCK_MAP,
   series: FIELD_LOCK_MAP,
-  audiobook: FIELD_LOCK_MAP,
   season: SEASON_FIELD_LOCK_MAP,
   episode: EPISODE_FIELD_LOCK_MAP,
 };
@@ -75,54 +66,21 @@ interface EditMetadataDialogProps {
   onOpenChange: (open: boolean) => void;
 }
 
-// The item pages keep this dialog mounted while it is closed, and a page stays
-// mounted when a link opens another title of the same kind ("More Like
-// This"). The form is keyed by the item and by each opening, so every opening
-// starts from the item as it is now: another title's values (#4212), the
-// provider's after Reset to Provider, and none of the edits a closed dialog
-// left unsaved (#4235). Closing keeps the form, so the dialog closes on what
-// it showed, and an image applied while it is open updates it in place.
-export default function EditMetadataDialog(props: EditMetadataDialogProps) {
-  const [opening, setOpening] = useState({ open: props.open, count: 0 });
-  if (props.open !== opening.open) {
-    setOpening({ open: props.open, count: props.open ? opening.count + 1 : opening.count });
-  }
-  return <EditMetadataForm key={`${props.item.content_id}:${opening.count}`} {...props} />;
-}
-
-function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps) {
+export default function EditMetadataDialog({ item, open, onOpenChange }: EditMetadataDialogProps) {
   const t = useT();
   const [activeSection, setActiveSection] = useState<Section>("general");
-  // Keep only the fields this opening edited, like the locks below. The rest
-  // show the item as it is now, so a refetch that lands while the dialog is
-  // open, after a save or Reset to Provider, shows through instead of being
-  // saved back over.
-  const [edits, setEdits] = useState<Partial<ReturnType<typeof initFormState>>>({});
+  const [form, setForm] = useState(() => initFormState(item));
   // Keep only local changes to locks. Image selection updates the item while
   // this dialog is open, so a snapshot of the original locks can go stale.
   const [lockOverrides, setLockOverrides] = useState<Map<number, boolean>>(() => new Map());
+  const [imageApplyPending, setImageApplyPending] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   const updateMutation = useUpdateItemMetadata(item.content_id);
-  // Each opening has a new form, so read a save, an image write, or a reset
-  // from an earlier opening too.
-  const savePending = useItemMetadataSavePending(item.content_id);
-  const imageWritePending = useItemImageWritePending(item.content_id);
-  const resetPending = useItemMetadataResetPending(item.content_id);
   const refreshMutation = useRefreshItemMetadata();
-  // A save sends the whole lock list, and a reset clears the locks, so either
-  // one started while another write is running could leave the locks wrong.
-  const writePending = savePending || imageWritePending || resetPending;
 
   const ownsImageLock = item.type === "movie" || item.type === "series";
-  // A season or episode has the series' content rating, which decides age limits.
-  const ownsContentRating = item.type !== "season" && item.type !== "episode";
-  // Seasons order by number, so a sort title would do nothing.
-  const ownsSortTitle = item.type !== "season";
   const fieldLockMap = FIELD_LOCK_MAPS[item.type];
-  // An audiobook's fields mostly come from its file tags, which no provider
-  // supplies, so a reset would empty them rather than restore them.
-  const canResetToProvider = fieldLockMap !== undefined && item.type !== "audiobook";
   const canEditImages = useIsActingAdmin();
   const visibleSections = SECTIONS.filter(
     (s) => s.types.includes(item.type) && (s.key !== "images" || canEditImages),
@@ -132,7 +90,6 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
     : "general";
 
   const originalForm = useMemo(() => initFormState(item), [item]);
-  const form = useMemo(() => ({ ...originalForm, ...edits }), [originalForm, edits]);
   const lockedFields = useMemo(() => {
     const fields = new Set(item.locked_fields ?? []);
     for (const [field, locked] of lockOverrides) {
@@ -144,7 +101,7 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
 
   const setField = useCallback(
     (field: string, value: unknown) => {
-      setEdits((prev) => ({ ...prev, [field]: value }));
+      setForm((prev) => ({ ...prev, [field]: value }));
       const lockField = fieldLockMap?.[field];
       if (lockField !== undefined) {
         setLockOverrides((prev) => new Map(prev).set(lockField, true));
@@ -233,12 +190,20 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
     });
   }
 
-  function handleReset() {
+  async function handleReset() {
     setShowResetConfirm(false);
-    // The server clears the locks in the reset's own write, so a reset that
-    // fails keeps them.
+    // A refresh skips locked fields, so the locks must go first or the reset
+    // would keep every manual edit. If unlocking fails, the dialog stays open
+    // with the unsaved edits.
+    if (fieldLockMap && (item.locked_fields?.length ?? 0) > 0) {
+      try {
+        await updateMutation.mutateAsync({ locked_fields: [] });
+      } catch {
+        return; // useUpdateItemMetadata already reported the failure.
+      }
+    }
     onOpenChange(false);
-    refreshMutation.mutate({ item, mode: "reset" });
+    refreshMutation.mutate({ item, mode: "quick" });
   }
 
   function renderLockIcon(fieldName: string) {
@@ -267,7 +232,15 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
     );
   }
 
-  const typeLabel = t(TYPE_LABEL_KEYS[item.type] ?? "web.item.editMetadata.typeEpisode");
+  const typeLabel = t(
+    item.type === "movie"
+      ? "web.item.editMetadata.typeMovie"
+      : item.type === "series"
+        ? "web.item.editMetadata.typeSeries"
+        : item.type === "season"
+          ? "web.item.editMetadata.typeSeason"
+          : "web.item.editMetadata.typeEpisode",
+  );
 
   return (
     <>
@@ -277,7 +250,7 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
           showCloseButton
         >
           {/* Header */}
-          <DialogHeader className="border-border/10 shrink-0 flex-row items-center justify-between border-b px-5 py-4 pe-12">
+          <DialogHeader className="border-border/10 shrink-0 flex-row items-center justify-between border-b px-5 py-4">
             <div className="flex items-center gap-2.5">
               <DialogTitle className="text-[15px] font-semibold">
                 {t("web.item.dialog.editMetadataTitle")}
@@ -329,17 +302,15 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
                   </FieldRow>
 
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                    {ownsSortTitle && (
-                      <FieldRow
-                        label={t("web.item.editMetadata.sortTitle")}
-                        lockIcon={renderLockIcon("sort_title")}
-                      >
-                        <Input
-                          value={form.sort_title}
-                          onChange={(e) => setField("sort_title", e.target.value)}
-                        />
-                      </FieldRow>
-                    )}
+                    <FieldRow
+                      label={t("web.item.editMetadata.sortTitle")}
+                      lockIcon={renderLockIcon("sort_title")}
+                    >
+                      <Input
+                        value={form.sort_title}
+                        onChange={(e) => setField("sort_title", e.target.value)}
+                      />
+                    </FieldRow>
                     <FieldRow
                       label={t("web.item.editMetadata.originalTitle")}
                       lockIcon={renderLockIcon("original_title")}
@@ -359,7 +330,7 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
                       value={form.overview}
                       onChange={(e) => setField("overview", e.target.value)}
                       rows={4}
-                      className="border-input bg-background text-foreground focus:border-ring focus:ring-ring/50 w-full resize-y rounded-md px-3 py-2.5 text-sm shadow-xs transition-[color,box-shadow] outline-none focus:ring-[3px]"
+                      className="border-border bg-background text-foreground focus:border-ring focus:ring-ring/50 w-full resize-y rounded-md px-3 py-2.5 text-sm shadow-xs transition-[color,box-shadow] outline-none focus:ring-[3px]"
                     />
                   </FieldRow>
 
@@ -379,17 +350,15 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
                   )}
 
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                    {ownsContentRating && (
-                      <FieldRow
-                        label={t("web.item.editMetadata.contentRating")}
-                        lockIcon={renderLockIcon("content_rating")}
-                      >
-                        <Input
-                          value={form.content_rating}
-                          onChange={(e) => setField("content_rating", e.target.value)}
-                        />
-                      </FieldRow>
-                    )}
+                    <FieldRow
+                      label={t("web.item.editMetadata.contentRating")}
+                      lockIcon={renderLockIcon("content_rating")}
+                    >
+                      <Input
+                        value={form.content_rating}
+                        onChange={(e) => setField("content_rating", e.target.value)}
+                      />
+                    </FieldRow>
 
                     {item.type === "movie" && (
                       <FieldRow
@@ -456,9 +425,7 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
 
               {effectiveActiveSection === "dates" && (
                 <div className="space-y-4">
-                  {(item.type === "movie" ||
-                    item.type === "series" ||
-                    item.type === "audiobook") && (
+                  {(item.type === "movie" || item.type === "series") && (
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                       <FieldRow
                         label={t("web.item.dialog.fieldYear")}
@@ -471,7 +438,7 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
                         />
                       </FieldRow>
 
-                      {(item.type === "movie" || item.type === "audiobook") && (
+                      {item.type === "movie" && (
                         <FieldRow
                           label={t("web.item.editMetadata.releaseDate")}
                           lockIcon={renderLockIcon("release_date")}
@@ -719,6 +686,7 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
                     item={item}
                     enabled={effectiveActiveSection === "images"}
                     onImageApplied={handleImageApplied}
+                    onApplyPendingChange={setImageApplyPending}
                   />
                 </div>
               )}
@@ -728,12 +696,14 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
           {/* Footer */}
           <div className="border-border/10 flex shrink-0 flex-col-reverse gap-2 border-t px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5 sm:py-3.5">
             <div>
-              {canResetToProvider && (
+              {fieldLockMap && (
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={() => setShowResetConfirm(true)}
-                  disabled={writePending}
+                  // A save or image apply still running could lock a field
+                  // again after the reset unlocks it.
+                  disabled={updateMutation.isPending || imageApplyPending}
                   className="text-muted-foreground hover:text-foreground"
                 >
                   {t("web.item.editMetadata.resetToProvider")}
@@ -752,10 +722,12 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
               <Button
                 size="sm"
                 onClick={handleSave}
-                disabled={writePending}
+                disabled={updateMutation.isPending || imageApplyPending}
                 className="max-sm:flex-1"
               >
-                {savePending ? t("web.item.dialog.saving") : t("web.item.editMetadata.saveChanges")}
+                {updateMutation.isPending
+                  ? t("web.item.dialog.saving")
+                  : t("web.item.editMetadata.saveChanges")}
               </Button>
             </div>
           </div>
@@ -766,9 +738,7 @@ function EditMetadataForm({ item, open, onOpenChange }: EditMetadataDialogProps)
         open={showResetConfirm}
         onOpenChange={setShowResetConfirm}
         title={t("web.item.editMetadata.resetToProvider")}
-        description={t(
-          RESET_DESCRIPTION_KEYS[item.type] ?? "web.item.editMetadata.resetDescription",
-        )}
+        description={RESET_DESCRIPTIONS[item.type] ?? t("web.item.editMetadata.resetDescription")}
         confirmLabel={t("web.item.editMetadata.resetConfirm")}
         variant="destructive"
         onConfirm={handleReset}

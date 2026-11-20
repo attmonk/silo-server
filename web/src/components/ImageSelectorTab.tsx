@@ -1,5 +1,4 @@
-import { useState, useMemo, useCallback, useRef, type ChangeEvent } from "react";
-import { joinList } from "@/lib/appLocale";
+import { useState, useMemo, useCallback, useEffect, useRef, type ChangeEvent } from "react";
 import { Check, Loader2, AlertCircle, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -7,8 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { ItemDetail, RemoteImage } from "@/api/types";
 import { useItemImages, useApplyItemImage, useUploadItemImage } from "@/hooks/queries/items";
-import { numberText, useT, type MessageKey } from "@/i18n";
-
+import { useT, type MessageKey } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 type ImageTab = "poster" | "backdrop" | "logo";
@@ -60,9 +58,15 @@ interface ImageSelectorTabProps {
   item: ItemDetail;
   enabled: boolean;
   onImageApplied?: () => void;
+  onApplyPendingChange?: (pending: boolean) => void;
 }
 
-export default function ImageSelectorTab({ item, enabled, onImageApplied }: ImageSelectorTabProps) {
+export default function ImageSelectorTab({
+  item,
+  enabled,
+  onImageApplied,
+  onApplyPendingChange,
+}: ImageSelectorTabProps) {
   const t = useT();
   const availableTabs = item.type === "season" ? SEASON_TABS : IMAGE_TABS;
   const [activeTab, setActiveTab] = useState<ImageTab>("poster");
@@ -80,6 +84,11 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
   const pending = applyMutation.isPending || uploadMutation.isPending;
 
   const images = useMemo(() => data?.images ?? [], [data]);
+
+  useEffect(() => {
+    onApplyPendingChange?.(pending);
+    return () => onApplyPendingChange?.(false);
+  }, [pending, onApplyPendingChange]);
 
   const current = data?.current;
   const providerErrors = data?.provider_errors;
@@ -291,7 +300,7 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
               )}
             >
               {p.id === null ? t("web.item.images.allProviders") : p.id.toUpperCase()}
-              <span className="tabular-nums opacity-60">{numberText(p.count)}</span>
+              <span className="tabular-nums opacity-60">{p.count}</span>
             </button>
           ))}
         </div>
@@ -303,7 +312,9 @@ export default function ImageSelectorTab({ item, enabled, onImageApplied }: Imag
           <AlertCircle className="size-3.5 shrink-0" />
           <span>
             {t("web.item.images.providerErrors", {
-              providers: joinList(Object.keys(providerErrors).map((k) => k.toUpperCase())),
+              providers: Object.keys(providerErrors)
+                .map((k) => k.toUpperCase())
+                .join(", "),
             })}
           </span>
         </div>

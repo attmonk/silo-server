@@ -112,7 +112,6 @@ type managedRepositoryReconciler interface {
 
 type autoUpdateInstallationStore interface {
 	List(ctx context.Context) ([]*Installation, error)
-	GetByID(ctx context.Context, id int) (*Installation, error)
 	Update(ctx context.Context, id int, input UpdateInstallationInput) error
 	Delete(ctx context.Context, id int) error
 }
@@ -125,7 +124,8 @@ type autoUpdateCatalog interface {
 type autoUpdateInstaller interface {
 	InstallRemote(ctx context.Context, req InstallArchiveRequest) (*InstallResult, error)
 	InstallBinary(ctx context.Context, req InstallBinaryRequest) (*InstallResult, error)
-	PrepareCatalogReplacement(ctx context.Context, existing *Installation, target *ResolvedCatalogInstall) (*PreparedReplacement, error)
+	ReplaceRemote(ctx context.Context, existing *Installation, req InstallArchiveRequest) (*InstallResult, error)
+	ReplaceBinary(ctx context.Context, existing *Installation, req InstallBinaryRequest) (*InstallResult, error)
 }
 
 type autoUpdateHost interface {
@@ -441,19 +441,7 @@ func (s *AutoUpdateService) handleExistingPlugin(ctx context.Context, existing *
 
 	switch existing.UpdatePolicy {
 	case "auto":
-		err := s.autoUpdatePlugin(ctx, existing, entry)
-		if errors.Is(err, ErrInstallationChanged) {
-			// Another install or update replaced the plugin while this one
-			// downloaded; it is skipped, not refused, and the next pass
-			// compares the catalog against what is installed now.
-			s.logger.InfoContext(ctx, "skipped plugin auto-update: the plugin was replaced while it downloaded",
-				"plugin_id", existing.PluginID,
-				"from_version", existing.Version,
-				"to_version", entry.Manifest.GetVersion(),
-			)
-			return autoUpdateOutcomeNone, nil
-		}
-		return autoUpdateOutcomeUpdated, err
+		return autoUpdateOutcomeUpdated, s.autoUpdatePlugin(ctx, existing, entry)
 	case "notify":
 		return autoUpdateOutcomeNotified, s.notifyPluginUpdate(ctx, existing, entry)
 	default:
@@ -462,37 +450,34 @@ func (s *AutoUpdateService) handleExistingPlugin(ctx context.Context, existing *
 	}
 }
 
-// autoUpdatePlugin replaces the plugin in-place so the installation ID and
-// dependent configuration rows remain stable. The new package is downloaded
-// and checked first; the running plugin is stopped only once it passed and
-// the installation still holds the package it was checked against.
+// autoUpdatePlugin stops the running plugin and replaces it in-place so the
+// installation ID and dependent configuration rows remain stable.
 func (s *AutoUpdateService) autoUpdatePlugin(ctx context.Context, existing *Installation, entry CatalogEntry) error {
 	pluginID := existing.PluginID
 	oldVersion := existing.Version
 	newVersion := entry.Manifest.GetVersion()
 
-	target, err := s.catalog.ResolveInstall(ctx, InstallCatalogRequest{
-		RepositoryID: entry.RepositoryID,
-		PluginID:     pluginID,
-		Version:      newVersion,
-	})
-	var prepared *PreparedReplacement
-	if err == nil {
-		prepared, err = s.installer.PrepareCatalogReplacement(ctx, existing, target)
-	}
-	if err != nil {
-		return fmt.Errorf("install updated plugin %s from %s to %s: %w", pluginID, oldVersion, newVersion, err)
-	}
-
-	if err := checkUnchanged(ctx, s.installations.GetByID, existing); err != nil {
-		return fmt.Errorf("install updated plugin %s from %s to %s: %w", pluginID, oldVersion, newVersion, err)
-	}
+	// Stop the running plugin if a host is available.
 	if s.host != nil {
 		if err := s.host.Stop(existing.ID); err != nil && !errors.Is(err, pluginhost.ErrClientNotFound) {
 			return fmt.Errorf("stop plugin %s: %w", pluginID, err)
 		}
 	}
-	if _, err := prepared.Apply(ctx); err != nil {
+
+	// Install the new version.
+	target, err := s.catalog.ResolveInstall(ctx, InstallCatalogRequest{
+		RepositoryID: entry.RepositoryID,
+		PluginID:     pluginID,
+		Version:      newVersion,
+	})
+	if err == nil {
+		if target.LegacyArchive {
+			_, err = s.installer.ReplaceRemote(ctx, existing, target.ArchiveRequest())
+		} else {
+			_, err = s.installer.ReplaceBinary(ctx, existing, target.BinaryRequest())
+		}
+	}
+	if err != nil {
 		// The old process was stopped above and the row still names the old
 		// release. A lazily started plugin comes back on its next RPC, but a
 		// resident only restarts on a lifecycle reconcile, and the run's
@@ -561,16 +546,11 @@ func (s *AutoUpdateService) recordUpdateFailure(
 		}
 		input.IfVersion = &existing.Version
 	case updateErr == nil && existing.UpdateFailure != nil:
-		// Guarded too: once another install replaced the package this pass
-		// read, the record (if any) is about updating that install and is not
-		// this pass's to clear.
 		input.ClearUpdateFailure = true
-		input.IfInstallPath = &existing.InstallPath
 	default:
 		return
 	}
-	err := s.installations.Update(ctx, existing.ID, input)
-	if err != nil && !errors.Is(err, ErrInstallationNotFound) && !errors.Is(err, ErrInstallationChanged) {
+	if err := s.installations.Update(ctx, existing.ID, input); err != nil && !errors.Is(err, ErrInstallationNotFound) {
 		summary.recordFailuref("record update result for plugin %s: %v", existing.PluginID, err)
 	}
 }

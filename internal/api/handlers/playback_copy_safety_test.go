@@ -88,22 +88,22 @@ func (r *recordingCopySafetyRacer) bareRaces() []int {
 // Starting playback must never wait on the H.264 copy-safety scan: it takes the
 // cached-only ensure, and the plan it issues is handed to the racer that
 // resolves the verdict behind it.
-func TestStartPlaybackV2DoesNotBlockOnCopySafetyScan(t *testing.T) {
+func TestHandleStartPlaybackV3DoesNotBlockOnCopySafetyScan(t *testing.T) {
 	sessionMgr := playback.NewSessionManager(0, 0)
 	file := v3HandlerFixtureFile(t)
 	ensurer := &blockingProbeEnsurer{t: t}
 	racer := &recordingCopySafetyRacer{}
 
-	handler := newKeyedPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	handler.ProbeEnsurer = ensurer
 	handler.CopySafetyRacer = racer
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start",
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start",
 		strings.NewReader(marshalV3StartRequest(t, v3HandlerStartRequest()))).WithContext(newAuthorizedPlaybackContext())
 	rr := httptest.NewRecorder()
-	serveStartPlaybackV2(t, handler, rr, req)
+	handler.HandleStartPlayback(rr, req)
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())

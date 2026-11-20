@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import {
   captureProfileRequestContext,
   captureSessionIdentity,
@@ -18,7 +17,7 @@ export async function mintEventsSocketTicket(profileContext: ProfileRequestConte
   });
   if (!isEventsAuthorityActive(profileContext)) throw new StaleApiRequestContextError();
   if (ticket.protocol !== "silo.events.v2" || !/^[A-Za-z0-9_-]{43}$/.test(ticket.ticket)) {
-    throw new Error(t("web.common.errors.realtimeCredentialInvalid"));
+    throw new Error("Invalid realtime handshake credential.");
   }
   return ticket;
 }
