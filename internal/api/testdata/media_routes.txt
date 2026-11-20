@@ -797,6 +797,8 @@ GET /api/v2/notifications/email-preferences/address/capabilities	non-media
 GET /api/v2/notifications/email/unsubscribe	non-media
 POST /api/v2/notifications/email/unsubscribe	non-media
 GET /api/v2/notifications/email/verify	non-media
+POST /api/v2/notifications/incoming	non-media
+GET /api/v2/notifications/incoming/capabilities	non-media
 GET /api/v2/notifications/plugin-channels	non-media
 GET /api/v2/notifications/plugin-destinations	non-media
 POST /api/v2/notifications/plugin-destinations	non-media
@@ -880,6 +882,10 @@ POST /api/v2/plugin-content/plugins/{installation_id}/*	non-media
 PUT /api/v2/plugin-content/plugins/{installation_id}/*	non-media
 TRACE /api/v2/plugin-content/plugins/{installation_id}/*	non-media
 GET /api/v2/policy/capability	non-media
+GET /api/v2/premieres	non-media
+GET /api/v2/premieres/capabilities	non-media
+GET /api/v2/premieres/settings	non-media
+PUT /api/v2/premieres/settings	non-media
 GET /api/v2/profile/export	non-media
 POST /api/v2/profile/import	non-media
 DELETE /api/v2/profile/sections	non-media
@@ -1865,6 +1871,8 @@ GET /api/v2/notifications/email-preferences/address/capabilities	non-media
 GET /api/v2/notifications/email/unsubscribe	non-media
 POST /api/v2/notifications/email/unsubscribe	non-media
 GET /api/v2/notifications/email/verify	non-media
+POST /api/v2/notifications/incoming	non-media
+GET /api/v2/notifications/incoming/capabilities	non-media
 GET /api/v2/notifications/plugin-channels	non-media
 GET /api/v2/notifications/plugin-destinations	non-media
 POST /api/v2/notifications/plugin-destinations	non-media
@@ -1948,6 +1956,10 @@ POST /api/v2/plugin-content/plugins/{installation_id}/*	non-media
 PUT /api/v2/plugin-content/plugins/{installation_id}/*	non-media
 TRACE /api/v2/plugin-content/plugins/{installation_id}/*	non-media
 GET /api/v2/policy/capability	non-media
+GET /api/v2/premieres	non-media
+GET /api/v2/premieres/capabilities	non-media
+GET /api/v2/premieres/settings	non-media
+PUT /api/v2/premieres/settings	non-media
 GET /api/v2/profile/export	non-media
 POST /api/v2/profile/import	non-media
 DELETE /api/v2/profile/sections	non-media

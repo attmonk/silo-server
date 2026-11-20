@@ -1,5 +1,5 @@
 {
-  "revision": "6a1f169b365c5809f274bdbb2429a4c0b7dfccaf046426000c9dbdfa8c56035a",
+  "revision": "8084113545c51dd0ac9f2a4f6651f9c15471ce30c802bfe005cfe5f5a47c70d7",
   "state": "available",
   "allowed": true,
   "available": true,
@@ -38,6 +38,11 @@
     {
       "name": "notifications",
       "description": "Read the profile's notifications as they arrive and mark them read. No delivery settings.",
+      "audience": "user"
+    },
+    {
+      "name": "notifications:send",
+      "description": "Create incoming notifications for the acting profile. No inbox reads or delivery settings.",
       "audience": "user"
     },
     {

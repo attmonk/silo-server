@@ -82,6 +82,10 @@ var apiKeyScopeRoutes = map[string][]scopeRoute{
 		scopeRoute{http.MethodGet, regexp.MustCompile(`^/api/v2/notifications(/(sync|unread-count|capabilities))?$`)},
 		scopeRoute{http.MethodPost, regexp.MustCompile(`^/api/v2/notifications/(read-all|[^/]+/read)$`)},
 	),
+	auth.ScopeNotificationsSend: userScope(
+		scopeRoute{http.MethodGet, regexp.MustCompile(`^/api/v2/notifications/incoming/capabilities$`)},
+		scopeRoute{http.MethodPost, regexp.MustCompile(`^/api/v2/notifications/incoming$`)},
+	),
 	auth.ScopeRequests: userScope(
 		scopeRoute{http.MethodGet, regexp.MustCompile(`^/api/v2/requests/(mine|status|search|[0-9]+)$`)},
 		scopeRoute{http.MethodGet, regexp.MustCompile(`^/api/v2/requests/detail/[^/]+/[^/]+$`)},

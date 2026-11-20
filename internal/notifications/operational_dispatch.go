@@ -15,6 +15,8 @@ import (
 // (e.g. the auto-disable notice's loop guard). Web push has no per-type
 // filter: profile-level gating happens before dispatch.
 type OperationalDispatch struct {
+	// admit runs event admission under the insertion transaction.
+	admit         func(context.Context, pgx.Tx) error
 	WebhookFilter func(Webhook) bool
 	// PluginDestinationFilter does for plugin destinations what
 	// WebhookFilter does for webhooks; nil keeps the delivery off them.
@@ -52,6 +54,11 @@ func (s *System) DispatchOperational(ctx context.Context, delivery Delivery, opt
 		return nil, fmt.Errorf("begin operational dispatch tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if opts.admit != nil {
+		if err := opts.admit(ctx, tx); err != nil {
+			return nil, err
+		}
+	}
 
 	row, err := s.insertOperational(ctx, tx, delivery, opts, recipient, channels)
 	if err != nil || row == nil {

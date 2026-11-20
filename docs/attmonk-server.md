@@ -1,9 +1,9 @@
 # ATTMonk Server
 
-ATTMonk Server is ATTMonk-maintained fork of Silo. Its web client, default
+ATTMonk Server is the ATTMonk-maintained fork of Silo. Its web client, default
 server name, installed web app, bundled icons, setup screens and help copy use
 ATTMonk Server branding. Uploaded custom server names and brand assets still
-take precedence. Existing default names saved as `Silo` are updated on upgrade.
+take precedence. The default server name is updated on upgrade; custom names take precedence.
 
 The fork retains the upstream license and attribution. Silo remains the name of
 the upstream project and its native apps, plugin SDK, push relay and shared
@@ -27,3 +27,10 @@ The deployment branch is built on the existing server runtime, with an image-onl
 Compose override. Keep the active overrides, database, Redis, mounts and GPU
 configuration when upgrading. The branding migration changes only the legacy
 default server label; it preserves custom names, account IDs and data.
+
+Published images use `ghcr.io/attmonk/attmonk-server`: `server` and
+`server-build-N` keep external PostgreSQL/Redis, while `latest` and `build-N`
+are the bundled image. Both variants also carry immutable commit tags
+(`<commit>-base` and `<commit>`, respectively). Only the deployment branch
+publishes this image after CI succeeds; the integration branch does not publish
+ATTMonk builds. The build-number offset preserves continuity after build 37.

@@ -30,6 +30,15 @@ func BuildNotificationDisplay(row DeliveryRow) NotificationDisplay {
 		URL:        "/notifications",
 	}
 	switch row.Type {
+	case DeliveryTypePremiere, DeliveryTypeIncoming:
+		flags := noticeFlags(row)
+		display.Title = flags.Title
+		display.Body = truncateDisplayText(flags.Message, displayBodyMaxLen)
+		display.ThreadID = "external:" + flags.Source
+		display.Category = "external_notification"
+		if flags.URL != "" && validNoticeURL(flags.URL) {
+			display.URL = flags.URL
+		}
 	case DeliveryTypeEpisodeAvailable:
 		display.Category = "episode_available"
 		display.Title = episodeDisplayTitle(row)

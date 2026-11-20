@@ -602,6 +602,7 @@ func registerAll(reg *Registry) {
 	registerAdminAccessGroups(reg)
 	registerPreferences(reg)
 	registerHome(reg)
+	registerPremieres(reg)
 	registerFavorites(reg)
 	registerNotInterested(reg)
 	registerTitleAllowances(reg)

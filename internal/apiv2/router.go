@@ -32,6 +32,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/literaryworks"
 	"github.com/Silo-Server/silo-server/internal/metadata/translation"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 	"github.com/Silo-Server/silo-server/internal/ratingsources"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
@@ -247,6 +248,7 @@ type Dependencies struct {
 	NotificationRelay             NotificationRelayService
 	AdminNotificationPush         AdminNotificationPushService
 	NotificationInbox             NotificationInboxService
+	NotificationIncoming          NotificationIncomingService
 	CompatConnectInfo             CompatConnectInfoService
 	AdminCatalogTransfer          AdminCatalogTransferService
 	AdminCatalogSearch            AdminCatalogSearchService
@@ -403,6 +405,8 @@ type Dependencies struct {
 	LibraryCollections LibraryCollectionService
 	// Calendar answers the airing calendar (*handlers.CalendarHandler).
 	Calendar CalendarService
+	// Premieres is ATTMonk metadata-driven channel shortcut extension.
+	Premieres *notifications.PremiereService
 	// HomeDismissals records and clears home-card dismissals
 	// (*handlers.HomeDismissalHandler).
 	HomeDismissals HomeDismissalService

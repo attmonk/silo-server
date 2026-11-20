@@ -69,6 +69,9 @@ const (
 	// not reach delivery settings: preferences, webhooks, email, Discord or
 	// push registrations.
 	ScopeNotifications = "notifications"
+	// ScopeNotificationsSend admits incoming notices for the key's acting profile,
+	// without inbox reads, event subscriptions or delivery settings.
+	ScopeNotificationsSend = "notifications:send"
 )
 
 // Scope audiences. An admin scope names operations that need an
@@ -114,6 +117,10 @@ func APIKeyScopeCatalog() []APIKeyScope {
 		{
 			Name: ScopeNotifications, Audience: APIKeyScopeAudienceUser,
 			Description: "Read the profile's notifications as they arrive and mark them read. No delivery settings.",
+		},
+		{
+			Name: ScopeNotificationsSend, Audience: APIKeyScopeAudienceUser,
+			Description: "Create incoming notifications for the acting profile. No inbox reads or delivery settings.",
 		},
 		{
 			Name: ScopeAdminUsers, Audience: APIKeyScopeAudienceAdmin,

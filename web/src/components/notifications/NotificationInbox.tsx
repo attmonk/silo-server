@@ -12,6 +12,7 @@ import {
   type useMarkAllNotificationsRead,
   type useNotifications,
 } from "@/hooks/queries/notifications";
+import { navigateToPluginRoute } from "@/lib/buildPluginHref";
 import { preferredDateLocale } from "@/lib/datetime";
 import { requestDetailHref } from "@/lib/mediaRequests";
 import { cn } from "@/lib/utils";
@@ -51,6 +52,10 @@ function formatNotificationTime(t: Translate, value: string): string {
   return date.toLocaleDateString(preferredDateLocale(), { month: "short", day: "numeric" });
 }
 
+function isNotice(notification: AppNotification): boolean {
+  return notification.type === "external.notification" || notification.type === "episode.premiere";
+}
+
 /** A webhook or plugin destination was turned off after repeated failed deliveries. */
 function isDestinationDisabledNotice(notification: AppNotification): boolean {
   return (
@@ -60,6 +65,9 @@ function isDestinationDisabledNotice(notification: AppNotification): boolean {
 }
 
 function notificationTitle(t: Translate, notification: AppNotification): string {
+  if (isNotice(notification)) {
+    return notification.reason_flags?.title || t("web.notifications.inbox.genericTitle");
+  }
   if (notification.type === "episode.available") {
     return notification.series_title || t("web.notifications.inbox.newEpisode");
   }
@@ -84,6 +92,7 @@ function notificationTitle(t: Translate, notification: AppNotification): string 
 }
 
 function notificationDescription(t: Translate, notification: AppNotification): string {
+  if (isNotice(notification)) return notification.reason_flags?.message || "";
   if (notification.type === "episode.available") {
     const code = formatEpisodeCode(notification);
     const title = notification.episode_title;
@@ -150,6 +159,18 @@ function episodeRange(t: Translate, notifications: AppNotification[]): string {
     : t("web.notifications.inbox.episodeRange", { first, last: lastCode });
 }
 
+function safeNoticeHref(raw: string | undefined): string | null {
+  if (!raw?.startsWith("/") || raw.startsWith("//") || /[\\\p{Cc}]/u.test(raw)) {
+    return null;
+  }
+  try {
+    const path = decodeURIComponent(raw.split(/[?#]/u, 1)[0] ?? "");
+    return path.startsWith("//") || /[\\\p{Cc}]/u.test(path) ? null : raw;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Where a row leads. Episode and fulfilled-request rows open the catalog item;
  * approved and declined requests have no catalog item yet, so they open the
@@ -157,6 +178,7 @@ function episodeRange(t: Translate, notifications: AppNotification[]): string {
  * destination that stopped working opens notification settings, where it is fixed.
  */
 function notificationHref(notification: AppNotification): string | null {
+  if (isNotice(notification)) return safeNoticeHref(notification.reason_flags?.url);
   if (isDestinationDisabledNotice(notification)) return "/settings/notifications";
   if (notification.episode_id) return `/item/${notification.episode_id}`;
   if (notification.series_id) return `/item/${notification.series_id}`;
@@ -347,6 +369,24 @@ function InboxEntryRow({
       >
         {body}
       </button>
+    );
+  } else if (
+    href &&
+    isNotice(newest) &&
+    decodeURIComponent(href.split(/[?#]/u, 1)[0] ?? "").startsWith("/api/v2/plugin-content/")
+  ) {
+    row = (
+      <a
+        href={href}
+        onClick={(event) => {
+          event.preventDefault();
+          if (unread.length > 0) onMarkRead(unread);
+          void navigateToPluginRoute(href);
+        }}
+        className={rowClass}
+      >
+        {body}
+      </a>
     );
   } else if (href) {
     row = (

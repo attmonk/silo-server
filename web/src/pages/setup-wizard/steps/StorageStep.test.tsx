@@ -191,7 +191,7 @@ describe("StorageStep", () => {
     expect(screen.getByLabelText("Folder inside the bucket")).toBeDisabled();
     expect(screen.getByLabelText("Access key")).toBeEnabled();
     expect(
-      screen.getByText(/Silo records a configured private bucket at startup/),
+      screen.getByText(/ATTMonk Server records a configured private bucket at startup/),
     ).toBeInTheDocument();
   });
 
@@ -457,7 +457,7 @@ describe("StorageStep", () => {
 
       await userEvent.click(screen.getByRole("button", { name: /Continue/ }));
 
-      expect(await screen.findByRole("alert")).toHaveTextContent("Silo hasn’t restarted yet");
+      expect(await screen.findByRole("alert")).toHaveTextContent("ATTMonk Server hasn’t restarted yet");
       expect(markDone).not.toHaveBeenCalled();
 
       back = true;

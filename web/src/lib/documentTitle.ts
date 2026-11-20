@@ -1,7 +1,7 @@
 import { t, type MessageKey } from "@/i18n";
 
 /** The product name: the tab title when admin branding names no server. */
-const PRODUCT_NAME = "Silo";
+import { PRODUCT_NAME } from "@/lib/productBrand";
 
 /** Default app name, overridable by admin branding settings. */
 export let APP_DOCUMENT_TITLE = PRODUCT_NAME;

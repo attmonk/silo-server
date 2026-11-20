@@ -198,6 +198,7 @@ type NotificationPushDisplayInput struct {
 type NotificationPushDisplayOutput struct{ Body NotificationPushDisplay }
 
 func registerNotificationInbox(reg *Registry) {
+	registerNotificationIncoming(reg)
 	display := notificationOperation(http.MethodGet, "/push/apple/display/{delivery_id}", notificationApplePushDisplayOperation)
 	display.Summary = "Read compact display metadata for an Apple push notification."
 	Register(reg, display, func(ctx context.Context, in *NotificationPushDisplayInput) (*NotificationPushDisplayOutput, error) {

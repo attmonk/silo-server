@@ -685,6 +685,12 @@ export function applyNotificationsSnapshot(queryClient: QueryClient, rows: AppNo
 export function notificationToast(
   notification: AppNotification,
 ): { title: string; description?: string } | null {
+  if (notification.type === "external.notification" || notification.type === "episode.premiere") {
+    return {
+      title: notification.reason_flags?.title || t("web.notifications.inbox.genericTitle"),
+      description: notification.reason_flags?.message || undefined,
+    };
+  }
   if (notification.type === "episode.available" && notification.series_title) {
     return {
       title: t("web.notifications.toast.newEpisode", { series: notification.series_title }),

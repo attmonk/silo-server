@@ -8,6 +8,7 @@ import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 import os from "os";
 import { configDefaults } from "vitest/config";
+import { PRODUCT_NAME } from "./src/lib/productBrand";
 
 /// <reference types="vitest" />
 
@@ -155,6 +156,68 @@ function themeBootScript(): Plugin {
 const ADMIN_MESSAGE_PREFIX = "web.admin.";
 const CATALOG_PART = /[\\/]src[\\/]locales[\\/][^\\/]+\.json\?part=(app|admin)$/;
 
+// These messages name upstream products, services, or reviewers. The fork does
+// not own those identities. Generated translation files remain unchanged.
+const UPSTREAM_BRAND_MESSAGES = new Set([
+  "web.admin.plugins.communityCatalog.description",
+  "web.admin.plugins.source.silo",
+  "web.admin.plugins.source.approvedCommunityNotice",
+  "web.admin.settings.notifications.relay.description",
+  "web.admin.downloads.deviceCopies.revokeDialog.description",
+  "web.admin.downloads.deviceCopies.revokeDialog.descriptionProfile",
+  "web.admin.settings.general.network.lanDiscovery.description",
+  "web.audiobooks.player.intervalsShared",
+  "web.auth.openInApp",
+  "web.common.markers.sharingDisclosure",
+  "web.settings.connectApps.appType.silo",
+  "web.settings.connectApps.noSiloSignIn.recoveryTitle",
+  "web.settings.connectApps.scope.siloBody",
+  "web.settings.connectApps.scope.siloBodyTyped",
+  "web.settings.connectApps.scope.siloTitle",
+  "web.settings.connectApps.troubleshooting.siloAddressQuestion",
+  "web.settings.nav.connectApps.description",
+  "web.settings.playback.seek.description",
+  "web.setup.connect.lede",
+  "web.setup.connect.summarySiloOnly",
+  "web.setup.features.onlineMarkersDescription",
+  "web.setup.features.onlineMarkersLabel",
+  "web.setup.features.pushDescription",
+  "web.setup.features.shareMarkersLabel",
+]);
+
+function brandCatalogMessage(key: string, message: unknown): unknown {
+  if (
+    UPSTREAM_BRAND_MESSAGES.has(key) ||
+    key.startsWith("web.notifications.pushPrivacy.") ||
+    key.startsWith("web.auth.activate.remote") ||
+    key.startsWith("web.auth.activate.result.remote") ||
+    key.startsWith("web.watchTogether.invite.")
+  ) {
+    return message;
+  }
+  // Only literal ICU nodes contain product copy. Argument names, tags, select
+  // branches, and user-provided values must keep their original bytes.
+  return JSON.parse(JSON.stringify(message), (_key, value: unknown) => {
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      "type" in value &&
+      value.type === 0 &&
+      "value" in value &&
+      typeof value.value === "string"
+    ) {
+      return {
+        ...value,
+        value: value.value.replace(
+          /(?<![\w./@-])(?:Silo(?: Server)?|ATTMonk(?: Server)?)(?![\w./@-])/g,
+          PRODUCT_NAME,
+        ),
+      };
+    }
+    return value;
+  });
+}
+
 /**
  * Serves one part of a generated catalog: `locales/<tag>.json?part=admin` holds
  * the `web.admin.*` messages and `?part=app` the rest, so admin text never
@@ -174,7 +237,9 @@ export function catalogParts(): Plugin {
       const admin = match[1] === "admin";
       const messages = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
       const part = Object.fromEntries(
-        Object.entries(messages).filter(([key]) => key.startsWith(ADMIN_MESSAGE_PREFIX) === admin),
+        Object.entries(messages)
+          .filter(([key]) => key.startsWith(ADMIN_MESSAGE_PREFIX) === admin)
+          .map(([key, message]) => [key, brandCatalogMessage(key, message)]),
       );
       return JSON.stringify(part);
     },

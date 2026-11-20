@@ -33,6 +33,12 @@ func TestAPIKeyScopesAllow(t *testing.T) {
 		{"unscoped allows anything", nil, http.MethodPost, "/api/v2/admin/settings", true},
 		{"empty scopes allow anything", []string{}, http.MethodGet, "/api/v2/watch/home", true},
 
+		{"incoming notification", []string{auth.ScopeNotificationsSend}, http.MethodPost, "/api/v2/notifications/incoming", true},
+		{"incoming discovery", []string{auth.ScopeNotificationsSend}, http.MethodGet, "/api/v2/notifications/incoming/capabilities", true},
+		{"send denies inbox", []string{auth.ScopeNotificationsSend}, http.MethodGet, "/api/v2/notifications", false},
+		{"send denies delivery settings", []string{auth.ScopeNotificationsSend}, http.MethodPut, "/api/v2/notifications/preferences", false},
+		{"send denies event tickets", []string{auth.ScopeNotificationsSend}, http.MethodPost, "/api/v2/events/ws-ticket", false},
+		{"inbox scope denies sending", []string{auth.ScopeNotifications}, http.MethodPost, "/api/v2/notifications/incoming", false},
 		{"users list", users, http.MethodGet, "/api/v2/admin/users", true},
 		{"users create", users, http.MethodPost, "/api/v2/admin/users", true},
 		{"users get", users, http.MethodGet, "/api/v2/admin/users/42", true},

@@ -105,4 +105,45 @@ describe("catalogParts", () => {
     expect(await load(`${file}?part=admin`)).toEqual({ "web.admin.users.title": [2] });
     expect(await load(file)).toBeNull();
   });
+
+  it("brands ICU copy without changing arguments, choices, upstream identities, or source files", async () => {
+    const file = path.join(dir, "src", "locales", "en.json");
+    const messages = {
+      "web.admin.example": [
+        { type: 0, value: "Silo Server welcomes " },
+        { type: 1, value: "Silo" },
+        { type: 0, value: " https://github.com/Silo-Server/silo-server " },
+        {
+          type: 5,
+          value: "product",
+          options: {
+            Silo: { value: [{ type: 0, value: "ATTMonk Server" }] },
+            other: { value: [{ type: 0, value: "Serveur Silo" }] },
+          },
+        },
+      ],
+      "web.admin.plugins.source.approvedCommunityNotice": [
+        { type: 0, value: "Reviewed by Silo maintainers" },
+      ],
+    };
+    const source = JSON.stringify(messages);
+    writeFileSync(file, source);
+    expect(await load(`${file}?part=admin`)).toEqual({
+      ...messages,
+      "web.admin.example": [
+        { type: 0, value: "ATTMonk Server welcomes " },
+        { type: 1, value: "Silo" },
+        { type: 0, value: " https://github.com/Silo-Server/silo-server " },
+        {
+          type: 5,
+          value: "product",
+          options: {
+            Silo: { value: [{ type: 0, value: "ATTMonk Server" }] },
+            other: { value: [{ type: 0, value: "Serveur ATTMonk Server" }] },
+          },
+        },
+      ],
+    });
+    expect(readFileSync(file, "utf8")).toBe(source);
+  });
 });

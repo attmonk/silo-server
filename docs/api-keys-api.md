@@ -201,6 +201,7 @@ The Jellyfin and plugin surfaces refuse them, as they refuse every scoped key.
 | `watch:read` | `/history`, `/progress`, progress snapshots, `/favorites`, `/ratings`, `/watchlist`, `/not-interested`, and `/profile/export` |
 | `watch:write` | `POST` and `DELETE /watched/{id}`, `POST /sync/progress`, `POST /history/remove`, `DELETE /progress/{id}/position`, writes to favorites, ratings, hidden titles and watchlist entries for titles in the library. `POST /profile/import` stays outside it, because an import also overwrites the profile's settings and notification preferences |
 | `notifications` | `GET /notifications`, `/notifications/sync`, `/notifications/unread-count`, `/notifications/capabilities`, and marking read with `POST /notifications/{id}/read` and `/notifications/read-all`. No preferences, webhooks, email, Discord or push registrations |
+| `notifications:send` (fork extension) | `POST /notifications/incoming` and `GET /notifications/incoming/capabilities`, for the verified acting profile only. No inbox reads, event socket, or delivery settings |
 | `requests` | Request discovery and search, and reading, creating, following, cancelling and removing requests as the profile's own session can: the account's requests, or only the profile's own when it is blocked from requests. Also adding and removing watchlist titles that are not in the library (`PUT` and `DELETE /watchlist/titles/{media_type}/{tmdb_id}`), which can create or withdraw a request |
 | `libraries:read` | See [Restricted discovery scopes](#restricted-discovery-scopes) |
 

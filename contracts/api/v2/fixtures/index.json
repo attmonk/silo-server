@@ -12613,6 +12613,49 @@
       "body_file": "notification_get_notification_unread_count.json"
     },
     {
+      "name": "notification_incoming",
+      "operation_id": "receiveIncomingNotification",
+      "scenario": "Authenticated admission targets only the verified acting profile.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/notifications/incoming",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-owner"
+        },
+        "body": "{\"source\":\"integration\",\"event_id\":\"one\",\"title\":\"Reminder\"}"
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/NotificationIncomingResult",
+      "body_file": "notification_incoming.json"
+    },
+    {
+      "name": "notification_incoming_capabilities",
+      "operation_id": "getIncomingNotificationCapabilities",
+      "scenario": "The acting profile discovers incoming notification support.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/notifications/incoming/capabilities",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-owner"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "private, no-cache",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/NotificationIncomingCapability",
+      "body_file": "notification_incoming_capabilities.json"
+    },
+    {
       "name": "notification_list_notification_series",
       "operation_id": "listNotificationSeries",
       "scenario": "Series that can notify the acting profile, with one the viewer may not see omitted.",
@@ -13660,6 +13703,28 @@
       "response_media_type": "application/problem+json",
       "schema": "#/components/schemas/Problem",
       "body_file": "precondition_required.json"
+    },
+    {
+      "name": "premiere_capabilities_unavailable",
+      "operation_id": "getPremiereCapabilities",
+      "scenario": "Premiere settings stay hidden when the optional Live TV bridge is unavailable.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/premieres/capabilities",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-owner"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "private, no-cache",
+        "Content-Type": "application/json",
+        "ETag": "\"4cec07f11085e52f8e9fe54c518b632aaf93bb4df3d0149549a42d3cac44c3ce\""
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/PremiereCapability",
+      "body_file": "premiere_capabilities_unavailable.json"
     },
     {
       "name": "prepare_download_again",

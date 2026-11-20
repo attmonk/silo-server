@@ -1,6 +1,6 @@
 # Local streaming relay for plugin HTTP routes
 
-This is a ATTMonk fork extension. It lets an authenticated plugin route deliver an unbounded media stream without buffering it in the SDK's `HandleHTTPResponse.Body`.
+This is a attmonk fork extension. It lets an authenticated plugin route deliver an unbounded media stream without buffering it in the SDK's `HandleHTTPResponse.Body`.
 
 A trusted installed plugin can return status `200` and a header:
 

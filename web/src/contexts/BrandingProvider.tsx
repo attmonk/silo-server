@@ -7,7 +7,9 @@ import { themeKeys } from "@/hooks/queries/keys";
 import { accentDeclarations } from "@/lib/accentColor";
 import { setAppDocumentTitle } from "@/lib/documentTitle";
 
-const DEFAULT_SERVER_NAME = "Silo";
+import { DEFAULT_FAVICON_URL, PRODUCT_NAME } from "@/lib/productBrand";
+
+const DEFAULT_SERVER_NAME = PRODUCT_NAME;
 
 /**
  * The subtitle the server sends when no administrator set one
@@ -85,7 +87,7 @@ function applyFavicon(url: string | null) {
     link.rel = "icon";
     document.head.appendChild(link);
   }
-  link.href = url ?? "/favicon.ico";
+  link.href = url ?? DEFAULT_FAVICON_URL;
 }
 
 const ACCENT_STYLE_ID = "silo-accent";

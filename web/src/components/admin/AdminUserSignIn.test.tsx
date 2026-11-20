@@ -242,7 +242,7 @@ describe("AdminUserSignIn linking by subject", () => {
   });
 
   it.each([
-    ["identity_linked_elsewhere", 409, "already connected to another Silo account"],
+    ["identity_linked_elsewhere", 409, "already connected to another ATTMonk Server account"],
     ["permission_denied", 403, "Only the server owner can change another admin's sign-in."],
     ["validation_failed", 422, "raw validation_failed"],
   ])("explains a %s refusal", async (type, status, text) => {

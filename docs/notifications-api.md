@@ -55,6 +55,54 @@ Fanout transactions lock their complete recipient profile union in sorted order
 before inserting; unrelated profiles can progress independently. Existing rows
 retain their timestamps, and migration seeds the boundary from their maximum.
 
+## Incoming notices (fork extension)
+
+`GET /incoming/capabilities` discovers incoming notification support for the
+verified acting profile. `POST /incoming` accepts an authenticated account's
+notice for that same profile. It does not accept a recipient in the body or
+provide an anonymous webhook URL. Integrations use the normal v2 authentication
+and profile headers; demo sessions cannot write. A scoped API key needs
+`notifications:send`, which grants only admission and incoming capability discovery.
+Bind the key to one profile to keep the integration tied to that recipient; the
+existing `notifications` scope still grants no sending rights.
+
+The JSON body requires `source` (1–64 lowercase letters, digits, dots, underscores
+or hyphens, beginning with a letter or digit), `event_id` (1–128 characters), and
+`title` (1–200 characters). Optional `message` is plain text up to 4,000 characters;
+`url` is a server-relative destination up to 2,048 characters. Absolute URLs,
+network-path references, backslashes and control characters are rejected, including
+encoded path forms. Optional `expires_at` is a UTC instant, using the v2 timestamp
+format. The stored `external.notification` delivery carries these fields in
+`reason_flags`; clients render the title and message as text, never HTML.
+
+A successful response has a `status`:
+
+- `accepted`: the inbox row and enabled profile push outboxes committed together;
+  `delivery_id` identifies the durable inbox record.
+- `duplicate`: the retained record for this account, profile, source and event ID
+  already has exactly this content. The same `delivery_id` is returned without
+  changing read state or sending again.
+- `disabled`: in-app notifications or the profile's notifications are disabled;
+  no delivery is created.
+- `expired`: the deadline passed before admission; no delivery is created.
+
+Changed content under an existing event identity returns `409 conflict`; invalid
+content returns `422 validation_failed`. Identity is scoped to both account and
+profile, and deduplication lasts while the inbox delivery is retained. Disabled
+and expired admissions do not reserve an event identity. A previously accepted
+replay returns `duplicate` even if its deadline has since passed.
+
+Web push and native push use the existing profile settings and retry queues.
+Account email and Discord delivery follow their existing digest preferences.
+Incoming notices do not enqueue outbound profile webhooks, preventing feedback
+loops. A deadline also suppresses queued channel attempts after expiry; it cannot
+recall already delivered messages or remove an existing inbox entry. Plugin links
+in the web inbox establish Silo's plugin launch session before navigation.
+
+The capability and admission endpoints are producer APIs; they do not change
+Jellyfin compatibility or require client-side notification producers. Existing
+native push display metadata includes the notice title, body and local URL.
+
 ## Notified series
 
 `GET /series` (`listNotificationSeries`) lists every series the acting profile
@@ -936,3 +984,67 @@ snapshot. The form reports queued/pending verification and prevents editing the
 submitted address while its request is pending. It does not claim an email was
 sent. The dispatcher and retention policy above close the worker uncertainty and
 receipt/payload retention items; the migration must precede dispatching nodes.
+
+
+## Metadata premiere reminders (ATTMonk Server extension)
+
+The `/api/v2/premieres` surface requires the authenticated account and a verified
+profile. `GET /capabilities` reports availability, with ordinary capability ETag
+revalidation. It is unavailable when the fork's Live TV bridge is disabled or the
+plugin services are absent.
+
+- `GET /settings` returns `preferences`, `mappings` and that profile's accessible
+  plugin channels. Preferences are `enabled` and `window_minutes` (15–240,
+  default 60). The notification master switch remains authoritative.
+- `PUT /settings` atomically replaces that profile's preferences and mappings.
+  Each mapping names `broadcaster`, optional `series_id`, `channel_ids` and
+  `window_minutes`. Channel IDs must belong to the current recipient lineup.
+  `channels_available` reports lineup lookup failures; saved mappings remain
+  readable, and turning reminders off works when channels disappear.
+  A series override takes precedence; unresolved multiple broadcasters produce
+  no shortcut. No account or profile selector is accepted in the body.
+- `GET /api/v2/premieres` returns `items` for the current
+  metadata window, optionally restricted with `item_id` to a series or episode.
+  Each entry contains episode/series identity, UTC `starts_at`/`ends_at`,
+  `active`, broadcaster and channel page links. Calendar library and maturity
+  access rules apply. A channel link uses the authenticated plugin-content
+  mount and never carries an upstream media URL.
+
+The schedule is the catalog's original episode date combined with its series
+wall-clock airtime and source timezone. A date-only entry cannot generate a timed
+shortcut. This is an expected premiere, not EPG confirmation of current content.
+The existing calendar's season-premiere badge is not the eligibility filter:
+ordinary episodes participate too. Streaming-only titles need an explicit usable
+channel mapping; no stream is fabricated from a streaming service's name.
+
+The API host checks configured profiles every minute, using qualifying series
+only and at most four profiles concurrently. Favorites and watchlist
+relationships qualify immediately through the configured user store. Upstream's
+removed favorites/watchlist notification switches are no longer consulted.
+Viewing interest requires a completed episode, not playback progress alone, and
+uses `notify_next_up`. Series mutes, current catalog access and the notification
+master switch are checked before admission. The scheduler sends at most five
+minutes after the expected start; it never sends a backlog after that grace
+period. An episode completed by the recipient is skipped.
+
+Pending reminders are derived from durable catalog metadata, so corrections and
+restarts do not leave a second stale schedule. `premiere_receipts` records one
+series/season/episode identity per account/profile independently of inbox retention.
+Receipt admission, the `episode.premiere` inbox delivery and durable push outbox
+inserts share one transaction. Multiple channels, libraries, hosts and subsequent
+reruns do not create another premiere delivery. Deleting a profile removes its
+mappings, preferences and receipts.
+
+Premiere deliveries carry the same plain display fields as incoming notifications
+and expire at the configured window's end. They link to the episode page with
+`premiere=1`, where channels and timing are resolved again. Already delivered
+messages cannot be recalled. Existing email/Discord preferences apply; expiry may
+suppress a reminder before a digest is due. Webhook fanout is not enabled for this
+notification type.
+
+The web calendar and series/episode details expose the action only during the
+expected window. A single channel opens directly; several open a chooser. Native
+clients may discover the new API, but existing native detail screens do not expose
+these web controls. Their generic notification handling remains the compatibility
+fallback; richer native premiere navigation is a separate client integration.
+Jellyfin's existing Live TV bridge is unchanged and has no premiere-reminder inbox.

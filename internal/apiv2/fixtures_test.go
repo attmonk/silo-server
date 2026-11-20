@@ -1770,7 +1770,9 @@ func fixtureCases() []fixtureCase {
 	cases = append(cases, adminCatalogItemsFixtureCases()...)
 	cases = append(cases, adminCatalogMatchHintsFixtureCases()...)
 	cases = append(cases, deviceLoginBindingFixtureCases()...)
-	return append(cases, adminDashboardLayoutFixtureCases()...)
+	cases = append(cases, premiereFixtureCases()...)
+	cases = append(cases, adminDashboardLayoutFixtureCases()...)
+	return append(cases, notificationIncomingFixtureCases()...)
 }
 
 // deviceLoginBindingFixtureCases pin the session binding a device-login
@@ -2216,6 +2218,7 @@ func fixtureDeps() Dependencies {
 	deps.Invitations = fixtureInvitations()
 	deps.PasswordResets = fixturePasswordResets()
 	deps.NotificationInbox = fixtureNotificationInbox()
+	deps.NotificationIncoming = new(fixtureIncomingNotifications)
 	deps.AdminNotificationPush = new(fakeAdminNotificationPush)
 	deps.AdminNotificationDiscord = new(fakeAdminNotificationDiscord)
 	deps.NotificationDestinationTests = new(fakeNotificationDestinationTests)

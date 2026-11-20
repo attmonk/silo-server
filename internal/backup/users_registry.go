@@ -142,6 +142,9 @@ var excludedUserTables = map[string]string{
 	"user_setting_mutations":                   "setting write idempotency records",
 	"user_setting_migration_rejects":           "settings migration records",
 	// Data that names this server, or that the 1.0 restore does not cover.
+	"premiere_preferences":             "fork premiere settings; preserved by full server backups",
+	"premiere_channel_mappings":        "fork channel mappings; preserved by full server backups",
+	"premiere_receipts":                "fork delivery deduplication; preserved by full server backups",
 	"jellycompat_displayprefs":         "Jellyfin client display state",
 	"user_profile_onboarding":          "a restored profile repeats onboarding tours",
 	"media_request_follows":            "media requests are not restored",

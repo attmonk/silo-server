@@ -191,6 +191,7 @@ const (
 // restoredFlagColumns are the boolean columns of restored tables that are
 // not stricterFlags, each with why the backup's value is the one to keep.
 var restoredFlagColumns = map[string]string{
+	"premiere_preferences.enabled":                            "a user reminder preference; delivery still requires the current notification policy",
 	"access_groups.is_default":                                "which group new accounts join; the invitation carry compares the policy it grants",
 	"admin_playback_history.completed":                        whyHistory,
 	"admin_playback_history.measured":                         whyHistory,

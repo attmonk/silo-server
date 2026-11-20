@@ -89,7 +89,7 @@ function makeConnectInfo(
 
 const LOCAL_PROVIDER: AuthProviderOption = {
   id: "local",
-  display_name: "Silo account",
+  display_name: "ATTMonk Server account",
   mode: "credentials",
   default: true,
 };

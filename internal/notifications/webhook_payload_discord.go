@@ -168,6 +168,9 @@ func buildDiscordDigestEntry(row DeliveryRow, test bool) discordDigestEntry {
 	title := truncateWithEllipsis(discordEmbedTitle(row), discordTitleLimit)
 
 	overview := row.SeriesOverview
+	if row.Type == DeliveryTypePremiere || row.Type == DeliveryTypeIncoming {
+		overview = noticeFlags(row).Message
+	}
 	if row.Type == DeliveryTypeEpisodeAvailable && row.EpisodeOverview != "" {
 		overview = row.EpisodeOverview
 	}
@@ -239,6 +242,8 @@ func buildDiscordDigestEntry(row DeliveryRow, test bool) discordDigestEntry {
 
 func discordEmbedTitle(row DeliveryRow) string {
 	switch row.Type {
+	case DeliveryTypePremiere, DeliveryTypeIncoming:
+		return noticeFlags(row).Title
 	case DeliveryTypeRequestFulfilled:
 		if row.SeriesTitle != "" {
 			return titleWithYear(row.SeriesTitle, row.Year)

@@ -258,7 +258,7 @@ describe("StorageSettings", () => {
     expect(screen.getByRole("dialog", { name: "Change artwork storage" })).toBeInTheDocument();
     expect(screen.queryByRole("combobox", { name: "Target" })).not.toBeInTheDocument();
     expect(screen.getByRole("group", { name: "Target" })).toHaveTextContent(
-      "Local disk (default Silo behavior)",
+      "Local disk (default ATTMonk Server behavior)",
     );
     expect(screen.queryByText("Configured S3 location")).not.toBeInTheDocument();
     serverStatus.current = undefined;
