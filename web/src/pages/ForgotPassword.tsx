@@ -11,7 +11,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { AuthCard, SignInHint } from "@/components/auth/AuthCard";
-import { useT } from "@/i18n";
 
 export default function ForgotPassword() {
   const [searchParams] = useSearchParams();
@@ -26,8 +25,7 @@ export default function ForgotPassword() {
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const lifetime = useRef<AbortController | null>(null);
-  const t = useT();
-  useDocumentTitle(t("web.auth.forgotPassword.documentTitle"));
+  useDocumentTitle("Forgot Password");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -41,7 +39,7 @@ export default function ForgotPassword() {
         <div
           className="border-primary h-8 w-8 animate-spin rounded-full border-b-2"
           role="status"
-          aria-label={t("common.loading")}
+          aria-label="Loading"
         />
       </div>
     );
@@ -52,15 +50,16 @@ export default function ForgotPassword() {
   }
   if (sentFor !== null) {
     return (
-      <AuthCard eyebrow={serverName} title={t("web.auth.forgotPassword.checkEmailTitle")}>
+      <AuthCard eyebrow={serverName} title="Check your email">
         <p role="status" className="mb-3 text-sm">
-          {t("web.auth.forgotPassword.sent", { login: sentFor })}
+          If {sentFor} matches an account with an email address, we sent that address a link to
+          choose a new password.
         </p>
         <p className="text-muted-foreground mb-4 text-sm">
-          {t("web.auth.forgotPassword.spamHint")}
+          Nothing after a few minutes? Check your spam folder, then try again.
         </p>
         <Button asChild className="w-full">
-          <Link to="/login">{t("web.auth.forgotPassword.backToSignIn")}</Link>
+          <Link to="/login">Back to sign in</Link>
         </Button>
       </AuthCard>
     );
@@ -69,11 +68,11 @@ export default function ForgotPassword() {
     return (
       <AuthCard
         eyebrow={serverName}
-        title={t("web.auth.passwordRules.resetPasswordTitle")}
-        description={t("web.auth.forgotPassword.unreachable")}
+        title="Reset password"
+        description="The server could not be reached. Try again."
       >
         <Button className="w-full" onClick={capability.retry}>
-          {t("common.tryAgain")}
+          Try again
         </Button>
         <SignInHint />
       </AuthCard>
@@ -83,8 +82,8 @@ export default function ForgotPassword() {
     return (
       <AuthCard
         eyebrow={serverName}
-        title={t("web.auth.passwordRules.resetPasswordTitle")}
-        description={t("web.auth.forgotPassword.unavailable")}
+        title="Reset password"
+        description="This server doesn't offer password resets from the sign-in page. Ask your admin to reset your password."
       >
         <SignInHint />
       </AuthCard>
@@ -107,9 +106,9 @@ export default function ForgotPassword() {
       if (err instanceof V2ProblemError && err.status === 409) {
         setRefused(true);
       } else if (err instanceof V2ProblemError && err.status === 429) {
-        setError(t("web.auth.forgotPassword.rateLimited"));
+        setError("Too many requests from this network. Wait a minute, then try again.");
       } else {
-        setError(t("web.auth.forgotPassword.sendFailed"));
+        setError("Could not send the request. Try again.");
       }
     } finally {
       if (!controller.signal.aborted) setSubmitting(false);
@@ -119,8 +118,8 @@ export default function ForgotPassword() {
   return (
     <AuthCard
       eyebrow={serverName}
-      title={t("web.auth.passwordRules.resetPasswordTitle")}
-      description={t("web.auth.forgotPassword.description")}
+      title="Reset password"
+      description="Enter your username or email. If it matches an account, we'll email that account a link to choose a new password."
     >
       {error && (
         <p role="alert" className="text-destructive mb-4 text-sm">
@@ -129,7 +128,7 @@ export default function ForgotPassword() {
       )}
       <form onSubmit={handleSubmit} className="space-y-4">
         <div className="space-y-2">
-          <Label htmlFor="forgot-login">{t("web.auth.forgotPassword.loginLabel")}</Label>
+          <Label htmlFor="forgot-login">Username or email</Label>
           <Input
             id="forgot-login"
             value={login}
@@ -141,7 +140,7 @@ export default function ForgotPassword() {
           />
         </div>
         <Button type="submit" className="w-full" disabled={submitting}>
-          {submitting ? t("web.auth.forgotPassword.sending") : t("web.auth.forgotPassword.send")}
+          {submitting ? "Sending..." : "Send reset link"}
         </Button>
       </form>
       <SignInHint />

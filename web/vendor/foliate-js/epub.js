@@ -968,13 +968,7 @@ class Loader {
                 el.setAttribute('style',
                     await this.replaceCSS(el.getAttribute('style'), href, parents))
             // TODO: replace inline scripts? probably not worth the trouble
-            // Silo patch: a document parsed as HTML is parsed as HTML again
-            // downstream, so serialize it as HTML. XMLSerializer escapes `>`
-            // and `&` inside <style>, which HTML then reads literally.
-            const result = item.mediaType === MIME.HTML
-                ? (doc.doctype ? `<!DOCTYPE ${doc.doctype.name}>` : '')
-                    + doc.documentElement.outerHTML
-                : new XMLSerializer().serializeToString(doc)
+            const result = new XMLSerializer().serializeToString(doc)
             return this.createURL(href, result, item.mediaType, parent)
         }
 

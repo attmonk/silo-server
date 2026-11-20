@@ -311,52 +311,43 @@ func (c *PlexClient) FetchLibrarySections(ctx context.Context, baseURL, token st
 	return sections, nil
 }
 
-// Plex section listings. Watched items include titles marked watched without
-// playback. In-progress items have a saved resume position; unlike
-// /library/onDeck that has no Continue Watching age window and never adds
-// unstarted next-up episodes.
-const (
-	plexSectionExcludedElements = "Media,Genre,Role,Director,Writer,Country,Rating"
-	plexSectionExcludedFields   = "summary,thumb,art,grandparentArt,grandparentThumb,parentThumb,tagline"
-
-	plexFilterWatched    = "unwatched"
-	plexFilterInProgress = "inProgress"
-)
-
-func plexFilterValue(filterKey string) string {
-	switch filterKey {
-	case plexFilterWatched:
-		return "0"
-	case plexFilterInProgress:
-		return "1"
-	}
-	return ""
+// FetchWatchedItems lists the section items the token's user has played at
+// least once, including items marked watched without playback.
+func (c *PlexClient) FetchWatchedItems(ctx context.Context, baseURL, token, sectionKey string, mediaType int) ([]PlexItem, error) {
+	return c.fetchSectionItems(ctx, baseURL, token, sectionKey, mediaType, "unwatched", "0")
 }
 
-// forEachSectionPage visits a section listing page by page, starting at
-// offset. visit gets each page and the offset it started at.
-func (c *PlexClient) forEachSectionPage(ctx context.Context, baseURL, token, sectionKey string, mediaType int, filterKey string, offset int, visit func(items []PlexItem, pageStart int) error) error {
+// FetchInProgressItems lists the section items with a saved resume position.
+// Unlike /library/onDeck it has no Continue Watching age window and never
+// adds unstarted next-up episodes.
+func (c *PlexClient) FetchInProgressItems(ctx context.Context, baseURL, token, sectionKey string, mediaType int) ([]PlexItem, error) {
+	return c.fetchSectionItems(ctx, baseURL, token, sectionKey, mediaType, "inProgress", "1")
+}
+
+func (c *PlexClient) FetchSectionItems(ctx context.Context, baseURL, token, sectionKey string, mediaType int) ([]PlexItem, error) {
+	return c.fetchSectionItems(ctx, baseURL, token, sectionKey, mediaType, "", "")
+}
+
+func (c *PlexClient) fetchSectionItems(ctx context.Context, baseURL, token, sectionKey string, mediaType int, filterKey, filterValue string) ([]PlexItem, error) {
+	var allItems []PlexItem
 	var budget listingBudget
+	offset := 0
 	for {
 		if err := budget.startPage(); err != nil {
-			return fmt.Errorf("fetching Plex section items (section %s, type %d): %w", sectionKey, mediaType, err)
+			return nil, fmt.Errorf("fetching Plex section items (section %s, type %d): %w", sectionKey, mediaType, err)
 		}
 		query := url.Values{}
 		query.Set("type", strconv.Itoa(mediaType))
 		if filterKey != "" {
-			query.Set(filterKey, plexFilterValue(filterKey))
+			query.Set(filterKey, filterValue)
 		}
 		query.Set("includeGuids", "1")
-		// Only watch state and ids are read; Plex answers the page without the
-		// rest, which also makes a page cheaper for it to build.
-		query.Set("excludeElements", plexSectionExcludedElements)
-		query.Set("excludeFields", plexSectionExcludedFields)
 		query.Set("X-Plex-Container-Start", strconv.Itoa(offset))
 		query.Set("X-Plex-Container-Size", strconv.Itoa(plexPageSize))
 		reqURL := fmt.Sprintf("%s/library/sections/%s/all?%s", baseURL, url.PathEscape(sectionKey), query.Encode())
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		c.setPlexHeaders(req, token)
 		var container plexMediaContainer
@@ -364,30 +355,20 @@ func (c *PlexClient) forEachSectionPage(ctx context.Context, baseURL, token, sec
 		if err == nil {
 			err = budget.addItems(len(container.items()))
 		}
+		if err == nil {
+			err = retainItems(ctx, container.items())
+		}
 		if err != nil {
-			return fmt.Errorf("fetching Plex section items (section %s, type %d, offset %d): %w", sectionKey, mediaType, offset, err)
+			return nil, fmt.Errorf("fetching Plex section items (section %s, type %d, offset %d): %w", sectionKey, mediaType, offset, err)
 		}
 		pageItems := container.items()
-		if err := visit(pageItems, offset); err != nil {
-			return err
-		}
+		allItems = append(allItems, pageItems...)
 		offset += len(pageItems)
 		if offset >= container.MediaContainer.TotalSize || len(pageItems) == 0 {
-			return nil
+			break
 		}
 	}
-}
-
-// fetchInProgressItems reads a section's in-progress list, which is held for
-// the watched listing to merge against.
-func (c *PlexClient) fetchInProgressItems(ctx context.Context, baseURL, token, sectionKey string, mediaType int) ([]PlexItem, error) {
-	var items []PlexItem
-	err := c.forEachSectionPage(ctx, baseURL, token, sectionKey, mediaType, plexFilterInProgress, 0, collectHeld(ctx, &items))
-	if err != nil {
-		releaseItems(ctx, items)
-		return nil, err
-	}
-	return items, nil
+	return allItems, nil
 }
 
 // FetchWatchlist pages through the user's account-level watchlist on the
@@ -554,7 +535,11 @@ func (c *PlexClient) FetchMetadataBatch(ctx context.Context, baseURL, token stri
 	if err := c.doJSON(req, &container); err != nil {
 		return nil, fmt.Errorf("fetching Plex metadata for %s: %w", strings.Join(ratingKeys, ","), err)
 	}
-	return keepRequested(container.items(), ratingKeys, func(item PlexItem) string { return item.RatingKey }), nil
+	items := keepRequested(container.items(), ratingKeys, func(item PlexItem) string { return item.RatingKey })
+	if err := retainItems(ctx, items); err != nil {
+		return nil, fmt.Errorf("fetching Plex metadata for %s: %w", strings.Join(ratingKeys, ","), err)
+	}
+	return items, nil
 }
 
 // Authenticate exchanges Plex account credentials for an auth token via plex.tv.
@@ -694,13 +679,15 @@ func (item PlexHistoryItem) retainedSize() int64 {
 	return sizeOf[PlexHistoryItem]() + stringBytes(item.RatingKey, item.Key, item.Type, item.Title, item.GrandparentTitle, item.GrandparentKey, item.GrandparentRatingKey) + item.Guid.retainedSize()
 }
 
-// forEachUserHistoryPage visits a Plex account's watch history, newest play
-// first, page by page from offset. Requires an admin token.
-func (c *PlexClient) forEachUserHistoryPage(ctx context.Context, baseURL, token, accountID string, offset int, visit func(items []PlexHistoryItem, pageStart int) error) error {
+// FetchUserHistory returns the complete watch history for a specific account on the
+// Plex Media Server. Requires an admin token.
+func (c *PlexClient) FetchUserHistory(ctx context.Context, baseURL, token, accountID string) ([]PlexHistoryItem, error) {
+	var allItems []PlexHistoryItem
 	var budget listingBudget
+	offset := 0
 	for {
 		if err := budget.startPage(); err != nil {
-			return fmt.Errorf("fetching Plex user history (account %s): %w", accountID, err)
+			return nil, fmt.Errorf("fetching Plex user history (account %s): %w", accountID, err)
 		}
 		query := url.Values{}
 		query.Set("accountID", accountID)
@@ -711,7 +698,7 @@ func (c *PlexClient) forEachUserHistoryPage(ctx context.Context, baseURL, token,
 		reqURL := fmt.Sprintf("%s/status/sessions/history/all?%s", strings.TrimRight(baseURL, "/"), query.Encode())
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		c.setPlexHeaders(req, token)
 		var container struct {
@@ -725,23 +712,25 @@ func (c *PlexClient) forEachUserHistoryPage(ctx context.Context, baseURL, token,
 		if err == nil {
 			err = budget.addItems(len(container.MediaContainer.Metadata))
 		}
-		if err != nil {
-			return fmt.Errorf("fetching Plex user history (account %s, offset %d): %w", accountID, offset, err)
+		if err == nil {
+			err = retainItems(ctx, container.MediaContainer.Metadata)
 		}
-		page := container.MediaContainer.Metadata
-		for i := range page {
-			if page[i].GrandparentRatingKey == "" {
-				page[i].GrandparentRatingKey = plexRatingKeyFromMetadataPath(page[i].GrandparentKey)
+		if err != nil {
+			return nil, fmt.Errorf("fetching Plex user history (account %s, offset %d): %w", accountID, offset, err)
+		}
+		for i := range container.MediaContainer.Metadata {
+			item := &container.MediaContainer.Metadata[i]
+			if item.GrandparentRatingKey == "" {
+				item.GrandparentRatingKey = plexRatingKeyFromMetadataPath(item.GrandparentKey)
 			}
 		}
-		if err := visit(page, offset); err != nil {
-			return err
-		}
-		offset += len(page)
-		if offset >= container.MediaContainer.TotalSize || len(page) == 0 {
-			return nil
+		allItems = append(allItems, container.MediaContainer.Metadata...)
+		offset += len(container.MediaContainer.Metadata)
+		if offset >= container.MediaContainer.TotalSize || len(container.MediaContainer.Metadata) == 0 {
+			break
 		}
 	}
+	return allItems, nil
 }
 
 // plexRatingKeyFromMetadataPath returns the rating key of a PMS metadata path

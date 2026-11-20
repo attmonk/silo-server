@@ -30,9 +30,7 @@ const (
 
 // SocketIdentity is a delegated login-session proof, never an independent login,
 // or, for the events socket only, the proof of one API key (APIKeyID set, no
-// SessionID). An admin monitoring key's identity names no profile and no
-// viewer scope; a user key's names the viewer scope it was minted under and
-// the profile it acts as, if any.
+// SessionID or profile).
 // ProfileToken retains the PIN proof captured when the ticket was requested.
 // Neither it nor the opaque ticket may be included in logs or socket messages.
 type SocketIdentity struct {
@@ -68,14 +66,13 @@ func (i SocketIdentity) MaxLifetime() time.Duration {
 
 // holdsAuthority reports whether the identity names exactly one credential:
 // a login session with the viewer scope it was minted under, or an API key
-// at a known revision. A key identity without a viewer scope is a monitoring
-// key's, whose revision stands in for the scope and which names no profile.
+// at a known revision, which stands in for the scope.
 func (i SocketIdentity) holdsAuthority() bool {
 	if i.UserID <= 0 {
 		return false
 	}
 	if i.APIKeyID != 0 {
-		return i.APIKeyID > 0 && i.APIKeyRevision > 0 && i.SessionID == "" && (i.AccessFingerprint != "" || i.ProfileID == "")
+		return i.APIKeyID > 0 && i.APIKeyRevision > 0 && i.SessionID == "" && i.ProfileID == ""
 	}
 	return i.SessionID != "" && i.AccessFingerprint != ""
 }

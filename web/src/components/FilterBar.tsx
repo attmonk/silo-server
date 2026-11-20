@@ -5,7 +5,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useT } from "@/i18n";
 import { getDefaultQuerySortOrder, getQuerySortOptions } from "@/lib/querySortOptions";
 
 interface Filters {
@@ -20,19 +19,18 @@ interface FilterBarProps {
 }
 
 export default function FilterBar({ filters, onChange }: FilterBarProps) {
-  const t = useT();
   const sortOptions = getQuerySortOptions(false);
 
   return (
     <div className="flex flex-wrap gap-3">
       <Select value={filters.type} onValueChange={(v) => onChange({ ...filters, type: v })}>
         <SelectTrigger className="w-32">
-          <SelectValue placeholder={t("web.catalog.filters.typePlaceholder")} />
+          <SelectValue placeholder="Type" />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value="all">{t("web.catalog.mediaType.all")}</SelectItem>
-          <SelectItem value="movie">{t("web.catalog.mediaType.movies")}</SelectItem>
-          <SelectItem value="series">{t("web.catalog.mediaType.series")}</SelectItem>
+          <SelectItem value="all">All</SelectItem>
+          <SelectItem value="movie">Movies</SelectItem>
+          <SelectItem value="series">Series</SelectItem>
         </SelectContent>
       </Select>
 
@@ -41,7 +39,7 @@ export default function FilterBar({ filters, onChange }: FilterBarProps) {
         onValueChange={(v) => onChange({ ...filters, sort: v, order: getDefaultQuerySortOrder(v) })}
       >
         <SelectTrigger className="w-40">
-          <SelectValue placeholder={t("web.catalog.sort.sortBy")} />
+          <SelectValue placeholder="Sort by" />
         </SelectTrigger>
         <SelectContent>
           {sortOptions.map((option) => (
@@ -54,11 +52,11 @@ export default function FilterBar({ filters, onChange }: FilterBarProps) {
 
       <Select value={filters.order} onValueChange={(v) => onChange({ ...filters, order: v })}>
         <SelectTrigger className="w-28">
-          <SelectValue placeholder={t("web.catalog.sort.order")} />
+          <SelectValue placeholder="Order" />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value="desc">{t("web.catalog.sort.descShort")}</SelectItem>
-          <SelectItem value="asc">{t("web.catalog.sort.ascShort")}</SelectItem>
+          <SelectItem value="desc">Desc</SelectItem>
+          <SelectItem value="asc">Asc</SelectItem>
         </SelectContent>
       </Select>
     </div>

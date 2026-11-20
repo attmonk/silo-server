@@ -10,11 +10,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { useT, type MessageKey } from "@/i18n";
 import { sectionLibraryFilterIds, withSectionLibraryFilterIds } from "@/lib/sectionLibraryFilter";
 import { hasParamFields } from "@/lib/homeRows/paramFields";
 import { variantOf } from "@/lib/homeRows/variants";
-import { Segmented } from "@/components/collections/fields/Segmented";
 import { FamilyNightFields, HolidayFields } from "./SeasonalFields";
 
 type Config = Record<string, unknown>;
@@ -55,12 +53,11 @@ function LibraryFilterField({
   onChange,
   libraries,
 }: FieldProps & { libraries: ParamLibrary[] }) {
-  const t = useT();
   return (
-    <Field label={t("web.home.addRow.params.from")} hint={t("web.home.addRow.params.fromHint")}>
+    <Field label="From" hint="Which libraries the row takes titles from.">
       <LibraryMultiSelect
         libraries={libraries}
-        emptyLabel={t("web.home.addRow.params.allLibraries")}
+        emptyLabel="All libraries"
         value={sectionLibraryFilterIds(config)}
         onChange={(ids) => onChange(withSectionLibraryFilterIds(config, ids))}
       />
@@ -68,23 +65,23 @@ function LibraryFilterField({
   );
 }
 
-const MEDIA_TYPES: ReadonlyArray<{ value: string; label: MessageKey }> = [
-  { value: "all", label: "web.home.addRow.params.mediaEverything" },
-  { value: "movie", label: "web.home.addRow.params.mediaMovies" },
-  { value: "series", label: "web.home.addRow.params.mediaShows" },
-  { value: "audiobook", label: "web.home.addRow.params.mediaAudiobooks" },
+const MEDIA_TYPES = [
+  { value: "all", label: "Everything" },
+  { value: "movie", label: "Movies" },
+  { value: "series", label: "TV shows" },
+  { value: "audiobook", label: "Audiobooks" },
 ];
 
 // "default" keeps the list's stored order: provider sync order, newest added first.
-const LIST_ORDERS: ReadonlyArray<{ value: string; label: MessageKey }> = [
-  { value: "default", label: "web.home.addRow.params.orderList" },
-  { value: "added_at:desc", label: "web.home.addRow.params.orderAddedDesc" },
-  { value: "added_at:asc", label: "web.home.addRow.params.orderAddedAsc" },
-  { value: "title:asc", label: "web.home.addRow.params.orderTitleAsc" },
-  { value: "title:desc", label: "web.home.addRow.params.orderTitleDesc" },
-  { value: "release_date:desc", label: "web.home.addRow.params.orderReleaseDesc" },
-  { value: "release_date:asc", label: "web.home.addRow.params.orderReleaseAsc" },
-  { value: "rating_imdb:desc", label: "web.home.addRow.params.orderImdbDesc" },
+const LIST_ORDERS = [
+  { value: "default", label: "List order" },
+  { value: "added_at:desc", label: "Newest added first" },
+  { value: "added_at:asc", label: "Oldest added first" },
+  { value: "title:asc", label: "A to Z" },
+  { value: "title:desc", label: "Z to A" },
+  { value: "release_date:desc", label: "Newest released first" },
+  { value: "release_date:asc", label: "Oldest released first" },
+  { value: "rating_imdb:desc", label: "Highest IMDb rating first" },
 ];
 
 function listOrderValue(config: Config): string {
@@ -106,7 +103,6 @@ function PersonalListFields({
   onChange,
   libraries,
 }: FieldProps & { libraries: ParamLibrary[] }) {
-  const t = useT();
   const id = useId();
   const filterType =
     typeof config.filter_type === "string" && config.filter_type ? config.filter_type : "all";
@@ -115,7 +111,7 @@ function PersonalListFields({
     : [];
   return (
     <div className="grid gap-4 sm:grid-cols-2">
-      <Field label={t("web.home.addRow.params.mediaType")} htmlFor={`${id}-type`}>
+      <Field label="Media type" htmlFor={`${id}-type`}>
         <Select
           value={filterType}
           onValueChange={(value) =>
@@ -128,23 +124,23 @@ function PersonalListFields({
           <SelectContent>
             {MEDIA_TYPES.map((option) => (
               <SelectItem key={option.value} value={option.value}>
-                {t(option.label)}
+                {option.label}
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
       </Field>
-      <Field label={t("web.home.addRow.libraries")}>
+      <Field label="Libraries">
         <LibraryMultiSelect
           libraries={libraries}
-          emptyLabel={t("web.home.addRow.params.allLibraries")}
+          emptyLabel="All libraries"
           value={libraryIds}
           onChange={(ids) =>
             onChange({ ...config, filter_library_ids: ids.length > 0 ? ids : undefined })
           }
         />
       </Field>
-      <Field label={t("web.home.addRow.order")} htmlFor={`${id}-order`}>
+      <Field label="Order" htmlFor={`${id}-order`}>
         <Select
           value={listOrderValue(config)}
           onValueChange={(value) => {
@@ -158,7 +154,7 @@ function PersonalListFields({
           <SelectContent>
             {LIST_ORDERS.map((option) => (
               <SelectItem key={option.value} value={option.value}>
-                {t(option.label)}
+                {option.label}
               </SelectItem>
             ))}
           </SelectContent>
@@ -176,7 +172,7 @@ function NumberField({
   label,
   placeholder,
   hint,
-}: FieldProps & { paramKey: string; label: string; placeholder: number; hint: string }) {
+}: FieldProps & { paramKey: string; label: string; placeholder: string; hint: string }) {
   const id = useId();
   const raw = config[paramKey];
   return (
@@ -188,7 +184,7 @@ function NumberField({
         step={1}
         inputMode="numeric"
         className="w-32"
-        placeholder={String(placeholder)}
+        placeholder={placeholder}
         value={typeof raw === "number" && Number.isFinite(raw) ? String(raw) : ""}
         onChange={(event) => {
           const parsed = Number(event.target.value);
@@ -205,13 +201,12 @@ function NumberField({
 }
 
 function GenreField({ config, onChange }: FieldProps) {
-  const t = useT();
   const id = useId();
   return (
     <Field
-      label={t("web.home.addRow.params.genre")}
+      label="Genre (optional)"
       htmlFor={id}
-      hint={t("web.home.addRow.params.genreHint")}
+      hint="Leave blank to follow each viewer's strongest genre."
     >
       <Input
         id={id}
@@ -222,14 +217,13 @@ function GenreField({ config, onChange }: FieldProps) {
   );
 }
 
-const CADENCES: ReadonlyArray<{ value: string; label: MessageKey }> = [
-  { value: "daily", label: "web.home.addRow.params.everyDay" },
-  { value: "weekly", label: "web.home.addRow.params.everyWeek" },
-  { value: "monthly", label: "web.home.addRow.params.everyMonth" },
+const CADENCES = [
+  { value: "daily", label: "Every day" },
+  { value: "weekly", label: "Every week" },
+  { value: "monthly", label: "Every month" },
 ];
 
 function SpotlightFields({ config, onChange }: FieldProps) {
-  const t = useT();
   const id = useId();
   // A preset with a pinned subject and no auto_rotate is pinned, as the
   // server reads it; defaulting the switch on would hide the subject.
@@ -238,7 +232,7 @@ function SpotlightFields({ config, onChange }: FieldProps) {
   return (
     <div className="grid gap-4">
       <div className="flex items-center justify-between gap-4">
-        <Label htmlFor={`${id}-rotate`}>{t("web.home.addRow.params.autoRotate")}</Label>
+        <Label htmlFor={`${id}-rotate`}>Pick a new subject automatically</Label>
         <Switch
           id={`${id}-rotate`}
           checked={rotating}
@@ -246,7 +240,7 @@ function SpotlightFields({ config, onChange }: FieldProps) {
         />
       </div>
       {rotating ? (
-        <Field label={t("web.home.addRow.params.howOften")} htmlFor={`${id}-cadence`}>
+        <Field label="How often" htmlFor={`${id}-cadence`}>
           <Select
             value={cadence}
             onValueChange={(value) => onChange({ ...config, rotation_cadence: value })}
@@ -257,48 +251,23 @@ function SpotlightFields({ config, onChange }: FieldProps) {
             <SelectContent>
               {CADENCES.map((option) => (
                 <SelectItem key={option.value} value={option.value}>
-                  {t(option.label)}
+                  {option.label}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
         </Field>
       ) : (
-        <Field label={t("web.home.addRow.params.subject")} htmlFor={`${id}-subject`}>
+        <Field label="Subject" htmlFor={`${id}-subject`}>
           <Input
             id={`${id}-subject`}
-            placeholder={
-              config.subject_type === "era"
-                ? t("web.home.addRow.params.subjectEra")
-                : t("web.home.addRow.params.subjectPerson")
-            }
+            placeholder={config.subject_type === "era" ? "e.g. 1990s" : "e.g. Christopher Nolan"}
             value={typeof config.subject === "string" ? config.subject : ""}
             onChange={(event) => onChange({ ...config, subject: event.target.value })}
           />
         </Field>
       )}
     </div>
-  );
-}
-
-type TrendingShow = "all" | "movie" | "series";
-
-/** Which titles a worldwide trending row keeps; Both leaves filter_type unset. */
-function TrendingShowField({ config, onChange }: FieldProps) {
-  const t = useT();
-  const value: TrendingShow =
-    config.filter_type === "movie" || config.filter_type === "series" ? config.filter_type : "all";
-  return (
-    <Segmented<TrendingShow>
-      label={t("web.home.addRow.params.trendingShow")}
-      value={value}
-      options={[
-        { value: "all", label: t("web.collections.tmdbSources.mediaBoth") },
-        { value: "movie", label: t("web.collections.tmdbSources.mediaMovies") },
-        { value: "series", label: t("web.collections.tmdbSources.mediaTv") },
-      ]}
-      onChange={(next) => onChange({ ...config, filter_type: next === "all" ? undefined : next })}
-    />
   );
 }
 
@@ -320,7 +289,6 @@ export function ParamFields({
   libraries: ParamLibrary[];
   onLibraryPage: boolean;
 }) {
-  const t = useT();
   if (!hasParamFields(sectionType, slot, config, onLibraryPage)) return null;
   const props = { config, onChange };
   if (slot === "primary") {
@@ -331,7 +299,6 @@ export function ParamFields({
         <HolidayFields {...props} />
       );
     }
-    if (sectionType === "trending_discover") return <TrendingShowField {...props} />;
     return <LibraryFilterField {...props} libraries={libraries} />;
   }
   switch (sectionType) {
@@ -343,9 +310,9 @@ export function ParamFields({
         <NumberField
           {...props}
           paramKey="lookback_days"
-          label={t("web.home.addRow.params.lookBack")}
-          placeholder={30}
-          hint={t("web.home.addRow.params.lookBackHint")}
+          label="Look back (days)"
+          placeholder="30"
+          hint="How recently a new season must have arrived."
         />
       );
     case "short_watches":
@@ -353,9 +320,9 @@ export function ParamFields({
         <NumberField
           {...props}
           paramKey="max_minutes"
-          label={t("web.home.addRow.params.maxMinutes")}
-          placeholder={95}
-          hint={t("web.home.addRow.params.maxMinutesHint")}
+          label="Longest runtime (minutes)"
+          placeholder="95"
+          hint="Movies at or under this runtime qualify."
         />
       );
     case "anniversaries":
@@ -363,9 +330,9 @@ export function ParamFields({
         <NumberField
           {...props}
           paramKey="milestone_years"
-          label={t("web.home.addRow.params.milestone")}
-          placeholder={5}
-          hint={t("web.home.addRow.params.milestoneHint")}
+          label="Milestone (years)"
+          placeholder="5"
+          hint="Only anniversaries that are a multiple of this. 1 shows every anniversary."
         />
       );
     case "taste_match":

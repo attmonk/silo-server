@@ -6,9 +6,8 @@ import type { AdminUserEditor } from "@/api/v2/adminUsers";
 import type { PolicyInheritHints } from "@/components/UserPolicyFields";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useT, type MessageKey } from "@/i18n";
 
-import { ACCESS_CARD_TITLE_KEYS, useCardEditing, type AccessCardId } from "../cardEditing";
+import { ACCESS_CARD_TITLES, useCardEditing, type AccessCardId } from "../cardEditing";
 import { DetailCard } from "../ui";
 import type { InheritContext } from "./policySources";
 
@@ -30,8 +29,7 @@ export interface AccessCardProps {
 /** What the card chrome needs from a card's draft (see useAccountCardDraft). */
 export interface CardEditState {
   editing: boolean;
-  /** The changed rows, by their label's message id. */
-  changed: MessageKey[];
+  changed: string[];
   conflict: boolean;
   saving: boolean;
   error: string;
@@ -72,25 +70,20 @@ export function EditableCard({
   state: CardEditState;
   children: ReactNode;
 }) {
-  const t = useT();
   const { active } = useCardEditing();
-  const title = t(ACCESS_CARD_TITLE_KEYS[id]);
+  const title = ACCESS_CARD_TITLES[id];
   const otherEditing = active !== null && active.id !== id;
   const [reloading, setReloading] = useState(false);
   const count = state.changed.length;
 
   let control: ReactNode;
   if (state.editing) {
-    control = (
-      <Badge className="border-amber-500/30 bg-amber-500/10 text-amber-300">
-        {t("web.admin.users.detail.access.card.editing")}
-      </Badge>
-    );
+    control = <Badge className="border-amber-500/30 bg-amber-500/10 text-amber-300">Editing</Badge>;
   } else if (!manageable) {
     control = (
       <span className="text-muted-foreground inline-flex items-center gap-1 text-xs">
         <Lock aria-hidden="true" className="size-3" />
-        {t("web.admin.users.detail.access.card.viewOnly")}
+        View only
       </span>
     );
   } else {
@@ -99,11 +92,11 @@ export function EditableCard({
         type="button"
         variant="outline"
         size="xs"
-        aria-label={t("web.admin.users.detail.access.card.editAria", { card: title })}
+        aria-label={`Edit ${title}`}
         disabled={otherEditing || !available || !canEdit}
         onClick={state.start}
       >
-        {t("web.admin.users.detail.access.card.edit")}
+        Edit
       </Button>
     );
   }
@@ -117,7 +110,7 @@ export function EditableCard({
         >
           <TriangleAlert aria-hidden="true" className="size-4 shrink-0 text-amber-400" />
           <span className="min-w-0 flex-1 basis-48">
-            {t("web.admin.users.detail.access.card.conflict")}
+            Another admin changed this account after you started. Your edits are kept.
           </span>
           <Button
             type="button"
@@ -133,20 +126,16 @@ export function EditableCard({
               }
             }}
           >
-            {t("web.admin.users.detail.access.card.reloadAndReview")}
+            Reload and review
           </Button>
         </div>
       ) : (
         <span className="text-muted-foreground min-w-0 flex-1 text-xs">
-          {count > 0
-            ? t("web.admin.users.detail.access.card.unsavedWithRows", {
-                count,
-                rows: state.changed.map((row) => t(row)).join(", "),
-              })
-            : t("web.admin.users.detail.access.card.unsaved", { count })}
+          {count} unsaved {count === 1 ? "change" : "changes"}
+          {count > 0 ? ` · ${state.changed.join(", ")}` : ""}
         </span>
       )}
-      <div className="ms-auto flex items-center gap-2">
+      <div className="ml-auto flex items-center gap-2">
         <Button
           type="button"
           variant="ghost"
@@ -154,7 +143,7 @@ export function EditableCard({
           disabled={state.saving}
           onClick={state.cancel}
         >
-          {t("common.cancel")}
+          Cancel
         </Button>
         <Button
           type="button"
@@ -162,7 +151,7 @@ export function EditableCard({
           disabled={count === 0 || state.saving || state.conflict || invalid}
           onClick={() => void state.save()}
         >
-          {state.saving ? t("web.admin.users.detail.access.card.saving") : t("common.save")}
+          {state.saving ? "Saving..." : "Save"}
         </Button>
       </div>
     </>

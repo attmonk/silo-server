@@ -19,7 +19,6 @@ import (
 )
 
 type httpRouteClient interface {
-	Retain() (func(), error)
 	Handle(ctx context.Context, req *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error)
 }
 
@@ -100,11 +99,17 @@ func (p *HTTPProxy) PublicGETRoute(ctx context.Context, installationID int, rout
 	return descriptor != nil && descriptor.GetAccess() == publicAccess, nil
 }
 
-// serveRoute serves a dynamic plugin route. A plugin redirect to another
-// origin than the one the request arrived on is answered with 502 instead: a
-// client following it would carry the credentials it attached for this server
-// to that origin.
-func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installationID int, authenticated bool, admin bool) {
+// ServeRoute serves a dynamic plugin route on the frozen /api/v1 mount and
+// relays the plugin's status and Location unchanged.
+func (p *HTTPProxy) ServeRoute(w http.ResponseWriter, r *http.Request, installationID int, authenticated bool, admin bool) {
+	p.serveRoute(w, r, installationID, authenticated, admin, false)
+}
+
+// serveRoute serves a dynamic plugin route. With sameOriginRedirects, a
+// plugin redirect to another origin than the one the request arrived on is
+// answered with 502 instead: a client following it would carry the
+// credentials it attached for this server to that origin.
+func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installationID int, authenticated bool, admin bool, sameOriginRedirects bool) {
 	descriptors, err := p.service.RouteDescriptors(r.Context(), installationID)
 	if err != nil {
 		if errors.Is(err, ErrInstallationDisabled) || errors.Is(err, ErrInstallationNotFound) {
@@ -143,13 +148,6 @@ func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installat
 		return
 	}
 
-	release, err := client.Retain()
-	if err != nil {
-		http.Error(w, "plugin routes unavailable", http.StatusBadGateway)
-		return
-	}
-	defer release()
-
 	body, status := readPluginRouteBody(w, r)
 	if status != http.StatusOK {
 		http.Error(w, http.StatusText(status), status)
@@ -158,8 +156,11 @@ func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installat
 	headers := forwardedRequestHeaders(r.Header)
 	if _, _, userID, contextProfileID := pluginAccessUserFromContext(r.Context()); userID > 0 {
 		headers["X-Silo-User-Id"] = strconv.Itoa(userID)
+		if contextProfileID != "" {
+			headers["X-Silo-Profile-Id"] = contextProfileID
+		}
 		if admin {
-			headers["X-Silo-User-Role"] = relayAdminAccess
+			headers["X-Silo-User-Role"] = "admin"
 		} else {
 			headers["X-Silo-User-Role"] = "user"
 		}
@@ -213,19 +214,20 @@ func (p *HTTPProxy) serveRoute(w http.ResponseWriter, r *http.Request, installat
 		return
 	}
 
-	writePluginRouteResponse(w, r, installationID, response)
+	writePluginRouteResponse(w, r, installationID, response, sameOriginRedirects)
 }
 
 // writePluginRouteResponse relays a plugin route's answer: its allowed
-// headers, status and body. A redirect that leaves the request's origin, or
-// whose Location is ambiguous, is a 502 instead (see serveRoute).
-func writePluginRouteResponse(w http.ResponseWriter, r *http.Request, installationID int, response *pluginv1.HandleHTTPResponse) {
+// headers, status and body. With sameOriginRedirects, a redirect that leaves
+// the request's origin, or whose Location is ambiguous, is a 502 instead (see
+// serveRoute).
+func writePluginRouteResponse(w http.ResponseWriter, r *http.Request, installationID int, response *pluginv1.HandleHTTPResponse, sameOriginRedirects bool) {
 	status := int(response.GetStatusCode())
 	if status == 0 {
 		status = http.StatusOK
 	}
 	headers, ambiguousLocation := filteredResponseHeaders(response.GetHeaders())
-	if isRedirectStatus(status) && (ambiguousLocation || redirectLeavesOrigin(r, headers[locationHeader])) {
+	if sameOriginRedirects && isRedirectStatus(status) && (ambiguousLocation || redirectLeavesOrigin(r, headers[locationHeader])) {
 		slog.WarnContext(r.Context(), "plugin route redirected to another origin or sent several Location headers; not relayed", "component", "plugins", "installation_id", installationID, "status", status)
 		http.Error(w, "plugin route redirected to another origin", http.StatusBadGateway)
 		return

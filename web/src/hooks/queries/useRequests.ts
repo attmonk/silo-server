@@ -7,7 +7,6 @@ import {
 } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { V2ProblemError } from "@/api/v2/request";
-import { t } from "@/i18n";
 import { v2 } from "@/api/v2/request";
 import {
   browseDiscoverV2,
@@ -128,7 +127,7 @@ export function useRequestDiscoverySection(section: string) {
  * is ignored as the end. A page without one read a single source page, so
  * page + 1 follows, up to TMDB's cap.
  */
-function nextDiscoverySectionPage(
+export function nextDiscoverySectionPage(
   lastPage: RequestDiscoverySection,
   _allPages: RequestDiscoverySection[],
   lastPageParam: number,
@@ -198,7 +197,7 @@ export function useRequestBrowse({ kind, slug, mediaType, sort }: UseRequestBrow
  * TMDB one page at a time (the server does no rating backfill here), so
  * page + 1 is the next page, up to TMDB's cap.
  */
-function nextBrowsePage(
+export function nextBrowsePage(
   lastPage: DiscoverBrowseResponse,
   _allPages: DiscoverBrowseResponse[],
   lastPageParam: number,
@@ -286,11 +285,11 @@ export function useCreateMediaRequest() {
     retry: false,
     mutationFn: (body: CreateMediaRequestInput) => createMediaRequestV2(body),
     onSuccess: () => {
-      toast.success(t("web.common.requests.toast.submitted"));
+      toast.success("Request submitted");
       invalidateRequestSurfaces(queryClient);
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : t("requests.error.create"));
+      toast.error(err instanceof Error ? err.message : "Failed to submit request");
     },
   });
 }
@@ -313,15 +312,11 @@ export function useToggleRequestFollow() {
         ? followRequestMediaV2(mediaType, tmdbID).then(() => undefined)
         : unfollowRequestMediaV2(mediaType, tmdbID),
     onSuccess: (_data, { follow }) => {
-      toast.success(
-        follow
-          ? t("web.common.requests.toast.following")
-          : t("web.common.requests.toast.unfollowed"),
-      );
+      toast.success(follow ? "We'll let you know when it's available" : "Notification turned off");
       invalidateRequestSurfaces(queryClient);
     },
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : t("requests.error.follow"));
+      toast.error(err instanceof Error ? err.message : "Failed to update notification");
     },
   });
 }
@@ -332,13 +327,13 @@ export function useCancelMediaRequest() {
     retry: false,
     mutationFn: (id: string) => cancelMediaRequestV2(id),
     onSuccess: () => {
-      toast.success(t("web.common.requests.toast.cancelled"));
+      toast.success("Request cancelled");
     },
     // A refused action still refreshes the queue: another admin may have
     // acted first, and the row should show what happened.
     onSettled: () => invalidateRequestSurfaces(queryClient),
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : t("web.common.requests.toast.cancelFailed"));
+      toast.error(err instanceof Error ? err.message : "Failed to cancel request");
     },
   });
 }
@@ -349,13 +344,13 @@ export function useRemoveFailedMediaRequest() {
     retry: false,
     mutationFn: (id: string) => removeFailedMediaRequestV2(id),
     onSuccess: () => {
-      toast.success(t("web.common.requests.toast.removed"));
+      toast.success("Request removed");
     },
     // A refused removal still refreshes: an admin may have retried it, and the
     // row should show what happened.
     onSettled: () => invalidateRequestSurfaces(queryClient),
     onError: (err) => {
-      toast.error(err instanceof Error ? err.message : t("web.common.requests.toast.removeFailed"));
+      toast.error(err instanceof Error ? err.message : "Failed to remove request");
     },
   });
 }

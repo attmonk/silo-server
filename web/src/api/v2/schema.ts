@@ -6,10 +6,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /**
-     * List the external sign-in identities linked to the caller's account.
-     * @description Every profile on the account may read the list. can_unlink answers for the profile X-Profile-Id names, or for a request that names none, by deleteAccountIdentity's rule: a profile other than the account's primary one reads false.
-     */
+    /** List the external sign-in identities linked to the caller's account. */
     get: operations["listAccountIdentities"];
     put?: never;
     post?: never;
@@ -31,7 +28,7 @@ export interface paths {
     post?: never;
     /**
      * Disconnect an external sign-in identity from the caller's account.
-     * @description How the account signs in belongs to the whole household, so only the account's household manager may disconnect an identity. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied. Allowed only while the account can still sign in another way: its local password (with local password sign-in on, or as a break-glass account) or another identity; otherwise 409 last_sign_in_method. An API key or an impersonation session is refused with 403 permission_denied.
+     * @description Allowed only while the account can still sign in another way: its local password (with local password sign-in on, or as a break-glass account) or another identity; otherwise 409 last_sign_in_method. An API key or an impersonation session is refused with 403.
      */
     delete: operations["deleteAccountIdentity"];
     options?: never;
@@ -724,263 +721,6 @@ export interface paths {
     put?: never;
     /** Reserve and start the autoscan poll task on this process. Returns a process task snapshot, not durable dispatch or scan completion. Polls every enabled polling source immediately, except a source already being polled, ignoring per-source and default poll intervals. Does nothing (still 200) while Autoscan is disabled; webhook sources are not polled. Inspect activity for per-source outcomes. No automatic replay. */
     post: operations["triggerAdminAutoscan"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** List this server's backups with their manifest summaries, the other server identities at the destination, and the warnings the dashboard shows. */
-    get: operations["listAdminBackups"];
-    put?: never;
-    /** Back up now. The backup runs on this server; poll the list or the backup task for its result. 409 when another backup or restore is running. */
-    post: operations["startAdminBackup"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/{id}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    post?: never;
-    /** Delete one backup of this server. 409 when another backup or restore is running, or a queued or running restore reads this backup. */
-    delete: operations["deleteAdminBackup"];
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/{id}/download-links": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Mint short-lived download URLs for a complete backup's objects, or for its restore set alone: presigned storage URLs, or signed links to this server where the storage cannot presign. */
-    post: operations["createAdminBackupDownloadLinks"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/{id}/objects/{name}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Stream one object of a backup. Authorized by the signed capability in the download link, not by a session. */
-    get: operations["downloadAdminBackupObject"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/{id}/restore": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Restore the chosen items of a backup as a backup_restore job. A backup of this server is taken first; follow the job through the admin jobs endpoints. 409 when another backup or restore is running, or the backup changed since the preview. */
-    post: operations["startAdminBackupRestore"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/{id}/restore-set": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo, and 409 backup_unauthenticated, before anything inside the restore set is read, when this server cannot authenticate the backup's manifest and accept_unauthenticated is not set. */
-    get: operations["getAdminBackupRestoreSet"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/capabilities": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** What backups on this server support. not_configured when the server has no storage to write backups to. */
-    get: operations["getAdminBackupCapabilities"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/s3/acknowledge-key": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Confirm that a copy of this server's SECRET_KEY is kept somewhere other than this server. backup.destination can be set to s3 only after this, and S3 backups pause when SECRET_KEY changes until it is confirmed again. 409 when key_check is not this server's current check value. */
-    post: operations["acknowledgeAdminBackupKey"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/s3/test": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Test a bucket for backups: reach it (HeadBucket), then write and delete a test object under the key prefix. A failed test answers ok false with the step that failed. Nothing is saved. */
-    post: operations["testAdminBackupS3"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/uploads": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** List restore sets uploaded to this server, newest first, finished or not. Unfinished and rejected uploads are deleted 24 hours after their last activity, complete ones 7 days after their last use. */
-    get: operations["listAdminBackupUploads"];
-    put?: never;
-    /** Start uploading a restore set (restore-set.tar, from another server's Download restore set). The answer gives the part size; send the parts, then complete the upload. Parts go to the shared storage, so any API server takes any part. 413 above 2 GiB; 409 upload_limit_reached when three uploads are already in progress. Where this server's private storage is an S3 bucket the parts are stored encrypted with a key derived from SECRET_KEY, and uploads, like backups, need that key confirmed first (409 otherwise). */
-    post: operations["createAdminBackupUpload"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/uploads/{upload_id}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    post?: never;
-    /** Delete an upload and its parts. 409 while a restore from it is queued or running, or while another backup or restore holds the lock for a complete upload. */
-    delete: operations["deleteAdminBackupUpload"];
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/uploads/{upload_id}/complete": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Check a fully received upload: its bytes are read in order through the restore-set checks, and their SHA-256 is frozen. The answer is complete, or rejected with the reason (not a restore set, from a newer Silo, encrypted with another server's key). A finished upload answers as it is. 409 while another backup or restore holds the lock; complete it again then. */
-    post: operations["completeAdminBackupUpload"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/uploads/{upload_id}/parts/{part}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    /** Store one part of an upload. Every part but the last is exactly part_size bytes. Parts may arrive in any order and on any API server; sending a part again replaces it until the upload is completed. 409 while the same part, or four parts of the upload, are being received; 408 when the part does not arrive within 2 minutes. */
-    put: operations["putAdminBackupUploadPart"];
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/uploads/{upload_id}/restore": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Restore the chosen items of a complete upload as a backup_restore job, as for a backup: a backup of this server is taken first. 409 when another backup or restore is running, or the digest is not the upload's. */
-    post: operations["startAdminBackupUploadRestore"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/backups/uploads/{upload_id}/restore-set": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Preview a complete upload's restore set against this server, as for a backup. The digest is the one frozen when the upload completed. 409 for an upload not yet complete, and 409 backup_unauthenticated, before anything inside it is read, without accept_unauthenticated: an upload carries no manifest this server signed. */
-    get: operations["getAdminBackupUploadRestoreSet"];
-    put?: never;
-    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -2524,23 +2264,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v2/admin/items/{id}/match/hints": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Read the title, year, and provider IDs the scanner parsed from an authorized catalog item's folder and file names. */
-    get: operations["getAdminItemMatchHints"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v2/admin/items/{id}/match/search": {
     parameters: {
       query?: never;
@@ -3385,7 +3108,7 @@ export interface paths {
       cookie?: never;
     };
     get?: never;
-    /** Update stored node configuration under the original If-Match revision. A field named in the node's env_managed is set by the node's environment: a change to it is 422 validation_failed with field code managed_by_environment at body.<field>, and restating its current value is accepted. Configuration changes advance ETag and persist pool invalidation; a no-change PUT retains ETag. Disabling alone removes new placement and routine health sampling after reconciliation, preserves the last health sample, leaves existing streams serving and does not contact the worker. The response acknowledges stored configuration, not worker reload, replica completion or session teardown. */
+    /** Update stored node configuration under the original If-Match revision. Configuration changes advance ETag and persist pool invalidation; a no-change PUT retains ETag. Disabling alone removes new placement and routine health sampling after reconciliation, preserves the last health sample, leaves existing streams serving and does not contact the worker. The response acknowledges stored configuration, not worker reload, replica completion or session teardown. */
     put: operations["updateAdminNode"];
     post?: never;
     /** Delete the original If-Match configuration and atomically persist pool invalidation for replica reconciliation. No worker teardown, session completion or all-replica acknowledgement. A subsequent 404 is not proof of this caller's outcome. */
@@ -3440,23 +3163,6 @@ export interface paths {
     put?: never;
     /** Synchronously request force reload from one stored node, including a disabled node. May tear down sessions. Ten-second timeout, no redirects or automatic replay; per-node status is acknowledgement or uncertainty, not a durable receipt. */
     post: operations["forceReloadAdminNode"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/nodes/{id}/key": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Issue a new key for a transcode node and return it once. Each call rotates: the previous key stops working on this server at once and on other servers and proxies within seconds. The node's running streams fail until it restarts with the new key; drain the node first to avoid that. A disabled node can take a key. Never replay an uncertain issue; issue again instead. */
-    post: operations["issueAdminNodeKey"];
     delete?: never;
     options?: never;
     head?: never;
@@ -3703,40 +3409,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v2/admin/overlay-images": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Add an image to the card overlay image library. The image is re-encoded and addressed by its content: uploading the same image again keeps one entry and renames it. No automatic retry: a delayed retry can restore an image deleted in between. */
-    post: operations["uploadAdminOverlayImage"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/overlay-images/{ref}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    post?: never;
-    /** Remove an image from the card overlay image library and delete its bytes. Badges that name it fall back to their own rendering. */
-    delete: operations["deleteAdminOverlayImage"];
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v2/admin/people/{id}": {
     parameters: {
       query?: never;
@@ -3938,7 +3610,7 @@ export interface paths {
     put?: never;
     /**
      * Test an auth plugin's connection with staged, unsaved settings.
-     * @description The running plugin tests the staged configuration (merged over the stored entries it does not replace) and persists nothing. A blank secret field reuses the stored secret only while the rest of that entry is unchanged and no secret in it is entered (a secret object or list sent in it counts as entered); otherwise that entry is tested with only the secrets entered. The rule is per entry: stored entries not named here keep their secrets. A failed check is a 200 result with ok false. A plugin without a connection test, or a disabled installation, is 409. The check reaches the provider and is bounded by a server timeout; never retry an uncertain result automatically.
+     * @description The running plugin tests the staged configuration (merged over the stored entries it does not replace) and persists nothing. A failed check is a 200 result with ok false. A plugin without a connection test, or a disabled installation, is 409. The check reaches the provider and is bounded by a server timeout; never retry an uncertain result automatically.
      */
     post: operations["testAdminPluginAuthBinding"];
     delete?: never;
@@ -4024,7 +3696,7 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /** Install the recorded available version from the installation's repository, fetching over the network, and clear the marker. No applicable update is 409, as is an update that another install of the plugin replaced while its package downloaded. There is no replay identity: a lost response may follow a committed update; reconcile from the installation and never automatically retry. */
+    /** Install the recorded available version from the installation's repository, fetching over the network, and clear the marker. No applicable update is 409. There is no replay identity: a lost response may follow a committed update; reconcile from the installation and never automatically retry. */
     post: operations["applyAdminPluginUpdate"];
     delete?: never;
     options?: never;
@@ -4407,7 +4079,7 @@ export interface paths {
     put?: never;
     /**
      * Delete the embedding lock, every item embedding, taste clusters and per-profile cached rows, and clear taste profile vectors, in one transaction.
-     * @description Recovers a server whose embedding lock pins a model it can no longer use, or switches embedding models. It refuses with 409 while the embedding, taste profile or recommendation job, or a stale profile sweep, runs on any server, while a catalog import with embeddings runs, and while a saved embedding model or base URL waits for a server restart. Run the embedding job afterwards to build the new embedding space.
+     * @description Recovers a server whose embedding lock pins a model it can no longer use, or switches embedding models. It refuses with 409 while the embedding, taste profile or recommendation job, or a stale profile sweep, runs on any server, while a catalog import with embeddings runs, and while saved embedding settings wait for a server restart. Run the embedding job afterwards to build the new embedding space.
      */
     post: operations["resetAdminRecommendationEmbeddings"];
     delete?: never;
@@ -6093,43 +5765,11 @@ export interface paths {
     /** Manage login accounts and their household configuration. */
     get: operations["listAdminUserProfiles"];
     put?: never;
-    /**
-     * Create a profile on an account.
-     * @description Takes the createProfile body. A household already at the account's profile limit, or a name another profile on the account uses, is 409 conflict. The first profile on an account becomes its primary profile. Only the server Owner may change the Owner's or another admin account's profiles (403 permission_denied otherwise): a primary profile's PIN guards that account's admin access.
-     */
-    post: operations["createAdminUserProfile"];
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
     patch?: never;
-    trace?: never;
-  };
-  "/api/v2/admin/users/{id}/profiles/{profile_id}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /**
-     * Get one profile of an account.
-     * @description The profile as listProfiles reports it to its own household. 404 not_found when the profile does not belong to the account.
-     */
-    get: operations["getAdminUserProfile"];
-    put?: never;
-    post?: never;
-    /**
-     * Delete one profile of an account.
-     * @description Removes the profile and its per-profile data, as deleteProfile does. The primary profile cannot be deleted (409 conflict); delete the account instead. 404 not_found when the profile does not belong to the account. Only the server Owner may change the Owner's or another admin account's profiles (403 permission_denied otherwise): a primary profile's PIN guards that account's admin access.
-     */
-    delete: operations["deleteAdminUserProfile"];
-    options?: never;
-    head?: never;
-    /**
-     * Update one profile of an account; omitted members are unchanged.
-     * @description Takes the updateProfile body, every member included. "pin": null removes the profile's PIN and a new value replaces it; either ends the profile tokens issued for the old PIN and clears its wrong-attempt lockout. A name another profile on the account uses is 409 conflict. 404 not_found when the profile does not belong to the account. Only the server Owner may change the Owner's or another admin account's profiles (403 permission_denied otherwise): a primary profile's PIN guards that account's admin access.
-     */
-    patch: operations["updateAdminUserProfile"];
     trace?: never;
   };
   "/api/v2/admin/users/{id}/profiles/{profile_id}/sections": {
@@ -6328,15 +5968,12 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /**
-     * Manage the login account's API keys.
-     * @description The account's primary profile lists every key on the account; any other profile lists only the keys bound to it. A request without X-Profile-Id lists them all while no profile on the account is PIN-protected or access-restricted, and is otherwise 422, as on the catalog reads. This is for a login session: an API key cannot list keys and receives 403 permission_denied.
-     */
+    /** Manage the login account's API keys. */
     get: operations["listPersonalAPIKeys"];
     put?: never;
     /**
      * Manage the login account's API keys.
-     * @description A server admin's login session creates an account key (no profile_id) acting through the account's primary profile: X-Profile-Id must name the primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied. A request without X-Profile-Id is accepted only while no profile on the account is PIN-protected or access-restricted (content-rating, advisory-age or library limits); otherwise it is 403 permission_denied. While user_keys_enabled is true (getPersonalAPIKeyScopes), any account may also create keys that carry user scopes only: the primary profile an account key or a key bound to any profile of the account (profile_id), and any other profile a key bound to itself, each with its own X-Profile-Token when PIN-protected. Past max_user_keys the request is 409 conflict.
+     * @description Only a server admin's login session may create a key, acting through the account's primary profile. X-Profile-Id must name the primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied. A request without X-Profile-Id is accepted only while no profile on the account is PIN-protected or access-restricted (content-rating, advisory-age or library limits); otherwise it is 403 permission_denied.
      */
     post: operations["createPersonalAPIKey"];
     delete?: never;
@@ -6355,10 +5992,7 @@ export interface paths {
     get?: never;
     put?: never;
     post?: never;
-    /**
-     * Manage the login account's API keys.
-     * @description Revokes a key the caller can list (listPersonalAPIKeys); any other key is 404. This is for a login session: an API key cannot revoke keys and receives 403 permission_denied.
-     */
+    /** Manage the login account's API keys. */
     delete: operations["revokePersonalAPIKey"];
     options?: never;
     head?: never;
@@ -6542,10 +6176,7 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /**
-     * Poll a pairing request from the device and collect its tokens once approved.
-     * @description A request started with binding is polled only with its binding_secret: a poll without it, or with another secret, is 403 device_binding_mismatch and leaves the request unchanged.
-     */
+    /** Poll a pairing request from the device and collect its tokens once approved. */
     post: operations["pollDeviceLogin"];
     delete?: never;
     options?: never;
@@ -7103,23 +6734,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v2/capabilities/profile-export": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Discover profile export and import: the document format and version, the import size limit, and the data types carried. */
-    get: operations["getProfileExportCapability"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v2/capabilities/ratings": {
     parameters: {
       query?: never;
@@ -7129,23 +6743,6 @@ export interface paths {
     };
     /** Whether item detail carries the ratings list, and the rating sources title pages and cards show. */
     get: operations["getRatingsCapability"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/capabilities/title-allowances": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Whether the household's primary profile can allow limited profiles specific titles above their rating limits. */
-    get: operations["getTitleAllowanceCapability"];
     put?: never;
     post?: never;
     delete?: never;
@@ -7374,23 +6971,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v2/catalog/items/{id}/title-allowances": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** For a movie or series, the standing of every other profile on the account: within its limits, allowed, or above its limits and allowable. Household managers only. */
-    get: operations["listTitleAllowanceProfiles"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v2/catalog/items/{id}/trailers/refresh": {
     parameters: {
       query?: never;
@@ -7466,7 +7046,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** Search people by name, with exact matches first, then the most credited for a specific query, and optional media scope. */
+    /** Search people by name, with exact matches first and optional media scope. */
     get: operations["listPeople"];
     put?: never;
     post?: never;
@@ -8741,7 +8321,7 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /** Delegate the current login session, or an API key holding admin:monitor:read, catalog:read, watch:read or notifications, for one realtime handshake. */
+    /** Delegate the current login session, or an admin:monitor:read API key, for one realtime handshake. */
     post: operations["createEventsSocketTicket"];
     delete?: never;
     options?: never;
@@ -9015,7 +8595,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** The home page's sections that have cards for the acting profile, with those cards. */
+    /** The home page's sections with their cards, as the acting profile sees them. */
     get: operations["listHomeSections"];
     put?: never;
     post?: never;
@@ -9066,11 +8646,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /**
-     * Manage emailed invitations.
-     * @deprecated
-     * @description Deprecated: a token in the path reaches the access logs of anything in front of the server. Use lookupInvitationLink.
-     */
+    /** Manage emailed invitations. */
     get: operations["lookupInvitation"];
     put?: never;
     post?: never;
@@ -9089,29 +8665,8 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /**
-     * Manage emailed invitations.
-     * @deprecated
-     * @description Deprecated: a token in the path reaches the access logs of anything in front of the server. Use acceptInvitationLink.
-     */
+    /** Manage emailed invitations. */
     post: operations["acceptInvitation"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/invitations/accept": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Create the invited account through an invitation link. */
-    post: operations["acceptInvitationLink"];
     delete?: never;
     options?: never;
     head?: never;
@@ -9129,23 +8684,6 @@ export interface paths {
     get: operations["getInvitationCapabilities"];
     put?: never;
     post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/invitations/lookup": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Describe an invitation link for the claim screen. */
-    post: operations["lookupInvitationLink"];
     delete?: never;
     options?: never;
     head?: never;
@@ -9659,7 +9197,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** The library's sections that have cards for the acting profile, with those cards. */
+    /** The library's sections with their cards, as the acting profile sees them. */
     get: operations["listLibrarySections"];
     put?: never;
     post?: never;
@@ -10043,76 +9581,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v2/notifications/plugin-channels": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** List the notification channels the enabled plugins provide, with each channel's destination settings form. */
-    get: operations["listNotificationPluginChannels"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/notifications/plugin-destinations": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** List the acting profile's plugin destinations. A destination whose plugin is disabled or removed reads as unavailable, without its settings. */
-    get: operations["listNotificationPluginDestinations"];
-    put?: never;
-    /** Add a destination on a plugin-provided channel to the acting profile, after the plugin accepts its settings. A channel no enabled plugin provides is a 422 at body.capability_id. Send once; a replay answers 422 for the name already taken. */
-    post: operations["createNotificationPluginDestination"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/notifications/plugin-destinations/{id}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    /** Update a plugin destination using the original observed validator. Changed settings are checked by the plugin again. Never rebase or replay an uncertain update. */
-    put: operations["updateNotificationPluginDestination"];
-    post?: never;
-    /** Delete the acting profile's plugin destination and its queued messages. Does not recall a message already sent. */
-    delete: operations["deleteNotificationPluginDestination"];
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/notifications/plugin-destinations/{id}/test": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Send one test message to the acting profile's plugin destination now. A failed send is a 200 result with ok false; it isn't retried or counted. */
-    post: operations["testNotificationPluginDestination"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v2/notifications/preferences": {
     parameters: {
       query?: never;
@@ -10242,7 +9710,7 @@ export interface paths {
     };
     /**
      * List the series whose new episodes can notify the acting profile.
-     * @description Every series the profile has finished an episode of and waits on a next episode of, and every series it muted, filtered and sorted as asked (by title by default). Each carries its Next Up reason, whether the profile's notification preferences let it notify, whether the next new episode would notify, and whether the profile muted it. Series the viewer may not see are omitted.
+     * @description Every series the profile favorited, put on its watchlist, is partway through, or waits on a next episode of, and every series it muted, filtered and sorted as asked (by title by default). Each carries its reasons, which of them the profile's notification preferences let notify, and whether the profile muted it. Series the viewer may not see are omitted.
      */
     get: operations["listNotificationSeries"];
     put?: never;
@@ -10272,46 +9740,6 @@ export interface paths {
      * @description The series notifies the acting profile again for its active reasons. The mute applies when notification delivery evaluates a new episode, normally within a minute of it arriving: an episode evaluated while the series was muted is not announced later, and one still waiting to be evaluated when the profile unmutes is announced. Unmuting a series that is not muted succeeds and changes nothing. No access check runs, so a profile can lift a mute on a series it can no longer see.
      */
     delete: operations["unmuteNotificationSeries"];
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/notifications/series/mute": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /**
-     * Mute new-episode notifications for many series.
-     * @description Mutes each named series for the acting profile as PUT /series/{series_id}/mute mutes one, in one request, and answers an outcome per distinct series in request order: applied when this call muted it, unchanged when it was already muted, not_found for an ID that names no series or a series the viewer may not see.
-     */
-    post: operations["muteManyNotificationSeries"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/notifications/series/unmute": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /**
-     * Unmute new-episode notifications for many series.
-     * @description Unmutes each named series for the acting profile as DELETE /series/{series_id}/mute unmutes one, in one request, and answers an outcome per distinct series in request order: applied when this call unmuted it, unchanged when it was not muted. No access check runs, so a profile can lift a mute on a series it can no longer see.
-     */
-    post: operations["unmuteManyNotificationSeries"];
-    delete?: never;
     options?: never;
     head?: never;
     patch?: never;
@@ -10558,24 +9986,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v2/overlay-images/{ref}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Read a card overlay image. The ref addresses the content, so a response never changes. */
-    get: operations["getOverlayImage"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    /** Read a card overlay image. The ref addresses the content, so a response never changes. */
-    head: operations["headOverlayImage"];
-    patch?: never;
-    trace?: never;
-  };
   "/api/v2/password-resets": {
     parameters: {
       query?: never;
@@ -10600,11 +10010,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /**
-     * Describe a usable password reset link for the reset screen.
-     * @deprecated
-     * @description Deprecated: a token in the path reaches the access logs of anything in front of the server. Use lookupPasswordResetLink.
-     */
+    /** Describe a usable password reset link for the reset screen. */
     get: operations["lookupPasswordReset"];
     put?: never;
     post?: never;
@@ -10623,46 +10029,8 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /**
-     * Set a new password through a reset link, sign out everywhere, and sign in.
-     * @deprecated
-     * @description Deprecated: a token in the path reaches the access logs of anything in front of the server. Use completePasswordResetLink.
-     */
-    post: operations["completePasswordReset"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/password-resets/complete": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
     /** Set a new password through a reset link, sign out everywhere, and sign in. */
-    post: operations["completePasswordResetLink"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/password-resets/lookup": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Describe a usable password reset link for the reset screen. */
-    post: operations["lookupPasswordResetLink"];
+    post: operations["completePasswordReset"];
     delete?: never;
     options?: never;
     head?: never;
@@ -10902,7 +10270,7 @@ export interface paths {
     post?: never;
     delete?: never;
     options?: never;
-    head: operations["headPlaybackManifest"];
+    head?: never;
     patch?: never;
     trace?: never;
   };
@@ -10950,40 +10318,6 @@ export interface paths {
     get: operations["getPolicyCapability"];
     put?: never;
     post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/profile/export": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** Download the acting profile's own data as a silo-profile-export document: watch history and progress, ratings, favorites and watchlist, personal collections, dismissals, preferences, and notification preferences, leaving out titles the profile may not see now. It carries no account fields, password or PIN hashes, or access fields. */
-    get: operations["exportProfile"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/profile/import": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Merge a silo-profile-export document into the acting profile: newer progress and history win, ratings, favorites, and dismissals are added where the profile has none, collections gain missing items, and preferences are overwritten. Nothing is deleted, and importing the same document again changes nothing. The target is always the acting profile; a document carrying account or access fields is refused, and items the profile cannot see are left out. A PIN-protected profile needs its PIN-verified session. */
-    post: operations["importProfile"];
     delete?: never;
     options?: never;
     head?: never;
@@ -11077,93 +10411,6 @@ export interface paths {
     head?: never;
     /** Update a household profile; omitted members are unchanged. */
     patch: operations["updateProfile"];
-    trace?: never;
-  };
-  "/api/v2/profiles/{id}/allowed-collections": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** List the personal collections allowed for a profile, newest first. Household managers only. */
-    get: operations["listAllowedCollections"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/profiles/{id}/allowed-collections/{collection_id}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    /** Allow a profile every title in a personal collection, including titles added later. Only a manual collection the acting primary profile created can be allowed (422 collection_not_live); copy other collections' titles with allowCollectionTitles. A profile sees at most 10,000 of its allowed titles, from its own allowances and its live collections together, and at most 50,000 entries of its live collections together are read; the rest stay hidden. Household managers only. */
-    put: operations["allowCollection"];
-    post?: never;
-    /** Stop allowing a profile a personal collection. An absent allowance succeeds and changes nothing. Household managers only. */
-    delete: operations["disallowCollection"];
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/profiles/{id}/allowed-titles": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    /** List the movies and series allowed for a profile above its limits, as catalog cards, newest first, paged by cursor. Titles allowed only through a collection are not listed, and titles the acting profile may not see are omitted, so a page can hold fewer cards than its limit. Household managers only. */
-    get: operations["listAllowedTitles"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/profiles/{id}/allowed-titles/{item_id}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    /** Allow a profile a movie or series above its rating or advisory-age limit. A series allowance covers its seasons and episodes. The profile must have a limit (422 no_maturity_limits) and reach the title's library (422 no_library_access); episodes and seasons are refused with 422. A profile sees at most 10,000 of its allowed titles; the rest stay hidden. Allowing an allowed title succeeds and changes nothing. Household managers only. */
-    put: operations["allowTitle"];
-    post?: never;
-    /** Remove a profile's allowance for a title. An absent allowance succeeds and changes nothing. A title an allowed collection holds stays allowed. Household managers only. */
-    delete: operations["disallowTitle"];
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v2/profiles/{id}/allowed-titles/copy-collection": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    /** Allow a profile every movie and series a personal collection holds now, as individual title allowances, up to 10,000 titles per copy; a stored collection's copy reads at most its first 100,000 entries not yet allowed. Only titles the acting profile can see, in libraries the target profile can reach, are copied; for a smart collection, what its query matches for the acting profile. Titles added to the collection later are not allowed. Not retryable: a repeated copy of a stored collection with more titles than one copy takes continues with the next ones, so after an uncertain response read listAllowedTitles before copying again. Household managers only. */
-    post: operations["allowCollectionTitles"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
     trace?: never;
   };
   "/api/v2/profiles/{id}/avatar": {
@@ -11279,7 +10526,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** List the acting profile's ratings, most recently rated first; items the viewer may not see are omitted. */
+    /** List the acting profile's ratings, most recently rated first. */
     get: operations["listRatings"];
     put?: never;
     post?: never;
@@ -11296,7 +10543,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** Answer the acting profile's rating of the item, or 404 when the profile has not rated it (or the viewer may not see it). */
+    /** Answer the acting profile's rating of the item, or 404 when the profile has not rated it. */
     get: operations["getRating"];
     /** Set the acting profile's rating of the item, replacing any earlier rating; automatic retries repeat the rating timestamp and recommendation refresh. */
     put: operations["setRating"];
@@ -11570,10 +10817,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /**
-     * Get one of the account's media requests.
-     * @description A profile the household manager blocked from requests gets 403 for a request another profile made, unless it acts as an admin.
-     */
+    /** Get one of the account's media requests. */
     get: operations["getRequest"];
     put?: never;
     post?: never;
@@ -11796,10 +11040,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /**
-     * List the account's media requests, newest first.
-     * @description Lists the requests every profile on the account made. A profile the household manager blocked from requests sees only the requests it made itself.
-     */
+    /** List the account's media requests, newest first. */
     get: operations["listMyRequests"];
     put?: never;
     post?: never;
@@ -12494,7 +11735,7 @@ export interface paths {
     put?: never;
     /**
      * Submit a bounded subtitle multipart form.
-     * @description Detect a subtitle language from filename, metadata or content with an optional manual fallback. Does not store the file. A server runs at most 4 detections at once and an account may run two of them; beyond either limit the request gets 429 with Retry-After.
+     * @description Detect a subtitle language from filename, metadata or content with an optional manual fallback. Does not store the file.
      */
     post: operations["detectSubtitleLanguage"];
     delete?: never;
@@ -12930,10 +12171,7 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /**
-     * Poll device authorization. Concurrent polls are not durably coalesced.
-     * @description Refusals, by problem type: 409 conflict (the person has not approved the code yet); 410 device_login_expired (the code expired, or was already used and the connection no longer exists); 403 not_permitted (the person declined it on the provider's site). Polling a session that already completed answers the connection again, so retrying after a lost answer is safe.
-     */
+    /** Poll device authorization. Concurrent polls are not durably coalesced. */
     post: operations["pollWatchProviderDeviceAuth"];
     delete?: never;
     options?: never;
@@ -13501,16 +12739,10 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /**
-     * List the account's webhook connections.
-     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
-     */
+    /** List the account's webhook connections. */
     get: operations["listWebhookConnections"];
     put?: never;
-    /**
-     * Create an external webhook connection.
-     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
-     */
+    /** Create an external webhook connection. */
     post: operations["createWebhookConnection"];
     delete?: never;
     options?: never;
@@ -13526,16 +12758,10 @@ export interface paths {
       cookie?: never;
     };
     get?: never;
-    /**
-     * Update a webhook connection.
-     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
-     */
+    /** Update a webhook connection. */
     put: operations["updateWebhookConnection"];
     post?: never;
-    /**
-     * Delete a webhook connection.
-     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
-     */
+    /** Delete a webhook connection. */
     delete: operations["deleteWebhookConnection"];
     options?: never;
     head?: never;
@@ -13549,10 +12775,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /**
-     * List webhook events with stable pagination.
-     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
-     */
+    /** List webhook events with stable pagination. */
     get: operations["listWebhookEvents"];
     put?: never;
     post?: never;
@@ -13569,15 +12792,9 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /**
-     * Read external-user profile mappings.
-     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
-     */
+    /** Read external-user profile mappings. */
     get: operations["getWebhookMappings"];
-    /**
-     * Replace external-user profile mappings.
-     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
-     */
+    /** Replace external-user profile mappings. */
     put: operations["updateWebhookMappings"];
     post?: never;
     delete?: never;
@@ -13595,10 +12812,7 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /**
-     * Rotate the external receiver URL.
-     * @description Webhook sync connections are account-wide: a connection's receiver URL carries its secret, and its mappings choose which profile an external user's watch state is written to. Only the account's household manager may read or change them. X-Profile-Id must name the account's primary profile, with X-Profile-Token when that profile is PIN-protected (without it the request is 403 profile_verification_required); naming any other profile is 403 permission_denied, including on an admin account. A request without X-Profile-Id is accepted only from an admin account's API key, or from an admin account's login session while no profile on the account is PIN-protected or access-restricted; otherwise it is 403 permission_denied.
-     */
+    /** Rotate the external receiver URL. */
     post: operations["rotateWebhookConnection"];
     delete?: never;
     options?: never;
@@ -13729,7 +12943,7 @@ export interface components {
     };
     AccountIdentityCollection: {
       /**
-       * @description Whether deleteAccountIdentity would disconnect an identity now for the profile asking: that profile is the account's household manager (deleteAccountIdentity describes who is), and the account has another identity, or its local password still signs in (the account's password sign-in is on, and local password sign-in is on for the server or the account is break-glass). False with no identity
+       * @description Whether deleteAccountIdentity would disconnect an identity now: the account has another identity, or its local password still signs in (the account's password sign-in is on, and local password sign-in is on for the server or the account is break-glass). False with no identity
        * @example true
        */
       can_unlink: boolean;
@@ -14009,8 +13223,6 @@ export interface components {
       profile_avatars: boolean;
       /** @description Whether access groups and account policy overrides take max_profiles, the household profile limit; null on an account inherits its group's limit */
       profile_limits: boolean;
-      /** @description Whether getAdminUserProfile, createAdminUserProfile, updateAdminUserProfile and deleteAdminUserProfile can read and change an account's profiles, including setting or removing a profile's PIN, and whether listAdminUserProfiles reports has_pin, is_primary and is_child */
-      profile_management: boolean;
       /** @description Whether listAdminUserProfileSectionOverrides, getAdminUserProfileSectionSettings, replaceAdminUserProfileSectionOverrides and resetAdminUserProfileSectionOverrides can read and change one profile's page layout */
       profile_sections: boolean;
       /** @description Whether getAdminRequestUserUsage can report an account's request quota use */
@@ -14086,16 +13298,11 @@ export interface components {
        * @example /avatars/presets/fox.png
        */
       avatar_url?: string;
-      /** @description Whether the profile is locked with a PIN */
-      has_pin: boolean;
       /**
        * @description Opaque identifier
        * @example 1
        */
       id: string;
-      is_child: boolean;
-      /** @description The household parent (not the server admin role) */
-      is_primary: boolean;
       /**
        * Format: date-time
        * @description Latest time any device reported this profile; null when no device has
@@ -14328,8 +13535,6 @@ export interface components {
       id: string;
       key_prefix: string;
       label: string;
-      /** @description The household profile the key is bound to and always acts as. Absent on an account key, which may name any profile on its account */
-      profile_id?: string;
       /** @enum {string} */
       rate_tier: "standard" | "elevated";
       scopes: string[];
@@ -14368,8 +13573,6 @@ export interface components {
       /** @description Credential disclosed only in this creation response. Store it securely. */
       key: string;
       label: string;
-      /** @description The household profile the key is bound to. Absent on an account key */
-      profile_id?: string;
       rate_tier: string;
       scopes: string[];
       /**
@@ -14405,8 +13608,6 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       last_used_at?: string;
-      /** @description The household profile the key is bound to and always acts as. Absent on an account key, which may name any profile on its account */
-      profile_id?: string;
       /** @enum {string} */
       rate_tier: "standard" | "elevated";
       scopes: string[];
@@ -14837,910 +14038,6 @@ export interface components {
       path_rewrites: components["schemas"]["AdminAutoscanPathRewrite"][];
       plugin_id: string;
     };
-    AdminBackup: {
-      /**
-       * Format: int64
-       * @description Files copied into blobs.tar
-       */
-      blob_count: number;
-      /** @description Whether this copy counts as a clean copy for rotation: complete, with every file, and verified under this server's SECRET_KEY. Rotation always keeps the newest clean copy, even beyond backup.keep */
-      clean: boolean;
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      completed_at?: string;
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      created_at: string;
-      /** @description Whether the objects are stored encrypted with a key derived from SECRET_KEY. The manifest is never encrypted */
-      encrypted: boolean;
-      /** @description The backup folder name: UTC start time and kind */
-      id: string;
-      /** @description Check value of the SECRET_KEY the backup was taken with: 16 hex digits in groups of 4 */
-      key_check?: string;
-      /** @description Whether key_check is this server's. Settings and credentials the backup holds encrypted cannot be read with another key, and an encrypted backup that does not match cannot be previewed, restored, or downloaded decrypted here */
-      key_matches: boolean;
-      /** @enum {string} */
-      kind: "nightly" | "manual" | "before-restore" | "before-upgrade";
-      /** @description Where the backup folder is: a filesystem path on this server's storage, or s3://bucket/key in a bucket */
-      location: string;
-      missing_blobs: components["schemas"]["AdminBackupMissingBlob"][];
-      /**
-       * Format: int64
-       * @description Files missing when the backup copied them, all of them; missing_blobs lists at most the first 10,000
-       */
-      missing_blobs_total: number;
-      objects: components["schemas"]["AdminBackupObject"][];
-      /** @description Items the restore set left out; the dump still holds them */
-      restore_set_omitted: components["schemas"]["AdminBackupOmitted"][];
-      silo_version?: string;
-      /** Format: int64 */
-      size_bytes: number;
-      /**
-       * @description complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored. unreadable: its manifest could not be read just now (the destination failed or the read was cut short); it is kept, and neither rotated nor swept, until it reads
-       * @enum {string}
-       */
-      status:
-        | "complete"
-        | "complete_with_warnings"
-        | "in_progress"
-        | "incomplete"
-        | "unverified"
-        | "unreadable";
-    };
-    AdminBackupAcknowledgeKeyBody: {
-      /** @description The check value the admin was shown (key_check from the backup list). It must be this server's current one */
-      key_check: string;
-    };
-    AdminBackupAcknowledgeKeyOutputBody: {
-      /** @description The check value now confirmed */
-      key_check: string;
-    };
-    AdminBackupActive: {
-      backup_id?: string;
-      message?: string;
-      /**
-       * @description restore: a selective restore from backup_id or upload_id is running; upload: the upload upload_id is being checked
-       * @enum {string}
-       */
-      operation: "backup" | "delete" | "restore" | "upload";
-      /**
-       * Format: double
-       * @description Percent complete, for a backup
-       */
-      progress: number;
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      started_at: string;
-      /** @description The upload a restore reads, or the upload being checked or deleted */
-      upload_id?: string;
-    };
-    AdminBackupCapabilities: {
-      /** @description Whether the current principal may use the capability */
-      allowed: boolean;
-      /** @description Backup destinations this server can write to: default, the server's own storage, when it has one, and s3, a bucket used only for backups */
-      destinations: string[];
-      /** @description Whether a full backup can be downloaded */
-      download: boolean;
-      /** @description Whether backups can be encrypted. Backups in any S3 bucket always are, with a key derived from SECRET_KEY: the s3 destination, and the default one when this server's private storage is a bucket */
-      encryption: boolean;
-      /**
-       * Format: int64
-       * @description The largest restore set an upload takes
-       */
-      max_upload_bytes: number;
-      /** @description Opaque revision of this document */
-      revision: string;
-      /** @description Whether parts of a backup can be previewed and restored from the API: settings, plugins, libraries, accounts and their profiles' data, collections and uploaded artwork */
-      selective_restore: boolean;
-      /**
-       * @description Support and configuration state, not health
-       * @enum {string}
-       */
-      state: "available" | "disabled" | "not_configured" | "unsupported";
-      /** @description Whether a restore set can be uploaded from another server */
-      upload: boolean;
-    };
-    AdminBackupDownloadLink: {
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      expires_at: string;
-      name: string;
-      /** Format: int64 */
-      size_bytes: number;
-      /**
-       * Format: uri-reference
-       * @description Short-lived URL that downloads the object without a session: a presigned storage URL, or a signed path on this server
-       */
-      url: string;
-    };
-    AdminBackupDownloadLinksBody: {
-      /**
-       * @description What to download: full is every stored object as it is, encrypted for an encrypted backup (decrypt with silo backup decrypt); restore-set is restore-set.tar alone, decrypted by this server for an encrypted backup
-       * @enum {string}
-       */
-      scope: "full" | "restore-set";
-    };
-    AdminBackupDownloadLinksOutputBody: {
-      items: components["schemas"]["AdminBackupDownloadLink"][];
-    };
-    AdminBackupLastRun: {
-      /** @description Why a failed or interrupted run stopped */
-      error?: string;
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      finished_at?: string;
-      id: string;
-      /** @enum {string} */
-      kind: "nightly" | "manual" | "before-restore" | "before-upgrade";
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      started_at: string;
-      /**
-       * @description interrupted: the server running it stopped before it finished
-       * @enum {string}
-       */
-      status: "complete" | "complete_with_warnings" | "failed" | "interrupted";
-    };
-    AdminBackupLibraryMapping: {
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      backup_id: string;
-      /**
-       * @description The library here with the identical folder set; absent when the library is not on this server
-       * @example 1
-       */
-      local_id?: string;
-      name: string;
-      selectable: boolean;
-      /** @enum {string} */
-      status: "on_this_server" | "not_on_this_server" | "folder_missing";
-    };
-    AdminBackupList: {
-      /** @description The operation holding the lock, started on any server */
-      active?: components["schemas"]["AdminBackupActive"];
-      /** @description Whether a backup, delete, or selective restore holds the cluster-wide backup lock now */
-      busy: boolean;
-      /**
-       * @description Where new backups go (backup.destination). Items lists only this destination's backups; copies at a previous destination stay there
-       * @enum {string}
-       */
-      destination: "default" | "s3";
-      destination_available: boolean;
-      /** @description Whether nightly backups run (backup.enabled) */
-      enabled: boolean;
-      /** @description Whether new backups are encrypted: true for the s3 destination, and for default when this server's private storage is an S3 bucket. Encrypted backups run only while key_confirmed is true */
-      encrypted: boolean;
-      /** @description This server's backups, newest first */
-      items: components["schemas"]["AdminBackup"][];
-      /**
-       * Format: int64
-       * @description How many nightly and manual backups rotation keeps (backup.keep)
-       */
-      keep: number;
-      /** @description This server's SECRET_KEY check value, 16 hex digits in groups of 4. It names the key without revealing it; silo secret check prints it for a key */
-      key_check: string;
-      /** @description Whether an admin confirmed keeping a copy of the SECRET_KEY with this check value. Encrypted backups (any S3 bucket) run only while it is true */
-      key_confirmed: boolean;
-      /** @description The latest backup run, including one that failed or was interrupted */
-      last_run?: components["schemas"]["AdminBackupLastRun"];
-      /**
-       * Format: date-time
-       * @description When the latest successful backup finished, at any destination
-       */
-      last_success_at?: string;
-      /** @description Other server identities with backups at this destination */
-      other_server_ids: string[];
-      /** @description This server's identity; its backups live under backups/<server_id>/ */
-      server_id: string;
-      /** @description Conditions the dashboard should show */
-      warnings: components["schemas"]["AdminBackupWarning"][];
-    };
-    AdminBackupMissingBlob: {
-      key: string;
-      /** @description What referenced the file, such as library poster */
-      source: string;
-      /** @enum {string} */
-      store: "assets" | "operational";
-    };
-    AdminBackupObject: {
-      /** @description Object name in the backup folder as stored, such as db.dump, or db.dump.age when the backup is encrypted */
-      name: string;
-      /** @description SHA-256 of the stored bytes */
-      sha256: string;
-      /** Format: int64 */
-      size_bytes: number;
-    };
-    AdminBackupOmitted: {
-      /** @description What failed, stable across backups so items can be grouped: the part being read (a profile data type such as notifications, or profiles or items) and, when its error names one, the step that failed in it, such as notifications: reading notification preferences. Absent for too_large and for backups taken before restore set format 3 */
-      cause?: string;
-      /** @description The underlying error, without ids */
-      error?: string;
-      /** @description The item's id in its section, such as the account id */
-      id: string;
-      label: string;
-      message: string;
-      /**
-       * @description too_large: its document exceeds what a restore set may hold; export_failed: reading it failed
-       * @enum {string}
-       */
-      reason: "too_large" | "export_failed";
-      /** @enum {string} */
-      section: "users";
-    };
-    AdminBackupRestoreAccount: {
-      /** @description An administrator account: restoring it creates an administrator here */
-      admin: boolean;
-      email: string;
-      /** @description The account's access group in the backup; a new account joins the group of that name here */
-      group?: string;
-      /**
-       * Format: int64
-       * @description Library entries of the account's own library list with no library here; they are dropped, never widened
-       */
-      libraries_left_out: number;
-      /**
-       * @description The matched account here
-       * @example 1
-       */
-      local_id?: string;
-      local_username?: string;
-      /**
-       * @description account_id: the backup is this server's and the account id exists; restored: an earlier restore of this backup's server created it; username_email: the one account here whose username or email is this account's username or email; new: restoring creates it
-       * @enum {string}
-       */
-      match: "account_id" | "restored" | "username_email" | "new";
-      /** @description For a new account, what this server's policy would grant beyond the backup's; any difference makes it unselectable */
-      policy_differences: components["schemas"]["AdminBackupRestorePolicyDifference"][];
-      /**
-       * Format: int64
-       * @description How many new profiles the account can take here; a restore that chooses more leaves the rest out
-       */
-      profile_room: number;
-      profiles: components["schemas"]["AdminBackupRestoreProfile"][];
-      /** @enum {string} */
-      role: "admin" | "user";
-      /** @description What a restore selection names for this account: the local account id, or new */
-      target: string;
-      username: string;
-    };
-    AdminBackupRestoreBody: {
-      /** @description Confirms restoring from a backup whose manifest this server cannot authenticate (authenticated false in the preview); refused without it */
-      accept_unauthenticated?: boolean;
-      /** @description The digest the preview returned */
-      digest: string;
-      selection: components["schemas"]["AdminBackupRestoreSelection"];
-    };
-    AdminBackupRestoreCollection: {
-      /** @description The template bundle that created a template collection */
-      bundle_id?: string;
-      /** @description A template collection's fields the admin changed from the template's defaults that a restore writes here: title, description, visibility, featured, sort order, item sort, source, sync schedule, poster, backdrop */
-      changes?: string[];
-      /** Format: int64 */
-      items: number;
-      /** @description Libraries here the collection maps to */
-      library_ids?: string[];
-      /** @description The collection here: for a manual collection the one with the same name in the mapped library, for a template collection the one the same template created for the mapped library */
-      local_id?: string;
-      /**
-       * Format: int64
-       * @description Items the collection here lacks that a restore adds
-       */
-      missing_items: number;
-      /** @description A template collection's template in the collection template catalog */
-      template_id?: string;
-      /**
-       * Format: int64
-       * @description Items not in this server's catalog, left out
-       */
-      unknown_items: number;
-    };
-    AdminBackupRestoreCounts: {
-      /** Format: int64 */
-      failed: number;
-      /** Format: int64 */
-      left_out: number;
-      /** Format: int64 */
-      restored: number;
-      /** Format: int64 */
-      unchanged: number;
-    };
-    AdminBackupRestoreDataType: {
-      /**
-       * Format: int64
-       * @description Entries the backup holds
-       */
-      count: number;
-      /** @enum {string} */
-      id:
-        | "watch_history"
-        | "ratings"
-        | "favorites"
-        | "collections"
-        | "dismissals"
-        | "preferences"
-        | "notifications";
-      /**
-       * Format: int64
-       * @description For a profile matched here: how many entries restoring this data type would add or change, by the same merge rules a restore applies. Items are matched by content id only, so an item a restore would match by provider ids counts as not here. Absent for a profile a restore creates
-       */
-      pending?: number;
-    };
-    AdminBackupRestoreHomeSection: {
-      /** @description What a restore replaces in the section here: title, position, featured, item limit, enabled, web only, configuration, and N collection items */
-      changes?: string[];
-      /**
-       * @description The library here whose page holds the section
-       * @example 1
-       */
-      library_id?: string;
-      /** @description The matching section here: the same id on the server that took the backup, else the one section of the page with the same type and title */
-      local_id?: string;
-      /** @enum {string} */
-      scope: "home" | "library";
-      section_type: string;
-    };
-    AdminBackupRestoreItem: {
-      account?: components["schemas"]["AdminBackupRestoreAccount"];
-      collection?: components["schemas"]["AdminBackupRestoreCollection"];
-      /** @description A settings page whose differing settings connect to an outside service */
-      external_service: boolean;
-      home_section?: components["schemas"]["AdminBackupRestoreHomeSection"];
-      /** @description The id to choose this item by in a restore request */
-      id: string;
-      /** @enum {string} */
-      kind:
-        | "settings_page"
-        | "plugin"
-        | "library"
-        | "collection"
-        | "template_collection"
-        | "item_artwork"
-        | "branding"
-        | "home_section"
-        | "account";
-      label: string;
-      library?: components["schemas"]["AdminBackupRestoreLibrary"];
-      /** @description What restoring the item does or why it cannot be chosen, for display */
-      message?: string;
-      /** @description Files the item references that were missing when the backup was taken */
-      missing_blobs: string[];
-      plugin?: components["schemas"]["AdminBackupRestorePlugin"];
-      /** @enum {string} */
-      reason?:
-        | "same"
-        | "path_in_use"
-        | "folder_missing"
-        | "library_not_restorable"
-        | "library_not_mapped"
-        | "ambiguous_name"
-        | "needs_another_key"
-        | "config_needs_another_key"
-        | "other_version"
-        | "item_not_on_this_server"
-        | "file_missing"
-        | "not_in_backup"
-        | "changed_since_preview"
-        | "ambiguous_account"
-        | "ambiguous_profile"
-        | "policy_wider"
-        | "group_not_on_this_server"
-        | "login_taken"
-        | "profile_limit"
-        | "user_store_unsupported"
-        | "template_not_available"
-        | "collection_not_mapped"
-        | "unreadable"
-        | "files_missing_here"
-        | "needs_install"
-        | "kept_stricter"
-        | "unverified_backup"
-        | "over_restore_budget"
-        | "needs_primary_profile";
-      /** @description Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request */
-      requires: string[];
-      restart_required: boolean;
-      /** @description Whether the item can be chosen. Items on this server already have nothing to restore. */
-      selectable: boolean;
-      settings?: components["schemas"]["AdminBackupRestoreSetting"][];
-      /** @enum {string} */
-      status:
-        | "on_this_server"
-        | "not_on_this_server"
-        | "differs"
-        | "folder_missing"
-        | "ambiguous"
-        | "needs_another_key";
-    };
-    AdminBackupRestoreLibrary: {
-      /**
-       * @description The library here with the identical folder set
-       * @example 1
-       */
-      local_id?: string;
-      /** @description Folders this server cannot open */
-      missing_paths?: string[];
-      paths: string[];
-      type: string;
-    };
-    AdminBackupRestorePlugin: {
-      config_keys: string[];
-      /** @description False when the configuration was encrypted with another SECRET_KEY: the plugin installs without it and stays disabled */
-      config_restorable: boolean;
-      /** @description Whether the plugin was enabled in the backup */
-      enabled: boolean;
-      /** @description The version installed here, when the plugin is installed */
-      installed_version?: string;
-      version: string;
-    };
-    AdminBackupRestorePolicyDifference: {
-      /** @description The value in the backup, as display text */
-      backup: string;
-      /** @enum {string} */
-      field:
-        | "library_ids"
-        | "max_playback_quality"
-        | "max_streams"
-        | "max_transcodes"
-        | "max_remote_stream_bitrate_kbps"
-        | "max_local_stream_bitrate_kbps"
-        | "max_profiles"
-        | "download_allowed"
-        | "download_transcode_allowed"
-        | "transcode_allowed"
-        | "audio_transcode_allowed"
-        | "requests_allowed"
-        | "permissions";
-      /** @description The value this server would give, as display text */
-      here: string;
-    };
-    AdminBackupRestoreProfile: {
-      /** @description The data the profile carries, in restore order */
-      data_types: components["schemas"]["AdminBackupRestoreDataType"][];
-      has_pin: boolean;
-      /** @description The id to choose this profile by in a restore request */
-      id: string;
-      is_primary: boolean;
-      /**
-       * Format: int64
-       * @description Allowed libraries with no library here; dropped, never widened
-       */
-      libraries_left_out: number;
-      local_id?: string;
-      /** @enum {string} */
-      match: "profile_id" | "restored" | "name" | "new";
-      message?: string;
-      name: string;
-      /** @description A restricted profile with none of its allowed libraries here: restored with no library access */
-      no_library_access: boolean;
-      /** @enum {string} */
-      reason?: "same" | "ambiguous_profile" | "profile_limit";
-      /** @description Library restrictions are on */
-      restricted: boolean;
-      selectable: boolean;
-      /**
-       * @description on_this_server: matched here, and restoring would change nothing in the data the backup has for it (data_types[].pending all 0); differs: matched, with pending changes
-       * @enum {string}
-       */
-      status: "on_this_server" | "not_on_this_server" | "differs" | "ambiguous";
-      /** @description What a restore selection names for this profile: the local profile id, or new */
-      target: string;
-    };
-    AdminBackupRestoreProfileSelection: {
-      /** @description Data types to merge; none restores or keeps the profile without data */
-      data_types?: (
-        | "watch_history"
-        | "ratings"
-        | "favorites"
-        | "collections"
-        | "dismissals"
-        | "preferences"
-        | "notifications"
-      )[];
-      /** @description The profile's id in the preview */
-      profile: string;
-      /** @description The target the preview showed: the local profile id, or new */
-      target: string;
-    };
-    AdminBackupRestoreReport: {
-      /** @description The backup restored from; absent for an upload */
-      backup_id?: string;
-      /** @description The recovery point taken before anything was restored. Restoring it in full with silo backup restore goes back to how the server was. */
-      before_restore_backup_id?: string;
-      counts: components["schemas"]["AdminBackupRestoreCounts"];
-      /** @description Why the restore stopped, when it did */
-      error?: string;
-      /**
-       * @description Classifies error: restore_set_changed (the backup changed since its preview; nothing was restored), busy (another backup or restore held the lock), before_restore_backup_failed (nothing was restored), interrupted, or failed
-       * @enum {string}
-       */
-      error_code?:
-        | "restore_set_changed"
-        | "busy"
-        | "before_restore_backup_failed"
-        | "interrupted"
-        | "failed";
-      /** @description The server running the restore stopped; items listed committed, the rest did not. Running the same restore again is safe. */
-      interrupted: boolean;
-      items: components["schemas"]["AdminBackupRestoreReportItem"][];
-      library_map: components["schemas"]["AdminBackupLibraryMapping"][];
-      /** @description The upload restored from; absent for a backup */
-      upload_id?: string;
-    };
-    AdminBackupRestoreReportAccount: {
-      created: boolean;
-      /** @description Titles of items a restored profile's access here hides (its libraries, content rating, or advisory limits); their entries were left out */
-      hidden: string[];
-      /**
-       * @description The account here, created or matched
-       * @example 1
-       */
-      local_id?: string;
-      profiles: components["schemas"]["AdminBackupRestoreReportProfile"][];
-      /** @description Titles of items the account's data names that this server's catalog does not hold; their entries were left out */
-      unmatched: string[];
-    };
-    AdminBackupRestoreReportData: {
-      /** Format: int64 */
-      added: number;
-      /**
-       * Format: int64
-       * @description Entries left out: items not in this catalog, or references with nothing to map to
-       */
-      left_out: number;
-      notes: string[];
-      /** @enum {string} */
-      type:
-        | "watch_history"
-        | "ratings"
-        | "favorites"
-        | "collections"
-        | "dismissals"
-        | "preferences"
-        | "notifications";
-      /** Format: int64 */
-      unchanged: number;
-      /** Format: int64 */
-      updated: number;
-    };
-    AdminBackupRestoreReportItem: {
-      account?: components["schemas"]["AdminBackupRestoreReportAccount"];
-      /** @description Why a failed item failed */
-      error?: string;
-      id: string;
-      /** @enum {string} */
-      kind:
-        | "settings_page"
-        | "plugin"
-        | "library"
-        | "collection"
-        | "template_collection"
-        | "item_artwork"
-        | "branding"
-        | "home_section"
-        | "account";
-      label: string;
-      message?: string;
-      missing_blobs: string[];
-      notes: string[];
-      /** @enum {string} */
-      outcome: "restored" | "unchanged" | "left_out" | "failed";
-      /**
-       * @description Why a left_out item was left out
-       * @enum {string}
-       */
-      reason?:
-        | "same"
-        | "path_in_use"
-        | "folder_missing"
-        | "library_not_restorable"
-        | "library_not_mapped"
-        | "ambiguous_name"
-        | "needs_another_key"
-        | "config_needs_another_key"
-        | "other_version"
-        | "item_not_on_this_server"
-        | "file_missing"
-        | "not_in_backup"
-        | "changed_since_preview"
-        | "ambiguous_account"
-        | "ambiguous_profile"
-        | "policy_wider"
-        | "group_not_on_this_server"
-        | "login_taken"
-        | "profile_limit"
-        | "user_store_unsupported"
-        | "template_not_available"
-        | "collection_not_mapped"
-        | "unreadable"
-        | "files_missing_here"
-        | "needs_install"
-        | "kept_stricter"
-        | "unverified_backup"
-        | "over_restore_budget"
-        | "needs_primary_profile";
-      restart_keys: string[];
-      restart_required: boolean;
-      /** @enum {string} */
-      section: "libraries" | "plugins" | "settings" | "collections" | "home_sections" | "users";
-    };
-    AdminBackupRestoreReportProfile: {
-      created: boolean;
-      data: components["schemas"]["AdminBackupRestoreReportData"][];
-      id: string;
-      label: string;
-      local_id?: string;
-      message?: string;
-      notes: string[];
-      /** @enum {string} */
-      outcome: "restored" | "unchanged" | "left_out";
-      /** @enum {string} */
-      reason?:
-        | "same"
-        | "path_in_use"
-        | "folder_missing"
-        | "library_not_restorable"
-        | "library_not_mapped"
-        | "ambiguous_name"
-        | "needs_another_key"
-        | "config_needs_another_key"
-        | "other_version"
-        | "item_not_on_this_server"
-        | "file_missing"
-        | "not_in_backup"
-        | "changed_since_preview"
-        | "ambiguous_account"
-        | "ambiguous_profile"
-        | "policy_wider"
-        | "group_not_on_this_server"
-        | "login_taken"
-        | "profile_limit"
-        | "user_store_unsupported"
-        | "template_not_available"
-        | "collection_not_mapped";
-    };
-    AdminBackupRestoreSection: {
-      /**
-       * Format: int64
-       * @description Items the section holds in the backup
-       */
-      count: number;
-      /** @enum {string} */
-      id: "libraries" | "plugins" | "settings" | "collections" | "home_sections" | "users";
-      items: components["schemas"]["AdminBackupRestoreItem"][];
-    };
-    AdminBackupRestoreSelection: {
-      /** @description Collection, template collection, item artwork, and branding item ids */
-      collections?: string[];
-      /** @description Page section item ids (section:<id>) */
-      home_sections?: string[];
-      /** @description Backup library ids */
-      libraries?: string[];
-      /** @description Plugin ids */
-      plugins?: string[];
-      /** @description Settings page ids */
-      settings?: string[];
-      /** @description Accounts of the users section, each with the target the preview showed */
-      users?: components["schemas"]["AdminBackupRestoreUserSelection"][];
-    };
-    AdminBackupRestoreSet: {
-      /** @description Whether the backup's manifest verified under this server's SECRET_KEY. When false the server cannot tell whether the backup was changed after it was written, and a restore needs accept_unauthenticated */
-      authenticated: boolean;
-      /** @description The backup previewed; absent for an upload */
-      backup_id?: string;
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      created_at: string;
-      /** @description SHA-256 of the restore set; a restore request must carry it */
-      digest: string;
-      /** Format: int64 */
-      format_version: number;
-      /** @description Whether the backup was taken with this server's SECRET_KEY; when false, encrypted settings and plugin configuration cannot be restored */
-      key_matches: boolean;
-      library_map: components["schemas"]["AdminBackupLibraryMapping"][];
-      missing_blobs: string[];
-      /** @description Setting keys a restore never writes because they describe this server (its identity, storage, infrastructure, and credentials). An entry ending in . or _ is a key prefix. */
-      never_restored_settings: string[];
-      /** @description Items the restore set left out (the dump still holds them), so they are not in any section */
-      omitted: components["schemas"]["AdminBackupOmitted"][];
-      same_server: boolean;
-      sections: components["schemas"]["AdminBackupRestoreSection"][];
-      /** @description The server the backup was taken on */
-      server_id: string;
-      server_name: string;
-      silo_version: string;
-      /** @description The upload previewed; absent for a backup */
-      upload_id?: string;
-    };
-    AdminBackupRestoreSetting: {
-      /** @description The value in the backup; empty when masked */
-      backup_value: string;
-      /**
-       * @description external_service: connects to an outside service (mail, requests, metadata providers)
-       * @enum {string}
-       */
-      class: "portable" | "external_service";
-      /** @description The value on this server; empty when masked */
-      current_value: string;
-      key: string;
-      /** @description An encrypted or sensitive setting: both values are omitted */
-      masked: boolean;
-      /** @description The setting applies after a restart */
-      restart_required: boolean;
-      /**
-       * @description on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees, mail transport security), so this server keeps its stricter value and a restore never writes it; cleared: the restore changes where a service connects and the backup has no secret this server can read for it, so restoring clears the secret here and turns the service off; unverified_backup: it connects to an outside service, which a backup this server cannot verify never restores
-       * @enum {string}
-       */
-      status:
-        | "on_this_server"
-        | "differs"
-        | "needs_another_key"
-        | "kept_stricter"
-        | "cleared"
-        | "unverified_backup";
-    };
-    AdminBackupRestoreSource: {
-      /** @description The backup restored from; absent for an upload */
-      backup_id?: string;
-      /** @description The upload restored from; absent for a backup */
-      upload_id?: string;
-    };
-    AdminBackupRestoreUserSelection: {
-      /** @description The account's id in the preview */
-      account: string;
-      /** @description Profiles to restore; none restores the account alone */
-      profiles?: components["schemas"]["AdminBackupRestoreProfileSelection"][];
-      /** @description The target the preview showed: the local account id, or new */
-      target: string;
-    };
-    AdminBackupS3TestBody: {
-      access_key?: string;
-      bucket: string;
-      /** @description The S3 API endpoint, such as https://s3.us-east-1.amazonaws.com. It is not validated as a URI here: an endpoint the test cannot reach fails with step endpoint */
-      endpoint: string;
-      /** @description The folder in the bucket; backups go under <key_prefix>/backups/ */
-      key_prefix?: string;
-      /** @description Path-style addressing (endpoint/bucket/key) instead of virtual-hosted (bucket.endpoint/key) */
-      path_style?: boolean;
-      region?: string;
-      /** @description Omitted uses the stored backup.s3.secret_key, but only when endpoint and access_key are the stored ones */
-      secret_key?: string;
-    };
-    AdminBackupS3TestResult: {
-      /** @description What happened, for display: Connected. Silo wrote and deleted a test file. or what failed */
-      message: string;
-      ok: boolean;
-      /**
-       * @description The step that failed: endpoint, the address cannot be reached; credentials, the keys were refused; bucket, no such bucket or the wrong region; permission, the keys cannot write under the folder; a bucket that refuses only the delete passes, and its lifecycle rules remove old backups
-       * @enum {string}
-       */
-      step?: "endpoint" | "credentials" | "bucket" | "permission";
-    };
-    AdminBackupStarted: {
-      id: string;
-      /** @enum {string} */
-      kind: "manual";
-      /** @enum {string} */
-      status: "in_progress";
-    };
-    AdminBackupUpload: {
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      completed_at?: string;
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      created_at: string;
-      /** @description SHA-256 of the file as uploaded (the bytes sent, not the parts as stored, which are encrypted on a bucket), frozen when the upload completed; a restore request must carry it */
-      digest?: string;
-      /**
-       * Format: date-time
-       * @description When the upload is deleted: an unfinished or rejected one 24 hours after its last activity, a complete one 7 days after it was last completed, previewed, or restored from. One a queued or running restore reads is kept.
-       */
-      expires_at?: string;
-      id: string;
-      /** @description Where the upload's parts are: a folder in this server's storage, or s3://bucket/key in a bucket */
-      location: string;
-      /** Format: int64 */
-      part_count: number;
-      /**
-       * Format: int64
-       * @description Every part but the last is exactly this many bytes
-       */
-      part_size: number;
-      /** Format: int64 */
-      received_bytes: number;
-      /** Format: int64 */
-      received_parts: number;
-      rejection?: components["schemas"]["AdminBackupUploadRejection"];
-      /** Format: int64 */
-      size_bytes: number;
-      /** @description What a complete restore set says about itself */
-      source?: components["schemas"]["AdminBackupUploadSource"];
-      /**
-       * @description uploading: taking parts; checking: being read and checked; complete: checked, and can be previewed and restored; rejected: not a restore set this server reads (rejection says why); its parts are deleted
-       * @enum {string}
-       */
-      status: "uploading" | "checking" | "complete" | "rejected";
-      /**
-       * Format: date-time
-       * @description The last part or status change
-       */
-      updated_at: string;
-    };
-    AdminBackupUploadCreateBody: {
-      /**
-       * Format: int64
-       * @description Omitted picks 4 MiB
-       */
-      part_size?: number;
-      /** @description The file's SHA-256, when the client knows it; completion rejects other bytes */
-      sha256?: string;
-      /**
-       * Format: int64
-       * @description The file's size; at most max_upload_bytes from the capabilities (2 GiB)
-       */
-      size_bytes: number;
-    };
-    AdminBackupUploadListOutputBody: {
-      items: components["schemas"]["AdminBackupUpload"][];
-    };
-    AdminBackupUploadRejection: {
-      message: string;
-      /**
-       * @description not_a_restore_set: the file is not a restore set Silo reads (message says what failed); newer_silo: written by a newer Silo, upgrade this server first; encrypted: encrypted with another server's SECRET_KEY, decrypt it with silo backup decrypt first; checksum_mismatch: the bytes do not match the sha256 sent when the upload started
-       * @enum {string}
-       */
-      reason: "not_a_restore_set" | "newer_silo" | "encrypted" | "checksum_mismatch";
-    };
-    AdminBackupUploadSource: {
-      /**
-       * Format: date-time
-       * @description When the backup holding the restore set was taken
-       */
-      created_at: string;
-      /** Format: int64 */
-      format_version: number;
-      /** @description The server the restore set was taken on */
-      server_id: string;
-      server_name: string;
-      silo_version: string;
-    };
-    AdminBackupWarning: {
-      /**
-       * @description no_recent_backup: no backup completed in 48 hours, at any destination. no_backups_at_destination: backups completed before, but none is at the current destination (it was switched); earlier copies stay where they were written. key_not_confirmed: backups are encrypted (an S3 bucket) and this server's SECRET_KEY was not confirmed, or changed since; encrypted backups and uploads are paused until POST /admin/backups/s3/acknowledge-key. backup_unreadable: some backups' manifests could not be read just now
-       * @enum {string}
-       */
-      code:
-        | "disabled"
-        | "no_recent_backup"
-        | "destination_unavailable"
-        | "sqlite_user_store"
-        | "pg_dump_missing"
-        | "pg_dump_too_old"
-        | "key_not_confirmed"
-        | "no_backups_at_destination"
-        | "backup_unreadable";
-      message: string;
-    };
     AdminBrandingAsset: {
       /** @enum {string} */
       kind: "wordmark" | "mark" | "favicon" | "login_bg";
@@ -15782,8 +14079,6 @@ export interface components {
       allowed: boolean;
       /** @description catalog.item.changed on the v2 events socket also carries change added, removed and files_changed to administrators */
       item_change_events: boolean;
-      /** @description listAdminCatalogItems accepts include_file_paths from this caller: a login session, an unscoped key, or a key holding admin:catalog:paths */
-      item_file_paths: boolean;
       /** @description listAdminCatalogItems is served */
       item_listing: boolean;
       /**
@@ -15791,12 +14086,6 @@ export interface components {
        * @description Most content_ids one listAdminCatalogItems request accepts
        */
       item_listing_max_content_ids: number;
-      /** @description getAdminItemMatchHints is served: the title, year and provider IDs the scanner parsed from an item's folder and file names */
-      item_match_hints: boolean;
-      /** @description listAdminCatalogItems returns genres, content_rating, studios, networks, ratings and dates on movies and series and air_date on episodes, and accepts include_people */
-      item_metadata: boolean;
-      /** @description refreshAdminItemMetadata accepts mode reset, which resets an item, season or episode to its providers */
-      item_metadata_reset: boolean;
       /** @description Opaque revision of this document */
       revision: string;
       /**
@@ -15824,69 +14113,16 @@ export interface components {
        * @description When Silo first saw the item: the earliest first-seen time across its libraries, or its first-seen time in library_id when that filter is set. Not a change cursor; metadata and file changes do not move it
        */
       added_at: string;
-      /**
-       * Format: date
-       * @description Air date of an episode, YYYY-MM-DD; absent when unknown and for a movie or series
-       */
-      air_date?: string;
-      /** @description Actors and guest stars of a movie or series in credit order, only with include_people; absent when there are none. No photos */
-      cast?: components["schemas"]["CastCredit"][];
       /** @example movie-tmdb-949 */
       content_id: string;
-      /**
-       * @description Stored content rating of a movie or series; absent when unknown and for an episode
-       * @example PG-13
-       */
-      content_rating?: string;
-      /** @description Other credits of a movie or series, only with include_people; absent when there are none. No photos */
-      crew?: components["schemas"]["CrewCredit"][];
       /**
        * Format: int64
        * @description An episode's number in its season; absent otherwise
        */
       episode_number?: number;
-      /**
-       * Format: date
-       * @description First air date of a series, YYYY-MM-DD; absent when unknown and for a movie or episode
-       */
-      first_air_date?: string;
-      /** @description Stored genres of a movie or series, not localized; absent when there are none and for an episode */
-      genres?: string[];
       imdb_id?: string;
-      /**
-       * Format: date
-       * @description Last air date of a series as its metadata provider reports it, YYYY-MM-DD; absent when unknown and for a movie or episode
-       */
-      last_air_date?: string;
       /** @description Every enabled library the item is present in, whatever library_id filters */
       library_ids: string[];
-      /** @description Networks a series aired on; absent when there are none and for a movie or episode */
-      networks?: string[];
-      /**
-       * Format: double
-       * @description Stored IMDb rating of a movie or series on IMDb's 0-10 scale
-       */
-      rating_imdb?: number;
-      /**
-       * Format: int64
-       * @description Stored Rotten Tomatoes audience score of a movie or series, a percentage, whether or not title pages show it
-       */
-      rating_rt_audience?: number;
-      /**
-       * Format: int64
-       * @description Stored Rotten Tomatoes critic score of a movie or series, a percentage, whether or not title pages show it
-       */
-      rating_rt_critic?: number;
-      /**
-       * Format: double
-       * @description Stored TMDB rating of a movie or series on TMDB's 0-10 scale
-       */
-      rating_tmdb?: number;
-      /**
-       * Format: date
-       * @description Release date of a movie or series (a series may store its first air date here), YYYY-MM-DD; absent when unknown and for an episode
-       */
-      release_date?: string;
       /**
        * Format: int64
        * @description An episode's season; absent otherwise
@@ -15901,8 +14137,6 @@ export interface components {
        * @example matched
        */
       status?: string;
-      /** @description Production studios of a movie or series; absent when there are none and for an episode */
-      studios?: string[];
       /** @description Episode title for an episode; empty when the episode has none */
       title: string;
       tmdb_id?: string;
@@ -15957,11 +14191,6 @@ export interface components {
        * @example 120
        */
       file_id: string;
-      /**
-       * @description The file's path as the scanning server stores it, only with include_file_paths. Map it to another host's mounts through the library's paths. Bytes of a name that are not UTF-8 are stored as private-use code points
-       * @example /media/movies/Heat (1995)/Heat.mkv
-       */
-      file_path?: string;
       /**
        * Format: int64
        * @description Bytes
@@ -16415,11 +14644,6 @@ export interface components {
       total: number;
     };
     AdminCollectionSection: {
-      /**
-       * Format: int64
-       * @description For a row of collections (section_type collection_posters), how many collections it lists, this one included. Absent for every other row.
-       */
-      collection_count?: number;
       enabled: boolean;
       /** @description The row is its page's hero banner. */
       featured: boolean;
@@ -16529,7 +14753,6 @@ export interface components {
        * @enum {string}
        */
       state: "available" | "disabled" | "not_configured" | "unsupported";
-      streams_by_method: boolean;
       timeseries: boolean;
       top_activity: boolean;
       watch_providers: boolean;
@@ -16583,15 +14806,14 @@ export interface components {
       node_id?: string;
     };
     AdminDashboardLayout: {
-      /** @description Stored layout; null when this account has none saved, and the client keeps its local or default arrangement */
       layout: {
         [key: string]: unknown;
-      } | null;
+      };
       /**
        * Format: date-time
-       * @description When the stored layout was last saved; null when none is saved
+       * @description RFC 3339 instant in UTC with millisecond precision
        */
-      updated_at: string | null;
+      updated_at: string;
     };
     AdminDashboardLayoutSaveBody: {
       layout: {
@@ -16657,14 +14879,6 @@ export interface components {
       total_users: number;
       watch_providers: components["schemas"]["AdminDashboardWatchProviderStats"][];
     };
-    AdminDashboardStreamsByMethod: {
-      /** Format: int64 */
-      direct: number;
-      /** Format: int64 */
-      remux: number;
-      /** Format: int64 */
-      transcode: number;
-    };
     AdminDashboardTimeseries: {
       /** Format: int64 */
       download_egress_bytes: number;
@@ -16706,8 +14920,6 @@ export interface components {
       remux: number;
       /** Format: int64 */
       streams: number;
-      /** @description streams split by play method, from the bucket's peak-streams minute, so the parts add up to no more than streams and can be stacked. direct, remux and transcode on the point are each their own peak and may come from different minutes. Sessions with any other play method are streams minus the sum of these values. */
-      streams_by_method: components["schemas"]["AdminDashboardStreamsByMethod"];
       /**
        * Format: date-time
        * @description RFC 3339 instant in UTC with millisecond precision
@@ -17145,20 +15357,6 @@ export interface components {
       source?: components["schemas"]["AdminDiscoverSource"];
       /** @example Trending Movies */
       title: string;
-      /**
-       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
-       * @example {
-       *       "library": "Movies"
-       *     }
-       */
-      title_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
-       * @example home.section.recentlyAddedIn
-       */
-      title_key?: string;
       /**
        * @example tmdb_chart
        * @enum {string}
@@ -18436,8 +16634,6 @@ export interface components {
        * @enum {string}
        */
       state: "available" | "disabled" | "not_configured" | "unsupported";
-      /** @description Whether lookupInvitationLink and acceptInvitationLink, which take the token in the request body, are available. Servers that predate them omit this; read an absent value as false and use the deprecated path operations there. */
-      token_in_body?: boolean;
     };
     AdminInvitationCreateInputBody: {
       /**
@@ -18579,11 +16775,10 @@ export interface components {
     };
     AdminItemMetadataRefreshInputBody: {
       /**
-       * @description quick rescans the item's folder and refreshes its metadata; complete rebuilds the item from its files first; reset is a quick refresh that also clears the item's field locks and every field its providers have no value for, and fails without changing the item when a provider lookup, search or fallback-language lookup fails for any reason other than a not-found answer or an enrichment provider whose key is missing or rejected, or when the item is pinned unmatched; through a library whose metadata language is not the item's own, it keeps the item's own-language title, overview and tagline. getAdminCatalogCapabilities reports item_metadata_reset when reset is accepted; a server without it rejects reset with 422
        * @default quick
        * @enum {string}
        */
-      mode: "quick" | "complete" | "reset";
+      mode: "quick" | "complete";
     };
     AdminItemMetadataUpdate: {
       /** @description Season or episode air date; null clears it */
@@ -18600,7 +16795,6 @@ export interface components {
       /** @description Null clears the stored date */
       first_air_date?: string | null;
       genres?: string[] | null;
-      /** @description IMDb title ID, stored trimmed and in lowercase; an empty string clears it */
       imdb_id?: string | null;
       /** @description Null clears the stored date */
       last_air_date?: string | null;
@@ -18643,9 +16837,7 @@ export interface components {
       studios?: string[] | null;
       tagline?: string | null;
       title?: string | null;
-      /** @description TMDB ID, stored trimmed and without a TMDB URL slug (550-fight-club saves as 550); an empty string clears it */
       tmdb_id?: string | null;
-      /** @description TheTVDB ID, stored trimmed; an empty string clears it */
       tvdb_id?: string | null;
       /** Format: int64 */
       year?: number | null;
@@ -19071,19 +17263,6 @@ export interface components {
       /** @description More candidates were returned by providers; refine the search to narrow results. */
       truncated: boolean;
     };
-    AdminMatchHints: {
-      /** @description Provider IDs tagged in the folder or file name, keyed by provider (tmdb, imdb, tvdb); empty, never null. */
-      provider_ids: {
-        [key: string]: string;
-      };
-      /** @description Title the scanner parsed from the folder or file name; empty when it found none. */
-      title: string;
-      /**
-       * Format: int64
-       * @description Year the scanner parsed from the folder or file name; 0 when it found none.
-       */
-      year: number;
-    };
     AdminMatchSearchBody: {
       imdb_id?: string;
       /**
@@ -19178,8 +17357,6 @@ export interface components {
       /** Format: int64 */
       egress_kbps: number;
       enabled: boolean;
-      /** @description Configuration fields the node declared from its own environment at its last start, named as in the update body. updateAdminNode refuses a change to any of them; restating the current value is accepted. Empty when the node declares nothing. Requires the env_declarations node capability. */
-      env_managed: string[];
       group: string | null;
       healthy: boolean;
       hw_accel_override?: string;
@@ -19189,8 +17366,6 @@ export interface components {
        * @example 1
        */
       id: string;
-      /** @description A key has been issued to this transcode node. The key itself is shown only when it is issued. Always false for a proxy. */
-      key_issued: boolean;
       /**
        * Format: date-time
        * @description RFC 3339 instant in UTC with millisecond precision, or null
@@ -19210,11 +17385,6 @@ export interface components {
       physical_gpu_keys?: string[];
       /** @description Client-facing node address as configured; not validated as a URI */
       public_url?: string;
-      /**
-       * @description How this transcode node reads source media: local through its own library mount, core over HTTP from the API servers. Absent on proxies.
-       * @enum {string}
-       */
-      source_access?: "local" | "core";
       /** @enum {string} */
       type: "proxy" | "transcode";
       /** @description Node address as configured; not validated as a URI */
@@ -19225,14 +17395,8 @@ export interface components {
       allowed: boolean;
       /** @description Transcode nodes can drain: the drain and resume operations, and drain_requested and drain_state on node rows. */
       drain: boolean;
-      /** @description Nodes can declare their own configuration from their environment: env_managed on node rows names the fields a node declares, and updateAdminNode refuses a change to them with field code managed_by_environment. */
-      env_declarations: boolean;
-      /** @description Transcode nodes can be issued their own key: POST /admin/nodes/{id}/key, and key_issued on node rows. */
-      node_keys: boolean;
       /** @description Opaque revision of this document */
       revision: string;
-      /** @description Transcode nodes can read source media through the API servers instead of a library mount: source_access on node rows and in the create and update bodies. */
-      source_access: boolean;
       /**
        * @description Support and configuration state, not health
        * @enum {string}
@@ -19250,11 +17414,6 @@ export interface components {
       name: string;
       /** Format: uri-reference */
       public_url?: string;
-      /**
-       * @description How a transcode node reads source media: local through its own library mount at the API servers' paths, or core over HTTP from the API servers, so the node needs no library mount. Absent means local. A proxy accepts only local. Requires the source_access node capability.
-       * @enum {string}
-       */
-      source_access?: "local" | "core";
       /** @enum {string} */
       type: "proxy" | "transcode";
       /** Format: uri-reference */
@@ -19288,10 +17447,6 @@ export interface components {
       /** @description The URL-fenced persistence call returned successfully; it may have ignored a concurrently repointed node. Not a revision receipt. */
       health_persisted: boolean;
       healthy: boolean;
-    };
-    AdminNodeKey: {
-      /** @description The transcode node's new key, for its SILO_NODE_KEY setting. Shown only in this response; it is never returned again. */
-      node_key: string;
     };
     AdminNodeNetworkAccess: {
       /** @description Overlay DNS name of the node. */
@@ -19457,11 +17612,6 @@ export interface components {
       name?: string;
       /** Format: uri-reference */
       public_url?: string | null;
-      /**
-       * @description How this transcode node reads source media: local or core (see the create body). Applies to jobs the node starts after the change; running jobs keep their mode. A proxy accepts only local. Requires the source_access node capability.
-       * @enum {string}
-       */
-      source_access?: "local" | "core";
       /** Format: uri-reference */
       url?: string;
     };
@@ -19473,7 +17623,7 @@ export interface components {
     };
     AdminNotificationPushTestInputBody: {
       /**
-       * @description A profile on the authenticated account. A profile or device on another account answers 404, as a device that does not exist does.
+       * @description Opaque identifier
        * @example 1
        */
       profile_id: string;
@@ -19531,15 +17681,6 @@ export interface components {
       timestamp: string;
       user_id?: string;
     };
-    AdminOverlayImageForm: {
-      /**
-       * Format: binary
-       * @description The image: PNG, JPEG or WebP, at most 4 MiB. Silo stores it as WebP no larger than 600x300, keeping transparency.
-       */
-      file: string;
-      /** @description Label administrators see when they assign the image to a badge: 1 to 64 characters after trimming. Required. */
-      name?: string;
-    };
     AdminPasswordReset: {
       /**
        * @example link
@@ -19559,8 +17700,8 @@ export interface components {
       expires_at: string;
       /**
        * Format: uri
-       * @description Present for delivery=link only. One-time disclosure of a bearer credential for the account's password; share it only with the account holder. The token is the URL's fragment, which browsers never send to the server
-       * @example https://silo.example.test/reset-password#3f2b47eb7b36dd2d
+       * @description Present for delivery=link only. One-time disclosure of a bearer credential for the account's password; share it only with the account holder
+       * @example https://silo.example.test/reset-password/3f2b47eb7b36dd2d
        */
       reset_url?: string;
     };
@@ -19822,8 +17963,6 @@ export interface components {
       workloads: string[];
     };
     AdminPlaybackSession: {
-      /** @description Why the route changes the file instead of playing it as it is, video causes first, from the vocabulary in the capabilities' adaptation_reason_values. Absent for direct play, for a session planned before the server recorded reasons, and for Jellyfin-protocol sessions. Clients ignore values they do not know. */
-      adaptation_reasons?: string[];
       audio_decision?: string;
       /** Format: int64 */
       audio_track_index: number;
@@ -19845,10 +17984,7 @@ export interface components {
       episode_name?: string;
       /** Format: int64 */
       episode_number?: number;
-      /**
-       * Format: int64
-       * @description Length in seconds of what position_seconds is measured against: the file, or the whole book for a multi-file audiobook; null when unknown
-       */
+      /** Format: int64 */
       file_duration: number | null;
       has_playback_control: boolean;
       is_jellyfin_client?: boolean;
@@ -19959,10 +18095,6 @@ export interface components {
       video_decision?: string;
     };
     AdminPlaybackSessionCapabilitiesOutputBody: {
-      /** @description Every adaptation_reasons value this server emits, in the order it reports them. A later server may add values. */
-      adaptation_reason_values: string[];
-      /** @description Rows may carry adaptation_reasons */
-      adaptation_reasons: boolean;
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
       available: boolean;
@@ -20103,7 +18235,7 @@ export interface components {
     AdminPluginAuthBindingTestInputBody: {
       /** @description auth_provider.v1 capability to test; empty tests the plugin's first one */
       capability_id?: string;
-      /** @description Staged global configuration entries, unsaved, merged as updateAdminPluginInstallationConfig would merge them. Entries and fields not named here use the stored values; a declared non-secret field sent as null or a blank string is cleared so the plugin default applies; blank secret fields use the stored secret only while the rest of that entry is unchanged and no secret in it is entered (a secret object or list sent in it counts as entered), otherwise only the secrets entered are used and stored top-level fields the schema does not declare are left out of that entry; clear_secrets drops it from the test */
+      /** @description Staged global configuration entries, unsaved, merged as updateAdminPluginInstallationConfig would merge them. Entries and fields not named here use the stored values; a declared non-secret field sent as null or a blank string is cleared so the plugin default applies; blank secret fields use the stored secret; clear_secrets drops it from the test */
       config?: components["schemas"]["AdminPluginConfigWrite"][];
     };
     AdminPluginAuthBindingWrite: {
@@ -20123,8 +18255,6 @@ export interface components {
        */
       callback_url?: string;
       config_schema: components["schemas"]["AdminPluginConfigSchema"][];
-      /** @description On a scheduled_task.v1 capability: the schedule its manifest declares, which the task runs unless it has a saved schedule or its binding sets a trigger the server can run. Omitted when the manifest declares none the server can run; without a saved schedule or runnable binding trigger, the task then runs once at server start */
-      default_schedule?: components["schemas"]["AdminTaskTrigger"];
       description: string;
       display_name: string;
       id: string;
@@ -20217,7 +18347,7 @@ export interface components {
       clear_secrets?: string[];
       /** @description The manifest global_config_schema key */
       key: string;
-      /** @description The entry's fields, merged over the stored entry. A declared non-secret top-level field sent as null or a blank string is removed so the plugin default applies; blank secret fields preserve the stored secret. A connection test reuses a stored secret only while the rest of the entry is unchanged and no secret in it is entered (a secret object or list sent in it counts as entered); otherwise it also leaves out stored top-level fields the schema does not declare */
+      /** @description The entry's fields, merged over the stored entry. A declared non-secret top-level field sent as null or a blank string is removed so the plugin default applies; blank secret fields preserve the stored secret */
       value: {
         [key: string]: unknown;
       };
@@ -20307,13 +18437,9 @@ export interface components {
       repository_name?: string;
       routes: components["schemas"]["PluginRoute"][];
       runtime: components["schemas"]["AdminPluginRuntime"];
-      /** @description The release signature check of the installed package. */
-      signature: components["schemas"]["AdminPluginSignature"];
       /** @enum {string} */
       source_kind: "silo" | "approved_community" | "external";
       task_bindings: components["schemas"]["AdminPluginTaskBinding"][];
-      /** @description The last automatic update that failed, such as a download that did not match its catalog checksum. Absent when the last check did not fail for this plugin. */
-      update_failure?: components["schemas"]["AdminPluginUpdateFailure"];
       update_policy: string;
       /**
        * Format: date-time
@@ -20430,23 +18556,6 @@ export interface components {
        */
       state: "stopped" | "starting" | "running" | "backoff" | "failed";
     };
-    AdminPluginSignature: {
-      /**
-       * Format: uri
-       * @description The repository the verified signature names. Present only when state is verified.
-       */
-      source_repo?: string;
-      /**
-       * @description verified: the release's Sigstore bundle proved it was built from source_repo at the version's tag. unsigned: there was nothing to check, as for an upload, an archive install, or a catalog entry without a signature. invalid: a signature was checked and did not prove that. unknown: not checked, as for an installation from before Silo checked signatures or an install whose check could not run.
-       * @enum {string}
-       */
-      state: "unknown" | "verified" | "unsigned" | "invalid";
-      /**
-       * Format: date-time
-       * @description When Silo verified the signature. Present only when state is verified.
-       */
-      verified_at?: string;
-    };
     AdminPluginTaskBinding: {
       capability_id: string;
       /**
@@ -20470,21 +18579,10 @@ export interface components {
     };
     AdminPluginTaskBindingWrite: {
       enabled: boolean;
-      /** @description The task's schedule as a task trigger (type interval, daily, weekly or startup with that type's fields). The task runs it unless the task has a saved schedule (a task-page edit, or a schedule an earlier server release saved from the binding trigger); an empty or unrunnable trigger leaves the manifest default_trigger, else one run at server start. Omitted stores an empty object */
+      /** @description Plugin-defined trigger document; omitted stores an empty object */
       trigger?: {
         [key: string]: unknown;
       };
-    };
-    AdminPluginUpdateFailure: {
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      failed_at: string;
-      /** @description Why the update was refused, written for the administrator; it names no URL or checksum */
-      reason: string;
-      /** @description The version Silo tried and failed to install */
-      version: string;
     };
     AdminPluginUploadForm: {
       /**
@@ -20940,12 +19038,6 @@ export interface components {
       embeddings: components["schemas"]["AdminRecommendationJobStatus"];
       /** @description Why the stored embedding lock rejects the embedding settings this server runs with; empty when it does not. */
       lock_conflict: string;
-      /** @description Values for lock_conflict_key's placeholders, by name. Absent when lock_conflict is empty. */
-      lock_conflict_args?: {
-        [key: string]: string;
-      };
-      /** @description Translation catalog key of lock_conflict, which clients show in a non-English interface. Absent when lock_conflict is empty. */
-      lock_conflict_key?: string;
       recommendations: components["schemas"]["AdminRecommendationJobStatus"];
       /** @description The stale profile sweep, which rebuilds profiles after their signals or access change. */
       stale_sweep: components["schemas"]["AdminRecommendationStaleSweep"];
@@ -21612,26 +19704,10 @@ export interface components {
       section_type: string;
       title: string;
       /**
-       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
-       * @example {
-       *       "library": "Movies"
-       *     }
-       */
-      title_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
-       * @example home.section.recentlyAddedIn
-       */
-      title_key?: string;
-      /**
        * Format: date-time
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       updated_at: string;
-      /** @description Keeps the section off every client but the web app while it is its page's first featured section, the one the web shows as the banner: a viewer section read then answers it only to a caller whose X-Silo-Client-Family is web. Once another featured section comes first, every client gets it as a regular row. Always false on a section that is not featured. */
-      web_only: boolean;
     };
     AdminSectionBulkCreate: {
       /** @description A recipe's configuration document; its keys are fixed by the recipe named in section_type. */
@@ -21668,8 +19744,6 @@ export interface components {
        * @enum {string}
        */
       state: "available" | "disabled" | "not_configured" | "unsupported";
-      /** @description Admin sections accept and answer web_only, and viewer section reads honor it */
-      web_only: boolean;
     };
     AdminSectionCreate: {
       /** @description A recipe's configuration document; its keys are fixed by the recipe named in section_type. */
@@ -21694,8 +19768,6 @@ export interface components {
       scope: "home" | "library";
       section_type: string;
       title: string;
-      /** @description Keep the featured section off every client but the web app; ignored unless featured is true. Send it only when getAdminSectionCapabilities reports web_only */
-      web_only?: boolean;
     };
     AdminSectionDefaults: {
       reset_profiles?: boolean;
@@ -21729,8 +19801,6 @@ export interface components {
       section_type: string;
     };
     AdminSectionPreviewResult: {
-      /** @description The cards a row of collections (section_type collection_posters) shows the acting admin, in order; items is then empty and total_count is their number. Absent for every other section type */
-      collections?: components["schemas"]["SectionCollectionCard"][];
       /** @description The page's items; empty, never null */
       items: components["schemas"]["CatalogItem"][];
       /** @description Cursor state; absent for bounded unpaginated collections */
@@ -21751,16 +19821,10 @@ export interface components {
       position?: number;
       section_type?: string;
       title?: string;
-      /** @description Keep the featured section off every client but the web app. Absent keeps the saved value, except that an update making the section featured saves false; a section that is not featured after the update always saves false. Send it only when getAdminSectionCapabilities reports web_only */
-      web_only?: boolean;
     };
     AdminSensitiveStatus: {
       configured: string[];
       managed_by_env: string[];
-      /** @description The environment variable that sets each key in managed_by_env, keyed by setting key. */
-      managed_by_env_vars: {
-        [key: string]: string;
-      };
     };
     AdminServerHealth: {
       /** Format: int64 */
@@ -21835,20 +19899,6 @@ export interface components {
     };
     AdminSettingsCheckResult: {
       message: string;
-      /**
-       * @description Values of the message_key message's placeholders by name; present only with message_key, and absent when the message has none
-       * @example {
-       *       "dimensions": "1024"
-       *     }
-       */
-      message_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is message. A client that has the key shows its translation, filling message_args, and otherwise shows message. Absent when message has no catalog entry
-       * @example web.admin.common.connectionCheck.result.redisConnected
-       */
-      message_key?: string;
       success: boolean;
     };
     AdminSettingsUpdateInputBody: {
@@ -22169,11 +20219,6 @@ export interface components {
       next_run_at?: string;
       /** Format: double */
       progress: number;
-      /**
-       * Format: date-time
-       * @description When the run in progress on this process started. Absent while the task is idle.
-       */
-      started_at?: string;
       /** @enum {string} */
       state: "idle" | "running" | "cancelling";
       triggers: components["schemas"]["AdminTaskTrigger"][];
@@ -22258,10 +20303,6 @@ export interface components {
     AdminTaskJob: {
       /** Format: int64 */
       artifact_size_bytes: number;
-      /** @description A backup_restore job's report: each chosen item restored, unchanged, left out (with a reason), or failed (with an error). Kept when the job is canceled or interrupted. */
-      backup_restore_result?: components["schemas"]["AdminBackupRestoreReport"];
-      /** @description The backup a backup_restore job restores from, present from the moment it is queued */
-      backup_restore_source?: components["schemas"]["AdminBackupRestoreSource"];
       cancelable: boolean;
       catalog_result?: components["schemas"]["AdminTaskJobCatalogResult"];
       /**
@@ -23331,58 +21372,6 @@ export interface components {
       /** @description The content ID of the item that finished. The shuffle advances only while this item is still current, so a retry after a lost response changes nothing */
       from_content_id: string;
     };
-    AllowCollectionTitlesInputBody: {
-      /**
-       * @description A personal collection the acting profile can see
-       * @example 0b9b5c1e-5d0e-4c55-8f5c-2a1d2f3e4b5c
-       */
-      collection_id: string;
-    };
-    AllowCollectionTitlesResult: {
-      /**
-       * Format: int64
-       * @description Movies and series newly allowed; titles already allowed are not counted
-       * @example 12
-       */
-      added: number;
-    };
-    AllowedCollection: {
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       * @example 2026-01-02T03:04:05.000Z
-       */
-      allowed_at: string;
-      /**
-       * @description Opaque identifier
-       * @example 0b9b5c1e-5d0e-4c55-8f5c-2a1d2f3e4b5c
-       */
-      collection_id: string;
-      /**
-       * Format: int64
-       * @example 24
-       */
-      item_count: number;
-      /**
-       * @description Whether the collection allows its titles now: true while it is a manual collection the primary profile created. A collection that stops meeting that allows nothing until it does again
-       * @example true
-       */
-      live: boolean;
-      /** @example Family movie night */
-      name: string;
-    };
-    AllowedCollectionCollection: {
-      /** @description The page's items; empty, never null */
-      items: components["schemas"]["AllowedCollection"][];
-      /** @description Cursor state; absent for bounded unpaginated collections */
-      page?: components["schemas"]["PageInfo"];
-    };
-    AllowedTitleCollection: {
-      /** @description The page's items; empty, never null */
-      items: components["schemas"]["CatalogItem"][];
-      /** @description Cursor state; absent for bounded unpaginated collections */
-      page?: components["schemas"]["PageInfo"];
-    };
     AndroidPushRegistrationBody: {
       device_id: string;
       /** @enum {string} */
@@ -23394,8 +21383,6 @@ export interface components {
     AndroidPushRegistrationCapability: {
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
-      /** @description A registration applied at a new generation records the calling login session, and push to it stops when that session ends. A replay of the current generation records nothing, so an older registration binds only at a newer generation. */
-      binds_login_session: boolean;
       platforms: string[];
       /** @description Local ordered registration storage is configured; does not assert provider delivery availability. */
       registration_available: boolean;
@@ -23440,8 +21427,6 @@ export interface components {
       removed: boolean;
     };
     APIKeyScope: {
-      /** @enum {string} */
-      audience: "admin" | "user";
       description: string;
       name: string;
     };
@@ -23503,7 +21488,7 @@ export interface components {
       device_id: string;
     };
     ApplePushResetReceipt: {
-      /** @description True when the server cleared the installation's binding and its Apple push registrations. False when there was nothing to clear: no ordered record for this device_id, or one already bound to the sent key, whose generation order still applies. After a cleared or absent record, the next registration with that key binds at any positive generation, unless a retirement reached the cleared record first and fenced older generations. */
+      /** @description True when the server cleared the installation's binding and its Apple push registrations. False when there was nothing to clear: no ordered record for this device_id, or one already bound to the sent key, whose generation order still applies. After a cleared or absent record, the next registration with that key binds at any positive generation. */
       reset: boolean;
     };
     ApplePushRetirementBody: {
@@ -23590,27 +21575,8 @@ export interface components {
     };
     AudiobookRelatedItem: {
       content_id: string;
-      /**
-       * Format: int64
-       * @description Audiobooks only: total listening time, summed over the book's files the viewer can play, as the book's own total_duration_seconds is. Absent for ebooks and when no file reports a duration
-       * @example 41520
-       */
-      duration_seconds?: number;
-      /**
-       * @description The profile finished this book, by the rule a catalog card's user_state.played follows: an audiobook's visible progress or a visible completed history row, an ebook's reading progress. Absent when false and without a profile
-       * @example true
-       */
-      played?: boolean;
-      /** @description The poster's ThumbHash, for a blurred preview while poster_url loads */
-      poster_thumbhash?: string;
       /** Format: uri-reference */
       poster_url?: string;
-      /**
-       * Format: double
-       * @description How far the profile is into the book, 0-1: listening position over the progress row's duration for an audiobook, reading progress for an ebook. Present only while the book is started and not played
-       * @example 0.42
-       */
-      progress_ratio?: number;
       /** Format: int64 */
       series_index?: number;
       title: string;
@@ -24007,20 +21973,6 @@ export interface components {
       tmdb_id?: string;
       tvdb_id?: string;
     };
-    CatalogAvailability: {
-      /**
-       * Format: int64
-       * @description Complete seasons, or episodes in the library
-       * @example 2
-       */
-      have: number;
-      /**
-       * Format: int64
-       * @description Seasons that have aired, or known episodes
-       * @example 3
-       */
-      total: number;
-    };
     CatalogBoxSet: {
       backdrop_thumbhash?: string;
       /**
@@ -24220,15 +22172,6 @@ export interface components {
        * @enum {string}
        */
       advisory_source?: "commonsense" | "mdblist";
-      /**
-       * @description On an audiobook or ebook card in a catalog browse listing: up to three author names in credit order, the names the book's detail page lists under authors. Absent for other types, on other listings, and when the book credits no author
-       * @example [
-       *       "Frank Herbert"
-       *     ]
-       */
-      authors?: string[];
-      /** @description On a series, complete seasons out of seasons that have aired. On a season, episodes in the library out of the episodes the season lists. Sent only while the acting profile's poster badges are on and include the availability badge. Absent for other types, for specials, and when episode metadata is incomplete. */
-      availability?: components["schemas"]["CatalogAvailability"];
       /** @description Whether backdrop_url is an episode still. False for series artwork; absent when provenance is unavailable. */
       backdrop_is_episode_still?: boolean;
       backdrop_thumbhash?: string;
@@ -24246,20 +22189,12 @@ export interface components {
       content_id: string;
       /** @example R */
       content_rating?: string;
-      /**
-       * Format: double
-       * @description The length position_seconds is measured against, in seconds, as the progress record holds it. Present with position_seconds; a card draws its progress bar and time left from the pair
-       */
+      /** Format: double */
       duration_seconds?: number;
       /** Format: int64 */
       episode_number?: number;
       /** @description Empty, never null */
       genres: string[];
-      /**
-       * @description The item's IMDb ID, the one item detail shows. On movie and series cards in catalog browse, collection, favorites, and history listings, and on item detail, when the item has one; Home and library section cards and episode cards leave it absent
-       * @example tt0113277
-       */
-      imdb_id?: string;
       /** @description On a continue-watching card: in_progress or next_up */
       item_source?: string;
       /** @description Empty, never null */
@@ -24295,7 +22230,7 @@ export interface components {
       play_content_id?: string;
       /**
        * Format: double
-       * @description The profile's resume position, in seconds. On a Continue Watching card, and on a catalog browse or box set card for a title the profile has started and not finished (absent while user_state.played is true); other listings leave it absent. Series, seasons, and ebooks never carry it on a browse card
+       * @description Resume position on a continue-watching card
        */
       position_seconds?: number;
       /** @description Whether poster_url is an episode still. False for series or season artwork; absent when provenance is unavailable. */
@@ -24376,16 +22311,6 @@ export interface components {
       /** @example Heat */
       title: string;
       /**
-       * @description The item's TMDB ID, the one item detail shows. Present where imdb_id is
-       * @example 949
-       */
-      tmdb_id?: string;
-      /**
-       * @description The item's TVDB ID, the one item detail shows. Present where imdb_id is
-       * @example 81189
-       */
-      tvdb_id?: string;
-      /**
        * @description movie, series, season, episode, audiobook, ebook, podcast, podcast_episode
        * @example movie
        */
@@ -24440,15 +22365,6 @@ export interface components {
       air_time?: string;
       air_timezone?: string;
       audiobook?: components["schemas"]["AudiobookDetailExtension"];
-      /**
-       * @description On an audiobook or ebook card in a catalog browse listing: up to three author names in credit order, the names the book's detail page lists under authors. Absent for other types, on other listings, and when the book credits no author
-       * @example [
-       *       "Frank Herbert"
-       *     ]
-       */
-      authors?: string[];
-      /** @description On a series, complete seasons out of seasons that have aired. On a season, episodes in the library out of the episodes the season lists. Sent only while the acting profile's poster badges are on and include the availability badge. Absent for other types, for specials, and when episode metadata is incomplete. */
-      availability?: components["schemas"]["CatalogAvailability"];
       /** @description Whether backdrop_url is an episode still. False for series artwork; absent when provenance is unavailable. */
       backdrop_is_episode_still?: boolean;
       backdrop_thumbhash?: string;
@@ -24491,10 +22407,7 @@ export interface components {
        * @description Presigned, short-lived. Transparent disc art. Movies only
        */
       disc_url?: string;
-      /**
-       * Format: double
-       * @description The length position_seconds is measured against, in seconds, as the progress record holds it. Present with position_seconds; a card draws its progress bar and time left from the pair
-       */
+      /** Format: double */
       duration_seconds?: number;
       ebook?: components["schemas"]["EbookDetailExtension"];
       /** @description Whether forced subtitles show for this item under the viewer's preferences */
@@ -24522,10 +22435,6 @@ export interface components {
       folder_paths?: string[];
       /** @description Empty, never null */
       genres: string[];
-      /**
-       * @description The item's IMDb ID, the one item detail shows. On movie and series cards in catalog browse, collection, favorites, and history listings, and on item detail, when the item has one; Home and library section cards and episode cards leave it absent
-       * @example tt0113277
-       */
       imdb_id?: string;
       intro?: components["schemas"]["Marker"];
       is_specials?: boolean;
@@ -24574,7 +22483,7 @@ export interface components {
       playback_variants?: components["schemas"]["PlaybackVariant"][];
       /**
        * Format: double
-       * @description The profile's resume position, in seconds. On a Continue Watching card, and on a catalog browse or box set card for a title the profile has started and not finished (absent while user_state.played is true); other listings leave it absent. Series, seasons, and ebooks never carry it on a browse card
+       * @description Resume position on a continue-watching card
        */
       position_seconds?: number;
       /** @description Whether poster_url is an episode still. False for series or season artwork; absent when provenance is unavailable. */
@@ -24673,15 +22582,7 @@ export interface components {
       thumb_url?: string;
       /** @example Heat */
       title: string;
-      /**
-       * @description The item's TMDB ID, the one item detail shows. Present where imdb_id is
-       * @example 949
-       */
       tmdb_id?: string;
-      /**
-       * @description The item's TVDB ID, the one item detail shows. Present where imdb_id is
-       * @example 81189
-       */
       tvdb_id?: string;
       /**
        * @description movie, series, season, episode, audiobook, ebook, podcast, podcast_episode
@@ -24690,10 +22591,7 @@ export interface components {
       type: string;
       upcoming_event?: components["schemas"]["CatalogItemUpcomingEvent"];
       user_data?: components["schemas"]["WatchRollup"];
-      /**
-       * Format: int64
-       * @description The profile's rating, 1 to 10, which clients show as five stars with half stars; absent when unrated
-       */
+      /** Format: int64 */
       user_rating?: number;
       /** @description The viewer's flags; absent without a profile */
       user_state?: components["schemas"]["CatalogItemUserState"];
@@ -24790,18 +22688,6 @@ export interface components {
       not_interested: boolean;
       /** @example false */
       played: boolean;
-      /**
-       * Format: int64
-       * @description Available episodes the profile has not watched; present on a series or season the profile has not finished
-       * @example 6
-       */
-      unplayed_count?: number;
-      /**
-       * Format: int64
-       * @description Episodes the profile has watched; present on a series or season the profile has not finished
-       * @example 4
-       */
-      watched_count?: number;
     };
     CatalogLetter: {
       /**
@@ -25655,18 +23541,6 @@ export interface components {
       has_more: boolean;
       ordered_ids: string[];
     };
-    CollectionNotificationPluginChannel: {
-      /** @description The page's items; empty, never null */
-      items: components["schemas"]["NotificationPluginChannel"][];
-      /** @description Cursor state; absent for bounded unpaginated collections */
-      page?: components["schemas"]["PageInfo"];
-    };
-    CollectionNotificationPluginDestination: {
-      /** @description The page's items; empty, never null */
-      items: components["schemas"]["NotificationPluginDestination"][];
-      /** @description Cursor state; absent for bounded unpaginated collections */
-      page?: components["schemas"]["PageInfo"];
-    };
     CollectionNotificationServerChannel: {
       /** @description The page's items; empty, never null */
       items: components["schemas"]["NotificationServerChannel"][];
@@ -25848,14 +23722,6 @@ export interface components {
       page?: components["schemas"]["PageInfo"];
     };
     CompatConnectAccountInfo: {
-      /** @description True when a password sign-in without a provider, such as a Jellyfin client's, goes to the server's directory (LDAP), where this account has a linked identity, so the directory username and password sign in */
-      directory_login_available: boolean;
-      /**
-       * @description The account's username at that directory; present when directory_login_available is true
-       * @example alice
-       */
-      directory_username?: string;
-      /** @description True when the account's own Silo password signs in */
       password_login_available: boolean;
     };
     CompatConnectInfoResponse: {
@@ -26087,11 +23953,6 @@ export interface components {
     };
     DeviceLogin: {
       /**
-       * @description The session binding the device started the request with; absent for an unbound request. An approver that compared one request's code can approve later requests carrying the same binding without comparing again
-       * @example Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU
-       */
-      binding?: string;
-      /**
        * @description Purpose the request was opened with: device_login, remote_playback, or jellyfin_quick_connect for a Jellyfin app signing in with Quick Connect, which is approved for a profile through approve-handoff
        * @example device_login
        */
@@ -26195,11 +24056,6 @@ export interface components {
       remote_playback_handoff: boolean;
       /** @description Opaque revision of this document */
       revision: string;
-      /**
-       * @description Whether startDeviceLogin accepts binding, getDeviceLogin reports it, and pollDeviceLogin requires the matching binding_secret for a bound request
-       * @example true
-       */
-      session_binding: boolean;
       /**
        * @description Support and configuration state, not health
        * @enum {string}
@@ -26317,7 +24173,6 @@ export interface components {
        */
       user_code: string;
       /**
-       * Format: uri
        * @description Page on this server where the approver enters the user code; server.public_url when configured, otherwise the address the device used
        * @example https://silo.example.test/activate
        */
@@ -26367,7 +24222,6 @@ export interface components {
       custom_name?: string | null;
     };
     DiagnosticsCapabilities: {
-      accepted_crash_sources: string[];
       accepted_schema_versions: number[];
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
@@ -26523,20 +24377,6 @@ export interface components {
       /** @example Trending Movies */
       title: string;
       /**
-       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
-       * @example {
-       *       "library": "Movies"
-       *     }
-       */
-      title_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
-       * @example home.section.recentlyAddedIn
-       */
-      title_key?: string;
-      /**
        * @description What the row shows: tmdb_chart, tmdb_discover, tmdb_list or mdblist (title rows, in items), or studios, networks or genres (brand rows). More values may be added
        * @example tmdb_chart
        */
@@ -26562,20 +24402,6 @@ export interface components {
       results: components["schemas"]["RequestMediaResult"][];
       /** @example Trending Movies */
       title: string;
-      /**
-       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
-       * @example {
-       *       "library": "Movies"
-       *     }
-       */
-      title_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
-       * @example home.section.recentlyAddedIn
-       */
-      title_key?: string;
       /**
        * Format: int64
        * @example 500
@@ -26605,7 +24431,6 @@ export interface components {
     DownloadCapability: {
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
-      batch_version: boolean;
       bounded_creation: boolean;
       bounded_manifests: boolean;
       bounded_subscription_sync: boolean;
@@ -26661,7 +24486,7 @@ export interface components {
        */
       expected_revision?: number;
       /**
-       * @description The file to download. On a series or season page (with batch_version), a version template: each episode the page registers gets its version closest to this file; existing managed entries keep their file unless expected_entries names them.
+       * @description Opaque identifier
        * @example 1
        */
       media_file_id?: string;
@@ -26919,17 +24744,17 @@ export interface components {
       series_id: string;
     };
     DownloadSubscriptionPatchBody: {
-      active?: boolean;
-      delete_watched?: boolean;
+      active?: boolean | null;
+      delete_watched?: boolean | null;
       /** Format: int64 */
-      max_storage_bytes?: number;
-      mode?: string;
+      max_storage_bytes?: number | null;
+      mode?: string | null;
       /**
        * @description Quality preset for episodes registered from now on; already-registered downloads keep theirs.
-       * @enum {string}
+       * @enum {string|null}
        */
-      quality?: "original" | "20mbps" | "10mbps" | "5mbps" | "2mbps" | "1mbps";
-      season_numbers?: number[];
+      quality?: "original" | "20mbps" | "10mbps" | "5mbps" | "2mbps" | "1mbps" | null;
+      season_numbers?: number[] | null;
     };
     DownloadSubscriptionSync: {
       /**
@@ -27614,7 +25439,7 @@ export interface components {
       state: "available" | "disabled" | "not_configured" | "unsupported";
       /** @description Whether adding a title the library doesn't have to the watchlist also requests it (or follows its request) for this viewer: requests and watchlist requests are on for the server, the profile has not opted out, and the viewer may request. */
       watchlist_requests: boolean;
-      /** @description Whether the server keeps watchlist entries for titles the library doesn't have: the /watchlist/titles operations, and in_watchlist on discovery results and the title detail. False while requests are disabled, when those operations answer 409 capability_disabled, and for a profile blocked from requests, when they answer 403; the entries are kept. */
+      /** @description Whether the server keeps watchlist entries for titles the library doesn't have: the /watchlist/titles operations, and in_watchlist on discovery results and the title detail. False while requests are disabled, when those operations answer 409 capability_disabled; the entries are kept. */
       watchlist_titles_supported: boolean;
     };
     FileMarkers: {
@@ -27666,7 +25491,6 @@ export interface components {
        * @example 120
        */
       file_id: string;
-      /** @description Absent for viewers without file-path visibility, except on audiobooks and ebooks */
       file_name?: string;
       /** @description Absent for viewers without file-path visibility */
       file_path?: string;
@@ -27740,15 +25564,6 @@ export interface components {
        * @enum {string}
        */
       advisory_source?: "commonsense" | "mdblist";
-      /**
-       * @description On an audiobook or ebook card in a catalog browse listing: up to three author names in credit order, the names the book's detail page lists under authors. Absent for other types, on other listings, and when the book credits no author
-       * @example [
-       *       "Frank Herbert"
-       *     ]
-       */
-      authors?: string[];
-      /** @description On a series, complete seasons out of seasons that have aired. On a season, episodes in the library out of the episodes the season lists. Sent only while the acting profile's poster badges are on and include the availability badge. Absent for other types, for specials, and when episode metadata is incomplete. */
-      availability?: components["schemas"]["CatalogAvailability"];
       /** @description Whether backdrop_url is an episode still. False for series artwork; absent when provenance is unavailable. */
       backdrop_is_episode_still?: boolean;
       backdrop_thumbhash?: string;
@@ -27766,20 +25581,12 @@ export interface components {
       content_id: string;
       /** @example R */
       content_rating?: string;
-      /**
-       * Format: double
-       * @description The length position_seconds is measured against, in seconds, as the progress record holds it. Present with position_seconds; a card draws its progress bar and time left from the pair
-       */
+      /** Format: double */
       duration_seconds?: number;
       /** Format: int64 */
       episode_number?: number;
       /** @description Empty, never null */
       genres: string[];
-      /**
-       * @description The item's IMDb ID, the one item detail shows. On movie and series cards in catalog browse, collection, favorites, and history listings, and on item detail, when the item has one; Home and library section cards and episode cards leave it absent
-       * @example tt0113277
-       */
-      imdb_id?: string;
       /** @description On a continue-watching card: in_progress or next_up */
       item_source?: string;
       /** @description Empty, never null */
@@ -27815,7 +25622,7 @@ export interface components {
       play_content_id?: string;
       /**
        * Format: double
-       * @description The profile's resume position, in seconds. On a Continue Watching card, and on a catalog browse or box set card for a title the profile has started and not finished (absent while user_state.played is true); other listings leave it absent. Series, seasons, and ebooks never carry it on a browse card
+       * @description Resume position on a continue-watching card
        */
       position_seconds?: number;
       /** @description Whether poster_url is an episode still. False for series or season artwork; absent when provenance is unavailable. */
@@ -27895,16 +25702,6 @@ export interface components {
       studios?: string[];
       /** @example Heat */
       title: string;
-      /**
-       * @description The item's TMDB ID, the one item detail shows. Present where imdb_id is
-       * @example 949
-       */
-      tmdb_id?: string;
-      /**
-       * @description The item's TVDB ID, the one item detail shows. Present where imdb_id is
-       * @example 81189
-       */
-      tvdb_id?: string;
       /**
        * @description movie, series, season, episode, audiobook, ebook, podcast, podcast_episode
        * @example movie
@@ -28249,11 +26046,6 @@ export interface components {
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
       /**
-       * @description Sections may be rows of collections (section_type collection_posters): such a section answers its cards in collections instead of items, and the section recipe gallery offers the collection_posters recipe. A client that does not show collections leaves the row out, as it leaves out any section with no items. Absent when the home sections service is not configured, and on a server that predates rows of collections
-       * @example true
-       */
-      collection_rows?: boolean;
-      /**
        * Format: int64
        * @description The largest include_items getHomeLayout accepts: the layout then also answers that many first sections with their cards in included_sections. Absent when the home sections service is not configured
        * @example 4
@@ -28273,11 +26065,6 @@ export interface components {
        * @example 100
        */
       section_item_limit_max?: number;
-      /**
-       * @description Sections, profile section settings, admin section definitions and recommendation rows carry title_key, with title_args when its message has placeholders, for titles the server writes, so a client can translate them (a few, such as an editorial row's subject title, have none; a client shows title whenever the key is absent or unknown), and profile section settings carry default_title_key and default_title_args the same way for default_title. Request Discover rows carry title_key the same way, and the section recipe gallery's presets carry display_name_key, description_short_key and description_long_key for their text; those came later, so a server that reports this flag may not send them. Informational: clients act on each key whenever it is present. Absent when the home sections service is not configured, and on a server that predates section title keys
-       * @example true
-       */
-      section_title_keys?: boolean;
       /**
        * @description Support and configuration state, not health
        * @enum {string}
@@ -28420,13 +26207,11 @@ export interface components {
        * @enum {string}
        */
       state: "available" | "disabled" | "not_configured" | "unsupported";
-      /** @description Whether lookupInvitationLink and acceptInvitationLink, which take the token in the request body, are available. Servers that predate them omit this; read an absent value as false and use the deprecated path operations there. */
-      token_in_body?: boolean;
     };
     InvitationDelivery: {
       /**
        * Format: uri
-       * @description One-time disclosure; never retained for replay. Contains the bearer claim token as the URL's fragment, which browsers never send to the server.
+       * @description One-time disclosure; never retained for replay. Contains the bearer claim token.
        */
       claim_url: string;
       /**
@@ -28435,17 +26220,6 @@ export interface components {
        */
       delivery_status: "sent" | "not_configured" | "failed_or_unknown" | "not_requested";
       invitation: components["schemas"]["AdminInvitation"];
-    };
-    InvitationLinkAcceptInputBody: {
-      /** @description The invitee's address. Required when the lookup reports email_required; ignored otherwise. */
-      email?: string;
-      password: string;
-      /** @description The token from the invitation link's fragment */
-      token: string;
-    };
-    InvitationLinkInputBody: {
-      /** @description The token from the invitation link's fragment */
-      token: string;
     };
     InvitationLookup: {
       acceptance_available: boolean;
@@ -30166,7 +27940,6 @@ export interface components {
       discord: components["schemas"]["NotificationAccountChannelCapability"];
       email: components["schemas"]["NotificationAccountChannelCapability"];
       in_app: components["schemas"]["NotificationInAppCapability"];
-      plugin_destinations: components["schemas"]["NotificationPluginDestinationCapability"];
       /** @description Opaque revision of this document */
       revision: string;
       series: components["schemas"]["NotificationSeriesCapability"];
@@ -30332,152 +28105,12 @@ export interface components {
       page?: components["schemas"]["PageInfo"];
       read_cutoff: string;
     };
-    NotificationPluginChannel: {
-      capability_id: string;
-      description: string;
-      display_name: string;
-      /** @description Names the channel together with capability_id; both stay stable across plugin upgrades */
-      plugin_id: string;
-      /** @description The destination settings form the plugin declares */
-      settings_form: components["schemas"]["NotificationPluginSettingsForm"];
-    };
-    NotificationPluginDestination: {
-      /** @description An enabled plugin provides the destination's channel. False while that plugin is disabled or uninstalled; nothing is sent then */
-      available: boolean;
-      capability_id: string;
-      /** @description The channel's display name; empty while it is unavailable */
-      channel_name: string;
-      /** Format: int64 */
-      consecutive_failures: number;
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
-       */
-      created_at: string;
-      disabled_reason: string | null;
-      enabled: boolean;
-      /** @description Original validator for conditional update and deletion; preserve unchanged with the observed row. */
-      etag: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      id: string;
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision, or null
-       */
-      last_failure_at: string | null;
-      last_failure_message: string | null;
-      /**
-       * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision, or null
-       */
-      last_success_at: string | null;
-      name: string;
-      notify_next_up: boolean;
-      notify_requests: boolean;
-      plugin_id: string;
-      /** @description Secret settings that have a stored value */
-      secret_settings_set: string[];
-      /** @description Stored settings the channel's current schema declares and does not mark secret; empty while the channel is unavailable */
-      settings: {
-        [key: string]: unknown;
-      };
-    };
-    NotificationPluginDestinationCapability: {
-      /** @description At least one enabled plugin provides a channel; GET /notifications/plugin-channels lists them */
-      available: boolean;
-      /** Format: int64 */
-      max_per_profile: number;
-    };
-    NotificationPluginDestinationCreateInputBody: {
-      capability_id: string;
-      /** @description Defaults to true */
-      enabled?: boolean;
-      name: string;
-      /** @description Defaults to true */
-      notify_next_up?: boolean;
-      /** @description Defaults to true */
-      notify_requests?: boolean;
-      plugin_id: string;
-      /** @description Settings fields, checked against the channel's settings form: declared fields only, each of its declared type, and every required field present */
-      settings?: {
-        [key: string]: unknown;
-      };
-    };
-    NotificationPluginDestinationWrite: {
-      /** @description Secret settings to remove */
-      clear_secrets?: string[];
-      enabled?: boolean;
-      name?: string;
-      notify_next_up?: boolean;
-      notify_requests?: boolean;
-      /** @description Settings fields, merged over the stored ones. A non-secret field sent as null is removed; a secret field sent blank or left out keeps its stored value. Each value is checked against the channel's settings form */
-      settings?: {
-        [key: string]: unknown;
-      };
-    };
-    NotificationPluginSettingsField: {
-      /**
-       * @description How to render the input. password hides what is typed; select picks one of options. A client that doesn't know a control renders the field by its type
-       * @enum {string}
-       */
-      control: "text" | "password" | "number" | "switch" | "select";
-      /** @description The value a new destination starts with, of the field's type; absent when there is none */
-      default_value?: string | number | boolean;
-      /** @description Help text; absent when the plugin gives none */
-      description?: string;
-      /** @description The setting's key in settings */
-      key: string;
-      label: string;
-      /**
-       * Format: int64
-       * @description Most characters in a string; absent when unbounded
-       */
-      max_length?: number;
-      /**
-       * Format: double
-       * @description Largest allowed number, inclusive; absent when unbounded
-       */
-      maximum?: number;
-      /**
-       * Format: int64
-       * @description Fewest characters in a string; absent when unbounded
-       */
-      min_length?: number;
-      /**
-       * Format: double
-       * @description Smallest allowed number, inclusive; absent when unbounded
-       */
-      minimum?: number;
-      /** @description The choices of a select field, in order; absent for other controls */
-      options?: components["schemas"]["NotificationPluginSettingsOption"][];
-      /** @description A Go RE2 regular expression a string must match somewhere in it; absent when there is none. A client may check it before saving; the server's check is the one that counts */
-      pattern?: string;
-      /** @description Absent when the plugin gives none */
-      placeholder?: string;
-      /** @description The server refuses a save without a value. A stored secret left blank on an edit counts */
-      required: boolean;
-      /** @description Write-only: never returned in settings; listed in secret_settings_set when stored. Leave it blank on an edit to keep the stored value. A destination's secret_settings_set can also name a setting saved as secret before a plugin upgrade unmarked it; treat that one as secret too */
-      secret: boolean;
-      /**
-       * @description The JSON type the value is sent as
-       * @enum {string}
-       */
-      type: "string" | "integer" | "number" | "boolean";
-    };
-    NotificationPluginSettingsForm: {
-      fields: components["schemas"]["NotificationPluginSettingsField"][];
-    };
-    NotificationPluginSettingsOption: {
-      label: string;
-      /** @description The choice, of the field's type */
-      value: string | number | boolean;
-    };
     NotificationPreferences: {
       enabled: boolean;
+      notify_continue_watching: boolean;
+      notify_favorites: boolean;
       notify_next_up: boolean;
+      notify_watchlist: boolean;
       /**
        * @description Opaque identifier
        * @example 1
@@ -30486,7 +28119,10 @@ export interface components {
     };
     NotificationPreferencesPatch: {
       enabled?: boolean;
+      notify_continue_watching?: boolean;
+      notify_favorites?: boolean;
       notify_next_up?: boolean;
+      notify_watchlist?: boolean;
     };
     NotificationPushCapability: {
       available: boolean;
@@ -30539,9 +28175,9 @@ export interface components {
       item: components["schemas"]["CatalogItem"];
       /** @description The profile muted the series: it gets no new-episode notification for it, whatever the reasons, until it unmutes. active_reasons still names the reasons that would notify once unmuted. */
       muted: boolean;
-      /** @description With an active Next Up reason, the episode just before the one Next Up waits for, normally the last episode the profile finished: only a new episode after it notifies */
+      /** @description With an active Next Up reason, the last episode the profile finished: on that reason alone, only a new episode after it notifies */
       next_up_after?: components["schemas"]["NotificationEpisodeRef"];
-      /** @description True when the episode the profile waits for would notify on arrival: next_up is active, the profile has not muted the series, and it is caught up, meaning the first episode the catalog lists at or after the one Next Up waits for has not arrived, or none is listed. False while that episode is already available: the profile has an episode to watch first, and nothing notifies until it watches on. */
+      /** @description True when at least one reason is active and the profile has not muted the series */
       notifies: boolean;
       /** @description The profile's relationships to the series */
       reasons: components["schemas"]["NotificationSeriesReasons"];
@@ -30549,8 +28185,6 @@ export interface components {
     NotificationSeriesCapability: {
       /** @description GET /notifications/series lists the series whose new episodes can notify the profile */
       available: boolean;
-      /** @description POST /notifications/series/mute and /notifications/series/unmute mute and unmute many series at once, and GET /notifications/series accepts status=muted */
-      bulk_mute: boolean;
       /** @description PUT and DELETE /notifications/series/{series_id}/mute mute and unmute one series, and list entries carry muted */
       mute: boolean;
     };
@@ -30560,34 +28194,15 @@ export interface components {
       /** @description Cursor state; absent for bounded unpaginated collections */
       page?: components["schemas"]["PageInfo"];
     };
-    NotificationSeriesMuteRequest: {
-      /**
-       * @description Catalog item identifiers of the series. A repeated identifier is reported once.
-       * @example [
-       *       "series-tvdb-81189"
-       *     ]
-       */
-      series_ids: string[];
-    };
-    NotificationSeriesMuteResult: {
-      /**
-       * @description applied: this call muted or unmuted the series. unchanged: it was already in the requested state. not_found: a mute named no series, or one the viewer may not see; an unmute never answers it.
-       * @enum {string}
-       */
-      outcome: "applied" | "unchanged" | "not_found";
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      series_id: string;
-    };
-    NotificationSeriesMuteResults: {
-      /** @description One result per distinct requested series, in request order */
-      results: components["schemas"]["NotificationSeriesMuteResult"][];
-    };
     NotificationSeriesReasons: {
-      /** @description The profile finished an episode and waits for the next: the series is not dropped, its Next Up card is not removed, and no episode is partly watched since */
+      /** @description The profile is partway through the series */
+      continue_watching: boolean;
+      /** @description The series is one of the profile's favorites */
+      favorite: boolean;
+      /** @description The profile finished an episode and waits for the next */
       next_up: boolean;
+      /** @description The series is on the profile's watchlist */
+      watchlist: boolean;
     };
     NotificationServerChannel: {
       /** Format: int64 */
@@ -30678,8 +28293,11 @@ export interface components {
     };
     NotificationWebhookCreateInputBody: {
       name: string;
+      notify_continue_watching?: boolean;
+      notify_favorites?: boolean;
       notify_next_up?: boolean;
       notify_requests?: boolean;
+      notify_watchlist?: boolean;
       /** @enum {string} */
       type?: "discord" | "generic";
       /** Format: uri */
@@ -30711,8 +28329,11 @@ export interface components {
        */
       last_success_at: string | null;
       name: string;
+      notify_continue_watching: boolean;
+      notify_favorites: boolean;
       notify_next_up: boolean;
       notify_requests: boolean;
+      notify_watchlist: boolean;
       /** @enum {string} */
       type: "discord" | "generic";
       url_host: string;
@@ -30723,8 +28344,11 @@ export interface components {
     NotificationWebhookUpdateInputBody: {
       enabled?: boolean;
       name?: string;
+      notify_continue_watching?: boolean;
+      notify_favorites?: boolean;
       notify_next_up?: boolean;
       notify_requests?: boolean;
+      notify_watchlist?: boolean;
       /** Format: uri */
       url?: string;
     };
@@ -30978,13 +28602,6 @@ export interface components {
        */
       enabled: boolean;
       /**
-       * @description Whether this server has the asset storage uploadAdminOverlayImage needs
-       * @example true
-       */
-      image_uploads_available: boolean;
-      /** @description Images administrators uploaded for badges, in upload order; card overlay documents name them by ref */
-      images: components["schemas"]["OverlayImage"][];
-      /**
        * @description Default quick-action mode; one of the ui.card_quick_actions values in the settings contract
        * @example both
        */
@@ -30994,36 +28611,6 @@ export interface components {
        * @example false
        */
       quick_actions_enabled: boolean;
-    };
-    OverlayImage: {
-      /**
-       * Format: int64
-       * @description Stored height in pixels
-       * @example 120
-       */
-      height: number;
-      /**
-       * @description Administrator's label for the image
-       * @example 4K Dolby Vision
-       */
-      name: string;
-      /**
-       * @description Content reference card overlay documents use; it changes exactly when the stored bytes change
-       * @example 9f2c4e7a1b3d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f7.webp
-       */
-      ref: string;
-      /**
-       * Format: uri-reference
-       * @description Public, immutable path of the image bytes
-       * @example /api/v2/overlay-images/9f2c4e7a1b3d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f7.webp
-       */
-      url: string;
-      /**
-       * Format: int64
-       * @description Stored width in pixels
-       * @example 300
-       */
-      width: number;
     };
     PageInfo: {
       /**
@@ -31091,19 +28678,6 @@ export interface components {
       tokens?: components["schemas"]["TokenPair"];
       username: string;
     };
-    PasswordResetLinkCompleteInputBody: {
-      /**
-       * @description The new password
-       * @example margin fossil quench hollow
-       */
-      password: string;
-      /** @description The token from the reset link's fragment */
-      token: string;
-    };
-    PasswordResetLinkInputBody: {
-      /** @description The token from the reset link's fragment */
-      token: string;
-    };
     PasswordResetLookup: {
       /**
        * Format: date-time
@@ -31160,8 +28734,6 @@ export interface components {
     };
     PersonalAPIKeyCreateInputBody: {
       label: string;
-      /** @description Bind the key to this profile of the account: it always acts as that profile and cannot name another. Requires user_keys_enabled and user scopes */
-      profile_id?: string;
       scopes?: string[];
     };
     PersonalAPIKeyListItem: {
@@ -31182,8 +28754,6 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       last_used_at?: string;
-      /** @description The household profile the key is bound to and always acts as. Absent on an account key, which may name any profile on its account */
-      profile_id?: string;
       /** @enum {string} */
       rate_tier: "standard" | "elevated";
       scopes: string[];
@@ -31195,14 +28765,7 @@ export interface components {
     };
     PersonalAPIKeyScopesOutputBody: {
       available: boolean;
-      /**
-       * Format: int64
-       * @description How many keys an account may hold before it can create no more for itself
-       */
-      max_user_keys: number;
       scopes: components["schemas"]["APIKeyScope"][];
-      /** @description Whether accounts that are not admins, and profiles other than the primary one, may create keys. Such a key, and any key bound to a profile, carries scopes whose audience is user */
-      user_keys_enabled: boolean;
     };
     PersonalCollection: {
       /**
@@ -31930,7 +29493,7 @@ export interface components {
       episode_number: number | null;
       /**
        * Format: int64
-       * @description Length in seconds of what position_seconds is measured against: the file, or the whole book for a multi-file audiobook; null when unknown
+       * @description Seconds; null when unknown
        * @example 8520
        */
       file_duration: number | null;
@@ -32605,11 +30168,6 @@ export interface components {
     };
     PollDeviceLoginInputBody: {
       /**
-       * @description For a request started with binding: the secret, as base64url without padding, whose SHA-256 is the binding. Required on every poll of a bound request; ignored otherwise
-       * @example AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-       */
-      binding_secret?: string;
-      /**
        * @description The device code from startDeviceLogin
        * @example d3v1c3c0d3
        */
@@ -32722,10 +30280,7 @@ export interface components {
        * @example en
        */
       language: string;
-      /**
-       * @description Whether the profile is limited to allowed_library_ids within its account's libraries. The primary profile is never limited: it sees every library its account can access and hides libraries through its settings instead
-       * @example false
-       */
+      /** @example false */
       library_restrictions_enabled: boolean;
       /**
        * Format: int64
@@ -32755,11 +30310,6 @@ export interface components {
        * @example auto
        */
       quality_preference: string;
-      /**
-       * @description Whether the profile may make and follow requests and use request discovery. False keeps it out of those even when the account may request; it can still list, read and cancel the requests it made before. The account's own requests switch still applies on top. Set by the household manager
-       * @example true
-       */
-      requests_allowed: boolean;
       /**
        * @description Hide titles with no advisory age as well, so the profile sees only titles an advisory service rated at or under max_advisory_age. Advisory ages are looked up over time, so on a large library a profile with this set starts with few titles. No effect without max_advisory_age
        * @example false
@@ -32804,19 +30354,8 @@ export interface components {
        * @example true
        */
       max_advisory_age_supported: boolean;
-      /**
-       * Format: int64
-       * @description How many profiles this account may have, from its effective access policy; createProfile answers 409 once the household holds this many. Omitted on a remote-playback handoff, which lists only its own profile and cannot create one, and when the server could not read the limit; in that second case a client keeps offering new profiles and createProfile stays the check
-       * @example 5
-       */
-      max_profiles?: number;
       /** @description Cursor state; absent for bounded unpaginated collections */
       page?: components["schemas"]["PageInfo"];
-      /**
-       * @description Whether profiles accept requests_allowed and the server enforces it
-       * @example true
-       */
-      requests_allowed_supported: boolean;
       /**
        * @description Whether profiles accept require_advisory_age and the server enforces it
        * @example true
@@ -32825,7 +30364,7 @@ export interface components {
     };
     ProfileCreate: {
       /**
-       * @description Unique library identifiers the profile may see when restrictions are enabled. Must be empty on an account's first profile, which becomes its primary profile, even with restrictions off
+       * @description Unique library identifiers the profile may see when restrictions are enabled
        * @example [
        *       "1",
        *       "2"
@@ -32852,10 +30391,7 @@ export interface components {
        * @example en
        */
       language?: string;
-      /**
-       * @description Limits the profile to allowed_library_ids. Must be false or omitted on an account's first profile, which becomes its primary profile
-       * @example false
-       */
+      /** @example false */
       library_restrictions_enabled?: boolean;
       /**
        * Format: int64
@@ -32895,11 +30431,6 @@ export interface components {
        */
       quality_preference?: string;
       /**
-       * @description Whether the profile may make and follow requests and use request discovery. False keeps it out of those even when the account may request; it can still list, read and cancel the requests it made before. The account's own requests switch still applies on top. Set by the household manager. Omitted means allowed
-       * @example false
-       */
-      requests_allowed?: boolean;
-      /**
        * @description Hide titles with no advisory age as well, so the profile sees only titles an advisory service rated at or under max_advisory_age. Advisory ages are looked up over time, so on a large library a profile with this set starts with few titles. No effect without max_advisory_age
        * @example true
        */
@@ -32919,67 +30450,6 @@ export interface components {
        * @example auto
        */
       subtitle_mode?: string;
-    };
-    ProfileExportCapability: {
-      /** @description Whether the current principal may use the capability */
-      allowed: boolean;
-      /** @description The data types an export carries, in import order */
-      data_types: string[];
-      /**
-       * @description The document format exports carry and imports accept
-       * @example silo-profile-export
-       */
-      format: string;
-      /**
-       * Format: int64
-       * @description The largest document an import accepts
-       */
-      max_import_bytes: number;
-      /** @description Opaque revision of this document */
-      revision: string;
-      /**
-       * @description Support and configuration state, not health
-       * @enum {string}
-       */
-      state: "available" | "disabled" | "not_configured" | "unsupported";
-      /**
-       * Format: int64
-       * @description The newest format version this server writes and reads
-       * @example 2
-       */
-      version: number;
-    };
-    ProfileImportData: {
-      /** Format: int64 */
-      added: number;
-      /**
-       * Format: int64
-       * @description Entries left out: items not in this catalog or that the profile cannot see, or references with nothing to map to
-       */
-      left_out: number;
-      notes: string[];
-      /** @enum {string} */
-      type:
-        | "watch_history"
-        | "ratings"
-        | "favorites"
-        | "collections"
-        | "dismissals"
-        | "preferences"
-        | "notifications";
-      /** Format: int64 */
-      unchanged: number;
-      /** Format: int64 */
-      updated: number;
-    };
-    ProfileImportResult: {
-      data: components["schemas"]["ProfileImportData"][];
-      /** @description Always empty: items the profile may not see are listed in unmatched, so an import cannot reveal what a hidden library holds */
-      hidden: string[];
-      /** @description The export came from this server; library references were kept only then */
-      same_server: boolean;
-      /** @description Titles of items left out: not in this server's catalog, or not available to this profile. The two are not told apart */
-      unmatched: string[];
     };
     ProfilePINCheck: {
       /**
@@ -33011,20 +30481,6 @@ export interface components {
        * @example Continue Watching
        */
       default_title: string;
-      /**
-       * @description Values of the default_title_key message's placeholders by name; present only with default_title_key, and absent when the message has none
-       * @example {
-       *       "library": "Movies"
-       *     }
-       */
-      default_title_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is default_title, under the same rules as title_key: present only while default_title is the server's own text, and absent when an administrator typed it
-       * @example home.section.continueWatching
-       */
-      default_title_key?: string;
       /** @example false */
       featured: boolean;
       /**
@@ -33059,20 +30515,6 @@ export interface components {
        * @example Continue Watching
        */
       title: string;
-      /**
-       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
-       * @example {
-       *       "library": "Movies"
-       *     }
-       */
-      title_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
-       * @example home.section.recentlyAddedIn
-       */
-      title_key?: string;
     };
     ProfileSectionSettingCollection: {
       /** @description The page's items; empty, never null */
@@ -33109,10 +30551,7 @@ export interface components {
        * @example en
        */
       language?: string | null;
-      /**
-       * @description Limits the profile to allowed_library_ids. The primary profile can't be limited: true, or a non-empty allowed_library_ids, fails validation on it
-       * @example false
-       */
+      /** @example false */
       library_restrictions_enabled?: boolean;
       /**
        * Format: int64
@@ -33151,11 +30590,6 @@ export interface components {
        * @example auto
        */
       quality_preference?: string;
-      /**
-       * @description Whether the profile may make and follow requests and use request discovery. False keeps it out of those even when the account may request; it can still list, read and cancel the requests it made before. The account's own requests switch still applies on top. Set by the household manager
-       * @example false
-       */
-      requests_allowed?: boolean;
       /**
        * @description Hide titles with no advisory age as well, so the profile sees only titles an advisory service rated at or under max_advisory_age. Advisory ages are looked up over time, so on a large library a profile with this set starts with few titles. No effect without max_advisory_age
        * @example true
@@ -33474,8 +30908,8 @@ export interface components {
       rated_at: string;
       /**
        * Format: int64
-       * @description 1 to 10; clients show it as five stars with half stars (7 is 3.5 stars)
-       * @example 7
+       * @description Stars, 1 to 5
+       * @example 4
        */
       rating: number;
     };
@@ -33507,8 +30941,8 @@ export interface components {
     RatingSet: {
       /**
        * Format: int64
-       * @description 1 to 10; clients show it as five stars with half stars (7 is 3.5 stars)
-       * @example 7
+       * @description Stars, 1 to 5
+       * @example 4
        */
       rating: number;
     };
@@ -33595,25 +31029,10 @@ export interface components {
       };
       /** @description Empty when the preset has none */
       description_long: string;
-      /**
-       * @description Key of the shared translation catalog message whose English is description_long; absent when the preset has no description_long
-       * @example home.recipe.seAuto.details
-       */
-      description_long_key?: string;
       /** @example Items added in the last seven days */
       description_short: string;
-      /**
-       * @description Key of the shared translation catalog message whose English is description_short, with the same fallback
-       * @example home.recipe.mwWeek.description
-       */
-      description_short_key?: string;
       /** @example New this week */
       display_name: string;
-      /**
-       * @description Key of the shared translation catalog message whose English is display_name. A client that has the key shows its translation and otherwise display_name
-       * @example home.recipe.mwWeek.name
-       */
-      display_name_key?: string;
       /** @example sparkles */
       icon: string;
       /** @example new_this_week */
@@ -33637,20 +31056,6 @@ export interface components {
        * @example Because you enjoy Crime
        */
       title: string;
-      /**
-       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
-       * @example {
-       *       "library": "Movies"
-       *     }
-       */
-      title_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
-       * @example home.section.recentlyAddedIn
-       */
-      title_key?: string;
       /**
        * @description Row type: cluster, similar_users_liked, popular, recently_added, top_rated, genre_sampler
        * @example cluster
@@ -34177,8 +31582,6 @@ export interface components {
        * @description Calendar date, YYYY-MM-DD
        */
       air_date?: string;
-      /** @description Episodes in the library out of the episodes this season lists. Sent only while the acting profile's poster badges are on and include the availability badge. Absent for specials and when episode metadata is incomplete. */
-      availability?: components["schemas"]["CatalogAvailability"];
       /** @example series:severance-S01 */
       content_id: string;
       /** Format: int64 */
@@ -34268,8 +31671,6 @@ export interface components {
       page?: components["schemas"]["PageInfo"];
     };
     Section: {
-      /** @description The cards of a row of collections (section_type collection_posters), in the row's order: the collections the viewer can see. Such a section has no items, total_count is the number of collections, and item_limit does not apply. Absent on every other section. See getHomeCapabilities collection_rows */
-      collections?: components["schemas"]["SectionCollectionCard"][];
       /** @example false */
       customized: boolean;
       /** @example false */
@@ -34295,20 +31696,6 @@ export interface components {
       /** @example Recently Added */
       title: string;
       /**
-       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
-       * @example {
-       *       "library": "Movies"
-       *     }
-       */
-      title_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
-       * @example home.section.recentlyAddedIn
-       */
-      title_key?: string;
-      /**
        * Format: int64
        * @description Items the section has in total, at least the number returned
        * @example 120
@@ -34318,48 +31705,6 @@ export interface components {
     SectionCollection: {
       /** @description Empty, never null */
       sections: components["schemas"]["Section"][];
-    };
-    SectionCollectionCard: {
-      backdrop_thumbhash?: string;
-      /**
-       * Format: uri-reference
-       * @description Presigned, short-lived backdrop of a server collection that has one, for a hero backdrop while the card is focused: the page-width variant, or the card thumbnail when the backdrop is set to another artwork such as the collection's poster. Absent when none and on personal collections
-       */
-      backdrop_url?: string;
-      /** @description Present on a personal collection: the profile that made it */
-      creator_profile_id?: string;
-      /** @example 01J9Z8C3W4R5T6Y7U8I9O0P1Q2 */
-      id: string;
-      /**
-       * Format: int64
-       * @description The titles the acting profile sees in the collection
-       * @example 12
-       */
-      item_count: number;
-      /**
-       * @description Present on a server collection: a library the viewer can open that holds it, for the collection's page link. On a library page, that library
-       * @example 1
-       */
-      library_id?: string;
-      /**
-       * @description poster_url is the acting profile's collage of the collection's first titles it can see, composed by the server because the collection has no uploaded, template or imported poster. False for an uploaded, template or imported poster and whenever poster_url is empty
-       * @example false
-       */
-      poster_is_collage: boolean;
-      poster_thumbhash?: string;
-      /**
-       * Format: uri-reference
-       * @description Presigned, short-lived; empty when none
-       */
-      poster_url: string;
-      /**
-       * @description library for a server collection, user for a personal collection
-       * @example library
-       * @enum {string}
-       */
-      source: "library" | "user";
-      /** @example Marvel */
-      title: string;
     };
     SectionLayout: {
       /** @description Empty, never null */
@@ -34389,20 +31734,6 @@ export interface components {
       section_type: string;
       /** @example Recently Added */
       title: string;
-      /**
-       * @description Values of the title_key message's placeholders by name, such as library for a generated library row; present only with title_key, and absent when the message has none
-       * @example {
-       *       "library": "Movies"
-       *     }
-       */
-      title_args?: {
-        [key: string]: string;
-      };
-      /**
-       * @description Key of the shared translation catalog message whose English is title, present only while title is the server's own text: a built-in or generated section, recommendation row or request Discover row name, or a seasonal row's built-in in-season title. A client that has the key shows its translation, filling title_args, and otherwise shows title. Absent when an administrator or the profile typed the title, except that upgrading keyed existing titles identical to a built-in name, and a profile title equal to the administrator's keeps the key. A client acts on title_key whenever it is present
-       * @example home.section.recentlyAddedIn
-       */
-      title_key?: string;
     };
     SectionOverride: {
       /** @description Legacy config override; absent when the profile saved none (the section's own config applies), {} when it saved an empty one */
@@ -34835,11 +32166,6 @@ export interface components {
        * @example true
        */
       supports_idempotent_writes: boolean;
-      /**
-       * @description Whether this server keeps a card overlay image library: getOverlayConfig lists it and card overlay documents may name its images
-       * @example true
-       */
-      supports_overlay_images: boolean;
     };
     SettingSourceContext: {
       /**
@@ -35190,11 +32516,6 @@ export interface components {
     };
     StartDeviceLoginInputBody: {
       /**
-       * @description Session binding: base64url without padding of SHA-256 of a 32-byte secret the device keeps. getDeviceLogin shows it to the approver, and every poll of the request must send the secret as binding_secret. Omit for an unbound request; an empty string is malformed like any other value
-       * @example Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU
-       */
-      binding?: string;
-      /**
        * @description Pairing purpose; defaults to device_login. remote_playback requires temporary=true and is approved through approve-handoff
        * @example device_login
        * @enum {string}
@@ -35449,11 +32770,6 @@ export interface components {
       /** @description Embedded tracks only: selecting this track, with the plan's delivery and audio, yields subtitle.embedded. The client may switch to it locally and report the change with a subtitle_track_changed replan, which returns a plan for the same media; url, when the row has one, stays the fallback; a bitmap track delivered only by burn-in has none. */
       native_selectable?: boolean;
       source: string;
-      /**
-       * Format: int64
-       * @description Stored subtitle row ID, matching subtitle_ready.subtitle_id. Present for downloaded, uploaded and generated tracks, including tracks without a URL or sync_key. Stable across inventory reordering; selection still uses combined_index.
-       */
-      stored_subtitle_id?: number;
       /**
        * Format: int64
        * @description Embedded tracks only: the absolute probed stream index, the namespace of subtitle.embedded.stream_index and the sidecar URL's embedded_stream_index
@@ -35928,54 +33244,6 @@ export interface components {
       provider?: string;
       title: string;
     };
-    TitleAllowanceCapability: {
-      /** @description Whether the current principal may use the capability */
-      allowed: boolean;
-      /** @description Opaque revision of this document */
-      revision: string;
-      /**
-       * @description Support and configuration state, not health
-       * @enum {string}
-       */
-      state: "available" | "disabled" | "not_configured" | "unsupported";
-    };
-    TitleAllowanceProfile: {
-      /**
-       * Format: int64
-       * @description The profile's advisory-age limit; null means none
-       * @example 10
-       */
-      max_advisory_age: number | null;
-      /**
-       * @description The profile's content-rating ceiling; empty means none
-       * @example PG
-       */
-      max_content_rating: string;
-      /** @example Emma */
-      name: string;
-      /**
-       * @description Opaque identifier
-       * @example 2
-       */
-      profile_id: string;
-      /**
-       * @description within_limits: the profile sees the title without an allowance. allowed: the profile has its own allowance for it. allowed_by_collection: an allowed collection holds it. above_limit: the title is above the profile's limits and can be allowed. no_library_access: the profile cannot see the title's library, so an allowance would not help
-       * @example above_limit
-       * @enum {string}
-       */
-      state:
-        | "within_limits"
-        | "allowed"
-        | "allowed_by_collection"
-        | "above_limit"
-        | "no_library_access";
-    };
-    TitleAllowanceProfileCollection: {
-      /** @description The page's items; empty, never null */
-      items: components["schemas"]["TitleAllowanceProfile"][];
-      /** @description Cursor state; absent for bounded unpaginated collections */
-      page?: components["schemas"]["PageInfo"];
-    };
     TMDBCollectionImport: {
       /** @example  */
       description?: string;
@@ -36203,7 +33471,7 @@ export interface components {
       /** @example Movies */
       library_name: string;
       /**
-       * @description unmatched, pending or ambiguous. An audiobook without a provider match is unmatched
+       * @description unmatched, pending or ambiguous
        * @example unmatched
        */
       status: string;
@@ -36334,7 +33602,6 @@ export interface components {
       default: boolean;
       embedded_title?: string;
       external: boolean;
-      /** @description An external track's file name; absent for viewers without file-path visibility, except on audiobooks and ebooks */
       file_name?: string;
       forced: boolean;
       hearing_impaired: boolean;
@@ -36392,8 +33659,6 @@ export interface components {
       /** Format: int64 */
       dv_profile?: number;
       dv_rpu_present?: boolean;
-      /** @description Color range FFmpeg reported on the first decoded frame of a PQ track (tv, pc, or unknown when the frame carried none); absent when the frame was not read. Can differ from color_range, the container's tag */
-      frame_color_range?: string;
       frame_rate?: string;
       hdr10_plus?: boolean;
       /** Format: int64 */
@@ -36543,9 +33808,8 @@ export interface components {
        * @example 42
        */
       file_id: string;
-      /** @description Absent for viewers without file-path visibility, except on audiobooks and ebooks */
       file_name?: string;
-      /** @description Absent for viewers without file-path visibility */
+      /** @description Only for accounts allowed to see paths */
       file_path?: string;
       /**
        * Format: int64
@@ -36855,7 +34119,7 @@ export interface components {
         [key: string]: unknown;
       };
       export_favorites_enabled: boolean;
-      /** @description Send the profile's ratings, 1 to 10, to the provider unchanged and clear removed ones. */
+      /** @description Send the profile's star ratings to the provider (stars times two) and clear removed ones. */
       export_ratings_enabled: boolean;
       /** @description Has no effect: mark unwatched keeps watch history, so Silo sends providers no history removals. */
       export_unwatched_enabled: boolean;
@@ -36863,7 +34127,7 @@ export interface components {
       export_watchlist_enabled: boolean;
       import_favorites_enabled: boolean;
       import_progress_enabled: boolean;
-      /** @description Import the provider's movie and series ratings, 1 to 10, unchanged. */
+      /** @description Import the provider's movie and series ratings as stars (1-2 is 1 star, 9-10 is 5 stars). */
       import_ratings_enabled: boolean;
       import_watched_enabled: boolean;
       import_watchlist_enabled: boolean;
@@ -37021,7 +34285,6 @@ export interface components {
       default: boolean;
       embedded_title?: string;
       external: boolean;
-      /** @description An external track's file name; absent for viewers without file-path visibility, except on audiobooks and ebooks */
       file_name?: string;
       forced: boolean;
       hearing_impaired: boolean;
@@ -37372,15 +34635,6 @@ export interface components {
        * @enum {string}
        */
       advisory_source?: "commonsense" | "mdblist";
-      /**
-       * @description On an audiobook or ebook card in a catalog browse listing: up to three author names in credit order, the names the book's detail page lists under authors. Absent for other types, on other listings, and when the book credits no author
-       * @example [
-       *       "Frank Herbert"
-       *     ]
-       */
-      authors?: string[];
-      /** @description On a series, complete seasons out of seasons that have aired. On a season, episodes in the library out of the episodes the season lists. Sent only while the acting profile's poster badges are on and include the availability badge. Absent for other types, for specials, and when episode metadata is incomplete. */
-      availability?: components["schemas"]["CatalogAvailability"];
       /** @description Whether backdrop_url is an episode still. False for series artwork; absent when provenance is unavailable. */
       backdrop_is_episode_still?: boolean;
       backdrop_thumbhash?: string;
@@ -37400,20 +34654,12 @@ export interface components {
       content_id: string;
       /** @example R */
       content_rating?: string;
-      /**
-       * Format: double
-       * @description The length position_seconds is measured against, in seconds, as the progress record holds it. Present with position_seconds; a card draws its progress bar and time left from the pair
-       */
+      /** Format: double */
       duration_seconds?: number;
       /** Format: int64 */
       episode_number?: number;
       /** @description Empty, never null */
       genres: string[];
-      /**
-       * @description The item's IMDb ID, the one item detail shows. On movie and series cards in catalog browse, collection, favorites, and history listings, and on item detail, when the item has one; Home and library section cards and episode cards leave it absent
-       * @example tt0113277
-       */
-      imdb_id?: string;
       /** @description On a continue-watching card: in_progress or next_up */
       item_source?: string;
       /** @description Empty, never null */
@@ -37449,7 +34695,7 @@ export interface components {
       play_content_id?: string;
       /**
        * Format: double
-       * @description The profile's resume position, in seconds. On a Continue Watching card, and on a catalog browse or box set card for a title the profile has started and not finished (absent while user_state.played is true); other listings leave it absent. Series, seasons, and ebooks never carry it on a browse card
+       * @description Resume position on a continue-watching card
        */
       position_seconds?: number;
       /** @description Whether poster_url is an episode still. False for series or season artwork; absent when provenance is unavailable. */
@@ -37529,16 +34775,6 @@ export interface components {
       studios?: string[];
       /** @example Heat */
       title: string;
-      /**
-       * @description The item's TMDB ID, the one item detail shows. Present where imdb_id is
-       * @example 949
-       */
-      tmdb_id?: string;
-      /**
-       * @description The item's TVDB ID, the one item detail shows. Present where imdb_id is
-       * @example 81189
-       */
-      tvdb_id?: string;
       /**
        * @description movie, series, season, episode, audiobook, ebook, podcast, podcast_episode
        * @example movie
@@ -37612,15 +34848,6 @@ export interface components {
        * @enum {string}
        */
       advisory_source?: "commonsense" | "mdblist";
-      /**
-       * @description On an audiobook or ebook card in a catalog browse listing: up to three author names in credit order, the names the book's detail page lists under authors. Absent for other types, on other listings, and when the book credits no author
-       * @example [
-       *       "Frank Herbert"
-       *     ]
-       */
-      authors?: string[];
-      /** @description On a series, complete seasons out of seasons that have aired. On a season, episodes in the library out of the episodes the season lists. Sent only while the acting profile's poster badges are on and include the availability badge. Absent for other types, for specials, and when episode metadata is incomplete. */
-      availability?: components["schemas"]["CatalogAvailability"];
       /** @description Whether backdrop_url is an episode still. False for series artwork; absent when provenance is unavailable. */
       backdrop_is_episode_still?: boolean;
       backdrop_thumbhash?: string;
@@ -37638,20 +34865,12 @@ export interface components {
       content_id: string;
       /** @example R */
       content_rating?: string;
-      /**
-       * Format: double
-       * @description The length position_seconds is measured against, in seconds, as the progress record holds it. Present with position_seconds; a card draws its progress bar and time left from the pair
-       */
+      /** Format: double */
       duration_seconds?: number;
       /** Format: int64 */
       episode_number?: number;
       /** @description Empty, never null */
       genres: string[];
-      /**
-       * @description The item's IMDb ID, the one item detail shows. On movie and series cards in catalog browse, collection, favorites, and history listings, and on item detail, when the item has one; Home and library section cards and episode cards leave it absent
-       * @example tt0113277
-       */
-      imdb_id?: string;
       /** @description On a continue-watching card: in_progress or next_up */
       item_source?: string;
       /** @description Empty, never null */
@@ -37687,7 +34906,7 @@ export interface components {
       play_content_id?: string;
       /**
        * Format: double
-       * @description The profile's resume position, in seconds. On a Continue Watching card, and on a catalog browse or box set card for a title the profile has started and not finished (absent while user_state.played is true); other listings leave it absent. Series, seasons, and ebooks never carry it on a browse card
+       * @description Resume position on a continue-watching card
        */
       position_seconds?: number;
       /** @description Whether poster_url is an episode still. False for series or season artwork; absent when provenance is unavailable. */
@@ -37767,16 +34986,6 @@ export interface components {
       studios?: string[];
       /** @example Heat */
       title: string;
-      /**
-       * @description The item's TMDB ID, the one item detail shows. Present where imdb_id is
-       * @example 949
-       */
-      tmdb_id?: string;
-      /**
-       * @description The item's TVDB ID, the one item detail shows. Present where imdb_id is
-       * @example 81189
-       */
-      tvdb_id?: string;
       /**
        * @description movie, series, season, episode, audiobook, ebook, podcast, podcast_episode
        * @example movie
@@ -38120,12 +35329,7 @@ export interface operations {
   listAccountIdentities: {
     parameters: {
       query?: never;
-      header?: {
-        /** @description Optional. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
+      header?: never;
       path?: never;
       cookie?: never;
     };
@@ -38151,24 +35355,6 @@ export interface operations {
       };
       /** @description Unauthorized */
       401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
         headers: {
           [name: string]: unknown;
         };
@@ -38226,12 +35412,7 @@ export interface operations {
   deleteAccountIdentity: {
     parameters: {
       query?: never;
-      header?: {
-        /** @description Optional. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
+      header?: never;
       path: {
         /** @description Identity id */
         id: string;
@@ -44843,2135 +42024,6 @@ export interface operations {
       };
     };
   };
-  listAdminBackups: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupList"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  startAdminBackup: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Accepted */
-      202: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupStarted"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  deleteAdminBackup: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  createAdminBackupDownloadLinks: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["AdminBackupDownloadLinksBody"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupDownloadLinksOutputBody"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  downloadAdminBackupObject: {
-    parameters: {
-      query: {
-        exp: number;
-        sig: string;
-      };
-      header?: never;
-      path: {
-        id: string;
-        name:
-          | "manifest.json"
-          | "db.dump"
-          | "blobs.tar"
-          | "restore-set.tar"
-          | "db.dump.age"
-          | "blobs.tar.age"
-          | "restore-set.tar.age";
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description The stored object */
-      200: {
-        headers: {
-          "Content-Disposition"?: string;
-          "Content-Length"?: number;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/octet-stream": string;
-        };
-      };
-      /** @description Object not found, or the capability is invalid or expired */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description The backup is encrypted with another server's SECRET_KEY, so this server cannot decrypt its restore set, or the stored restore set no longer matches its checksum in the manifest */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Backup storage unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-    };
-  };
-  startAdminBackupRestore: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["AdminBackupRestoreBody"];
-      };
-    };
-    responses: {
-      /** @description Accepted */
-      202: {
-        headers: {
-          Location?: string;
-          "Retry-After"?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminTaskJob"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  getAdminBackupRestoreSet: {
-    parameters: {
-      query?: {
-        /** @description Confirms reading a backup whose manifest this server cannot authenticate; without it such a backup answers 409 backup_unauthenticated and nothing inside it is read */
-        accept_unauthenticated?: boolean;
-      };
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupRestoreSet"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  getAdminBackupCapabilities: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
-        "If-Match"?: string;
-        "If-None-Match"?: string;
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupCapabilities"];
-        };
-      };
-      /** @description The representation named by If-None-Match is current; no body. */
-      304: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Failed */
-      412: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  acknowledgeAdminBackupKey: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["AdminBackupAcknowledgeKeyBody"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupAcknowledgeKeyOutputBody"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  testAdminBackupS3: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["AdminBackupS3TestBody"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupS3TestResult"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  listAdminBackupUploads: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupUploadListOutputBody"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  createAdminBackupUpload: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["AdminBackupUploadCreateBody"];
-      };
-    };
-    responses: {
-      /** @description Created */
-      201: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupUpload"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  deleteAdminBackupUpload: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        upload_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  completeAdminBackupUpload: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        upload_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupUpload"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  putAdminBackupUploadPart: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description The part's position, counting from 0 */
-        part: number;
-        upload_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/octet-stream": string;
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupUpload"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  startAdminBackupUploadRestore: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        upload_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["AdminBackupRestoreBody"];
-      };
-    };
-    responses: {
-      /** @description Accepted */
-      202: {
-        headers: {
-          Location?: string;
-          "Retry-After"?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminTaskJob"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  getAdminBackupUploadRestoreSet: {
-    parameters: {
-      query?: {
-        /** @description Confirms reading an upload, which this server cannot authenticate: it carries no manifest this server signed. Without it the preview answers 409 backup_unauthenticated and nothing inside the upload is read */
-        accept_unauthenticated?: boolean;
-      };
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        upload_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminBackupRestoreSet"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   uploadAdminBrandingAsset: {
     parameters: {
       query?: never;
@@ -48159,10 +43211,6 @@ export interface operations {
         content_ids?: string[];
         /** @description Opaque cursor from page.next_cursor; valid only with the filters that produced it */
         cursor?: string;
-        /** @description Also return each version's file_path. Send it only when getAdminCatalogCapabilities reports item_file_paths; a key whose scopes lack admin:catalog:paths receives 403 */
-        include_file_paths?: boolean;
-        /** @description Also return cast and crew on movies and series. Send it only when getAdminCatalogCapabilities reports item_metadata */
-        include_people?: boolean;
         /** @description Only items present in this library; added_at and added_after then use the item's first-seen time in this library */
         library_id?: string;
         /** @description Page size; default 50, maximum 200 */
@@ -61534,117 +56582,6 @@ export interface operations {
       };
     };
   };
-  getAdminItemMatchHints: {
-    parameters: {
-      query?: {
-        /** @description Library to read; required for an item in several libraries. */
-        library_id?: string;
-      };
-      header?: {
-        /** @description Optional. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminMatchHints"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   searchAdminItemMatches: {
     parameters: {
       query?: never;
@@ -68668,124 +63605,6 @@ export interface operations {
       };
     };
   };
-  issueAdminNodeKey: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Created */
-      201: {
-        headers: {
-          "Cache-Control"?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AdminNodeKey"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   reprobeAdminNode: {
     parameters: {
       query?: never;
@@ -70690,260 +65509,6 @@ export interface operations {
       };
     };
   };
-  uploadAdminOverlayImage: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "multipart/form-data": components["schemas"]["AdminOverlayImageForm"];
-      };
-    };
-    responses: {
-      /** @description Created */
-      201: {
-        headers: {
-          Location?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["OverlayImage"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  deleteAdminOverlayImage: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Content reference of the image */
-        ref: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   updateAdminPerson: {
     parameters: {
       query?: never;
@@ -72274,15 +66839,6 @@ export interface operations {
       };
       /** @description Request Timeout */
       408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
         headers: {
           [name: string]: unknown;
         };
@@ -74174,15 +68730,6 @@ export interface operations {
       };
       /** @description Request Timeout */
       408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
         headers: {
           [name: string]: unknown;
         };
@@ -92927,536 +87474,6 @@ export interface operations {
       };
     };
   };
-  createAdminUserProfile: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description The account */
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["ProfileCreate"];
-      };
-    };
-    responses: {
-      /** @description Created */
-      201: {
-        headers: {
-          Location?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Profile"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  getAdminUserProfile: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description The account */
-        id: string;
-        /** @description A profile of the account */
-        profile_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Profile"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  deleteAdminUserProfile: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description The account */
-        id: string;
-        /** @description A profile of the account */
-        profile_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  updateAdminUserProfile: {
-    parameters: {
-      query?: never;
-      header?: {
-        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description The account */
-        id: string;
-        /** @description A profile of the account */
-        profile_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["ProfileUpdate"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Profile"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   listAdminUserProfileSectionOverrides: {
     parameters: {
       query?: {
@@ -95139,12 +89156,7 @@ export interface operations {
         /** @description Page size; default 50, maximum 200 */
         limit?: number;
       };
-      header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
+      header?: never;
       path?: never;
       cookie?: never;
     };
@@ -95179,15 +89191,6 @@ export interface operations {
       };
       /** @description Forbidden */
       403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
         headers: {
           [name: string]: unknown;
         };
@@ -95323,15 +89326,6 @@ export interface operations {
           "application/problem+json": components["schemas"]["Problem"];
         };
       };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
       /** @description Request Entity Too Large */
       413: {
         headers: {
@@ -95391,12 +89385,7 @@ export interface operations {
   revokePersonalAPIKey: {
     parameters: {
       query?: never;
-      header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
+      header?: never;
       path: {
         /** @description Opaque identifier */
         id: string;
@@ -96807,14 +90796,7 @@ export interface operations {
   pollDeviceLogin: {
     parameters: {
       query?: never;
-      header?: {
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
-      };
+      header?: never;
       path?: never;
       cookie?: never;
     };
@@ -96835,15 +90817,6 @@ export interface operations {
       };
       /** @description Bad Request */
       400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
         headers: {
           [name: string]: unknown;
         };
@@ -97233,14 +91206,7 @@ export interface operations {
   login: {
     parameters: {
       query?: never;
-      header?: {
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
-      };
+      header?: never;
       path?: never;
       cookie?: never;
     };
@@ -97462,14 +91428,7 @@ export interface operations {
   signInWithNetworkIdentity: {
     parameters: {
       query?: never;
-      header?: {
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
-      };
+      header?: never;
       path: {
         /** @description The network provider's plugin installation, as listAuthProviders shows it */
         id: string;
@@ -97952,14 +91911,7 @@ export interface operations {
   completeOAuthLogin: {
     parameters: {
       query?: never;
-      header?: {
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
-      };
+      header?: never;
       path?: never;
       cookie?: {
         /** @description Completion cookie the callback set in the browser it sent to the web completion page (HttpOnly, path-scoped to this operation, two minutes). The browser sends it by itself; a web code redeemed without it, or with another browser's, is 400 invalid_grant and stays redeemable. Native codes ignore it */
@@ -98718,14 +92670,7 @@ export interface operations {
   setupServer: {
     parameters: {
       query?: never;
-      header?: {
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
-      };
+      header?: never;
       path?: never;
       cookie?: never;
     };
@@ -98904,14 +92849,7 @@ export interface operations {
   signup: {
     parameters: {
       query?: never;
-      header?: {
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
-      };
+      header?: never;
       path?: never;
       cookie?: never;
     };
@@ -100275,138 +94213,6 @@ export interface operations {
       };
     };
   };
-  getProfileExportCapability: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
-        "If-Match"?: string;
-        "If-None-Match"?: string;
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["ProfileExportCapability"];
-        };
-      };
-      /** @description The representation named by If-None-Match is current; no body. */
-      304: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Failed */
-      412: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   getRatingsCapability: {
     parameters: {
       query?: never;
@@ -100434,138 +94240,6 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["RatingsCapability"];
-        };
-      };
-      /** @description The representation named by If-None-Match is current; no body. */
-      304: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Failed */
-      412: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  getTitleAllowanceCapability: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
-        "If-Match"?: string;
-        "If-None-Match"?: string;
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["TitleAllowanceCapability"];
         };
       };
       /** @description The representation named by If-None-Match is current; no body. */
@@ -102495,115 +96169,6 @@ export interface operations {
       };
       /** @description Unsupported Media Type */
       415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  listTitleAllowanceProfiles: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Catalog item identifier of a movie or series */
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["TitleAllowanceProfileCollection"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
         headers: {
           [name: string]: unknown;
         };
@@ -110523,7 +104088,7 @@ export interface operations {
         "If-Range"?: string;
         "If-Unmodified-Since"?: string;
         Range?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -110724,7 +104289,7 @@ export interface operations {
         "If-Range"?: string;
         "If-Unmodified-Since"?: string;
         Range?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -110881,7 +104446,7 @@ export interface operations {
         "If-Range"?: string;
         "If-Unmodified-Since"?: string;
         Range?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -111090,7 +104655,7 @@ export interface operations {
         "If-Range"?: string;
         "If-Unmodified-Since"?: string;
         Range?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -118264,8 +111829,6 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        /** @description The caller's client family: tv, mobile, tablet, desktop or web. Only web receives a featured section an administrator limited to the web app (an admin section's web_only). For any other value, or none, layouts and lists leave that section out and reading it alone answers 404 */
-        "X-Silo-Client-Family"?: string;
       };
       path?: never;
       cookie?: never;
@@ -118387,8 +111950,6 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        /** @description The caller's client family: tv, mobile, tablet, desktop or web. Only web receives a featured section an administrator limited to the web app (an admin section's web_only). For any other value, or none, layouts and lists leave that section out and reading it alone answers 404 */
-        "X-Silo-Client-Family"?: string;
       };
       path?: never;
       cookie?: never;
@@ -118510,8 +112071,6 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        /** @description The caller's client family: tv, mobile, tablet, desktop or web. Only web receives a featured section an administrator limited to the web app (an admin section's web_only). For any other value, or none, layouts and lists leave that section out and reading it alone answers 404 */
-        "X-Silo-Client-Family"?: string;
       };
       path: {
         /** @description Section identifier from the home layout */
@@ -118844,12 +112403,6 @@ export interface operations {
       query?: never;
       header?: {
         "User-Agent"?: string;
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
       };
       path: {
         token: string;
@@ -118859,155 +112412,6 @@ export interface operations {
     requestBody: {
       content: {
         "application/json": components["schemas"]["InvitationAcceptInputBody"];
-      };
-    };
-    responses: {
-      /** @description Created */
-      201: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["InvitationAcceptance"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Implemented */
-      501: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  acceptInvitationLink: {
-    parameters: {
-      query?: never;
-      header?: {
-        "User-Agent"?: string;
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["InvitationLinkAcceptInputBody"];
       };
     };
     responses: {
@@ -119205,129 +112609,6 @@ export interface operations {
         headers: {
           /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
           ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  lookupInvitationLink: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["InvitationLinkInputBody"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["InvitationLookup"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
           [name: string]: unknown;
         };
         content: {
@@ -123576,8 +116857,6 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        /** @description The caller's client family: tv, mobile, tablet, desktop or web. Only web receives a featured section an administrator limited to the web app (an admin section's web_only). For any other value, or none, layouts and lists leave that section out and reading it alone answers 404 */
-        "X-Silo-Client-Family"?: string;
       };
       path: {
         /** @description Library identifier */
@@ -123702,8 +116981,6 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        /** @description The caller's client family: tv, mobile, tablet, desktop or web. Only web receives a featured section an administrator limited to the web app (an admin section's web_only). For any other value, or none, layouts and lists leave that section out and reading it alone answers 404 */
-        "X-Silo-Client-Family"?: string;
       };
       path: {
         /** @description Library identifier */
@@ -123826,8 +117103,6 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        /** @description The caller's client family: tv, mobile, tablet, desktop or web. Only web receives a featured section an administrator limited to the web app (an admin section's web_only). For any other value, or none, layouts and lists leave that section out and reading it alone answers 404 */
-        "X-Silo-Client-Family"?: string;
       };
       path: {
         /** @description Library identifier */
@@ -124044,7 +117319,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -124154,7 +117429,7 @@ export interface operations {
       query?: never;
       header?: {
         "User-Agent"?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -124295,7 +117570,7 @@ export interface operations {
       query?: never;
       header?: {
         "User-Agent"?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -124405,7 +117680,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -124515,7 +117790,7 @@ export interface operations {
       query?: never;
       header?: {
         "User-Agent"?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -126959,773 +120234,6 @@ export interface operations {
       };
     };
   };
-  listNotificationPluginChannels: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["CollectionNotificationPluginChannel"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  listNotificationPluginDestinations: {
-    parameters: {
-      query?: {
-        cursor?: string;
-        /** @description Page size; default 50, maximum 200 */
-        limit?: number;
-      };
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["CollectionNotificationPluginDestination"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  createNotificationPluginDestination: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["NotificationPluginDestinationCreateInputBody"];
-      };
-    };
-    responses: {
-      /** @description Created */
-      201: {
-        headers: {
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["NotificationPluginDestination"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  updateNotificationPluginDestination: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The resource's current ETag, or "*" to overwrite deliberately. A missing field is 428 precondition_required; a stale tag is 412 precondition_failed with the current ETag. */
-        "If-Match": string;
-        /** @description Optional second precondition, evaluated after If-Match succeeds: "*" or any tag matching the current representation is 412 precondition_failed with the current ETag. */
-        "If-None-Match"?: string;
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["NotificationPluginDestinationWrite"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["NotificationPluginDestination"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Failed */
-      412: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Required */
-      428: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  deleteNotificationPluginDestination: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The resource's current ETag, or "*" to overwrite deliberately. A missing field is 428 precondition_required; a stale tag is 412 precondition_failed with the current ETag. */
-        "If-Match": string;
-        /** @description Optional second precondition, evaluated after If-Match succeeds: "*" or any tag matching the current representation is 412 precondition_failed with the current ETag. */
-        "If-None-Match"?: string;
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Failed */
-      412: {
-        headers: {
-          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
-          ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Precondition Required */
-      428: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  testNotificationPluginDestination: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Opaque identifier */
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["NotificationDestinationTestResult"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   getNotificationPreferences: {
     parameters: {
       query?: never;
@@ -128741,6 +121249,8 @@ export interface operations {
         poster_width?: number;
         /** @description Keeps the series whose title or sort title contains this text, case-insensitively */
         q?: string;
+        /** @description Keeps the series with this reason, whether or not the preferences let it notify; absent keeps every reason */
+        reason?: "favorite" | "watchlist" | "continue_watching" | "next_up";
         /** @description One field, descending with a leading '-'. added_at is when the series joined the catalog; latest_episode_added when it last gained an episode. A series without a year or an episode sorts last either way; ties order by title. */
         sort?:
           | "title"
@@ -128751,8 +121261,8 @@ export interface operations {
           | "-added_at"
           | "latest_episode_added"
           | "-latest_episode_added";
-        /** @description active keeps the series whose next new episode would notify (notifies is true); inactive keeps the rest: the profile's preferences silence Next Up, the profile has an available episode to watch first, Next Up is off for the series (dropped, its card removed, an episode partly watched), or the profile muted it; muted keeps only the series the profile muted */
-        status?: "all" | "active" | "inactive" | "muted";
+        /** @description active keeps the series that notify; inactive keeps the ones that do not, because the profile's preferences silence every reason or the profile muted the series */
+        status?: "all" | "active" | "inactive";
         /** @description Width in device pixels the client draws an episode's or a local extra's still_url at. Overrides image_size for those stills */
         still_width?: number;
       };
@@ -129028,280 +121538,6 @@ export interface operations {
       };
       /** @description Not Acceptable */
       406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  muteManyNotificationSeries: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["NotificationSeriesMuteRequest"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["NotificationSeriesMuteResults"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  unmuteManyNotificationSeries: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["NotificationSeriesMuteRequest"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["NotificationSeriesMuteResults"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
         headers: {
           [name: string]: unknown;
         };
@@ -131415,128 +123651,6 @@ export interface operations {
       };
     };
   };
-  getOverlayImage: {
-    parameters: {
-      query?: never;
-      header?: {
-        "If-None-Match"?: string;
-      };
-      path: {
-        ref: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Image bytes (no body for HEAD) */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          "Content-Length"?: string;
-          "Content-Security-Policy"?: string;
-          ETag?: string;
-          "X-Content-Type-Options"?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "image/webp": string;
-        };
-      };
-      /** @description Image unchanged */
-      304: {
-        headers: {
-          "Cache-Control"?: string;
-          "Content-Length"?: string;
-          "Content-Security-Policy"?: string;
-          ETag?: string;
-          "X-Content-Type-Options"?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Unknown or deleted image */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Image could not be read */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Overlay images are not available on this server */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-    };
-  };
-  headOverlayImage: {
-    parameters: {
-      query?: never;
-      header?: {
-        "If-None-Match"?: string;
-      };
-      path: {
-        ref: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Image bytes (no body for HEAD) */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          "Content-Length"?: string;
-          "Content-Security-Policy"?: string;
-          ETag?: string;
-          "X-Content-Type-Options"?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Image unchanged */
-      304: {
-        headers: {
-          "Cache-Control"?: string;
-          "Content-Length"?: string;
-          "Content-Security-Policy"?: string;
-          ETag?: string;
-          "X-Content-Type-Options"?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Unknown or deleted image */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Image could not be read */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Overlay images are not available on this server */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-    };
-  };
   requestPasswordReset: {
     parameters: {
       query?: never;
@@ -131696,15 +123810,6 @@ export interface operations {
           "application/problem+json": components["schemas"]["Problem"];
         };
       };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
       /** @description Unprocessable Entity */
       422: {
         headers: {
@@ -131748,12 +123853,6 @@ export interface operations {
       query?: never;
       header?: {
         "User-Agent"?: string;
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
       };
       path: {
         token: string;
@@ -131804,269 +123903,6 @@ export interface operations {
       };
       /** @description Request Timeout */
       408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  completePasswordResetLink: {
-    parameters: {
-      query?: never;
-      header?: {
-        "User-Agent"?: string;
-        /** @description The client's stable device identifier, recorded on the login session this sign-in opens */
-        "X-Silo-Device-Id"?: string;
-        /** @description Optional device name recorded on the login session (first 120 characters) */
-        "X-Silo-Device-Name"?: string;
-        /** @description Optional platform recorded on the login session (first 40 characters) */
-        "X-Silo-Device-Platform"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["PasswordResetLinkCompleteInputBody"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["PasswordResetCompletion"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  lookupPasswordResetLink: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["PasswordResetLinkInputBody"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["PasswordResetLookup"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
         headers: {
           [name: string]: unknown;
         };
@@ -133545,15 +125381,6 @@ export interface operations {
           "application/problem+json": components["schemas"]["Problem"];
         };
       };
-      /** @description Gone */
-      410: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
       /** @description Request Entity Too Large */
       413: {
         headers: {
@@ -133919,7 +125746,7 @@ export interface operations {
         silo_rendition?: "video" | "subtitles";
         /** @description Set with silo_rendition=subtitles by the multivariant playlist of a plan with on-demand renditions (hls_subtitle_renditions_all_v1): the container track number whose WebVTT playlist to answer. */
         silo_track?: string;
-        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Without an Authorization header or token, it alone authorizes this session's media as the account and profile it names, while the login session that started playback is active; viewer authorization still applies. Omitted for header-authenticated media. */
+        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
         st?: string;
         /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */
         token?: string;
@@ -134040,136 +125867,10 @@ export interface operations {
       };
     };
   };
-  headPlaybackManifest: {
-    parameters: {
-      query?: {
-        /** @description Set by the multivariant playlist of a plan with subtitle.hls_rendition: video selects the media playlist, subtitles the WebVTT subtitle playlist. Absent, such a plan's manifest is the multivariant playlist. */
-        silo_rendition?: "video" | "subtitles";
-        /** @description Set with silo_rendition=subtitles by the multivariant playlist of a plan with on-demand renditions (hls_subtitle_renditions_all_v1): the container track number whose WebVTT playlist to answer. */
-        silo_track?: string;
-        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Without an Authorization header or token, it alone authorizes this session's media as the account and profile it names, while the login session that started playback is active; viewer authorization still applies. Omitted for header-authenticated media. */
-        st?: string;
-        /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */
-        token?: string;
-      };
-      header?: {
-        /** @description Optional. When present, it must name a profile of the authenticated account. */
-        "X-Profile-Id"?: string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        session_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Playback bytes or HEAD metadata */
-      200: {
-        headers: {
-          "Cache-Control"?: string;
-          "Content-Length"?: number;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Gone */
-      410: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   getPlaybackSegment: {
     parameters: {
       query?: {
-        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Without an Authorization header or token, it alone authorizes this session's media as the account and profile it names, while the login session that started playback is active; viewer authorization still applies. Omitted for header-authenticated media. */
+        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
         st?: string;
         /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */
         token?: string;
@@ -134525,281 +126226,6 @@ export interface operations {
         headers: {
           /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
           ETag?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  exportProfile: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          "Content-Disposition"?: string;
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": {
-            [key: string]: unknown;
-          };
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  importProfile: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path?: never;
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": {
-          [key: string]: unknown;
-        };
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["ProfileImportResult"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Conflict */
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
           [name: string]: unknown;
         };
         content: {
@@ -135876,817 +127302,6 @@ export interface operations {
       };
       /** @description Conflict */
       409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Entity Too Large */
-      413: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unsupported Media Type */
-      415: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  listAllowedCollections: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Profile identifier */
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AllowedCollectionCollection"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  allowCollection: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Personal collection identifier */
-        collection_id: string;
-        /** @description Profile identifier */
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  disallowCollection: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Personal collection identifier */
-        collection_id: string;
-        /** @description Profile identifier */
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  listAllowedTitles: {
-    parameters: {
-      query?: {
-        /** @description Width in device pixels the client draws backdrop_url and backdrop_urls at. Overrides image_size for backdrops */
-        backdrop_width?: number;
-        /** @description Opaque cursor from page.next_cursor */
-        cursor?: string;
-        /** @description Artwork size for every image in the response; absent picks each surface's default */
-        image_size?: "small" | "medium" | "large" | "original";
-        /** @description Page size; default 50, maximum 200 */
-        limit?: number;
-        /** @description Width in device pixels the client draws logo_url at. Overrides image_size for logos */
-        logo_width?: number;
-        /** @description Width in device pixels the client draws a cast or crew photo_url at. Overrides image_size for headshots */
-        photo_width?: number;
-        /** @description Width in device pixels the client draws poster_url at. Overrides image_size for posters: the narrowest cached size at least this wide, else the original */
-        poster_width?: number;
-        /** @description Width in device pixels the client draws an episode's or a local extra's still_url at. Overrides image_size for those stills */
-        still_width?: number;
-      };
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Profile identifier */
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AllowedTitleCollection"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  allowTitle: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Profile identifier */
-        id: string;
-        /** @description Catalog item identifier of a movie or series */
-        item_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  disallowTitle: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Profile identifier */
-        id: string;
-        /** @description Catalog item identifier of a movie or series */
-        item_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description No Content */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unprocessable Entity */
-      422: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Too Many Requests */
-      429: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Internal Server Error */
-      500: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Service Unavailable */
-      503: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  allowCollectionTitles: {
-    parameters: {
-      query?: never;
-      header: {
-        /** @description The household profile acting for this request; it must belong to the authenticated account. */
-        "X-Profile-Id": string;
-        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
-        "X-Profile-Token"?: string;
-      };
-      path: {
-        /** @description Profile identifier */
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["AllowCollectionTitlesInputBody"];
-      };
-    };
-    responses: {
-      /** @description OK */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AllowCollectionTitlesResult"];
-        };
-      };
-      /** @description Bad Request */
-      400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Unauthorized */
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Forbidden */
-      403: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Found */
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Not Acceptable */
-      406: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Request Timeout */
-      408: {
         headers: {
           [name: string]: unknown;
         };
@@ -145763,9 +136378,7 @@ export interface operations {
   getPlaybackMedia: {
     parameters: {
       query?: {
-        /** @description Set to refuse by the server on a server_remux_progressive URL whose attempt listed progressive_range_refusal_v1 in deliveries.progressive.features. A progressive remux streams from its seek origin and cannot resume: with it, a GET whose Range starts past byte 0 (or is a suffix range) answers 409 before the remux starts, and the client reopens the stream at its current position. Without it such a range streams from the origin with 200. */
-        remux_range?: "refuse";
-        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Without an Authorization header or token, it alone authorizes this session's media as the account and profile it names, while the login session that started playback is active; viewer authorization still applies. Omitted for header-authenticated media. */
+        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
         st?: string;
         /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */
         token?: string;
@@ -145974,9 +136587,7 @@ export interface operations {
   headPlaybackMedia: {
     parameters: {
       query?: {
-        /** @description Set to refuse by the server on a server_remux_progressive URL whose attempt listed progressive_range_refusal_v1 in deliveries.progressive.features. A progressive remux streams from its seek origin and cannot resume: with it, a GET whose Range starts past byte 0 (or is a suffix range) answers 409 before the remux starts, and the client reopens the stream at its current position. Without it such a range streams from the origin with 200. */
-        remux_range?: "refuse";
-        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Without an Authorization header or token, it alone authorizes this session's media as the account and profile it names, while the login session that started playback is active; viewer authorization still applies. Omitted for header-authenticated media. */
+        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
         st?: string;
         /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */
         token?: string;
@@ -146151,7 +136762,7 @@ export interface operations {
         original?: string;
         /** @description Seek position in seconds for windowed text extraction. */
         position?: number;
-        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Without an Authorization header or token, it alone authorizes this session's media as the account and profile it names, while the login session that started playback is active; viewer authorization still applies. Omitted for header-authenticated media. */
+        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
         st?: string;
         /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */
         token?: string;
@@ -146301,7 +136912,7 @@ export interface operations {
         original?: string;
         /** @description Seek position in seconds for windowed text extraction. */
         position?: number;
-        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Without an Authorization header or token, it alone authorizes this session's media as the account and profile it names, while the login session that started playback is active; viewer authorization still applies. Omitted for header-authenticated media. */
+        /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
         st?: string;
         /** @description Media-element fallback for the account bearer token when an Authorization header cannot be set. Header-authenticated media requires the Authorization header and the profile selector. */
         token?: string;
@@ -146921,7 +137532,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -147030,7 +137641,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -147139,7 +137750,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -147251,7 +137862,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -147366,7 +137977,7 @@ export interface operations {
         "If-Match": string;
         /** @description Optional second precondition, evaluated after If-Match succeeds: "*" or any tag matching the current representation is 412 precondition_failed with the current ETag. */
         "If-None-Match"?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -147533,7 +138144,7 @@ export interface operations {
         media_file_id: string;
       };
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -147639,7 +138250,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -147748,7 +138359,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -148093,7 +138704,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -148367,7 +138978,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -148636,7 +139247,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -148777,7 +139388,7 @@ export interface operations {
         "If-Match": string;
         /** @description Optional second precondition, evaluated after If-Match succeeds: "*" or any tag matching the current representation is 412 precondition_failed with the current ETag. */
         "If-None-Match"?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -148907,7 +139518,7 @@ export interface operations {
         /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
         "If-Match"?: string;
         "If-None-Match"?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -149038,7 +139649,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -149148,7 +139759,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -149261,7 +139872,7 @@ export interface operations {
         "If-Match": string;
         /** @description Optional second precondition, evaluated after If-Match succeeds: "*" or any tag matching the current representation is 412 precondition_failed with the current ETag. */
         "If-None-Match"?: string;
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -149555,7 +140166,7 @@ export interface operations {
     parameters: {
       query?: never;
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -151390,15 +142001,6 @@ export interface operations {
       };
       /** @description Conflict */
       409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/problem+json": components["schemas"]["Problem"];
-        };
-      };
-      /** @description Gone */
-      410: {
         headers: {
           [name: string]: unknown;
         };
@@ -155072,7 +145674,7 @@ export interface operations {
         still_width?: number;
       };
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
@@ -155186,7 +145788,7 @@ export interface operations {
         file_id: string;
       };
       header?: {
-        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id. An API key, on an operation that admits one, is not held to this: a profile key's binding supplies the header and refuses any other profile, and an account key may name any profile on its account without X-Profile-Token, or send no header and act with the account's own access rather than one profile's limits and state. When present, it must name a profile of the authenticated account. */
+        /** @description Optional while no profile on the authenticated account is PIN-protected or access-restricted (content-rating, advisory-age or library limits). Otherwise it is required: a request without it, or with an empty value, is refused with 422 validation_failed at header.x-profile-id; API keys are exempt. When present, it must name a profile of the authenticated account. */
         "X-Profile-Id"?: string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;

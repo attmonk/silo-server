@@ -6,13 +6,13 @@ import { CollectionRowSummary } from "@/components/collections/CollectionRowSumm
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  myRowsOnceCreated,
-  noMyRowsYet,
-  noRowsYet,
-  rowsFailed,
-  rowsNotListed,
-  rowsOnceCreated,
-  rowsThatShowIt,
+  MY_ROWS_ONCE_CREATED,
+  NO_MY_ROWS_YET,
+  NO_ROWS_YET,
+  ROWS_FAILED,
+  ROWS_NOT_LISTED,
+  ROWS_ONCE_CREATED,
+  ROWS_THAT_SHOW_IT,
   rowCountLabel,
 } from "@/lib/collections/copy";
 import { openRowPath, rowMeta, type CollectionRow, type RowsState } from "@/lib/collections/rows";
@@ -20,7 +20,6 @@ import { cn } from "@/lib/utils";
 
 import { SettingRow } from "../fields/SettingRow";
 import { AddAsRowMenu } from "./AddAsRowMenu";
-import { useAppLanguage, useT } from "@/i18n";
 
 type AddAsRowProps = Pick<ComponentProps<typeof AddAsRowMenu>, "bound" | "others" | "onPick"> & {
   /** Why the collection can't be added as a row yet, shown under the row's name. */
@@ -37,7 +36,6 @@ function RowsList({
   libraryNames: ReadonlyMap<number, string>;
   highlightId?: string | null;
 }) {
-  const t = useT();
   return (
     <ul className="border-border/80 divide-border/70 grid divide-y overflow-hidden rounded-xl border">
       {rows.map((row) => {
@@ -47,7 +45,7 @@ function RowsList({
           <li key={row.id} data-highlighted={fresh || undefined}>
             <Link
               to={openRowPath(row)}
-              aria-label={t("web.collections.editor.rowLinkLabel", { title: row.title, meta })}
+              aria-label={`${row.title}, ${meta}`}
               className={cn(
                 "hover:bg-accent/40 focus-visible:ring-ring/50 flex items-center gap-3 px-3 py-2.5 outline-none focus-visible:ring-[3px] focus-visible:ring-inset",
                 fresh && "bg-emerald-500/10 ring-1 ring-emerald-500/50 ring-inset",
@@ -66,9 +64,8 @@ function RowsList({
 
 /** "Rows that show it" before the collection is created: one line, nothing to add yet. */
 export function RowsOnceCreated({ mine = false }: { mine?: boolean }) {
-  useAppLanguage();
   return (
-    <SettingRow label={rowsThatShowIt()} value={mine ? myRowsOnceCreated() : rowsOnceCreated()} />
+    <SettingRow label={ROWS_THAT_SHOW_IT} value={mine ? MY_ROWS_ONCE_CREATED : ROWS_ONCE_CREATED} />
   );
 }
 
@@ -94,7 +91,6 @@ export function RowsThatShowIt({
   mine?: boolean;
   addAsRow: AddAsRowProps;
 }) {
-  const t = useT();
   const reasonId = useId();
   const { disabledReason, ...menu } = addAsRow;
   const listed = rows?.status === "ready" ? rows.rows : null;
@@ -102,21 +98,21 @@ export function RowsThatShowIt({
   if (rows?.status === "error") {
     line = (
       <span role="alert" className="flex flex-wrap items-center gap-x-3 gap-y-1">
-        {rowsFailed()}
+        {ROWS_FAILED}
         <Button variant="outline" size="sm" className="h-7" onClick={rows.onRetry}>
-          {t("common.retry")}
+          Retry
         </Button>
       </span>
     );
   } else if (listed && listed.length > 0) {
     line = rowCountLabel(listed.length);
   } else if (listed) {
-    line = mine ? noMyRowsYet() : noRowsYet();
+    line = mine ? NO_MY_ROWS_YET : NO_ROWS_YET;
   }
 
   return (
     <SettingRow
-      label={rowsThatShowIt()}
+      label={ROWS_THAT_SHOW_IT}
       value={
         line || disabledReason ? (
           <>
@@ -147,7 +143,7 @@ export function RowsThatShowIt({
       {listed && listed.length > 0 ? (
         <>
           <RowsList rows={listed} libraryNames={libraryNames} highlightId={highlightId} />
-          {mine ? null : <p className="text-muted-foreground text-[12.5px]">{rowsNotListed()}</p>}
+          {mine ? null : <p className="text-muted-foreground text-[12.5px]">{ROWS_NOT_LISTED}</p>}
         </>
       ) : null}
     </SettingRow>

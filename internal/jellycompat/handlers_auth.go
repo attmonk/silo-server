@@ -88,7 +88,6 @@ type userDTOResponse struct {
 	EnableAutoLogin           bool                      `json:"EnableAutoLogin"`
 	LastLoginDate             string                    `json:"LastLoginDate"`
 	LastActivityDate          string                    `json:"LastActivityDate"`
-	PrimaryImageTag           string                    `json:"PrimaryImageTag,omitempty"`
 	Policy                    userPolicyResponse        `json:"Policy"`
 	Configuration             userConfigurationResponse `json:"Configuration"`
 }
@@ -181,8 +180,6 @@ type AuthHandler struct {
 	authenticator *Authenticator
 	storeProvider userstore.UserStoreProvider
 	liveTV        *LiveTV // attmonk fork: sets EnableLiveTvAccess; nil when Live TV is off
-	// avatars decides the PrimaryImageTag; nil reports no user avatars.
-	avatars *compatUserAvatars
 }
 
 // NewAuthHandler creates a new auth handler. The config provider is invoked
@@ -344,7 +341,7 @@ func (h *AuthHandler) HandleUserByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !isPseudoUser(chi.URLParam(r, "id"), session.PseudoUserID) {
+	if chi.URLParam(r, "id") != session.PseudoUserID.String() {
 		writeError(w, http.StatusNotFound, "NotFound", "User not found")
 		return
 	}
@@ -379,7 +376,7 @@ func (h *AuthHandler) userDTO(session *Session) userDTOResponse {
 	}
 
 	return userDTOResponse{
-		ID:                        compatUserID(session.PseudoUserID),
+		ID:                        session.PseudoUserID.String(),
 		Name:                      name,
 		ServerID:                  h.cfg().JellyfinCompat.ServerID,
 		HasPassword:               true,
@@ -482,7 +479,7 @@ func (h *AuthHandler) sessionInfo(r *http.Request, session *Session) *sessionInf
 		RemoteEndPoint:        clientip.FromContext(r.Context()),
 		PlayableMediaTypes:    []string{},
 		ID:                    strings.ReplaceAll(sessionID.String(), "-", ""),
-		UserID:                compatUserID(session.PseudoUserID),
+		UserID:                session.PseudoUserID.String(),
 		UserName:              name,
 		Client:                authorizationValue(r, "Client"),
 		LastActivityDate:      now,

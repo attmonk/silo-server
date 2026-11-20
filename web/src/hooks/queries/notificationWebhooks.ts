@@ -1,4 +1,4 @@
-import { v2, v2ErrorText } from "@/api/v2/request";
+import { v2 } from "@/api/v2/request";
 import { requireNotificationAuthority } from "@/api/v2/notifications";
 import { useRef } from "react";
 import { testNotificationDestination } from "@/api/v2/notificationDestinationTests";
@@ -19,7 +19,6 @@ import {
 } from "@/api/v2/notificationDestinations";
 import { notificationKeys } from "./keys";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 
 export function useNotificationCapability() {
   const context = captureProfileRequestContext();
@@ -51,10 +50,8 @@ export function useCreateNotificationWebhook() {
     mutationFn: async (input: NotificationWebhookInput) => {
       if (!context) throw new StaleApiRequestContextError();
       requireNotificationAuthority(context);
-      if (inFlight.current)
-        throw new Error(t("web.common.toast.notificationWebhooks.createInProgress"));
-      if (!input.name || !input.url)
-        throw new Error(t("web.common.toast.notificationWebhooks.nameAndUrlRequired"));
+      if (inFlight.current) throw new Error("Destination creation is already in progress.");
+      if (!input.name || !input.url) throw new Error("A name and webhook URL are required.");
       inFlight.current = true;
       try {
         const result = await v2("POST /api/v2/notifications/webhooks", {
@@ -89,7 +86,7 @@ export function useUpdateNotificationWebhook() {
       if (!intent.authority) throw new StaleApiRequestContextError();
       const { id, etag, type: _type, ...body } = intent.input;
       if (!etag || etag === "*")
-        throw new Error(t("web.common.toast.notificationWebhooks.reloadBeforeEditing"));
+        throw new Error("Reload the webhook list before editing this destination.");
       requireNotificationAuthority(intent.authority);
       const result = await v2("PUT /api/v2/notifications/webhooks/{id}", {
         path: { id },
@@ -116,11 +113,7 @@ export function useUpdateNotificationWebhook() {
       } catch {
         return;
       }
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : t("web.common.toast.notificationWebhooks.updateFailed"),
-      );
+      toast.error(error instanceof Error ? error.message : "Failed to update webhook");
     },
   });
   return {
@@ -144,13 +137,13 @@ export function useDeleteNotificationWebhook() {
     }) => {
       if (!intent.authority) throw new StaleApiRequestContextError();
       if (!intent.etag || intent.etag === "*")
-        throw new Error(t("web.common.toast.notificationWebhooks.reloadBeforeDeleting"));
+        throw new Error("Reload the webhook list before deleting this destination.");
       await deleteNotificationWebhook(intent, intent.authority);
       return intent.authority;
     },
     onSuccess: (authority) => {
       requireNotificationAuthority(authority);
-      toast.success(t("web.common.toast.notificationWebhooks.deleted"));
+      toast.success("Webhook deleted");
       void queryClient.invalidateQueries({
         queryKey: [...notificationKeys.webhooks(), notificationScope(authority)],
         exact: true,
@@ -164,7 +157,7 @@ export function useDeleteNotificationWebhook() {
       } catch {
         return;
       }
-      toast.error(t("web.common.toast.notificationWebhooks.deleteFailed"));
+      toast.error("Failed to delete webhook");
     },
   });
   return {
@@ -187,8 +180,7 @@ export function useTestNotificationWebhook() {
     retry: false,
     mutationFn: async (id: string) => {
       if (!context) throw new StaleApiRequestContextError();
-      if (inFlight.current)
-        throw new Error(t("web.common.toast.notificationWebhooks.testInProgress"));
+      if (inFlight.current) throw new Error("A test delivery is already in progress.");
       inFlight.current = true;
       try {
         return await testNotificationDestination("webhook", id, context);
@@ -226,7 +218,7 @@ export function useRotateNotificationWebhookSecret() {
       } catch {
         return;
       }
-      toast.error(v2ErrorText(error, t("web.common.toast.notificationWebhooks.rotateFailed")));
+      toast.error(error instanceof Error ? error.message : "Failed to rotate signing secret");
     },
   });
   return {
@@ -266,7 +258,7 @@ export function useDeleteWebPushSubscription() {
       });
     },
     onError: () => {
-      toast.error(t("web.common.toast.notificationWebhooks.pushRemoveFailed"));
+      toast.error("Failed to remove push subscription");
     },
   });
 }

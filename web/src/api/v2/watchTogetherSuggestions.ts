@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import {
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
@@ -42,7 +41,7 @@ export async function listRoomSuggestions(
         row.room_id !== roomId ||
         !["movie", "episode"].includes(row.content_type)
       )
-        throw new Error(t("web.common.errors.roomSuggestionInvalid"));
+        throw new Error("Invalid room suggestion.");
       ids.add(row.id);
       items.push({
         ...row,
@@ -50,10 +49,9 @@ export async function listRoomSuggestions(
         content_type: row.content_type as "movie" | "episode",
       });
     }
-    if (!result.page) throw new Error(t("web.common.errors.suggestionContinuationMissing"));
+    if (!result.page) throw new Error("Missing suggestion continuation.");
     if (!result.page.has_more) {
-      if (result.page.next_cursor)
-        throw new Error(t("web.common.errors.suggestionContinuationInvalid"));
+      if (result.page.next_cursor) throw new Error("Invalid suggestion continuation.");
       items.sort(
         (a, b) =>
           b.vote_count - a.vote_count ||
@@ -63,12 +61,11 @@ export async function listRoomSuggestions(
       return { suggestions: items };
     }
     const next = result.page.next_cursor;
-    if (!next || cursors.has(next))
-      throw new Error(t("web.common.errors.suggestionContinuationInvalid"));
+    if (!next || cursors.has(next)) throw new Error("Invalid suggestion continuation.");
     cursors.add(next);
     cursor = next;
   }
-  throw new Error(t("web.common.errors.roomSuggestionsTooMany"));
+  throw new Error("Too many room suggestions. Reload the room.");
 }
 export async function setRoomSuggestionVote(
   roomId: string,

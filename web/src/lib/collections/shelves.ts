@@ -5,9 +5,7 @@
  */
 import type { GroupSortMode, LibraryCollection, LibraryCollectionGroup } from "@/api/types";
 
-import { t, type MessageKey } from "@/i18n";
-
-import { noHeading } from "./copy";
+import { NO_HEADING } from "./copy";
 
 /** The id the order routes use for the collections on no shelf. */
 export const UNGROUPED = "ungrouped";
@@ -34,28 +32,20 @@ export interface CollectionMove {
   orderedIds: string[];
 }
 
-const SHELF_ORDER_LABEL: Readonly<Record<GroupSortMode, MessageKey>> = {
-  manual: "web.collections.shelves.orderManual",
-  name_asc: "web.collections.shelves.orderNameAsc",
-  name_desc: "web.collections.shelves.orderNameDesc",
-  recent: "web.collections.shelves.orderRecent",
-  most_items: "web.collections.shelves.orderMostItems",
+export const SHELF_ORDER_LABEL: Readonly<Record<GroupSortMode, string>> = {
+  manual: "Your order",
+  name_asc: "Name A–Z",
+  name_desc: "Name Z–A",
+  recent: "Recently updated",
+  most_items: "Most titles",
 };
 
-/** Every order a shelf can have, in the order the menu offers them. */
-export const SHELF_SORT_MODES = Object.keys(SHELF_ORDER_LABEL) as GroupSortMode[];
-
-/** "Your order", "Name A–Z": a shelf's order as its menu names it. */
-export function shelfOrderLabel(mode: GroupSortMode): string {
-  return t(SHELF_ORDER_LABEL[mode]);
-}
-
-const SORTED_BY: Readonly<Record<GroupSortMode, MessageKey | null>> = {
+const SORTED_BY: Readonly<Record<GroupSortMode, string | null>> = {
   manual: null,
-  name_asc: "web.collections.shelves.sortedByName",
-  name_desc: "web.collections.shelves.sortedByName",
-  recent: "web.collections.shelves.sortedByRecent",
-  most_items: "web.collections.shelves.sortedByMostItems",
+  name_asc: "name",
+  name_desc: "name",
+  recent: "recently updated",
+  most_items: "most titles",
 };
 
 /** Plain string order, as the server compares ids and names (Go's `<`, not a locale). */
@@ -99,7 +89,7 @@ export function boardShelves(
       shelf: {
         id: UNGROUPED,
         kind: "ungrouped",
-        name: noHeading(),
+        name: NO_HEADING,
         sortMode: "manual",
         collections: [...ungrouped],
       } satisfies Shelf,
@@ -159,17 +149,15 @@ export function applyPin(shelves: readonly Shelf[], id: string, pinned: boolean)
 
 /** What a shelf that orders itself sorts by ("name", "most titles"); null for Your order. */
 export function sortedBy(mode: GroupSortMode): string | null {
-  const key = SORTED_BY[mode];
-  return key ? t(key) : null;
+  return SORTED_BY[mode];
 }
 
 /** "3 collections", or "2 collections, sorted by name" on a shelf that orders itself. */
 export function shelfCountLine(shelf: Shelf): string {
   const count = shelf.collections.length;
+  const line = `${count} collection${count === 1 ? "" : "s"}`;
   const by = sortedBy(shelf.sortMode);
-  return by
-    ? t("web.collections.shelves.countSorted", { count, count_text: count, by })
-    : t("web.collections.shelves.count", { count, count_text: count });
+  return by ? `${line}, sorted by ${by}` : line;
 }
 
 /** My collections holds each viewer's own collections, never a server one. */

@@ -21,7 +21,6 @@ import {
 } from "@/lib/collections/scope";
 import { useListReturnPath } from "@/lib/collections/listReturn";
 import type { SyncedTab } from "@/lib/collections/synced";
-import { useT } from "@/i18n";
 
 const CREATE_KINDS: readonly CreateKind[] = ["manual", "smart", "synced"];
 const SYNCED_TABS: readonly SyncedTab[] = ["mdblist", "tmdb_chart", "tmdb_list"];
@@ -33,7 +32,6 @@ function readOnlyHref(href: string) {
 
 /** Header and cards in their final places while the collection loads; no save bar. */
 function EditorSkeleton() {
-  const t = useT();
   const panel = (rows: number) => (
     <div className="surface-panel grid gap-4 rounded-[22px] p-5 sm:p-6">
       <Skeleton className="h-5 w-28" />
@@ -44,7 +42,7 @@ function EditorSkeleton() {
   );
   return (
     <div role="status" aria-busy="true">
-      <span className="sr-only">{t("web.collections.editorPage.loading")}</span>
+      <span className="sr-only">Loading collection editor…</span>
       <CollectionEditorShell
         header={
           <div aria-hidden className="grid gap-4">
@@ -71,14 +69,12 @@ function EditorSkeleton() {
 /**
  * Every collection editor URL, both scopes: `/new?type=…[&source=…]` and
  * `/:id/edit`. Mounted once per family by a pathless route, so it stays the
- * same page from `/new` to `/:id/edit` after a Create that left something
- * unsaved; a clean Create returns to the list. Every type opens the
+ * same page from `/new` to `/:id/edit` after Create. Every type opens the
  * same editor, create and edit. `/new` with no type opens the collection
  * list with the New collection picker over it, so old links still work.
  * Someone who can't change the collection is sent to its page instead of a form.
  */
 export default function CollectionEditorPage({ scope: scopeKind }: { scope: ScopeKind }) {
-  const t = useT();
   const scope = (scopeKind === "server" ? SERVER_SCOPE : PERSONAL_SCOPE) as CollectionScope;
   const { id } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
@@ -88,8 +84,7 @@ export default function CollectionEditorPage({ scope: scopeKind }: { scope: Scop
   const source = SYNCED_TABS.find((tab) => tab === searchParams.get("source"));
   const location = useLocation();
   // The collection the create editor made, its kind, and the visit it was made
-  // on: the editor carries on at its edit URL when Create left something
-  // unsaved. Any other visit starts a fresh one.
+  // on: the editor carries on at its edit URL. Any other visit starts a fresh one.
   const [created, setCreated] = useState<{
     round: number;
     id?: string;
@@ -127,8 +122,8 @@ export default function CollectionEditorPage({ scope: scopeKind }: { scope: Scop
     if (editor.error && !isNotFoundProblem(editor.error)) {
       return (
         <PageUnavailable
-          title={t("web.collections.editorPage.loadFailedTitle")}
-          description={t("web.collections.editorPage.loadFailedDescription")}
+          title="Couldn't load this collection"
+          description="Something went wrong while loading it. Try again in a moment."
           onRetry={() => void editor.refetch()}
           retrying={editor.isFetching}
         />
@@ -147,24 +142,19 @@ export default function CollectionEditorPage({ scope: scopeKind }: { scope: Scop
 }
 
 function CollectionNotFound({ scope, listPath }: { scope: ScopeKind; listPath: string }) {
-  const t = useT();
-  useDocumentTitle(t("web.collections.editorPage.notFoundDocumentTitle"));
+  useDocumentTitle("Not found");
   return (
     <PageUnavailable
-      title={
-        scope === "server"
-          ? t("web.collections.editorPage.notFoundServer")
-          : t("web.collections.editorPage.notFoundPersonal")
-      }
+      title={scope === "server" ? "Collection not found" : "This collection isn't available"}
       description={
         scope === "server"
-          ? t("web.collections.editorPage.notFoundServerHelp")
-          : t("web.collections.editorPage.notFoundPersonalHelp")
+          ? "It may have been deleted, or the link may be wrong."
+          : "It may have been deleted, or you may not have access to it."
       }
     >
       <Button asChild variant="outline">
         <ViewTransitionLink to={listPath} up>
-          {t("web.collections.editorPage.allCollections")}
+          All collections
         </ViewTransitionLink>
       </Button>
     </PageUnavailable>

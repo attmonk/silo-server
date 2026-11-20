@@ -1,27 +1,25 @@
 import type { LibraryRealtimeMonitoringEntry, LibraryRealtimeMonitoringState } from "@/api/types";
-import { t, type MessageKey } from "@/i18n";
-import { formatLocale } from "@/lib/appLocale";
 
 /** Where the server-wide real-time monitoring switch lives. */
 export const REALTIME_MONITORING_SETTINGS_PATH = "/admin/settings/library";
 
-const STATE_LABELS: Record<LibraryRealtimeMonitoringState, MessageKey> = {
-  server_disabled: "web.admin.common.libraryEditor.monitoringState.serverDisabled",
-  library_disabled: "web.admin.common.libraryEditor.monitoringState.libraryDisabled",
-  monitoring_off: "web.admin.common.libraryEditor.monitoringState.monitoringOff",
-  not_reporting: "web.admin.common.libraryEditor.monitoringState.notReporting",
-  starting: "web.admin.common.libraryEditor.monitoringState.starting",
-  monitoring: "web.admin.common.libraryEditor.monitoringState.monitoring",
-  unsupported_filesystem: "web.admin.common.libraryEditor.monitoringState.unsupportedFilesystem",
-  unsupported_platform: "web.admin.common.libraryEditor.monitoringState.unsupportedPlatform",
-  limit_reached: "web.admin.common.libraryEditor.monitoringState.limitReached",
-  root_unavailable: "web.admin.common.libraryEditor.monitoringState.rootUnavailable",
-  error: "web.admin.common.libraryEditor.monitoringState.error",
+const STATE_LABELS: Record<LibraryRealtimeMonitoringState, string> = {
+  server_disabled: "Turned off server-wide",
+  library_disabled: "Library is disabled",
+  monitoring_off: "Off",
+  not_reporting: "Not reporting",
+  starting: "Starting",
+  monitoring: "Monitoring",
+  unsupported_filesystem: "Unsupported filesystem",
+  unsupported_platform: "Unsupported platform",
+  limit_reached: "Watch limit reached",
+  root_unavailable: "Folder unavailable",
+  error: "Error",
 };
 
 /** A short label for a monitoring state; unknown states read as an error. */
 export function realtimeMonitoringStateLabel(state: string): string {
-  return t(STATE_LABELS[state as LibraryRealtimeMonitoringState] ?? STATE_LABELS.error);
+  return STATE_LABELS[state as LibraryRealtimeMonitoringState] ?? STATE_LABELS.error;
 }
 
 /**
@@ -32,23 +30,14 @@ export function realtimeMonitoringStateLabel(state: string): string {
 export function realtimeMonitoringStatusText(entry: LibraryRealtimeMonitoringEntry): string {
   const summary = statusSummary(entry);
   const detail = entry.detail.trim();
-  return detail
-    ? t("web.admin.common.libraryEditor.monitoringStatus.withDetail", { summary, detail })
-    : summary;
+  return detail ? `${summary} · ${detail}` : summary;
 }
 
 function statusSummary(entry: LibraryRealtimeMonitoringEntry): string {
   if (entry.state !== "monitoring") return realtimeMonitoringStateLabel(entry.state);
-  const count = {
-    count: entry.directories,
-    count_text: entry.directories.toLocaleString(formatLocale()),
-  };
-  return entry.backend
-    ? t("web.admin.common.libraryEditor.monitoringStatus.foldersWithBackend", {
-        ...count,
-        backend: entry.backend,
-      })
-    : t("web.admin.common.libraryEditor.monitoringStatus.folders", count);
+  const folderNoun = entry.directories === 1 ? "folder" : "folders";
+  const summary = `Monitoring ${entry.directories.toLocaleString()} ${folderNoun}`;
+  return entry.backend ? `${summary} (${entry.backend})` : summary;
 }
 
 // Monitoring is switched on for these libraries but is not working on a node

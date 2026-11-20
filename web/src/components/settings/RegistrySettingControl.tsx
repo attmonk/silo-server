@@ -7,10 +7,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { SettingSlider } from "@/components/settings/SettingSlider";
-import { useT, type Translate } from "@/i18n";
 import { bitrateSelectChoices } from "@/lib/bitrateOptions";
 import { controlKindFor, optionsFor, type SettingDisplay } from "@/lib/settingsDisplay";
-import { settingLabel } from "@/lib/settingsText";
 
 const EMPTY_SELECT_VALUE = "__empty__";
 
@@ -30,12 +28,11 @@ interface RegistrySettingControlProps {
  * cap) offers the shared bitrate ladder plus the stored value, as the profile
  * and device settings screens do, rather than only an unset entry.
  */
-function selectOptions(t: Translate, definition: SettingDisplay, value: string) {
-  const options = optionsFor(definition, value);
+function selectOptions(definition: SettingDisplay, value: string) {
+  const options = optionsFor(definition);
   const numeric = definition.type === "integer" || definition.type === "number";
   if (!numeric || options.some((option) => option.value !== "")) return options;
-  const unsetLabel =
-    definition.unit === "kbps" ? t("web.settings.value.noLimit") : t("web.settings.value.unset");
+  const unsetLabel = definition.unit === "kbps" ? "No limit" : "Unset";
   return bitrateSelectChoices(definition, value, unsetLabel);
 }
 
@@ -58,7 +55,6 @@ export function RegistrySettingControl({
   disabled = false,
   onChange,
 }: RegistrySettingControlProps) {
-  const t = useT();
   const control = controlKindFor(definition);
 
   if (control === "switch") {
@@ -84,7 +80,7 @@ export function RegistrySettingControl({
         step={definition.step}
         unit={definition.unit}
         disabled={disabled}
-        aria-label={settingLabel(definition)}
+        aria-label={definition.label}
         onCommit={(next) => onChange(String(next))}
       />
     );
@@ -100,7 +96,7 @@ export function RegistrySettingControl({
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
-        {selectOptions(t, definition, value).map((option) => (
+        {selectOptions(definition, value).map((option) => (
           <SelectItem
             key={option.value || EMPTY_SELECT_VALUE}
             value={option.value === "" ? EMPTY_SELECT_VALUE : option.value}

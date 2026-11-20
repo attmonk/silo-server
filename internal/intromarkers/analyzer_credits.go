@@ -163,12 +163,11 @@ func (a *Analyzer) analyzeCreditsGroup(ctx context.Context, group candidateGroup
 	analysisHash := CreditsAnalysisConfigHash(opts.creditsTail)
 	if !opts.force && !anyCandidateIn(group.Candidates, opts.unsettledFileIDs) {
 		// A run without tail passes also keeps off a group a tail-capable
-		// run settled, under any behavior version: its audio-only result
-		// could replace the audio and video credits written there, and that
-		// run would not come back.
+		// run settled: its audio-only result could replace the audio and
+		// video credits written there, and that run would not come back.
 		hashes := []string{analysisHash}
 		if !opts.creditsTail {
-			hashes = append(hashes, creditsTailSettledHashes()...)
+			hashes = append(hashes, CreditsAnalysisConfigHash(true))
 		}
 		for _, hash := range hashes {
 			existing, err := a.repo.LoadSeasonState(ctx, state, hash)

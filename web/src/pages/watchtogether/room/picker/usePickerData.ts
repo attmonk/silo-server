@@ -8,12 +8,7 @@ import {
   useHomeLayout,
 } from "@/hooks/queries/sections";
 import { sectionKeys } from "@/hooks/queries/keys";
-import type {
-  BrowseItem,
-  HomeSectionItemsResponse,
-  SectionItem,
-  SectionTitleKey,
-} from "@/api/types";
+import type { BrowseItem, HomeSectionItemsResponse, SectionItem } from "@/api/types";
 import {
   getWatchTogetherRoomPicker,
   queryWatchTogetherMemberState,
@@ -21,7 +16,6 @@ import {
 } from "@/lib/watchTogether";
 import type { ItemMemberState } from "@/api/v2/watchTogetherMemberState";
 import { useDebounce } from "@/hooks/useDebounce";
-import { sectionTitleKey } from "@/lib/sectionTitle";
 
 export const pickerKeys = {
   rows: (roomId: string, members: WatchTogetherRoomMember[]) =>
@@ -175,8 +169,7 @@ const skippedSectionTypes = new Set([
 ]);
 const maxShelfSections = 4;
 
-/** A home row on the shelf; its title shows through `useSectionTitle`. */
-export interface ShelfSection extends SectionTitleKey {
+export interface ShelfSection {
   id: string;
   title: string;
   items: (SectionItem & { type: "movie" | "series" })[];
@@ -214,9 +207,7 @@ export function useHomeShelfSections(enabled: boolean) {
         const resolved = results[index]?.data?.section;
         if (!resolved) return [];
         const items = resolved.items.filter(isPickable);
-        return items.length > 0
-          ? [{ id: section.id, title: resolved.title, ...sectionTitleKey(resolved), items }]
-          : [];
+        return items.length > 0 ? [{ id: section.id, title: resolved.title, items }] : [];
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- results is a new array each render; its data is what matters
     [wanted, ...results.map((result) => result.data)],

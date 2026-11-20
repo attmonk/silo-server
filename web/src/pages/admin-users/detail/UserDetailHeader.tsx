@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import { Link } from "react-router";
 import { ChevronRight, Info, MoreHorizontal } from "lucide-react";
 
@@ -12,8 +12,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useT, type MessageKey } from "@/i18n";
-import { TOUCH_HIT_AREA, TOUCH_TARGETS } from "@/lib/touchTargets";
 import { cn } from "@/lib/utils";
 
 import { roleLabel } from "./access/policySources";
@@ -40,24 +38,19 @@ export interface UserDetailHeaderProps {
   onDelete(): void;
 }
 
-/** Meta items marked `wide` only fit from `sm` up. */
-const WIDE_ONLY = "hidden sm:inline-flex";
-/** A header action shares the row on a phone; a long label wraps instead of overflowing. */
-const HEADER_ACTION =
-  "flex-1 max-lg:h-auto max-lg:min-w-0 max-lg:py-1 max-lg:text-center max-lg:whitespace-normal";
-/** The separator between meta items; punctuation, not text to translate. */
-const MIDDLE_DOT = "·";
+/** Meta items marked `wide`, and the separator before them, only fit from `sm` up. */
+const WIDE_ONLY = "hidden sm:inline";
 
 /** Why "View as user" is off for a reachable account, most basic reason first. */
 function viewAsDisabledReason(
   user: AdminUser,
   ownAccount: boolean,
   viewAsDisabled: boolean,
-): MessageKey | undefined {
-  if (!user.enabled) return "web.admin.users.detail.header.viewAsReason.enableFirst";
-  if (user.is_owner) return "web.admin.users.detail.header.viewAsReason.owner";
-  if (ownAccount) return "web.admin.users.detail.header.viewAsReason.ownAccount";
-  if (viewAsDisabled) return "web.admin.users.detail.header.viewAsReason.adminOwnerOnly";
+): string | undefined {
+  if (!user.enabled) return "Enable the account first";
+  if (user.is_owner) return "The server owner can't be viewed as";
+  if (ownAccount) return "This is your own account";
+  if (viewAsDisabled) return "Only the server owner can view as another admin";
   return undefined;
 }
 
@@ -81,38 +74,31 @@ export function UserDetailHeader({
   onEnable,
   onDelete,
 }: UserDetailHeaderProps) {
-  const t = useT();
   const lastActive = user.last_active_at
-    ? t("web.admin.users.detail.header.lastActive", { when: formatLastSeen(user.last_active_at) })
-    : t("web.admin.users.detail.header.noActivity");
+    ? `Last active ${formatLastSeen(user.last_active_at)}`
+    : "No recorded activity";
   const meta: Array<{ key: string; node: ReactNode; wide?: boolean }> = [
     ...(user.email ? [{ key: "email", node: user.email }] : []),
     ...(user.role !== "admin" && user.access_group_id !== null
       ? [
           {
             key: "group",
-            node: t("web.admin.users.detail.header.group", {
-              name:
-                groupName ??
-                t("web.admin.users.detail.header.groupIdFallback", {
-                  id: user.access_group_id,
-                }),
-              b: (chunks) => <span className="text-foreground font-medium">{chunks}</span>,
-            }),
+            node: (
+              <>
+                Group:{" "}
+                <span className="text-foreground font-medium">
+                  {groupName ?? `#${user.access_group_id}`}
+                </span>
+              </>
+            ),
           },
         ]
       : []),
-    {
-      key: "joined",
-      node: t("web.admin.users.detail.header.joined", { date: formatAccountDate(user.created_at) }),
-      wide: true,
-    },
+    { key: "joined", node: `Joined ${formatAccountDate(user.created_at)}`, wide: true },
     { key: "active", node: lastActive },
     {
       key: "signin",
-      node: user.password_login
-        ? t("web.admin.users.detail.header.passwordSignIn")
-        : t("web.admin.users.detail.header.externalSignIn"),
+      node: user.password_login ? "Password sign-in" : "External sign-in",
       wide: true,
     },
   ];
@@ -127,26 +113,22 @@ export function UserDetailHeader({
   const showReset = user.password_login && manageable;
   const showSetPassword = !user.password_login && manageable;
   const hasMenu = transferable || canDisable || canEnable || canDelete;
-  const viewAsReasonKey = available
+  const viewAsReason = available
     ? viewAsDisabledReason(user, ownAccount, viewAsDisabled)
     : undefined;
-  const viewAsReason = viewAsReasonKey ? t(viewAsReasonKey) : undefined;
 
   return (
     <div className="space-y-5">
       <nav
-        aria-label={t("web.admin.users.detail.header.breadcrumb")}
+        aria-label="Breadcrumb"
         className="text-muted-foreground flex items-center gap-1.5 text-sm"
       >
-        <Link to="/admin" className={cn("hover:text-foreground transition-colors", TOUCH_HIT_AREA)}>
-          {t("web.admin.users.detail.header.breadcrumbAdmin")}
+        <Link to="/admin" className="hover:text-foreground transition-colors">
+          Admin
         </Link>
         <ChevronRight aria-hidden="true" className="h-3.5 w-3.5" />
-        <Link
-          to="/admin/users"
-          className={cn("hover:text-foreground transition-colors", TOUCH_HIT_AREA)}
-        >
-          {t("web.admin.users.detail.header.breadcrumbUsers")}
+        <Link to="/admin/users" className="hover:text-foreground transition-colors">
+          Users
         </Link>
         <ChevronRight aria-hidden="true" className="h-3.5 w-3.5" />
         <span className="text-foreground min-w-0 truncate font-medium">{user.username}</span>
@@ -166,61 +148,53 @@ export function UserDetailHeader({
               {user.enabled ? (
                 <Badge variant="outline" className="border-success/30 text-success">
                   <span aria-hidden="true" className="bg-success size-1.5 rounded-full" />
-                  {t("web.admin.users.detail.header.status.active")}
+                  Active
                 </Badge>
               ) : (
-                <Badge variant="destructive">
-                  {t("web.admin.users.detail.header.status.disabled")}
-                </Badge>
+                <Badge variant="destructive">Disabled</Badge>
               )}
               {user.password_change_required ? (
                 <Badge
                   variant="outline"
                   className="border-amber-500/30 bg-amber-500/10 text-amber-300"
                 >
-                  {t("web.admin.users.detail.header.temporaryPassword")}
+                  Temporary password
                 </Badge>
               ) : null}
             </div>
-            {/* Each item carries the separator before it, and the list starts one
-                separator's width past the clipped start edge: the separator that
-                opens a line is cut off, so a wrap never leaves one dangling. */}
-            <div className="overflow-hidden">
-              <p className="text-muted-foreground -ms-5 flex flex-wrap items-center gap-y-1 text-sm">
-                {meta.map((item) => (
-                  <span
-                    key={item.key}
-                    className={cn("inline-flex max-w-full min-w-0", item.wide && WIDE_ONLY)}
-                  >
+            <p className="text-muted-foreground flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+              {meta.map((item, index) => (
+                <Fragment key={item.key}>
+                  {index > 0 ? (
                     <span
                       aria-hidden="true"
-                      className="text-muted-foreground/50 w-5 shrink-0 text-center"
+                      className={cn("text-muted-foreground/50", item.wide && WIDE_ONLY)}
                     >
-                      {MIDDLE_DOT}
+                      ·
                     </span>
-                    <span className="min-w-0 wrap-anywhere">{item.node}</span>
-                  </span>
-                ))}
-              </p>
-            </div>
+                  ) : null}
+                  <span className={cn(item.wide && WIDE_ONLY)}>{item.node}</span>
+                </Fragment>
+              ))}
+            </p>
             {!manageable ? (
               <div className="border-info/25 bg-info/5 text-muted-foreground flex items-start gap-2 rounded-xl border px-3 py-2.5 text-sm">
                 <Info aria-hidden="true" className="text-info mt-0.5 size-4 shrink-0" />
                 <span>
                   {user.is_owner
-                    ? t("web.admin.users.detail.header.ownerNotice")
-                    : t("web.admin.users.detail.header.adminNotice")}
+                    ? "This is the server owner. Only the owner can change this account."
+                    : "Only the server owner can change another admin account. You can view it."}
                 </span>
               </div>
             ) : null}
             {!user.enabled ? (
               <div className="border-destructive/30 bg-destructive/10 flex flex-wrap items-center gap-3 rounded-xl border px-3 py-2.5 text-sm">
                 <span className="min-w-0 flex-1 basis-56">
-                  {t("web.admin.users.detail.header.disabledNotice")}
+                  This account can't sign in. Its profiles and history are kept.
                 </span>
                 {manageable && available ? (
                   <Button type="button" variant="outline" size="sm" onClick={onEnable}>
-                    {t("web.admin.users.detail.header.enableAccount")}
+                    Enable account
                   </Button>
                 ) : null}
               </div>
@@ -230,82 +204,73 @@ export function UserDetailHeader({
 
         <div className="flex w-full items-center gap-2 sm:w-auto sm:shrink-0">
           {/* A disabled button gets no pointer events, so its wrapper carries the reason. */}
-          <span title={viewAsReason} className="flex min-w-0 flex-1 sm:flex-none">
+          <span title={viewAsReason} className="flex flex-1 sm:flex-none">
             <Button
               type="button"
               variant="outline"
               size="sm"
-              className={HEADER_ACTION}
+              className="flex-1"
               onClick={onViewAs}
               disabled={!available || viewAsDisabled}
               aria-description={viewAsReason}
             >
-              {t("web.admin.users.detail.header.viewAs")}
+              View as user
             </Button>
           </span>
           {/* A reset link needs password sign-in on. An account without it (one a
               sign-in provider manages) gets a password set directly on the
               Sign-in tab, and setting one turns its password sign-in back on. */}
           {showReset ? (
-            <span className="flex min-w-0 flex-1 sm:flex-none">
+            <span className="flex flex-1 sm:flex-none">
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                className={HEADER_ACTION}
+                className="flex-1"
                 onClick={onResetPassword}
                 disabled={!available}
               >
-                {t("web.admin.users.detail.header.resetPassword")}
+                Reset password
               </Button>
             </span>
           ) : null}
           {showSetPassword ? (
-            <span className="flex min-w-0 flex-1 sm:flex-none">
+            <span className="flex flex-1 sm:flex-none">
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                className={HEADER_ACTION}
+                className="flex-1"
                 onClick={onSetPassword}
                 disabled={!available || !user.enabled}
               >
-                {t("web.admin.users.detail.header.setPassword")}
+                Set password
               </Button>
             </span>
           ) : null}
           {hasMenu ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon-sm"
-                  aria-label={t("web.admin.users.detail.header.moreActions")}
-                >
+                <Button type="button" variant="outline" size="icon-sm" aria-label="More actions">
                   <MoreHorizontal />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className={cn("min-w-52", TOUCH_TARGETS)}>
+              <DropdownMenuContent align="end" className="min-w-52">
                 {transferable ? (
                   <DropdownMenuItem disabled={!available} onSelect={onTransfer}>
-                    {t("web.admin.users.detail.header.makeOwner")}
-                    <span className="text-muted-foreground ms-auto text-xs">
-                      {t("web.admin.users.detail.header.makeOwnerHint")}
-                    </span>
+                    Make owner
+                    <span className="text-muted-foreground ml-auto text-xs">owner only</span>
                   </DropdownMenuItem>
                 ) : null}
                 {canDisable ? (
                   <DropdownMenuItem disabled={!available} onSelect={onDisable}>
-                    {t("web.admin.users.detail.header.disableAccount")}
-                    <span className="text-muted-foreground ms-auto text-xs">
-                      {t("web.admin.users.detail.header.disableHint")}
-                    </span>
+                    Disable account
+                    <span className="text-muted-foreground ml-auto text-xs">keeps data</span>
                   </DropdownMenuItem>
                 ) : null}
                 {canEnable ? (
                   <DropdownMenuItem disabled={!available} onSelect={onEnable}>
-                    {t("web.admin.users.detail.header.enableAccount")}
+                    Enable account
                   </DropdownMenuItem>
                 ) : null}
                 {canDelete ? (
@@ -316,10 +281,10 @@ export function UserDetailHeader({
                       disabled={!available || deleteBlocked}
                       onSelect={onDelete}
                     >
-                      {t("web.admin.users.detail.header.deleteAccount")}
+                      Delete account…
                       {deleteBlocked ? (
-                        <span className="text-muted-foreground ms-auto text-xs">
-                          {t("web.admin.users.detail.header.deleteBlockedHint")}
+                        <span className="text-muted-foreground ml-auto text-xs">
+                          save or cancel edits first
                         </span>
                       ) : null}
                     </DropdownMenuItem>

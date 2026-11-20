@@ -55,21 +55,6 @@ var (
 // before fetching the file again.
 var TypePreparedFileExpired = ProblemType{"prepared_file_expired", http.StatusConflict, "Prepared file expired"}
 
-// TypeDeviceBindingMismatch: a poll of a device sign-in request started with
-// a session binding did not carry the secret the binding was made from
-// (docs/architecture/device-login.md, "Session binding").
-var TypeDeviceBindingMismatch = ProblemType{"device_binding_mismatch", http.StatusForbidden, "Device binding mismatch"}
-
-// TypeRestoreSetChanged: a restore request carries a digest the backup's
-// restore set no longer has; preview the backup again.
-var TypeRestoreSetChanged = ProblemType{"restore_set_changed", http.StatusConflict, "Restore set changed"}
-
-// TypeBackupUnauthenticated: this server cannot authenticate the backup's
-// manifest (another SECRET_KEY, or a build that did not record what checking
-// it needs), so it reads the backup only with the admin's confirmation
-// (accept_unauthenticated).
-var TypeBackupUnauthenticated = ProblemType{"backup_unauthenticated", http.StatusConflict, "Backup not authenticated"}
-
 // ProblemType is one entry of the shared problem catalog.
 type ProblemType struct {
 	// ID is the stable identifier and the final path segment of the type URI.
@@ -125,7 +110,7 @@ var (
 	TypeCapabilityUnsupported                         = ProblemType{"capability_unsupported", http.StatusNotImplemented, "Capability unsupported"}
 	TypeDependencyUnavailable                         = ProblemType{"dependency_unavailable", http.StatusServiceUnavailable, "Dependency unavailable"}
 	TypeClientUpgradeRequired                         = ProblemType{"client_upgrade_required", http.StatusGone, "Client upgrade required"}
-	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypePushInstallationKeyMismatch, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired, TypeDeviceBindingMismatch, TypeRestoreSetChanged, TypeBackupUnauthenticated, TypeUploadLimitReached}
+	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypePushInstallationKeyMismatch, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired}
 	defaultTypeByStatus                               = map[int]ProblemType{}
 	problemContentType                                = "application/problem+json"
 	_                               error             = (*Problem)(nil)
@@ -176,10 +161,6 @@ type Problem struct {
 	headers http.Header
 }
 
-// validationSummary is the detail of a validation failure whose reasons are
-// only in its field errors.
-const validationSummary = "The request did not pass validation; see errors."
-
 // NewProblem builds an application problem of type t.
 func NewProblem(t ProblemType, detail string) *Problem {
 	return &Problem{Type: t.URI(), Title: t.Title, Status: t.Status, Detail: detail}
@@ -189,15 +170,6 @@ func NewProblem(t ProblemType, detail string) *Problem {
 func (p *Problem) WithErrors(errs ...ProblemError) *Problem {
 	p.Errors = append(p.Errors, errs...)
 	return p
-}
-
-// promoteSoleFieldDetail gives a validation failure that says only "see
-// errors" its one field error's reason as the detail, so a client that shows
-// the detail (as English clients do) tells the user what to fix.
-func (p *Problem) promoteSoleFieldDetail() {
-	if p.Detail == validationSummary && len(p.Errors) == 1 && p.Errors[0].Detail != "" {
-		p.Detail = p.Errors[0].Detail
-	}
 }
 
 // WithHeader adds a response header (Retry-After, Location, ...).
@@ -371,7 +343,7 @@ func humaStatusType(status int, msg string) ProblemType {
 func humaDetail(t ProblemType, msg string, bodyLimit int64) string {
 	switch t.ID {
 	case TypeValidationFailed.ID:
-		return validationSummary
+		return "The request did not pass validation; see errors."
 	case TypeMalformedRequest.ID:
 		return "The request could not be parsed."
 	case TypeNotAcceptable.ID:
@@ -394,27 +366,17 @@ func humaDetail(t ProblemType, msg string, bodyLimit int64) string {
 // Error codes carried in Problem.errors[].code. They are contract values
 // (docs/architecture/api-contract.md, "Problem Details"); add, never rename.
 const (
-	codeInvalid     = "invalid"
-	codeInvalidType = "invalid_type"
-	codeInvalidEnum = "invalid_enum"
-	codeRequired    = "required"
-	codeOutOfRange  = "out_of_range"
-	// codeDuplicate: the value, such as a name, is already taken by another
-	// item of the same kind.
-	codeDuplicate        = "duplicate"
+	codeInvalid          = "invalid"
+	codeInvalidType      = "invalid_type"
+	codeInvalidEnum      = "invalid_enum"
+	codeRequired         = "required"
+	codeOutOfRange       = "out_of_range"
 	codeUnknownField     = "unknown_field"
 	codeUnknownParameter = "unknown_parameter"
 	codeMalformedJSON    = "malformed_json"
 	codeMalformedForm    = "malformed_form"
-	// codeManagedByEnvironment refuses a change to a field a stream node
-	// declares from its own environment (env_managed on an admin node).
-	codeManagedByEnvironment = "managed_by_environment"
 
-	locationBody     = "body"
-	locationBodyFile = "body.file"
-
-	// The detail of a required image upload's missing file part.
-	detailImageFileRequired = "an image file is required"
+	locationBody = "body"
 )
 
 // validationCode maps Huma's validation messages onto stable codes. A message
@@ -528,7 +490,6 @@ func problemTransformer(ctx huma.Context, _ string, v any) (any, error) {
 	if p.Instance == "" {
 		p.Instance = requestInstance(requestIDFrom(ctx.Context()))
 	}
-	p.promoteSoleFieldDetail()
 	noteProblem(ctx.Context(), p)
 	return p, nil
 }
@@ -539,7 +500,6 @@ func writeProblem(w http.ResponseWriter, r *http.Request, p *Problem) {
 	if p.Instance == "" {
 		p.Instance = requestInstance(requestIDFrom(r.Context()))
 	}
-	p.promoteSoleFieldDetail()
 	noteProblem(r.Context(), p)
 	h := w.Header()
 	for name, values := range p.GetHeaders() {

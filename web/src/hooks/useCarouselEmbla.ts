@@ -2,22 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EmblaCarouselType, EmblaOptionsType } from "embla-carousel";
 import useEmblaCarousel from "embla-carousel-react";
 import { WheelGesturesPlugin } from "embla-carousel-wheel-gestures";
-import { Direction } from "radix-ui";
 import {
   createCarouselResizeController,
   getCarouselEmblaOptions,
   getCarouselWheelGestureOptions,
-  wheelGesturesForDirection,
 } from "@/lib/carouselEmbla";
-import { prefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
 
 interface UseCarouselEmblaOptions {
   options?: EmblaOptionsType;
 }
 
 export function useCarouselEmbla({ options }: UseCarouselEmblaOptions = {}) {
-  // Embla reinitialises when the options change, so a language switch re-lays the slides.
-  const direction = Direction.useDirection();
   const [canScrollPrev, setCanScrollPrev] = useState(false);
   const [canScrollNext, setCanScrollNext] = useState(false);
   const canScrollPrevRef = useRef(false);
@@ -32,7 +27,6 @@ export function useCarouselEmbla({ options }: UseCarouselEmblaOptions = {}) {
   const emblaOptions = useMemo(
     () =>
       getCarouselEmblaOptions({
-        direction,
         ...options,
         // Preserve deliberate opt-outs and custom observers. `true` means the
         // shared default, which is the coalesced path for every Silo carousel.
@@ -41,12 +35,9 @@ export function useCarouselEmbla({ options }: UseCarouselEmblaOptions = {}) {
             ? options.watchResize
             : resizeController.watchResize,
       }),
-    [direction, options, resizeController],
+    [options, resizeController],
   );
-  const emblaPlugins = useMemo(
-    () => [wheelGesturesForDirection(WheelGesturesPlugin(getCarouselWheelGestureOptions()))],
-    [],
-  );
+  const emblaPlugins = useMemo(() => [WheelGesturesPlugin(getCarouselWheelGestureOptions())], []);
   const [emblaRef, emblaApi] = useEmblaCarousel(emblaOptions, emblaPlugins);
 
   const updateScrollState = useCallback((api: EmblaCarouselType) => {
@@ -78,13 +69,12 @@ export function useCarouselEmbla({ options }: UseCarouselEmblaOptions = {}) {
     };
   }, [emblaApi, updateScrollState]);
 
-  // Under reduced motion a page turn jumps instead of sliding a row of slides.
   const scrollPrev = useCallback(() => {
-    emblaApi?.scrollPrev(prefersReducedMotion());
+    emblaApi?.scrollPrev();
   }, [emblaApi]);
 
   const scrollNext = useCallback(() => {
-    emblaApi?.scrollNext(prefersReducedMotion());
+    emblaApi?.scrollNext();
   }, [emblaApi]);
 
   return {

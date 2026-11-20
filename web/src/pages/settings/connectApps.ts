@@ -1,7 +1,10 @@
 import type { Profile } from "@/api/types";
 import type { AccountIdentity } from "@/hooks/queries/account";
 import type { AuthProviderOption } from "@/hooks/useAuth";
-import { t } from "@/i18n";
+
+export const SILO_APP_EXAMPLES = "Silo for iPhone, Apple TV, Android, Android TV, and this website";
+
+export const JELLYFIN_APP_EXAMPLES = "Infuse, Swiftfin, JellyCon, Findroid, Jellyfin Media Player";
 
 /**
  * Builds the username a Jellyfin-protocol client must send.
@@ -29,7 +32,7 @@ export function buildJellyfinUsername(accountUsername: string, profileName: stri
  */
 export function jellyfinUsernameIssue(profileName: string): string | null {
   if (profileName.includes("#")) {
-    return t("web.settings.connectApps.usernameIssue");
+    return "This profile's name contains a #, which Jellyfin apps can't sign in with. Rename it in Settings → Profiles to use it from one.";
   }
   return null;
 }
@@ -65,11 +68,11 @@ export function buildJellyfinPasswordHint(
   profile: Pick<Profile, "name" | "has_pin"> | null,
 ): string {
   if (!profile) {
-    return t("web.settings.connectApps.passwordHint.noProfile");
+    return "Your account password.";
   }
   return profile.has_pin
-    ? t("web.settings.connectApps.passwordHint.pin", { name: profile.name })
-    : t("web.settings.connectApps.passwordHint.noPin", { name: profile.name });
+    ? `${profile.name} has a PIN, so append # and the PIN to your account password.`
+    : `${profile.name} has no PIN — just your account password, nothing appended.`;
 }
 
 /**

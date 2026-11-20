@@ -316,7 +316,7 @@ type ItemDetail struct {
 	IsSpecials     bool            `json:"is_specials,omitempty"`
 	SeasonUserData *SeasonUserData `json:"user_data,omitempty"`
 	UserState      *ItemUserState  `json:"user_state,omitempty"`
-	UserRating     *int            `json:"user_rating,omitempty"` // 1 to 10
+	UserRating     *int            `json:"user_rating,omitempty"`
 
 	// File versions available for playback.
 	Versions         []FileVersion     `json:"versions"`
@@ -443,15 +443,11 @@ type AudiobookRelatedContent struct {
 }
 
 type AudiobookRelatedItem struct {
-	ContentID       string   `json:"content_id"`
-	Title           string   `json:"title"`
-	Year            int      `json:"year,omitempty"`
-	PosterURL       string   `json:"poster_url,omitempty" format:"uri-reference"`
-	PosterThumbhash string   `json:"poster_thumbhash,omitempty" doc:"The poster's ThumbHash, for a blurred preview while poster_url loads"`
-	SeriesIndex     *int     `json:"series_index,omitempty"`
-	DurationSeconds int      `json:"duration_seconds,omitempty" doc:"Audiobooks only: total listening time, summed over the book's files the viewer can play, as the book's own total_duration_seconds is. Absent for ebooks and when no file reports a duration" example:"41520"`
-	Played          bool     `json:"played,omitempty" doc:"The profile finished this book, by the rule a catalog card's user_state.played follows: an audiobook's visible progress or a visible completed history row, an ebook's reading progress. Absent when false and without a profile" example:"true"`
-	ProgressRatio   *float64 `json:"progress_ratio,omitempty" minimum:"0" maximum:"1" doc:"How far the profile is into the book, 0-1: listening position over the progress row's duration for an audiobook, reading progress for an ebook. Present only while the book is started and not played" example:"0.42"`
+	ContentID   string `json:"content_id"`
+	Title       string `json:"title"`
+	Year        int    `json:"year,omitempty"`
+	PosterURL   string `json:"poster_url,omitempty" format:"uri-reference"`
+	SeriesIndex *int   `json:"series_index,omitempty"`
 }
 
 type AudiobookSeriesGroup struct {
@@ -680,7 +676,7 @@ type VersionSubtitleTrack struct {
 	Default         bool   `json:"default"`
 	HearingImpaired bool   `json:"hearing_impaired"`
 	External        bool   `json:"external"`
-	FileName        string `json:"file_name,omitempty" doc:"An external track's file name; absent for viewers without file-path visibility, except on audiobooks and ebooks"`
+	FileName        string `json:"file_name,omitempty"`
 	// IndexOnly is models.SubtitleTrack.IndexOnly, for planners that read
 	// this projection.
 	IndexOnly bool `json:"-"`
@@ -1385,33 +1381,18 @@ func (s *DetailService) pendingPresentationLanguage(ctx context.Context, filter 
 	return language, err
 }
 
-// validatePresentationItemAccess checks that the presentation library holds
-// at least one of contentIDs.
-func (s *DetailService) validatePresentationItemAccess(ctx context.Context, filter AccessFilter, contentIDs ...string) error {
+func (s *DetailService) validatePresentationItemAccess(ctx context.Context, filter AccessFilter, contentID string) error {
 	if filter.PresentationLibraryID == nil {
 		return nil
 	}
-	membership, err := s.itemRepo.GetItemsInLibrary(ctx, contentIDs, *filter.PresentationLibraryID)
+	membership, err := s.itemRepo.GetItemsInLibrary(ctx, []string{contentID}, *filter.PresentationLibraryID)
 	if err != nil {
 		return err
 	}
-	for _, contentID := range contentIDs {
-		if membership[contentID] {
-			return nil
-		}
+	if !membership[contentID] {
+		return ErrItemNotFound
 	}
-	return ErrItemNotFound
-}
-
-// validatePresentationEpisodeAccess accepts the series' library for opted-in
-// native reads, matching the series' episode lists. File access is checked
-// separately; this does not grant access to files in another library.
-func (s *DetailService) validatePresentationEpisodeAccess(ctx context.Context, filter AccessFilter, episode *models.Episode) error {
-	memberIDs := []string{episode.ContentID}
-	if filter.SeriesLibraryCoversEpisodes {
-		memberIDs = append(memberIDs, episode.SeriesID)
-	}
-	return s.validatePresentationItemAccess(ctx, filter, memberIDs...)
+	return nil
 }
 
 func sameMetadataLanguage(a, b string) bool {
@@ -1790,29 +1771,12 @@ func (s *DetailService) GetItemDetailWithOptions(ctx context.Context, contentID 
 	}
 }
 
-const (
-	detailTypeAudiobook = "audiobook"
-	detailTypeEbook     = "ebook"
-	detailTypeEpisode   = "episode"
-	detailTypeExtra     = "extra"
-)
+const detailTypeAudiobook = "audiobook"
 
 // GetItemVersions builds the browse version selector without loading unrelated
 // presentation data. It shares detail authorization and playback metadata, but
 // does not require localization, credits, artwork, or recommendations to succeed.
 func (s *DetailService) GetItemVersions(ctx context.Context, contentID string, filter AccessFilter) ([]FileVersion, error) {
-	return s.GetItemVersionsWithOptions(ctx, contentID, filter, ItemVersionsOptions{})
-}
-
-// ItemVersionsOptions shapes what GetItemVersionsWithOptions answers.
-type ItemVersionsOptions struct {
-	// HideFileIdentity strips file identity for a viewer who may not see it
-	// (see HideFileIdentity).
-	HideFileIdentity bool
-}
-
-// GetItemVersionsWithOptions is GetItemVersions shaped by opts.
-func (s *DetailService) GetItemVersionsWithOptions(ctx context.Context, contentID string, filter AccessFilter, opts ItemVersionsOptions) ([]FileVersion, error) {
 	target, err := s.resolveDetailTarget(ctx, contentID, filter)
 	if err != nil {
 		return nil, err
@@ -1843,17 +1807,6 @@ func (s *DetailService) GetItemVersionsWithOptions(ctx context.Context, contentI
 	}
 	files = s.prepareBrowseFiles(ctx, files)
 	versions, _, _, _, _, _, _ := s.buildPlaybackInfo(ctx, files, filter, audioPreferenceContentID)
-	itemType := detailTypeExtra
-	switch {
-	case target.item != nil:
-		itemType = target.item.Type
-	case target.episode != nil:
-		itemType = detailTypeEpisode
-	}
-	sortVideoVersions(itemType, versions)
-	if opts.HideFileIdentity {
-		HideFileIdentity(versions, itemType)
-	}
 	return versions, nil
 }
 
@@ -1928,7 +1881,7 @@ func (s *DetailService) resolveDetailTarget(ctx context.Context, contentID strin
 	if err := s.itemRepo.EnsureAccessible(ctx, episode.SeriesID, filter); err != nil {
 		return nil, err
 	}
-	if err := s.validatePresentationEpisodeAccess(ctx, filter, episode); err != nil {
+	if err := s.validatePresentationItemAccess(ctx, filter, episode.ContentID); err != nil {
 		return nil, err
 	}
 	return &detailTarget{episode: episode}, nil
@@ -1968,7 +1921,6 @@ func (s *DetailService) buildExtraItemDetail(ctx context.Context, extra *models.
 		trickplay,
 		markerPreviews,
 	)
-	sortVideoVersions(detail.Type, detail.Versions)
 	if parent, parentErr := s.itemRepo.GetByID(ctx, extra.ParentID); parentErr == nil {
 		if localized, locErr := s.LocalizeItemModel(ctx, parent, filter); locErr == nil {
 			parent = localized
@@ -2105,33 +2057,19 @@ func (s *DetailService) GetEpisodeDetailsForSeries(
 		// A failed optional batch leaves the per-episode reads in place. Their
 		// existing error handling skips only the detail that could not be built.
 	}
-	// One read for the whole page, rather than one per episode.
-	episodes, err := s.episodeRepo.GetByIDs(ctx, episodeContentIDs)
-	if err != nil {
-		return nil, err
-	}
-	episodesByID := make(map[string]*models.Episode, len(episodes))
-	for _, episode := range episodes {
-		if episode != nil {
-			episodesByID[episode.ContentID] = episode
-		}
-	}
-	// One membership read for the page. Each episode must itself be in the
-	// presentation library, as validatePresentationItemAccess requires of one ID.
-	var inLibrary map[string]bool
-	if filter.PresentationLibraryID != nil {
-		inLibrary, err = s.itemRepo.GetItemsInLibrary(ctx, episodeContentIDs, *filter.PresentationLibraryID)
+	for _, contentID := range episodeContentIDs {
+		episode, err := s.episodeRepo.GetByID(ctx, contentID)
 		if err != nil {
+			if errors.Is(err, ErrEpisodeNotFound) {
+				continue
+			}
 			return nil, err
 		}
-	}
-	for _, contentID := range episodeContentIDs {
-		episode := episodesByID[contentID]
-		if episode == nil {
-			continue
-		}
-		if filter.PresentationLibraryID != nil && !inLibrary[contentID] {
-			continue
+		if err := s.validatePresentationItemAccess(ctx, filter, contentID); err != nil {
+			if errors.Is(err, ErrItemNotFound) {
+				continue
+			}
+			return nil, err
 		}
 		detail, err := s.buildEpisodeDetail(ctx, episode, seriesCtx, filter)
 		if err != nil {
@@ -2693,7 +2631,6 @@ func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.M
 		detail.Versions, detail.PlaybackVariants, detail.Subtitles, detail.Intro, detail.Credits, detail.Recap, detail.Preview = s.buildPlaybackInfoWith(
 			ctx, files, filter, audioResolver, availability, pf == nil || !pf.skipMarkerPreviews,
 		)
-		sortVideoVersions(item.Type, detail.Versions)
 		detail.OverlaySummary = overlays.BuildSummary(files)
 		if withSubtitleDefaults {
 			if !subtitlesResolved {
@@ -2958,7 +2895,6 @@ func (s *DetailService) buildAudiobookExtension(
 	go func() { defer wg.Done(); alsoByAuthor = s.fetchAudiobookAlsoByAuthor(ctx, item.ContentID, filter) }()
 	go func() { defer wg.Done(); similar = s.fetchAudiobookSimilarByGenres(ctx, item.ContentID, filter) }()
 	wg.Wait()
-	s.applyRelatedBookStates(ctx, detailTypeAudiobook, filter, series, alsoByAuthor, similar)
 
 	return &AudiobookDetailExtension{
 		Authors:              audiobookPeopleFromCrew(crew, models.PersonKindAuthor.String()),
@@ -2997,7 +2933,6 @@ func (s *DetailService) buildEbookExtension(
 	go func() { defer wg.Done(); alsoByAuthor = s.fetchEbookAlsoByAuthor(ctx, item.ContentID, filter) }()
 	go func() { defer wg.Done(); similar = s.fetchEbookSimilarByGenres(ctx, item.ContentID, filter) }()
 	wg.Wait()
-	s.applyRelatedBookStates(ctx, detailTypeEbook, filter, series, alsoByAuthor, similar)
 
 	return &EbookDetailExtension{
 		Authors:   audiobookPeopleFromCrew(crew, models.PersonKindAuthor.String()),
@@ -3131,31 +3066,10 @@ func appendAudiobookItemAccessConditions(
 	args *[]any,
 	argIdx *int,
 ) bool {
-	return appendLibraryAudiobookAccessConditions(alias, 0, filter, conditions, args, argIdx)
-}
-
-// appendLibraryAudiobookAccessConditions is appendAudiobookItemAccessConditions
-// for a query whose every row is joined to the item's media_item_libraries row
-// in libraryID (0 when the query joins none). That row already proves the item
-// sits in a library, and in an allowed one when libraryID is allowed, so those
-// EXISTS checks are left out. The disabled-library and rating checks stay.
-func appendLibraryAudiobookAccessConditions(
-	alias string,
-	libraryID int,
-	filter AccessFilter,
-	conditions *[]string,
-	args *[]any,
-	argIdx *int,
-) bool {
-	joined := libraryID > 0
-	switch {
-	case filter.AllowedLibraryIDs == nil:
-		if !joined {
-			*conditions = append(*conditions, InSomeLibraryWhere(alias+".content_id"))
+	if filter.AllowedLibraryIDs != nil {
+		if len(filter.AllowedLibraryIDs) == 0 {
+			return false
 		}
-	case len(filter.AllowedLibraryIDs) == 0:
-		return false
-	case !joined || !slices.Contains(filter.AllowedLibraryIDs, libraryID):
 		*conditions = append(*conditions, fmt.Sprintf(`
 			EXISTS (
 				SELECT 1 FROM media_item_libraries mil_allowed
@@ -3164,6 +3078,8 @@ func appendLibraryAudiobookAccessConditions(
 			)`, alias, *argIdx))
 		*args = append(*args, filter.AllowedLibraryIDs)
 		*argIdx = *argIdx + 1
+	} else {
+		*conditions = append(*conditions, InSomeLibraryWhere(alias+".content_id"))
 	}
 	if len(filter.DisabledLibraryIDs) > 0 {
 		*conditions = append(*conditions, fmt.Sprintf(`
@@ -3177,149 +3093,6 @@ func appendLibraryAudiobookAccessConditions(
 	}
 	ApplySectionAccessFilter(alias, AccessFilter{MaturityLimits: filter.MaturityLimits}, conditions, args, argIdx)
 	return true
-}
-
-// relatedBookDurationSQL selects the total listening time of the audiobook at
-// alias: the durations of its present files the viewer may play, summed as
-// total_duration_seconds is. MediaFileAccessSQL is the SQL form of the access
-// rule the detail page filters those files by; like every SQL caller it leaves
-// out the Go-only presentation-library scope, which belongs to the opened
-// book, not to the books beside it. Ebooks have no listening time and select 0.
-func relatedBookDurationSQL(alias, mediaType string, filter AccessFilter, args *[]any, argIdx *int) string {
-	if mediaType != detailTypeAudiobook {
-		return "0"
-	}
-	conditions := []string{
-		"mf.content_id = " + alias + ".content_id",
-		playableFileExists,
-		"mf.duration > 0",
-	}
-	conditions = append(conditions, mediaFileAccessConditions("mf", filter, func(value any) int {
-		*args = append(*args, value)
-		*argIdx = len(*args) + 1
-		return len(*args)
-	})...)
-	return "(SELECT COALESCE(SUM(mf.duration), 0) FROM media_files mf WHERE " + strings.Join(conditions, " AND ") + ")"
-}
-
-// relatedBookState is the profile's state on one related book.
-type relatedBookState struct {
-	played bool
-	ratio  *float64
-}
-
-// applyRelatedBookStates sets Played and ProgressRatio on the related books of
-// a book page, the series entries and the related rows, with one lookup for
-// all of them. Without a profile they stay unset.
-func (s *DetailService) applyRelatedBookStates(ctx context.Context, mediaType string, filter AccessFilter, series *AudiobookSeriesGroup, lists ...[]AudiobookRelatedItem) {
-	if s == nil || filter.UserID == 0 || filter.ProfileID == "" {
-		return
-	}
-	if series != nil {
-		lists = append(lists, series.Entries)
-	}
-	ids := make([]string, 0, 54)
-	seen := make(map[string]struct{}, 54)
-	for _, list := range lists {
-		for _, item := range list {
-			if _, ok := seen[item.ContentID]; !ok {
-				seen[item.ContentID] = struct{}{}
-				ids = append(ids, item.ContentID)
-			}
-		}
-	}
-	if len(ids) == 0 {
-		return
-	}
-	var states map[string]relatedBookState
-	switch mediaType {
-	case detailTypeAudiobook:
-		states = s.audiobookListeningStates(ctx, filter, ids)
-	case detailTypeEbook:
-		states = s.ebookReadingStates(ctx, filter, ids)
-	}
-	for _, list := range lists {
-		for i := range list {
-			state := states[list[i].ContentID]
-			list[i].Played, list[i].ProgressRatio = state.played, state.ratio
-		}
-	}
-}
-
-// audiobookListeningStates reads the profile's audiobook state through
-// ListProgressWithCompletedHistory, the read a catalog card's
-// user_state.played follows: played on visible completed progress or a
-// visible completed history row, in progress on a visible unfinished
-// position. A failed read leaves every book unset; the rows are decoration.
-func (s *DetailService) audiobookListeningStates(ctx context.Context, filter AccessFilter, ids []string) map[string]relatedBookState {
-	if s.userStoreProvider == nil {
-		return nil
-	}
-	store, err := s.userStoreProvider.ForUser(ctx, filter.UserID)
-	if err != nil || store == nil {
-		return nil
-	}
-	progress, err := userstore.ListProgressWithCompletedHistory(ctx, store, filter.ProfileID, ids)
-	if err != nil {
-		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "related audiobooks: listening state", "component", "catalog", "error", err)
-		return nil
-	}
-	states := make(map[string]relatedBookState, len(progress))
-	for id, p := range progress {
-		switch {
-		case p.Completed:
-			states[id] = relatedBookState{played: true}
-		case p.PositionSeconds > 0 && p.DurationSeconds > 0:
-			states[id] = relatedBookState{ratio: new(min(p.PositionSeconds/p.DurationSeconds, 1))}
-		}
-	}
-	return states
-}
-
-// ebookReadingStates reads the profile's ebook reading progress, finished at
-// the threshold every ebook surface uses (see mangaChaptersQuery). A row the
-// profile hid from history stays out until reading moves it past the hide,
-// as in the ebook progress store's ListByContentIDs.
-func (s *DetailService) ebookReadingStates(ctx context.Context, filter AccessFilter, ids []string) map[string]relatedBookState {
-	if s.itemRepo == nil || s.itemRepo.pool == nil {
-		return nil
-	}
-	rows, err := s.itemRepo.pool.Query(ctx, `
-		SELECT erp.content_id, erp.progress
-		FROM ebook_reader_progress erp
-		WHERE erp.user_id = $1 AND erp.profile_id = $2 AND erp.content_id = ANY($3::text[])
-		  AND NOT EXISTS (
-			SELECT 1
-			FROM user_history_hidden_items hhi
-			WHERE hhi.user_id = erp.user_id
-			  AND hhi.profile_id = erp.profile_id
-			  AND hhi.media_item_id = erp.content_id
-			  AND erp.updated_at <= hhi.hidden_before
-		  )`,
-		filter.UserID, filter.ProfileID, ids)
-	if err != nil {
-		slog.Log(ctx, ctxerr.LogLevel(ctx, err, slog.LevelWarn), "related ebooks: reading state", "component", "catalog", "error", err)
-		return nil
-	}
-	defer rows.Close()
-	states := make(map[string]relatedBookState, len(ids))
-	for rows.Next() {
-		var id string
-		var progress float64
-		if err := rows.Scan(&id, &progress); err != nil {
-			return nil
-		}
-		switch {
-		case progress >= models.EbookFinishedProgressThreshold:
-			states[id] = relatedBookState{played: true}
-		case progress > 0:
-			states[id] = relatedBookState{ratio: new(progress)}
-		}
-	}
-	if rows.Err() != nil {
-		return nil
-	}
-	return states
 }
 
 func (s *DetailService) fetchAudiobookAlsoByAuthor(ctx context.Context, contentID string, filter AccessFilter) []AudiobookRelatedItem {
@@ -3344,10 +3117,8 @@ func (s *DetailService) fetchBookAlsoByAuthor(ctx context.Context, contentID str
 	if !appendAudiobookItemAccessConditions("m2", filter, &conditions, &args, &argIdx) {
 		return []AudiobookRelatedItem{}
 	}
-	duration := relatedBookDurationSQL("m2", mediaType, filter, &args, &argIdx)
 	query := fmt.Sprintf(`
-		SELECT m2.content_id, m2.title, COALESCE(m2.year, 0), COALESCE(m2.poster_path, ''),
-			COALESCE(m2.poster_thumbhash, ''), %s
+		SELECT m2.content_id, m2.title, COALESCE(m2.year, 0), COALESCE(m2.poster_path, '')
 		FROM item_people ip1
 		JOIN item_people ip2
 		  ON ip2.person_id = ip1.person_id
@@ -3357,7 +3128,7 @@ func (s *DetailService) fetchBookAlsoByAuthor(ctx context.Context, contentID str
 		WHERE %s
 		ORDER BY m2.year DESC NULLS LAST, LOWER(m2.sort_title)
 		LIMIT 12
-	`, duration, strings.Join(conditions, " AND "))
+	`, strings.Join(conditions, " AND "))
 	rows, err := s.itemRepo.pool.Query(ctx, query, args...)
 	if err != nil {
 		return []AudiobookRelatedItem{}
@@ -3369,7 +3140,7 @@ func (s *DetailService) fetchBookAlsoByAuthor(ctx context.Context, contentID str
 	for rows.Next() {
 		var item AudiobookRelatedItem
 		var posterPath string
-		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &posterPath, &item.PosterThumbhash, &item.DurationSeconds); err != nil {
+		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &posterPath); err != nil {
 			return []AudiobookRelatedItem{}
 		}
 		if _, ok := seen[item.ContentID]; ok {
@@ -3413,7 +3184,6 @@ func (s *DetailService) fetchBookSimilarByGenres(ctx context.Context, contentID 
 	if !appendAudiobookItemAccessConditions("m", filter, &conditions, &args, &argIdx) {
 		return []AudiobookRelatedItem{}
 	}
-	duration := relatedBookDurationSQL("m", mediaType, filter, &args, &argIdx)
 	query := fmt.Sprintf(`
 		WITH this_genres AS (
 			SELECT unnest(genres) AS g FROM media_items WHERE content_id = $1
@@ -3421,8 +3191,7 @@ func (s *DetailService) fetchBookSimilarByGenres(ctx context.Context, contentID 
 		this_author AS (
 			SELECT person_id FROM item_people WHERE content_id = $1 AND kind = $2
 		)
-		SELECT m.content_id, m.title, COALESCE(m.year, 0), COALESCE(m.poster_path, ''),
-			COALESCE(m.poster_thumbhash, ''), %s
+		SELECT m.content_id, m.title, COALESCE(m.year, 0), COALESCE(m.poster_path, '')
 		FROM media_items m
 		WHERE %s
 		ORDER BY
@@ -3434,7 +3203,7 @@ func (s *DetailService) fetchBookSimilarByGenres(ctx context.Context, contentID 
 			COALESCE(m.year, 0) DESC,
 			LOWER(m.sort_title)
 		LIMIT 12
-	`, duration, strings.Join(conditions, " AND "))
+	`, strings.Join(conditions, " AND "))
 	rows, err := s.itemRepo.pool.Query(ctx, query, args...)
 	if err != nil {
 		return []AudiobookRelatedItem{}
@@ -3445,7 +3214,7 @@ func (s *DetailService) fetchBookSimilarByGenres(ctx context.Context, contentID 
 	for rows.Next() {
 		var item AudiobookRelatedItem
 		var posterPath string
-		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &posterPath, &item.PosterThumbhash, &item.DurationSeconds); err != nil {
+		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &posterPath); err != nil {
 			return []AudiobookRelatedItem{}
 		}
 		item.PosterURL = s.presignAudiobookPosterURL(ctx, posterPath, filter)
@@ -3483,15 +3252,12 @@ func (s *DetailService) fetchBookSeries(ctx context.Context, contentID string, m
 	if !appendAudiobookItemAccessConditions("m", filter, &conditions, &args, &argIdx) {
 		return nil
 	}
-	duration := relatedBookDurationSQL("m", mediaType, filter, &args, &argIdx)
 	query := fmt.Sprintf(`
 		SELECT
 			m.content_id,
 			m.title,
 			COALESCE(m.year, 0),
 			COALESCE(m.poster_path, ''),
-			COALESCE(m.poster_thumbhash, ''),
-			%s,
 			s.series_name,
 			s.series_index
 		FROM %s root
@@ -3500,7 +3266,7 @@ func (s *DetailService) fetchBookSeries(ctx context.Context, contentID string, m
 		WHERE %s
 		ORDER BY s.series_index NULLS LAST, LOWER(m.sort_title)
 		LIMIT 30
-	`, duration, tableName, tableName, strings.Join(conditions, " AND "))
+	`, tableName, tableName, strings.Join(conditions, " AND "))
 	rows, err := s.itemRepo.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil
@@ -3516,7 +3282,7 @@ func (s *DetailService) fetchBookSeries(ctx context.Context, contentID string, m
 			name   string
 			index  *float64
 		)
-		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &poster, &item.PosterThumbhash, &item.DurationSeconds, &name, &index); err != nil {
+		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &poster, &name, &index); err != nil {
 			return nil
 		}
 		if seriesName == "" {
@@ -3699,12 +3465,7 @@ func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Se
 		ContentID:                  season.ContentID,
 		Type:                       "season",
 		Title:                      title,
-		OriginalTitle:              season.OriginalTitle,
 		Overview:                   season.Overview,
-		Tagline:                    season.Tagline,
-		ImdbID:                     season.ImdbID,
-		TmdbID:                     season.TmdbID,
-		TvdbID:                     season.TvdbID,
 		PendingTranslationLanguage: pendingTranslation,
 		MachineTranslatedFields:    season.MachineTranslatedFields,
 		PosterThumbhash:            season.PosterThumbhash,
@@ -3714,7 +3475,6 @@ func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Se
 		SeasonNumber:               &seasonNumber,
 		EpisodeCount:               &episodeCount,
 		IsSpecials:                 season.SeasonNumber == 0,
-		LockedFields:               season.LockedFields,
 		Cast:                       castCredits,
 		Crew:                       crewCredits,
 		Versions:                   []FileVersion{},
@@ -3833,10 +3593,7 @@ func (s *DetailService) buildEpisodeDetail(ctx context.Context, episode *models.
 		ContentID:                  episode.ContentID,
 		Type:                       "episode",
 		Title:                      episode.Title,
-		SortTitle:                  episode.SortTitle,
-		OriginalTitle:              episode.OriginalTitle,
 		Overview:                   episode.Overview,
-		Tagline:                    episode.Tagline,
 		PendingTranslationLanguage: pendingTranslation,
 		MachineTranslatedFields:    episode.MachineTranslatedFields,
 		Runtime:                    episode.Runtime,
@@ -3852,7 +3609,6 @@ func (s *DetailService) buildEpisodeDetail(ctx context.Context, episode *models.
 		SeasonNumber:               &seasonNumber,
 		SeasonID:                   episode.SeasonID,
 		EpisodeNumber:              &episodeNumber,
-		LockedFields:               episode.LockedFields,
 		Cast:                       seriesCtx.castCredits,
 		Crew:                       seriesCtx.crewCredits,
 		Versions:                   []FileVersion{},
@@ -3892,7 +3648,6 @@ func (s *DetailService) buildEpisodeDetail(ctx context.Context, episode *models.
 		seriesCtx.trickplay,
 		!seriesCtx.skipMarkerPreviews,
 	)
-	sortVideoVersions(detail.Type, detail.Versions)
 	detail.OverlaySummary = overlays.BuildSummary(files)
 	s.episodeSubtitleDefaults(ctx, seriesCtx, filter, episode.SeriesID, files).applyToItemDetail(detail)
 	versionPref := seriesCtx.versionPref
@@ -3979,7 +3734,7 @@ func (s *DetailService) GetWatchDetail(ctx context.Context, contentID string, fi
 	if err := s.itemRepo.EnsureAccessible(ctx, episode.SeriesID, filter); err != nil {
 		return nil, err
 	}
-	if err := s.validatePresentationEpisodeAccess(ctx, filter, episode); err != nil {
+	if err := s.validatePresentationItemAccess(ctx, filter, episode.ContentID); err != nil {
 		return nil, err
 	}
 	// Seasons and episodes inherit original_language from the parent series.
@@ -4135,7 +3890,6 @@ func (s *DetailService) newWatchDetail(
 		filter,
 		audioPreferenceContentID,
 	)
-	sortVideoVersions(contentType, versions)
 	return &WatchDetail{
 		ContentID:        contentID,
 		Type:             contentType,
@@ -4801,7 +4555,7 @@ func (s *DetailService) buildPlaybackInfoWith(
 			key := fmt.Sprintf("external:%s:%s:%v:%v", sub.Language, sub.Format, sub.Forced, sub.HearingImpaired)
 			if _, exists := subtitleSet[key]; !exists {
 				subtitleSet[key] = SubtitleInfo{
-					Source:          subtitleSourceExternal,
+					Source:          "external",
 					Language:        sub.Language,
 					Codec:           sub.Format,
 					Forced:          sub.Forced,
@@ -4986,27 +4740,6 @@ func playbackVariantID(version FileVersion) string {
 		return "default"
 	}
 	return strings.Join([]string{editionKey, presentationKind, groupKey}, "|")
-}
-
-// sortVideoVersions gives a movie, episode or extra's top-level versions the
-// order sortFileVersions gives each playback variant part, so clients read one
-// ranking from either list. Files that start playback (a single file or a
-// multipart presentation's first part) come before later parts, so a caller
-// taking versions[0] as a default never starts mid-title. The files of other
-// types keep the order their builder chose: an audiobook's files are its parts
-// in sequence.
-func sortVideoVersions(itemType string, versions []FileVersion) {
-	switch itemType {
-	case playableTypeMovie, detailTypeEpisode, detailTypeExtra:
-		sortFileVersions(versions)
-		sort.SliceStable(versions, func(i, j int) bool {
-			return !isLaterPart(versions[i]) && isLaterPart(versions[j])
-		})
-	}
-}
-
-func isLaterPart(v FileVersion) bool {
-	return v.PresentationPartIndex > 1
 }
 
 func sortFileVersions(versions []FileVersion) {
@@ -5203,7 +4936,7 @@ func buildVersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {
 			Index:           nextExternalIndex + i,
 			Language:        sub.Language,
 			Codec:           sub.Format,
-			Title:           firstNonEmpty(sub.Title, sub.FileName()),
+			Title:           firstNonEmpty(sub.Title, fspath.Display(filepath.Base(sub.Path))),
 			TitleIsFallback: strings.TrimSpace(sub.Title) == "",
 			EmbeddedTitle:   sub.EmbeddedTitle,
 			Resolution:      sub.Resolution,
@@ -5211,7 +4944,7 @@ func buildVersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {
 			Default:         sub.Default,
 			HearingImpaired: sub.HearingImpaired,
 			External:        true,
-			FileName:        sub.FileName(),
+			FileName:        fspath.Display(filepath.Base(sub.Path)),
 		})
 	}
 	return tracks

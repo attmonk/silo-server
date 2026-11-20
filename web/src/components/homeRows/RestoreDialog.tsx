@@ -11,71 +11,71 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { useT, type Translate } from "@/i18n";
-import { joinList } from "@/lib/appLocale";
 import type { PageRef } from "@/lib/homeRows/types";
 
 /** Collection rows named in the dialog before it says "and N more". */
 const NAMED_COLLECTION_ROWS = 3;
 
-/**
- * Which pages a sentence names, for the messages' `target` select: Home, one
- * library page, Home and every library page, or every library page (`other`).
- */
-type Target = "home" | "library" | "homeAll" | "other";
+/** "Home" or "the Movies page", for use inside a sentence. */
+function pageName(page: PageRef, label: string): string {
+  return page.kind === "home" ? "Home" : `the ${label} page`;
+}
 
-function targetOf(page: PageRef, restoreAll: boolean): Target {
-  if (!restoreAll) return page.kind === "home" ? "home" : "library";
-  return page.kind === "home" ? "homeAll" : "other";
+function capitalize(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /** "A", "A and B", "A, B and C", "A, B, C and 2 more". */
-function listTitles(t: Translate, titles: string[]): string {
-  const [first = "", second = "", third = ""] = titles;
-  const rest = titles.length - NAMED_COLLECTION_ROWS;
-  if (rest > 0)
-    return t("web.home.rows.restore.listMore", { first, second, third, more_count: rest });
-  if (titles.length === 3) return t("web.home.rows.restore.listTriple", { first, second, third });
-  if (titles.length === 2) return t("web.home.rows.restore.listPair", { first, second });
-  return first;
+function listTitles(titles: string[]): string {
+  const named = titles.slice(0, NAMED_COLLECTION_ROWS);
+  const rest = titles.length - named.length;
+  const parts = rest > 0 ? [...named, `${rest} more`] : named;
+  return parts.length === 1 ? parts[0]! : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
 }
 
-function rowsLine(t: Translate, rowCount: number, page: PageRef, label: string): string {
-  const values = { target: targetOf(page, false), page: label };
-  if (rowCount === 0) return t("web.home.rows.restore.rowsEmpty", values);
-  return t("web.home.rows.restore.rows", { ...values, row_count: rowCount });
+function rowsLine(rowCount: number, name: string): string {
+  if (rowCount === 0) return `${capitalize(name)} gets Silo's default rows.`;
+  return rowCount === 1
+    ? `The 1 row on ${name} is replaced by Silo's default rows.`
+    : `The ${rowCount} rows on ${name} are replaced by Silo's default rows.`;
 }
 
-function collectionLine(t: Translate, titles: string[]): string | null {
+function collectionLine(titles: string[]): string | null {
   if (titles.length === 0) return null;
-  if (titles.length === 1) return t("web.home.rows.restore.collectionOne", { row: titles[0]! });
-  return t("web.home.rows.restore.collectionMany", { rows: listTitles(t, titles) });
+  if (titles.length === 1)
+    return `${titles[0]} shows a collection and is removed. The collection itself stays in Collections.`;
+  return `Rows that show collections, like ${listTitles(titles)}, are removed. The collections themselves stay in Collections.`;
+}
+
+/** Every page the restore changes, for use inside a sentence. */
+function targetName(page: PageRef, label: string, restoreAll: boolean): string {
+  if (!restoreAll) return pageName(page, label);
+  return page.kind === "home" ? "Home and every library page" : "every library page";
+}
+
+/** The profile pages the reset clears: "Home", "Movies page", "library pages"… */
+function profilePagesName(page: PageRef, label: string, restoreAll: boolean): string {
+  if (restoreAll) return page.kind === "home" ? "Home and library pages" : "library pages";
+  return page.kind === "home" ? "Home" : `${label} page`;
 }
 
 function otherPagesLine(
-  t: Translate,
   page: PageRef,
   otherLibraryLabels: string[],
   restoreAll: boolean,
 ): string | null {
-  const libraries = listNames(otherLibraryLabels);
+  const others = otherLibraryLabels.join(", ");
   if (restoreAll) {
+    const restored = `also go back to Silo's default rows, and their collection rows are removed.`;
     return page.kind === "home"
-      ? t("web.home.rows.restore.allFromHome", { libraries })
-      : t("web.home.rows.restore.allFromLibrary", { libraries });
+      ? `Library pages (${others}) ${restored}`
+      : `The other library pages (${others}) ${restored} Home doesn't change.`;
   }
   if (page.kind === "home")
-    return otherLibraryLabels.length > 0
-      ? t("web.home.rows.restore.librariesUnchanged", { libraries })
-      : null;
+    return otherLibraryLabels.length > 0 ? `Library pages (${others}) don't change.` : null;
   return otherLibraryLabels.length > 0
-    ? t("web.home.rows.restore.homeAndLibrariesUnchanged", { libraries })
-    : t("web.home.rows.restore.homeUnchanged");
-}
-
-/** Library names as a list: "Movies, TV Shows" in English. */
-function listNames(names: string[]): string {
-  return joinList(names);
+    ? `Home and the other library pages (${others}) don't change.`
+    : "Home doesn't change.";
 }
 
 function OptionRow({
@@ -166,26 +166,29 @@ export function RestoreDialog({
   onReload: () => void;
   onOpenChange: (open: boolean) => void;
 }) {
-  const t = useT();
   const id = useId();
+  const name = pageName(page, pageLabel);
   const all = restoreAll && otherLibraryLabels.length > 0;
-  const target = { target: targetOf(page, all), page: pageLabel };
+  const target = targetName(page, pageLabel, all);
   const bullets: Array<[LucideIcon, string | null]> = [
-    [Rows3, rowsLine(t, rowCount, page, pageLabel)],
-    [Trash2, collectionLine(t, collectionRowTitles)],
-    [Library, otherPagesLine(t, page, otherLibraryLabels, all)],
+    [Rows3, rowsLine(rowCount, name)],
+    [Trash2, collectionLine(collectionRowTitles)],
+    [Library, otherPagesLine(page, otherLibraryLabels, all)],
   ];
   const reset = resetSupported && resetProfiles;
   return (
     <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
       <DialogContent className="gap-5 sm:max-w-[640px]">
         {/* Keeps the title clear of the close button. */}
-        <DialogHeader className="px-6 sm:ps-0 sm:pe-6">
-          <DialogTitle>{t("web.home.rows.restore.title", target)}</DialogTitle>
-          <DialogDescription>{t("web.home.rows.restore.description", target)}</DialogDescription>
+        <DialogHeader className="px-6 sm:pr-6 sm:pl-0">
+          <DialogTitle>Restore {target} to the default rows?</DialogTitle>
+          <DialogDescription>
+            {capitalize(target)} {all && page.kind === "home" ? "go" : "goes"} back to the rows Silo
+            starts with.
+          </DialogDescription>
         </DialogHeader>
         <ul
-          aria-label={t("web.home.rows.whatChanges")}
+          aria-label="What changes"
           className="text-foreground/85 m-0 grid list-none gap-2.5 p-0 text-sm leading-normal"
         >
           {bullets.map(([Icon, text]) =>
@@ -202,12 +205,10 @@ export function RestoreDialog({
             id={`${id}-all`}
             label={
               page.kind === "home"
-                ? t("web.home.rows.restore.alsoEveryLibrary")
-                : t("web.home.rows.restore.alsoOtherLibraries")
+                ? "Also restore every library page"
+                : "Also restore the other library pages"
             }
-            help={t("web.home.rows.restore.alsoHelp", {
-              libraries: listNames(otherLibraryLabels),
-            })}
+            help={`${otherLibraryLabels.join(", ")} go back to Silo's default rows too.`}
             checked={all}
             disabled={busy}
             onCheckedChange={onRestoreAllChange}
@@ -215,13 +216,13 @@ export function RestoreDialog({
         ) : null}
         <OptionRow
           id={`${id}-reset`}
-          label={t("web.home.rows.restore.resetLabel", target)}
+          label={`Also reset every profile's ${profilePagesName(page, pageLabel, all)}`}
           help={
             reset
-              ? t("web.home.rows.restore.resetHelpOn", target)
-              : t("web.home.rows.restore.resetHelpOff")
+              ? `Clears what each profile hid, renamed, moved or added on ${target}.`
+              : "Profiles keep rows they added. What they hid or renamed on the old rows no longer applies."
           }
-          note={resetSupported ? undefined : t("web.home.rows.restore.resetUnsupported")}
+          note={resetSupported ? undefined : "Resetting profiles isn't available on this server."}
           checked={reset}
           disabled={!resetSupported || busy}
           onCheckedChange={onResetProfilesChange}
@@ -232,22 +233,25 @@ export function RestoreDialog({
             className="border-warning/40 bg-warning/10 flex items-center gap-3 rounded-[14px] border px-4 py-3 text-sm"
           >
             <CircleAlert aria-hidden className="text-warning size-[18px] shrink-0" />
-            <p className="min-w-0 flex-1">{t("web.home.rows.restore.conflict")}</p>
+            <p className="min-w-0 flex-1">
+              These rows changed since you opened this. Reload to see the current rows, then try
+              again.
+            </p>
             <Button size="sm" variant="outline" disabled={busy} onClick={onReload}>
-              {t("web.home.rows.reloadRows")}
+              Reload rows
             </Button>
           </div>
         ) : null}
         <DialogFooter className="items-center sm:justify-between">
-          <p className="text-muted-foreground text-[13px]">{t("web.home.rows.cantUndo")}</p>
+          <p className="text-muted-foreground text-[13px]">This can&apos;t be undone.</p>
           <div className="flex gap-2">
             <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
-              {t("common.cancel")}
+              Cancel
             </Button>
             {conflict ? null : (
               <Button variant="destructive" disabled={busy || !canConfirm} onClick={onConfirm}>
                 <RotateCcw />
-                {t("web.home.rows.restore.confirm")}
+                Restore defaults
               </Button>
             )}
           </div>

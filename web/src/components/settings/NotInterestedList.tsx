@@ -3,11 +3,9 @@ import { ThumbsDown } from "lucide-react";
 import type { BrowseItem } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { useNotInterestedList, useToggleNotInterested } from "@/hooks/queries/notInterested";
-import { numberText, useT } from "@/i18n";
 import { buildItemHref } from "@/lib/mediaNavigation";
 
 function NotInterestedRow({ item }: { item: BrowseItem }) {
-  const t = useT();
   const { mutate: toggle, isPending } = useToggleNotInterested(item.content_id);
   return (
     <li className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2 py-2 sm:grid-cols-[auto_minmax(0,1fr)_auto]">
@@ -27,12 +25,7 @@ function NotInterestedRow({ item }: { item: BrowseItem }) {
           {item.title}
         </Link>
         <span className="text-muted-foreground text-xs">
-          {[
-            item.year > 0 ? numberText(item.year) : null,
-            item.type === "series"
-              ? t("web.settings.notInterestedList.series")
-              : t("web.settings.notInterestedList.movie"),
-          ]
+          {[item.year > 0 ? item.year : null, item.type === "series" ? "Series" : "Movie"]
             .filter(Boolean)
             .join(" · ")}
         </span>
@@ -44,7 +37,7 @@ function NotInterestedRow({ item }: { item: BrowseItem }) {
         disabled={isPending}
         onClick={() => toggle(true)}
       >
-        {t("web.settings.notInterestedList.restore")}
+        Show in Recommendations
       </Button>
     </li>
   );
@@ -66,7 +59,6 @@ export function NotInterestedList() {
     refetch,
     isRefetching,
   } = useNotInterestedList();
-  const t = useT();
   const items = data?.pages.flatMap((page) => page.items) ?? [];
 
   return (
@@ -77,19 +69,18 @@ export function NotInterestedList() {
         </div>
         <div className="min-w-0 flex-1 space-y-3">
           <div>
-            <h3 className="text-base font-semibold">{t("web.settings.notInterestedList.title")}</h3>
+            <h3 className="text-base font-semibold">Not interested</h3>
             <p className="text-muted-foreground mt-1 text-sm">
-              {t("web.settings.notInterestedList.description")}
+              Titles you marked Not interested stay out of your recommendations, and similar titles
+              rank lower. You can still find and play them anywhere else.
             </p>
           </div>
           {isPending ? (
-            <p className="text-muted-foreground text-sm">
-              {t("web.settings.notInterestedList.loading")}
-            </p>
+            <p className="text-muted-foreground text-sm">Loading…</p>
           ) : !data ? (
             <div className="flex items-center gap-3">
               <p className="text-muted-foreground text-sm">
-                {t("web.settings.notInterestedList.loadFailed")}
+                Couldn't load your Not interested titles.
               </p>
               <Button
                 variant="outline"
@@ -97,7 +88,7 @@ export function NotInterestedList() {
                 disabled={isRefetching}
                 onClick={() => void refetch()}
               >
-                {t("common.retry")}
+                Retry
               </Button>
             </div>
           ) : (
@@ -111,14 +102,14 @@ export function NotInterestedList() {
               ) : (
                 !hasNextPage && (
                   <p className="text-muted-foreground text-sm">
-                    {t("web.settings.notInterestedList.empty")}
+                    Nothing yet. Choose Not Interested from a movie or show's menu.
                   </p>
                 )
               )}
               {isError && !isFetchNextPageError && (
                 <div className="flex items-center gap-3">
                   <p className="text-muted-foreground text-sm">
-                    {t("web.settings.notInterestedList.refreshFailed")}
+                    Couldn't refresh this list; it may be out of date.
                   </p>
                   <Button
                     variant="outline"
@@ -126,7 +117,7 @@ export function NotInterestedList() {
                     disabled={isRefetching}
                     onClick={() => void refetch()}
                   >
-                    {t("common.retry")}
+                    Retry
                   </Button>
                 </div>
               )}
@@ -139,14 +130,14 @@ export function NotInterestedList() {
                     onClick={() => void fetchNextPage()}
                   >
                     {isFetchingNextPage
-                      ? t("web.settings.notInterestedList.loading")
+                      ? "Loading…"
                       : isFetchNextPageError
-                        ? t("web.settings.notInterestedList.retryMore")
-                        : t("web.settings.notInterestedList.showMore")}
+                        ? "Retry loading more"
+                        : "Show more"}
                   </Button>
                   {isFetchNextPageError && !isFetchingNextPage && (
                     <span className="text-muted-foreground text-sm">
-                      {t("web.settings.notInterestedList.loadMoreFailed")}
+                      Couldn't load more titles.
                     </span>
                   )}
                 </div>

@@ -29,11 +29,7 @@ import {
   useSetSettingValue,
 } from "@/hooks/queries/settingValues";
 import type { SettingIdentity } from "@/hooks/queries/settingValues";
-import { libraryTypeLabel } from "@/components/admin/libraries/libraryTypes";
-import { useSortableAccessibility } from "@/hooks/useSortableAccessibility";
-import { useT } from "@/i18n";
-import { SETTING_DEFINITIONS, SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
-import { settingUnsetLabel } from "@/lib/settingsText";
+import { SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
 import {
   buildInheritedLanguageLabel,
   buildInheritedShowForcedSubtitlesLabel,
@@ -52,7 +48,7 @@ import {
   libraryScope,
   type LibraryPlaybackEditorState,
   NONE_VALUE,
-  subtitleModeOptions,
+  SUBTITLE_MODE_OPTIONS,
 } from "./libraryPlaybackPreferences";
 import { namedLanguageOptionsFor, type SettingOption } from "@/lib/languageOptions";
 import { toast } from "sonner";
@@ -67,11 +63,14 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import type { DragStartEvent, DragEndEvent } from "@dnd-kit/core";
-import { SortableContext, verticalListSortingStrategy, arrayMove } from "@dnd-kit/sortable";
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+  useSortable,
+  arrayMove,
+} from "@dnd-kit/sortable";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { useMotionSafeOverlay, useMotionSafeSortable } from "@/hooks/useSortableList";
-import { useMotionScrollBehavior } from "@/hooks/usePrefersReducedMotion";
 
 function sortLibrariesByOrder(libraries: UserLibrary[], ids: number[]) {
   const selected = new Set(ids);
@@ -98,7 +97,6 @@ async function clearIgnoringUnset(clear: ReturnType<typeof useClearSettingValue>
 }
 
 function RememberLibraryPageStateSetting() {
-  const t = useT();
   const { data: effective } = useEffectiveSettings({
     keys: [SETTING_KEYS.UI_REMEMBER_LIBRARY_PAGE_STATE],
   });
@@ -123,16 +121,16 @@ function RememberLibraryPageStateSetting() {
           identity: DEVICE_SCOPE,
         });
       }
-      toast.success(t("web.settings.library.rememberPages.saved"));
+      toast.success("Library page preference saved");
     } catch {
-      toast.error(t("web.settings.library.rememberPages.saveFailed"));
+      toast.error("Failed to save library page preference");
     }
   }
 
   return (
     <SettingRow
-      label={t("web.settings.library.rememberPages.label")}
-      description={t("web.settings.library.rememberPages.description")}
+      label="Remember library pages"
+      description="Return each library to the last tab, sort, and filters used on this profile and device."
       control={(id) => (
         <Switch
           id={id}
@@ -219,11 +217,9 @@ function LanguageField({
 }
 
 function SortableLibraryCard({ id, children }: { id: number; children: React.ReactNode }) {
-  const t = useT();
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useMotionSafeSortable({
-      id,
-    });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id,
+  });
 
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -235,7 +231,7 @@ function SortableLibraryCard({ id, children }: { id: number; children: React.Rea
     <div ref={setNodeRef} style={style} className="flex gap-2">
       <button
         type="button"
-        aria-label={t("web.settings.library.dragToReorder")}
+        aria-label="Drag to reorder"
         className="hover:bg-surface-hover mt-4 cursor-grab touch-none self-start rounded-md p-1 transition-colors"
         {...attributes}
         {...listeners}
@@ -266,7 +262,6 @@ function LibraryCard({
   };
   onToggleVisibility: (checked: boolean) => void;
 }) {
-  const t = useT();
   const controlId = useId();
   // Resolved with this library in context, so each key reports whether the
   // answer came from the library's own row or from a wider scope.
@@ -342,7 +337,7 @@ function LibraryCard({
       }
     } catch {
       setEditorState(rollbackState);
-      toast.error(t("web.settings.library.playbackSaveFailed"));
+      toast.error("Failed to update playback defaults");
     }
   }
 
@@ -371,11 +366,11 @@ function LibraryCard({
           <div className="flex flex-wrap items-center gap-2">
             <span className="truncate text-sm font-medium">{library.name}</span>
             <Badge variant="outline" className="shrink-0 capitalize">
-              {libraryTypeLabel(library.type)}
+              {library.type}
             </Badge>
             {hasOverride && (
               <Badge variant="secondary" className="shrink-0">
-                {t("web.settings.value.custom")}
+                Custom
               </Badge>
             )}
           </div>
@@ -395,15 +390,11 @@ function LibraryCard({
             ) : (
               <ChevronRight className="size-3.5" />
             )}
-            <span>
-              {expanded
-                ? t("web.settings.library.hideOverrides")
-                : t("web.settings.library.editOverrides")}
-            </span>
+            <span>{expanded ? "Hide playback overrides" : "Edit playback overrides"}</span>
           </Button>
           <div className="surface-panel-subtle flex items-center justify-between rounded-[1rem] px-3 py-2 sm:min-w-[180px]">
             <Label htmlFor={controlId} className="text-xs font-medium">
-              {t("web.settings.library.visibleInNavigation")}
+              Visible in navigation
             </Label>
             <Switch
               id={controlId}
@@ -418,11 +409,12 @@ function LibraryCard({
       {expanded && (
         <div className="border-border/50 bg-muted/20 border-t px-4 py-4 sm:px-5">
           <p className="text-muted-foreground mb-3 text-xs">
-            {t("web.settings.library.overridesIntro")}
+            Override your profile&apos;s playback defaults for this library. Changes save
+            automatically.
           </p>
           <div className="grid gap-4 sm:grid-cols-2">
             <LanguageField
-              label={t("web.settings.library.spokenLanguage")}
+              label="Spoken language"
               value={editorState.audioLanguage}
               options={audioLanguageOptions}
               disabled={playbackPending}
@@ -435,7 +427,7 @@ function LibraryCard({
             </LanguageField>
 
             <LanguageField
-              label={t("web.settings.library.subtitleLanguage")}
+              label="Subtitle language"
               value={editorState.subtitleLanguage}
               options={subtitleLanguageOptions}
               disabled={playbackPending}
@@ -445,13 +437,11 @@ function LibraryCard({
               <SelectItem value={INHERIT_VALUE}>
                 {buildInheritedSubtitleLanguageLabel(profileDefaults.subtitleLanguage ?? "")}
               </SelectItem>
-              <SelectItem value={NONE_VALUE}>
-                {settingUnsetLabel(SETTING_DEFINITIONS[SETTING_KEYS.PLAYBACK_SUBTITLE_LANGUAGE])}
-              </SelectItem>
+              <SelectItem value={NONE_VALUE}>None</SelectItem>
             </LanguageField>
 
             <PlaybackField
-              label={t("web.settings.library.subtitleBehavior")}
+              label="Subtitle behavior"
               value={editorState.subtitleMode}
               disabled={playbackPending}
               hint={getProfileDefaultSubtitleModeHint(profileDefaults.subtitleMode)}
@@ -460,7 +450,7 @@ function LibraryCard({
               <SelectItem value={INHERIT_VALUE}>
                 {buildInheritedSubtitleModeLabel(profileDefaults.subtitleMode)}
               </SelectItem>
-              {subtitleModeOptions().map((mode) => (
+              {SUBTITLE_MODE_OPTIONS.map((mode) => (
                 <SelectItem key={mode.value} value={mode.value}>
                   {mode.label}
                 </SelectItem>
@@ -468,7 +458,7 @@ function LibraryCard({
             </PlaybackField>
 
             <PlaybackField
-              label={t("web.settings.library.forcedSubtitles")}
+              label="Forced subtitles"
               value={editorState.showForcedSubtitles}
               disabled={playbackPending}
               hint={getProfileDefaultForcedSubtitlesHint(profileDefaults.showForcedSubtitles)}
@@ -477,8 +467,8 @@ function LibraryCard({
               <SelectItem value={INHERIT_VALUE}>
                 {buildInheritedShowForcedSubtitlesLabel(profileDefaults.showForcedSubtitles)}
               </SelectItem>
-              <SelectItem value="on">{t("web.settings.library.on")}</SelectItem>
-              <SelectItem value="off">{t("web.settings.library.off")}</SelectItem>
+              <SelectItem value="on">On</SelectItem>
+              <SelectItem value="off">Off</SelectItem>
             </PlaybackField>
           </div>
 
@@ -493,7 +483,7 @@ function LibraryCard({
                 onClick={handleReset}
               >
                 <RotateCcw className="size-3" />
-                {t("web.settings.library.resetToProfileDefaults")}
+                Reset to profile defaults
               </Button>
             </div>
           )}
@@ -504,7 +494,6 @@ function LibraryCard({
 }
 
 export default function LibrarySettings() {
-  const t = useT();
   // Hidden libraries stay listed so each keeps a switch to show it again.
   const { data: libraries, isLoading: librariesLoading } = useAvailableUserLibraries({
     includeHidden: true,
@@ -526,15 +515,10 @@ export default function LibrarySettings() {
   const [disabledLibraryIDs, setDisabledLibraryIDs] = useState<number[]>([]);
   const [orderedLibraries, setOrderedLibraries] = useState<UserLibrary[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
-  const scrollBehavior = useMotionScrollBehavior();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-      scrollBehavior,
-    }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
-  const overlayMotion = useMotionSafeOverlay();
 
   useEffect(() => {
     // Keep the editable local order in sync with the latest saved setting.
@@ -566,7 +550,7 @@ export default function LibrarySettings() {
       {
         onError: () => {
           setDisabledLibraryIDs(rollbackIDs);
-          toast.error(t("web.settings.library.visibilitySaveFailed"));
+          toast.error("Failed to update library visibility");
         },
       },
     );
@@ -618,7 +602,7 @@ export default function LibrarySettings() {
       {
         onError: () => {
           setOrderedLibraries(prev);
-          toast.error(t("web.settings.library.orderSaveFailed"));
+          toast.error("Failed to update library order");
         },
       },
     );
@@ -629,23 +613,21 @@ export default function LibrarySettings() {
   }
 
   const activeLibrary = activeId != null ? orderedLibraries.find((l) => l.id === activeId) : null;
-  const sortableAccessibility = useSortableAccessibility(
-    (orderedLibraries.length > 0 ? orderedLibraries : (libraries ?? [])).map((library) => ({
-      id: library.id,
-      name: library.name,
-    })),
-  );
 
   if (librariesLoading || libraryPrefsLoading || profileLoading || playbackPrefsLoading) {
-    return <div className="text-muted-foreground pt-4">{t("web.settings.library.loading")}</div>;
+    return <div className="text-muted-foreground pt-4">Loading libraries...</div>;
   }
 
   if (!libraries || libraries.length === 0) {
-    return <div className="text-muted-foreground pt-4">{t("web.settings.library.empty")}</div>;
+    return (
+      <div className="text-muted-foreground pt-4">
+        No libraries are available for this account right now.
+      </div>
+    );
   }
 
   if (!currentProfile) {
-    return <div className="text-muted-foreground pt-4">{t("web.settings.library.noProfile")}</div>;
+    return <div className="text-muted-foreground pt-4">Choose a profile to manage libraries.</div>;
   }
 
   const displayLibraries = orderedLibraries.length > 0 ? orderedLibraries : libraries;
@@ -672,25 +654,21 @@ export default function LibrarySettings() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.library.title")}
-        subtitle={t("web.settings.library.subtitle")}
+        title="Libraries"
+        subtitle="Toggle which libraries appear in your navigation and customize playback defaults per library."
       />
 
       <SettingsGroup
-        title={t("web.settings.library.browsing.title")}
-        description={t("web.settings.library.browsing.description")}
+        title="Browsing"
+        description="These preferences apply to this profile on the current device."
       >
         <RememberLibraryPageStateSetting />
       </SettingsGroup>
 
       <div className="surface-panel-subtle flex flex-col gap-4 rounded-[1.4rem] p-4 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-muted-foreground text-sm leading-relaxed">
-          {t("web.settings.library.visibleCount", {
-            count: libraries.length,
-            count_text: libraries.length,
-            visible: visibleCount,
-            strong: (chunks) => <span className="text-foreground font-medium">{chunks}</span>,
-          })}
+          <span className="text-foreground font-medium">{visibleCount}</span> of {libraries.length}{" "}
+          libraries visible for this profile.
         </p>
         <div className="flex flex-col gap-2 sm:flex-row">
           <Button
@@ -701,7 +679,7 @@ export default function LibrarySettings() {
             disabled={setSetting.isPending || visibleCount === libraries.length}
           >
             <Eye className="size-3.5" />
-            {t("web.settings.library.showAll")}
+            Show all
           </Button>
           <Button
             size="sm"
@@ -711,7 +689,7 @@ export default function LibrarySettings() {
             disabled={setSetting.isPending || visibleCount === 0}
           >
             <EyeOff className="size-3.5" />
-            {t("web.settings.library.hideAll")}
+            Hide all
           </Button>
         </div>
       </div>
@@ -719,7 +697,6 @@ export default function LibrarySettings() {
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
-        accessibility={sortableAccessibility}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragCancel={handleDragCancel}
@@ -745,13 +722,13 @@ export default function LibrarySettings() {
             })}
           </div>
         </SortableContext>
-        <DragOverlay {...overlayMotion}>
+        <DragOverlay>
           {activeLibrary ? (
             <div className="surface-panel flex items-center gap-3 rounded-[1.5rem] px-4 py-4 shadow-lg">
               <GripVertical className="text-muted-foreground h-4 w-4" />
               <span className="text-sm font-medium">{activeLibrary.name}</span>
               <Badge variant="outline" className="capitalize">
-                {libraryTypeLabel(activeLibrary.type)}
+                {activeLibrary.type}
               </Badge>
             </div>
           ) : null}

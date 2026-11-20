@@ -2,16 +2,15 @@ import { useId, useState } from "react";
 
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
 import { Button } from "@/components/ui/button";
-import { useT, type MessageKey } from "@/i18n";
 import {
   getProfileLaunchMode,
   setProfileLaunchMode,
   type ProfileLaunchMode,
 } from "@/lib/profileLaunch";
 
-const CHOICES: ReadonlyArray<{ value: ProfileLaunchMode; labelKey: MessageKey }> = [
-  { value: "remember", labelKey: "web.settings.profileLaunch.remember" },
-  { value: "ask", labelKey: "web.settings.profileLaunch.ask" },
+const CHOICES: ReadonlyArray<{ value: ProfileLaunchMode; label: string }> = [
+  { value: "remember", label: "Remember last profile" },
+  { value: "ask", label: "Ask who's watching" },
 ];
 
 /**
@@ -19,7 +18,6 @@ const CHOICES: ReadonlyArray<{ value: ProfileLaunchMode; labelKey: MessageKey }>
  * Silo is opened in a new tab or window. Stored in the browser only.
  */
 export function ProfileLaunchSettingsGroup() {
-  const t = useT();
   const [mode, setMode] = useState<ProfileLaunchMode>(getProfileLaunchMode);
   const labelId = useId();
 
@@ -30,12 +28,12 @@ export function ProfileLaunchSettingsGroup() {
 
   return (
     <SettingsGroup
-      title={t("web.settings.profileLaunch.title")}
-      description={t("web.settings.profileLaunch.description")}
+      title="This browser"
+      description="Applies only to this browser. Your other devices keep their own choice."
     >
       <div className="space-y-2">
         <p id={labelId} className="text-sm font-medium">
-          {t("web.settings.profileLaunch.label")}
+          Profile at launch
         </p>
         <div role="radiogroup" aria-labelledby={labelId} className="flex flex-wrap gap-2">
           {CHOICES.map((choice) => (
@@ -48,14 +46,14 @@ export function ProfileLaunchSettingsGroup() {
               size="sm"
               onClick={() => choose(choice.value)}
             >
-              {t(choice.labelKey)}
+              {choice.label}
             </Button>
           ))}
         </div>
         <p className="text-muted-foreground text-[13px] leading-relaxed">
           {mode === "ask"
-            ? t("web.settings.profileLaunch.askHint")
-            : t("web.settings.profileLaunch.rememberHint")}
+            ? "Each new tab or window starts at “Who's watching?”, and a PIN-protected profile needs its PIN again."
+            : "New tabs and windows open the profile last used here."}
         </p>
       </div>
     </SettingsGroup>

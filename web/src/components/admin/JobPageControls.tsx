@@ -1,9 +1,8 @@
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 
 export function JobPageControls({
   query,
-  label,
+  label = "Load older jobs",
 }: {
   query: {
     isError: boolean;
@@ -14,18 +13,14 @@ export function JobPageControls({
   };
   label?: string;
 }) {
-  const t = useT();
   return (
     <div className="flex flex-wrap gap-2 p-3">
       {query.isError && (
         <div role="alert">
-          {t("web.admin.common.jobPageControls.loadFailed", {
-            button: (chunks) => (
-              <Button variant="outline" onClick={() => void query.restart()}>
-                {chunks}
-              </Button>
-            ),
-          })}
+          Jobs could not load.{" "}
+          <Button variant="outline" onClick={() => void query.restart()}>
+            Restart jobs
+          </Button>
         </div>
       )}
       {query.hasNextPage && (
@@ -34,7 +29,7 @@ export function JobPageControls({
           disabled={query.isFetchingNextPage}
           onClick={() => void query.fetchNextPage()}
         >
-          {label ?? t("web.admin.common.jobPageControls.loadOlder")}
+          {label}
         </Button>
       )}
     </div>

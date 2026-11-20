@@ -5,10 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Silo-Server/silo-server/internal/cache"
-	"github.com/Silo-Server/silo-server/internal/libraryingest"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/scanqueue"
 )
@@ -43,6 +41,35 @@ func (r *libraryRefreshTestResolver) ResolveForLibrary(_ context.Context, _ stri
 	return r.req, nil
 }
 
+func TestLibraryRefreshUnmatchedItemCarriesDirectScanRun(t *testing.T) {
+	t.Parallel()
+
+	ingester := &itemRefreshTestIngester{}
+	scanRuns := &itemRefreshTestScanRuns{}
+	refresher := &itemRefreshTestRefresher{}
+	executor := &LibraryRefreshExecutor{
+		folderRepo: &itemRefreshTestFolderRepo{folder: &models.MediaFolder{ID: 9, Enabled: true}},
+		resolver: &libraryRefreshTestResolver{req: &ItemRefreshRequest{
+			ScanFolderID:     9,
+			ScanPath:         "/media/shows/new-show",
+			RefreshContentID: "series-1",
+		}},
+		ingester:  ingester,
+		scanRuns:  scanRuns,
+		refresher: refresher,
+	}
+
+	if err := executor.refreshUnmatchedItem(context.Background(), 9, "series-1"); err != nil {
+		t.Fatalf("refreshUnmatchedItem: %v", err)
+	}
+	if ingester.runID != "admin-refresh-run" || scanRuns.completedID != "admin-refresh-run" {
+		t.Fatalf("scan lifecycle run context=%q completed=%q", ingester.runID, scanRuns.completedID)
+	}
+	if scanRuns.createdInput.Mode != scanqueue.ModeSubtree || scanRuns.createdInput.Trigger != libraryRefreshScanTrigger {
+		t.Fatalf("scan create input = %#v", scanRuns.createdInput)
+	}
+}
+
 func TestLibraryRefreshWithholdsScanCompleteWhenMetadataFails(t *testing.T) {
 	t.Parallel()
 
@@ -61,7 +88,7 @@ func TestLibraryRefreshWithholdsScanCompleteWhenMetadataFails(t *testing.T) {
 		eventBus:  eventBus,
 	}
 
-	err := executor.refreshUnmatchedItem(context.Background(), 9, "series-1", false)
+	err := executor.refreshUnmatchedItem(context.Background(), 9, "series-1")
 	if err == nil || !strings.Contains(err.Error(), "metadata failed") {
 		t.Fatalf("refreshUnmatchedItem() error = %v, want metadata failure", err)
 	}
@@ -76,56 +103,40 @@ func TestLibraryRefreshWithholdsScanCompleteWhenMetadataFails(t *testing.T) {
 	}
 }
 
-type libraryRefreshTestRequeuer struct{ requeued []string }
-
-func (r *libraryRefreshTestRequeuer) RequeueUnmatchedInLibrary(context.Context, int) (int, error) {
-	return 0, nil
-}
-
-func (r *libraryRefreshTestRequeuer) RequeueUnmatched(_ context.Context, contentID string) (bool, error) {
-	r.requeued = append(r.requeued, contentID)
-	return true, nil
-}
-
-type blockingFolderIngester struct{ *itemRefreshTestIngester }
-
-func (b blockingFolderIngester) IngestFolder(ctx context.Context, _ *models.MediaFolder) (*libraryingest.Result, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
-// A full refresh's library scan ends when its run stops being this claim's
-// running run (canceled here or on another server), instead of reading the
-// rest of the library. Books it already re-read are committed, so the caches
-// are still invalidated.
-func TestAudiobookLibraryRefreshStopsWhenItsRunIsLost(t *testing.T) {
+func TestLibraryRefreshPublishesScanCompleteAfterDirectIngest(t *testing.T) {
 	t.Parallel()
 
 	eventBus := &libraryRefreshTestEventBus{}
-	executor := &LibraryRefreshExecutor{
-		eventBus:           eventBus,
-		itemLister:         &libraryRefreshTestLister{},
-		folderRepo:         &itemRefreshTestFolderRepo{folder: &models.MediaFolder{ID: 9, Type: "audiobooks", Enabled: true}},
-		ingester:           blockingFolderIngester{&itemRefreshTestIngester{}},
-		scanRuns:           &itemRefreshTestScanRuns{heartbeatErr: scanqueue.ErrScanRunNotFound},
-		refresher:          &itemRefreshTestRefresher{},
-		scanHeartbeatEvery: time.Millisecond,
+	executor := NewLibraryRefreshExecutor(
+		&libraryRefreshTestItemLister{items: []LibraryRefreshItem{{ContentID: "series-1"}}},
+		&itemRefreshTestFolderRepo{folder: &models.MediaFolder{ID: 9, Enabled: true}},
+		&libraryRefreshTestResolver{req: &ItemRefreshRequest{
+			ScanFolderID:     9,
+			ScanPath:         "/media/shows/new-show",
+			RefreshContentID: "series-1",
+		}},
+		&itemRefreshTestIngester{},
+		&itemRefreshTestScanRuns{},
+		&itemRefreshTestRefresher{},
+		eventBus,
+		nil,
+	)
+	executor.unmatchedDelay = 0
+
+	result, err := executor.Execute(context.Background(), LibraryRefreshRequest{
+		LibraryID: 9,
+		Mode:      LibraryRefreshModeFull,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
 	}
-	_, err := executor.Execute(t.Context(), LibraryRefreshRequest{LibraryID: 9, Mode: LibraryRefreshModeFull}, nil)
-	if !errors.Is(err, errLibraryScanRunLost) {
-		t.Fatalf("Execute() error = %v, want errLibraryScanRunLost", err)
+	if result.PipelineOK != 1 {
+		t.Fatalf("pipeline successes = %d, want 1", result.PipelineOK)
 	}
-	var invalidated bool
 	for _, event := range eventBus.events {
-		invalidated = invalidated || (event.Type == cache.EventScanComplete && event.Payload == "9")
+		if event.Type == cache.EventScanComplete && event.Payload == "9" {
+			return
+		}
 	}
-	if !invalidated {
-		t.Errorf("events = %#v, want scan_complete for library 9 after the scan ended early", eventBus.events)
-	}
-}
-
-type libraryRefreshTestLister struct{ items []LibraryRefreshItem }
-
-func (l *libraryRefreshTestLister) ListLibraryItems(context.Context, int, LibraryRefreshMode) ([]LibraryRefreshItem, error) {
-	return l.items, nil
+	t.Fatalf("events = %#v, want scan_complete for library 9", eventBus.events)
 }

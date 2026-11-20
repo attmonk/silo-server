@@ -18,7 +18,6 @@ import {
   useTestSubtitleProvider,
   useUpdateSubtitleProvider,
 } from "@/hooks/queries/admin/subtitles";
-import { useT, type MessageKey } from "@/i18n";
 import { sortSubtitleProviders } from "@/lib/subtitleProviders";
 import { SettingField, SettingFieldRow } from "@/pages/admin-settings/SettingField";
 
@@ -28,18 +27,18 @@ import { useWizardContext } from "../WizardContext";
 
 type SubtitleProviderConfig = components["schemas"]["AdminSubtitleProvider"];
 
-const PROVIDER_META: Record<string, { name: string; description: MessageKey }> = {
+const PROVIDER_META: Record<string, { name: string; description: string }> = {
   opensubtitles: {
     name: "OpenSubtitles",
-    description: "web.setup.subtitles.openSubtitlesDescription",
+    description: "The largest subtitle catalogue. Needs a free account.",
   },
   subdl: {
     name: "SubDL",
-    description: "web.setup.subtitles.subdlDescription",
+    description: "Fast, with a generous free tier. Needs an API key.",
   },
   subsource: {
     name: "SubSource",
-    description: "web.setup.subtitles.subsourceDescription",
+    description: "Community-run source. Needs an API key.",
   },
 };
 
@@ -89,10 +88,8 @@ function ProviderRow({
   onChange: (next: ProviderDraft) => void;
   disabled: boolean;
 }) {
-  const t = useT();
   const name = config.provider_name;
-  const meta = PROVIDER_META[name];
-  const displayName = meta?.name ?? name;
+  const meta = PROVIDER_META[name] ?? { name, description: "" };
   const isOpenSubtitles = name === "opensubtitles";
   const canonical = draft.editor?.body ?? config;
   const hasCredentials = isOpenSubtitles ? canonical.has_credentials : canonical.has_api_key;
@@ -121,10 +118,7 @@ function ProviderRow({
         onError: (err) =>
           setTested({
             signature: testedSignature,
-            result: {
-              success: false,
-              error: err instanceof Error ? err.message : t("web.setup.subtitles.testFailed"),
-            },
+            result: { success: false, error: err instanceof Error ? err.message : "Test failed" },
           }),
       },
     );
@@ -135,21 +129,21 @@ function ProviderRow({
   return (
     <>
       <SettingFieldRow
-        label={displayName}
+        label={meta.name}
         description={
-          draft.loadFailed ? t("web.setup.subtitles.loadFailed") : meta ? t(meta.description) : ""
+          draft.loadFailed
+            ? "Couldn't load the saved configuration. Reload the page to edit this provider."
+            : meta.description
         }
         status={
           hasCredentials && !draft.dirty ? (
-            <span className="text-muted-foreground text-xs">
-              {t("web.setup.subtitles.credentialsSaved")}
-            </span>
+            <span className="text-muted-foreground text-xs">Credentials saved</span>
           ) : undefined
         }
       >
         <Switch
           checked={draft.enabled}
-          aria-label={t("web.setup.subtitles.enableLabel", { provider: displayName })}
+          aria-label={`Enable ${meta.name}`}
           disabled={rowDisabled}
           onCheckedChange={(v) => onChange({ ...draft, enabled: v, dirty: true })}
         />
@@ -159,14 +153,14 @@ function ProviderRow({
           {isOpenSubtitles ? (
             <>
               <SettingField
-                label={t("web.auth.username")}
-                description={hasCredentials ? t("web.setup.subtitles.usernameKeep") : undefined}
+                label="Username"
+                description={hasCredentials ? "Leave blank to keep the saved username." : undefined}
                 value={draft.username}
                 onChange={(v) => onChange({ ...draft, username: v, dirty: true })}
                 disabled={rowDisabled}
               />
               <SecretField
-                label={t("web.auth.password")}
+                label="Password"
                 value={draft.password}
                 configured={hasCredentials}
                 onChange={(v) => onChange({ ...draft, password: v, dirty: true })}
@@ -175,7 +169,7 @@ function ProviderRow({
             </>
           ) : (
             <SecretField
-              label={t("web.setup.subtitles.apiKey")}
+              label="API key"
               value={draft.apiKey}
               configured={hasCredentials}
               onChange={(v) => onChange({ ...draft, apiKey: v, dirty: true })}
@@ -192,18 +186,16 @@ function ProviderRow({
             >
               {test.isPending ? (
                 <>
-                  <Loader2 className="me-1.5 size-3 animate-spin" />
-                  {t("web.setup.subtitles.testing")}
+                  <Loader2 className="mr-1.5 size-3 animate-spin" />
+                  Testing
                 </>
               ) : (
-                t("web.setup.subtitles.test")
+                "Test connection"
               )}
             </Button>
             {testResult !== null ? (
               <span className={testResult.success ? "text-green-500" : "text-red-400"}>
-                {testResult.success
-                  ? t("web.setup.wizard.connected")
-                  : (testResult.error ?? t("web.setup.subtitles.failed"))}
+                {testResult.success ? "Connected" : (testResult.error ?? "Failed")}
               </span>
             ) : null}
           </div>
@@ -215,7 +207,6 @@ function ProviderRow({
 
 export function SubtitlesStep() {
   const { markDone } = useWizardContext();
-  const t = useT();
   const providers = useSubtitleProviders();
   const updateProvider = useUpdateSubtitleProvider();
   const [submitting, setSubmitting] = useState(false);
@@ -300,10 +291,7 @@ export function SubtitlesStep() {
   useStepSummary(
     "subtitles",
     enabledProviders > 0
-      ? t("web.setup.subtitles.summary", {
-          count: enabledProviders,
-          shown: enabledProviders,
-        })
+      ? `${enabledProviders} ${enabledProviders === 1 ? "source" : "sources"}`
       : undefined,
   );
 
@@ -367,28 +355,28 @@ export function SubtitlesStep() {
       loadEditor(failure.config, () => false);
     }
     const reason = failures[0]!.reason;
-    toast.error(reason instanceof Error ? reason.message : t("web.setup.subtitles.saveFailed"));
+    toast.error(reason instanceof Error ? reason.message : "Failed to save subtitle sources");
   }
 
   if (providers.isLoading) return <StepSkeleton rows={3} />;
 
   return (
     <StepFrame
-      title={t("web.setup.subtitles.title")}
-      lede={t("web.setup.subtitles.lede")}
+      title="Subtitle sources"
+      lede="When a file has no subtitles in the language someone wants, Silo can fetch them. Each source needs its own free account or API key."
       onSubmit={handleSubmit}
       busy={submitting}
       onSkip={() => markDone("subtitles")}
-      footnote={t("web.setup.subtitles.footnote")}
+      footnote="Languages and matching rules are in Admin › Settings › Providers."
     >
       <StepSection>
         {providers.isError ? (
           <div className="py-4">
-            <p className="text-sm font-medium">{t("web.setup.subtitles.listLoadFailed")}</p>
+            <p className="text-sm font-medium">Couldn't load subtitle sources</p>
             <p className="text-muted-foreground mt-1 text-xs">
               {providers.error instanceof Error
                 ? providers.error.message
-                : t("web.setup.subtitles.noAnswer")}
+                : "The server did not answer."}
             </p>
             <Button
               type="button"
@@ -397,11 +385,13 @@ export function SubtitlesStep() {
               className="mt-3"
               onClick={() => void providers.refetch()}
             >
-              {t("common.tryAgain")}
+              Try again
             </Button>
           </div>
         ) : providerList.length === 0 ? (
-          <p className="text-muted-foreground py-4 text-sm">{t("web.setup.subtitles.none")}</p>
+          <p className="text-muted-foreground py-4 text-sm">
+            No subtitle providers are installed on this server.
+          </p>
         ) : (
           providerList.map((config) => (
             <ProviderRow

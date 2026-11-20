@@ -20,7 +20,6 @@ import {
   useAdminDownloadStorage,
   useAdminDownloadStorageEvents,
 } from "@/hooks/queries/admin/downloadStorage";
-import { useAppLanguage, useT } from "@/i18n";
 import { formatDateTime } from "@/lib/datetime";
 import { StatStrip, StatTile } from "@/pages/admin-users/detail/ui";
 import {
@@ -33,14 +32,14 @@ import {
 import { LoadMoreButton } from "./controls";
 
 const ALL = "all";
-/** Days of history to show; 0 shows every kept row. */
-const DAY_OPTIONS = [1, 7, 30, 0];
-const H = "web.admin.downloads.history";
+const DAY_OPTIONS = [
+  { value: 1, label: "Last day" },
+  { value: 7, label: "Last 7 days" },
+  { value: 30, label: "Last 30 days" },
+  { value: 0, label: "All kept history" },
+];
 
 export default function HistoryTab() {
-  const t = useT();
-  // The reason, item and location labels come from plain helpers.
-  useAppLanguage();
   const storage = useAdminDownloadStorage();
   const [reason, setReason] = useState("");
   const [location, setLocation] = useState("");
@@ -58,33 +57,24 @@ export default function HistoryTab() {
     <div className="space-y-4">
       <StatStrip columns={4}>
         <StatTile
-          label={t(`${H}.freed`)}
+          label="Freed, 30 days"
           value={settings ? formatStorageBytes(settings.freed_last_30_days_bytes) : "—"}
-          detail={t(`${H}.freedDetail`)}
+          detail="server and nodes"
         />
         <StatTile
-          label={t(`${H}.cacheFor`)}
-          value={
-            settings
-              ? t(`${H}.cacheHours`, {
-                  count: settings.cache_hours,
-                  count_text: settings.cache_hours,
-                })
-              : "—"
-          }
-          detail={t(`${H}.cacheDetail`)}
+          label="Keep cached files for"
+          value={settings ? `${settings.cache_hours} h` : "—"}
+          detail="after their last use"
         />
         <StatTile
-          label={t(`${H}.diskCeiling`)}
-          value={
-            settings ? t(`${H}.diskCeilingValue`, { percent: settings.disk_ceiling_percent }) : "—"
-          }
-          detail={t(`${H}.diskCeilingDetail`)}
+          label="Disk ceiling"
+          value={settings ? `${settings.disk_ceiling_percent}%` : "—"}
+          detail="cached files go early above it"
         />
         <StatTile
-          label={t(`${H}.kept`)}
-          value={t(`${H}.keptValue`, { count: 90 })}
-          detail={t(`${H}.keptDetail`)}
+          label="History kept"
+          value="90 days"
+          detail="one row per clean-up pass or action"
         />
       </StatStrip>
 
@@ -93,11 +83,11 @@ export default function HistoryTab() {
           value={reason || ALL}
           onValueChange={(value) => setReason(value === ALL ? "" : value)}
         >
-          <SelectTrigger size="sm" className="w-52" aria-label={t(`${H}.reasonLabel`)}>
+          <SelectTrigger size="sm" className="w-52" aria-label="Reason">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value={ALL}>{t(`${H}.everyReason`)}</SelectItem>
+            <SelectItem value={ALL}>Every reason</SelectItem>
             {STORAGE_EVENT_REASONS.map((value) => (
               <SelectItem key={value} value={value}>
                 {storageEventReasonLabel(value)}
@@ -109,27 +99,27 @@ export default function HistoryTab() {
           value={location || ALL}
           onValueChange={(value) => setLocation(value === ALL ? "" : value)}
         >
-          <SelectTrigger size="sm" className="w-44" aria-label={t(`${H}.locationLabel`)}>
+          <SelectTrigger size="sm" className="w-44" aria-label="Location">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value={ALL}>{t(`${H}.allLocations`)}</SelectItem>
+            <SelectItem value={ALL}>All locations</SelectItem>
             {locations.map((l) => (
               <SelectItem key={l.key} value={l.key}>
                 {l.name}
               </SelectItem>
             ))}
-            <SelectItem value="device">{t(`${H}.devices`)}</SelectItem>
+            <SelectItem value="device">Devices</SelectItem>
           </SelectContent>
         </Select>
         <Select value={String(days)} onValueChange={(value) => setDays(Number(value))}>
-          <SelectTrigger size="sm" className="w-40" aria-label={t(`${H}.whenLabel`)}>
+          <SelectTrigger size="sm" className="w-40" aria-label="When">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {DAY_OPTIONS.map((value) => (
-              <SelectItem key={value} value={String(value)}>
-                {value === 0 ? t(`${H}.allKept`) : t(`${H}.lastDays`, { count: value })}
+            {DAY_OPTIONS.map((option) => (
+              <SelectItem key={option.value} value={String(option.value)}>
+                {option.label}
               </SelectItem>
             ))}
           </SelectContent>
@@ -140,12 +130,12 @@ export default function HistoryTab() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>{t(`${H}.column.when`)}</TableHead>
-              <TableHead>{t(`${H}.column.whatHappened`)}</TableHead>
-              <TableHead>{t(`${H}.column.item`)}</TableHead>
-              <TableHead className="hidden sm:table-cell">{t(`${H}.column.location`)}</TableHead>
-              <TableHead className="text-end">{t(`${H}.column.size`)}</TableHead>
-              <TableHead className="hidden md:table-cell">{t(`${H}.column.by`)}</TableHead>
+              <TableHead>When</TableHead>
+              <TableHead>What happened</TableHead>
+              <TableHead>Item</TableHead>
+              <TableHead className="hidden sm:table-cell">Location</TableHead>
+              <TableHead className="text-right">Size</TableHead>
+              <TableHead className="hidden md:table-cell">By</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -160,7 +150,9 @@ export default function HistoryTab() {
             ) : rows.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={6} className="text-muted-foreground py-10 text-center">
-                  {events.isError ? t(`${H}.loadFailed`) : t(`${H}.empty`)}
+                  {events.isError
+                    ? "History could not be read."
+                    : "Nothing was cleaned up or revoked in this period."}
                 </TableCell>
               </TableRow>
             ) : (
@@ -175,20 +167,18 @@ export default function HistoryTab() {
                     {event.detail && event.reason !== "untracked" ? (
                       <div className="text-muted-foreground text-xs">{event.detail}</div>
                     ) : event.reason === "revoked" ? (
-                      <div className="text-warning text-xs">{t(`${H}.waitingForDevice`)}</div>
+                      <div className="text-warning text-xs">waiting for device</div>
                     ) : null}
                   </TableCell>
                   <TableCell className="hidden sm:table-cell">
                     {storageEventLocation(event)}
                   </TableCell>
-                  <TableCell className="text-end whitespace-nowrap tabular-nums">
+                  <TableCell className="text-right whitespace-nowrap tabular-nums">
                     {formatStorageBytes(event.bytes)}
                   </TableCell>
                   <TableCell className="text-muted-foreground hidden md:table-cell">
                     {event.actor?.username ??
-                      (event.reason === "device_removed"
-                        ? t(`${H}.deviceConfirmed`)
-                        : t(`${H}.automatic`))}
+                      (event.reason === "device_removed" ? "Device confirmed" : "Automatic")}
                   </TableCell>
                 </TableRow>
               ))

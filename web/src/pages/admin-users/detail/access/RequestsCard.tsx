@@ -16,7 +16,6 @@ import {
 } from "@/hooks/queries/admin/requests";
 import { useAdminUserCapabilities } from "@/hooks/queries/admin/users";
 import { useAdminUserRequestUsage } from "@/hooks/queries/admin/userActivity";
-import { useT, type MessageKey, type Translate } from "@/i18n";
 import {
   clearLegacyRequestBlock,
   describeInheritedValue,
@@ -42,7 +41,6 @@ import { useCardEditing } from "../cardEditing";
 import { EditableCard, type AccessCardProps } from "./EditableCard";
 import { ChoicePolicyEdit, PolicyValueRow } from "./PolicyRow";
 import {
-  inheritedFrom,
   inheritedValueText,
   rowChanged,
   rowDraft,
@@ -53,9 +51,6 @@ import {
 } from "./policySources";
 import { useAccountCardDraft } from "./useAccountCardDraft";
 
-/** The space before a trailing note; kept out of the JSX so it is not read as text. */
-const SPACE = " ";
-
 const ACCOUNT: RequestPolicySource = { kind: "account" };
 
 function requestSourceTag(source: RequestPolicySource): ValueSource {
@@ -63,34 +58,15 @@ function requestSourceTag(source: RequestPolicySource): ValueSource {
   return source.kind === "group" ? "group" : "default";
 }
 
-/** "50 per 7 days", "1 per day", or "Unlimited" ("unlimited" when `inline`, after a prefix). */
-function formatRequestLimit(t: Translate, quota: RequestQuota, inline = false): string {
-  if (quota.unlimited) {
-    return inline
-      ? t("web.admin.users.detail.access.inline.unlimited")
-      : t("web.admin.users.detail.access.value.unlimited");
-  }
-  return t("web.admin.users.detail.access.requests.perWindow", {
-    days: quota.days,
-    days_text: quota.days,
-    max: quota.max,
-  });
+/** "50 per 7 days", "1 per day", or "Unlimited". */
+function formatRequestLimit(quota: RequestQuota): string {
+  if (quota.unlimited) return "Unlimited";
+  return `${quota.max} per ${quota.days === 1 ? "day" : `${quota.days} days`}`;
 }
 
-function formatApprovalValue(t: Translate, autoApprove: boolean, inline = false): string {
-  if (inline) {
-    return autoApprove
-      ? t("web.admin.users.detail.access.requests.automaticInline")
-      : t("web.admin.users.detail.access.requests.needsApprovalInline");
-  }
-  return autoApprove
-    ? t("web.admin.users.detail.access.requests.automatic")
-    : t("web.admin.users.detail.access.requests.needsApproval");
+function formatApprovalValue(autoApprove: boolean): string {
+  return autoApprove ? "Automatic" : "Needs approval";
 }
-
-const CAN_REQUEST_ROW = "web.admin.users.detail.access.requests.canRequest";
-const APPROVAL_ROW = "web.admin.users.detail.access.requests.approval";
-const LIMIT_ROW = "web.admin.users.detail.access.requests.limit";
 
 /**
  * How requests resolve for an account: its own approval and limit, then its
@@ -134,9 +110,8 @@ export function useAccountRequestTerms(user: AdminUser, groupName: string | unde
   };
 }
 
-/** "Default: …" or "Group: …" for a request term inherited from `source`. */
-function inheritedRequestText(source: RequestPolicySource, value: string): string {
-  return inheritedFrom(source.kind === "group" ? "group" : "default", value);
+function inheritedPrefix(source: RequestPolicySource): string {
+  return source.kind === "group" ? "Group" : "Default";
 }
 
 interface RequestsDraft {
@@ -144,6 +119,11 @@ interface RequestsDraft {
   /** Undefined while the account's limit is not loaded. */
   limit: RequestLimitDraft | undefined;
 }
+
+const REQUEST_OPTIONS = [
+  { value: true, label: "Yes" },
+  { value: false, label: "No" },
+];
 
 export function RequestsCard({
   user,
@@ -155,7 +135,6 @@ export function RequestsCard({
   ctx,
   hints,
 }: AccessCardProps) {
-  const t = useT();
   const groupName = groups.find((group) => group.id === user.access_group_id)?.name;
   const request = useAccountRequestTerms(user, groupName);
   const { accountLimit, settings, groupLimit, group, terms, inherited, server } = request;
@@ -170,7 +149,7 @@ export function RequestsCard({
   const limitRecord = limitBase ?? accountLimit.data;
   const limitRecordDraft = limitRecord ? requestLimitDraft(limitRecord) : undefined;
 
-  const draft = useAccountCardDraft<RequestsDraft, MessageKey>({
+  const draft = useAccountCardDraft<RequestsDraft>({
     id: "requests",
     editor,
     toDraft: (account) => ({
@@ -184,24 +163,24 @@ export function RequestsCard({
         : {};
     },
     changedRows: (d, base) => {
-      const rows: MessageKey[] = [];
+      const rows: string[] = [];
       if (rowChanged(d.requests, rowOverride(base.requests) ?? null)) {
-        rows.push(CAN_REQUEST_ROW);
+        rows.push("Can request media");
       }
       // The limit compares with the record the edit holds, not the live query.
       if (d.limit && limitRecordDraft) {
-        if (d.limit.approval !== limitRecordDraft.approval) rows.push(APPROVAL_ROW);
+        if (d.limit.approval !== limitRecordDraft.approval) rows.push("Approval");
         const limitOnly = { ...d.limit, approval: limitRecordDraft.approval };
-        if (requestLimitChanges(limitOnly, limitRecordDraft) > 0) rows.push(LIMIT_ROW);
+        if (requestLimitChanges(limitOnly, limitRecordDraft) > 0) rows.push("Limit");
       }
       return rows;
     },
     validate: (d) =>
       d.limit && hasRequestLimitErrors(requestLimitErrors(d.limit))
-        ? t("web.admin.users.detail.access.requests.fixLimit")
+        ? "Fix the request limit before saving."
         : null,
     extra: {
-      savedLabel: t("web.admin.users.detail.access.requests.savedPart"),
+      savedLabel: "Request approval and limit",
       changed: (d) =>
         Boolean(d.limit && limitRecordDraft && requestLimitChanges(d.limit, limitRecordDraft) > 0),
       write: async (d) => {
@@ -215,7 +194,7 @@ export function RequestsCard({
       reload: async () => {
         const result = await accountLimit.refetch();
         if (!result.data || result.isError) {
-          throw new Error(t("web.admin.users.detail.access.requests.reloadFailed"));
+          throw new Error("Couldn't reload this account's request settings.");
         }
         setLimitBase(result.data);
         const oldLimit = limitRecordDraft;
@@ -265,20 +244,21 @@ export function RequestsCard({
     <div className="px-4 py-3 sm:px-5">
       <div
         role="note"
-        aria-label={t("web.admin.users.detail.access.requests.legacyTitle")}
+        aria-label="Blocked by an old setting"
         className="space-y-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5 text-sm"
       >
         <p className="flex items-center gap-2 font-medium">
           <TriangleAlert aria-hidden="true" className="size-4 text-amber-500" />
-          {t("web.admin.users.detail.access.requests.legacyTitle")}
+          Blocked by an old setting
         </p>
         <p className="text-muted-foreground text-xs leading-relaxed">
-          {t("web.admin.users.detail.access.requests.legacyBody")}
+          This account's request limit still says it is blocked, a setting the editors no longer
+          offer. Reset it to the default to use an approval and limit again. To keep the account
+          from requesting, turn off Can request media instead.
         </p>
         {legacyConflict ? (
           <p className="text-xs">
-            {t("web.admin.users.detail.access.requests.legacyConflict")}
-            {SPACE}
+            Another admin changed these request settings.{" "}
             <Button
               type="button"
               variant="link"
@@ -289,7 +269,7 @@ export function RequestsCard({
                 if (result.data && !result.isError) setLegacyConflict(false);
               }}
             >
-              {t("web.admin.users.detail.access.requests.reload")}
+              Reload
             </Button>
           </p>
         ) : null}
@@ -301,7 +281,7 @@ export function RequestsCard({
             onClick={() => void resetLegacy()}
             disabled={updateLimit.isPending || legacyConflict || active !== null || !available}
           >
-            {t("web.admin.users.detail.access.requests.resetToDefault")}
+            Reset to default
           </Button>
         ) : null}
       </div>
@@ -312,13 +292,13 @@ export function RequestsCard({
     server && !server.requests_enabled ? (
       <p className="text-muted-foreground flex items-start gap-2 px-4 py-3 text-xs sm:px-5">
         <Info aria-hidden="true" className="text-info mt-px size-3.5 shrink-0" />
-        {t("web.admin.users.detail.access.requests.serverOff")}
+        Requests are turned off for the whole server.
       </p>
     ) : null;
 
   const loadError = request.loadFailed ? (
     <div role="alert" className="flex flex-wrap items-center gap-2 px-4 py-3 text-sm sm:px-5">
-      <span>{t("web.admin.users.detail.access.requests.loadFailed")}</span>
+      <span>Couldn't load this account's request settings.</span>
       <Button
         type="button"
         variant="outline"
@@ -329,7 +309,7 @@ export function RequestsCard({
           if (request.groupId !== null) void groupLimit.refetch();
         }}
       >
-        {t("common.retry")}
+        Retry
       </Button>
     </div>
   ) : null;
@@ -355,13 +335,13 @@ export function RequestsCard({
       id="requests"
       description={
         user.role === "admin"
-          ? t("web.admin.users.detail.access.requests.adminDescription")
+          ? "Admin accounts don't use an access group's request settings."
           : undefined
       }
       actions={
         <Button asChild variant="ghost" size="xs">
           <Link to={`/admin/requests?user=${user.id}`}>
-            {t("web.admin.users.detail.access.requests.openRequests")}
+            Requests
             <ArrowUpRight aria-hidden="true" />
           </Link>
         </Button>
@@ -382,32 +362,23 @@ export function RequestsCard({
       {draft.editing && d ? (
         <>
           <ChoicePolicyEdit
-            label={t(CAN_REQUEST_ROW)}
+            label="Can request media"
             row={d.requests}
             saved={draft.base?.requests_allowed ?? null}
             inherited={hints.requests_allowed}
-            options={[
-              { value: true, label: t("web.admin.users.detail.access.value.yes") },
-              { value: false, label: t("web.admin.users.detail.access.value.no") },
-            ]}
+            options={REQUEST_OPTIONS}
             onChange={(requests) => draft.setDraft((prev) => ({ ...prev, requests }))}
           />
           {legacyNote ??
             (d.limit ? (
               <div
-                data-changed={
-                  changed.has(APPROVAL_ROW) || changed.has(LIMIT_ROW) ? "true" : undefined
-                }
+                data-changed={changed.has("Approval") || changed.has("Limit") ? "true" : undefined}
                 className="border-border/50 border-t px-4 py-3.5 sm:px-5"
               >
                 <RequestLimitFields
                   draft={d.limit}
                   onChange={(limit) => draft.setDraft((prev) => ({ ...prev, limit }))}
-                  inheritLabel={
-                    group
-                      ? t("web.admin.users.detail.access.requests.useGroupDefault")
-                      : t("web.admin.users.detail.access.requests.useServerDefault")
-                  }
+                  inheritLabel={group ? "Use group default" : "Use server default"}
                   inherited={
                     inherited
                       ? {
@@ -435,12 +406,8 @@ export function RequestsCard({
       ) : (
         <>
           <PolicyValueRow
-            label={t(CAN_REQUEST_ROW)}
-            value={
-              user.effective_policy.requests_allowed
-                ? t("web.admin.users.detail.access.value.yes")
-                : t("web.admin.users.detail.access.value.no")
-            }
+            label="Can request media"
+            value={user.effective_policy.requests_allowed ? "Yes" : "No"}
             source={rowSource(user, "requests", ctx)}
             base={inheritedValueText("requests", hints, ctx, libraries)}
           />
@@ -454,29 +421,24 @@ export function RequestsCard({
             ) : (
               <>
                 <PolicyValueRow
-                  label={t(APPROVAL_ROW)}
-                  value={formatApprovalValue(t, terms.autoApprove)}
+                  label="Approval"
+                  value={formatApprovalValue(terms.autoApprove)}
                   source={requestSourceTag(terms.approvalSource)}
                   base={
                     inherited
-                      ? inheritedRequestText(
-                          inherited.approvalSource,
-                          formatApprovalValue(t, inherited.autoApprove, true),
-                        )
+                      ? `${inheritedPrefix(inherited.approvalSource)}: ${formatApprovalValue(inherited.autoApprove).toLowerCase()}`
                       : undefined
                   }
                 />
                 <PolicyValueRow
-                  label={t(LIMIT_ROW)}
+                  label="Limit"
                   value={
                     <>
-                      {formatRequestLimit(t, terms.quota)}
+                      {formatRequestLimit(terms.quota)}
                       {used !== undefined && !terms.quota.unlimited ? (
                         <span className="text-muted-foreground text-xs font-normal">
-                          {SPACE}
-                          {t("web.admin.users.detail.access.requests.used", {
-                            used: used,
-                          })}
+                          {" "}
+                          · {used} used
                         </span>
                       ) : null}
                     </>
@@ -484,10 +446,7 @@ export function RequestsCard({
                   source={requestSourceTag(terms.quotaSource)}
                   base={
                     inherited
-                      ? inheritedRequestText(
-                          inherited.quotaSource,
-                          formatRequestLimit(t, inherited.quota, true),
-                        )
+                      ? `${inheritedPrefix(inherited.quotaSource)}: ${formatRequestLimit(inherited.quota).toLowerCase()}`
                       : undefined
                   }
                 />

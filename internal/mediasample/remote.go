@@ -90,9 +90,8 @@ type RemoteClient struct {
 }
 
 // Run sends req to the node route at endpoint (the node URL joined with
-// RemotePath), signed with the key keys holds for that transcode node. A
-// failure is a *RemoteError.
-func (c RemoteClient) Run(ctx context.Context, endpoint string, keys nodeauth.Keyring, req Request) (Result, error) {
+// RemotePath), signed with the node secret. A failure is a *RemoteError.
+func (c RemoteClient) Run(ctx context.Context, endpoint, secret string, req Request) (Result, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return Result{}, &RemoteError{Reason: ReasonInvalidRequest, Err: err}
@@ -102,7 +101,7 @@ func (c RemoteClient) Run(ctx context.Context, endpoint string, keys nodeauth.Ke
 		return Result{}, &RemoteError{Reason: ReasonNodeUnavailable, Err: err}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if err := nodeauth.SignTranscode(httpReq, strings.TrimSuffix(endpoint, RemotePath), keys); err != nil {
+	if err := nodeauth.Sign(httpReq, strings.TrimSuffix(endpoint, RemotePath), secret); err != nil {
 		return Result{}, &RemoteError{Reason: ReasonNodeUnavailable, Err: err}
 	}
 	resp, err := telemetry.DoTrustedNode(c.HTTP, httpReq, "media_sample")

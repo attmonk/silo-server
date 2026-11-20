@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import type { CollectionOption } from "@/hooks/queries/useAllUserCollections";
-import { useT, type MessageKey } from "@/i18n";
 import { pageLabel } from "@/lib/homeRows/pages";
 import { draftForPreset, findRecipe, withCollection, type RowDraft } from "@/lib/homeRows/rowDraft";
 import {
@@ -43,11 +42,11 @@ export function useRowDialog() {
   return [dialog, setRowDialog] as const;
 }
 
-const CANT_ADD: MessageKey = "web.home.rows.links.cantAdd";
-const PAGE_LOCKED: MessageKey = "web.home.rows.links.pageLocked";
-const ROW_GONE: MessageKey = "web.home.rows.links.rowGone";
-const NO_KINDS: MessageKey = "web.home.rows.links.noKinds";
-const NO_COLLECTIONS: MessageKey = "web.home.rows.links.noCollections";
+const CANT_ADD = "This collection can't be added here.";
+const PAGE_LOCKED = "This page can't change right now.";
+const ROW_GONE = "That row no longer exists.";
+const NO_KINDS = "The kinds of rows didn't load, so Add row couldn't open.";
+const NO_COLLECTIONS = "Collections didn't load, so Add row couldn't open.";
 
 /** Every link parameter's value, to notice a new link. Empty when there is none. */
 function linkKey(params: URLSearchParams) {
@@ -80,7 +79,6 @@ export function useRowLinks({
   onAdd: (seed: RowSeed) => void;
   onEdit: (row: HomeRow) => void;
 }) {
-  const t = useT();
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -126,12 +124,13 @@ export function useRowLinks({
     function seedFor(option: CollectionOption, draft: RowDraft): RowSeed {
       if (!returnTo) return { draft };
       const { surface, page, pages } = adapter;
+      const where = page.kind === "home" ? "Home" : `the ${pageLabel(page, pages)} page`;
       // Home rows was a detour from `returnTo`: replace it, so Back doesn't return to it.
       const carried = typeof arrivedWith === "object" ? arrivedWith : null;
       const back = () => navigate(returnTo, { replace: true, state: carried });
       return {
         draft,
-        back: { label: t("web.home.rows.links.back", { collection: option.title }), onClick: back },
+        back: { label: `Back to ${option.title}`, onClick: back },
         onAdded: ([id]) => {
           if (!id) return back();
           // New rows go to the bottom; the page may not show this one yet.
@@ -141,14 +140,9 @@ export function useRowLinks({
           const position = at === -1 ? total : at + 1;
           const added: AddedRowState = { addedRow: { id, surface, page, position } };
           navigate(returnTo, { replace: true, state: { ...carried, ...added } });
-          const place = { position, total };
-          const message =
-            page.kind === "home"
-              ? t("web.home.rows.links.addedHome", place)
-              : t("web.home.rows.links.addedLibrary", { page: pageLabel(page, pages), ...place });
-          toast.success(message, {
+          toast.success(`Added to ${where} as row ${position} of ${total}`, {
             action: {
-              label: t("web.home.rows.links.moveIt"),
+              label: "Move it",
               onClick: () => navigate(homeRowsPath(surface, page, { edit: id })),
             },
           });
@@ -161,7 +155,7 @@ export function useRowLinks({
       handled.current = links;
       action();
     }
-    const refuse = (message: MessageKey) => finish(() => toast.error(t(message)));
+    const refuse = (message: string) => finish(() => toast.error(message));
 
     if (add === "invalid") {
       refuse(CANT_ADD);
@@ -189,5 +183,5 @@ export function useRowLinks({
     } else {
       handled.current = links;
     }
-  }, [links, arrivedWith, settled, adapter, catalog, catalogFailed, navigate, onAdd, onEdit, t]);
+  }, [links, arrivedWith, settled, adapter, catalog, catalogFailed, navigate, onAdd, onEdit]);
 }

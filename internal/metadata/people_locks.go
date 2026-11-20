@@ -2,7 +2,6 @@ package metadata
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"slices"
 
@@ -26,21 +25,22 @@ var _ metadataItemPeopleRepo = (*catalog.ItemRepository)(nil)
 // by the incoming one, or kept as stored when the providers sent none for it.
 // (Without either lock a replace merge takes the incoming credits wholesale,
 // as before.) When the credits cannot be read, the returned locks hold both
-// groups, so the credits stay as stored, and the read error is returned with
-// them for a caller that can't leave them.
-func (s *MetadataService) peopleLocksForMerge(ctx context.Context, contentID string, locked []MetadataField, existing, incoming *MetadataResult) ([]MetadataField, error) {
+// groups and the credits stay as stored.
+func (s *MetadataService) peopleLocksForMerge(ctx context.Context, contentID string, locked []MetadataField, existing, incoming *MetadataResult) []MetadataField {
 	castLocked, crewLocked := isFieldLocked(locked, FieldCast), isFieldLocked(locked, FieldCrew)
 	if castLocked == crewLocked || len(existing.People) > 0 {
-		return locked, nil
+		return locked
 	}
 	bothLocked := append(slices.Clone(locked), FieldCast, FieldCrew)
 	repo, ok := s.itemRepo.(metadataItemPeopleRepo)
 	if !ok {
-		return bothLocked, nil
+		return bothLocked
 	}
 	people, err := repo.GetPeople(ctx, contentID)
 	if err != nil {
-		return bothLocked, fmt.Errorf("reading stored credits for a cast or crew lock: %w", err)
+		slog.WarnContext(ctx, "metadata: could not read stored credits for a cast or crew lock; leaving credits unchanged", "component", "metadata",
+			"content_id", contentID, "error", err)
+		return bothLocked
 	}
 	storedCast, storedCrew := splitPeopleByRole(people)
 	incomingCast, incomingCrew := splitPeopleByRole(incoming.People)
@@ -55,7 +55,7 @@ func (s *MetadataService) peopleLocksForMerge(ctx context.Context, contentID str
 		}
 		existing.People = append(existing.People, storedCrew...)
 	}
-	return locked, nil
+	return locked
 }
 
 // keepStoredLocalCredits prepares a fill-empty write (scheduled refresh,

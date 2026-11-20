@@ -120,9 +120,13 @@ func (m *PermissionMiddleware) RequireMetadataCurationForItem(next http.Handler)
 			return
 		}
 
-		scope := access.MetadataCurationScope{LibraryIDs: slices.Clone(effective.LibraryIDs)}
-		ctx := access.WithMetadataCurationScope(r.Context(), scope)
-		next.ServeHTTP(w, r.WithContext(access.WithMetadataCurationAuthorizer(ctx, scope.Authorizer())))
+		authorize := func(ctx context.Context, libraries []int) error {
+			if len(libraries) == 0 || !metadataTargetWithinUserLibraries(effective.LibraryIDs, libraries) {
+				return access.ErrMetadataCurationScope
+			}
+			return ctx.Err()
+		}
+		next.ServeHTTP(w, r.WithContext(access.WithMetadataCurationAuthorizer(r.Context(), authorize)))
 	})
 }
 

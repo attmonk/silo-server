@@ -5,7 +5,6 @@ import {
   type KeyboardEvent,
 } from "react";
 
-import { useT } from "@/i18n";
 import { formatTime } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
 import {
@@ -17,7 +16,6 @@ import {
 } from "./chartMath";
 import { ChartLegend, ChartTooltip, ChartTooltipRow } from "./chartChrome";
 import { useMeasuredSize } from "./useMeasuredSize";
-import { formatLocale } from "@/lib/appLocale";
 
 export interface LineChartPoint {
   /** Sample timestamp in epoch milliseconds. */
@@ -66,12 +64,6 @@ export interface LineChartProps {
   fill?: boolean;
   /** Categorical slot for the series color; single-series charts stay on slot 0. */
   seriesIndex?: number;
-  /**
-   * A color for the primary series that is not a categorical slot, such as a
-   * neutral token for a total drawn under overlays that take the slots.
-   * Overrides `seriesIndex`.
-   */
-  color?: string;
   /** Series name for the hover readout. */
   seriesLabel?: string;
   formatValue?: (value: number) => string;
@@ -114,7 +106,7 @@ const VIEW_WIDTH = 1000;
 const VIEW_HEIGHT = 100;
 
 function defaultFormatValue(value: number): string {
-  return value.toLocaleString(formatLocale());
+  return value.toLocaleString();
 }
 
 /**
@@ -127,11 +119,10 @@ export function LineChart({
   height = 160,
   fill = false,
   seriesIndex = 0,
-  color: colorProp,
-  seriesLabel: seriesLabelProp,
+  seriesLabel = "Value",
   formatValue = defaultFormatValue,
   formatTick,
-  formatTimestamp = (time) => formatTime(time),
+  formatTimestamp = (t) => formatTime(t),
   edgeLabels,
   minTickStep,
   overlays = [],
@@ -139,10 +130,8 @@ export function LineChart({
   ariaLabel,
   className,
 }: LineChartProps) {
-  const t = useT();
-  const seriesLabel = seriesLabelProp ?? t("web.admin.dashboard.chart.value");
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
-  const color = colorProp ?? chartSeriesColor(seriesIndex);
+  const color = chartSeriesColor(seriesIndex);
   const { ref: plotRef, size: plotSize } = useMeasuredSize<HTMLDivElement>();
   const viewWidth = plotSize && plotSize.width > 0 ? plotSize.width : VIEW_WIDTH;
   const viewHeight = plotSize && plotSize.height > 0 ? plotSize.height : VIEW_HEIGHT;
@@ -270,10 +259,8 @@ export function LineChart({
   const firstPoint = points[0];
   const lastPoint = points[points.length - 1];
 
-  // Time runs left to right in every language; the plot and its labels use physical
-  // coordinates (eslint.config.js PHYSICAL_DIRECTION).
   return (
-    <div dir="ltr" className={cn("w-full", fill && "flex min-h-0 flex-1 flex-col", className)}>
+    <div className={cn("w-full", fill && "flex min-h-0 flex-1 flex-col", className)}>
       {stacked ? (
         // Top band first, so the legend reads in the order the bands stack.
         <ChartLegend
@@ -449,7 +436,7 @@ export function LineChart({
                 {activeValue !== null ? (
                   <ChartTooltipRow
                     color={stacked ? undefined : color}
-                    label={stacked ? t("web.admin.dashboard.chart.total") : seriesLabel}
+                    label={stacked ? "Total" : seriesLabel}
                     value={formatValue(activeValue)}
                   />
                 ) : null}
@@ -474,7 +461,7 @@ export function LineChart({
             className="focus-visible:ring-ring absolute inset-0 cursor-crosshair rounded-sm focus-visible:ring-2 focus-visible:outline-none"
             tabIndex={0}
             role="application"
-            aria-label={t("web.admin.dashboard.chart.inspectSamples", { chart: ariaLabel })}
+            aria-label={`${ariaLabel} — use arrow keys to inspect samples`}
             onPointerMove={handlePointerMove}
             onPointerLeave={() => setActiveIndex(null)}
             onBlur={() => setActiveIndex(null)}

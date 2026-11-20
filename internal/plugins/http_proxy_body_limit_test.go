@@ -82,7 +82,7 @@ func TestHTTPProxyRouteBodyLimit(t *testing.T) {
 				req.ContentLength = -1
 			}
 			rec := httptest.NewRecorder()
-			proxy.serveRoute(rec, req, 1, false, false)
+			proxy.ServeRoute(rec, req, 1, false, false)
 			if rec.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
 			}
@@ -102,7 +102,7 @@ func TestHTTPProxyRouteBodyReadErrorSkipsPlugin(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/plugins/1/api/upload", failingBody{})
 	req.ContentLength = -1
 	rec := httptest.NewRecorder()
-	proxy.serveRoute(rec, req, 1, false, false)
+	proxy.ServeRoute(rec, req, 1, false, false)
 	if rec.Code != http.StatusBadRequest || client.calls != 0 {
 		t.Fatalf("status = %d calls = %d, want 400 and no plugin call", rec.Code, client.calls)
 	}
@@ -126,5 +126,3 @@ func TestPluginRouteBodyLimitFitsRPCMessage(t *testing.T) {
 		t.Fatalf("at-limit request encodes to %d bytes, over the %d-byte RPC limit", size, pluginRPCMaxMessageBytes)
 	}
 }
-
-func (*bodyLimitRouteClient) Retain() (func(), error) { return func() {}, nil }

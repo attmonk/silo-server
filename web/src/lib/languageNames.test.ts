@@ -1,43 +1,26 @@
 // @vitest-environment node
 
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import { languageOptions } from "@/player/utils/languageNames";
-import { resolveAppLocale, setAppLocale } from "./appLocale";
 import {
   canonicalLanguageTag,
   canonicalLanguageWireValue,
-  displayLanguageName,
+  englishLanguageName,
   getLanguageName,
-  loadLanguageNames,
   normalizeLanguageCode,
 } from "./languageNames";
 
-function applyLanguage(stored: string) {
-  setAppLocale(
-    resolveAppLocale({
-      stored,
-      navigatorLanguages: [],
-      runtimeLocale: "en-US",
-      hasCatalog: () => true,
-      pseudoLocales: false,
-    }),
-  );
-}
-
 describe("languageNames", () => {
-  afterEach(() => applyLanguage("en"));
-
   it("uses bundled English CLDR names for ISO 639-1 and ISO 639-3 values", () => {
-    expect(displayLanguageName("sa")).toBe("Sanskrit");
-    expect(displayLanguageName("se")).toBe("Northern Sami");
-    expect(displayLanguageName("sm")).toBe("Samoan");
-    expect(displayLanguageName("yue")).toBe("Cantonese");
+    expect(englishLanguageName("sa")).toBe("Sanskrit");
+    expect(englishLanguageName("se")).toBe("Northern Sami");
+    expect(englishLanguageName("sm")).toBe("Samoan");
+    expect(englishLanguageName("yue")).toBe("Cantonese");
   });
 
   it("preserves region and script specificity in names", () => {
-    expect(displayLanguageName("pt-BR")).toBe("Brazilian Portuguese");
-    expect(displayLanguageName("sr-Latn")).toBe("Serbian (Latin)");
+    expect(englishLanguageName("pt-BR")).toBe("Brazilian Portuguese");
+    expect(englishLanguageName("sr-Latn")).toBe("Serbian (Latin)");
   });
 
   it("canonicalizes ISO aliases without changing regional identity", () => {
@@ -50,23 +33,9 @@ describe("languageNames", () => {
   });
 
   it("distinguishes an unassigned tag from a translated language name", () => {
-    expect(displayLanguageName("xx")).toBeNull();
+    expect(englishLanguageName("xx")).toBeNull();
     expect(getLanguageName("xx")).toBe("Unknown language (xx)");
     expect(getLanguageName("")).toBe("Unknown");
     expect(getLanguageName("ENG")).toBe("English");
-  });
-
-  it("names languages in the interface language once its data has loaded", async () => {
-    const germanOption = () => languageOptions().find((option) => option.code === "de")?.label;
-    applyLanguage("pt-BR");
-    expect(displayLanguageName("de")).toBe("German");
-    expect(germanOption()).toBe("German");
-    await loadLanguageNames("pt-BR");
-    expect(displayLanguageName("de")).toBe("alemão");
-    expect(germanOption()).toBe("alemão");
-
-    applyLanguage("zh-Hans");
-    await loadLanguageNames("zh-Hans");
-    expect(displayLanguageName("fr")).toBe("法语");
   });
 });

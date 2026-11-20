@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -79,9 +78,7 @@ type TMDBMovieCollection struct {
 	BackdropThumbhash  string
 	// MemberTMDBIDs lists the collection's movies in release order.
 	MemberTMDBIDs []int64
-	// Language is the metadata language the collection was fetched in.
-	Language  string
-	FetchedAt time.Time
+	FetchedAt     time.Time
 }
 
 // BoxSetGroup is one box set of a library as a viewer sees it: the
@@ -111,7 +108,7 @@ func (r *BoxSetRepository) Collections(ctx context.Context, ids []int64) (map[in
 		return out, nil
 	}
 	rows, err := r.pool.Query(ctx, `
-		SELECT tmdb_collection_id, name, overview, poster_path, poster_thumbhash, backdrop_path, backdrop_thumbhash, member_tmdb_ids, language, fetched_at
+		SELECT tmdb_collection_id, name, overview, poster_path, poster_thumbhash, backdrop_path, backdrop_thumbhash, member_tmdb_ids, fetched_at
 		FROM tmdb_movie_collections WHERE tmdb_collection_id = ANY($1)`, ids)
 	if err != nil {
 		return nil, fmt.Errorf("querying tmdb collections: %w", err)
@@ -119,7 +116,7 @@ func (r *BoxSetRepository) Collections(ctx context.Context, ids []int64) (map[in
 	defer rows.Close()
 	for rows.Next() {
 		var c TMDBMovieCollection
-		if err := rows.Scan(&c.ID, &c.Name, &c.Overview, &c.PosterPath, &c.PosterThumbhash, &c.BackdropPath, &c.BackdropThumbhash, &c.MemberTMDBIDs, &c.Language, &c.FetchedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Overview, &c.PosterPath, &c.PosterThumbhash, &c.BackdropPath, &c.BackdropThumbhash, &c.MemberTMDBIDs, &c.FetchedAt); err != nil {
 			return nil, fmt.Errorf("scanning tmdb collection: %w", err)
 		}
 		out[c.ID] = c
@@ -187,69 +184,45 @@ func (r *BoxSetRepository) RecordMovieCollection(ctx context.Context, contentID 
 	return nil
 }
 
-// currentBoxSetMemberLibraries selects, as cf, the libraries that make the
-// collection lookup row m current: its movie still has the TMDB ID it was
-// looked up under, and they are enabled libraries with box sets on holding
-// it. Only such rows keep a collection stored and refreshed: a library that
-// turns box sets off, or a rematched movie, leaves its lookup rows behind.
-const currentBoxSetMemberLibraries = `
-			FROM media_items cmi
+// currentBoxSetMember holds when the collection lookup row m is current (its
+// movie still has the TMDB ID it was looked up under) and its movie is in an
+// enabled library with box sets on. Only such rows keep a collection stored
+// and refreshed: a library that turns box sets off, or a rematched movie,
+// leaves its lookup rows behind.
+const currentBoxSetMember = `EXISTS (
+			SELECT 1 FROM media_items cmi
 			JOIN media_item_libraries cmil ON cmil.content_id = cmi.content_id
 			JOIN media_folders cf ON cf.id = cmil.media_folder_id
 			WHERE cmi.content_id = m.content_id AND cmi.tmdb_id = m.checked_tmdb_id::text
-			  AND cf.box_sets_enabled AND cf.enabled IS NOT FALSE`
-
-// currentBoxSetMember holds when the collection lookup row m is current.
-const currentBoxSetMember = `EXISTS (SELECT 1 ` + currentBoxSetMemberLibraries + `)`
-
-// CollectionFetch is a collection due for a fetch and the metadata language
-// to fetch it in.
-type CollectionFetch struct {
-	ID       int64
-	Language string
-}
+			  AND cf.box_sets_enabled AND cf.enabled IS NOT FALSE)`
 
 // CollectionsNeedingFetch returns up to limit collections a movie of a box
-// set library belongs to that are not stored yet, were fetched before
-// staleBefore, or were fetched in another language than the one they are
-// due in. A collection is due in the metadata language of the first library,
-// in library order, that shows it: one with box sets on holding at least its
-// box set minimum of the collection's movies, or failing that any library
-// holding one of them. One collection serves every library, so a deployment
-// whose box set libraries differ in language shows it in one of them.
-func (r *BoxSetRepository) CollectionsNeedingFetch(ctx context.Context, staleBefore time.Time, limit int, skip []int64) ([]CollectionFetch, error) {
+// set library belongs to that are not stored yet or were fetched before
+// staleBefore.
+func (r *BoxSetRepository) CollectionsNeedingFetch(ctx context.Context, staleBefore time.Time, limit int, skip []int64) ([]int64, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT due.tmdb_collection_id, due.language
-		FROM (
-			SELECT DISTINCT ON (m.tmdb_collection_id) m.tmdb_collection_id, lib.language
-			FROM media_item_tmdb_collections m
-			CROSS JOIN LATERAL (
-				SELECT cf.id, cf.sort_order, cf.box_set_min_movies,
-					COALESCE(NULLIF(BTRIM(cf.metadata_language), ''), 'en') AS language
-				`+currentBoxSetMemberLibraries+`
-			) lib
-			WHERE m.tmdb_collection_id IS NOT NULL
-			  AND NOT (m.tmdb_collection_id = ANY($3::bigint[]))
-			GROUP BY m.tmdb_collection_id, lib.id, lib.sort_order, lib.box_set_min_movies, lib.language
-			ORDER BY m.tmdb_collection_id, count(*) >= GREATEST(lib.box_set_min_movies, $4) DESC, lib.sort_order, lib.id
-		) due
-		LEFT JOIN tmdb_movie_collections c ON c.tmdb_collection_id = due.tmdb_collection_id
-		WHERE c.tmdb_collection_id IS NULL OR c.fetched_at < $1 OR c.language <> due.language
-		ORDER BY c.fetched_at NULLS FIRST, due.tmdb_collection_id
-		LIMIT $2`, staleBefore, limit, nonNilSlice(skip), MinBoxSetMinMovies)
+		SELECT DISTINCT m.tmdb_collection_id, c.fetched_at
+		FROM media_item_tmdb_collections m
+		LEFT JOIN tmdb_movie_collections c ON c.tmdb_collection_id = m.tmdb_collection_id
+		WHERE m.tmdb_collection_id IS NOT NULL AND (c.tmdb_collection_id IS NULL OR c.fetched_at < $1)
+		  AND `+currentBoxSetMember+`
+		  AND NOT (m.tmdb_collection_id = ANY($3::bigint[]))
+		ORDER BY c.fetched_at NULLS FIRST, m.tmdb_collection_id
+		LIMIT $2`, staleBefore, limit, nonNilSlice(skip))
 	if err != nil {
 		return nil, fmt.Errorf("querying collections needing a fetch: %w", err)
 	}
 	defer rows.Close()
-	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (CollectionFetch, error) {
-		var c CollectionFetch
-		err := row.Scan(&c.ID, &c.Language)
-		return c, err
-	})
-	if err != nil {
-		return nil, fmt.Errorf("reading collections needing a fetch: %w", err)
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		var fetchedAt *time.Time
+		if err := rows.Scan(&id, &fetchedAt); err != nil {
+			return nil, fmt.Errorf("scanning collection needing a fetch: %w", err)
+		}
+		ids = append(ids, id)
 	}
-	return out, nil
+	return ids, rows.Err()
 }
 
 // UpsertCollection stores a fetched collection with the provider URLs of its
@@ -262,11 +235,10 @@ func (r *BoxSetRepository) UpsertCollection(ctx context.Context, c TMDBMovieColl
 		members = []int64{}
 	}
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO tmdb_movie_collections (tmdb_collection_id, name, overview, poster_path, poster_source_path, backdrop_path, backdrop_source_path, member_tmdb_ids, language, fetched_at)
-		VALUES ($1, $2, $3, $4, $4, $5, $5, $6, $7, now())
+		INSERT INTO tmdb_movie_collections (tmdb_collection_id, name, overview, poster_path, poster_source_path, backdrop_path, backdrop_source_path, member_tmdb_ids, fetched_at)
+		VALUES ($1, $2, $3, $4, $4, $5, $5, $6, now())
 		ON CONFLICT (tmdb_collection_id) DO UPDATE SET
 			name = EXCLUDED.name,
-			language = EXCLUDED.language,
 			overview = EXCLUDED.overview,
 			poster_path = CASE WHEN tmdb_movie_collections.poster_source_path = EXCLUDED.poster_source_path
 				THEN tmdb_movie_collections.poster_path ELSE EXCLUDED.poster_path END,
@@ -281,7 +253,7 @@ func (r *BoxSetRepository) UpsertCollection(ctx context.Context, c TMDBMovieColl
 			member_tmdb_ids = EXCLUDED.member_tmdb_ids,
 			fetched_at = EXCLUDED.fetched_at,
 			updated_at = now()`,
-		c.ID, c.Name, c.Overview, c.PosterSourcePath, c.BackdropSourcePath, members, c.Language)
+		c.ID, c.Name, c.Overview, c.PosterSourcePath, c.BackdropSourcePath, members)
 	if err != nil {
 		return fmt.Errorf("storing tmdb collection: %w", err)
 	}
@@ -350,10 +322,10 @@ func (r *BoxSetRepository) SetCollectionArtwork(ctx context.Context, id int64, s
 	return nil
 }
 
-// TouchCollection marks a collection fetched in language without changing
-// it, so one TMDB no longer serves is not fetched again on every run.
-func (r *BoxSetRepository) TouchCollection(ctx context.Context, id int64, language string) error {
-	_, err := r.pool.Exec(ctx, `UPDATE tmdb_movie_collections SET fetched_at = now(), language = $2 WHERE tmdb_collection_id = $1`, id, language)
+// TouchCollection marks a collection fetched without changing it, so one
+// TMDB no longer serves is not fetched again on every run.
+func (r *BoxSetRepository) TouchCollection(ctx context.Context, id int64) error {
+	_, err := r.pool.Exec(ctx, `UPDATE tmdb_movie_collections SET fetched_at = now() WHERE tmdb_collection_id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("touching tmdb collection: %w", err)
 	}
@@ -551,9 +523,7 @@ func (e *QueryExecutor) movieBoxSet(ctx context.Context, contentID string, libra
 // SearchBoxSetCollectionIDs returns up to limit stored collections that match
 // query among the movies of libraryIDs the viewer can see, skipping the first
 // offset: first those whose name contains every word of it, then those with
-// at least two such movies whose titles do, case-insensitively. Name matches
-// that open with a query word rank first, then those with a word that opens
-// with one, then shorter names. Only movies
+// at least two such movies whose titles do, case-insensitively. Only movies
 // access admits count, so a match cannot reveal a title the viewer may not
 // see.
 func (r *CatalogResolver) SearchBoxSetCollectionIDs(ctx context.Context, query string, libraryIDs []int, access AccessFilter, limit, offset int) ([]int64, error) {
@@ -575,17 +545,9 @@ func (e *QueryExecutor) searchBoxSetCollections(ctx context.Context, query strin
 	patterns := make([]string, 0, len(words))
 	namePatterns := []string{}
 	suffixPatterns := []string{}
-	// Query words that open the stem, or open one of its words, rank a name
-	// match: "harry" finds "Harry Potter" before "Dirty Harry", and "man"
-	// finds "Ant-Man" before "Human".
-	leadPatterns := make([]string, 0, len(words))
-	wordStartPatterns := make([]string, 0, len(words))
 	for _, word := range words {
-		escaped := escapePrefixForLike(word)
-		pattern := "%" + escaped + "%"
+		pattern := "%" + escapePrefixForLike(word) + "%"
 		patterns = append(patterns, pattern)
-		leadPatterns = append(leadPatterns, escaped+"%")
-		wordStartPatterns = append(wordStartPatterns, `[^[:alnum:]]`+regexp.QuoteMeta(word))
 		if boxSetSuffixWords[word] {
 			suffixPatterns = append(suffixPatterns, pattern)
 		} else {
@@ -596,23 +558,13 @@ func (e *QueryExecutor) searchBoxSetCollections(ctx context.Context, query strin
 	if err != nil {
 		return nil, err
 	}
-	bind := func(v any) int {
-		args = append(args, v)
-		return len(args)
-	}
-	allIdx, nameIdx, suffixIdx := bind(patterns), bind(namePatterns), bind(suffixPatterns)
-	leadIdx, wordStartIdx := bind(leadPatterns), bind(wordStartPatterns)
-	limitIdx, offsetIdx := bind(limit), bind(offset)
+	args = append(args, patterns, namePatterns, suffixPatterns, limit, offset)
+	patternIdx := len(args) - 4
 	// A name matches when one query word is in its stem, the other words
 	// are too, and the suffix words are either there or answered by its
 	// suffix.
 	nameMatch := fmt.Sprintf(`(%[1]s LIKE ANY($%[3]d::text[]) AND %[1]s LIKE ALL($%[4]d::text[]) AND (%[2]s OR %[1]s LIKE ALL($%[5]d::text[])))`,
-		boxSetStemSQL, boxSetSuffixedSQL, allIdx, nameIdx, suffixIdx)
-	// Name matches come first: those whose stem opens with a query word,
-	// then those with a word that does, then the rest; within each, shorter
-	// names, then box sets with more movies the viewer sees.
-	nameRank := fmt.Sprintf(`CASE WHEN %[1]s LIKE ANY($%[2]d::text[]) THEN 0 WHEN %[1]s ~ ANY($%[3]d::text[]) THEN 1 ELSE 2 END`,
-		boxSetStemSQL, leadIdx, wordStartIdx)
+		boxSetStemSQL, boxSetSuffixedSQL, patternIdx, patternIdx+1, patternIdx+2)
 	// Grouping the movies the viewer can see by collection keeps only
 	// collections with such a movie, so matches elsewhere do not use up the
 	// candidates a page reads.
@@ -621,11 +573,9 @@ func (e *QueryExecutor) searchBoxSetCollections(ctx context.Context, query strin
 		GROUP BY bsm.tmdb_collection_id, c.name
 		HAVING %[6]s
 			OR count(*) FILTER (WHERE lower(mi.title) LIKE ALL($%[3]d::text[])) >= 2
-		ORDER BY CASE WHEN %[6]s THEN %[8]s END NULLS LAST,
-			CASE WHEN %[6]s THEN length(%[7]s) END NULLS LAST,
-			count(DISTINCT mi.content_id) DESC, bsm.tmdb_collection_id
+		ORDER BY CASE WHEN %[6]s THEN length(%[7]s) ELSE NULL END NULLS LAST, bsm.tmdb_collection_id
 		LIMIT $%[4]d OFFSET $%[5]d`,
-		with, from, allIdx, limitIdx, offsetIdx, nameMatch, boxSetStemSQL, nameRank)
+		with, from, patternIdx, patternIdx+3, patternIdx+4, nameMatch, boxSetStemSQL)
 	rows, err := e.Pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("searching box sets: %w", err)

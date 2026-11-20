@@ -3,15 +3,13 @@ import {
   type QueryDefinition,
   type QueryDefinitionInput,
 } from "@/api/types";
-import type { MessageKey } from "@/i18n";
 
 import {
   guidedStateToQueryDefinition,
   queryDefinitionToGuidedState,
 } from "./CollectionGuidedRulesEditor";
 
-/** Shown where the Guided editor can't open a definition (see `isGuidedRepresentable`). */
-export const GUIDED_UNAVAILABLE_MESSAGE: MessageKey = "web.common.collections.guidedUnavailable";
+export const GUIDED_UNAVAILABLE_MESSAGE = "These rules use options the Guided view can't show.";
 
 /**
  * Reports whether the Guided editor can edit qd without losing anything. Guided

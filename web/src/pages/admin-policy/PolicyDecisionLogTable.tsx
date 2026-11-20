@@ -26,7 +26,6 @@ import {
   usePolicyDecisions,
   type PolicyDecisionFilters,
 } from "@/hooks/queries/admin/policy";
-import { useT } from "@/i18n";
 
 import {
   formatPolicyDate,
@@ -50,7 +49,6 @@ function decisionLabel(value: string) {
 }
 
 export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps) {
-  const t = useT();
   const [decisionName, setDecisionName] = useState("all");
   const [userID, setUserID] = useState("");
   const [allowed, setAllowed] = useState("all");
@@ -117,25 +115,19 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
     <div className="space-y-4">
       {decisions.error && (
         <div role="alert">
-          <p>
-            {messageFromError(decisions.error, t("web.admin.access.policy.decisions.loadFailed"))}
-          </p>
-          <Button onClick={resetFilters}>{t("web.admin.access.policy.decisions.restart")}</Button>
+          <p>{messageFromError(decisions.error, "Unable to load decisions. Restart the list.")}</p>
+          <Button onClick={resetFilters}>Restart decisions</Button>
         </div>
       )}
       <div className="surface-panel-subtle grid gap-3 rounded-2xl p-4 md:grid-cols-[minmax(160px,220px)_120px_130px_1fr_1fr_auto] md:items-end">
         <div className="space-y-2">
-          <Label htmlFor="policy-decision-name">
-            {t("web.admin.access.policy.decisions.filter.decision")}
-          </Label>
+          <Label htmlFor="policy-decision-name">Decision</Label>
           <Select value={decisionName} onValueChange={setDecisionName}>
             <SelectTrigger id="policy-decision-name" className="w-full">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">
-                {t("web.admin.access.policy.decisions.filter.allDecisions")}
-              </SelectItem>
+              <SelectItem value="all">All decisions</SelectItem>
               {domains.map((domain) => {
                 const value = decisionNameForDomain(domain);
                 return (
@@ -149,38 +141,32 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="policy-user-id">
-            {t("web.admin.access.policy.decisions.filter.userId")}
-          </Label>
+          <Label htmlFor="policy-user-id">User ID</Label>
           <Input
             id="policy-user-id"
             value={userID}
             onChange={(event) => setUserID(event.target.value)}
             inputMode="numeric"
-            placeholder={t("web.admin.access.policy.decisions.filter.userIdPlaceholder")}
+            placeholder="42"
           />
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="policy-allowed">
-            {t("web.admin.access.policy.decisions.filter.allowed")}
-          </Label>
+          <Label htmlFor="policy-allowed">Allowed</Label>
           <Select value={allowed} onValueChange={setAllowed}>
             <SelectTrigger id="policy-allowed" className="w-full">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">
-                {t("web.admin.access.policy.decisions.filter.all")}
-              </SelectItem>
-              <SelectItem value="true">{t("web.admin.access.policy.outcome.allowed")}</SelectItem>
-              <SelectItem value="false">{t("web.admin.access.policy.outcome.denied")}</SelectItem>
+              <SelectItem value="all">All</SelectItem>
+              <SelectItem value="true">Allowed</SelectItem>
+              <SelectItem value="false">Denied</SelectItem>
             </SelectContent>
           </Select>
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="policy-from">{t("web.admin.access.policy.decisions.filter.from")}</Label>
+          <Label htmlFor="policy-from">From</Label>
           <Input
             id="policy-from"
             type="datetime-local"
@@ -190,7 +176,7 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="policy-to">{t("web.admin.access.policy.decisions.filter.to")}</Label>
+          <Label htmlFor="policy-to">To</Label>
           <Input
             id="policy-to"
             type="datetime-local"
@@ -201,10 +187,10 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
 
         <div className="flex gap-2">
           <Button type="button" variant="outline" onClick={resetFilters}>
-            {t("web.admin.access.policy.decisions.filter.reset")}
+            Reset
           </Button>
           <Button type="button" onClick={applyFilters}>
-            {t("web.admin.access.policy.decisions.filter.apply")}
+            Apply
           </Button>
         </div>
       </div>
@@ -213,12 +199,12 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>{t("web.admin.access.policy.decisions.column.time")}</TableHead>
-              <TableHead>{t("web.admin.access.policy.decisions.column.decision")}</TableHead>
-              <TableHead>{t("web.admin.access.policy.decisions.column.user")}</TableHead>
-              <TableHead>{t("web.admin.access.policy.decisions.column.allowed")}</TableHead>
-              <TableHead>{t("web.admin.access.policy.decisions.column.eval")}</TableHead>
-              <TableHead>{t("web.admin.access.policy.decisions.column.digest")}</TableHead>
+              <TableHead>Time</TableHead>
+              <TableHead>Decision</TableHead>
+              <TableHead>User</TableHead>
+              <TableHead>Allowed</TableHead>
+              <TableHead>Eval</TableHead>
+              <TableHead>Digest</TableHead>
               <TableHead className="w-[48px]"> </TableHead>
             </TableRow>
           </TableHeader>
@@ -226,14 +212,14 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
             {decisions.isLoading && (
               <TableRow>
                 <TableCell colSpan={7} className="text-muted-foreground py-6 text-center">
-                  {t("web.admin.access.policy.decisions.loading")}
+                  Loading policy decisions...
                 </TableCell>
               </TableRow>
             )}
             {!decisions.isLoading && decisions.data?.items.length === 0 && (
               <TableRow>
                 <TableCell colSpan={7} className="text-muted-foreground py-6 text-center">
-                  {t("web.admin.access.policy.decisions.empty")}
+                  No policy decisions matched the current filters.
                 </TableCell>
               </TableRow>
             )}
@@ -248,7 +234,7 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
                   >
                     <TableCell>{formatPolicyDate(entry.timestamp)}</TableCell>
                     <TableCell>{decisionLabel(entry.decision_name)}</TableCell>
-                    <TableCell>{entry.user_id ?? t("web.admin.access.policy.noValue")}</TableCell>
+                    <TableCell>{entry.user_id ?? "—"}</TableCell>
                     <TableCell>
                       <Badge
                         variant={
@@ -260,21 +246,21 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
                         }
                       >
                         {entry.allowed === false
-                          ? t("web.admin.access.policy.outcome.denied")
+                          ? "Denied"
                           : entry.allowed === true
-                            ? t("web.admin.access.policy.outcome.allowed")
-                            : t("web.admin.access.policy.outcome.error")}
+                            ? "Allowed"
+                            : "Error"}
                       </Badge>
                     </TableCell>
                     <TableCell>{formatPolicyEvalMicros(entry.eval_time_ns)}</TableCell>
                     <TableCell className="max-w-[260px] truncate font-mono text-xs">
-                      {entry.input_digest || t("web.admin.access.policy.noValue")}
+                      {entry.input_digest || "—"}
                     </TableCell>
-                    <TableCell className="text-end">
+                    <TableCell className="text-right">
                       {expanded ? (
-                        <ChevronUp className="text-muted-foreground ms-auto size-4" />
+                        <ChevronUp className="text-muted-foreground ml-auto size-4" />
                       ) : (
-                        <ChevronDown className="text-muted-foreground ms-auto size-4" />
+                        <ChevronDown className="text-muted-foreground ml-auto size-4" />
                       )}
                     </TableCell>
                   </TableRow>
@@ -305,13 +291,13 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
           disabled={cursorStack.length === 0 || decisions.isFetching}
           onClick={goPrevious}
         >
-          {t("web.admin.access.policy.decisions.previous")}
+          Previous
         </Button>
         <div className="text-muted-foreground text-xs">
           {decisions.isFetching
-            ? t("web.admin.access.policy.decisions.refreshing")
+            ? "Refreshing..."
             : decisions.data?.page?.next_cursor
-              ? t("web.admin.access.policy.decisions.moreRows")
+              ? "More rows"
               : ""}
         </div>
         <Button
@@ -320,7 +306,7 @@ export function PolicyDecisionLogTable({ domains }: PolicyDecisionLogTableProps)
           disabled={!decisions.data?.page?.next_cursor || decisions.isFetching}
           onClick={goNext}
         >
-          {t("web.admin.access.policy.decisions.next")}
+          Next
         </Button>
       </div>
     </div>
@@ -340,26 +326,15 @@ function DecisionDetail({
   inputSample?: unknown;
   resultSample?: unknown;
 }) {
-  const t = useT();
   if (isLoading) {
-    return (
-      <p className="text-muted-foreground text-sm">
-        {t("web.admin.access.policy.decisions.detail.loading")}
-      </p>
-    );
+    return <p className="text-muted-foreground text-sm">Loading decision details...</p>;
   }
 
   return (
     <div className="grid gap-4 lg:grid-cols-2">
       <div className="space-y-2">
-        <h3 className="text-sm font-semibold">
-          {t("web.admin.access.policy.decisions.detail.input")}
-        </h3>
-        <p className="text-muted-foreground font-mono text-xs">
-          {t("web.admin.access.policy.decisions.detail.digest", {
-            digest: inputDigest || t("web.admin.access.policy.noValue"),
-          })}
-        </p>
+        <h3 className="text-sm font-semibold">Input</h3>
+        <p className="text-muted-foreground font-mono text-xs">Digest: {inputDigest || "—"}</p>
         {inputSample !== undefined && (
           <pre className="border-border bg-background max-h-[260px] overflow-auto rounded-lg border p-3 font-mono text-xs">
             {prettyPolicyJson(inputSample)}
@@ -367,9 +342,7 @@ function DecisionDetail({
         )}
       </div>
       <div className="space-y-2">
-        <h3 className="text-sm font-semibold">
-          {t("web.admin.access.policy.decisions.detail.result")}
-        </h3>
+        <h3 className="text-sm font-semibold">Result</h3>
         {error && <p className="text-destructive text-sm">{error}</p>}
         {resultSample !== undefined && (
           <pre className="border-border bg-background max-h-[260px] overflow-auto rounded-lg border p-3 font-mono text-xs">
@@ -377,9 +350,7 @@ function DecisionDetail({
           </pre>
         )}
         {!error && resultSample === undefined && (
-          <p className="text-muted-foreground text-sm">
-            {t("web.admin.access.policy.decisions.detail.noResult")}
-          </p>
+          <p className="text-muted-foreground text-sm">No verbose result sample was logged.</p>
         )}
       </div>
     </div>

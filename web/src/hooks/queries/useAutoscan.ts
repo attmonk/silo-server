@@ -5,7 +5,7 @@ import {
 } from "./admin/autoscanSourceObservation";
 import { readAdminAutoscanEvents, type AutoscanEventQuery } from "@/api/v2/adminAutoscanEvents";
 import { readAdminAutoscanScans, type AutoscanScanQuery } from "@/api/v2/adminAutoscanScans";
-import { problemFieldDetail, V2ProblemError, v2 } from "@/api/v2/request";
+import { V2ProblemError, v2 } from "@/api/v2/request";
 import { readAdminAutoscanRewrites } from "@/api/v2/adminAutoscanRewrites";
 import { readAdminAutoscanAvailableSources } from "@/api/v2/adminAutoscanAvailableSources";
 import { readAdminAutoscanConnections } from "@/api/v2/adminAutoscanConnections";
@@ -23,7 +23,6 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 import {
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
@@ -92,20 +91,24 @@ export function useUpdateAutoscanSettings() {
       if (!isCapturedProfileAuthorityActive(profileContext))
         throw new StaleApiRequestContextError();
       if (result.reschedule_state === "failed")
-        toast.warning(t("web.admin.common.autoscan.settingsSavedRescheduleFailed"));
+        toast.warning(
+          "Settings saved, but poll-task rescheduling failed. Runtime may retain its previous schedule until restart.",
+        );
       else if (result.reschedule_state === "not_configured")
-        toast.warning(t("web.admin.common.autoscan.settingsSavedNoRescheduler"));
+        toast.warning("Settings saved; no poll-task rescheduler is configured on this server.");
       return result.settings;
     },
     retry: false,
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success(t("web.admin.common.autoscan.settingsSaved"));
+      toast.success("Autoscan settings saved");
       queryClient.invalidateQueries({ queryKey: adminKeys.autoscanSettings() });
     },
     onError: (_error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.error(t("web.admin.common.autoscan.settingsUnconfirmed"));
+      toast.error(
+        "Settings persistence could not be confirmed. Reload settings before submitting again.",
+      );
     },
   });
   return {
@@ -190,12 +193,14 @@ export function useCreateAutoscanConnection() {
     retry: false,
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success(t("web.admin.common.autoscan.connectionCreated"));
+      toast.success("Autoscan connection created");
       queryClient.invalidateQueries({ queryKey: adminKeys.autoscanConnections() });
     },
     onError: (_error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.error(t("web.admin.common.autoscan.connectionCreateUnconfirmed"));
+      toast.error(
+        "Connection creation could not be confirmed. Refresh connections before submitting again.",
+      );
     },
   });
   return {
@@ -258,12 +263,14 @@ export function useUpdateAutoscanConnection() {
     retry: false,
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success(t("web.admin.common.autoscan.connectionUpdated"));
+      toast.success("Autoscan connection updated");
       queryClient.invalidateQueries({ queryKey: adminKeys.autoscanConnections() });
     },
     onError: (_error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.error(t("web.admin.common.autoscan.connectionUpdateUnconfirmed"));
+      toast.error(
+        "Connection update could not be confirmed. Refresh connections before submitting again.",
+      );
     },
   });
   return {
@@ -319,13 +326,15 @@ export function useDeleteAutoscanConnection() {
     retry: false,
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success(t("web.admin.common.autoscan.connectionDeleted"));
+      toast.success("Autoscan connection deleted");
       queryClient.invalidateQueries({ queryKey: adminKeys.autoscanConnections() });
       queryClient.invalidateQueries({ queryKey: adminKeys.autoscanSources() });
     },
     onError: (_error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.error(t("web.admin.common.autoscan.connectionDeleteUnconfirmed"));
+      toast.error(
+        "Connection deletion could not be confirmed. Refresh connections and check source bindings before submitting again.",
+      );
     },
   });
   return {
@@ -496,18 +505,17 @@ function useAutoscanSourceWrite(create: boolean) {
       // the follow-up read lands.
       if (!create) storeAutoscanSourceReadback(queryClient, intent.profileContext, result);
       queryClient.invalidateQueries({ queryKey: adminKeys.autoscanSources() });
-      toast.success(
-        create
-          ? t("web.admin.common.autoscan.sourceCreated")
-          : t("web.admin.common.autoscan.sourceSaved"),
-      );
+      toast.success(create ? "Autoscan source created" : "Autoscan source saved");
     },
     onError: (error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
       // A validation refusal is a definite answer: nothing was written. Show
       // the server's reason instead of the uncertain-outcome message.
       const rejection = sourceWriteRejection(error);
-      toast.error(rejection ?? t("web.admin.common.autoscan.sourceWriteUnconfirmed"));
+      toast.error(
+        rejection ??
+          "Source write could not be confirmed. Refresh sources before another explicit submission.",
+      );
     },
   });
 }
@@ -519,10 +527,8 @@ function useAutoscanSourceWrite(create: boolean) {
 function sourceWriteRejection(error: unknown): string | null {
   if (!(error instanceof V2ProblemError) || error.status !== 422) return null;
   const detail = error.problem.detail;
-  // `message` is `detail` in English and the catalog text in a translated interface.
-  if (detail && !/see errors/i.test(detail)) return error.message;
-  const field = error.problem.errors?.find((e) => e.detail);
-  return (field && problemFieldDetail(field)) || detail || null;
+  if (detail && !/see errors/i.test(detail)) return detail;
+  return error.problem.errors?.find((e) => e.detail)?.detail || detail || null;
 }
 
 function sourceWriteCallbacks(
@@ -623,12 +629,14 @@ export function useDeleteAutoscanSource() {
     retry: false,
     onSuccess: (_result, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.success(t("web.admin.common.autoscan.sourceDeleted"));
+      toast.success("Autoscan source deleted");
       queryClient.invalidateQueries({ queryKey: adminKeys.autoscanSources() });
     },
     onError: (_error, intent) => {
       if (!isCapturedProfileAuthorityActive(intent.profileContext)) return;
-      toast.error(t("web.admin.common.autoscan.sourceDeleteUnconfirmed"));
+      toast.error(
+        "Source deletion could not be confirmed. Refresh sources before submitting again; running work may continue.",
+      );
     },
   });
   return {
@@ -757,8 +765,8 @@ function useAutoscanWebhookLifecycle(
       queryClient.invalidateQueries({ queryKey: adminKeys.autoscanSources() });
       toast.success(
         action === "create"
-          ? t("web.admin.common.autoscan.webhookCreated")
-          : t("web.admin.common.autoscan.webhookRotated"),
+          ? "Webhook endpoint created or already configured"
+          : "Webhook URL rotated. Copy the new URL into Sonarr or Radarr; the old one no longer works.",
       );
     },
     onError: (_error, intent) => {
@@ -775,7 +783,9 @@ function useAutoscanWebhookLifecycle(
         failedObservation: nextAutoscanSourceObservation(),
       });
       void queryClient.invalidateQueries({ queryKey: adminKeys.autoscanSources() });
-      toast.error(t("web.admin.common.autoscan.webhookUnconfirmed"));
+      toast.error(
+        "Webhook change could not be confirmed. Refresh source state before another explicit submission.",
+      );
     },
   });
   const submit = (intent: AutoscanWebhookIntent, options?: WebhookCallbacks) =>
@@ -885,11 +895,7 @@ export function useAutoscanRewriteSuggestions() {
     retry: false,
     onError: (err, intent) => {
       if (isCapturedProfileAuthorityActive(intent.profileContext))
-        toast.error(
-          err instanceof Error
-            ? err.message
-            : t("web.admin.common.autoscan.rewriteSuggestionsFailed"),
-        );
+        toast.error(err instanceof Error ? err.message : "Could not read rewrite suggestions");
     },
   });
 }
@@ -982,7 +988,9 @@ export function useTriggerAutoscan() {
     },
     onSuccess: (_task, authority) => {
       if (!isCapturedProfileAuthorityActive(authority)) return;
-      toast.success(t("web.admin.common.autoscan.pollStarted"));
+      toast.success(
+        "Autoscan poll started on this server process. Check activity for source outcomes.",
+      );
       refreshPollState();
     },
     onError: (error, authority) => {
@@ -992,11 +1000,15 @@ export function useTriggerAutoscan() {
       // scheduled one, which skips sources polled within their interval, so
       // the admin is told to press again once it finishes.
       if (isAutoscanAlreadyRunning(error)) {
-        toast.info(t("web.admin.common.autoscan.pollAlreadyRunning"));
+        toast.info(
+          "A poll is already running and may skip recently polled sources. Press Run now again when it finishes to poll every source.",
+        );
         refreshPollState();
         return;
       }
-      toast.error(t("web.admin.common.autoscan.pollStartUnconfirmed"));
+      toast.error(
+        "Autoscan start could not be confirmed. Check task and activity state before running again.",
+      );
     },
   });
   return {

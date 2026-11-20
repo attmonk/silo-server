@@ -1,4 +1,3 @@
-import { codeNumber, t } from "@/i18n";
 import { formatTime, preferredDateLocale } from "@/lib/datetime";
 
 interface UpcomingPresentationEvent {
@@ -18,15 +17,15 @@ interface UpcomingPresentationEvent {
 export function upcomingBadgeLabel(badge: string): string {
   switch (badge) {
     case "series_premiere":
-      return t("web.calendar.event.badge.seriesPremiere");
+      return "Premiere";
     case "season_premiere":
-      return t("web.calendar.event.badge.seasonPremiere");
+      return "New Season";
     case "finale":
-      return t("web.calendar.event.badge.finale");
+      return "Finale";
     case "digital":
-      return t("web.calendar.event.badge.digital");
+      return "Digital";
     case "physical":
-      return t("web.calendar.event.badge.physical");
+      return "Physical";
     default:
       return badge;
   }
@@ -53,21 +52,16 @@ export function formatUpcomingSubtitle(event: UpcomingPresentationEvent): string
     (event.type === "episode" || event.type === "season_premiere") &&
     event.season_number != null
   ) {
-    const season = event.season_number;
-    const title = event.episode_title;
     if (event.episode_number != null) {
-      const code = { season: codeNumber(season), episode: codeNumber(event.episode_number) };
-      return title
-        ? t("web.calendar.event.episodeTitled", { ...code, title })
-        : t("web.calendar.event.episode", code);
+      return `S${event.season_number} · E${event.episode_number}${
+        event.episode_title ? ` - ${event.episode_title}` : ""
+      }`;
     }
-    return title
-      ? t("web.calendar.event.seasonTitled", { season, title })
-      : t("web.calendar.event.season", { season });
+    return `Season ${event.season_number}${event.episode_title ? ` · ${event.episode_title}` : ""}`;
   }
 
   if (event.type === "movie") {
-    return t("web.calendar.event.movie");
+    return "Movie";
   }
 
   return "";

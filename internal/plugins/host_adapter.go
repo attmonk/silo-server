@@ -39,7 +39,3 @@ func (h *hostAdapter) Shutdown(ctx context.Context) error {
 func (h *hostAdapter) NextStartSeq() uint64 {
 	return h.host.NextStartSeq()
 }
-
-func (h *hostAdapter) Running(installationID int) bool {
-	return h.host.Running(installationID)
-}

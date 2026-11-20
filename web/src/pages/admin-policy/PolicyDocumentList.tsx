@@ -5,7 +5,6 @@ import { useSearchParams } from "react-router";
 import type { PolicyDocument } from "@/api/adminPolicy";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { useT } from "@/i18n";
 import { PolicyEnabledControl } from "./PolicyRevisionReview";
 import { useCreatePolicyDocument, usePolicyDocuments } from "@/hooks/queries/admin/policy";
 
@@ -23,7 +22,6 @@ function parseDocumentID(value: string | null) {
 }
 
 export function PolicyDocumentList({ domains }: PolicyDocumentListProps) {
-  const t = useT();
   const [searchParams, setSearchParams] = useSearchParams();
   const documents = usePolicyDocuments();
   const selectedDocumentId = parseDocumentID(searchParams.get("document"));
@@ -45,11 +43,11 @@ export function PolicyDocumentList({ domains }: PolicyDocumentListProps) {
           type="button"
           variant="ghost"
           size="sm"
-          className="text-muted-foreground -ms-2"
+          className="text-muted-foreground -ml-2"
           onClick={() => selectDocument(undefined)}
         >
           <ArrowLeft className="size-4" />
-          {t("web.admin.access.policy.allOverrides")}
+          All overrides
         </Button>
         <PolicyEditorPanel documentId={selectedDocumentId} domains={domains} />
       </div>
@@ -60,18 +58,12 @@ export function PolicyDocumentList({ domains }: PolicyDocumentListProps) {
     <div className="space-y-5">
       {documents.error && (
         <div role="alert">
-          <p>
-            {messageFromError(documents.error, t("web.admin.access.policy.overrides.loadFailed"))}
-          </p>
-          <Button onClick={() => void documents.restart()}>
-            {t("web.admin.access.policy.overrides.restart")}
-          </Button>
+          <p>{messageFromError(documents.error, "Unable to load overrides.")}</p>
+          <Button onClick={() => void documents.restart()}>Restart overrides</Button>
         </div>
       )}
       {documents.isLoading && (
-        <p className="text-muted-foreground text-sm">
-          {t("web.admin.access.policy.overrides.loading")}
-        </p>
+        <p className="text-muted-foreground text-sm">Loading policy documents...</p>
       )}
       {!documents.isLoading &&
         domains.map((domain) => (
@@ -87,7 +79,7 @@ export function PolicyDocumentList({ domains }: PolicyDocumentListProps) {
           onClick={() => void documents.fetchNextPage()}
           disabled={documents.isFetchingNextPage}
         >
-          {t("web.admin.access.policy.overrides.loadMore")}
+          Load more overrides
         </Button>
       )}
     </div>
@@ -101,8 +93,7 @@ interface PolicyDomainCardProps {
 }
 
 function PolicyDomainCard({ domain, documents, onSelect }: PolicyDomainCardProps) {
-  const t = useT();
-  const meta = policyDomainMeta(domain, t);
+  const meta = policyDomainMeta(domain);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
   const [error, setError] = useState("");
@@ -112,7 +103,7 @@ function PolicyDomainCard({ domain, documents, onSelect }: PolicyDomainCardProps
     setError("");
     const trimmedName = name.trim();
     if (!trimmedName) {
-      setError(t("web.admin.access.policy.overrides.nameRequired"));
+      setError("Name is required.");
       return;
     }
     try {
@@ -121,7 +112,7 @@ function PolicyDomainCard({ domain, documents, onSelect }: PolicyDomainCardProps
       setCreating(false);
       onSelect(document.id);
     } catch (err) {
-      setError(messageFromError(err, t("web.admin.access.policy.overrides.createFailed")));
+      setError(messageFromError(err, "Failed to create policy document."));
     }
   }
 
@@ -140,35 +131,28 @@ function PolicyDomainCard({ domain, documents, onSelect }: PolicyDomainCardProps
         {!creating && (
           <Button type="button" variant="outline" size="sm" onClick={() => setCreating(true)}>
             <Plus className="size-4" />
-            {t("web.admin.access.policy.overrides.new")}
+            New override
           </Button>
         )}
       </div>
 
       {creating && (
-        <form
-          className="border-border mt-4 flex flex-wrap items-center gap-2 border-t pt-4"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void create();
-          }}
-        >
+        <div className="border-border mt-4 flex flex-wrap items-center gap-2 border-t pt-4">
           <Input
             value={name}
             onChange={(event) => setName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void create();
+            }}
             placeholder={
-              meta.example
-                ? t("web.admin.access.policy.overrides.namePlaceholderExample", {
-                    example: meta.example,
-                  })
-                : t("web.admin.access.policy.overrides.namePlaceholder")
+              meta.example ? `e.g. ${meta.example.replace(/[“”]/g, "")}` : "Override name"
             }
-            aria-label={t("web.admin.access.policy.overrides.nameLabel", { domain: meta.title })}
+            aria-label={`New ${meta.title} override name`}
             className="max-w-sm"
             autoFocus
           />
-          <Button type="submit" size="sm" disabled={createDocument.isPending}>
-            {t("web.admin.access.policy.overrides.create")}
+          <Button type="button" size="sm" onClick={create} disabled={createDocument.isPending}>
+            Create
           </Button>
           <Button
             type="button"
@@ -180,9 +164,9 @@ function PolicyDomainCard({ domain, documents, onSelect }: PolicyDomainCardProps
               setError("");
             }}
           >
-            {t("common.cancel")}
+            Cancel
           </Button>
-        </form>
+        </div>
       )}
 
       {error && <p className="text-destructive mt-3 text-sm">{error}</p>}
@@ -203,9 +187,7 @@ function PolicyDomainCard({ domain, documents, onSelect }: PolicyDomainCardProps
                 <span className="min-w-0 flex-1 truncate text-sm font-medium">{document.name}</span>
                 <PolicyStatusPill status={policyDocumentStatus(document)} />
                 <span className="text-muted-foreground hidden text-xs sm:block">
-                  {t("web.admin.access.policy.overrides.updated", {
-                    date: formatPolicyDate(document.updated_at),
-                  })}
+                  Updated {formatPolicyDate(document.updated_at)}
                 </span>
                 <span
                   onClick={(event) => event.stopPropagation()}
@@ -220,12 +202,13 @@ function PolicyDomainCard({ domain, documents, onSelect }: PolicyDomainCardProps
       ) : (
         !creating && (
           <p className="text-muted-foreground border-border mt-4 border-t pt-4 text-sm">
-            {meta.example
-              ? t("web.admin.access.policy.overrides.emptyExample", {
-                  example: meta.example,
-                  hint: (chunks) => <span className="text-muted-foreground/80">{chunks}</span>,
-                })
-              : t("web.admin.access.policy.overrides.empty")}
+            No overrides for this domain are shown on the loaded pages.
+            {meta.example && (
+              <span className="text-muted-foreground/80">
+                {" "}
+                Write an override like {meta.example}
+              </span>
+            )}
           </p>
         )
       )}

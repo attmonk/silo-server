@@ -1,5 +1,4 @@
 import type { AdminSession } from "@/api/types";
-import { useT } from "@/i18n";
 import { isJellyfinSession } from "@/pages/adminActivityPresentation";
 
 /**
@@ -8,16 +7,15 @@ import { isJellyfinSession } from "@/pages/adminActivityPresentation";
  * native sessions, so callers can drop it into any badge row unconditionally.
  */
 export function JellyfinSessionPill({ session }: { session: AdminSession }) {
-  const t = useT();
   if (!isJellyfinSession(session)) {
     return null;
   }
   return (
     <span
       className="inline-flex flex-shrink-0 rounded border border-[#AA5CC3]/30 bg-[#AA5CC3]/15 px-1.5 py-0.5 text-[9px] font-semibold text-[#AA5CC3]"
-      title={t("web.player.jellyfinSession.title")}
+      title="Jellyfin client"
     >
-      {t("web.player.jellyfinSession.label")}
+      JF
     </span>
   );
 }

@@ -1,5 +1,3 @@
-import { t, type MessageKey } from "@/i18n";
-
 export type PersonalizedSorts = boolean | "date_viewed";
 export type QuerySortOrder = "asc" | "desc";
 export type QuerySortRelevanceScope =
@@ -36,9 +34,7 @@ type ApplicableMediaScope = Exclude<QuerySortRelevanceScope, "all">;
 
 export interface QuerySortOption {
   value: QuerySortField;
-  labelKey: MessageKey;
-  /** The sort's name in the interface language, read when used. */
-  readonly label: string;
+  label: string;
   defaultOrder: QuerySortOrder;
   personalized: boolean;
   applicableMediaScopes: ApplicableMediaScope[];
@@ -91,42 +87,31 @@ const ALL_MEDIA_SCOPES: ApplicableMediaScope[] = [...ALL_VIDEO_SCOPES, "audioboo
 // Bitrate) are meaningless there, so manga is opt-in per sort field instead
 // of being part of ALL_MEDIA_SCOPES.
 
-type QuerySortOptionSpec = Omit<QuerySortOption, "label">;
-
-function withLabel(spec: QuerySortOptionSpec): QuerySortOption {
-  return {
-    ...spec,
-    get label() {
-      return t(this.labelKey);
-    },
-  };
-}
-
-const QUERY_SORT_OPTION_SPECS: QuerySortOptionSpec[] = [
+export const QUERY_SORT_OPTIONS: QuerySortOption[] = [
   {
     value: "title",
-    labelKey: "catalog.sort.title",
+    label: "Title",
     defaultOrder: "asc",
     personalized: false,
     applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
   },
   {
     value: "added_at",
-    labelKey: "catalog.sort.added",
+    label: "Date Added",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
   },
   {
     value: "release_date",
-    labelKey: "catalog.sort.released",
+    label: "Release Date",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
   },
   {
     value: "last_air_date",
-    labelKey: "web.common.sort.latestEpisodeAirDate",
+    label: "Latest Episode Air Date",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: ["series", "episode"],
@@ -134,49 +119,49 @@ const QUERY_SORT_OPTION_SPECS: QuerySortOptionSpec[] = [
   },
   {
     value: "latest_episode_added",
-    labelKey: "web.common.sort.latestEpisodeAdded",
+    label: "Latest Episode Added",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: ["series"],
   },
   {
     value: "year",
-    labelKey: "catalog.sort.year",
+    label: "Year",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
   },
   {
     value: "content_rating",
-    labelKey: "web.common.sort.contentRating",
+    label: "Content Rating",
     defaultOrder: "asc",
     personalized: false,
     applicableMediaScopes: ALL_VIDEO_SCOPES,
   },
   {
     value: "runtime",
-    labelKey: "web.common.sort.duration",
+    label: "Duration",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: ALL_MEDIA_SCOPES,
   },
   {
     value: "rating_imdb",
-    labelKey: "catalog.sort.imdbRating",
+    label: "IMDb Rating",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: ALL_VIDEO_SCOPES,
   },
   {
     value: "rating_tmdb",
-    labelKey: "web.common.sort.tmdbRating",
+    label: "TMDB Rating",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: ALL_VIDEO_SCOPES,
   },
   {
     value: "rating_rt_critic",
-    labelKey: "web.common.sort.rtCriticRating",
+    label: "RT Critic Rating",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: ALL_VIDEO_SCOPES,
@@ -184,7 +169,7 @@ const QUERY_SORT_OPTION_SPECS: QuerySortOptionSpec[] = [
   },
   {
     value: "rating_rt_audience",
-    labelKey: "web.common.sort.rtAudienceRating",
+    label: "RT Audience Rating",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: ALL_VIDEO_SCOPES,
@@ -192,35 +177,35 @@ const QUERY_SORT_OPTION_SPECS: QuerySortOptionSpec[] = [
   },
   {
     value: "resolution",
-    labelKey: "catalog.sort.resolution",
+    label: "Resolution",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: ALL_VIDEO_SCOPES,
   },
   {
     value: "bitrate",
-    labelKey: "web.common.sort.bitrate",
+    label: "Bitrate",
     defaultOrder: "desc",
     personalized: false,
     applicableMediaScopes: ALL_MEDIA_SCOPES,
   },
   {
     value: "progress",
-    labelKey: "web.common.sort.progress",
+    label: "Progress",
     defaultOrder: "desc",
     personalized: true,
     applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
   },
   {
     value: "date_viewed",
-    labelKey: "web.common.sort.dateViewed",
+    label: "Date Viewed",
     defaultOrder: "desc",
     personalized: true,
     applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
   },
   {
     value: "plays",
-    labelKey: "web.common.sort.plays",
+    label: "Plays",
     defaultOrder: "desc",
     personalized: true,
     applicableMediaScopes: [...ALL_MEDIA_SCOPES, "manga"],
@@ -230,34 +215,32 @@ const QUERY_SORT_OPTION_SPECS: QuerySortOptionSpec[] = [
   // ebook_series joins on the backend.
   {
     value: "author",
-    labelKey: "catalog.sort.author",
+    label: "Author",
     defaultOrder: "asc",
     personalized: false,
     applicableMediaScopes: ["audiobook", "ebook", "manga"],
   },
   {
     value: "narrator",
-    labelKey: "catalog.sort.narrator",
+    label: "Narrator",
     defaultOrder: "asc",
     personalized: false,
     applicableMediaScopes: ["audiobook"],
   },
   {
     value: "series",
-    labelKey: "catalog.sort.series",
+    label: "Series",
     defaultOrder: "asc",
     personalized: false,
     applicableMediaScopes: ["audiobook", "ebook"],
   },
 ];
 
-export const QUERY_SORT_OPTIONS: QuerySortOption[] = QUERY_SORT_OPTION_SPECS.map(withLabel);
-
 const QUERY_SORT_OPTION_MAP = new Map(QUERY_SORT_OPTIONS.map((option) => [option.value, option]));
 
-const EBOOK_SORT_LABELS: Partial<Record<QuerySortField, MessageKey>> = {
-  date_viewed: "web.common.sort.dateRead",
-  plays: "web.common.sort.reads",
+const EBOOK_SORT_LABELS: Partial<Record<QuerySortField, string>> = {
+  date_viewed: "Date Read",
+  plays: "Reads",
 };
 
 function normalizeQuerySortOptionsConfig(
@@ -309,7 +292,7 @@ export function getQuerySortOptions(input: QuerySortOptionsInput = false): Query
       relevanceScope === "ebook" || relevanceScope === "manga"
         ? EBOOK_SORT_LABELS[option.value]
         : undefined;
-    return ebookLabel ? withLabel({ ...option, labelKey: ebookLabel }) : option;
+    return ebookLabel ? { ...option, label: ebookLabel } : option;
   });
 }
 

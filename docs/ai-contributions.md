@@ -38,9 +38,8 @@ resolve its findings. For non-trivial changes, describe its scope and method;
 
 Report real observations and check results, including required checks that failed
 or were not run. Keep validation summaries concise; include short output excerpts
-only when they explain a failure. Every pull request needs evidence: changes
-that alter what users see need before-and-after captures, and other changes need
-the steps, build, and test or API results that show they work, as
+only when they explain a failure. Changes that alter what users see need
+before-and-after evidence, as
 [Show visible changes](../CONTRIBUTING.md#show-visible-changes) describes.
 
 Reproduce bugs on a real deployment before filing. Separate observations from

@@ -38,8 +38,6 @@ type handshakeCompleter struct {
 	links int
 }
 
-func (f *handshakeCompleter) ProviderAnswerFence(context.Context) (int64, error) { return 0, nil }
-
 func (f *handshakeCompleter) ResolveOAuthLogin(_ context.Context, in auth.OAuthLoginInput) (*models.User, int64, error) {
 	f.in = in
 	f.calls++

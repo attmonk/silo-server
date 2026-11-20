@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,10 +24,12 @@ import (
 
 type ArtifactStore interface {
 	Bucket() string
-	GetObjectStream(ctx context.Context, bucket, key string) (io.ReadCloser, error)
+	GetObject(ctx context.Context, bucket, key string) ([]byte, error)
 	UploadFile(ctx context.Context, bucket, key, path, contentType string) (int64, error)
 	DeleteObject(ctx context.Context, bucket, key string) error
 }
+
+const remoteCatalogImportTimeout = 10 * time.Minute
 
 const (
 	// imageCacheCleanupMaxStalledClaims bounds how long a cleanup keeps
@@ -64,7 +68,6 @@ type Runner struct {
 	templateBundleApply        templateBundleApplyExecutor
 	storageTransition          storageTransitionExecutor
 	storageTransitionCommitted func(context.Context) error
-	backupRestore              backupRestoreExecutor
 	realtimeHub                *notifications.Hub
 	imageCacheCleanupSlice     time.Duration
 	pollInterval               time.Duration
@@ -227,7 +230,6 @@ func (r *Runner) runNext() {
 		JobTypeDeleteLibrary,
 		JobTypeTemplateBundleApply,
 		JobTypeStorageTransition,
-		JobTypeBackupRestore,
 	})
 	cancel()
 	if err != nil {
@@ -257,8 +259,8 @@ func (r *Runner) runNext() {
 		itemRefresh: r.itemRefresh, libraryRefresh: r.libraryRefresh, libraryDelete: r.libraryDelete,
 		imageCacheCleanup: r.imageCacheCleanup, imageCacheCleanupSlice: r.imageCacheCleanupSlice,
 		templateBundleApply: r.templateBundleApply, storageTransition: r.storageTransition,
-		storageTransitionCommitted: r.storageTransitionCommitted, backupRestore: r.backupRestore,
-		realtimeHub: r.realtimeHub, heartbeatInterval: r.heartbeatInterval, retention: r.retention, cancelRegistry: r.cancelRegistry,
+		storageTransitionCommitted: r.storageTransitionCommitted,
+		realtimeHub:                r.realtimeHub, heartbeatInterval: r.heartbeatInterval, retention: r.retention, cancelRegistry: r.cancelRegistry,
 		storageRestart: r.storageRestart, stop: r.stop,
 	}
 	if job.JobType == JobTypeStorageTransition && r.storageRestartPending() {
@@ -271,9 +273,6 @@ func (r *Runner) runNext() {
 		message := "Library metadata refresh canceled"
 		if job.JobType == JobTypeImageCacheCleanup {
 			message = QueuedImageCacheCleanupCanceledMessage(job.ProgressCurrent, job.ProgressTotal)
-		}
-		if job.JobType == JobTypeBackupRestore {
-			message = "Restore canceled"
 		}
 		if job.JobType == JobTypeStorageTransition {
 			message = "Storage transition canceled; verified copy checkpoints retained"
@@ -319,8 +318,6 @@ func (r *Runner) runNext() {
 		r.executeImageCacheCleanup(job)
 	case JobTypeStorageTransition:
 		r.executeStorageTransition(job)
-	case JobTypeBackupRestore:
-		r.executeBackupRestore(job)
 	default:
 		r.failJob(job.ID, 0, 0, "Admin job failed", "unsupported admin job type")
 	}
@@ -1089,10 +1086,10 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 		r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
 	}
 
-	var data io.ReadCloser
+	var data []byte
 	if req.LocalPath != "" {
 		var err error
-		data, err = os.Open(req.LocalPath)
+		data, err = os.ReadFile(req.LocalPath)
 		if err != nil {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", fmt.Sprintf("reading local file: %v", err))
 			return
@@ -1104,7 +1101,7 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 			r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
 		}
 		var err error
-		data, err = catalogseed.DownloadRemoteBundle(ctx, req.RemoteURL)
+		data, err = downloadRemoteCatalogSeed(ctx, req.RemoteURL)
 		if err != nil {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", err.Error())
 			return
@@ -1122,7 +1119,7 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 			return
 		}
 		var err error
-		data, err = r.store.GetObjectStream(ctx, req.SourceBucket, req.SourceKey)
+		data, err = r.store.GetObject(ctx, req.SourceBucket, req.SourceKey)
 		if err != nil {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", err.Error())
 			return
@@ -1136,14 +1133,11 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 		}
 	}
 
-	// Deferred after the staged-object cleanup, so the source closes first.
-	defer func() { _ = data.Close() }()
-
 	var (
 		lastProgressUpdate time.Time
 		lastProgress       catalogseed.ImportProgress
 	)
-	result, importErr := r.exporter.ImportReader(ctx, data, req.Options, func(progress catalogseed.ImportProgress) {
+	result, importErr := r.exporter.ImportWithProgress(ctx, data, req.Options, func(progress catalogseed.ImportProgress) {
 		lastProgress = progress
 		if time.Since(lastProgressUpdate) < time.Second && progress.Current != progress.Total {
 			return
@@ -1173,6 +1167,44 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 		return
 	}
 	r.publishJobByID(completeCtx, notifications.TypeJobCompleted, job.ID)
+}
+
+func downloadRemoteCatalogSeed(ctx context.Context, remoteURL string) ([]byte, error) {
+	parsed, err := url.Parse(remoteURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid remote URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("invalid remote URL scheme")
+	}
+	if !strings.HasSuffix(strings.ToLower(parsed.Path), ".json.gz") {
+		return nil, fmt.Errorf("remote URL must point to a .json.gz file")
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, remoteCatalogImportTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, remoteURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building remote import request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("downloading remote catalog seed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("downloading remote catalog seed: unexpected status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading remote catalog seed: %w", err)
+	}
+
+	return data, nil
 }
 
 func (r *Runner) executeItemRefresh(job *models.AdminJob) {

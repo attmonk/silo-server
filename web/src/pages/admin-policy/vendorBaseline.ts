@@ -1,5 +1,4 @@
 import type { PolicyVendorModule } from "@/api/adminPolicy";
-import { t } from "@/i18n";
 
 /**
  * The baseline ships as Rego modules; this module turns them into something an
@@ -27,7 +26,7 @@ export function parseRankLadder(source: string): LadderTier[] | undefined {
   for (let entry = entryPattern.exec(table); entry; entry = entryPattern.exec(table)) {
     const [, rawLabel, rawRank] = entry;
     if (rawLabel === undefined || rawRank === undefined) continue;
-    const label = rawLabel === "" ? t("web.admin.access.policy.baseline.anyTier") : rawLabel;
+    const label = rawLabel === "" ? "Any" : rawLabel;
     const rank = Number.parseInt(rawRank, 10);
     const labels = tiers.get(rank) ?? [];
     labels.push(label);

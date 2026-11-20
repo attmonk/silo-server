@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"log/slog"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -15,16 +14,21 @@ type itemUserStateResponse struct {
 	InWatchlist bool `json:"in_watchlist"`
 	// NotInterested is served by v2 only; the frozen v1 shape leaves it out.
 	NotInterested bool `json:"-"`
-	// WatchedCount and UnplayedCount are served by v2 only, on a series or
-	// season the profile has not finished, so a card can say how many
-	// episodes are left. Nil everywhere else.
-	WatchedCount  *int `json:"-"`
-	UnplayedCount *int `json:"-"`
 }
 
 type itemUserStateOptions struct {
 	UserID             int
 	EbookProgressStore EbookReaderProgressLister
+}
+
+func resolveItemUserStates(
+	ctx context.Context,
+	store userstore.UserStore,
+	profileID string,
+	episodeRepo *catalog.EpisodeRepository,
+	items []*models.MediaItem,
+) (map[string]*itemUserStateResponse, error) {
+	return resolveItemUserStatesWithOptions(ctx, store, profileID, episodeRepo, items, itemUserStateOptions{})
 }
 
 func resolveItemUserStatesWithOptions(
@@ -176,7 +180,6 @@ func resolveItemUserStatesWithOptions(
 		result[item.ContentID] = state
 	}
 
-	attachEpisodeCounts(ctx, store, profileID, result, seriesIDs, seasonIDs)
 	return result, nil
 }
 
@@ -229,59 +232,6 @@ func readItemUserFlags(ctx context.Context, store userstore.UserStore, profileID
 		reads.played[id] = progress.Completed
 	}
 	return reads, nil
-}
-
-// attachEpisodeCounts fills WatchedCount and UnplayedCount on the series and
-// seasons in result the profile has not finished, with one rollup query per
-// kind. Played keeps coming from the completion path above; the counts only
-// decorate a card, so a store without the rollup or a failed query leaves
-// them absent.
-func attachEpisodeCounts(
-	ctx context.Context,
-	store userstore.UserStore,
-	profileID string,
-	result map[string]*itemUserStateResponse,
-	seriesIDs, seasonIDs []string,
-) {
-	rollup, ok := store.(userstore.SeriesEpisodeRollupStore)
-	if !ok {
-		return
-	}
-	unfinished := func(ids []string) []string {
-		out := make([]string, 0, len(ids))
-		for _, id := range ids {
-			if state := result[id]; state != nil && !state.Played {
-				out = append(out, id)
-			}
-		}
-		return out
-	}
-	attach := func(counts map[string]userstore.SeriesWatchCounts) {
-		for id, c := range counts {
-			state := result[id]
-			if state == nil || state.Played || c.TotalEpisodes == 0 || c.WatchedCount >= c.TotalEpisodes {
-				continue
-			}
-			watched, unplayed := c.WatchedCount, c.TotalEpisodes-c.WatchedCount
-			state.WatchedCount, state.UnplayedCount = &watched, &unplayed
-		}
-	}
-	if ids := unfinished(seriesIDs); len(ids) > 0 {
-		counts, err := rollup.SeriesEpisodeWatchCounts(ctx, profileID, ids)
-		if err != nil {
-			slog.WarnContext(ctx, "series episode counts failed", "component", "api", "error", err)
-		} else {
-			attach(counts)
-		}
-	}
-	if ids := unfinished(seasonIDs); len(ids) > 0 {
-		counts, err := rollup.SeasonEpisodeWatchCounts(ctx, profileID, ids)
-		if err != nil {
-			slog.WarnContext(ctx, "season episode counts failed", "component", "api", "error", err)
-		} else {
-			attach(counts)
-		}
-	}
 }
 
 func resolveEbookProgressForUserStates(

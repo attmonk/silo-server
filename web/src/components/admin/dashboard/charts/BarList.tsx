@@ -1,9 +1,7 @@
 import { Link } from "react-router";
 
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { chartSeriesColor } from "./chartMath";
-import { formatLocale } from "@/lib/appLocale";
 
 export interface BarListItem {
   id: string;
@@ -25,7 +23,7 @@ export interface BarListProps {
 }
 
 function defaultFormatValue(value: number): string {
-  return value.toLocaleString(formatLocale());
+  return value.toLocaleString();
 }
 
 /**
@@ -39,16 +37,11 @@ export function BarList({
   items,
   seriesIndex = 0,
   formatValue = defaultFormatValue,
-  emptyLabel,
+  emptyLabel = "No activity yet",
   className,
 }: BarListProps) {
-  const t = useT();
   if (items.length === 0) {
-    return (
-      <div className="text-muted-foreground py-4 text-center text-sm">
-        {emptyLabel ?? t("web.admin.dashboard.chart.noActivityYet")}
-      </div>
-    );
+    return <div className="text-muted-foreground py-4 text-center text-sm">{emptyLabel}</div>;
   }
 
   const color = chartSeriesColor(seriesIndex);
@@ -69,7 +62,7 @@ export function BarList({
           >
             <span
               aria-hidden="true"
-              className="absolute inset-y-0 start-0 rounded-e-[4px]"
+              className="absolute inset-y-0 left-0 rounded-r-[4px]"
               style={{
                 width: `${ratio * 100}%`,
                 minWidth: value > 0 ? 6 : 0,

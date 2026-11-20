@@ -138,7 +138,6 @@ const setupDomain = "setup"
 
 // SetupServerInput creates the first administrator.
 type SetupServerInput struct {
-	SignInDeviceHeaders
 	RawBody []byte
 	Body    struct {
 		Username             string `json:"username" minLength:"1" maxLength:"254" doc:"Login name of the administrator" example:"admin"`
@@ -161,7 +160,6 @@ type SignupStatusOutput struct {
 
 // SignupInput creates an account from an invite code.
 type SignupInput struct {
-	SignInDeviceHeaders
 	RawBody []byte
 	Body    struct {
 		Username             string `json:"username" minLength:"1" maxLength:"254" doc:"Login name" example:"alice"`

@@ -12,7 +12,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useRequestWatchProviders } from "@/hooks/queries/admin/requestDiscover";
-import { useT } from "@/i18n";
 import { ROUTING_COUNTRIES, ROUTING_LANGUAGES } from "@/lib/requestRoutingOptions";
 import { tmdbGenresFor } from "@/lib/tmdbGenres";
 import { ValuePicker, type Choice } from "@/pages/admin-settings/RequestRouteFields";
@@ -151,7 +150,6 @@ export function DiscoverFilterFields({
   onChange: (filter: DiscoverFilter) => void;
   slot: "primary" | "more";
 }) {
-  const t = useT();
   const mediaType = filter.media_type as RequestMediaType;
   const set = (change: Partial<DiscoverFilter>) => onChange({ ...filter, ...change });
   const region = filter.watch_region ?? "US";
@@ -162,92 +160,73 @@ export function DiscoverFilterFields({
     return (
       <>
         <div className="flex flex-wrap gap-x-8 gap-y-4">
-          <Field label={t("web.admin.requests.filter.originalLanguage")}>
+          <Field label="Original language">
             <OptionSelect
-              label={t("web.admin.requests.filter.originalLanguage")}
+              label="Original language"
               value={filter.original_language || ANY}
               options={[
-                { value: ANY, label: t("web.admin.requests.filter.anyLanguage") },
+                { value: ANY, label: "Any language" },
                 ...ROUTING_LANGUAGES.map((l) => ({ value: l.code, label: l.name })),
               ]}
               onChange={(v) => set({ original_language: v === ANY ? undefined : v })}
             />
           </Field>
-          <Field
-            label={t("web.admin.requests.filter.ratingLimit")}
-            help={t("web.admin.requests.filter.ratingLimitHelp")}
-          >
+          <Field label="Rating limit" help="Each viewer's own limit still applies.">
             <OptionSelect
-              label={t("web.admin.requests.filter.ratingLimit")}
+              label="Rating limit"
               value={filter.certification_lte || ANY}
               options={[
-                { value: ANY, label: t("web.admin.requests.filter.noRatingLimit") },
-                ...RATING_CEILINGS[mediaType].map((r) => ({
-                  value: r,
-                  label: t("web.admin.requests.filter.upToRating", { rating: r }),
-                })),
+                { value: ANY, label: "No limit" },
+                ...RATING_CEILINGS[mediaType].map((r) => ({ value: r, label: `Up to ${r}` })),
               ]}
               onChange={(v) => set({ certification_lte: v === ANY ? undefined : v })}
             />
           </Field>
         </div>
-        <Field
-          label={t("web.admin.requests.filter.originCountries")}
-          help={t("web.admin.requests.filter.originCountriesHelp")}
-        >
+        <Field label="Countries of origin" help="A title from any one of them.">
           <ValuePicker
-            addLabel={t("web.admin.requests.filter.addCountry")}
+            addLabel="Add country"
             options={ROUTING_COUNTRIES.map((c) => ({ value: c.code, label: c.name }))}
             selected={filter.origin_countries ?? []}
             onChange={(codes) => set({ origin_countries: codes.length ? codes : undefined })}
           />
         </Field>
         <div className="flex flex-wrap gap-x-8 gap-y-4">
-          <Field
-            label={
-              mediaType === "series"
-                ? t("web.admin.requests.filter.firstAired")
-                : t("web.admin.requests.filter.released")
-            }
-          >
+          <Field label={mediaType === "series" ? "First aired" : "Released"}>
             <div className="flex items-center gap-2 text-sm">
               <NumberInput
-                label={t("web.admin.requests.filter.fromYear")}
+                label="From year"
                 value={filter.year_from}
                 onChange={(v) => set({ year_from: v })}
               />
-              <span className="text-muted-foreground">
-                {t("web.admin.requests.filter.rangeTo")}
-              </span>
+              <span className="text-muted-foreground">to</span>
               <NumberInput
-                label={t("web.admin.requests.filter.toYear")}
+                label="To year"
                 value={filter.year_to}
                 onChange={(v) => set({ year_to: v })}
               />
             </div>
           </Field>
-          <Field label={t("web.admin.requests.filter.runtime")}>
+          <Field label="Runtime, minutes">
             <div className="flex items-center gap-2 text-sm">
               <NumberInput
-                label={t("web.admin.requests.filter.shortestRuntime")}
+                label="Shortest runtime"
                 value={filter.runtime_gte}
                 min={0}
                 onChange={(v) => set({ runtime_gte: v })}
               />
-              <span className="text-muted-foreground">
-                {t("web.admin.requests.filter.rangeTo")}
-              </span>
+              <span className="text-muted-foreground">to</span>
               <NumberInput
-                label={t("web.admin.requests.filter.longestRuntime")}
+                label="Longest runtime"
                 value={filter.runtime_lte}
                 min={0}
                 onChange={(v) => set({ runtime_lte: v })}
               />
             </div>
           </Field>
-          <Field label={t("web.admin.requests.filter.lowestScore")}>
+          <Field label="Lowest TMDB score">
             <NumberInput
-              label={t("web.admin.requests.filter.lowestScore")}
+              label="Lowest TMDB score"
               value={filter.vote_average_gte}
               min={0}
               max={10}
@@ -255,9 +234,9 @@ export function DiscoverFilterFields({
               onChange={(v) => set({ vote_average_gte: v })}
             />
           </Field>
-          <Field label={t("web.admin.requests.filter.fewestVotes")}>
+          <Field label="Fewest votes">
             <NumberInput
-              label={t("web.admin.requests.filter.fewestVotes")}
+              label="Fewest votes"
               value={filter.vote_count_gte}
               min={0}
               onChange={(v) => set({ vote_count_gte: v })}
@@ -272,11 +251,11 @@ export function DiscoverFilterFields({
     <div className="grid gap-5">
       <div className="flex flex-wrap gap-x-8 gap-y-4">
         <Segmented<RequestMediaType>
-          label={t("web.admin.requests.filter.show")}
+          label="Show"
           value={mediaType}
           options={[
-            { value: "movie", label: t("web.admin.requests.filter.movies") },
-            { value: "series", label: t("web.admin.requests.filter.series") },
+            { value: "movie", label: "Movies" },
+            { value: "series", label: "Series" },
           ]}
           onChange={(next) =>
             // Genre and network IDs differ between movies and series.
@@ -291,91 +270,79 @@ export function DiscoverFilterFields({
           }
         />
         <Field
-          label={t("web.admin.requests.filter.order")}
+          label="Order"
           help={
             filter.sort_by.startsWith("vote_average")
-              ? t("web.admin.requests.filter.ratedOrderHelp")
+              ? "Without a vote minimum, titles need at least 100 votes."
               : undefined
           }
         >
           <OptionSelect
-            label={t("web.admin.requests.filter.order")}
+            label="Order"
             value={filter.sort_by}
             options={sortsFor(mediaType)}
             onChange={(v) => set({ sort_by: v })}
           />
         </Field>
       </div>
-      <Field
-        label={t("web.admin.requests.filter.genres")}
-        help={t("web.admin.requests.filter.genresHelp")}
-      >
+      <Field label="Genres" help="A title needs every genre listed here.">
         <ValuePicker
-          addLabel={t("web.admin.requests.filter.addGenre")}
+          addLabel="Add genre"
           options={genres}
           selected={(filter.genre_ids ?? []).map(String)}
           onChange={(ids) => set({ genre_ids: toIDs(ids) })}
         />
       </Field>
-      <Field label={t("web.admin.requests.filter.excludeGenres")}>
+      <Field label="Leave out genres">
         <ValuePicker
-          addLabel={t("web.admin.requests.filter.addGenre")}
+          addLabel="Add genre"
           options={genres}
           selected={(filter.exclude_genre_ids ?? []).map(String)}
           onChange={(ids) => set({ exclude_genre_ids: toIDs(ids) })}
         />
       </Field>
       <Field
-        label={t("web.admin.requests.filter.keywords")}
-        help={t("web.admin.requests.filter.keywordsHelp")}
+        label="Keywords"
+        help="TMDB keyword IDs, such as 210024 for anime. A title needs any one."
       >
         <IdList
-          label={t("web.admin.requests.filter.keywordId")}
+          label="Keyword ID"
           ids={filter.keyword_ids}
           onChange={(ids) => set({ keyword_ids: ids })}
         />
       </Field>
-      <Field
-        label={t("web.admin.requests.filter.studios")}
-        help={t("web.admin.requests.filter.studiosHelp")}
-      >
+      <Field label="Studios" help="TMDB company IDs, such as 41077 for A24.">
         <IdList
-          label={t("web.admin.requests.filter.companyId")}
+          label="Company ID"
           ids={filter.company_ids}
           onChange={(ids) => set({ company_ids: ids })}
         />
       </Field>
       {mediaType === "series" ? (
-        <Field
-          label={t("web.admin.requests.filter.networks")}
-          help={t("web.admin.requests.filter.networksHelp")}
-        >
+        <Field label="Networks" help="TMDB network IDs, such as 213 for Netflix originals.">
           <IdList
-            label={t("web.admin.requests.filter.networkId")}
+            label="Network ID"
             ids={filter.network_ids}
             onChange={(ids) => set({ network_ids: ids })}
           />
         </Field>
       ) : null}
-      <Field
-        label={t("web.admin.requests.filter.streamingOn")}
-        help={t("web.admin.requests.filter.streamingOnHelp")}
-      >
+      <Field label="Streaming on" help="Titles TMDB lists on any of these services in the region.">
         <div className="flex flex-wrap items-center gap-2">
           <Input
-            aria-label={t("web.admin.requests.filter.region")}
+            aria-label="Region"
             className="h-9 w-16 uppercase"
             maxLength={2}
             value={region}
             onChange={(event) => set({ watch_region: event.target.value.toUpperCase() })}
           />
           <ValuePicker
-            addLabel={t("web.admin.requests.filter.addService")}
+            addLabel="Add service"
             options={(providers.data ?? []).map((p) => ({ value: String(p.id), label: p.name }))}
             selected={(filter.watch_provider_ids ?? []).map(String)}
             onChange={(ids) => set({ watch_provider_ids: toIDs(ids), watch_region: region })}
             unavailableHint={
-              providers.isError ? t("web.admin.requests.filter.servicesFailed") : undefined
+              providers.isError ? "The services couldn't be loaded from TMDB." : undefined
             }
           />
         </div>

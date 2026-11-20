@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import type { SettingsSectionEntry } from "@/api/types";
-import { problemDisplayText, V2ProblemError } from "@/api/v2/request";
+import { V2ProblemError } from "@/api/v2/request";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SectionOrderList } from "@/components/sections/SectionOrderList";
 import { Button } from "@/components/ui/button";
@@ -19,26 +19,21 @@ import {
   createOverrideIdSource,
   hydrateRemovedSystemSections,
 } from "@/lib/homeRows/profileOverrides";
-import { useT, type Translate } from "@/i18n";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
 import { fetchRecipeCatalog } from "@/lib/recipes";
 
 import { DetailCard } from "../ui";
 
 // A refused save names its reason in the problem's first error (a 400 from
 // recipe validation) or in its detail.
-function saveErrorMessage(t: Translate, error: unknown): string {
+function saveErrorMessage(error: unknown): string {
   let reason: string | undefined;
   if (error instanceof V2ProblemError) {
-    const field = error.problem.errors?.[0];
-    reason = problemDisplayText(error.problem, field ? field.detail : (error.problem.detail ?? ""));
+    reason = error.problem.errors?.[0]?.detail ?? error.problem.detail;
   } else if (error instanceof Error) {
     reason = error.message;
   }
   reason = reason?.trim();
-  return reason
-    ? t("web.admin.users.detail.preferences.home.saveFailedReason", { reason })
-    : t("web.admin.users.detail.preferences.home.saveFailed");
+  return reason ? `Couldn't save Home sections: ${reason}` : "Couldn't save Home sections";
 }
 
 /**
@@ -55,7 +50,6 @@ export function ProfileHomeSections({
   profileId: string;
   profileName: string;
 }) {
-  const t = useT();
   const settings = useAdminProfileSectionSettings(userId, profileId);
   const overrides = useAdminProfileSectionOverrides(userId, profileId);
   const save = useSaveAdminProfileSections(userId, profileId);
@@ -90,7 +84,7 @@ export function ProfileHomeSections({
     });
     save.mutate(body, {
       onError: (error) => {
-        toast.error(saveErrorMessage(t, error));
+        toast.error(saveErrorMessage(error));
         if (settings.data) setSections(settings.data);
       },
     });
@@ -98,17 +92,11 @@ export function ProfileHomeSections({
 
   let body;
   if (settings.isLoading || overrides.isLoading) {
-    body = (
-      <p className="text-muted-foreground px-5 py-8 text-center text-sm">
-        {t("web.admin.users.detail.preferences.home.loading")}
-      </p>
-    );
+    body = <p className="text-muted-foreground px-5 py-8 text-center text-sm">Loading sections…</p>;
   } else if (settings.isError || overrides.isError) {
     body = (
       <p role="alert" className="text-destructive px-5 py-8 text-center text-sm">
-        {t("web.admin.users.detail.preferences.home.loadFailed", {
-          profile: profileName,
-        })}
+        Couldn&apos;t load {profileName}&apos;s Home sections.
       </p>
     );
   } else {
@@ -130,13 +118,11 @@ export function ProfileHomeSections({
   return (
     <>
       <DetailCard
-        title={t("web.admin.users.detail.preferences.home.title", { profile: profileName })}
-        description={t("web.admin.users.detail.preferences.home.description", {
-          profile: profileName,
-        })}
+        title={`Home sections · ${profileName}`}
+        description={`The rows on ${profileName}'s Home screen. Drag to reorder; the eye shows or hides a row.`}
         actions={
           <Button variant="outline" size="sm" disabled={busy} onClick={() => setConfirmReset(true)}>
-            {t("web.admin.users.detail.preferences.home.reset")}
+            Reset to default
           </Button>
         }
       >
@@ -145,24 +131,14 @@ export function ProfileHomeSections({
       <ConfirmDialog
         open={confirmReset}
         onOpenChange={setConfirmReset}
-        title={t("web.admin.users.detail.preferences.home.resetTitle", {
-          profile: profileName,
-        })}
-        description={t("web.admin.users.detail.preferences.home.resetDescription", {
-          profile: profileName,
-        })}
-        confirmLabel={t("web.admin.users.detail.preferences.home.resetConfirm")}
-        className={TOUCH_TARGETS}
+        title={`Reset ${profileName}'s Home sections?`}
+        description={`${profileName}'s Home goes back to the server's section order and visibility, and rows ${profileName} added are removed. Other profiles keep theirs.`}
+        confirmLabel="Reset"
         onConfirm={() => {
           setConfirmReset(false);
           reset.mutate(undefined, {
-            onSuccess: () =>
-              toast.success(
-                t("web.admin.users.detail.preferences.home.resetDone", {
-                  profile: profileName,
-                }),
-              ),
-            onError: () => toast.error(t("web.admin.users.detail.preferences.home.resetFailed")),
+            onSuccess: () => toast.success(`${profileName}'s Home sections reset`),
+            onError: () => toast.error("Couldn't reset Home sections"),
           });
         }}
       />

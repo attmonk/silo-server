@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { ArrowDown, ArrowUp, X } from "lucide-react";
 import { toast } from "sonner";
 
-import { v2ErrorText } from "@/api/v2/request";
 import { PageHeader } from "@/components/page/PageHeader";
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
 import { Button } from "@/components/ui/button";
@@ -15,9 +14,7 @@ import {
 } from "@/components/ui/select";
 import { useUICustomization } from "@/hooks/useUICustomization";
 import { useUserLibraries } from "@/hooks/queries/libraries";
-import { menuItemPinRef, usePinLabel, type PinRef } from "@/hooks/queries/pinLabels";
 import { useClearSettingValue, useSetSettingValue } from "@/hooks/queries/settingValues";
-import { useT, type MessageKey, type Translate } from "@/i18n";
 import { SETTING_KEYS } from "@/lib/settingsContract";
 import {
   defaultWebPrimaryMenu,
@@ -30,7 +27,7 @@ import {
 } from "@/lib/uiCustomization";
 
 import { CardOverlaySettings } from "./CardOverlaySettings";
-import { ChoiceButtons } from "@/components/settings/ChoiceButtons";
+import { ChoiceButtons } from "./ChoiceButtons";
 import { PosterCardPreview } from "./PosterCardPreview";
 import { ResetButton } from "./ResetButton";
 
@@ -40,14 +37,14 @@ const DEVICE_SCOPE = { scope: "profile_device" } as const;
 /** How long the preview keeps the hover-only shortcut buttons showing after a pick. */
 const SHORTCUT_REVEAL_MS = 2500;
 
-const BUILTIN_LABELS: Record<string, MessageKey> = {
-  home: "web.settings.interface.builtin.home",
-  movies: "web.settings.interface.builtin.movies",
-  series: "web.settings.interface.builtin.series",
-  music: "web.settings.interface.builtin.music",
-  audiobooks: "web.settings.interface.builtin.audiobooks",
-  for_you: "web.settings.interface.builtin.forYou",
-  calendar: "web.settings.interface.builtin.calendar",
+const BUILTIN_LABELS: Record<string, string> = {
+  home: "Home",
+  movies: "Movies",
+  series: "TV Shows",
+  music: "Music",
+  audiobooks: "Audiobooks",
+  for_you: "For You",
+  calendar: "Calendar",
 };
 
 const ADDABLE_WEB_BUILTINS: PrimaryMenuItem[] = [
@@ -58,30 +55,24 @@ const ADDABLE_WEB_BUILTINS: PrimaryMenuItem[] = [
   { type: "builtin", destination: "calendar" },
 ];
 
-const POSTER_SIZES: readonly { value: PosterSize; labelKey: MessageKey }[] = [
-  { value: "compact", labelKey: "web.settings.interface.posterCompact" },
-  { value: "standard", labelKey: "web.settings.interface.posterStandard" },
-  { value: "large", labelKey: "web.settings.interface.posterLarge" },
+const POSTER_SIZES: readonly { value: PosterSize; label: string }[] = [
+  { value: "compact", label: "Compact" },
+  { value: "standard", label: "Standard" },
+  { value: "large", label: "Large" },
 ];
 
-function menuItemLabel(
-  t: Translate,
-  item: PrimaryMenuItem,
-  pinLabel: (pin: PinRef) => string,
-): string {
-  if (item.type === "builtin") {
-    const key = BUILTIN_LABELS[item.destination];
-    return key ? t(key) : item.destination;
-  }
-  if (item.type === "library") return t("web.settings.interface.menuLibrary", { name: item.label });
-  // Named like the sidebar names the link: by the row's or collection's current title.
-  const name = pinLabel(menuItemPinRef(item));
-  if (item.type === "section") return t("web.settings.interface.menuSection", { name });
-  return t("web.settings.interface.menuCollection", { name });
+function menuItemLabel(item: PrimaryMenuItem): string {
+  if (item.type === "builtin") return BUILTIN_LABELS[item.destination] ?? item.destination;
+  if (item.type === "library") return `${item.label} · Library`;
+  if (item.type === "section") return `${item.label} · Section`;
+  return `${item.label} · Collection`;
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
 }
 
 export default function InterfaceSettings() {
-  const t = useT();
   const [revealShortcuts, setRevealShortcuts] = useState(false);
   const revealTimer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(revealTimer.current), []);
@@ -94,16 +85,14 @@ export default function InterfaceSettings() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.interface.title")}
-        subtitle={t("web.settings.interface.subtitle")}
+        title="Navigation & Cards"
+        subtitle="Choose how posters look and which links sit in your menu. Changes save as you make them."
       />
       {/* The preview sits beside the poster controls once there is room, and
-          stays in view while they scroll; at large poster sizes it can be
-          taller than the window, so it scrolls on its own. On narrow screens
-          it leads. */}
-      <div className="grid gap-x-10 @5xl:grid-cols-[minmax(0,1fr)_auto]">
+          stays in view while they scroll. On narrow screens it leads. */}
+      <div className="grid gap-x-10 @5xl:grid-cols-[minmax(0,1fr)_19rem]">
         <aside className="pb-2 @5xl:order-last @5xl:pb-0">
-          <div className="@5xl:sticky @5xl:top-6 @5xl:max-h-[calc(100dvh-1.5rem)] @5xl:overflow-y-auto @5xl:pt-6">
+          <div className="@5xl:sticky @5xl:top-6 @5xl:pt-6">
             <PosterCardPreview revealShortcuts={revealShortcuts} />
           </div>
         </aside>
@@ -144,17 +133,16 @@ function OverrideNotice({
  * edited, or null when they can.
  */
 function useCustomizationBlocker(): ReactNode {
-  const t = useT();
   const customization = useUICustomization();
   if (customization.isLoading) {
-    return <p className="text-muted-foreground text-sm">{t("web.settings.interface.loading")}</p>;
+    return <p className="text-muted-foreground text-sm">Loading…</p>;
   }
   if (customization.isUnavailable) {
     return (
       <div className="surface-panel-subtle rounded-xl border p-4" role="alert">
-        <p className="font-medium">{t("web.settings.interface.loadFailedTitle")}</p>
+        <p className="font-medium">Couldn't load your poster and menu settings</p>
         <p className="text-muted-foreground mt-1 text-sm">
-          {t("web.settings.interface.loadFailedDescription")}
+          Editing is off until they load, so nothing you chose earlier gets overwritten.
         </p>
       </div>
     );
@@ -162,9 +150,9 @@ function useCustomizationBlocker(): ReactNode {
   if (!customization.isSupported) {
     return (
       <div className="surface-panel-subtle rounded-xl border p-4" role="alert">
-        <p className="font-medium">{t("web.settings.interface.unsupportedTitle")}</p>
+        <p className="font-medium">Your server needs an update</p>
         <p className="text-muted-foreground mt-1 text-sm">
-          {t("web.settings.interface.unsupportedDescription")}
+          Poster size and the menu can be changed once your server runs a newer version of Silo.
         </p>
       </div>
     );
@@ -174,7 +162,6 @@ function useCustomizationBlocker(): ReactNode {
 
 /** Poster size, stored for the web client family. */
 function PosterSettings() {
-  const t = useT();
   const customization = useUICustomization();
   const setValue = useSetSettingValue();
   const clearValue = useClearSettingValue();
@@ -192,7 +179,7 @@ function PosterSettings() {
         identity: CLIENT_SCOPE,
       });
     } catch (error) {
-      toast.error(v2ErrorText(error, t("web.settings.interface.posterSaveFailed")));
+      toast.error(errorMessage(error, "Couldn't save poster settings"));
     }
   }
 
@@ -200,18 +187,18 @@ function PosterSettings() {
     try {
       await clearValue.mutateAsync({ key: SETTING_KEYS.UI_CARD_PRESENTATION, identity });
     } catch (error) {
-      toast.error(v2ErrorText(error, t("web.settings.interface.posterResetFailed")));
+      toast.error(errorMessage(error, "Couldn't reset poster settings"));
     }
   }
 
   return (
     <SettingsGroup
-      title={t("web.settings.interface.postersTitle")}
-      description={t("web.settings.interface.postersDescription")}
+      title="Posters"
+      description="How big posters are in your web browsers."
       actions={
         !blocker && clientOverride ? (
           <ResetButton
-            label={t("web.settings.interface.posterReset")}
+            label="Reset poster settings"
             disabled={busy}
             onClick={() => void clear(CLIENT_SCOPE)}
           />
@@ -222,17 +209,17 @@ function PosterSettings() {
         <>
           {deviceOverride ? (
             <OverrideNotice
-              action={t("web.settings.interface.matchOtherBrowsers")}
+              action="Match my other browsers"
               disabled={busy}
               onAction={() => void clear(DEVICE_SCOPE)}
             >
-              {t("web.settings.interface.posterDeviceOverride")}
+              This browser has its own poster settings, so changes here won't show in it.
             </OverrideNotice>
           ) : null}
           <ChoiceButtons
-            label={t("web.settings.interface.posterSize")}
+            label="Size"
             value={presentation.poster_size}
-            options={POSTER_SIZES.map((size) => ({ value: size.value, label: t(size.labelKey) }))}
+            options={POSTER_SIZES}
             disabled={busy || deviceOverride}
             onChange={(poster_size) => void save({ ...presentation, poster_size })}
           />
@@ -244,7 +231,6 @@ function PosterSettings() {
 
 /** The ordered links in the web menu, stored for the web client family. Saves on every edit. */
 function MenuSettings() {
-  const t = useT();
   const { data: libraries = [] } = useUserLibraries();
   const customization = useUICustomization();
   const setValue = useSetSettingValue();
@@ -295,11 +281,6 @@ function MenuSettings() {
     }
     return [...unique.values()];
   }, [customization.shortcuts.items, libraries, menuItems]);
-  const pinRefs = useMemo(
-    () => [...menuItems, ...availableItems].flatMap((item) => menuItemPinRef(item) ?? []),
-    [availableItems, menuItems],
-  );
-  const pinLabel = usePinLabel(pinRefs);
 
   async function saveMenu(next: PrimaryMenuItem[]) {
     setSaved({ items: next, overBaselineKey: baselineKey });
@@ -311,7 +292,7 @@ function MenuSettings() {
       });
     } catch (error) {
       setSaved(null);
-      toast.error(v2ErrorText(error, t("web.settings.interface.menuSaveFailed")));
+      toast.error(errorMessage(error, "Couldn't save your menu"));
     }
   }
 
@@ -320,7 +301,7 @@ function MenuSettings() {
       await clearValue.mutateAsync({ key: SETTING_KEYS.NAV_PRIMARY_MENU, identity });
       setSaved(null);
     } catch (error) {
-      toast.error(v2ErrorText(error, t("web.settings.interface.menuResetFailed")));
+      toast.error(errorMessage(error, "Couldn't reset your menu"));
     }
   }
 
@@ -329,12 +310,12 @@ function MenuSettings() {
 
   return (
     <SettingsGroup
-      title={t("web.settings.interface.menuTitle")}
-      description={t("web.settings.interface.menuDescription")}
+      title="Menu"
+      description="The links along the top of Silo in your web browsers. Search and your profile are always there."
       actions={
         clientOverride ? (
           <ResetButton
-            label={t("web.settings.interface.menuReset")}
+            label="Reset menu"
             disabled={locked}
             onClick={() => void clear(CLIENT_SCOPE)}
           />
@@ -344,16 +325,16 @@ function MenuSettings() {
       <>
         {deviceOverride ? (
           <OverrideNotice
-            action={t("web.settings.interface.matchOtherBrowsers")}
+            action="Match my other browsers"
             disabled={busy}
             onAction={() => void clear(DEVICE_SCOPE)}
           >
-            {t("web.settings.interface.menuDeviceOverride")}
+            This browser has its own menu, so changes here won't show in it.
           </OverrideNotice>
         ) : null}
-        <ol className="space-y-2" aria-label={t("web.settings.interface.menuLinks")}>
+        <ol className="space-y-2" aria-label="Menu links">
           {menuItems.map((item, index) => {
-            const label = menuItemLabel(t, item, pinLabel);
+            const label = menuItemLabel(item);
             const home = item.type === "builtin" && item.destination === "home";
             return (
               <li
@@ -367,7 +348,7 @@ function MenuSettings() {
                     variant="ghost"
                     size="icon"
                     disabled={locked || index === 0}
-                    aria-label={t("web.settings.interface.moveUp", { label })}
+                    aria-label={`Move ${label} up`}
                     onClick={() => void saveMenu(moveMenuItem(menuItems, index, -1))}
                   >
                     <ArrowUp className="h-4 w-4" />
@@ -377,7 +358,7 @@ function MenuSettings() {
                     variant="ghost"
                     size="icon"
                     disabled={locked || index === menuItems.length - 1}
-                    aria-label={t("web.settings.interface.moveDown", { label })}
+                    aria-label={`Move ${label} down`}
                     onClick={() => void saveMenu(moveMenuItem(menuItems, index, 1))}
                   >
                     <ArrowDown className="h-4 w-4" />
@@ -387,11 +368,7 @@ function MenuSettings() {
                     variant="ghost"
                     size="icon"
                     disabled={locked || home}
-                    aria-label={
-                      home
-                        ? t("web.settings.interface.homeNotRemovable")
-                        : t("web.settings.interface.remove", { label })
-                    }
+                    aria-label={home ? "Home can't be removed" : `Remove ${label}`}
                     onClick={() =>
                       void saveMenu(menuItems.filter((_, itemIndex) => itemIndex !== index))
                     }
@@ -412,16 +389,13 @@ function MenuSettings() {
               if (item) void saveMenu([...menuItems, item]);
             }}
           >
-            <SelectTrigger
-              className="w-full sm:max-w-xs"
-              aria-label={t("web.settings.interface.addLink")}
-            >
-              <SelectValue placeholder={t("web.settings.interface.addLinkPlaceholder")} />
+            <SelectTrigger className="w-full sm:max-w-xs" aria-label="Add a link">
+              <SelectValue placeholder="Add a link…" />
             </SelectTrigger>
             <SelectContent>
               {availableItems.map((item) => (
                 <SelectItem key={menuItemKey(item)} value={menuItemKey(item)}>
-                  {menuItemLabel(t, item, pinLabel)}
+                  {menuItemLabel(item)}
                 </SelectItem>
               ))}
             </SelectContent>

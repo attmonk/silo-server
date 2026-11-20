@@ -4,17 +4,6 @@ import type {
   AdminDownloadStorageFile,
   AdminDownloadStorageLocation,
 } from "@/api/v2/adminDownloadStorage";
-import { t, type MessageKey } from "@/i18n";
-import { formatDecimal } from "@/lib/numberFormat";
-
-/**
- * Values for a plural message: `count` selects the form, `count_text` prints
- * the number as given (digits by default, so 1234 is not grouped).
- */
-export function countValues(count: number, text = String(count)) {
-  return { count, count_text: text };
-}
-
 /**
  * Bytes in decimal units, the way drives are sold and the way the budget
  * settings take them, so a 500 GB budget reads "500 GB" here too. Zero reads
@@ -22,14 +11,7 @@ export function countValues(count: number, text = String(count)) {
  */
 export function formatStorageBytes(bytes: number | null | undefined): string {
   const value = Math.max(bytes ?? 0, 0);
-  const units: MessageKey[] = [
-    "web.common.format.size.bytes",
-    "web.common.format.size.kb",
-    "web.common.format.size.mb",
-    "web.common.format.size.gb",
-    "web.common.format.size.tb",
-    "web.common.format.size.pb",
-  ];
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
   let index = 0;
   let scaled = value;
   // 999.5 and up would round to "1000", so it moves to the next unit.
@@ -37,11 +19,8 @@ export function formatStorageBytes(bytes: number | null | undefined): string {
     scaled /= 1000;
     index++;
   }
-  const unit = units[index] ?? "web.common.format.size.pb";
-  if (index === 0) return t(unit, { size: formatDecimal(Math.round(scaled), 0) });
-  return t(unit, {
-    size: formatDecimal(scaled, scaled >= 10 ? 0 : 1),
-  });
+  if (index === 0) return `${Math.round(scaled)} B`;
+  return `${scaled >= 100 ? Math.round(scaled) : scaled.toFixed(scaled >= 10 ? 0 : 1)} ${units[index]}`;
 }
 
 /** Fill at which a node stops taking playback sessions (scratch pressure). */
@@ -57,12 +36,12 @@ export interface MeterSegment {
   fraction: number;
 }
 
-const SEGMENT_LABELS: Record<MeterSegmentKind, MessageKey> = {
-  in_use: "web.admin.downloads.presentation.segment.inUse",
-  cached: "web.admin.downloads.presentation.segment.cached",
-  untracked: "web.admin.downloads.presentation.segment.untracked",
-  other: "web.admin.downloads.presentation.segment.otherData",
-  free: "web.admin.downloads.presentation.segment.free",
+const SEGMENT_LABELS: Record<MeterSegmentKind, string> = {
+  in_use: "In use",
+  cached: "Cached",
+  untracked: "Untracked",
+  other: "Other data",
+  free: "Free",
 };
 
 /**
@@ -108,7 +87,7 @@ export function meterSegments(location: AdminDownloadStorageLocation): MeterSegm
   ];
   return parts.map(([kind, bytes]) => ({
     kind,
-    label: t(SEGMENT_LABELS[kind]),
+    label: SEGMENT_LABELS[kind],
     bytes,
     fraction: bytes / total,
   }));
@@ -151,19 +130,14 @@ export function storageWarnings(storage: AdminDownloadStorage): StorageWarning[]
     const fill = diskFillPercent(location);
     const usage = location.usage;
     if (fill !== null && fill >= ceiling - 5) {
+      const scratch = usage?.shares_scratch
+        ? ` Prepared files share this disk with transcode scratch, and at ${SCRATCH_ADMISSION_PERCENT}% the node stops taking playback sessions.`
+        : "";
       warnings.push({
         id: `fill:${location.key}`,
         tone: "warning",
-        title: t("web.admin.downloads.presentation.warning.fill.title", {
-          name: location.name,
-          percent: formatPercent(fill),
-        }),
-        body: usage?.shares_scratch
-          ? t("web.admin.downloads.presentation.warning.fill.bodyScratch", {
-              ceiling: ceiling,
-              scratch: SCRATCH_ADMISSION_PERCENT,
-            })
-          : t("web.admin.downloads.presentation.warning.fill.body", { ceiling: ceiling }),
+        title: `${location.name} is at ${formatPercent(fill)} disk.`,
+        body: `Clean-up deletes cached files early at ${ceiling}%.${scratch}`,
         location: location.key,
         action: "edit_location",
       });
@@ -172,14 +146,8 @@ export function storageWarnings(storage: AdminDownloadStorage): StorageWarning[]
       warnings.push({
         id: `ephemeral:${location.key}`,
         tone: "warning",
-        title: t("web.admin.downloads.presentation.warning.ephemeral.title", {
-          name: location.name,
-        }),
-        body: usage.fs_type
-          ? t("web.admin.downloads.presentation.warning.ephemeral.bodyWithType", {
-              fs_type: usage.fs_type,
-            })
-          : t("web.admin.downloads.presentation.warning.ephemeral.body"),
+        title: `${location.name} keeps prepared files on temporary storage.`,
+        body: `${usage.fs_type || "This filesystem"} does not survive a restart or a container recreation, so every prepared file is prepared again afterwards. Point the directory at a mounted volume.`,
         location: location.key,
         action: "edit_location",
       });
@@ -190,13 +158,8 @@ export function storageWarnings(storage: AdminDownloadStorage): StorageWarning[]
         warnings.push({
           id: `offline:${location.key}`,
           tone: "info",
-          title: t("web.admin.downloads.presentation.warning.offline.title", {
-            name: location.name,
-          }),
-          body: t("web.admin.downloads.presentation.warning.offline.body", {
-            ...countValues(location.waiting_downloads),
-            size: formatStorageBytes(held),
-          }),
+          title: `${location.name} is offline.`,
+          body: `Its ${formatStorageBytes(held)} of prepared files can't be reached; ${location.waiting_downloads} ${location.waiting_downloads === 1 ? "download is" : "downloads are"} waiting on them.`,
           location: location.key,
           action: "view_location",
         });
@@ -206,11 +169,8 @@ export function storageWarnings(storage: AdminDownloadStorage): StorageWarning[]
       warnings.push({
         id: `untracked:${location.key}`,
         tone: "info",
-        title: t("web.admin.downloads.presentation.warning.untracked.title", {
-          size: formatStorageBytes(location.untracked_bytes),
-          name: location.name,
-        }),
-        body: t("web.admin.downloads.presentation.warning.untracked.body"),
+        title: `${formatStorageBytes(location.untracked_bytes)} of untracked files on ${location.name}.`,
+        body: "Silo has no record of these files, so clean-up never removes them.",
         location: location.key,
         action: "review_untracked",
       });
@@ -219,8 +179,8 @@ export function storageWarnings(storage: AdminDownloadStorage): StorageWarning[]
       warnings.push({
         id: `replicas:${location.key}`,
         tone: "warning",
-        title: t("web.admin.downloads.presentation.warning.replicas.title"),
-        body: t("web.admin.downloads.presentation.warning.replicas.body"),
+        title: "API servers report different download directories.",
+        body: "Every API server should share one prepared-file volume; a file one server prepared may be missing on another.",
         location: location.key,
         action: "edit_location",
       });
@@ -231,12 +191,8 @@ export function storageWarnings(storage: AdminDownloadStorage): StorageWarning[]
     warnings.push({
       id: "stale",
       tone: "info",
-      title: t("web.admin.downloads.presentation.warning.stale.title", {
-        size: formatStorageBytes(stale),
-        days: storage.stale_device_days,
-        days_text: storage.stale_device_days,
-      }),
-      body: t("web.admin.downloads.presentation.warning.stale.body"),
+      title: `${formatStorageBytes(stale)} is waiting on devices not seen in ${storage.stale_device_days}+ days.`,
+      body: "Revoking those downloads lets the files expire.",
       action: "review_devices",
     });
   }
@@ -267,24 +223,20 @@ export function storageTotals(storage: AdminDownloadStorage): StorageTotals {
 /** "/srv/x", or what the node uses when no directory is configured or known yet. */
 export function locationDirectoryLabel(location: AdminDownloadStorageLocation): string {
   if (location.dir) return location.dir;
-  return t("web.admin.downloads.presentation.directoryDefault");
+  return "download-artifacts inside its transcode directory";
 }
 
 export function budgetLabel(location: AdminDownloadStorageLocation): string {
-  if (location.budget_source === "none" || location.budget_bytes <= 0) {
-    return t("web.admin.downloads.presentation.budget.none");
-  }
-  return t("web.admin.downloads.presentation.budget.amount", {
-    size: formatStorageBytes(location.budget_bytes),
-  });
+  if (location.budget_source === "none" || location.budget_bytes <= 0) return "No budget";
+  return `${formatStorageBytes(location.budget_bytes)} budget`;
 }
 
 export function budgetSourceLabel(location: AdminDownloadStorageLocation): string {
   switch (location.budget_source) {
     case "override":
-      return t("web.admin.downloads.presentation.budget.sourceCustom");
+      return "custom";
     case "setting":
-      return t("web.admin.downloads.presentation.budget.sourceDefault");
+      return "default";
     default:
       return "";
   }
@@ -302,18 +254,13 @@ export function recordsDrift(location: AdminDownloadStorageLocation): number {
 
 /** Title line for a prepared file; the episode goes in the subtitle. */
 export function storageFileTitle(file: AdminDownloadStorageFile): string {
-  return file.title || t("web.admin.downloads.presentation.file.unknownTitle");
+  return file.title || "Unknown title";
 }
 
 export function storageFileSubtitle(file: AdminDownloadStorageFile): string {
   if (file.season_number != null && file.episode_number != null) {
-    const values = { season: file.season_number, episode: file.episode_number };
-    return file.episode_title
-      ? t("web.admin.downloads.presentation.file.episodeWithTitle", {
-          ...values,
-          title: file.episode_title,
-        })
-      : t("web.admin.downloads.presentation.file.episode", values);
+    const episode = `S${file.season_number} · E${file.episode_number}`;
+    return file.episode_title ? `${episode} ${file.episode_title}` : episode;
   }
   return file.year ? String(file.year) : "";
 }
@@ -322,37 +269,20 @@ export function storageFileRecipe(file: AdminDownloadStorageFile): {
   main: string;
   detail: string;
 } {
-  if (file.format === "remux") {
-    return {
-      main: t("web.admin.downloads.presentation.recipe.remux"),
-      detail: t("web.admin.downloads.presentation.recipe.originalQuality"),
-    };
-  }
+  if (file.format === "remux") return { main: "Remux to MP4", detail: "original quality" };
   const codec = file.video_codec === "hevc" ? "HEVC" : file.video_codec.toUpperCase();
   const main = [file.resolution, codec].filter(Boolean).join(" ");
-  const detail = file.bitrate_kbps
-    ? t("web.admin.downloads.presentation.recipe.bitrate", {
-        mbps: Math.round(file.bitrate_kbps / 1000),
-      })
-    : "";
-  return { main: main || t("web.admin.downloads.presentation.recipe.transcode"), detail };
+  const detail = file.bitrate_kbps ? `${Math.round(file.bitrate_kbps / 1000)} Mbps` : "";
+  return { main: main || "Transcode", detail };
 }
 
 /** Who a file serves, in a few words. */
 export function storageFileUsage(file: AdminDownloadStorageFile): string {
   const parts: string[] = [];
-  if (file.downloading > 0) {
-    parts.push(
-      t("web.admin.downloads.presentation.usage.downloading", countValues(file.downloading)),
-    );
-  }
-  if (file.waiting > 0) {
-    parts.push(t("web.admin.downloads.presentation.usage.waiting", countValues(file.waiting)));
-  }
-  if (file.finished > 0) {
-    parts.push(t("web.admin.downloads.presentation.usage.finished", countValues(file.finished)));
-  }
-  return parts.join(" · ") || t("web.admin.downloads.presentation.usage.none");
+  if (file.downloading > 0) parts.push(`${file.downloading} downloading`);
+  if (file.waiting > 0) parts.push(`${file.waiting} waiting`);
+  if (file.finished > 0) parts.push(`${file.finished} finished`);
+  return parts.join(" · ") || "No downloads";
 }
 
 /** "in 22 h", "in 3 d", or "now" for a cached file's expiry. */
@@ -360,35 +290,26 @@ export function formatExpiresIn(value: string | undefined, now = Date.now()): st
   if (!value) return "";
   const ms = Date.parse(value) - now;
   if (Number.isNaN(ms)) return "";
-  if (ms <= 60_000) return t("web.admin.downloads.presentation.expires.now");
+  if (ms <= 60_000) return "now";
   const hours = ms / 3_600_000;
-  if (hours < 1) {
-    return t(
-      "web.admin.downloads.presentation.expires.minutes",
-      countValues(Math.round(ms / 60_000)),
-    );
-  }
-  if (hours < 48) {
-    return t("web.admin.downloads.presentation.expires.hours", countValues(Math.round(hours)));
-  }
-  return t("web.admin.downloads.presentation.expires.days", countValues(Math.round(hours / 24)));
+  if (hours < 1) return `in ${Math.round(ms / 60_000)} min`;
+  if (hours < 48) return `in ${Math.round(hours)} h`;
+  return `in ${Math.round(hours / 24)} d`;
 }
 
-const REASON_LABELS: Record<string, MessageKey> = {
-  cache_expired: "web.admin.downloads.presentation.reason.cacheExpired",
-  budget: "web.admin.downloads.presentation.reason.budget",
-  disk_ceiling: "web.admin.downloads.presentation.reason.diskCeiling",
-  admin_delete: "web.admin.downloads.presentation.reason.adminDelete",
-  untracked: "web.admin.downloads.presentation.reason.untracked",
-  missing: "web.admin.downloads.presentation.reason.missing",
-  revoked: "web.admin.downloads.presentation.reason.revoked",
-  device_removed: "web.admin.downloads.presentation.reason.deviceRemoved",
+const REASON_LABELS: Record<string, string> = {
+  cache_expired: "Expired from cache",
+  budget: "Over budget",
+  disk_ceiling: "Disk ceiling reached",
+  admin_delete: "Deleted by an administrator",
+  untracked: "Deleted untracked files",
+  missing: "Files found missing",
+  revoked: "Revoked downloads",
+  device_removed: "Removed from device",
 };
 
-/** A history reason's label; an unknown reason shows as the server sent it. */
 export function storageEventReasonLabel(reason: string): string {
-  const key = Object.hasOwn(REASON_LABELS, reason) ? REASON_LABELS[reason] : undefined;
-  return key ? t(key) : reason;
+  return REASON_LABELS[reason] ?? reason;
 }
 
 export const STORAGE_EVENT_REASONS = Object.keys(REASON_LABELS);
@@ -396,29 +317,18 @@ export const STORAGE_EVENT_REASONS = Object.keys(REASON_LABELS);
 /** The item column of a history row. */
 export function storageEventItem(event: AdminDownloadStorageEvent): string {
   if (event.reason === "revoked" || event.reason === "device_removed") {
-    const device = event.location_name || t("web.admin.downloads.presentation.event.unknownDevice");
-    const owner = event.account?.username;
-    return owner
-      ? t("web.admin.downloads.presentation.event.downloadsWithOwner", {
-          ...countValues(event.count),
-          device,
-          owner,
-        })
-      : t("web.admin.downloads.presentation.event.downloads", {
-          ...countValues(event.count),
-          device,
-        });
+    const device = event.location_name || "a device";
+    const owner = event.account?.username ? ` · ${event.account.username}` : "";
+    return `${event.count} ${event.count === 1 ? "download" : "downloads"} · ${device}${owner}`;
   }
   const first = event.titles[0];
   if (event.count === 1 && first) return first;
   if (event.detail && event.reason === "untracked") return event.detail;
-  return t("web.admin.downloads.presentation.event.files", countValues(event.count));
+  return `${event.count} ${event.count === 1 ? "file" : "files"}`;
 }
 
 export function storageEventLocation(event: AdminDownloadStorageEvent): string {
-  if (event.location === "device")
-    return t("web.admin.downloads.presentation.event.locationDevice");
-  if (event.location === "server")
-    return t("web.admin.downloads.presentation.event.locationServer");
+  if (event.location === "device") return "Device";
+  if (event.location === "server") return "Server";
   return event.location_name || event.location;
 }

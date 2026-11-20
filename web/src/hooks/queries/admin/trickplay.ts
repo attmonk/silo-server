@@ -4,7 +4,6 @@ import { toast } from "sonner";
 import { v2 } from "@/api/v2/request";
 import type { components } from "@/api/v2/schema";
 import { adminKeys } from "../keys";
-import { t } from "@/i18n";
 
 export type AdminTrickplayFile = components["schemas"]["AdminTrickplayFile"];
 export type AdminTrickplayLibrary = components["schemas"]["AdminTrickplayLibrary"];
@@ -57,16 +56,14 @@ export function useRegenerateItemTrickplay() {
     onSuccess: ({ requeued }, itemId) => {
       toast.success(
         requeued === 0
-          ? t("web.admin.errors.seekPreviewsNoneQueued")
-          : t("web.admin.errors.seekPreviewsQueued", { count: requeued }),
+          ? "No seek previews were queued"
+          : `Seek previews queued for ${requeued} ${requeued === 1 ? "file" : "files"}`,
       );
       void queryClient.invalidateQueries({ queryKey: adminKeys.itemTrickplay(itemId) });
       void queryClient.invalidateQueries({ queryKey: adminKeys.trickplayLibraries() });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.admin.errors.seekPreviewsQueueFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Could not queue seek previews");
     },
   });
 }

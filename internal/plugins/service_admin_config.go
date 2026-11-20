@@ -144,21 +144,15 @@ func validatedSecretClearSet(
 	return clearSet, nil
 }
 
-// preserveStoredSecrets merges a staged entry over the stored one the way a
-// save would and also returns the stored entry it merged over (nil when none
-// is saved). The stored map is the store's own value and must not be changed.
 func (s *Service) preserveStoredSecrets(
 	ctx context.Context,
 	installationID int,
 	key string,
 	value map[string]any,
 	secretPaths [][]string,
-) (merged, stored map[string]any, err error) {
-	stored, _, err = s.storedGlobalConfigEntry(ctx, installationID, key, len(secretPaths) > 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	return mergeConfigOverStored(stored, value, secretPaths), stored, nil
+) (map[string]any, error) {
+	merged, _, err := s.mergeStoredConfig(ctx, installationID, key, value, secretPaths)
+	return merged, err
 }
 
 func (s *Service) mergeStoredConfig(
@@ -168,49 +162,30 @@ func (s *Service) mergeStoredConfig(
 	value map[string]any,
 	secretPaths [][]string,
 ) (map[string]any, *time.Time, error) {
-	existing, expectedUpdatedAt, err := s.storedGlobalConfigEntry(ctx, installationID, key, len(secretPaths) > 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	return mergeConfigOverStored(existing, value, secretPaths), expectedUpdatedAt, nil
-}
-
-// storedGlobalConfigEntry loads one saved entry and its version. Without a
-// config store there is nothing saved, which is an error only when the
-// caller needs stored secrets.
-func (s *Service) storedGlobalConfigEntry(
-	ctx context.Context,
-	installationID int,
-	key string,
-	needsStore bool,
-) (map[string]any, *time.Time, error) {
 	if s.configs == nil {
-		if needsStore {
+		if len(secretPaths) > 0 {
 			return nil, nil, fmt.Errorf("plugin config store not configured")
 		}
-		return nil, nil, nil
+		merged := make(map[string]any, len(value))
+		for field, incoming := range value {
+			merged[field] = cloneConfigValue(incoming)
+		}
+		return merged, nil, nil
 	}
 	configs, err := s.configs.ListGlobalConfigs(ctx, installationID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load existing plugin config: %w", err)
 	}
+	var existing map[string]any
+	var expectedUpdatedAt *time.Time
 	for _, config := range configs {
 		if config != nil && config.Key == key {
+			existing = config.Value
 			updatedAt := config.UpdatedAt
-			return config.Value, &updatedAt, nil
+			expectedUpdatedAt = &updatedAt
+			break
 		}
 	}
-	return nil, nil, nil
-}
-
-// mergeConfigOverStored overlays a submitted entry on the stored one. A
-// secret the submission leaves blank keeps its stored value, including
-// secrets nested inside submitted objects.
-func mergeConfigOverStored(
-	existing map[string]any,
-	value map[string]any,
-	secretPaths [][]string,
-) map[string]any {
 	merged := make(map[string]any, len(existing)+len(value))
 	for field, saved := range existing {
 		merged[field] = cloneConfigValue(saved)
@@ -219,7 +194,7 @@ func mergeConfigOverStored(
 		merged[field] = cloneConfigValue(incoming)
 	}
 	if len(secretPaths) == 0 {
-		return merged
+		return merged, expectedUpdatedAt, nil
 	}
 	pathsByField := make(map[string][][]string)
 	for _, path := range secretPaths {
@@ -248,7 +223,7 @@ func mergeConfigOverStored(
 			merged[field] = cloneConfigValue(saved)
 		}
 	}
-	return merged
+	return merged, expectedUpdatedAt, nil
 }
 
 // applyGlobalConfigClears finishes a merged config entry and validates it:
@@ -262,33 +237,10 @@ func applyGlobalConfigClears(
 	value map[string]any,
 	clearSet map[string]struct{},
 ) error {
-	removeGlobalConfigClears(manifest, key, merged, value, clearSet)
-	return validateMergedGlobalConfig(manifest, key, merged, value)
-}
-
-// removeGlobalConfigClears removes the secrets in clearSet and the fields the
-// admin cleared from a merged entry.
-func removeGlobalConfigClears(
-	manifest *pluginv1.PluginManifest,
-	key string,
-	merged map[string]any,
-	value map[string]any,
-	clearSet map[string]struct{},
-) {
 	for field := range clearSet {
 		delete(merged, field)
 	}
 	dropClearedConfigFields(manifest, key, merged, value)
-}
-
-// validateMergedGlobalConfig checks a finished entry's declared projection
-// against the schema.
-func validateMergedGlobalConfig(
-	manifest *pluginv1.PluginManifest,
-	key string,
-	merged map[string]any,
-	value map[string]any,
-) error {
 	projection := globalConfigValidationProjection(manifest, key, merged, value)
 	return ValidateGlobalConfigValue(manifest, key, projection)
 }

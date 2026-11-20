@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import type { FormEvent, KeyboardEvent } from "react";
+import type { FormEvent, KeyboardEvent, ReactNode } from "react";
 import { Link, useSearchParams } from "react-router";
-import { Download, ExternalLink, FilterX, Trash2 } from "lucide-react";
+import { Bug, Download, ExternalLink, FilterX, Trash2, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
 import type { DiagnosticReport, DiagnosticReportState, DiagnosticReportSummary } from "@/api/types";
@@ -35,6 +35,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Switch } from "@/components/ui/switch";
+import { cn } from "@/lib/utils";
 import { useDateTimeFormat } from "@/hooks/useDateTimeFormat";
 import {
   downloadDiagnosticReport,
@@ -44,39 +45,21 @@ import {
   useDiagnosticsStatus,
   useUpdateDiagnosticsUploadsEnabled,
 } from "@/hooks/queries/admin/diagnostics";
-import {
-  draftFromSearchParams,
-  FILTER_KEYS,
-  normalizeUserID,
-  setOrDelete,
-  toRFC3339,
-  type FilterDraft,
-} from "./AdminDiagnostics.filters";
-import { EmptyState, FeatureStatusBanner, FilterField } from "./AdminDiagnostics.parts";
 import { formatDateTime as formatPreferredDateTime } from "@/lib/datetime";
-import { useT, type MessageKey, type Translate } from "@/i18n";
-import { formatDecimal } from "@/lib/numberFormat";
 
 const PAGE_SIZE = 25;
-const EM_DASH = "—";
+const FILTER_KEYS = ["user_id", "platform", "report_type", "from", "to", "short_id"];
 
-// Labels for known report types and states; their English matches formatToken().
-const REPORT_TYPE_LABELS: Record<string, MessageKey> = {
-  crash: "web.admin.diagnostics.reportType.crash",
-  anr: "web.admin.diagnostics.reportType.anr",
-  native_crash: "web.admin.diagnostics.reportType.nativeCrash",
-  hang: "web.admin.diagnostics.reportType.hang",
-  abnormal_exit: "web.admin.diagnostics.reportType.abnormalExit",
-  manual: "web.admin.diagnostics.reportType.manual",
-};
+interface FilterDraft {
+  userID: string;
+  platform: string;
+  reportType: string;
+  from: string;
+  to: string;
+  shortID: string;
+}
 
-const STATE_LABELS: Record<DiagnosticReportState, MessageKey> = {
-  receiving: "web.admin.diagnostics.state.receiving",
-  ready: "web.admin.diagnostics.state.ready",
-  failed: "web.admin.diagnostics.state.failed",
-};
 export default function AdminDiagnostics() {
-  const t = useT();
   useDateTimeFormat();
   const [searchParams, setSearchParams] = useSearchParams();
   const appliedFilterKey = FILTER_KEYS.map((key) => searchParams.get(key) ?? "").join("\u0000");
@@ -132,7 +115,7 @@ export default function AdminDiagnostics() {
     event.preventDefault();
     const userID = normalizeUserID(filters.userID);
     if (filters.userID.trim() && !userID) {
-      toast.error(t("web.admin.diagnostics.filters.invalidUserId"));
+      toast.error("User ID must be a positive whole number.");
       return;
     }
     const next = new URLSearchParams(searchParams);
@@ -179,9 +162,7 @@ export default function AdminDiagnostics() {
     try {
       await downloadDiagnosticReport(report);
     } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t("web.admin.diagnostics.detail.downloadFailed"),
-      );
+      toast.error(error instanceof Error ? error.message : "Failed to download diagnostic report");
     } finally {
       setDownloading(false);
     }
@@ -190,8 +171,8 @@ export default function AdminDiagnostics() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.admin.diagnostics.page.title")}
-        subtitle={t("web.admin.diagnostics.page.subtitle")}
+        title="Client Diagnostics"
+        subtitle="Review client crash reports, device context, and correlated playback sessions."
         actions={
           <div className="flex items-center gap-5 sm:gap-6">
             <div className="flex items-center gap-2">
@@ -199,7 +180,7 @@ export default function AdminDiagnostics() {
                 htmlFor="diagnostics-uploads-enabled"
                 className="text-muted-foreground text-sm"
               >
-                {t("web.admin.diagnostics.page.clientUploads")}
+                Client uploads
               </Label>
               <Switch
                 id="diagnostics-uploads-enabled"
@@ -208,17 +189,12 @@ export default function AdminDiagnostics() {
                 disabled={!status.data || status.isError || updateUploadsEnabled.isPending}
               />
             </div>
-            <div className="text-end">
+            <div className="text-right">
               <div className="text-muted-foreground text-xs font-medium tracking-[0.2em] uppercase">
-                {t("web.admin.diagnostics.page.retention")}
+                Retention
               </div>
               <div className="text-sm">
-                {status.data
-                  ? t("web.admin.diagnostics.page.retentionDays", {
-                      count: status.data.retention_days,
-                      count_text: status.data.retention_days,
-                    })
-                  : t("web.admin.diagnostics.page.loading")}
+                {status.data ? `${status.data.retention_days} days` : "Loading..."}
               </div>
             </div>
           </div>
@@ -233,46 +209,34 @@ export default function AdminDiagnostics() {
         className="surface-panel-subtle flex flex-wrap items-end gap-x-3 gap-y-4 rounded-2xl p-4"
         onSubmit={applyFilters}
       >
-        <FilterField
-          label={t("web.admin.diagnostics.filters.user")}
-          htmlFor="diagnostics-user"
-          className="w-24"
-        >
+        <FilterField label="User" htmlFor="diagnostics-user" className="w-24">
           <Input
             id="diagnostics-user"
             type="number"
             min={1}
             step={1}
             inputMode="numeric"
-            placeholder={t("web.admin.diagnostics.filters.userAny")}
+            placeholder="Any"
             value={filters.userID}
             onChange={(event) => setFilter("userID", event.target.value)}
           />
         </FilterField>
-        <FilterField
-          label={t("web.admin.diagnostics.filters.platform")}
-          htmlFor="diagnostics-platform"
-          className="min-w-36 flex-1"
-        >
+        <FilterField label="Platform" htmlFor="diagnostics-platform" className="min-w-36 flex-1">
           <Select value={filters.platform} onValueChange={(value) => setFilter("platform", value)}>
             <SelectTrigger id="diagnostics-platform" className="w-full">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">{t("web.admin.diagnostics.filters.allPlatforms")}</SelectItem>
-              <SelectItem value="android">{formatPlatform("android")}</SelectItem>
-              <SelectItem value="android-tv">{formatPlatform("android-tv")}</SelectItem>
-              <SelectItem value="ios">{formatPlatform("ios")}</SelectItem>
-              <SelectItem value="tvos">{formatPlatform("tvos")}</SelectItem>
-              <SelectItem value="roku">{formatPlatform("roku")}</SelectItem>
+              <SelectItem value="all">All platforms</SelectItem>
+              <SelectItem value="android">Android</SelectItem>
+              <SelectItem value="android-tv">Android TV</SelectItem>
+              <SelectItem value="ios">iOS</SelectItem>
+              <SelectItem value="tvos">tvOS</SelectItem>
+              <SelectItem value="roku">Roku</SelectItem>
             </SelectContent>
           </Select>
         </FilterField>
-        <FilterField
-          label={t("web.admin.diagnostics.filters.reportType")}
-          htmlFor="diagnostics-type"
-          className="min-w-36 flex-1"
-        >
+        <FilterField label="Report type" htmlFor="diagnostics-type" className="min-w-36 flex-1">
           <Select
             value={filters.reportType}
             onValueChange={(value) => setFilter("reportType", value)}
@@ -281,68 +245,50 @@ export default function AdminDiagnostics() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">{t("web.admin.diagnostics.filters.allTypes")}</SelectItem>
-              <SelectItem value="crash">{t("web.admin.diagnostics.filters.type.crash")}</SelectItem>
-              <SelectItem value="anr">{t("web.admin.diagnostics.filters.type.anr")}</SelectItem>
-              <SelectItem value="native_crash">
-                {t("web.admin.diagnostics.filters.type.nativeCrash")}
-              </SelectItem>
-              <SelectItem value="hang">{t("web.admin.diagnostics.filters.type.hang")}</SelectItem>
-              <SelectItem value="abnormal_exit">
-                {t("web.admin.diagnostics.filters.type.abnormalExit")}
-              </SelectItem>
-              <SelectItem value="manual">
-                {t("web.admin.diagnostics.filters.type.manual")}
-              </SelectItem>
+              <SelectItem value="all">All types</SelectItem>
+              <SelectItem value="crash">Crash</SelectItem>
+              <SelectItem value="anr">ANR</SelectItem>
+              <SelectItem value="native_crash">Native crash</SelectItem>
+              <SelectItem value="hang">Hang</SelectItem>
+              <SelectItem value="abnormal_exit">Abnormal exit</SelectItem>
+              <SelectItem value="manual">Manual</SelectItem>
             </SelectContent>
           </Select>
         </FilterField>
-        <FilterField
-          label={t("web.admin.diagnostics.filters.from")}
-          htmlFor="diagnostics-from"
-          className="min-w-44 flex-1"
-        >
+        <FilterField label="From" htmlFor="diagnostics-from" className="min-w-44 flex-1">
           <DateTimePicker
             id="diagnostics-from"
             value={filters.from}
             onChange={(value) => setFilter("from", value)}
           />
         </FilterField>
-        <FilterField
-          label={t("web.admin.diagnostics.filters.to")}
-          htmlFor="diagnostics-to"
-          className="min-w-44 flex-1"
-        >
+        <FilterField label="To" htmlFor="diagnostics-to" className="min-w-44 flex-1">
           <DateTimePicker
             id="diagnostics-to"
             value={filters.to}
             onChange={(value) => setFilter("to", value)}
           />
         </FilterField>
-        <FilterField
-          label={t("web.admin.diagnostics.filters.shortId")}
-          htmlFor="diagnostics-short-id"
-          className="min-w-32 flex-1"
-        >
+        <FilterField label="Short ID" htmlFor="diagnostics-short-id" className="min-w-32 flex-1">
           <Input
             id="diagnostics-short-id"
             className="font-mono uppercase placeholder:normal-case"
-            placeholder={t("web.admin.diagnostics.filters.shortIdPlaceholder")}
+            placeholder="Exact ID"
             value={filters.shortID}
             onChange={(event) => setFilter("shortID", event.target.value)}
           />
         </FilterField>
-        <div className="ms-auto flex gap-2">
-          <Button type="submit">{t("web.admin.diagnostics.filters.apply")}</Button>
+        <div className="ml-auto flex gap-2">
+          <Button type="submit">Apply</Button>
           <Button
             type="button"
             variant="outline"
             onClick={clearFilters}
             disabled={!hasAppliedFilters}
-            aria-label={t("web.admin.diagnostics.filters.clearLabel")}
+            aria-label="Clear diagnostic report filters"
           >
             <FilterX />
-            {t("web.admin.diagnostics.filters.clear")}
+            Clear
           </Button>
         </div>
       </form>
@@ -351,23 +297,21 @@ export default function AdminDiagnostics() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>{t("web.admin.diagnostics.columns.received")}</TableHead>
-              <TableHead>{t("web.admin.diagnostics.columns.shortId")}</TableHead>
-              <TableHead>{t("web.admin.diagnostics.columns.user")}</TableHead>
-              <TableHead>{t("web.admin.diagnostics.columns.platform")}</TableHead>
-              <TableHead>{t("web.admin.diagnostics.columns.type")}</TableHead>
-              <TableHead>{t("web.admin.diagnostics.columns.summary")}</TableHead>
-              <TableHead>{t("web.admin.diagnostics.columns.state")}</TableHead>
-              <TableHead className="text-end">
-                {t("web.admin.diagnostics.columns.bundle")}
-              </TableHead>
+              <TableHead>Received</TableHead>
+              <TableHead>Short ID</TableHead>
+              <TableHead>User</TableHead>
+              <TableHead>Platform</TableHead>
+              <TableHead>Type</TableHead>
+              <TableHead>Summary</TableHead>
+              <TableHead>State</TableHead>
+              <TableHead className="text-right">Bundle</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {reports.isLoading && (
               <TableRow>
                 <TableCell colSpan={8} className="text-muted-foreground py-10 text-center">
-                  {t("web.admin.diagnostics.list.loading")}
+                  Loading diagnostic reports...
                 </TableCell>
               </TableRow>
             )}
@@ -376,7 +320,7 @@ export default function AdminDiagnostics() {
                 <TableCell colSpan={8} className="text-destructive py-10 text-center">
                   {reports.error instanceof Error
                     ? reports.error.message
-                    : t("web.admin.diagnostics.list.loadError")}
+                    : "Failed to load diagnostic reports."}
                 </TableCell>
               </TableRow>
             )}
@@ -401,19 +345,15 @@ export default function AdminDiagnostics() {
           disabled={activeCursorStack.length === 0 || reports.isFetching}
           onClick={goPrevious}
         >
-          {t("web.admin.diagnostics.pagination.previous")}
+          Previous
         </Button>
         <div className="text-muted-foreground text-xs">
           {reports.isFetching
-            ? t("web.admin.diagnostics.pagination.refreshing")
+            ? "Refreshing..."
             : reports.data?.next_cursor
-              ? t("web.admin.diagnostics.pagination.pageWithMore", {
-                  page: activeCursorStack.length + 1,
-                })
+              ? `Page ${activeCursorStack.length + 1} · More reports`
               : reports.data?.reports.length
-                ? t("web.admin.diagnostics.pagination.page", {
-                    page: activeCursorStack.length + 1,
-                  })
+                ? `Page ${activeCursorStack.length + 1}`
                 : ""}
         </div>
         <Button
@@ -422,7 +362,7 @@ export default function AdminDiagnostics() {
           disabled={!reports.data?.next_cursor || reports.isFetching}
           onClick={goNext}
         >
-          {t("web.admin.diagnostics.pagination.next")}
+          Next
         </Button>
       </div>
 
@@ -433,28 +373,23 @@ export default function AdminDiagnostics() {
         <SheetContent className="w-full sm:max-w-3xl">
           <SheetHeader>
             <SheetTitle className="font-mono">
-              {selectedReport.data?.short_id ?? t("web.admin.diagnostics.sheet.titleFallback")}
+              {selectedReport.data?.short_id ?? "Report"}
             </SheetTitle>
             <SheetDescription>
               {selectedReport.data
-                ? t("web.admin.diagnostics.sheet.description", {
-                    type: reportTypeLabel(t, selectedReport.data.report_type),
-                    received: formatDateTime(selectedReport.data.received_at),
-                  })
-                : t("web.admin.diagnostics.sheet.descriptionFallback")}
+                ? `${formatToken(selectedReport.data.report_type)} · ${formatDateTime(selectedReport.data.received_at)}`
+                : "Client diagnostic report details"}
             </SheetDescription>
           </SheetHeader>
           <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-8">
             {selectedReport.isLoading && (
-              <p className="text-muted-foreground py-8 text-sm">
-                {t("web.admin.diagnostics.sheet.loading")}
-              </p>
+              <p className="text-muted-foreground py-8 text-sm">Loading report details...</p>
             )}
             {selectedReport.isError && (
               <p className="text-destructive py-8 text-sm">
                 {selectedReport.error instanceof Error
                   ? selectedReport.error.message
-                  : t("web.admin.diagnostics.sheet.loadError")}
+                  : "Failed to load report details."}
               </p>
             )}
             {selectedReport.data && (
@@ -473,11 +408,9 @@ export default function AdminDiagnostics() {
       <ConfirmDialog
         open={deleteConfirmationOpen}
         onOpenChange={setDeleteConfirmationOpen}
-        title={t("web.admin.diagnostics.delete.title")}
-        description={t("web.admin.diagnostics.delete.description", {
-          id: selectedReport.data?.short_id ?? "",
-        })}
-        confirmLabel={t("web.admin.diagnostics.delete.confirm")}
+        title="Delete diagnostic report?"
+        description={`This permanently deletes report ${selectedReport.data?.short_id ?? ""} and its uploaded bundle.`}
+        confirmLabel="Delete report"
         variant="destructive"
         isPending={deleteReport.isPending}
         onConfirm={() => {
@@ -494,6 +427,30 @@ export default function AdminDiagnostics() {
   );
 }
 
+function FilterField({
+  label,
+  htmlFor,
+  className,
+  children,
+}: {
+  label: string;
+  htmlFor: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className={cn("flex flex-col gap-1.5", className)}>
+      <Label
+        htmlFor={htmlFor}
+        className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase"
+      >
+        {label}
+      </Label>
+      {children}
+    </div>
+  );
+}
+
 function DiagnosticReportRow({
   report,
   onSelect,
@@ -501,7 +458,6 @@ function DiagnosticReportRow({
   report: DiagnosticReportSummary;
   onSelect: (id: string) => void;
 }) {
-  const t = useT();
   function handleKeyDown(event: KeyboardEvent<HTMLTableRowElement>) {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
@@ -515,12 +471,12 @@ function DiagnosticReportRow({
       tabIndex={0}
       onClick={() => onSelect(report.id)}
       onKeyDown={handleKeyDown}
-      aria-label={t("web.admin.diagnostics.row.openLabel", { id: report.short_id })}
+      aria-label={`Open diagnostic report ${report.short_id}`}
     >
       <TableCell className="whitespace-nowrap">{formatDateTime(report.received_at)}</TableCell>
       <TableCell className="font-mono text-xs font-medium">{report.short_id}</TableCell>
       <TableCell>
-        <div>{t("web.admin.diagnostics.userRef", { id: String(report.user_id) })}</div>
+        <div>#{report.user_id}</div>
         {report.profile_id && (
           <div className="text-muted-foreground max-w-[120px] truncate text-xs">
             {report.profile_id}
@@ -530,27 +486,23 @@ function DiagnosticReportRow({
       <TableCell>
         <div>{formatPlatform(report.platform)}</div>
         <div className="text-muted-foreground text-xs">
-          {report.app_build
-            ? t("web.admin.diagnostics.row.versionWithBuild", {
-                version: report.app_version,
-                build: report.app_build,
-              })
-            : t("web.admin.diagnostics.row.version", { version: report.app_version })}
+          v{report.app_version}
+          {report.app_build ? ` (${report.app_build})` : ""}
         </div>
       </TableCell>
       <TableCell>
-        <Badge variant="outline">{reportTypeLabel(t, report.report_type)}</Badge>
+        <Badge variant="outline">{formatToken(report.report_type)}</Badge>
       </TableCell>
       <TableCell>
         <div className="max-w-[360px] truncate" title={report.crash_summary}>
-          {report.crash_summary || EM_DASH}
+          {report.crash_summary || "—"}
         </div>
       </TableCell>
       <TableCell>
         <StateBadge state={report.state} />
       </TableCell>
-      <TableCell className="text-end font-mono text-xs tabular-nums">
-        {formatBytes(t, report.blob_bytes)}
+      <TableCell className="text-right font-mono text-xs tabular-nums">
+        {formatBytes(report.blob_bytes)}
       </TableCell>
     </TableRow>
   );
@@ -569,7 +521,6 @@ function DiagnosticReportDetail({
   onDownload: () => void;
   onDelete: () => void;
 }) {
-  const t = useT();
   const device = report.manifest.device_summary;
   const appBuild = report.app_build;
 
@@ -582,85 +533,46 @@ function DiagnosticReportDetail({
           disabled={report.state !== "ready" || downloading}
         >
           <Download />
-          {downloading
-            ? t("web.admin.diagnostics.detail.preparing")
-            : t("web.admin.diagnostics.detail.download")}
+          {downloading ? "Preparing..." : "Download bundle"}
         </Button>
         <Button type="button" variant="destructive" onClick={onDelete} disabled={deleting}>
           <Trash2 />
-          {t("web.admin.diagnostics.detail.delete")}
+          Delete
         </Button>
         {report.state !== "ready" && (
           <span className="text-muted-foreground text-xs">
-            {t("web.admin.diagnostics.detail.onlyReadyDownloadable")}
+            Only ready reports can be downloaded.
           </span>
         )}
       </div>
 
       <div className="surface-panel-subtle grid gap-4 rounded-xl p-4 sm:grid-cols-3">
         <DetailField
-          label={t("web.admin.diagnostics.detail.device")}
-          value={[device.manufacturer, device.model].filter(Boolean).join(" ") || EM_DASH}
+          label="Device"
+          value={[device.manufacturer, device.model].filter(Boolean).join(" ") || "—"}
         />
+        <DetailField label="OS" value={device.os || report.manifest.report.os_version || "—"} />
         <DetailField
-          label={t("web.admin.diagnostics.detail.os")}
-          value={device.os || report.manifest.report.os_version || EM_DASH}
-        />
-        <DetailField
-          label={t("web.admin.diagnostics.detail.app")}
-          value={
-            appBuild
-              ? t("web.admin.diagnostics.detail.appVersionWithBuild", {
-                  version: report.app_version,
-                  build: appBuild,
-                })
-              : report.app_version
-          }
+          label="App"
+          value={`${report.app_version}${appBuild ? ` (${appBuild})` : ""}`}
         />
       </div>
 
       <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
-        <DetailField
-          label={t("web.admin.diagnostics.detail.state")}
-          value={stateLabel(t, report.state)}
-        />
-        <DetailField
-          label={t("web.admin.diagnostics.detail.user")}
-          value={t("web.admin.diagnostics.userRef", { id: String(report.user_id) })}
-        />
-        <DetailField
-          label={t("web.admin.diagnostics.detail.profile")}
-          value={report.profile_id || EM_DASH}
-          mono
-        />
-        <DetailField
-          label={t("web.admin.diagnostics.detail.captured")}
-          value={formatDateTime(report.captured_at)}
-        />
-        <DetailField
-          label={t("web.admin.diagnostics.detail.received")}
-          value={formatDateTime(report.received_at)}
-        />
-        <DetailField
-          label={t("web.admin.diagnostics.detail.formFactor")}
-          value={formatToken(device.form_factor)}
-        />
-        <DetailField
-          label={t("web.admin.diagnostics.detail.compressed")}
-          value={formatBytes(t, report.blob_bytes)}
-        />
-        <DetailField
-          label={t("web.admin.diagnostics.detail.uncompressed")}
-          value={formatBytes(t, report.uncompressed_bytes)}
-        />
-        <DetailField label={t("web.admin.diagnostics.detail.reportId")} value={report.id} mono />
+        <DetailField label="State" value={formatToken(report.state)} />
+        <DetailField label="User" value={`#${report.user_id}`} />
+        <DetailField label="Profile" value={report.profile_id || "—"} mono />
+        <DetailField label="Captured" value={formatDateTime(report.captured_at)} />
+        <DetailField label="Received" value={formatDateTime(report.received_at)} />
+        <DetailField label="Form factor" value={formatToken(device.form_factor)} />
+        <DetailField label="Compressed" value={formatBytes(report.blob_bytes)} />
+        <DetailField label="Uncompressed" value={formatBytes(report.uncompressed_bytes)} />
+        <DetailField label="Report ID" value={report.id} mono />
       </div>
 
       {report.crash_summary && (
         <div>
-          <h3 className="mb-2 text-sm font-semibold">
-            {t("web.admin.diagnostics.detail.crashSummary")}
-          </h3>
+          <h3 className="mb-2 text-sm font-semibold">Crash summary</h3>
           <p className="bg-muted rounded-lg p-3 text-sm leading-6 whitespace-pre-wrap">
             {report.crash_summary}
           </p>
@@ -668,9 +580,7 @@ function DiagnosticReportDetail({
       )}
 
       <div>
-        <h3 className="mb-2 text-sm font-semibold">
-          {t("web.admin.diagnostics.detail.playbackSessions")}
-        </h3>
+        <h3 className="mb-2 text-sm font-semibold">Playback sessions</h3>
         {report.playback_session_ids.length > 0 ? (
           <div className="flex flex-col items-start gap-2">
             {report.playback_session_ids.map((sessionID) => (
@@ -685,15 +595,13 @@ function DiagnosticReportDetail({
             ))}
           </div>
         ) : (
-          <p className="text-muted-foreground text-sm">
-            {t("web.admin.diagnostics.detail.noPlaybackSessions")}
-          </p>
+          <p className="text-muted-foreground text-sm">No playback sessions were attached.</p>
         )}
       </div>
 
       <details className="group border-border overflow-hidden rounded-xl border">
         <summary className="bg-muted/40 hover:bg-muted/70 cursor-pointer px-4 py-3 text-sm font-semibold transition-colors">
-          {t("web.admin.diagnostics.detail.manifestJson")}
+          Full manifest JSON
         </summary>
         <pre className="bg-muted/20 max-h-[520px] overflow-auto border-t p-4 font-mono text-xs leading-5 break-all whitespace-pre-wrap">
           {JSON.stringify(report.manifest, null, 2)}
@@ -703,8 +611,36 @@ function DiagnosticReportDetail({
   );
 }
 
+function FeatureStatusBanner({ status }: { status: "disabled" | "storage_unavailable" }) {
+  const message =
+    status === "disabled"
+      ? "Client diagnostic uploads are currently disabled. Use the Client uploads toggle above to enable them. Reports from when the feature was enabled may still be available below."
+      : "Client diagnostic storage is currently unavailable. Existing report metadata may still be available below.";
+  return (
+    <div className="border-border bg-muted/30 text-muted-foreground flex items-start gap-3 rounded-xl border px-4 py-3 text-sm">
+      <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+      <p>{message}</p>
+    </div>
+  );
+}
+
+function EmptyState({ filtered }: { filtered: boolean }) {
+  return (
+    <div className="mx-auto flex max-w-md flex-col items-center gap-2">
+      <div className="bg-muted text-muted-foreground flex size-10 items-center justify-center rounded-xl">
+        <Bug className="size-5" aria-hidden="true" />
+      </div>
+      <h2 className="font-semibold">No diagnostic reports</h2>
+      <p className="text-muted-foreground text-sm">
+        {filtered
+          ? "No reports match these filters. Clients create reports from their Diagnostics setting."
+          : "Users can enable diagnostics in the client settings, then send a crash or manual report."}
+      </p>
+    </div>
+  );
+}
+
 function StateBadge({ state }: { state: DiagnosticReportState }) {
-  const t = useT();
   const className =
     state === "ready"
       ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
@@ -713,7 +649,7 @@ function StateBadge({ state }: { state: DiagnosticReportState }) {
         : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400";
   return (
     <Badge variant="outline" className={className}>
-      {stateLabel(t, state)}
+      {formatToken(state)}
     </Badge>
   );
 }
@@ -735,28 +671,64 @@ function DetailField({
   );
 }
 
+function draftFromSearchParams(searchParams: URLSearchParams): FilterDraft {
+  return {
+    userID: searchParams.get("user_id") ?? "",
+    platform: searchParams.get("platform") ?? "all",
+    reportType: searchParams.get("report_type") ?? "all",
+    from: toLocalDateTimeInput(searchParams.get("from")),
+    to: toLocalDateTimeInput(searchParams.get("to")),
+    shortID: searchParams.get("short_id") ?? "",
+  };
+}
+
+function setOrDelete(params: URLSearchParams, key: string, value: string | undefined) {
+  const normalized = value?.trim();
+  if (normalized) {
+    params.set(key, normalized);
+  } else {
+    params.delete(key);
+  }
+}
+
+function normalizeUserID(value: string) {
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  if (!/^[1-9]\d*$/.test(normalized)) return undefined;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) ? String(parsed) : undefined;
+}
+
+function toRFC3339(value: string) {
+  if (!value.trim()) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function toLocalDateTimeInput(value: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
 function formatDateTime(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : formatPreferredDateTime(date);
 }
 
-const BINARY_SIZE_KEYS: MessageKey[] = [
-  "web.common.format.size.kib",
-  "web.common.format.size.mib",
-  "web.common.format.size.gib",
-  "web.common.format.size.tib",
-];
-
-function formatBytes(t: Translate, value?: number) {
-  if (value === undefined || value === null) return EM_DASH;
-  if (value < 1024) return t("web.common.format.size.bytes", { size: value });
+function formatBytes(value?: number) {
+  if (value === undefined || value === null) return "—";
+  if (value < 1024) return `${value} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
   let size = value / 1024;
-  let key = BINARY_SIZE_KEYS[0]!;
-  for (let index = 1; index < BINARY_SIZE_KEYS.length && size >= 1024; index += 1) {
+  let unit = units[0];
+  for (let index = 1; index < units.length && size >= 1024; index += 1) {
     size /= 1024;
-    key = BINARY_SIZE_KEYS[index]!;
+    unit = units[index];
   }
-  return t(key, { size: formatDecimal(size, size >= 10 ? 0 : 1) });
+  return `${size >= 10 ? size.toFixed(0) : size.toFixed(1)} ${unit}`;
 }
 
 function formatPlatform(value: string) {
@@ -772,16 +744,6 @@ function formatPlatform(value: string) {
     default:
       return "Android";
   }
-}
-
-function reportTypeLabel(t: Translate, value: string) {
-  const key = REPORT_TYPE_LABELS[value] as MessageKey | undefined;
-  return key ? t(key) : formatToken(value);
-}
-
-function stateLabel(t: Translate, value: DiagnosticReportState) {
-  const key = STATE_LABELS[value] as MessageKey | undefined;
-  return key ? t(key) : formatToken(value);
 }
 
 function formatToken(value: string) {

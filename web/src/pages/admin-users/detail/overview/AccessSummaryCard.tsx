@@ -4,18 +4,15 @@ import { Download, LayoutGrid, Mail, Play } from "lucide-react";
 
 import type { AdminUser } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { useServerDownloadSwitches } from "@/hooks/admin/useServerDownloadSwitches";
 import { useAccessGroups } from "@/hooks/queries/admin/accessGroups";
 import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
 import { useAdminUserCapabilities } from "@/hooks/queries/admin/users";
 import { useAdminUserDownloadSummary } from "@/hooks/queries/admin/userActivity";
-import { useT, type Translate } from "@/i18n";
 import {
   PERMISSION_MARKER_EDIT,
   PERMISSION_METADATA_CURATION,
   hasAssignedPermission,
 } from "@/lib/permissions";
-import { playbackQualityPresetFromValue } from "@/lib/playback-quality";
 import type { ResolvedRequestTerms } from "@/lib/requestAccess";
 import { formatStreamBitrateLimit } from "@/lib/streamBitrateLimit";
 
@@ -31,6 +28,10 @@ import {
 } from "../access/policySources";
 import { userDetailTabSearch } from "../userDetailTabs";
 import { DetailCard, SourceTag } from "../ui";
+
+function plural(n: number, one: string, many: string) {
+  return `${n} ${n === 1 ? one : many}`;
+}
 
 function SummaryLine({
   icon,
@@ -59,71 +60,53 @@ function SummaryLine({
   );
 }
 
-function videoTranscodingText(t: Translate, video: VideoTranscoding): string {
+function videoTranscodingText(video: VideoTranscoding): string {
   switch (video.mode) {
     case "off":
-      return t("web.admin.users.detail.overview.access.noVideoTranscoding");
+      return "No video transcoding";
     case "unlimited":
-      return t("web.admin.users.detail.overview.access.unlimitedVideoTranscodes");
+      return "Unlimited video transcodes";
     case "limit":
-      return t("web.admin.users.detail.overview.access.videoTranscodeLimit", {
-        count: video.max,
-        count_text: video.max,
-      });
+      return `Up to ${plural(video.max, "video transcode", "video transcodes")}`;
   }
 }
 
 /** The requests line: whether the account can request, and its quota and approval once known. */
 function requestsSummary(
-  t: Translate,
   canRequest: boolean,
   terms: ResolvedRequestTerms | undefined,
 ): { title: ReactNode; detail?: ReactNode } {
-  if (!canRequest) return { title: t("web.admin.users.detail.overview.access.cantRequest") };
-  if (!terms) return { title: t("web.admin.users.detail.overview.access.requests") };
+  if (!canRequest) return { title: "Can't request media" };
+  if (!terms) return { title: "Requests" };
   const detail = (
     <>
-      {terms.autoApprove
-        ? t("web.admin.users.detail.overview.access.autoApprove")
-        : t("web.admin.users.detail.overview.access.needsApproval")}
+      {terms.autoApprove ? "Approved automatically" : "Needs approval"}
       {terms.approvalSource.kind === "account" ? CUSTOM : null}
     </>
   );
   const title = (
     <>
-      {formatQuota(t, terms.quota)}
+      {formatQuota(terms.quota)}
       {terms.quotaSource.kind === "account" ? CUSTOM : null}
     </>
   );
   return { title, detail };
 }
 
-function formatQuota(t: Translate, quota: ResolvedRequestTerms["quota"]): string {
-  if (quota.unlimited) return t("web.admin.users.detail.overview.access.unlimitedRequests");
-  const period =
-    quota.days === 1
-      ? t("web.admin.users.detail.overview.access.quotaDay")
-      : t("web.admin.users.detail.overview.access.quotaDays", {
-          days: quota.days,
-          days_text: quota.days,
-        });
-  return t("web.admin.users.detail.overview.access.quota", {
-    count: quota.max,
-    count_text: quota.max,
-    period,
-  });
+function formatQuota(quota: ResolvedRequestTerms["quota"]): string {
+  if (quota.unlimited) return "Unlimited requests";
+  const window = quota.days === 1 ? "day" : `${quota.days} days`;
+  return `${plural(quota.max, "request", "requests")} per ${window}`;
 }
 
 const CUSTOM = (
-  <span className="ms-1.5 inline-block align-middle">
+  <span className="ml-1.5 inline-block align-middle">
     <SourceTag source="custom" />
   </span>
 );
 
 /** A few lines on what the account can do, with the account's own limits marked. */
 export function AccessSummaryCard({ user }: { user: AdminUser }) {
-  const t = useT();
-  const { downloadsOff, conversionOff } = useServerDownloadSwitches();
   const groups = useAccessGroups().data ?? [];
   const libraries = useAdminLibraries().data ?? [];
   const capabilities = useAdminUserCapabilities().data;
@@ -134,116 +117,73 @@ export function AccessSummaryCard({ user }: { user: AdminUser }) {
   const effective = user.effective_policy;
   const ctx = inheritContextFor(user, groups);
   const custom = countCustomPolicyRows(user) + countCustomRequestTerms(terms);
-  const source =
-    ctx.kind === "group"
-      ? t("web.admin.users.detail.overview.access.groupSource", { name: ctx.name })
-      : t("web.admin.users.detail.overview.access.serverDefault");
+  const source = ctx.kind === "group" ? `${ctx.name} group` : "Server default";
 
   const marker = hasAssignedPermission(effective.permissions, PERMISSION_MARKER_EDIT);
   const curate = hasAssignedPermission(effective.permissions, PERMISSION_METADATA_CURATION);
   const videoText = videoTranscodingText(
-    t,
     videoTranscodingFromEffective(effective.transcode_allowed, effective.max_transcodes),
   );
   const videoCustom = user.transcode_allowed !== null || user.max_transcodes !== null;
   const remote = effective.max_remote_stream_bitrate_kbps;
 
   const summary = downloads.data;
-  // With downloads off server-wide only the counts remain: they describe
-  // copies already on the account's devices.
   const downloadsDetail = [
-    ...(downloadsOff
-      ? []
-      : [
-          effective.download_transcode_allowed && !conversionOff
-            ? t("web.admin.users.detail.overview.access.serverCopiesAllowed")
-            : t("web.admin.users.detail.overview.access.originalFilesOnly"),
-        ]),
+    effective.download_transcode_allowed ? "Server-prepared copies allowed" : "Original files only",
     ...(accountDownloads && summary
       ? [
-          t("web.admin.users.detail.overview.access.downloadsConfirmed", {
-            count: summary.completed,
-            count_text: summary.completed,
-          }),
-          t("web.admin.users.detail.overview.access.seriesMonitored", {
-            count: summary.monitored_series,
-            count_text: summary.monitored_series,
-          }),
+          `${plural(summary.completed, "download", "downloads")} confirmed on devices`,
+          `${plural(summary.monitored_series, "series", "series")} monitored`,
         ]
       : []),
   ].join(" · ");
 
-  let downloadsTitle = t("web.admin.users.detail.overview.access.downloadsNotAllowed");
-  if (downloadsOff) {
-    downloadsTitle = t("web.admin.users.detail.overview.access.downloadsServerOff");
-  } else if (effective.download_allowed) {
-    downloadsTitle = t("web.admin.users.detail.overview.access.downloadsAllowed");
-  }
-
   const canRequest = effective.requests_allowed && server?.requests_enabled !== false;
-  const requestsLine = requestsSummary(t, canRequest, terms);
+  const requestsLine = requestsSummary(canRequest, terms);
 
   return (
     <DetailCard
-      title={t("web.admin.users.detail.overview.access.title")}
+      title="Access"
       description={
         custom > 0
-          ? t("web.admin.users.detail.overview.access.withLimits", { count: custom, source })
+          ? `${source}, with ${plural(custom, "limit", "limits")} set for this account`
           : source
       }
       actions={
         <Button asChild variant="outline" size="xs">
-          <Link to={userDetailTabSearch("access")}>
-            {t("web.admin.users.detail.overview.access.openAccess")}
-          </Link>
+          <Link to={userDetailTabSearch("access")}>Access &amp; limits →</Link>
         </Button>
       }
     >
       <SummaryLine
         icon={<LayoutGrid />}
         title={libraryListText(effective.library_ids, libraries)}
-        detail={t("web.admin.users.detail.overview.access.markersCurate", {
-          marker: marker ? "yes" : "no",
-          curate: curate ? "yes" : "no",
-        })}
+        detail={`${marker ? "Can" : "Can't"} edit markers · ${curate ? "can" : "can't"} curate metadata`}
       />
       <SummaryLine
         icon={<Play />}
         title={
           <>
-            {playbackQualityPresetFromValue(effective.max_playback_quality) === "any"
-              ? t("web.admin.users.detail.overview.access.anyQuality")
-              : t("web.admin.users.detail.overview.access.quality", {
-                  quality: formatQuality(effective.max_playback_quality),
-                })}
-            {user.max_playback_quality !== null ? CUSTOM : null}
-            {" · "}
+            {formatQuality(effective.max_playback_quality)} quality
+            {user.max_playback_quality !== null ? CUSTOM : null} ·{" "}
             {effective.max_streams === 0
-              ? t("web.admin.users.detail.overview.access.unlimitedStreams")
-              : t("web.admin.users.detail.overview.access.streams", {
-                  count: effective.max_streams,
-                  count_text: effective.max_streams,
-                })}
+              ? "unlimited streams"
+              : plural(effective.max_streams, "stream", "streams")}
             {user.max_streams !== null ? CUSTOM : null}
           </>
         }
         detail={
           <>
             {videoText}
-            {videoCustom ? CUSTOM : null}
-            {" · "}
-            {remote === 0
-              ? t("web.admin.users.detail.overview.access.noBitrateCap")
-              : t("web.admin.users.detail.overview.access.remoteCap", {
-                  bitrate: formatStreamBitrateLimit(remote),
-                })}
+            {videoCustom ? CUSTOM : null} ·{" "}
+            {remote === 0 ? "no bitrate cap" : `${formatStreamBitrateLimit(remote)} remote cap`}
           </>
         }
       />
       <SummaryLine
         icon={<Download />}
-        title={downloadsTitle}
-        detail={downloadsDetail || undefined}
+        title={effective.download_allowed ? "Downloads allowed" : "Downloads not allowed"}
+        detail={downloadsDetail}
       />
       <SummaryLine icon={<Mail />} title={requestsLine.title} detail={requestsLine.detail} />
     </DetailCard>

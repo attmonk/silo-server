@@ -7,7 +7,6 @@ import type {
 } from "@/api/types";
 import { adminKeys } from "../keys";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 
 export type InviteCode = V2Result<"GET /api/v2/admin/invite-codes">["items"][number];
 
@@ -35,13 +34,11 @@ export function useCreateInviteCode() {
         retryAuthentication: false,
       }),
     onSuccess: () => {
-      toast.success(t("web.admin.settings.hooks.inviteCodes.created"));
+      toast.success("Invite code created");
       queryClient.invalidateQueries({ queryKey: adminKeys.inviteCodes() });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.admin.settings.hooks.inviteCodes.createFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to create invite code");
     },
   });
 }
@@ -56,9 +53,7 @@ export function useUpdateInviteCode() {
       queryClient.invalidateQueries({ queryKey: adminKeys.inviteCodes() });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.admin.settings.hooks.inviteCodes.updateFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to update invite code");
     },
   });
 }
@@ -74,17 +69,13 @@ export function useTopUpInviteCode() {
         retryAuthentication: false,
       }),
     onSuccess: () => {
-      toast.success(t("web.admin.settings.hooks.inviteCodes.toppedUp"));
+      toast.success("Invite code topped up");
       queryClient.invalidateQueries({ queryKey: adminKeys.inviteCodes() });
     },
     onError: (err) => {
       toast.error(
-        t("web.admin.settings.hooks.inviteCodes.topUpFailed", {
-          detail:
-            err instanceof Error
-              ? err.message
-              : t("web.admin.settings.hooks.inviteCodes.topUpUnconfirmed"),
-        }),
+        "Check the code’s current maximum uses before retrying the top-up. " +
+          (err instanceof Error ? err.message : "The result could not be confirmed."),
       );
       void queryClient.invalidateQueries({ queryKey: adminKeys.inviteCodes() });
     },
@@ -98,13 +89,11 @@ export function useDeleteInviteCode() {
     mutationFn: (id: string) =>
       v2("DELETE /api/v2/admin/invite-codes/{id}", { path: { id }, retryAuthentication: false }),
     onSuccess: () => {
-      toast.success(t("web.admin.settings.hooks.inviteCodes.deleted"));
+      toast.success("Invite code deleted");
       queryClient.invalidateQueries({ queryKey: adminKeys.inviteCodes() });
     },
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.admin.settings.hooks.inviteCodes.deleteFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to delete invite code");
     },
   });
 }

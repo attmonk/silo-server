@@ -1,5 +1,4 @@
-import type { EpisodeListItem, ItemDetail, Season } from "@/api/types";
-import { t } from "@/i18n";
+import type { ItemDetail, Season } from "@/api/types";
 
 export interface SeriesPrimaryAction {
   label: string;
@@ -8,8 +7,6 @@ export interface SeriesPrimaryAction {
 
 export interface LeafPrimaryAction {
   label: string;
-  /** True when the action continues a live resume point rather than starting. */
-  resuming: boolean;
   progress?: number;
 }
 
@@ -18,32 +15,18 @@ export interface EpisodeNavigationState {
   parentSeasonLabel?: string;
 }
 
-/**
- * The library an episode card links to the episode with. An episode with no
- * file in the list keeps none: with catalog.scope_versions_to_library on, the
- * list holds only the opened library's files, and that episode then opens
- * with every version instead of nothing to play.
- */
-export function episodeLinkLibraryId(
-  episode: Pick<EpisodeListItem, "files">,
-  libraryId: number | undefined,
-): number | undefined {
-  return (episode.files?.length ?? 0) > 0 ? libraryId : undefined;
-}
-
 function clampProgress(progress: number): number {
   return Math.max(0, Math.min(100, progress));
 }
 
 export function resolveLeafPrimaryAction(
   item: Pick<ItemDetail, "user_data">,
-  defaultLabel?: string,
+  defaultLabel = "Play",
 ): LeafPrimaryAction {
   const userData = item.user_data;
 
-  const playLabel = defaultLabel ?? t("web.detail.actions.play");
   if (!userData || !("position_seconds" in userData)) {
-    return { label: playLabel, resuming: false };
+    return { label: defaultLabel };
   }
 
   const positionSeconds = userData.position_seconds ?? 0;
@@ -58,33 +41,31 @@ export function resolveLeafPrimaryAction(
 
   if (isInProgress) {
     return {
-      label: t("web.detail.actions.resume"),
-      resuming: true,
+      label: "Resume",
       progress,
     };
   }
 
   return {
-    label: playLabel,
-    resuming: false,
+    label: defaultLabel,
     progress,
   };
 }
 
 export function getSeasonDisplayTitle(season: Season): string {
   if (season.is_specials || season.season_number === 0) {
-    return t("web.detail.seasons.specials");
+    return "Specials";
   }
 
   if (season.title && season.title !== `Season ${season.season_number}`) {
     return season.title;
   }
 
-  return t("web.detail.seasons.numbered", { season: season.season_number });
+  return `Season ${season.season_number}`;
 }
 
 export function formatEpisodeCount(count: number): string {
-  return t("web.detail.seasons.episodeCount", { count, count_text: count });
+  return `${count} ${count === 1 ? "episode" : "episodes"}`;
 }
 
 export function formatSeasonMeta(season: Season): string {
@@ -93,11 +74,7 @@ export function formatSeasonMeta(season: Season): string {
 
 /** Watched progress for a season card, e.g. "1 of 2 episodes". */
 export function formatSeasonProgress(season: Season, watchedCount: number): string {
-  return t("web.detail.seasons.watchedProgress", {
-    count: season.episode_count,
-    watched: watchedCount,
-    count_text: season.episode_count,
-  });
+  return `${watchedCount} of ${formatEpisodeCount(season.episode_count)}`;
 }
 
 export function resolveEpisodeSiblingSeason(
@@ -124,17 +101,17 @@ export function resolveSeriesPrimaryAction(
   item: Pick<ItemDetail, "play_content_id" | "user_data">,
 ): SeriesPrimaryAction {
   if (!item.play_content_id) {
-    return { label: t("web.detail.actions.browseSeries") };
+    return { label: "Browse Series" };
   }
 
   const href = `/watch/${item.play_content_id}`;
   const rollup = item.user_data && "in_progress_count" in item.user_data ? item.user_data : null;
   if (rollup && rollup.in_progress_count > 0) {
-    return { label: t("web.detail.actions.resume"), href };
+    return { label: "Resume", href };
   }
   if (rollup && rollup.watched_count > 0 && !rollup.played) {
-    return { label: t("web.detail.actions.playNext"), href };
+    return { label: "Play Next", href };
   }
   // Unstarted and fully watched series both resolve to the first episode.
-  return { label: t("web.detail.actions.startFromFirstEpisode", { episode: 1 }), href };
+  return { label: "Start From Episode 1", href };
 }

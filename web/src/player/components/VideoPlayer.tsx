@@ -1,11 +1,10 @@
-import { ChevronDown, X } from "lucide-react";
-import "@/styles/player-hud.css";
 import { useMediaSkipHandlers } from "../hooks/useMediaSkipHandlers";
 import {
   MEDIA_ENDED_EVENT,
   bufferedAheadMs,
   useAutoQualityDownshift,
 } from "../hooks/useAutoQualityDownshift";
+import { BUFFERING_QUALITY_COPY } from "../buffering-quality";
 import type {
   BufferingAnswer,
   BufferingMode,
@@ -19,7 +18,6 @@ import type { ParsedCue } from "../utils/parseVTT";
 import { resolveSubtitleAutoSelect } from "../utils/subtitleSort";
 import type HlsType from "hls.js";
 import { PlayerControls } from "./PlayerControls";
-import { PlayerLoadingCover } from "./PlayerLoadingCover";
 import { PlaybackInfoOverlay } from "./PlaybackInfoOverlay";
 import { PlaybackNoticeOverlay, PlaybackNoticeStack } from "./PlaybackNoticeOverlay";
 import { IntroSkipButton } from "./IntroSkipButton";
@@ -51,7 +49,6 @@ import { useSubtitleLayout } from "../hooks/useSubtitleLayout";
 import { useCoarsePointer } from "../hooks/useCoarsePointer";
 import { computeSubtitleFontSize } from "@/lib/subtitleAppearance";
 import { useNextEpisode } from "../hooks/useNextEpisode";
-import { resetStillWatchingStreak } from "../stillWatching";
 import { MARKER_KINDS, useMarkerEditor } from "../hooks/useMarkerEditor";
 import { useWatchTogetherPlaybackSync } from "../hooks/useWatchTogetherPlaybackSync";
 import type { WatchTogetherRoomConnectionResult } from "../hooks/useWatchTogetherRoomConnection";
@@ -102,7 +99,6 @@ import type {
   SeriesContext,
   SubtitleMode,
   VideoFitMode,
-  PlayerBackdrop,
 } from "../types";
 import type { PlayerTrickplay } from "../trickplay";
 import type { FailureV3, PlanV3, SubtitleInventoryItemV3 } from "../protocol-v3";
@@ -148,12 +144,9 @@ import {
   setWatchTogetherGuestControl,
 } from "@/lib/watchTogetherActions";
 import { toast } from "sonner";
-import { codeNumber, numberText, useT, type Translate } from "@/i18n";
-import { joinList } from "@/lib/appLocale";
 import { MediaDataMeter } from "../media-data-meter";
 import { mediaElementReleased, sourceLoadStarted } from "../bandwidth-probe";
 import { networkInformation, type NetworkInformationLike } from "../network-information";
-import { isRightToLeft } from "@/lib/direction";
 
 function pillKey(
   event: KeyboardEvent,
@@ -165,7 +158,7 @@ function pillKey(
   const isEditingOrInMenu =
     !targetInPrompt &&
     target?.closest(
-      'input, textarea, select, [contenteditable="true"], dialog, [role="dialog"], [role="menu"], [role="listbox"]',
+      'input, textarea, select, [contenteditable="true"], [role="dialog"], [role="menu"], [role="listbox"]',
     ) != null;
   if (isEditingOrInMenu) return null;
 
@@ -208,24 +201,16 @@ const LIVE_SUBTITLE_INDEX = 1_000_000;
 // Resume playback once translated cues cover at least this far ahead of the
 // playhead; a hard cap also resumes so we never wait forever.
 const TRANSLATION_RESUME_TIMEOUT_MS = 30_000;
-function skipMarkerLabel(t: Translate, kind: MarkerKind): string {
-  switch (kind) {
-    case "intro":
-      return t("introSkip.pill.skip");
-    case "recap":
-      return t("marker.skipRecap");
-    case "credits":
-      return t("marker.skipCredits");
-    case "preview":
-      return t("web.player.skip.preview");
-  }
-}
+const MARKER_SKIP_LABELS: Record<MarkerKind, string> = {
+  intro: "Skip Intro",
+  recap: "Skip Recap",
+  credits: "Skip Credits",
+  preview: "Skip Preview",
+};
 
 interface VideoPlayerProps {
   title: string;
   year?: number;
-  /** Shown dimmed behind the spinner until the first frame. */
-  backdrop?: PlayerBackdrop;
   streamUrl: string;
   /**
    * The server's plan for this session. Everything about *how* the media plays —
@@ -279,11 +264,7 @@ interface VideoPlayerProps {
     onAdopt?: (planRevision?: number, sent?: boolean) => void,
   ) => void;
   /** `track_change` replan for a subtitle the server has to render. */
-  onSubtitleTrackChange?: (
-    combinedIndex: number | null,
-    currentPosition: number,
-    storedSubtitleId?: number,
-  ) => void;
+  onSubtitleTrackChange?: (combinedIndex: number | null, currentPosition: number) => void;
   /** `failure_recovery` replan after the client could not play the plan. */
   onPlanFailure?: (failure: FailureV3, currentPosition: number) => void;
   /**
@@ -310,8 +291,6 @@ interface VideoPlayerProps {
    * Reports whether the replan landed a plan at the requested position.
    */
   onReanchorSeek?: (positionSeconds: number) => boolean | Promise<boolean>;
-  /** A seek the player made inside the stream it has, without a replan. */
-  onSeek?: (positionSeconds: number) => void;
   preferredSubtitleLanguage?: string | null;
   preferredSubtitleTrackSignature?: PlayerSubtitleTrackSignature | null;
   subtitleMode?: SubtitleMode;
@@ -350,14 +329,9 @@ interface VideoPlayerProps {
   preview?: PlayerTimeRange | null;
   markerSegments?: PlayerMarkerSegment[];
   autoPlayNextPreview?: boolean;
-  /** The viewer's Auto-play next episode setting; off, the Up next card does not count down. */
-  autoPlayNext?: boolean;
   canEditMarkers?: boolean;
-  /**
-   * Notified after a successful in-player marker edit, with only the kinds it
-   * wrote, so the host can patch local state.
-   */
-  onMarkersEdited?: (fileId: number, markers: Partial<MarkerDraft>) => void;
+  /** Notified after a successful in-player marker edit so the host can patch local state. */
+  onMarkersEdited?: (fileId: number, markers: MarkerDraft) => void;
   duration?: number;
   seriesContext?: SeriesContext;
   onNavigateEpisode?: (contentId: string, trigger: PlaybackStartTrigger) => void;
@@ -427,6 +401,7 @@ const MAX_AUTOPLAY_ATTEMPTS = 4;
 // cannot keep up at its current quality and is offered a lower one.
 const ROOM_STALLS_BEFORE_LOWER_QUALITY = 2;
 const ROOM_STALL_WINDOW_MS = 5 * 60_000;
+const LOWER_QUALITY_ACTION_LABEL = "Lower quality";
 // Buffering this soon after a failed media request is treated as an outage,
 // not a slow link, by the Auto downshift.
 /** Where the element's buffered media ends, in seconds; 0 with none. */
@@ -437,6 +412,7 @@ function bufferedEndSeconds(media: HTMLMediaElement): number {
 const PLAYBACK_NOTICE_VISIBLE_MS = 8_000;
 /** The buffering controller's display-only notices show for 5 seconds on every client. */
 const BUFFERING_NOTICE_VISIBLE_MS = 5_000;
+const ROOM_RECONNECTING_MESSAGE = "Reconnecting to room. Controls are temporarily unavailable.";
 // The server returns a room to the lobby once its position is within two
 // seconds of the end of the file. A viewer this close to its own end when the
 // room leaves playback saw the item finish, allowing for trailing the room.
@@ -453,30 +429,20 @@ interface PlaybackNoticeState {
   onAction?: () => void;
   /** How long it shows; PLAYBACK_NOTICE_VISIBLE_MS when absent. */
   visibleMs?: number;
-  /** Marks the notices the player withdraws or holds on its own. */
-  kind?: "room_reconnecting" | "lower_quality";
 }
 
 function watchTogetherNotice(
-  t: Translate,
   message: string,
   tone: "info" | "warning",
   onAction?: () => void,
-  actionLabel = t("web.player.room.joinPlayback"),
+  actionLabel = "Join playback",
 ): PlaybackNoticeState {
   return {
-    title: t("web.player.room.noticeTitle"),
+    title: "Watch Party",
     message,
     tone,
     actionLabel: onAction ? actionLabel : undefined,
     onAction,
-  };
-}
-
-function roomReconnectingNotice(t: Translate): PlaybackNoticeState {
-  return {
-    ...watchTogetherNotice(t, t("web.player.room.reconnecting"), "warning"),
-    kind: "room_reconnecting",
   };
 }
 
@@ -517,7 +483,6 @@ function readStringPayload(
 export function VideoPlayer({
   title,
   year,
-  backdrop,
   streamUrl,
   plan,
   planRevision,
@@ -549,7 +514,6 @@ export function VideoPlayer({
   connectionError = null,
   onPlanInvalidated,
   onReanchorSeek,
-  onSeek,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
   subtitleMode,
@@ -570,7 +534,6 @@ export function VideoPlayer({
   preview = null,
   markerSegments,
   autoPlayNextPreview = false,
-  autoPlayNext = true,
   canEditMarkers = true,
   onMarkersEdited,
   duration: propDuration,
@@ -599,12 +562,6 @@ export function VideoPlayer({
   watchTogetherRoomId,
   watchTogetherConnection,
 }: VideoPlayerProps) {
-  const t = useT();
-  // Text built outside render (callbacks, effects, transport handlers) reads
-  // the current language through this ref, so a language change neither
-  // rebuilds those callbacks nor re-runs the effects that hold them.
-  const tRef = useRef(t);
-  tRef.current = t;
   const playerConfig = usePlayerConfig();
   const isDetached = displayMode !== "foreground";
 
@@ -614,13 +571,6 @@ export function VideoPlayer({
   // Box under the <video> that holds the browser decode engine's canvas.
   const engineSurfaceRef = useRef<HTMLDivElement>(null);
   const [browserEngineActive, setBrowserEngineActive] = useState(false);
-  // The element showing the picture: the engine's visible canvas layer while
-  // it decodes, otherwise the <video> itself.
-  const getAmbientSource = useCallback((): HTMLVideoElement | HTMLCanvasElement | null => {
-    if (!browserEngineActive) return videoRef.current;
-    const layers = engineSurfaceRef.current?.querySelectorAll("canvas") ?? [];
-    return Array.from(layers).find((layer) => layer.style.display !== "none") ?? null;
-  }, [browserEngineActive]);
   // Bumped whenever an engine transport starts or stops. Frame callbacks
   // registered on one engine end with it, so renderers that drive themselves
   // from requestVideoFrameCallback (JASSUB) rebuild on it.
@@ -676,18 +626,10 @@ export function VideoPlayer({
   const mediaOutageRef = useRef(false);
   const outageBufferedEndRef = useRef(0);
   const reportedPlanFailureKeyRef = useRef<string | null>(null);
-  // Whether the current transport has played a frame. Reset whenever the
-  // transport is rebuilt (see the hls.js lifecycle effect).
+  // Whether the current transport has shown a frame. A network error after
+  // that is a lost connection, not a route that cannot play. Reset whenever
+  // the transport is rebuilt (see the hls.js lifecycle effect).
   const streamPlayedRef = useRef(false);
-  // Whether the current transport has shown a frame, by playing or by settling
-  // paused on it. A network error after that is a lost connection the
-  // reconnect can reopen, not a route that cannot play; reset with
-  // streamPlayedRef.
-  const streamFramedRef = useRef(false);
-  // Whether the viewer wants playback running, from the element's play and
-  // pause events. Chromium pauses the element before it reports a network
-  // error, so `video.paused` alone would reopen a playing stream paused.
-  const viewerPlayingRef = useRef(false);
   // When the current transport last stopped playing, or null while it plays.
   // Only a transport that has opened, shown a frame, or settled paused counts.
   const transportIdleSinceRef = useRef<number | null>(null);
@@ -791,13 +733,6 @@ export function VideoPlayer({
   const [buffering, setBuffering] = useState(false);
   const bufferingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [awaitingFirstFrame, setAwaitingFirstFrame] = useState(true);
-  // The session whose video has been on screen. A transport a replan loads
-  // into it (a seek outside the buffer, a quality or track change) waits for
-  // its first frame behind the buffering spinner, with the controls usable;
-  // only a session's start waits behind the opaque loading cover.
-  const [framedSessionId, setFramedSessionId] = useState<string | null>(null);
-  const sessionIdRef = useRef(sessionId);
-  sessionIdRef.current = sessionId;
   const [isLeaving, setIsLeaving] = useState(false);
   const leaveInProgressRef = useRef(false);
   const [notice, setNotice] = useState<PlaybackNoticeState | null>(null);
@@ -816,16 +751,6 @@ export function VideoPlayer({
   );
   const lastSubtitleIndexRef = useRef<number | null>(null);
   const subtitleSelectionWasManualRef = useRef(false);
-  // The stored subtitle the viewer picked and its ordinal. The track list can
-  // lag the server's (an announced track not folded in yet), so the pick's
-  // identity is taken from the track picked, not looked up by its ordinal.
-  const pickedStoredSubtitleRef = useRef<{ index: number | null; storedId?: number }>({
-    index: null,
-  });
-  // Sync keys of the stored subtitles someone added while this session plays.
-  // Auto-selection never picks them, so another viewer's download or upload
-  // can't change this viewer's subtitle.
-  const announcedSubtitleKeysRef = useRef(new Set<string>());
   // Subtitle delay in ms; positive shows later. It is the profile's timing
   // offset, so a change here follows the profile to every device.
   const [subtitleDelayMs, setSubtitleDelayMs] = useSubtitleDelay();
@@ -924,10 +849,7 @@ export function VideoPlayer({
     if (reportedSubtitleFailureRef.current === jobId) return;
     reportedSubtitleFailureRef.current = jobId;
     // The server sends a complete, viewer-facing reason; show it under a short title.
-    toast.error(
-      tRef.current("web.player.subtitles.processingFailed"),
-      message ? { description: message } : undefined,
-    );
+    toast.error("Subtitle processing failed", message ? { description: message } : undefined);
   }, []);
 
   const handleSubtitleJobAccepted = useCallback(
@@ -976,14 +898,14 @@ export function VideoPlayer({
       {
         index: LIVE_SUBTITLE_INDEX,
         language: liveTranslation.language,
-        label: liveTranslation.label || t("web.player.subtitles.aiTranslation"),
+        label: liveTranslation.label || "AI translation",
         source: "downloaded" as const,
         codec: "srt",
         url: "",
         live: true,
       },
     ];
-  }, [subtitleUrls, liveTranslation, t]);
+  }, [subtitleUrls, liveTranslation]);
 
   // -- Plan-derived transport --
   // The plan names its own protocol and timeline; nothing here is inferred from
@@ -1029,20 +951,19 @@ export function VideoPlayer({
   }, [planRevision]);
 
   /**
-   * Hands a network failure to the session's reconnect once the stream has
-   * shown a frame, played or settled paused, and reopens it playing when the
-   * viewer was. Returns false before the first frame, where the failure
+   * Hands a network failure to the session's reconnect when the stream has
+   * already played. Returns false before the first frame, where the failure
    * keeps going through route recovery: a stream that never started may be
    * one this route cannot deliver.
    */
   const reportConnectionLost = useCallback((): boolean => {
     const video = videoRef.current;
-    if (!onConnectionLost || !video || !streamFramedRef.current) return false;
+    if (!onConnectionLost || !video || !streamPlayedRef.current) return false;
     if (connectionStatusRef.current === "connected") {
       // A seek still in flight is where the viewer wants to be.
       const positionSeconds =
         pendingSeekTimeRef.current ?? toMediaTime(video.currentTime, timelineOffsetRef.current);
-      onConnectionLost(positionSeconds, viewerPlayingRef.current);
+      onConnectionLost(positionSeconds, !video.paused);
     }
     return true;
   }, [onConnectionLost]);
@@ -1092,7 +1013,7 @@ export function VideoPlayer({
                 : "HLS playback exhausted its startup recovery budget.",
           })
         ) {
-          setError(tRef.current("web.player.error.mediaNotLoaded"));
+          setError("Playback failed. The media could not be loaded.");
         }
       };
       // When Auto lowers on its own, a start that missed its deadline lowers, as
@@ -1128,29 +1049,13 @@ export function VideoPlayer({
   backendDurationRef.current = backendDuration;
   const effectiveInitialPosition = plan.timeline.player_start_seconds;
   const canSeekAnywhere = plan.timeline.can_seek_anywhere;
-  const canSeekAnywhereRef = useRef(canSeekAnywhere);
-  canSeekAnywhereRef.current = canSeekAnywhere;
-  const replanningRef = useRef(replanning);
-  replanningRef.current = replanning;
-  // The viewer's newest seek while a replan of this session was in flight, and
-  // the plan revision it was made on. The replanned stream starts there
-  // instead of where the replan was asked for. A later seek, or a replan that
-  // settles without a new stream, drops it.
-  const replanSeekRef = useRef<{ sessionId: string; revision: number; seconds: number } | null>(
-    null,
-  );
-  useEffect(() => {
-    if (!replanning && replanSeekRef.current?.revision === planRevision) {
-      replanSeekRef.current = null;
-    }
-  }, [planRevision, replanning]);
   // The menu is the plan's. The session's preference decides whether Auto is
   // lit, since `auto` names no rung; otherwise the plan names the entry it
   // delivers.
   const activeQualityId = qualityPreference;
   const activeQuality = plan.active_quality;
   const deliveredBitrateKbps = plan.effective_recipe.bitrate_kbps;
-  const qualityOptions = useMemo(() => qualityOptionsFromPlanV3(plan, t), [plan, t]);
+  const qualityOptions = useMemo(() => qualityOptionsFromPlanV3(plan), [plan]);
 
   // The file the server actually planned against, which is not necessarily the
   // one that was asked for — a fallback to an alternate version shows up here.
@@ -1252,12 +1157,9 @@ export function VideoPlayer({
   const roomReadinessPending = roomSyncWaiting || watchTogetherSync.catchingUp;
   const watchTogetherRoomActive = watchTogether.room !== null;
 
-  const showWatchTogetherNotice = useCallback(
-    (message: string, tone: "info" | "warning", onAction?: () => void, actionLabel?: string) => {
-      setNotice(watchTogetherNotice(tRef.current, message, tone, onAction, actionLabel));
-    },
-    [],
-  );
+  const showWatchTogetherNotice = useCallback((...args: Parameters<typeof watchTogetherNotice>) => {
+    setNotice(watchTogetherNotice(...args));
+  }, []);
 
   const resetLeaveState = useCallback(() => {
     leaveInProgressRef.current = false;
@@ -1325,7 +1227,7 @@ export function VideoPlayer({
     !watchTogether.closedReason &&
     !watchTogether.replacementReason &&
     !roomConnected;
-  const holdReconnectNotice = roomReconnecting && notice?.kind === "room_reconnecting";
+  const holdReconnectNotice = roomReconnecting && notice?.message === ROOM_RECONNECTING_MESSAGE;
   // Set once an outage outlasts the delay, so a notice that expires during it
   // hands back to the reconnect warning.
   const roomReconnectWarningDueRef = useRef(false);
@@ -1339,7 +1241,7 @@ export function VideoPlayer({
       return;
     }
     if (roomConnected) {
-      setNotice((current) => (current?.kind === "room_reconnecting" ? null : current));
+      setNotice((current) => (current?.message === ROOM_RECONNECTING_MESSAGE ? null : current));
       return;
     }
 
@@ -1350,7 +1252,7 @@ export function VideoPlayer({
       roomReconnectWarningDueRef.current = true;
       setNotice((current) =>
         current === null || current === noticeAtDisconnect
-          ? roomReconnectingNotice(tRef.current)
+          ? watchTogetherNotice(ROOM_RECONNECTING_MESSAGE, "warning")
           : current,
       );
     }, ROOM_RECONNECT_NOTICE_DELAY_MS);
@@ -1375,7 +1277,9 @@ export function VideoPlayer({
       () =>
         setNotice((current) => {
           if (current !== notice) return current;
-          return roomReconnectWarningDueRef.current ? roomReconnectingNotice(tRef.current) : null;
+          return roomReconnectWarningDueRef.current
+            ? watchTogetherNotice(ROOM_RECONNECTING_MESSAGE, "warning")
+            : null;
         }),
       notice.visibleMs ?? PLAYBACK_NOTICE_VISIBLE_MS,
     );
@@ -1443,8 +1347,8 @@ export function VideoPlayer({
       }
       compatibilityFallbackKeyRef.current = fallbackKey;
       setNotice({
-        title: tRef.current("web.player.compatibility.title"),
-        message: tRef.current("web.player.compatibility.firefoxStalled"),
+        title: "Compatibility mode",
+        message: "Firefox stalled on the original stream. Retrying with encoded video.",
         tone: "info",
       });
       reportCurrentPlanFailure({
@@ -1480,8 +1384,8 @@ export function VideoPlayer({
     compatibilityFallbackKeyRef.current = fallbackKey;
     setError(null);
     setNotice({
-      title: tRef.current("web.player.compatibility.title"),
-      message: tRef.current("web.player.compatibility.firefoxRejected"),
+      title: "Compatibility mode",
+      message: "Firefox rejected the original stream. Retrying with encoded video.",
       tone: "warning",
     });
     reportCurrentPlanFailure({
@@ -1670,27 +1574,16 @@ export function VideoPlayer({
 
       resetRoomCatchupRate();
 
-      // A seek this stream takes: the replan in flight, and a change queued
-      // behind it, resume there too.
-      const takeSeek = () => {
-        rememberPendingSeek(seconds);
-        replanSeekRef.current = replanningRef.current
-          ? { sessionId: sessionIdRef.current, revision: planRevisionRef.current, seconds }
-          : null;
-        onSeek?.(seconds);
-        setCurrentTime(seconds);
-      };
-
-      // The original's metadata handler seeks there once the clock's origin
-      // is known.
       if (directPlayOriginPendingRef.current) {
-        takeSeek();
+        rememberPendingSeek(seconds);
+        setCurrentTime(seconds);
         return true;
       }
 
       const nativeSeconds = toPlayerTime(seconds, timelineOffsetRef.current);
       if (canSeekAnywhere || isNativePositionInRanges(video.seekable, nativeSeconds)) {
-        takeSeek();
+        rememberPendingSeek(seconds);
+        setCurrentTime(seconds);
         if (isHlsStream) video.currentTime = nativeSeconds;
         else handleSeek(nativeSeconds);
         return true;
@@ -1704,7 +1597,6 @@ export function VideoPlayer({
       canSeekAnywhere,
       handleSeek,
       isHlsStream,
-      onSeek,
       reanchorAt,
       rememberPendingSeek,
       resetRoomCatchupRate,
@@ -1800,15 +1692,15 @@ export function VideoPlayer({
         !watchTogether.closedReason &&
         (watchTogether.connectionState !== "connected" || !watchTogether.room)
       ) {
-        setNotice(roomReconnectingNotice(tRef.current));
+        showWatchTogetherNotice(ROOM_RECONNECTING_MESSAGE, "warning");
         return false;
       }
       if (watchTogether.room && !watchTogether.room.self_can_manage_room) {
-        showWatchTogetherNotice(tRef.current("web.player.room.onlyHostCanSeek"), "warning");
+        showWatchTogetherNotice("Only the host can seek the room.", "warning");
         return false;
       }
       if (watchTogether.room && watchTogetherSync.attachedSessionId !== sessionId) {
-        showWatchTogetherNotice(tRef.current("web.player.room.joining"), "info");
+        showWatchTogetherNotice("Joining room playback. Try again in a moment.", "info");
         return false;
       }
 
@@ -1850,16 +1742,6 @@ export function VideoPlayer({
   // scrub instead of snapping back to where the element still is. In a room,
   // the viewer's held request comes first: the room's seeks for earlier skips
   // in a burst move the element without answering it.
-  // Automatic marker skips call handlePlayerSeek directly: only a viewer's own
-  // seek is evidence that someone is still watching.
-  const handleViewerSeek = useCallback(
-    (seconds: number) => {
-      resetStillWatchingStreak();
-      return handlePlayerSeek(seconds);
-    },
-    [handlePlayerSeek],
-  );
-
   const handleSkip = useCallback(
     (direction: "back" | "forward") => {
       const now =
@@ -1868,11 +1750,11 @@ export function VideoPlayer({
         elementMediaPosition() ??
         currentTimeRef.current;
       const seconds = direction === "back" ? seekIntervals.back : seekIntervals.forward;
-      handleViewerSeek(
+      handlePlayerSeek(
         skipTarget(now, durationRef.current, direction === "back" ? -seconds : seconds),
       );
     },
-    [elementMediaPosition, handleViewerSeek, seekIntervals.back, seekIntervals.forward],
+    [elementMediaPosition, handlePlayerSeek, seekIntervals.back, seekIntervals.forward],
   );
   const handleSkipRef = useRef(handleSkip);
   useEffect(() => {
@@ -1992,12 +1874,7 @@ export function VideoPlayer({
     const finished =
       durationRef.current > 0 &&
       durationRef.current - currentTimeRef.current <= ROOM_ITEM_END_WINDOW_SECONDS;
-    showWatchTogetherNotice(
-      finished
-        ? tRef.current("web.player.room.playbackFinished")
-        : tRef.current("web.player.room.hostStopped"),
-      "info",
-    );
+    showWatchTogetherNotice(finished ? "Playback finished." : "The host stopped playback.", "info");
     const exitState = buildExitState();
     void (async () => {
       try {
@@ -2075,7 +1952,7 @@ export function VideoPlayer({
     if (connectionStatus !== "ended" && !progressSessionEnded) return;
     if (sessionEndedHandledRef.current) return;
     sessionEndedHandledRef.current = true;
-    toast.info(tRef.current("web.player.session.endedByAdmin"));
+    toast.info("An administrator ended this playback session.");
     void handleExit();
   }, [connectionStatus, handleExit, progressSessionEnded]);
 
@@ -2101,12 +1978,6 @@ export function VideoPlayer({
   const handleSubtitleSelect = useCallback(
     (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => {
       subtitleSelectionWasManualRef.current = true;
-      pickedStoredSubtitleRef.current = {
-        index,
-        storedId:
-          inventoryTrack?.stored_subtitle_id ??
-          effectiveSubtitleTracks.find((track) => track.index === index)?.stored_subtitle_id,
-      };
       setActiveSubtitleIndex(index);
       // The in-progress live translation track is synthetic (a sentinel index
       // that exists only in memory); never persist it as the saved preference or
@@ -2114,7 +1985,7 @@ export function VideoPlayer({
       if (index === LIVE_SUBTITLE_INDEX) return;
       onSubtitleChanged?.(index, inventoryTrack);
     },
-    [effectiveSubtitleTracks, onSubtitleChanged],
+    [onSubtitleChanged],
   );
 
   // A choice in the subtitle menu wins over a reused track still waiting for
@@ -2225,13 +2096,11 @@ export function VideoPlayer({
       };
       switch (event.name) {
         case "subtitle_ready": {
-          // Broadcast to every viewer of the file when a stored track is
-          // added: generated, downloaded or uploaded. The payload carries the
-          // server-assigned ordinal, so the track is folded in at that ordinal
-          // without a round trip; only a payload the server could not resolve
-          // falls back to a replan. The track is offered, never auto-selected.
-          if (isForActiveStream(event.payload)) {
-            announcedSubtitleKeysRef.current.add(`stored-${event.payload.subtitle_id}`);
+          // Broadcast to every viewer of the file when a generated track is
+          // persisted. The payload carries the server-assigned ordinal, so the
+          // track is folded in at that ordinal without a round trip; only a
+          // payload the server could not resolve falls back to a replan.
+          if (event.payload.file_id === activeFileId) {
             if (event.payload.track) {
               onApplySubtitleTrack?.(event.payload.track);
             } else {
@@ -2520,7 +2389,6 @@ export function VideoPlayer({
     roomPlaybackActive ? undefined : seriesContext,
     currentTime,
     handleNavigate,
-    { autoPlay: autoPlayNext, playing },
   );
 
   // Previous-episode lookup (mirrors the helper in useNextEpisode). Auto-play
@@ -2543,13 +2411,9 @@ export function VideoPlayer({
   // Title strip copy passed into the floating HUD.
   const hudTitle = seriesContext?.seriesTitle ?? title;
   const hudSubtitle = seriesContext
-    ? t(title ? "web.player.hud.episodeWithTitle" : "web.player.hud.episode", {
-        season: codeNumber(seriesContext.currentSeason),
-        episode: codeNumber(seriesContext.currentEpisode),
-        title,
-      })
+    ? `S${seriesContext.currentSeason} · E${seriesContext.currentEpisode}${title ? ` — ${title}` : ""}`
     : year
-      ? numberText(year)
+      ? String(year)
       : undefined;
   const cancelNextEpisodeAutoPlay = nextEpisode.cancelAutoPlay;
   const cancelNextEpisodeAutoPlayRef = useRef(cancelNextEpisodeAutoPlay);
@@ -2576,17 +2440,13 @@ export function VideoPlayer({
     (region) => region !== null && currentTime >= region.start && currentTime < region.end,
   );
   const skipMarker = useCallback(() => {
-    if (activeSkipMarker) handleViewerSeek(activeSkipMarker.end);
-  }, [activeSkipMarker, handleViewerSeek]);
+    if (activeSkipMarker) handlePlayerSeek(activeSkipMarker.end);
+  }, [activeSkipMarker, handlePlayerSeek]);
 
   const introPromptCanSeek =
     !roomPlaybackActive ||
     (watchTogether.room?.self_can_manage_room === true &&
       watchTogetherSync.attachedSessionId === sessionId);
-  // Whether the player controls show. Their timers live with the rest of the
-  // control visibility code below; it is declared here because the intro
-  // prompt brings a timed-out offer back while the controls are up.
-  const [controlsVisible, setControlsVisible] = useState(true);
   const introKey = activeIntro
     ? `${sessionId}:${activeFileId ?? selectedVersion?.file_id ?? "unknown"}:${activeIntro.start}:${activeIntro.end}`
     : null;
@@ -2600,7 +2460,6 @@ export function VideoPlayer({
     introKey,
     currentTime,
     playing,
-    controlsVisible,
     enabled:
       displayMode === "foreground" &&
       isPlayerReady &&
@@ -2663,7 +2522,6 @@ export function VideoPlayer({
     // frame yet may be a route this browser cannot reach, so its network
     // failures go through startup recovery rather than the reconnect.
     streamPlayedRef.current = false;
-    streamFramedRef.current = false;
     transportIdleSinceRef.current = null;
     const video = videoRef.current;
     if (!video || !isPlayerReady || startupGuardRef.current?.hasFailed()) return;
@@ -2746,12 +2604,10 @@ export function VideoPlayer({
     // and the first frame is shown with the controls up.
     const settlePaused = () => {
       playbackStarted = true;
-      streamFramedRef.current = true;
       cleanupStartupListeners();
       startupGuardRef.current?.markPlaybackStarted();
       transportIdleSinceRef.current = Date.now();
       setAwaitingFirstFrame(false);
-      setFramedSessionId(sessionIdRef.current);
       setPlaying(false);
       pausedSourceLoading = true;
       endHoldOnceLoaded();
@@ -2835,36 +2691,10 @@ export function VideoPlayer({
     video.addEventListener("loadeddata", attemptAutoplayWhenReady);
     video.addEventListener("canplay", attemptAutoplayWhenReady);
 
-    // A seek made while this stream's plan was fetched is where the stream is
-    // heading, as a seek made while it loads is. Pending, it is also where a
-    // replan resumes before this stream plays. Taken by the first transport of
-    // the plan that replaced the seek's plan.
-    const replanSeek = replanSeekRef.current;
-    if (replanSeek && replanSeek.revision !== planRevision) {
-      replanSeekRef.current = null;
-      const seconds = pendingSeekTimeRef.current ?? replanSeek.seconds;
-      if (
-        replanSeek.sessionId === sessionIdRef.current &&
-        canSeekAnywhereRef.current &&
-        seconds !== roomHeldSeekRef.current
-      ) {
-        rememberPendingSeek(seconds);
-      }
-    }
-    // A seek the viewer made while the stream loads wins over the plan's start
-    // position; on a seek-anywhere plan it never replans. A room seek request
-    // the room has not run yet waits for the room's command.
-    const hlsStartPosition = () => {
-      const seconds = canSeekAnywhereRef.current ? pendingSeekTimeRef.current : null;
-      return seconds === null || seconds === roomHeldSeekRef.current
-        ? effectiveInitialPosition
-        : toPlayerTime(seconds, timelineOffsetRef.current);
-    };
-
     const attachNativeHLS = () => {
       video.src = effectiveStreamUrl;
       nativeHLSMetadataHandler = () => {
-        video.currentTime = hlsStartPosition();
+        video.currentTime = effectiveInitialPosition;
         attemptAutoplayWhenReady();
       };
       video.addEventListener("loadedmetadata", nativeHLSMetadataHandler, { once: true });
@@ -2911,8 +2741,7 @@ export function VideoPlayer({
               backBufferLength: Infinity,
               maxBufferLength,
               maxMaxBufferLength: maxBufferLength,
-              // hls.js seeks to this once the first fragment is buffered.
-              startPosition: hlsStartPosition(),
+              startPosition: effectiveInitialPosition,
               startFragPrefetch: true,
               // Segment requests may block while FFmpeg encodes on demand.
               // Remote transcode nodes can also briefly defer the initial
@@ -3007,7 +2836,7 @@ export function VideoPlayer({
                       message: "HLS media recovery failed after three attempts.",
                     })
                   ) {
-                    setError(tRef.current("web.player.error.playbackFailed"));
+                    setError("Playback failed. Please try again.");
                   }
                   hls?.destroy();
                   hlsRef.current = null;
@@ -3021,7 +2850,7 @@ export function VideoPlayer({
                     message: `HLS reported an unrecoverable ${data.type} error.`,
                   })
                 ) {
-                  setError(tRef.current("web.player.error.playbackFailed"));
+                  setError("Playback failed. Please try again.");
                 }
                 hls?.destroy();
                 hlsRef.current = null;
@@ -3081,7 +2910,7 @@ export function VideoPlayer({
                 message: "The browser rejected the planned HLS transport.",
               })
             ) {
-              setError(tRef.current("web.player.error.hlsUnsupported"));
+              setError("HLS playback is not supported in this browser.");
             }
           }
         } catch (error) {
@@ -3093,7 +2922,7 @@ export function VideoPlayer({
                 error instanceof Error ? error.message : "Failed to initialize HLS playback.",
             })
           ) {
-            setError(tRef.current("web.player.error.playerLoadFailed"));
+            setError("Failed to load video player.");
           }
         }
       } else {
@@ -3114,7 +2943,7 @@ export function VideoPlayer({
             : ({ kind: "native" } as const);
         if (route.kind === "unsupported") {
           if (!reportCurrentPlanFailure(route.failure)) {
-            setError(tRef.current("web.player.error.fileUnsupported"));
+            setError("This browser cannot play this file.");
           }
           return;
         }
@@ -3146,11 +2975,7 @@ export function VideoPlayer({
                 if (destroyed) return;
                 const fail = () => {
                   if (!reportCurrentPlanFailure(failure)) {
-                    setError(
-                      tRef.current("web.player.error.playbackError", {
-                        message: failure.message ?? failure.classification,
-                      }),
-                    );
+                    setError(`Playback error: ${failure.message ?? failure.classification}`);
                   }
                 };
                 // When Auto lowers on its own, a start that missed its deadline
@@ -3182,7 +3007,7 @@ export function VideoPlayer({
                   error instanceof Error ? error.message : "Failed to load the browser engine.",
               })
             ) {
-              setError(tRef.current("web.player.error.playerLoadFailed"));
+              setError("Failed to load video player.");
             }
           }
           return;
@@ -3264,7 +3089,6 @@ export function VideoPlayer({
     playsOriginalFile,
     plannedBitrateKbps,
     plannedDynamicRange,
-    rememberPendingSeek,
     reportCurrentPlanFailure,
     shouldAutoPlay,
   ]);
@@ -3280,7 +3104,6 @@ export function VideoPlayer({
         video.pause();
         return;
       }
-      viewerPlayingRef.current = true;
       setPlaying(true);
       const idleSince = transportIdleSinceRef.current;
       transportIdleSinceRef.current = null;
@@ -3291,8 +3114,6 @@ export function VideoPlayer({
     const onPause = () => {
       resetRoomCatchupRate();
       setPlaying(false);
-      // The pause Chromium adds to a media error is not the viewer's.
-      if (!video.error) viewerPlayingRef.current = false;
       // Only a stream that played or has opened. The pause a teardown queues
       // arrives after the next transport has started over, before it has
       // metadata.
@@ -3310,9 +3131,7 @@ export function VideoPlayer({
     const markPlaybackStarted = () => {
       startupGuardRef.current?.markPlaybackStarted();
       streamPlayedRef.current = true;
-      streamFramedRef.current = true;
       setAwaitingFirstFrame(false);
-      setFramedSessionId(sessionIdRef.current);
     };
     // `timeupdate` and `seeked` prove a frame is on screen only once the
     // loaded source has data for the current position. Tearing a transport
@@ -3460,11 +3279,7 @@ export function VideoPlayer({
         if (video.error.code === MEDIA_ERR_NETWORK && reportConnectionLost()) return;
         const message = video.error.message || "Unknown media element error";
         if (!reportCurrentPlanFailure({ classification: "decoder_error", message })) {
-          setError(
-            tRef.current("web.player.error.playbackError", {
-              message: video.error.message || tRef.current("web.player.error.unknownMediaError"),
-            }),
-          );
+          setError(`Playback error: ${message}`);
         }
       }
     };
@@ -3546,6 +3361,7 @@ export function VideoPlayer({
   }, []);
 
   // -- Control visibility (hover anywhere to show) --
+  const [controlsVisible, setControlsVisible] = useState(true);
   const isCoarsePointer = useCoarsePointer();
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const surfaceTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -3628,15 +3444,13 @@ export function VideoPlayer({
     resetControlsTimer();
     window.setTimeout(() => {
       containerRef.current
-        ?.querySelector<HTMLElement>("[data-player-seek-slider]")
+        ?.querySelector<HTMLElement>('[role="slider"][aria-label="Seek"]')
         ?.focus({ preventScroll: true });
     }, 0);
   }, [resetControlsTimer]);
 
   const selectIntroPrompt = useCallback(() => {
     if (!selectActiveIntroPrompt()) return false;
-    // A press on the prompt is the viewer's seek; automatic skips are not.
-    resetStillWatchingStreak();
     focusTransportAfterIntroPrompt();
     return true;
   }, [focusTransportAfterIntroPrompt, selectActiveIntroPrompt]);
@@ -3648,11 +3462,6 @@ export function VideoPlayer({
   }, [dismissActiveIntroPrompt, focusTransportAfterIntroPrompt]);
 
   const introPromptVisible = activeIntroPrompt !== null;
-  // Only a timed prompt takes focus and claims Enter/Space/Escape from the rest
-  // of the player. The untimed offer that returns with the controls answers
-  // Enter/Space only while it has focus, or Space with nothing focused would
-  // skip the intro instead of resuming.
-  const introPromptTimed = activeIntroPrompt?.timer != null;
 
   useEffect(() => {
     if (!introPromptVisible || displayMode !== "foreground") return;
@@ -3663,10 +3472,6 @@ export function VideoPlayer({
       if (event.defaultPrevented) return;
       const key = pillKey(event, promptSelector, containerRef.current);
       if (!key) return;
-      if (!introPromptTimed) {
-        const target = event.target instanceof HTMLElement ? event.target : null;
-        if (key !== "select" || target?.closest(promptSelector) == null) return;
-      }
 
       const handled = key === "select" ? selectIntroPrompt() : dismissIntroPrompt();
       if (!handled) return;
@@ -3676,7 +3481,7 @@ export function VideoPlayer({
 
     document.addEventListener("keydown", handlePromptKeyDown, true);
     return () => document.removeEventListener("keydown", handlePromptKeyDown, true);
-  }, [dismissIntroPrompt, displayMode, introPromptTimed, introPromptVisible, selectIntroPrompt]);
+  }, [dismissIntroPrompt, displayMode, introPromptVisible, selectIntroPrompt]);
 
   // A pill takes focus only after keyboard input, and never from a scrub, an
   // open menu or a text field.
@@ -3685,13 +3490,13 @@ export function VideoPlayer({
     const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const interactionInProgress =
       active?.closest(
-        'input, textarea, select, [contenteditable="true"], dialog, [role="dialog"], [role="menu"], [role="listbox"], [role="slider"]',
+        'input, textarea, select, [contenteditable="true"], [role="dialog"], [role="menu"], [role="listbox"], [role="slider"]',
       ) !== null ||
       containerRef.current?.querySelector('[role="dialog"], [role="menu"], [role="listbox"]') !=
         null;
     return !interactionInProgress;
   };
-  const focusIntroPromptOnMount = introPromptTimed && pillMayTakeFocus();
+  const focusIntroPromptOnMount = activeIntroPrompt !== null && pillMayTakeFocus();
 
   // -- Marker editing --
   const currentMarkers = useMemo<MarkerDraft>(
@@ -3753,7 +3558,6 @@ export function VideoPlayer({
     positionStyle: subtitlePositionStyle,
     fontScale: subtitleFontScale,
     coverCrop,
-    videoAspect,
   } = useSubtitleLayout(containerRef, videoRef, subtitleSettings.position, videoFit);
   // Scale cue text with the rendered video so subtitles stay proportionally
   // the same size as the window grows or shrinks.
@@ -3765,37 +3569,24 @@ export function VideoPlayer({
     [cueStyle, subtitleSettings.fontSize, subtitleFontScale],
   );
 
-  // How far the dock's top sits above the player's bottom edge, measured so
-  // bottom-anchored subtitles, the skip pill and the next-episode card can
-  // clear the controls while they show. It is the bar's height when the dock
-  // sits at the bottom; on a phone held upright the dock sits under the
-  // picture, and they must clear all of it. The .player-hud element is laid
-  // out even while the controls are faded out, so it is readable regardless.
-  const [dockClearance, setDockClearance] = useState(0);
+  // Measure the bottom control bar so bottom-anchored subtitles can lift just
+  // above it while it's visible (YouTube-style) instead of hiding behind it.
+  // The base offset scales with the player, but the bar is a roughly fixed
+  // pixel height, so measure rather than hardcode. The .player-hud element is
+  // laid out even while the controls are faded out, so its height is readable
+  // regardless of visibility.
+  const [controlBarHeight, setControlBarHeight] = useState(0);
   useEffect(() => {
     const container = containerRef.current;
     if (!container || isDetached) return;
     const hud = container.querySelector<HTMLElement>(".player-hud");
     if (!hud) return;
-    const update = () => {
-      // Layout offsets, not client rects: the hidden HUD is translated. Its
-      // offset parent is the controls surface, which fills the player.
-      const surface = hud.offsetParent as HTMLElement | null;
-      setDockClearance(
-        surface
-          ? Math.max(hud.offsetHeight, surface.clientHeight - hud.offsetTop)
-          : hud.offsetHeight,
-      );
-    };
+    const update = () => setControlBarHeight(hud.offsetHeight);
     update();
     const ro = new ResizeObserver(update);
     ro.observe(hud);
-    ro.observe(container);
     return () => ro.disconnect();
-    // videoAspect and videoFit move the upright-phone dock (Fill has none)
-    // without necessarily resizing anything the observer watches, so a change
-    // in either measures again.
-  }, [isDetached, isPlayerReady, displayMode, videoAspect, videoFit]);
+  }, [isDetached, isPlayerReady, displayMode]);
 
   // Bottom-anchored cues rise to clear the control bar (plus a small gap) only
   // while the bar is up and only in the main foreground player; top-anchored
@@ -3810,13 +3601,12 @@ export function VideoPlayer({
     }
     return 0;
   })();
-  // How far up from the player's bottom the controls reach, plus a gap: the
-  // bar's height, or on an upright phone the dock under the picture and
-  // everything below it. PGS bitmaps carry their own position, so they clear
-  // this whatever the text position setting says.
+  // Height the bar and its gap cover at the bottom of the player. PGS
+  // bitmaps carry their own position, so they clear this whatever the text
+  // position setting says.
   const subtitleHudInsetPx =
-    displayMode === "foreground" && controlsVisible && dockClearance > 0
-      ? dockClearance + SUBTITLE_HUD_GAP
+    displayMode === "foreground" && controlsVisible && controlBarHeight > 0
+      ? controlBarHeight + SUBTITLE_HUD_GAP
       : 0;
   const subtitleLiftPx =
     subtitleSettings.position !== "top"
@@ -3924,26 +3714,12 @@ export function VideoPlayer({
   const lastPlanSubtitleRef = useRef({
     sessionId,
     planId: plan.plan_id,
-    mediaFileId: plan.effective_media_file_id,
     index: plan.selected_tracks.subtitle?.index ?? null,
-    tracks: effectiveSubtitleTracks,
   });
   useEffect(() => {
-    // The stored subtitle the active selection names: the viewer's pick, or
-    // the track at its ordinal in `tracks`.
-    const activeStoredSubtitleId = (tracks: readonly PlayerSubtitleInfo[]) =>
-      pickedStoredSubtitleRef.current.index === activeSubtitleIndex
-        ? pickedStoredSubtitleRef.current.storedId
-        : tracks.find((track) => track.index === activeSubtitleIndex)?.stored_subtitle_id;
     const planSubtitleIndex = plan.selected_tracks.subtitle?.index ?? null;
     const previousPlan = lastPlanSubtitleRef.current;
-    lastPlanSubtitleRef.current = {
-      sessionId,
-      planId: plan.plan_id,
-      mediaFileId: plan.effective_media_file_id,
-      index: planSubtitleIndex,
-      tracks: effectiveSubtitleTracks,
-    };
+    lastPlanSubtitleRef.current = { sessionId, planId: plan.plan_id, index: planSubtitleIndex };
     // A replan in the same session that moved the subtitle on its own (a
     // version change dropping it, or bringing the viewer's kept subtitle back)
     // is the server's selection to adopt, not a difference to send back. Only
@@ -3959,28 +3735,6 @@ export function VideoPlayer({
       requestedSubtitleTrackChangeRef.current = null;
       setActiveSubtitleIndex(planSubtitleIndex);
       return;
-    }
-    // A pick of the viewer's own that has not landed yet names a stored
-    // subtitle by its ordinal in the previous plan. Deleting an earlier stored
-    // subtitle moves it down, and the new plan gives that ordinal another
-    // track, so the pick follows its stored subtitle, or turns subtitles off
-    // when it was deleted.
-    if (
-      previousPlan.sessionId === sessionId &&
-      previousPlan.planId !== plan.plan_id &&
-      previousPlan.mediaFileId === plan.effective_media_file_id
-    ) {
-      const storedId = activeStoredSubtitleId(previousPlan.tracks);
-      if (storedId !== undefined) {
-        const moved =
-          effectiveSubtitleTracks.find((track) => track.stored_subtitle_id === storedId)?.index ??
-          null;
-        if (moved !== activeSubtitleIndex) {
-          pickedStoredSubtitleRef.current = { index: moved, storedId };
-          setActiveSubtitleIndex(moved);
-          return;
-        }
-      }
     }
     // Live AI cues belong to the client overlay, not the server inventory.
     // Leave the current plan alone until a real downloaded track is ready.
@@ -4016,16 +3770,11 @@ export function VideoPlayer({
       currentTimeRef.current,
       subtitleFetchAnchorRef.current,
     );
-    const storedId =
-      desiredServerIndex === null ? undefined : activeStoredSubtitleId(effectiveSubtitleTracks);
-    if (storedId === undefined) onSubtitleTrackChange?.(desiredServerIndex, position);
-    else onSubtitleTrackChange?.(desiredServerIndex, position, storedId);
+    onSubtitleTrackChange?.(desiredServerIndex, position);
   }, [
     activeSubtitleIndex,
     activeSubtitleTrack?.burn_in_only,
-    effectiveSubtitleTracks,
     onSubtitleTrackChange,
-    plan.effective_media_file_id,
     plan.plan_id,
     plan.selected_tracks.subtitle?.index,
     plan.subtitle.mode,
@@ -4047,7 +3796,7 @@ export function VideoPlayer({
       subtitleSelectionWasManualRef.current = true;
       setActiveSubtitleIndex(plan.selected_tracks.subtitle?.index ?? null);
       requestedSubtitleTrackChangeRef.current = null;
-      toast.error(replanErrorTitle ?? tRef.current("web.player.watch.subtitleTrackUnusable"), {
+      toast.error(replanErrorTitle ?? "That subtitle track can't be used", {
         description: replanError,
       });
     }
@@ -4065,7 +3814,6 @@ export function VideoPlayer({
   const grantedSubtitleIndexRef = useRef<number | null>(null);
   grantedSubtitleIndexRef.current = plan.selected_tracks.subtitle?.index ?? null;
   useEffect(() => {
-    announcedSubtitleKeysRef.current = new Set();
     const reconnectFrom = reconnectFromSessionRef.current;
     if (reconnectFrom !== null && reconnectFrom !== sessionId) {
       reconnectFromSessionRef.current = null;
@@ -4088,15 +3836,7 @@ export function VideoPlayer({
       subtitleSelectionWasManualRef.current = false;
     }
 
-    const announced = announcedSubtitleKeysRef.current;
-    const candidateTracks = effectiveSubtitleTracks.filter((track) => {
-      if (track.index === activeSubtitleIndex) return true;
-      const key = track.stored_subtitle_id
-        ? `stored-${track.stored_subtitle_id}`
-        : syncKeyOf(track);
-      return key === null || !announced.has(key);
-    });
-    if (candidateTracks.length === 0) {
+    if (effectiveSubtitleTracks.length === 0) {
       setActiveSubtitleIndex(null);
       lastSubtitleIndexRef.current = null;
       return;
@@ -4109,7 +3849,7 @@ export function VideoPlayer({
 
     const match = resolveSubtitleAutoSelect({
       mode: effectiveMode,
-      tracks: candidateTracks,
+      tracks: effectiveSubtitleTracks,
       preferredLanguage: preferredSubtitleLanguage ?? null,
       preferredTrackSignature: preferredSubtitleTrackSignature ?? null,
       audioLanguage: audioLang,
@@ -4140,7 +3880,6 @@ export function VideoPlayer({
   const setPlayback = useCallback(
     (action: "play" | "pause" | "toggle") => {
       if (watchTogether.replacementReason) return;
-      resetStillWatchingStreak();
       const video = videoRef.current;
       if (!video) return;
       const shouldPlay = action === "toggle" ? video.paused : action === "play";
@@ -4149,15 +3888,15 @@ export function VideoPlayer({
         !watchTogether.closedReason &&
         (watchTogether.connectionState !== "connected" || !watchTogether.room)
       ) {
-        setNotice(roomReconnectingNotice(tRef.current));
+        showWatchTogetherNotice(ROOM_RECONNECTING_MESSAGE, "warning");
         return;
       }
       if (watchTogether.room && !watchTogether.room.self_can_control_transport) {
-        showWatchTogetherNotice(tRef.current("web.player.room.onlyHostCanControl"), "warning");
+        showWatchTogetherNotice("Only the host can control playback.", "warning");
         return;
       }
       if (watchTogether.room && watchTogetherSync.attachedSessionId !== sessionId) {
-        showWatchTogetherNotice(tRef.current("web.player.room.joining"), "info");
+        showWatchTogetherNotice("Joining room playback. Try again in a moment.", "info");
         return;
       }
 
@@ -4541,25 +4280,29 @@ export function VideoPlayer({
     // joins the room where it is when clicked.
     const offerJoinPlayback = () => {
       resetRoomCatchupRate();
-      showWatchTogetherNotice(tRef.current("web.player.room.autoplayBlocked"), "warning", () => {
-        if (!isMountedRef.current || lastRoomCommandIdRef.current !== command.command_id) return;
-        const currentVideo = videoRef.current;
-        if (!currentVideo) return;
-        roomCommandFinishedAtRef.current = performance.now();
-        if (!applyRoomPosition(currentVideo)) return;
-        void currentVideo
-          .play()
-          .then(() => {
-            if (!isMountedRef.current || lastRoomCommandIdRef.current !== command.command_id)
-              return;
-            reportRoomReadyRef.current();
-          })
-          .catch(() => {
-            if (!isMountedRef.current || lastRoomCommandIdRef.current !== command.command_id)
-              return;
-            resetRoomCatchupRate();
-          });
-      });
+      showWatchTogetherNotice(
+        "Your browser blocked automatic playback. Click to join playback.",
+        "warning",
+        () => {
+          if (!isMountedRef.current || lastRoomCommandIdRef.current !== command.command_id) return;
+          const currentVideo = videoRef.current;
+          if (!currentVideo) return;
+          roomCommandFinishedAtRef.current = performance.now();
+          if (!applyRoomPosition(currentVideo)) return;
+          void currentVideo
+            .play()
+            .then(() => {
+              if (!isMountedRef.current || lastRoomCommandIdRef.current !== command.command_id)
+                return;
+              reportRoomReadyRef.current();
+            })
+            .catch(() => {
+              if (!isMountedRef.current || lastRoomCommandIdRef.current !== command.command_id)
+                return;
+              resetRoomCatchupRate();
+            });
+        },
+      );
     };
     offerRoomJoinRef.current = offerJoinPlayback;
     if (repeat) return;
@@ -4832,7 +4575,7 @@ export function VideoPlayer({
   );
 
   const handlePlayPauseRef = useRef(handlePlayPause);
-  const handleViewerSeekRef = useRef(handleViewerSeek);
+  const handlePlayerSeekRef = useRef(handlePlayerSeek);
   const handleTogglePiPRef = useRef(handleTogglePiP);
   const handleQualitySelectRef = useRef(handleQualitySelect);
 
@@ -4841,8 +4584,8 @@ export function VideoPlayer({
   }, [handlePlayPause]);
 
   useEffect(() => {
-    handleViewerSeekRef.current = handleViewerSeek;
-  }, [handleViewerSeek]);
+    handlePlayerSeekRef.current = handlePlayerSeek;
+  }, [handlePlayerSeek]);
 
   useEffect(() => {
     handleTogglePiPRef.current = handleTogglePiP;
@@ -4927,10 +4670,7 @@ export function VideoPlayer({
     },
     onNotice: (key) => {
       const next: PlaybackNoticeState = {
-        message:
-          key === "lowered"
-            ? tRef.current("bufferingQuality.lowered")
-            : tRef.current("bufferingQuality.cantLower"),
+        message: BUFFERING_QUALITY_COPY[key],
         tone: "info",
         visibleMs: BUFFERING_NOTICE_VISIBLE_MS,
       };
@@ -4953,16 +4693,9 @@ export function VideoPlayer({
   // An outage shows the buffering spinner too, and says so: the browser
   // decoder keeps sending timeupdate while it waits, which clears `buffering`.
   const stalled = buffering || bufferingQuality.outage;
-  const sessionFramed = framedSessionId === sessionId;
-  const startupCover = !isPlayerReady || (awaitingFirstFrame && !sessionFramed);
-  const transportReloading = awaitingFirstFrame && sessionFramed && isPlayerReady && !error;
-  // A room seek makes the room wait as well; its panel shows while the reload
-  // runs, in place of the buffering spinner.
-  const roomSyncShown =
-    roomSyncWaiting && isPlayerReady && (!awaitingFirstFrame || transportReloading);
   let stallLabel: string | null = null;
-  if (watchTogetherSync.catchingUp) stallLabel = t("web.player.room.catchingUp");
-  else if (bufferingQuality.outage) stallLabel = t("web.player.connection.reconnecting");
+  if (watchTogetherSync.catchingUp) stallLabel = "Catching up to the party";
+  else if (bufferingQuality.outage) stallLabel = "Reconnecting…";
   const { answer: answerBufferingPill } = bufferingQuality;
   // The viewer's latest quality pick while it is pending. A pick that a newer
   // one replaced settles too, but must not end the newer one's suspension.
@@ -5039,7 +4772,7 @@ export function VideoPlayer({
   useEffect(() => {
     roomStallTimesRef.current = [];
     lowerQualityOfferedRef.current = false;
-    setNotice((current) => (current?.kind === "lower_quality" ? null : current));
+    setNotice((current) => (current?.actionLabel === LOWER_QUALITY_ACTION_LABEL ? null : current));
   }, [activeQualityId, sessionId, watchTogetherRoomId]);
 
   const lowerQualityChoiceRef = useRef(() =>
@@ -5050,7 +4783,9 @@ export function VideoPlayer({
       lowerQualityOption(qualityOptions, activeQualityId, activeQuality, deliveredBitrateKbps);
     // A replan can leave no lower rung; an offer that cannot act is withdrawn.
     if (!lowerQualityChoiceRef.current()) {
-      setNotice((current) => (current?.kind === "lower_quality" ? null : current));
+      setNotice((current) =>
+        current?.actionLabel === LOWER_QUALITY_ACTION_LABEL ? null : current,
+      );
     }
   }, [activeQuality, activeQualityId, deliveredBitrateKbps, qualityOptions]);
 
@@ -5066,22 +4801,17 @@ export function VideoPlayer({
       return;
     }
     lowerQualityOfferedRef.current = true;
-    const translate = tRef.current;
-    setNotice({
-      ...watchTogetherNotice(
-        translate,
-        translate("web.player.room.cantKeepUp"),
-        "warning",
-        () => {
-          // A replan can change the ladder while the offer shows; choose the
-          // step down from what is available when the viewer accepts.
-          const lower = lowerQualityChoiceRef.current();
-          if (lower) handleQualitySelectRef.current(lower.id);
-        },
-        translate("web.player.room.lowerQuality"),
-      ),
-      kind: "lower_quality",
-    });
+    showWatchTogetherNotice(
+      "Your connection is having trouble keeping up with the party.",
+      "warning",
+      () => {
+        // A replan can change the ladder while the offer shows; choose the
+        // step down from what is available when the viewer accepts.
+        const lower = lowerQualityChoiceRef.current();
+        if (lower) handleQualitySelectRef.current(lower.id);
+      },
+      LOWER_QUALITY_ACTION_LABEL,
+    );
   }, [
     activeQuality,
     activeQualityId,
@@ -5100,7 +4830,10 @@ export function VideoPlayer({
   useEffect(() => {
     if (!watchTogetherSync.catchingUp || catchingUpExplainedRef.current) return;
     catchingUpExplainedRef.current = true;
-    showWatchTogetherNotice(tRef.current("web.player.room.partyKeptPlaying"), "info");
+    showWatchTogetherNotice(
+      "The party kept playing. You'll rejoin at the current scene once your stream catches up.",
+      "info",
+    );
   }, [showWatchTogetherNotice, watchTogetherSync.catchingUp]);
 
   const previousRoomRef = useRef(watchTogether.room);
@@ -5110,7 +4843,7 @@ export function VideoPlayer({
     const leftBehind = roomMembersLeftBehind(previous, watchTogether.room);
     if (leftBehind.length > 0) {
       showWatchTogetherNotice(
-        tRef.current("web.player.room.continuingWithout", { names: joinList(leftBehind) }),
+        `Continuing without ${leftBehind.join(", ")}. They'll catch up.`,
         "info",
       );
     }
@@ -5141,12 +4874,12 @@ export function VideoPlayer({
         const nextCurrentTime = currentTimeRef.current;
         const nextDuration = durationRef.current;
         const maxTime = nextDuration > 0 ? nextDuration : nextCurrentTime + Math.abs(secondsDelta);
-        handleViewerSeekRef.current(Math.max(0, Math.min(maxTime, nextCurrentTime + secondsDelta)));
+        handlePlayerSeekRef.current(Math.max(0, Math.min(maxTime, nextCurrentTime + secondsDelta)));
       },
       skipBack: skipActions.back,
       skipForward: skipActions.forward,
       seekTo: (seconds: number) => {
-        handleViewerSeekRef.current(seconds);
+        handlePlayerSeekRef.current(seconds);
       },
       togglePictureInPicture: () => handleTogglePiPRef.current(),
     };
@@ -5198,34 +4931,27 @@ export function VideoPlayer({
         }
         case "display_message":
           setNotice({
-            title:
-              readStringPayload(command.payload, "title") ??
-              tRef.current("web.player.serverMessage.title"),
+            title: readStringPayload(command.payload, "title") ?? "Playback notice",
             message:
-              readStringPayload(command.payload, "message") ??
-              tRef.current("web.player.serverMessage.fallback"),
+              readStringPayload(command.payload, "message") ?? "A server message was received.",
             tone: "info",
           });
           return;
         case "server_restarting":
           setNotice({
-            title:
-              readStringPayload(command.payload, "title") ??
-              tRef.current("web.player.serverMessage.restartingTitle"),
+            title: readStringPayload(command.payload, "title") ?? "Server restarting",
             message:
               readStringPayload(command.payload, "message") ??
-              tRef.current("web.player.serverMessage.restarting"),
+              "Playback may end shortly while the server restarts.",
             tone: "warning",
           });
           return;
         case "server_shutting_down":
           setNotice({
-            title:
-              readStringPayload(command.payload, "title") ??
-              tRef.current("web.player.serverMessage.shuttingDownTitle"),
+            title: readStringPayload(command.payload, "title") ?? "Server shutting down",
             message:
               readStringPayload(command.payload, "message") ??
-              tRef.current("web.player.serverMessage.shuttingDown"),
+              "Playback may end shortly while the server shuts down.",
             tone: "warning",
           });
           return;
@@ -5259,9 +4985,7 @@ export function VideoPlayer({
               setNotice({
                 title:
                   readStringPayload(command.payload, "title") ??
-                  (command.name === "terminate"
-                    ? tRef.current("web.player.serverMessage.endedTitle")
-                    : tRef.current("web.player.serverMessage.stoppingTitle")),
+                  (command.name === "terminate" ? "Playback ended" : "Playback stopping"),
                 message,
                 tone: "warning",
               });
@@ -5288,13 +5012,7 @@ export function VideoPlayer({
   }, [onRealtimeConnectionStateChange, realtime.connectionState]);
 
   // -- Postroll mini-player resize --
-  // Null until the viewer resizes it: the post-roll layout's own width
-  // (--postroll-video-width) applies, so the end screen can sit beside it.
-  const [miniPlayerWidth, setMiniPlayerWidth] = useState<number | null>(null);
-  // The width the end screen reserves beside the player, read from the player
-  // before its first resize: dragging may shrink it, never grow it over the
-  // end screen's column.
-  const reservedMiniWidthRef = useRef<number | null>(null);
+  const [miniPlayerWidth, setMiniPlayerWidth] = useState(320);
   const isDraggingRef = useRef(false);
 
   const handleResizePointerDown = useCallback(
@@ -5303,20 +5021,14 @@ export function VideoPlayer({
       e.stopPropagation();
       isDraggingRef.current = true;
       const startX = e.clientX;
-      // The width on screen, which a narrowed window may hold below the
-      // width the viewer last dragged to.
-      const startWidth = containerRef.current?.offsetWidth ?? miniPlayerWidth ?? 320;
-      reservedMiniWidthRef.current ??= startWidth;
-      const maxWidth = reservedMiniWidthRef.current;
+      const startWidth = miniPlayerWidth;
       const target = e.currentTarget as HTMLElement;
       target.setPointerCapture(e.pointerId);
-      // The handle is at the bottom end corner: right, or left right to left.
-      const outward = isRightToLeft(target) ? -1 : 1;
 
       const onMove = (ev: PointerEvent) => {
-        // Dragging the handle outward grows the player.
-        const delta = (ev.clientX - startX) * outward;
-        setMiniPlayerWidth(Math.max(200, Math.min(maxWidth, startWidth + delta)));
+        // Handle is at bottom-right; dragging right grows the player.
+        const delta = ev.clientX - startX;
+        setMiniPlayerWidth(Math.max(200, Math.min(640, startWidth + delta)));
       };
       const onUp = () => {
         isDraggingRef.current = false;
@@ -5340,7 +5052,7 @@ export function VideoPlayer({
       watchTogether.room?.code,
     );
     if (!copied) {
-      showWatchTogetherNotice(tRef.current("web.player.room.inviteNotReady"), "info");
+      showWatchTogetherNotice("Invite link is not ready yet.", "info");
     }
   }, [showWatchTogetherNotice, watchTogether.room]);
 
@@ -5362,61 +5074,33 @@ export function VideoPlayer({
   // -- Render --
 
   const isPostrollVisible = displayMode === "postroll" && !hasEnded;
-  const bufferingShown =
-    !isDetached &&
-    ((stalled && !awaitingFirstFrame) || transportReloading) &&
-    !roomSyncWaiting &&
-    isPlayerReady;
 
   return (
     <div
       ref={containerRef}
       className={
         displayMode === "postroll"
-          ? `player-container fixed start-6 top-6 z-[60] aspect-video overflow-hidden rounded-2xl bg-black shadow-2xl ring-1 ring-white/10 transition-opacity duration-700 lg:start-12 lg:top-1/2 lg:-translate-y-1/2 ${hasEnded ? "pointer-events-none opacity-0" : "cursor-pointer"}`
+          ? `player-container fixed top-6 left-6 z-[60] aspect-video overflow-hidden rounded-2xl bg-black shadow-2xl ring-1 ring-white/10 transition-opacity duration-700 ${hasEnded ? "pointer-events-none opacity-0" : "cursor-pointer"}`
           : isDetached
-            ? "pointer-events-none fixed start-0 top-0 z-[-1] h-px w-px overflow-hidden opacity-0"
+            ? "pointer-events-none fixed top-0 left-0 z-[-1] h-px w-px overflow-hidden opacity-0"
             : controlsVisible
-              ? "player-container hud fixed inset-0 z-50 bg-black"
-              : "player-container hud fixed inset-0 z-50 cursor-none bg-black"
+              ? "player-container fixed inset-0 z-50 bg-black"
+              : "player-container fixed inset-0 z-50 cursor-none bg-black"
       }
-      style={
-        displayMode === "postroll"
-          ? {
-              // A width the viewer dragged still yields when the window narrows
-              // and the end screen's reserved column shrinks with it.
-              width:
-                miniPlayerWidth === null
-                  ? "var(--postroll-video-width)"
-                  : `min(${miniPlayerWidth}px, var(--postroll-video-width))`,
-            }
-          : undefined
-      }
+      style={displayMode === "postroll" ? { width: miniPlayerWidth } : undefined}
       onClick={isPostrollVisible ? handleMiniPlayerClick : undefined}
       onMouseEnter={isDetached ? undefined : resetControlsTimer}
       onMouseLeave={isDetached ? undefined : hideControlsOnMouseLeave}
       onMouseMove={isDetached ? undefined : resetControlsTimer}
     >
-      {/* Post-roll caption: the corner picture is this episode, still playing
-          its credits; a click returns to it. */}
-      {isPostrollVisible && (
-        <div className="hud pointer-events-none absolute inset-x-0 bottom-0 z-[5] bg-gradient-to-t from-black/85 to-transparent px-3 pt-6 pb-2.5 text-xs font-semibold">
-          {t("web.player.postRoll.stillPlaying")}
-        </div>
-      )}
-      {/* Postroll resize handle (bottom end corner) */}
+      {/* Postroll resize handle (bottom-left corner) */}
       {isPostrollVisible && (
         <div
           onPointerDown={handleResizePointerDown}
-          className="absolute end-0 bottom-0 z-10 flex h-6 w-6 cursor-nwse-resize items-end justify-end p-1 opacity-0 transition-opacity hover:opacity-100 rtl:cursor-nesw-resize"
+          className="absolute right-0 bottom-0 z-10 flex h-6 w-6 cursor-nwse-resize items-end justify-end p-1 opacity-0 transition-opacity hover:opacity-100"
           onClick={(e) => e.stopPropagation()}
         >
-          <svg
-            width="10"
-            height="10"
-            viewBox="0 0 10 10"
-            className="text-white/50 rtl:-scale-x-100"
-          >
+          <svg width="10" height="10" viewBox="0 0 10 10" className="text-white/50">
             <path
               d="M10 10L0 0M10 10L4 10M10 10L10 4"
               stroke="currentColor"
@@ -5429,7 +5113,7 @@ export function VideoPlayer({
       {/* Back button + media info */}
       {!isDetached && (
         <div
-          className={`hud-top-chrome absolute top-[max(1rem,env(safe-area-inset-top))] left-[max(1rem,env(safe-area-inset-left))] z-50 flex items-center gap-2 transition-opacity duration-300 sm:top-[max(1.5rem,env(safe-area-inset-top))] sm:left-[max(2rem,env(safe-area-inset-left))] rtl:right-[max(1rem,env(safe-area-inset-right))] rtl:left-auto sm:rtl:right-[max(2rem,env(safe-area-inset-right))] ${
+          className={`absolute top-[max(1rem,env(safe-area-inset-top))] left-[max(1rem,env(safe-area-inset-left))] z-50 flex items-center gap-3 transition-opacity duration-300 ${
             controlsVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
         >
@@ -5438,23 +5122,50 @@ export function VideoPlayer({
               void handleMinimize();
             }}
             disabled={isLeaving}
-            aria-label={t("web.player.minimize")}
-            title={t("web.player.minimize")}
-            className="hud-glass-btn"
+            aria-label="Minimize player"
+            title="Minimize player"
+            className="flex h-11 w-11 items-center justify-center rounded-full bg-black/60 text-white hover:bg-black/80"
             type="button"
           >
-            <ChevronDown />
+            <svg
+              aria-hidden="true"
+              xmlns="http://www.w3.org/2000/svg"
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="m6 9 6 6 6-6" />
+            </svg>
           </button>
           <button
             onClick={() => {
               void handleExit();
             }}
             disabled={isLeaving}
-            className="hud-glass-btn hud-glass-btn--text"
+            className="flex items-center gap-2 rounded-full bg-black/60 px-4 py-2 text-sm text-white hover:bg-black/80"
             type="button"
           >
-            <X />
-            {t("web.player.exit")}
+            <svg
+              aria-hidden="true"
+              xmlns="http://www.w3.org/2000/svg"
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+            Exit
           </button>
           {/* Title + episode info have moved to the bottom HUD in the
               redesigned player — the top-left chrome now carries only the
@@ -5465,28 +5176,19 @@ export function VideoPlayer({
             {seriesContext ? (
               <>
                 <span>
-                  {year
-                    ? t("web.player.titleWithYear", {
-                        title: seriesContext.seriesTitle ?? title,
-                        year: year,
-                      })
-                    : (seriesContext.seriesTitle ?? title)}
+                  {seriesContext.seriesTitle ?? title}
+                  {year ? ` (${year})` : ""}
                 </span>
                 <span>
-                  {title
-                    ? t("web.player.episode.codeWithTitle", {
-                        season: codeNumber(seriesContext.currentSeason),
-                        episode: codeNumber(seriesContext.currentEpisode),
-                        title,
-                      })
-                    : t("web.player.episode.code", {
-                        season: codeNumber(seriesContext.currentSeason),
-                        episode: codeNumber(seriesContext.currentEpisode),
-                      })}
+                  S{seriesContext.currentSeason}:E{seriesContext.currentEpisode}
+                  {title ? ` · ${title}` : ""}
                 </span>
               </>
             ) : (
-              <span>{year ? t("web.player.titleWithYear", { title, year: year }) : title}</span>
+              <span>
+                {title}
+                {year ? ` (${year})` : ""}
+              </span>
             )}
           </div>
         </div>
@@ -5509,72 +5211,76 @@ export function VideoPlayer({
 
       {!isDetached && watchTogetherRoomId && watchTogether.replacementReason ? (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 px-6">
-          <div role="alert" className="hud-card w-full max-w-md p-6 text-center">
-            <h2 className="text-lg font-semibold">{t("web.player.room.replacedTitle")}</h2>
-            <p className="mt-2 text-sm text-[var(--hud-ash)]">{watchTogether.replacementReason}</p>
-            <div className="mt-5 flex flex-wrap justify-center gap-3">
-              <button type="button" onClick={watchTogether.rejoinRoom} className="hud-primary-btn">
-                {t("web.player.room.rejoin")}
-              </button>
-              <button type="button" onClick={() => void handleExit()} className="hud-secondary-btn">
-                {t("web.player.room.leave")}
-              </button>
-            </div>
+          <div role="alert" className="max-w-sm text-center text-white">
+            <h2 className="text-lg font-semibold">Watch Party joined on another device</h2>
+            <p className="mt-2 text-sm text-white/70">{watchTogether.replacementReason}</p>
+            <button
+              type="button"
+              onClick={watchTogether.rejoinRoom}
+              className="mt-4 rounded-md bg-white px-4 py-2 text-sm font-medium text-black"
+            >
+              Rejoin Watch Party
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleExit()}
+              className="mt-4 ml-3 rounded-md border border-white/30 px-4 py-2 text-sm font-medium"
+            >
+              Leave Watch Party
+            </button>
           </div>
         </div>
       ) : null}
 
-      {/* Loading overlay — stays up until the session's first frame renders */}
-      {!isDetached && startupCover && !error && (
-        <PlayerLoadingCover
-          backdrop={backdrop}
-          label={t("web.player.loadingVideo")}
-          className="absolute inset-0 z-40"
-        />
+      {/* Loading overlay — stays up until the first frame renders */}
+      {!isDetached && (awaitingFirstFrame || !isPlayerReady) && !error && (
+        <div
+          role="status"
+          aria-label="Loading video"
+          className="absolute inset-0 z-40 flex items-center justify-center bg-black"
+        >
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white" />
+          <span className="sr-only">Loading video</span>
+        </div>
       )}
 
       {/* Room sync overlay */}
-      {!isDetached && roomSyncShown && (
+      {!isDetached && roomSyncWaiting && !awaitingFirstFrame && isPlayerReady && (
         <div
           role="status"
-          aria-label={t("web.player.room.syncing")}
+          aria-label="Syncing playback"
           className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center px-6"
         >
-          <div className="hud-card px-6 py-5 text-center">
-            <div className="hud-spinner mx-auto" />
-            <div className="mt-3 text-sm font-semibold">{t("web.player.room.syncing")}</div>
-            <div className="mt-1 text-xs text-[var(--hud-ash)]">
+          <div className="rounded-[8px] border border-white/15 bg-black/70 px-5 py-4 text-center text-white shadow-2xl backdrop-blur">
+            <div className="mx-auto h-10 w-10 animate-spin rounded-full border-2 border-white/20 border-t-white" />
+            <div className="mt-3 text-sm font-medium">Syncing playback</div>
+            <div className="mt-1 text-xs text-white/70">
               {watchTogether.room?.members?.some((member) => member.is_syncing)
-                ? t("web.player.room.waitingFor", {
-                    names: joinList(
-                      watchTogether.room.members
-                        .filter((member) => member.is_syncing)
-                        .map((member) =>
-                          member.is_self ? t("web.player.room.waitingForYou") : member.display_name,
-                        ),
-                    ),
-                  })
-                : t("web.player.room.waitingForEveryone")}
+                ? `Waiting for ${watchTogether.room.members
+                    .filter((member) => member.is_syncing)
+                    .map((member) => (member.is_self ? "you" : member.display_name))
+                    .join(", ")}`
+                : "Waiting for everyone to be ready."}
             </div>
           </div>
         </div>
       )}
 
-      {/* Loading spinner (mid-playback stalls, outages and replanned transports).
-          Viewers read a visible "Buffering" as a fault, so an ordinary stall shows
-          the spinner alone; only a party catch-up or a reconnect says why. */}
-      {bufferingShown && (
+      {/* Buffering spinner (mid-playback stalls and outages only) */}
+      {!isDetached && stalled && !roomSyncWaiting && !awaitingFirstFrame && isPlayerReady && (
         <div
           role="status"
-          aria-label={stallLabel ?? t("web.player.bufferingStatus")}
+          aria-label={stallLabel ?? "Buffering"}
           className="pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center gap-3"
         >
-          <div className="hud-spinner hud-spinner--float size-14 border-[0.25rem]" />
+          <div className="h-10 w-10 animate-spin rounded-full border-2 border-white/20 border-t-white" />
           {stallLabel ? (
-            <span className="hud-card rounded-full px-3 py-1 text-xs font-medium">
+            <span className="rounded-full bg-black/60 px-3 py-1 text-xs font-medium text-white/85">
               {stallLabel}
             </span>
-          ) : null}
+          ) : (
+            <span className="sr-only">Buffering</span>
+          )}
         </div>
       )}
 
@@ -5608,29 +5314,31 @@ export function VideoPlayer({
           role={connectionStatus === "reconnecting" ? "status" : "alert"}
           className="absolute inset-0 z-40 flex items-center justify-center bg-black/80 px-6"
         >
-          <div className="hud-card flex w-full max-w-md flex-col items-center gap-4 p-6 text-center">
-            {connectionStatus === "reconnecting" && <div className="hud-spinner" />}
-            <div className="space-y-1.5">
-              <p className="text-lg font-semibold">
+          <div className="flex max-w-md flex-col items-center gap-4 text-center">
+            {connectionStatus === "reconnecting" && (
+              <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white" />
+            )}
+            <div className="space-y-1">
+              <p className="text-base font-semibold text-white">
                 {connectionStatus === "reconnecting"
-                  ? t("web.player.connection.reconnecting")
-                  : (connectionErrorTitle ?? t("web.player.connection.lostTitle"))}
+                  ? "Reconnecting…"
+                  : (connectionErrorTitle ?? "Connection lost")}
               </p>
-              <p className="text-sm leading-relaxed text-[var(--hud-ash)]">
+              <p className="text-sm text-white/60">
                 {connectionStatus === "reconnecting"
-                  ? t("web.player.connection.reconnectingDetail")
-                  : (connectionError ?? t("web.player.connection.lostDetail"))}
+                  ? "The connection to the server was lost. Playback will continue where you left off."
+                  : (connectionError ?? "Silo couldn't reconnect to the server.")}
               </p>
             </div>
-            <div className="flex flex-wrap justify-center gap-3">
+            <div className="flex gap-2">
               {connectionStatus === "lost" && onRetryConnection && (
                 <button
                   onClick={onRetryConnection}
                   disabled={isLeaving}
                   type="button"
-                  className="hud-primary-btn"
+                  className="rounded bg-white px-4 py-2 text-sm font-medium text-black hover:bg-white/90"
                 >
-                  {t("common.tryAgain")}
+                  Try again
                 </button>
               )}
               <button
@@ -5639,9 +5347,9 @@ export function VideoPlayer({
                 }}
                 disabled={isLeaving}
                 type="button"
-                className="hud-secondary-btn"
+                className="rounded bg-white/10 px-4 py-2 text-sm text-white hover:bg-white/20"
               >
-                {t("player.goBack")}
+                Go Back
               </button>
             </div>
           </div>
@@ -5650,21 +5358,18 @@ export function VideoPlayer({
 
       {/* Error state */}
       {!isDetached && error && connectionStatus === "connected" && (
-        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/80 px-6">
-          <div
-            role="alert"
-            className="hud-card flex w-full max-w-md flex-col items-center gap-4 p-6 text-center"
-          >
-            <p className="text-sm leading-relaxed">{error}</p>
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/80">
+          <div className="text-center">
+            <div className="mb-4 text-sm text-white/60">{error}</div>
             <button
               onClick={() => {
                 void handleExit();
               }}
               disabled={isLeaving}
               type="button"
-              className="hud-secondary-btn"
+              className="rounded bg-white/10 px-4 py-2 text-sm text-white hover:bg-white/20"
             >
-              {t("player.goBack")}
+              Go Back
             </button>
           </div>
         </div>
@@ -5721,10 +5426,10 @@ export function VideoPlayer({
             role="status"
             className="pointer-events-none absolute inset-x-0 top-20 z-40 flex justify-center"
           >
-            <span className="hud-card rounded-full px-4 py-2 text-sm font-medium">
+            <span className="rounded bg-black/75 px-3 py-2 text-sm text-white">
               {subtitleLoadState === "loading"
-                ? t("web.player.subtitles.loading")
-                : t("web.player.subtitles.loadFailedRetrying")}
+                ? "Loading subtitles…"
+                : "Subtitles couldn't load. Retrying…"}
             </span>
           </div>
         )}
@@ -5764,10 +5469,8 @@ export function VideoPlayer({
           onSkip={selectIntroPrompt}
           label={activeIntroPrompt.label}
           caption={activeIntroPrompt.caption}
-          timer={activeIntroPrompt.timer ?? undefined}
-          introPrompt
+          timer={activeIntroPrompt}
           controlsVisible={controlsVisible}
-          dockHeight={dockClearance}
           focusOnMount={focusIntroPromptOnMount}
           provenance={activeIntro}
           showConfidence={showMarkerConfidence}
@@ -5777,9 +5480,8 @@ export function VideoPlayer({
       {!isDetached && !activeIntroPrompt && !nextEpisode.showCountdown && activeSkipMarker && (
         <IntroSkipButton
           onSkip={skipMarker}
-          label={skipMarkerLabel(t, activeSkipMarker.kind)}
+          label={MARKER_SKIP_LABELS[activeSkipMarker.kind]}
           controlsVisible={controlsVisible}
-          dockHeight={dockClearance}
           provenance={activeSkipMarker}
           showConfidence={showMarkerConfidence}
           showSource={showMarkerSource}
@@ -5794,7 +5496,6 @@ export function VideoPlayer({
       {/* Next episode overlay */}
       {!isDetached && nextEpisode.showCountdown && nextEpisode.nextEpisode && (
         <NextEpisodeOverlay
-          dockHeight={controlsVisible ? dockClearance : 0}
           episode={nextEpisode.nextEpisode}
           secondsRemaining={nextEpisode.secondsRemaining}
           onSkip={nextEpisode.skipToNext}
@@ -5805,11 +5506,9 @@ export function VideoPlayer({
       {/* Live translation buffering indicator */}
       {translationBuffering && (
         <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center">
-          <div className="hud-card flex items-center gap-3 rounded-full py-3 ps-3 pe-5 text-sm font-semibold">
-            <span className="hud-spinner size-6 border-2" />
-            {liveTranslation?.label
-              ? t("web.player.subtitles.preparingTranslation", { label: liveTranslation.label })
-              : t("web.player.subtitles.preparingTranslated")}
+          <div className="flex items-center gap-3 rounded-lg bg-black/80 px-4 py-3 text-sm text-white shadow-lg">
+            <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+            Preparing {liveTranslation?.label || "translated"} subtitles…
           </div>
         </div>
       )}
@@ -5893,18 +5592,14 @@ export function VideoPlayer({
                 }
               : undefined
           }
-          // A Watch Party plays at 1x whatever the local speed: the finish time
-          // and the speed shown follow the room.
-          playbackSpeed={baseRate}
+          playbackSpeed={playbackSpeed}
           onPlaybackSpeedChange={roomPlaybackActive ? undefined : setPlaybackSpeed}
           onTogglePiP={browserEngineActive ? undefined : handleTogglePiP}
           onPlayPause={handlePlayPause}
-          onSeek={handleViewerSeek}
+          onSeek={handlePlayerSeek}
           onVolumeChange={handleVolumeChange}
           onMutedChange={handleMutedChange}
           videoFit={videoFit}
-          videoAspect={videoAspect}
-          getAmbientSource={getAmbientSource}
           onVideoFitToggle={() =>
             setVideoFit((current) => (current === "cover" ? "contain" : "cover"))
           }

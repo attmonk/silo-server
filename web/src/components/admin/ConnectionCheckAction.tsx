@@ -2,7 +2,6 @@ import { useState } from "react";
 
 import type { AdminSettingsConnectionCheckRequest, ConnectionCheckResponse } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 import { useCheckAdminSettingsConnection } from "@/hooks/queries/admin/settings";
 
 type Props = {
@@ -19,10 +18,9 @@ export function ConnectionCheckAction({
   result,
   isPending = false,
   disabled = false,
-  label,
-  pendingLabel,
+  label = "Check Connection",
+  pendingLabel = "Checking...",
 }: Props) {
-  const t = useT();
   return (
     // py matches SettingFieldRow so the action reads as one more row in the
     // group instead of hugging the hairline under the last field.
@@ -37,9 +35,7 @@ export function ConnectionCheckAction({
         onClick={() => void onClick()}
         disabled={disabled || isPending}
       >
-        {isPending
-          ? (pendingLabel ?? t("web.admin.common.connectionCheck.checking"))
-          : (label ?? t("web.admin.common.connectionCheck.check"))}
+        {isPending ? pendingLabel : label}
       </Button>
       {result ? (
         <span
@@ -71,7 +67,6 @@ export function useConnectionCheck(
   form: { buildConnectionCheckRequest: (keys: string[]) => AdminSettingsConnectionCheckRequest },
   keys: string[],
 ) {
-  const t = useT();
   const mutation = useCheckAdminSettingsConnection();
   const [checked, setChecked] = useState<{
     signature: string;
@@ -89,8 +84,7 @@ export function useConnectionCheck(
     } catch (error) {
       result = {
         success: false,
-        message:
-          error instanceof Error ? error.message : t("web.admin.common.connectionCheck.failed"),
+        message: error instanceof Error ? error.message : "Connection check failed.",
       };
     }
     setChecked({ signature, result });

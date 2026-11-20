@@ -3,7 +3,6 @@ import { SquareKanban } from "lucide-react";
 import type { LibraryTabCollection, LibraryTabGroup, LibraryTabUngrouped } from "@/api/types";
 import { useLibraryCollections } from "@/hooks/queries/libraryCollections";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
-import { useT } from "@/i18n";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -14,14 +13,12 @@ import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import { ownerName } from "@/lib/collections/personalOwnership";
 import { SERVER_SCOPE } from "@/lib/collections/scope";
 import { cardGridClasses } from "@/lib/uiCustomization";
-import { useAppLanguage } from "@/i18n";
 
 interface LibraryCollectionsProps {
   libraryId: number;
 }
 
 export default function LibraryCollections({ libraryId }: LibraryCollectionsProps) {
-  const t = useT();
   const { data, isLoading } = useLibraryCollections(libraryId);
   const actingAdmin = useIsActingAdmin();
   const { cardPresentation } = useUICustomization();
@@ -51,17 +48,17 @@ export default function LibraryCollections({ libraryId }: LibraryCollectionsProp
       <div className="page-shell py-6 sm:py-8">
         <Card className="surface-panel overflow-hidden rounded-[2rem] border-0 shadow-none">
           <CardContent className="py-10 text-center">
-            <p className="text-lg font-semibold">{t("web.library.collections.emptyTitle")}</p>
+            <p className="text-lg font-semibold">No collections yet</p>
             {actingAdmin ? (
               <Link
                 to={SERVER_SCOPE.paths.list({ libraryId })}
                 className="text-primary mt-2 inline-block text-sm font-medium hover:underline"
               >
-                {t("web.library.collections.create")}
+                Create collections for this library
               </Link>
             ) : (
               <p className="text-muted-foreground mt-2 text-sm">
-                {t("web.library.collections.emptyBody")}
+                Collections for this library will show up here.
               </p>
             )}
           </CardContent>
@@ -74,18 +71,16 @@ export default function LibraryCollections({ libraryId }: LibraryCollectionsProp
     <div className="page-shell space-y-6 py-6 sm:py-8">
       <div className="page-header gap-5">
         <div className="space-y-3">
-          <h1 className="page-title text-[clamp(2rem,4vw,3rem)]">
-            {t("web.library.collections.title")}
-          </h1>
+          <h1 className="page-title text-[clamp(2rem,4vw,3rem)]">Collections</h1>
           <p className="page-subtitle text-sm sm:text-base">
-            {t("web.library.collections.subtitle")}
+            Browse hand-picked shelves and smart lists created for this library.
           </p>
         </div>
         {actingAdmin ? (
           <Button asChild variant="outline" size="sm">
             <Link to={SERVER_SCOPE.paths.list({ libraryId, view: "arrange" })}>
               <SquareKanban aria-hidden />
-              {t("web.library.collections.arrange")}
+              Arrange shelves
             </Link>
           </Button>
         ) : null}
@@ -167,7 +162,6 @@ function GroupSection({
   libraryId: number;
   gridClasses: string;
 }) {
-  useAppLanguage();
   const { data: profiles = [] } = useProfiles();
   const { profile } = useCurrentProfile();
   // Personal collections from another profile on the login carry its name.

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/markers"
@@ -131,11 +130,8 @@ func (t *ContributeMarkersTask) Execute(ctx context.Context, progress taskmanage
 		return t.candidates.CandidateManualCorrections(ctx, amenders, after, contributionCandidateBatch)
 	}
 	stopped, err := t.contributeCandidates(ctx, progress, markers.ContributeOptions{Corrections: true}, corrections, &state)
-	if err != nil {
+	if err != nil || stopped {
 		return err
-	}
-	if stopped {
-		return state.counts.failedRun()
 	}
 	// One pass per kind, intros first, so a pass asks each file for the one
 	// segment it was selected for.
@@ -145,33 +141,15 @@ func (t *ContributeMarkersTask) Execute(ctx context.Context, progress taskmanage
 		}
 		opts := markers.ContributeOptions{Segments: []markers.MarkerKind{kind}, Auto: true}
 		stopped, err := t.contributeCandidates(ctx, progress, opts, next, &state)
-		if err != nil {
+		if err != nil || stopped {
 			return err
-		}
-		if stopped {
-			// A run that stops early, at a usage limit or after a streak of
-			// failed files, is still a failure if nothing went through.
-			return state.counts.failedRun()
 		}
 	}
 
 	counts := state.counts
 	counts.write(progress, 0)
 	progress.Report(100, fmt.Sprintf("Contributed %d, skipped %d, invalid %d, failed %d", counts.submitted, counts.skipped, counts.invalid, counts.failed))
-	return counts.failedRun()
-}
-
-// failedRun reports a run where every attempt failed, which must not read as
-// a success. Skipped (already submitted) and invalid outcomes are answers
-// from the provider, so a run that saw any is not a total failure.
-func (c contributionCounts) failedRun() error {
-	if c.submitted != 0 || c.skipped != 0 || c.invalid != 0 || c.failed == 0 {
-		return nil
-	}
-	if c.lastErr != nil {
-		return fmt.Errorf("all %d contribution attempts failed, e.g. %w", c.failed, c.lastErr)
-	}
-	return fmt.Errorf("all %d contribution attempts failed", c.failed)
+	return nil
 }
 
 // contributionState is one run's tallies and waits, carried across its
@@ -245,9 +223,6 @@ func (t *ContributeMarkersTask) contributeCandidates(
 				outcomes, err := t.service.ContributeFile(ctx, file, opts)
 				if err != nil {
 					counts.failed++
-					counts.lastErr = err
-					slog.WarnContext(ctx, "contribute markers: resolve failed", "component", "taskmanager",
-						"file_id", file.ID, "error", err.Error())
 					failed = true
 					break
 				}
@@ -312,8 +287,6 @@ func contributionErrorWait(n int) time.Duration {
 
 type contributionCounts struct {
 	submitted, skipped, invalid, failed int
-	// lastErr is the most recent failure, reported when every attempt failed.
-	lastErr error
 }
 
 // add tallies one file's outcomes, once per provider and segment across the
@@ -341,7 +314,6 @@ func (c *contributionCounts) add(outcomes []markers.ContributionOutcome, tallied
 			c.invalid++
 		case markers.OutcomeStatusError:
 			c.failed++
-			c.lastErr = fmt.Errorf("provider %s: %s", o.Provider, o.Reason)
 		default:
 			c.submitted++
 		}

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
 // A Profile 8.1 source with an HDR10-compatible base layer, on an output that
@@ -60,6 +61,151 @@ func dvStripFallbackRegistryV3() *TransformationRegistryV3 {
 	})
 }
 
+// Once every native-DV route has failed on this output, the validated HDR10
+// strip must be offered before the planner gives up.
+func TestPlanPlaybackV3DV81FallsBackToHDR10StripAfterNativeDVFails(t *testing.T) {
+	file, req := dv81NativeAndHDR10FixtureV3()
+	plans, terminal := replanChainV3(t, PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+		Registry: dvStripFallbackRegistryV3(),
+	})
+
+	var native, strip []PlanV3
+	for _, plan := range plans {
+		if planStripsDVToHDR10V3(plan) {
+			strip = append(strip, plan)
+			continue
+		}
+		if len(strip) > 0 {
+			t.Fatalf("native-DV plan %s offered after the HDR10 strip", plan.Delivery)
+		}
+		native = append(native, plan)
+	}
+	if len(native) == 0 || !native[0].Claims.Video.DolbyVision {
+		t.Fatalf("first plan should preserve native Dolby Vision: %#v", plans)
+	}
+	if len(strip) != 2 || strip[0].Delivery != DeliveryRemuxProgressiveV3 || strip[1].Delivery != DeliveryRemuxHLSV3 {
+		t.Fatalf("strip plans = %d, want progressive then HLS remux", len(strip))
+	}
+	for _, plan := range strip {
+		if plan.EffectiveRecipe.DynamicRange != DynamicRangeHDR10V3 || !plan.Claims.Video.HDR10 || plan.Claims.Video.DolbyVision {
+			t.Fatalf("%s strip range=%s claims=%#v, want HDR10", plan.Delivery, plan.EffectiveRecipe.DynamicRange, plan.Claims.Video)
+		}
+		if !hasDegradationWarningV3(plan.DegradationWarnings, "dolby_vision_removed") {
+			t.Fatalf("%s strip is missing the dolby_vision_removed warning: %#v", plan.Delivery, plan.DegradationWarnings)
+		}
+		for _, failed := range native {
+			if plan.PlanID == failed.PlanID {
+				t.Fatalf("strip plan reused the native-DV plan id %s", plan.PlanID)
+			}
+		}
+	}
+	if terminal == nil || terminal.Reason != "hdr_transcode_unsupported" {
+		t.Fatalf("terminal = %#v, want hdr_transcode_unsupported once every recipe is exhausted", terminal)
+	}
+}
+
+// With a tone-map route installed, the HDR10 strip still outranks an SDR
+// transcode: it keeps the source's base layer and its HDR presentation.
+func TestPlanPlaybackV3DV81PrefersHDR10StripOverToneMap(t *testing.T) {
+	file, req := dv81NativeAndHDR10FixtureV3()
+	registry := NewTransformationRegistryV3([]TransformationSpecV3{
+		{Name: TransformationServerDV7HDR10V3, RecipeVersion: TransformationServerDV7HDR10RecipeVersionV3, Available: true},
+		{Name: TransformationVideoToH264V3, RecipeVersion: TransformationVideoToH264RecipeVersionV3, Available: true},
+		{Name: TransformationAudioToAACV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, Available: true},
+		{Name: TransformationHDRToSDRToneMapV3, RecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3, Available: true},
+	})
+	capabilities := tonemap.Capabilities{{
+		Mode: tonemap.ModeSoftware, Backend: tonemap.BackendSoftware, Filter: tonemap.SoftwareFilterBT2390,
+		SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ},
+	}}
+	plans, _ := replanChainV3(t, PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true, SoftwareToneMapEnabled: true},
+		Registry: registry, ToneMapCapabilities: capabilities,
+	})
+
+	firstStrip, firstTranscode := -1, -1
+	for i, plan := range plans {
+		if firstStrip < 0 && planStripsDVToHDR10V3(plan) {
+			firstStrip = i
+		}
+		if firstTranscode < 0 && plan.Delivery == DeliveryTranscodeHLSV3 {
+			firstTranscode = i
+		}
+	}
+	if firstStrip < 0 || firstTranscode >= 0 && firstTranscode < firstStrip {
+		t.Fatalf("strip index %d, transcode index %d: the HDR10 strip must precede any transcode", firstStrip, firstTranscode)
+	}
+}
+
+func TestPlanPlaybackV3DV81SkipsHDR10StripWhenItCannotApply(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*PlannerInputV3)
+	}{
+		{name: "source RPU cannot be stripped", mutate: func(input *PlannerInputV3) {
+			input.DVRPUStrippable = func() bool { return false }
+		}},
+		{name: "output lacks HDR10", mutate: func(input *PlannerInputV3) {
+			input.Request.Capabilities.HDRDetails = &HDRCapabilitiesV3{DolbyVisionProfiles: []int{8}}
+			input.Request.ClientPlaybackContext.Output.HDRDetails = input.Request.Capabilities.HDRDetails
+		}},
+		{name: "strip recipe not installed", mutate: func(input *PlannerInputV3) {
+			input.Registry = NewTransformationRegistryV3([]TransformationSpecV3{
+				{Name: TransformationAudioToAACV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, Available: true},
+			})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file, req := dv81NativeAndHDR10FixtureV3()
+			input := PlannerInputV3{
+				Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+				Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+				Registry: dvStripFallbackRegistryV3(),
+			}
+			test.mutate(&input)
+			plans, terminal := replanChainV3(t, input)
+			if len(plans) == 0 || !plans[0].Claims.Video.DolbyVision {
+				t.Fatalf("first plan should still preserve native Dolby Vision: %#v", plans)
+			}
+			for _, plan := range plans {
+				if planStripsDVToHDR10V3(plan) {
+					t.Fatalf("%s offered the HDR10 strip", plan.Delivery)
+				}
+			}
+			if terminal == nil {
+				t.Fatal("chain ended without a terminal")
+			}
+		})
+	}
+}
+
+// The strip fallback stays scoped to the executor pool that can run it: when
+// only HLS nodes carry the strip, the progressive delivery offers no strip plan.
+func TestPlanPlaybackV3DV81StripFallbackRespectsDeliveryExecutors(t *testing.T) {
+	file, req := dv81NativeAndHDR10FixtureV3()
+	withoutStrip := NewTransformationRegistryV3([]TransformationSpecV3{
+		{Name: TransformationAudioToAACV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, Available: true},
+	})
+	plans, _ := replanChainV3(t, PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings:                 PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+		Registry:                 dvStripFallbackRegistryV3(),
+		ProgressiveRemuxRegistry: func() *TransformationRegistryV3 { return withoutStrip },
+	})
+	var strip []PlanV3
+	for _, plan := range plans {
+		if planStripsDVToHDR10V3(plan) {
+			strip = append(strip, plan)
+		}
+	}
+	if len(strip) != 1 || strip[0].Delivery != DeliveryRemuxHLSV3 {
+		t.Fatalf("strip plans = %d, want only the HLS remux", len(strip))
+	}
+}
+
 // HLS cannot carry TrueHD without an AAC conversion. When no HLS executor
 // offers one, that route is skipped rather than ending planning, so the
 // progressive HDR10 strip, which copies TrueHD, is still reached. The
@@ -92,80 +238,5 @@ func TestPlanPlaybackV3DV81StripFallbackSurvivesMissingHLSAudioConversion(t *tes
 	}
 	if terminal == nil || terminal.Reason != TerminalAudioConversionUnsupportedV3 {
 		t.Fatalf("terminal = %#v, want the audio conversion cause once every recipe is exhausted", terminal)
-	}
-}
-
-// A single-track Profile 7 source goes to an output that takes Profile 8.1 as
-// the server's HLS 8.1 conversion (fMP4 only) before the HDR10 strip. A
-// dual-track source keeps its RPUs on the enhancement-layer track, which a
-// remux does not copy, so it goes straight to the strip, as does a client that
-// needs MPEG-TS copies. Without the strip, a failed 8.1 plan falls through to a
-// transcode, not to a raw Profile 7 copy.
-func TestPlanPlaybackV3Profile7ConvertsToDV81BeforeStrip(t *testing.T) {
-	registry := NewTransformationRegistryV3([]TransformationSpecV3{
-		{Name: TransformationServerDV7DV81V3, RecipeVersion: TransformationServerDV7DV81RecipeVersionV3, Available: true},
-		{Name: TransformationServerDV7HDR10V3, RecipeVersion: TransformationServerDV7HDR10RecipeVersionV3, Available: true},
-		{Name: TransformationAudioToAACV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, Available: true},
-	})
-	stripless := NewTransformationRegistryV3([]TransformationSpecV3{
-		{Name: TransformationServerDV7DV81V3, RecipeVersion: TransformationServerDV7DV81RecipeVersionV3, Available: true},
-		{Name: TransformationAudioToAACV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, Available: true},
-	})
-	for _, tc := range []struct {
-		singleTrack, mpegts bool
-		registry            *TransformationRegistryV3
-	}{{true, false, registry}, {false, false, registry}, {true, false, stripless}, {true, true, registry}} {
-		singleTrack := tc.singleTrack
-		file, req := dv81NativeAndHDR10FixtureV3()
-		track := &file.VideoTracks[0]
-		track.DVProfile, track.DVBLCompatID, track.VideoRangeType = 7, 6, "DOVIWithEL"
-		track.DVConfigPresent, track.DVRPUPresent, track.DVBLPresent, track.DVELPresent = true, true, true, singleTrack
-		track.DVEnhancementLayer = string(EnhancementFELV3)
-		hls := req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3]
-		// A delivery's own HDR details must accept the 8.1 output, not reject
-		// the Profile 7 source.
-		hls.HDRDetails = &HDRCapabilitiesV3{HDR10: true, DolbyVisionProfiles: []int{8}}
-		if tc.mpegts {
-			hls.Features = append(hls.Features, FeatureHLSCopyMPEGTSV3) // the conversion is fMP4-only
-		}
-		req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3] = hls
-
-		plans, _ := replanChainV3(t, PlannerInputV3{
-			Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
-			Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
-			Registry: tc.registry,
-		})
-		dv81, firstStrip := 0, -1
-		for i, plan := range plans {
-			for _, tr := range plan.Transformations {
-				if tr.Name != TransformationServerDV7DV81V3 {
-					continue
-				}
-				dv81++
-				if i != 0 || plan.Delivery != DeliveryRemuxHLSV3 || plan.EffectiveRecipe.SegmentContainer != "" ||
-					!plan.Claims.Video.DolbyVision || plan.EffectiveRecipe.DynamicRange != DynamicRangeDolbyVisionV3 {
-					t.Fatalf("8.1 plan %d = %s %s %#v", i, plan.Delivery, plan.EffectiveRecipe.SegmentContainer, plan.Claims.Video)
-				}
-			}
-			if firstStrip < 0 && planStripsDVToHDR10V3(plan) {
-				firstStrip = i
-			}
-			// Without the strip, the 8.1 plan must fall through to a
-			// transcode, never to a copy of the raw Profile 7 stream.
-			if plan.Delivery != DeliveryOriginalHTTPV3 && plan.Delivery != DeliveryTranscodeHLSV3 && len(plan.Transformations) == 0 {
-				t.Fatalf("plan %d copies Profile 7 unconverted: %s", i, plan.Delivery)
-			}
-		}
-		wantStrip := dv81
-		if tc.registry == stripless {
-			wantStrip = -1
-		}
-		want := 0
-		if singleTrack && !tc.mpegts {
-			want = 1
-		}
-		if dv81 != want || firstStrip != wantStrip {
-			t.Fatalf("single track %v, mpegts %v: %d 8.1 plans, first strip at %d", singleTrack, tc.mpegts, dv81, firstStrip)
-		}
 	}
 }

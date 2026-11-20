@@ -1,7 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
-import { v2ErrorText } from "@/api/v2/request";
 import { PageHeader } from "@/components/page/PageHeader";
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
 import { Button } from "@/components/ui/button";
@@ -10,7 +9,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAccountPasswordCapability, useChangeAccountPassword } from "@/hooks/queries/account";
-import { useT } from "@/i18n";
 import { AccountSignInSection } from "./AccountSignInSection";
 
 function passwordByteLength(value: string) {
@@ -18,7 +16,6 @@ function passwordByteLength(value: string) {
 }
 
 export default function AccountSettings() {
-  const t = useT();
   const capability = useAccountPasswordCapability();
   const changePassword = useChangeAccountPassword();
   const [currentPassword, setCurrentPassword] = useState("");
@@ -33,28 +30,19 @@ export default function AccountSettings() {
 
     const limits = capability.data;
     if (!limits?.allowed) {
-      setFormError(t("web.settings.account.password.error.unavailable"));
+      setFormError("Password changes are unavailable for this account.");
       return;
     }
     if (newPassword !== confirmPassword) {
-      setFormError(t("web.settings.account.password.error.mismatch"));
+      setFormError("New passwords do not match.");
       return;
     }
     if (Array.from(newPassword).length < limits.minimum_password_length) {
-      setFormError(
-        t("web.settings.account.password.error.tooShort", {
-          minimum: limits.minimum_password_length,
-          minimum_text: limits.minimum_password_length,
-        }),
-      );
+      setFormError(`New password must be at least ${limits.minimum_password_length} characters.`);
       return;
     }
     if (passwordByteLength(newPassword) > limits.maximum_password_bytes) {
-      setFormError(
-        t("web.settings.account.password.error.tooLong", {
-          maximum: limits.maximum_password_bytes,
-        }),
-      );
+      setFormError(`New password must be at most ${limits.maximum_password_bytes} bytes.`);
       return;
     }
 
@@ -72,53 +60,46 @@ export default function AccountSettings() {
       setConfirmPassword("");
       setSignOutOtherSessions(false);
       toast.success(
-        signOutOthers
-          ? t("web.settings.account.password.changedSignedOutOthers")
-          : t("web.settings.account.password.changed"),
+        signOutOthers ? "Password changed. Other devices are signed out." : "Password changed",
       );
     } catch (error) {
-      setFormError(v2ErrorText(error, t("web.settings.account.password.error.failed")));
+      setFormError(error instanceof Error ? error.message : "Failed to change password.");
     }
   }
 
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.account.title")}
-        subtitle={t("web.settings.account.subtitle")}
+        title="Account"
+        subtitle="Manage the sign-in credential shared by every profile on this account."
       />
 
       <SettingsGroup
-        title={t("web.settings.account.password.title")}
-        description={t("web.settings.account.password.description")}
+        title="Password"
+        description="Only the primary profile can change the shared account password. Your current password is required."
       >
         {capability.isLoading ? (
-          <div
-            className="max-w-md space-y-4"
-            role="status"
-            aria-label={t("web.settings.account.password.loading")}
-          >
+          <div className="max-w-md space-y-4" role="status" aria-label="Loading password settings">
             <Skeleton className="h-9 w-full" />
             <Skeleton className="h-9 w-full" />
             <Skeleton className="h-9 w-full" />
           </div>
         ) : capability.isError ? (
           <p className="text-destructive text-sm">
-            {t("web.settings.account.password.loadFailed")}
+            Password settings could not be loaded. Refresh the page to try again.
           </p>
         ) : !capability.data?.allowed ? (
           <div className="max-w-2xl space-y-1 text-sm">
-            <p className="font-medium">{t("web.settings.account.password.unavailableTitle")}</p>
+            <p className="font-medium">Local password changes are unavailable.</p>
             <p className="text-muted-foreground">
-              {t("web.settings.account.password.unavailableBody")}
+              This account signs in through an external provider, or the active profile does not own
+              the account credential.
             </p>
           </div>
         ) : (
           <form className="max-w-md space-y-4" onSubmit={(event) => void handleSubmit(event)}>
             <div className="space-y-2">
-              <Label htmlFor="account-current-password">
-                {t("web.settings.account.password.current")}
-              </Label>
+              <Label htmlFor="account-current-password">Current password</Label>
               <Input
                 id="account-current-password"
                 type="password"
@@ -130,7 +111,7 @@ export default function AccountSettings() {
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="account-new-password">{t("web.settings.account.password.new")}</Label>
+              <Label htmlFor="account-new-password">New password</Label>
               <Input
                 id="account-new-password"
                 type="password"
@@ -141,18 +122,13 @@ export default function AccountSettings() {
                 required
               />
               <p id="account-password-requirements" className="text-muted-foreground text-xs">
-                {t("web.settings.account.password.requirements", {
-                  minimum: capability.data.minimum_password_length,
-                  minimum_text: capability.data.minimum_password_length,
-                  maximum: capability.data.maximum_password_bytes,
-                })}
+                At least {capability.data.minimum_password_length} characters and no more than{" "}
+                {capability.data.maximum_password_bytes} bytes.
               </p>
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="account-confirm-password">
-                {t("web.settings.account.password.confirm")}
-              </Label>
+              <Label htmlFor="account-confirm-password">Confirm new password</Label>
               <Input
                 id="account-confirm-password"
                 type="password"
@@ -174,13 +150,14 @@ export default function AccountSettings() {
                 />
                 <div className="space-y-1">
                   <Label htmlFor="account-sign-out-other-sessions" className="font-normal">
-                    {t("web.settings.account.password.signOutOthers")}
+                    Sign out of other devices
                   </Label>
                   <p
                     id="account-sign-out-other-sessions-description"
                     className="text-muted-foreground text-xs"
                   >
-                    {t("web.settings.account.password.signOutOthersDescription")}
+                    Other browsers and apps must sign in again with the new password. This browser
+                    stays signed in, and API keys keep working.
                   </p>
                 </div>
               </div>
@@ -193,9 +170,7 @@ export default function AccountSettings() {
             ) : null}
 
             <Button type="submit" disabled={changePassword.isPending}>
-              {changePassword.isPending
-                ? t("web.settings.account.password.changing")
-                : t("web.settings.account.password.change")}
+              {changePassword.isPending ? "Changing…" : "Change password"}
             </Button>
           </form>
         )}

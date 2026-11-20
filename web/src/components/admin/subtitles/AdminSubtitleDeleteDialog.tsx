@@ -15,7 +15,6 @@ import {
   AlertDialogFooter,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { useT, type MessageKey } from "@/i18n";
 
 export type SubtitleDeleteTarget = { subtitle: AdminStoredSubtitle; scope: string };
 export default function AdminSubtitleDeleteDialog({
@@ -25,14 +24,12 @@ export default function AdminSubtitleDeleteDialog({
   target: SubtitleDeleteTarget | null;
   onClose: () => void;
 }) {
-  const t = useT();
   const queryClient = useQueryClient();
   const [ready, setReady] = useState<{
     target: SubtitleDeleteTarget;
     deletion: AdminSubtitleDeletion;
   } | null>(null);
-  // The failure, with the text to show when it carries none of its own.
-  const [error, setError] = useState<{ cause: unknown; fallback: MessageKey } | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [attempted, setAttempted] = useState(false);
   const generation = useRef(0);
   const [observedTarget, setObservedTarget] = useState(target);
@@ -52,7 +49,7 @@ export default function AdminSubtitleDeleteDialog({
         })
         .catch((err) => {
           if (generation.current === token)
-            setError({ cause: err, fallback: "web.admin.common.subtitles.delete.loadFailed" });
+            setError(err instanceof Error ? err.message : "Unable to load subtitle.");
         });
     return () => {
       generation.current = token + 1;
@@ -70,15 +67,13 @@ export default function AdminSubtitleDeleteDialog({
       void queryClient.invalidateQueries({
         queryKey: ["admin", "downloadedSubtitles", target.scope],
       });
-      toast.success(t("web.admin.common.subtitles.delete.deleted"));
+      toast.success("Subtitle metadata deleted");
       onClose();
     } catch (err) {
       if (generation.current === token && adminSubtitleListScope() === target.scope)
-        setError({ cause: err, fallback: "web.admin.common.subtitles.delete.confirmFailed" });
+        setError(err instanceof Error ? err.message : "Unable to confirm deletion.");
     }
   }
-  const errorText =
-    error && (error.cause instanceof Error ? error.cause.message : t(error.fallback));
   return (
     <AlertDialog
       open={target !== null}
@@ -88,31 +83,26 @@ export default function AdminSubtitleDeleteDialog({
     >
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>{t("web.admin.common.subtitles.delete.title")}</AlertDialogTitle>
+          <AlertDialogTitle>Delete subtitle?</AlertDialogTitle>
           <AlertDialogDescription>
             {active
-              ? t("web.admin.common.subtitles.delete.description", {
-                  language: active.subtitle.language.toUpperCase(),
-                  name: active.subtitle.release_name || active.subtitle.id,
-                })
-              : t("web.admin.common.subtitles.delete.loading")}
+              ? `Remove ${active.subtitle.language.toUpperCase()} subtitle “${active.subtitle.release_name || active.subtitle.id}”? Metadata is removed first; stored-file cleanup is best effort.`
+              : "Loading the current subtitle before confirmation…"}
           </AlertDialogDescription>
         </AlertDialogHeader>
-        {errorText && (
-          <p role="alert">
-            {t("web.admin.common.subtitles.delete.errorHint", { error: errorText })}
-          </p>
+        {error && (
+          <p role="alert">{error} Close and review the current subtitle before another attempt.</p>
         )}
         <AlertDialogFooter>
           <Button variant="outline" onClick={onClose}>
-            {t("web.admin.common.subtitles.delete.close")}
+            Close
           </Button>
           <Button
             variant="destructive"
-            disabled={!active || attempted || !!errorText}
+            disabled={!active || attempted || !!error}
             onClick={() => void confirm()}
           >
-            {t("web.admin.common.subtitles.delete.confirm")}
+            Delete
           </Button>
         </AlertDialogFooter>
       </AlertDialogContent>

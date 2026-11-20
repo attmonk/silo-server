@@ -5,7 +5,6 @@ import { userFromAccount } from "@/api/v2/account";
 import { v2, V2ProblemError } from "@/api/v2/request";
 import { useAuth } from "@/hooks/useAuth";
 import { sanitizeAuthRedirect } from "@/lib/authRedirect";
-import { useT } from "@/i18n";
 
 /**
  * A failed completion goes back to the login page with a reason= code the
@@ -19,7 +18,6 @@ function loginFailureHref(reason: string) {
 export default function OAuthComplete() {
   const navigate = useNavigate();
   const { completeLogin } = useAuth();
-  const t = useT();
   // The code is single use and leaves the address bar once read, so the
   // completion runs once; only leaving the page abandons it.
   const started = useRef(false);
@@ -80,7 +78,7 @@ export default function OAuthComplete() {
       <div
         className="border-primary h-8 w-8 animate-spin rounded-full border-b-2"
         role="status"
-        aria-label={t("web.auth.oauth.signingIn")}
+        aria-label="Signing in"
       />
     </div>
   );

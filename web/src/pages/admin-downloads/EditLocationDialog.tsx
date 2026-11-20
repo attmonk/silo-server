@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useId, useState } from "react";
 import { Link } from "react-router";
 import type {
   AdminDownloadStorage,
@@ -18,8 +18,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioCardItem, RadioGroup } from "@/components/ui/radio-group";
 import { useAdminNodes, useUpdateNode } from "@/hooks/queries/admin/nodes";
-import { useT } from "@/i18n";
-import { countValues, formatStorageBytes, preparedBytes } from "./downloadStoragePresentation";
+import { formatStorageBytes, preparedBytes } from "./downloadStoragePresentation";
 
 const BYTES_PER_GB = 1e9;
 
@@ -71,57 +70,44 @@ function ServerLocationInfo({
   storage: AdminDownloadStorage;
   onClose: () => void;
 }) {
-  const t = useT();
   return (
     <>
       <DialogHeader>
-        <DialogTitle>{t("web.admin.downloads.location.serverTitle")}</DialogTitle>
-        <DialogDescription>{t("web.admin.downloads.location.serverDescription")}</DialogDescription>
+        <DialogTitle>Edit location · Server</DialogTitle>
+        <DialogDescription>
+          The server's prepared-file directory and the default budget are server settings.
+        </DialogDescription>
       </DialogHeader>
       <dl className="space-y-3 text-sm">
         <div>
-          <dt className="text-muted-foreground text-xs">
-            {t("web.admin.downloads.location.directory")}
-          </dt>
+          <dt className="text-muted-foreground text-xs">Prepared file directory</dt>
           <dd className="font-mono text-xs break-all">{location.dir}</dd>
         </div>
         <div>
           <dt className="text-muted-foreground text-xs">
-            {t("web.admin.downloads.location.defaultBudget")}
+            Storage budget at every location without its own
           </dt>
           <dd>
             {storage.default_budget_bytes > 0
               ? formatStorageBytes(storage.default_budget_bytes)
-              : t("web.admin.downloads.location.noBudget")}
+              : "No budget"}
           </dd>
         </div>
         <div>
-          <dt className="text-muted-foreground text-xs">
-            {t("web.admin.downloads.location.keepCached")}
-          </dt>
-          <dd>
-            {t("web.admin.downloads.location.keepCachedValue", countValues(storage.cache_hours))}
-          </dd>
+          <dt className="text-muted-foreground text-xs">Keep cached files for</dt>
+          <dd>{storage.cache_hours} hours after their last use</dd>
         </div>
         <div>
-          <dt className="text-muted-foreground text-xs">
-            {t("web.admin.downloads.location.diskCeiling")}
-          </dt>
-          <dd>
-            {t("web.admin.downloads.location.percent", {
-              percent: storage.disk_ceiling_percent,
-            })}
-          </dd>
+          <dt className="text-muted-foreground text-xs">Disk ceiling</dt>
+          <dd>{storage.disk_ceiling_percent}%</dd>
         </div>
       </dl>
       <DialogFooter>
         <Button variant="ghost" onClick={onClose}>
-          {t("web.admin.downloads.location.close")}
+          Close
         </Button>
         <Button asChild>
-          <Link to="/admin/settings/downloads">
-            {t("web.admin.downloads.location.openSettings")}
-          </Link>
+          <Link to="/admin/settings/downloads">Open Downloads settings</Link>
         </Button>
       </DialogFooter>
     </>
@@ -150,25 +136,22 @@ function NodeLocationForm({
   storage: AdminDownloadStorage;
   onClose: () => void;
 }) {
-  const t = useT();
   const nodes = useAdminNodes();
   const node = nodes.data?.find((n) => String(n.id) === location.node_id);
   if (!node) {
     return (
       <>
         <DialogHeader>
-          <DialogTitle>
-            {t("web.admin.downloads.location.nodeTitle", { name: location.name })}
-          </DialogTitle>
+          <DialogTitle>Edit location · {location.name}</DialogTitle>
           <DialogDescription>
             {nodes.isLoading
-              ? t("web.admin.downloads.location.loadingNode")
-              : t("web.admin.downloads.location.nodeError")}
+              ? "Loading the node…"
+              : "This node could not be read. Reload and try again."}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>
-            {t("web.admin.downloads.location.close")}
+            Close
           </Button>
         </DialogFooter>
       </>
@@ -196,7 +179,6 @@ function NodeLocationFields({
   storage: AdminDownloadStorage;
   onClose: () => void;
 }) {
-  const t = useT();
   const update = useUpdateNode();
   const dirId = useId();
   const budgetId = useId();
@@ -210,12 +192,11 @@ function NodeLocationFields({
   );
 
   const trimmed = dir.trim();
-  const dirError =
-    trimmed !== "" && !trimmed.startsWith("/") ? t("web.admin.downloads.location.dirError") : null;
+  const dirError = trimmed !== "" && !trimmed.startsWith("/") ? "Use an absolute path." : null;
   const gbValue = Number(gb);
   const gbError =
     mode === "custom" && (!gb.trim() || !Number.isFinite(gbValue) || gbValue <= 0)
-      ? t("web.admin.downloads.location.gbError")
+      ? "Enter a budget in GB."
       : null;
   const dirChanged = trimmed !== currentDir;
   // A blank override inherits download.artifact_dir when it is set, which the
@@ -224,14 +205,6 @@ function NodeLocationFields({
   const clusterDir = server?.dir_source === "setting" ? server.dir : undefined;
   const indexed = preparedBytes(location);
   const stored = location.usage ? location.usage.bytes : indexed;
-  const code = (chunks: ReactNode[]) => <code className="font-mono">{chunks}</code>;
-  const dirChange = {
-    stored: formatStorageBytes(stored),
-    in_use: formatStorageBytes(location.in_use_bytes),
-    cached: formatStorageBytes(location.cached_bytes),
-    name: location.name,
-    b: (chunks: ReactNode[]) => <strong>{chunks}</strong>,
-  };
 
   function save() {
     if (dirError || gbError) return;
@@ -250,47 +223,56 @@ function NodeLocationFields({
   return (
     <>
       <DialogHeader>
-        <DialogTitle>
-          {t("web.admin.downloads.location.nodeTitle", { name: location.name })}
-        </DialogTitle>
-        <DialogDescription>{t("web.admin.downloads.location.nodeDescription")}</DialogDescription>
+        <DialogTitle>Edit location · {location.name}</DialogTitle>
+        <DialogDescription>
+          Where this node keeps prepared download files, and how much it may keep.
+        </DialogDescription>
       </DialogHeader>
       <div className="space-y-5">
         <div className="space-y-2">
-          <Label htmlFor={dirId}>{t("web.admin.downloads.location.directory")}</Label>
+          <Label htmlFor={dirId}>Prepared file directory</Label>
           <Input
             id={dirId}
             value={dir}
             onChange={(event) => setDir(event.target.value)}
-            placeholder={clusterDir ?? t("web.admin.downloads.location.dirPlaceholder")}
+            placeholder={clusterDir ?? "download-artifacts inside the transcode directory"}
             className="font-mono text-xs"
             aria-invalid={dirError ? true : undefined}
           />
           {dirError ? <p className="text-destructive text-xs">{dirError}</p> : null}
           <p className="text-muted-foreground text-xs">
-            {clusterDir
-              ? t("web.admin.downloads.location.dirHelpCluster", { dir: clusterDir, code })
-              : t("web.admin.downloads.location.dirHelpDefault", { code })}
+            {clusterDir ? (
+              <>
+                Leave blank to use <code className="font-mono">{clusterDir}</code>, the directory in
+                Settings → Downloads; it must exist on this node.
+              </>
+            ) : (
+              <>
+                Leave blank to use <code className="font-mono">download-artifacts</code> inside this
+                node's transcode directory.
+              </>
+            )}{" "}
+            A separate disk keeps downloads from competing with live transcodes.
           </p>
           {location.usage?.shares_scratch && !dirChanged ? (
             <p className="text-warning text-xs">
-              {t("web.admin.downloads.location.sharesScratch")}
+              The current directory is on the same disk as transcode scratch.
             </p>
           ) : null}
         </div>
         {dirChanged ? (
           <div className="border-warning/30 bg-warning/8 rounded-xl border p-3 text-xs" role="note">
-            {location.dir
-              ? t("web.admin.downloads.location.dirChangeWithDir", {
-                  ...dirChange,
-                  dir: location.dir,
-                  code,
-                })
-              : t("web.admin.downloads.location.dirChangeNoDir", dirChange)}
+            Changing the directory doesn't move files. Of the {formatStorageBytes(stored)} here,{" "}
+            <strong>{formatStorageBytes(location.in_use_bytes)} in use</strong> is prepared again in
+            the new directory and{" "}
+            <strong>{formatStorageBytes(location.cached_bytes)} cached</strong> is dropped. Old
+            files stay in{" "}
+            {location.dir ? <code className="font-mono">{location.dir}</code> : "the old directory"}{" "}
+            until you delete them. {location.name} picks up the change when it restarts.
           </div>
         ) : null}
         <div className="space-y-2">
-          <Label id={budgetId}>{t("web.admin.downloads.location.budget")}</Label>
+          <Label id={budgetId}>Storage budget</Label>
           <RadioGroup
             aria-labelledby={budgetId}
             value={mode}
@@ -299,57 +281,49 @@ function NodeLocationFields({
           >
             <RadioCardItem
               value="default"
-              label={t("web.admin.downloads.location.budgetDefault")}
+              label="Default"
               hint={
                 storage.default_budget_bytes > 0
                   ? formatStorageBytes(storage.default_budget_bytes)
-                  : t("web.admin.downloads.location.noBudget")
+                  : "No budget"
               }
             />
-            <RadioCardItem value="custom" label={t("web.admin.downloads.location.budgetCustom")} />
-            <RadioCardItem
-              value="none"
-              label={t("web.admin.downloads.location.budgetNone")}
-              hint={t("web.admin.downloads.location.budgetNoneHint")}
-            />
+            <RadioCardItem value="custom" label="Custom" />
+            <RadioCardItem value="none" label="None" hint="Disk ceiling only" />
           </RadioGroup>
           {mode === "custom" ? (
             <div className="flex items-center gap-2">
               <Input
-                aria-label={t("web.admin.downloads.location.budgetInput")}
+                aria-label="Budget in GB"
                 inputMode="decimal"
                 value={gb}
                 onChange={(event) => setGb(event.target.value)}
                 className="w-32"
                 aria-invalid={gbError ? true : undefined}
               />
-              <span className="text-muted-foreground text-sm">
-                {t("web.admin.downloads.location.gb")}
-              </span>
+              <span className="text-muted-foreground text-sm">GB</span>
             </div>
           ) : null}
           {gbError ? <p className="text-destructive text-xs">{gbError}</p> : null}
           <p className="text-muted-foreground text-xs">
-            {t("web.admin.downloads.location.budgetHelp", { size: formatStorageBytes(indexed) })}
+            {formatStorageBytes(indexed)} stored now. Over budget, Silo deletes cached files early,
+            least recently used first. Files a device is still waiting on stay.
           </p>
         </div>
         <p className="text-muted-foreground text-xs">
-          {t("web.admin.downloads.location.ceilingNote", {
-            percent: storage.disk_ceiling_percent,
-            link: (chunks) => (
-              <Link to="/admin/settings/downloads" className="underline underline-offset-3">
-                {chunks}
-              </Link>
-            ),
-          })}
+          Disk ceiling: {storage.disk_ceiling_percent}%, set for all locations in{" "}
+          <Link to="/admin/settings/downloads" className="underline underline-offset-3">
+            Settings → Downloads
+          </Link>
+          .
         </p>
       </div>
       <DialogFooter>
         <Button variant="ghost" onClick={onClose}>
-          {t("common.cancel")}
+          Cancel
         </Button>
         <Button onClick={save} disabled={!!dirError || !!gbError || update.isPending}>
-          {update.isPending ? t("web.admin.downloads.location.saving") : t("common.save")}
+          {update.isPending ? "Saving…" : "Save"}
         </Button>
       </DialogFooter>
     </>

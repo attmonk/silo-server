@@ -7,7 +7,6 @@ import {
 import type { GroupSortMode } from "@/api/types";
 import { requiredETag } from "@/api/v2/etag";
 import { v2 } from "@/api/v2/request";
-import { t } from "@/i18n";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { invalidateAdminCollectionQueries } from "../collectionSurfaceRefresh";
@@ -72,8 +71,7 @@ export function useCreateCollectionGroup(libraryId: number) {
         path: { library_id: String(libraryId) },
         body: input,
       }).then(adminGroupFromV2),
-    onError: (e) =>
-      toast.error(adminMutationMessage(e, t("web.admin.collections.shelves.addFailed"))),
+    onError: (e) => toast.error(adminMutationMessage(e, "Couldn't add the shelf")),
     // Returned, so the caller's mutateAsync settles once the shelves are read again.
     onSettled: () => invalidateAdminCollectionQueries(queryClient),
   });
@@ -97,8 +95,7 @@ export function useUpdateCollectionGroup() {
         headers: { "If-Match": requiredETag(etag) },
         body: patch,
       }).then(adminGroupFromV2),
-    onError: (e) =>
-      toast.error(adminMutationMessage(e, t("web.admin.collections.shelves.changeFailed"))),
+    onError: (e) => toast.error(adminMutationMessage(e, "Couldn't change the shelf")),
     onSettled: () => invalidateAdminCollectionQueries(queryClient),
   });
 }
@@ -112,8 +109,7 @@ export function useDeleteCollectionGroup() {
         path: { id },
         headers: { "If-Match": requiredETag(etag) },
       }),
-    onError: (e) =>
-      toast.error(adminMutationMessage(e, t("web.admin.collections.shelves.deleteFailed"))),
+    onError: (e) => toast.error(adminMutationMessage(e, "Couldn't delete the shelf")),
     onSettled: () => invalidateAdminCollectionQueries(queryClient),
   });
 }

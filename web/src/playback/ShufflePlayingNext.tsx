@@ -5,11 +5,9 @@ import { V2ProblemError } from "@/api/v2/request";
 import { advanceShuffle, deleteShuffle, skipShuffleItem, type Shuffle } from "@/api/v2/shuffles";
 import type { ContinueWatchingItem } from "@/hooks/queries/progress";
 import { shuffleKeys } from "@/hooks/queries/keys";
-import { useT, type Translate } from "@/i18n";
 import { useShuffle } from "@/hooks/queries/shuffles";
 import type { WatchRouteRequest } from "@/pages/watchRouteHelpers";
 import { PlayingNextScreen } from "@/player/components/PlayingNextScreen";
-import { recordAutoAdvance } from "@/player/stillWatching";
 import type { PlaybackStartTrigger } from "@/player/types";
 import { shuffleNextEpisodeRef } from "./shuffleNextEpisodeRef";
 import { useWatchPlaybackController } from "./watchPlaybackContext";
@@ -39,7 +37,6 @@ export default function ShufflePlayingNext({
   onPlayItem,
   onClose,
 }: ShufflePlayingNextProps) {
-  const t = useT();
   const queryClient = useQueryClient();
   const controller = useWatchPlaybackController();
   const shuffleQuery = useShuffle(shuffleId);
@@ -88,7 +85,6 @@ export default function ShufflePlayingNext({
         const advanced = await advanceShuffle(shuffleId, request.contentId);
         queryClient.setQueryData(shuffleKeys.detail(shuffleId), advanced);
         if (leftRef.current) return;
-        if (trigger === "automatic") recordAutoAdvance();
         controller.startPlayback(
           {
             contentId: advanced.current.content_id,
@@ -100,10 +96,10 @@ export default function ShufflePlayingNext({
           trigger,
         );
       } catch {
-        if (!leftRef.current) toast.error(t("upNext.shuffleContinueFailed"));
+        if (!leftRef.current) toast.error("Couldn't continue the shuffle.");
       }
     },
-    [controller, queryClient, request.contentId, request.returnHref, shuffleId, t],
+    [controller, queryClient, request.contentId, request.returnHref, shuffleId],
   );
 
   const handlePickAnother = useCallback(async () => {
@@ -112,9 +108,9 @@ export default function ShufflePlayingNext({
       const skipped = await skipShuffleItem(shuffleId, shuffle.next.content_id);
       queryClient.setQueryData(shuffleKeys.detail(shuffleId), skipped);
     } catch {
-      toast.error(t("upNext.pickAnotherFailed"));
+      toast.error("Couldn't pick another.");
     }
-  }, [queryClient, shuffle, shuffleId, t]);
+  }, [queryClient, shuffle, shuffleId]);
 
   const handleStop = useCallback(() => {
     void deleteShuffle(shuffleId).catch(() => undefined);
@@ -135,7 +131,7 @@ export default function ShufflePlayingNext({
       shuffle={
         shuffle
           ? {
-              scopeLabel: shuffleScopeLabel(shuffle, t),
+              scopeLabel: shuffleScopeLabel(shuffle),
               onStop: handleStop,
               onReshuffle: () => void handlePickAnother(),
             }
@@ -151,9 +147,7 @@ function shuffleNextHeading(shuffle: Shuffle): string {
 }
 
 /** Names what the shuffle draws from: "Movies", "Breaking Bad · Season 2". */
-function shuffleScopeLabel(shuffle: Shuffle, t: Translate): string {
+function shuffleScopeLabel(shuffle: Shuffle): string {
   const { title, parent_title: parentTitle } = shuffle.scope;
-  return parentTitle
-    ? t("web.player.shuffle.scopeWithParent", { parent: parentTitle, title })
-    : title;
+  return parentTitle ? `${parentTitle} · ${title}` : title;
 }

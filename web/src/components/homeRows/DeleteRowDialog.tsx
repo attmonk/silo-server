@@ -7,7 +7,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useT } from "@/i18n";
 
 /**
  * Confirms deleting one row for everyone. The row was read (with its version)
@@ -39,34 +38,34 @@ export function DeleteRowDialog({
   onOpenChange: (open: boolean) => void;
   onCloseAutoFocus?: (event: Event) => void;
 }) {
-  const t = useT();
   return (
     <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
       <DialogContent onCloseAutoFocus={onCloseAutoFocus}>
         <DialogHeader>
-          <DialogTitle>{t("web.home.rows.deleteTitle", { row: rowTitle })}</DialogTitle>
+          <DialogTitle>Delete {rowTitle}?</DialogTitle>
           <DialogDescription>
-            {description ?? t("web.home.rows.delete.description", { page: pageLabel })}
+            {description ??
+              `The row goes away from ${pageLabel} for everyone. If Silo made a collection just for this row, it removes that collection too when nothing else uses it.`}
           </DialogDescription>
         </DialogHeader>
         {conflict ? (
           <p role="alert" className="text-sm">
-            {t("web.home.rows.delete.conflict")}
+            This row changed since you opened it. Reload it before deleting.
           </p>
         ) : null}
         <DialogFooter className="items-center sm:justify-between">
-          <p className="text-muted-foreground text-sm">{t("web.home.rows.cantUndo")}</p>
+          <p className="text-muted-foreground text-sm">This can&apos;t be undone.</p>
           <div className="flex gap-2">
             <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
-              {t("common.cancel")}
+              Cancel
             </Button>
             {conflict ? (
               <Button disabled={busy} onClick={onReload}>
-                {t("web.home.rows.delete.reloadRow")}
+                Reload row
               </Button>
             ) : (
               <Button variant="destructive" disabled={busy || !canConfirm} onClick={onConfirm}>
-                {t("web.home.rows.deleteRow")}
+                Delete row
               </Button>
             )}
           </div>
@@ -98,24 +97,26 @@ export function DeleteRowsDialog({
   onConfirm: () => void;
   onOpenChange: (open: boolean) => void;
 }) {
-  const t = useT();
+  const rows = count === 1 ? "1 row" : `${count} rows`;
   return (
     <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{t("web.home.rows.deleteMany.title", { count })}</DialogTitle>
+          <DialogTitle>Delete {rows}?</DialogTitle>
           <DialogDescription>
-            {t("web.home.rows.deleteMany.description", { count, page: pageLabel })}
+            {count === 1 ? "The row goes" : "The rows go"} away from {pageLabel} for everyone. If
+            Silo made a collection just for one of them, it removes that collection too when nothing
+            else uses it.
           </DialogDescription>
         </DialogHeader>
         <DialogFooter className="items-center sm:justify-between">
-          <p className="text-muted-foreground text-sm">{t("web.home.rows.cantUndo")}</p>
+          <p className="text-muted-foreground text-sm">This can&apos;t be undone.</p>
           <div className="flex gap-2">
             <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
-              {t("common.cancel")}
+              Cancel
             </Button>
             <Button variant="destructive" disabled={busy} onClick={onConfirm}>
-              {busy && progress ? progress : t("web.home.rows.deleteMany.confirm", { count })}
+              {busy && progress ? progress : `Delete ${rows}`}
             </Button>
           </div>
         </DialogFooter>

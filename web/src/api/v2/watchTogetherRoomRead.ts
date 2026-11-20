@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import type { components } from "./schema";
 import {
   captureProfileRequestContext,
@@ -11,7 +10,7 @@ import { v2 } from "./request";
 function numericID(value: string): number {
   const id = Number(value);
   if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(id))
-    throw new Error(t("web.common.errors.roomIdentityInvalid"));
+    throw new Error("Invalid room identity.");
   return id;
 }
 export async function readRoom(
@@ -53,7 +52,7 @@ export function normalizeRoomResponse(
     !Number.isFinite(Date.parse(room.anchor_updated_at)) ||
     (room.selected_content_id !== undefined && typeof room.selected_content_id !== "string")
   )
-    throw new Error(t("web.common.errors.roomSnapshotInvalid"));
+    throw new Error("Invalid room snapshot.");
   return {
     room_access_token: result.room_access_token,
     room: {

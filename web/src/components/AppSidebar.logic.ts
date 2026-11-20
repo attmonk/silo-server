@@ -4,10 +4,8 @@ export function isSidebarExpanded(collapsed: boolean, hovered: boolean, profileM
   return !collapsed || hovered || profileMenuOpen;
 }
 
-/** Beside the collapsed rail, toward the content (Radix sides are physical). */
-export function getProfileMenuSide(collapsed: boolean, dir: "ltr" | "rtl") {
-  if (!collapsed) return "top";
-  return dir === "rtl" ? "left" : "right";
+export function getProfileMenuSide(collapsed: boolean) {
+  return collapsed ? "right" : "top";
 }
 
 /** Visible width of the collapsed rail, in px. */
@@ -26,6 +24,20 @@ export const SIDEBAR_SURFACE_WIDTH = 260;
  */
 export function isSidebarRailCollapsed(collapsed: boolean, sidebarExpanded: boolean) {
   return collapsed && !sidebarExpanded;
+}
+
+/**
+ * How far a library row slides left once the surface is clipped to the rail, so
+ * its icon lines up with the rest of the icon column.
+ *
+ * The slot reserved ahead of the icon is a chevron button when the library has
+ * pins — 12px padding + a 14px glyph + 4px = 30px — and a 12px border-box
+ * spacer otherwise (`w-3` includes its own `pl-3` under Tailwind's preflight).
+ * Every other nav row starts its icon 12px into the row, so only the chevron
+ * case is out of line; the spacer already matches and must not be shifted.
+ */
+export function libraryRowShift(hasPins: boolean) {
+  return hasPins ? "-18px" : "0px";
 }
 
 /**
@@ -56,18 +68,12 @@ export interface AppNavLink {
 }
 
 export interface AppNavGroup {
-  /**
-   * The manifest's first category segment, or {@link UNCATEGORIZED_APP_GROUP}
-   * for uncategorized plugins (the sidebar shows that one translated).
-   */
+  /** Display label for the group ("Other" for uncategorized plugins). */
   category: string;
   links: AppNavLink[];
 }
 
-/**
- * Group key for plugins whose manifest declares no category. The sidebar
- * renders it as the catalog's "Other" (`web.shell.sidebar.otherApps`).
- */
+/** Group label for plugins whose manifest declares no category. */
 export const UNCATEGORIZED_APP_GROUP = "Other";
 
 /**

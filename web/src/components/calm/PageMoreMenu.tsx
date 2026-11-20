@@ -9,7 +9,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 interface PageMoreMenuEntry {
@@ -117,7 +116,7 @@ function SwitchLook({ checked }: { checked: boolean }) {
     >
       <span
         data-state={state}
-        className="bg-foreground data-[state=checked]:bg-primary-foreground block size-4 rounded-full transition-transform data-[state=checked]:translate-x-[calc(100%-2px)] rtl:data-[state=checked]:-translate-x-[calc(100%-2px)]"
+        className="bg-foreground data-[state=checked]:bg-primary-foreground block size-4 rounded-full transition-transform data-[state=checked]:translate-x-[calc(100%-2px)]"
       />
     </span>
   );
@@ -173,7 +172,6 @@ export function PageMoreMenu({
   triggerRef?: Ref<HTMLButtonElement>;
   onOpenChange?: (open: boolean) => void;
 }) {
-  const t = useT();
   const afterClose = useRef<AfterClose | null>(null);
   const onChosen = (after: AfterClose | null) => {
     afterClose.current = after;
@@ -186,14 +184,14 @@ export function PageMoreMenu({
           type="button"
           variant="outline"
           size={compact ? "icon" : "sm"}
-          aria-label={compact ? t("web.ui.pageMoreMenu.more") : undefined}
+          aria-label={compact ? "More" : undefined}
           className={cn(
             "data-[state=open]:bg-accent",
             compact && "bg-surface/90 size-12 rounded-[14px]",
           )}
         >
           <Ellipsis className={compact ? "size-5" : undefined} />
-          {compact ? null : t("web.ui.pageMoreMenu.more")}
+          {compact ? null : "More"}
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent

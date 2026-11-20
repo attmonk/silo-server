@@ -83,9 +83,7 @@ func writePlaybackSessionEnded(w http.ResponseWriter) {
 }
 
 func writePlaybackSessionEndedError(w http.ResponseWriter, err error) bool {
-	// A session whose keyframe playlist can't be rebuilt is over too: no
-	// rebuild can serve the playlist its player holds.
-	if !errors.Is(err, errPlaybackSessionEnded) && !errors.Is(err, playback.ErrKeyframePlanChanged) {
+	if !errors.Is(err, errPlaybackSessionEnded) {
 		return false
 	}
 	writePlaybackSessionEnded(w)

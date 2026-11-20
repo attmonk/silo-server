@@ -1,5 +1,4 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { joinList } from "@/lib/appLocale";
 import { Plus, Trash2 } from "lucide-react";
 import { Link } from "react-router";
 
@@ -59,7 +58,6 @@ import {
   useRequestRouting,
   useUpdateRequestIntegration,
 } from "@/hooks/queries/admin/requests";
-import { useT, type Translate } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 import { FieldGroup } from "./FieldGroup";
@@ -68,6 +66,7 @@ import { supportedMediaTypesForConfig } from "./requestIntegrationMediaTypes";
 import {
   installationOptionLabel,
   installationOptionValue,
+  mediaTypePlural,
   ROUTING_OWNED_CONFIG_KEYS,
   serverConfigSchema,
   serverInstallation,
@@ -90,14 +89,15 @@ const KIND_TILE_CLASSES: Record<string, string> = {
   sonarr: "bg-sky-500/20 text-sky-700 dark:text-sky-300",
 };
 
-/** An example address for the URL field. */
-const URL_PLACEHOLDER = "http://192.168.1.10:8989";
-
 /** The plugin config key that marks a server as the 4K one. */
 const FOUR_K_KEY = "is_4k";
 
 /** The plugin's per-kind default switches, which routing replaced. */
 const RETIRED_DEFAULT_KEYS = ["is_default", "is_default_4k"] as const;
+
+function plural(count: number, word: string) {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
 
 /**
  * The service the plugin found at the address, e.g. Sonarr 4.0.14. Plugins
@@ -112,33 +112,16 @@ function detectedService(options: RequestIntegrationOptions) {
  * The Test result in words. Sonarr and Radarr answer with their quality
  * profiles and root folders; another plugin's options are just counted.
  */
-function connectedMessage(t: Translate, options: RequestIntegrationOptions): string {
+function connectedMessage(options: RequestIntegrationOptions): string {
   const profiles = options.quality_profile_id?.length;
   const folders = options.root_folder?.length;
   const parts = [
-    profiles !== undefined
-      ? t("web.admin.settings.requests.serverEditor.qualityProfiles", {
-          count: profiles,
-          count_text: profiles,
-        })
-      : null,
-    folders !== undefined
-      ? t("web.admin.settings.requests.serverEditor.rootFolders", {
-          count: folders,
-          count_text: folders,
-        })
-      : null,
-  ].filter((part): part is string => Boolean(part));
+    profiles !== undefined ? plural(profiles, "quality profile") : null,
+    folders !== undefined ? plural(folders, "root folder") : null,
+  ].filter(Boolean);
   const detected = detectedService(options);
-  const lead = detected
-    ? t("web.admin.settings.requests.serverEditor.testDetected", { service: detected.label })
-    : t("web.admin.settings.requests.serverEditor.testConnected");
-  return parts.length > 0
-    ? t("web.admin.settings.requests.serverEditor.testResult", {
-        result: lead,
-        details: joinList(parts),
-      })
-    : lead;
+  const lead = detected ? `Detected ${detected.label}` : "Connected";
+  return parts.length > 0 ? `${lead} — ${parts.join(", ")}` : lead;
 }
 
 /**
@@ -178,7 +161,6 @@ function ServerTile({
   routing: RequestRouting | undefined;
   onEdit: () => void;
 }) {
-  const t = useT();
   const type = serverTypeLabel(server, installations);
   const ready = serverReady(server, installations);
   const usage =
@@ -197,16 +179,10 @@ function ServerTile({
       }
       state={failing ? "error" : ready ? "connected" : "not_connected"}
       statePill={
-        !server.enabled
-          ? t("web.admin.settings.requests.servers.disabled")
-          : !ready
-            ? t("web.admin.settings.requests.servers.needsSetup")
-            : failing
-              ? t("web.admin.settings.requests.servers.unreachable")
-              : undefined
+        !server.enabled ? "Disabled" : !ready ? "Needs setup" : failing ? "Unreachable" : undefined
       }
       meta={failing ? server.last_check_error : usage || undefined}
-      primaryAction={{ label: t("web.admin.settings.requests.shared.edit"), onClick: onEdit }}
+      primaryAction={{ label: "Edit", onClick: onEdit }}
     />
   );
 }
@@ -233,7 +209,6 @@ export function RequestServersGroup({
   /** Whether the server offers routing; without it the routing mode is not read. */
   routing: boolean;
 }) {
-  const t = useT();
   // null: closed; "new": adding; otherwise the id of the server being edited.
   const [editing, setEditing] = useState<string | null>(null);
   const [newKey, setNewKey] = useState(0);
@@ -244,8 +219,8 @@ export function RequestServersGroup({
 
   return (
     <FieldGroup
-      label={t("web.admin.settings.requests.servers.label")}
-      description={t("web.admin.settings.requests.servers.description")}
+      label="Servers"
+      description="Where approved requests are sent."
       actions={
         <Button
           type="button"
@@ -258,7 +233,7 @@ export function RequestServersGroup({
           disabled={noRouterPlugin || installationsLoading}
         >
           <Plus aria-hidden="true" />
-          {t("web.admin.settings.requests.servers.addServer")}
+          Add server
         </Button>
       }
     >
@@ -269,22 +244,20 @@ export function RequestServersGroup({
             <Skeleton className="h-28 rounded-2xl" />
           </ProviderTileGrid>
         ) : serversError ? (
-          <p className="text-destructive text-sm">
-            {t("web.admin.settings.requests.servers.loadFailed")}
-          </p>
+          <p className="text-destructive text-sm">Request servers could not be loaded.</p>
         ) : noRouterPlugin ? (
           <p className="text-muted-foreground text-sm">
-            {t("web.admin.settings.requests.servers.noPlugin", {
-              link: (chunks) => (
-                <Link to="/admin/plugins" className="text-foreground underline underline-offset-2">
-                  {chunks}
-                </Link>
-              ),
-            })}
+            Requests go to Sonarr, Radarr, or another request server through a plugin. Install one
+            from{" "}
+            <Link to="/admin/plugins" className="text-foreground underline underline-offset-2">
+              Plugins
+            </Link>{" "}
+            first.
           </p>
         ) : servers.length === 0 ? (
           <p className="text-muted-foreground text-sm">
-            {t("web.admin.settings.requests.servers.empty")}
+            No servers yet. Without one, approved requests wait until the title shows up in a
+            library.
           </p>
         ) : (
           <ProviderTileGrid>
@@ -509,7 +482,6 @@ export function RequestServerEditor({
   standard: boolean;
   onDone: () => void;
 }) {
-  const t = useT();
   const sole = installations.length === 1 ? installations[0] : undefined;
   const [form, setForm] = useState<ServerFormState>(() => serverForm(source, sole));
   const [pluginConfig, setPluginConfig] = useState<Record<string, unknown>>(() => ({
@@ -540,7 +512,7 @@ export function RequestServerEditor({
   // Nor does it let a routed server change type (Sonarr ↔ Radarr): the routes
   // pointing at it are for one media type.
   const typeLock = routedBy
-    ? t("web.admin.settings.requests.serverEditor.typeLocked", { routes: routedBy })
+    ? `Routing sends requests here (${routedBy}). Change that first to switch the type.`
     : undefined;
   const deleteBlockedId = useId();
   const createServer = useCreateRequestIntegration();
@@ -562,7 +534,13 @@ export function RequestServerEditor({
   const needsBaseURL = serverNeedsBaseURL(selected);
   const needsAPIKey = serverNeedsAPIKey(selected);
   const connectionFields =
-    needsBaseURL && needsAPIKey ? "both" : needsBaseURL ? "url" : needsAPIKey ? "key" : "none";
+    needsBaseURL && needsAPIKey
+      ? "the URL and API key"
+      : needsBaseURL
+        ? "the URL"
+        : needsAPIKey
+          ? "the API key"
+          : "the server's settings";
   const fieldTypes = useMemo(() => parseFieldTypes(jsonSchema), [jsonSchema]);
   // The Sonarr/Radarr plugin's "4K instance" switch. Routing owns the
   // plugin's other default switches, so the editor shows this one itself.
@@ -622,11 +600,7 @@ export function RequestServerEditor({
   const currentKind = serverKind({ plugin_config: pluginConfig });
   const kindMismatch =
     detectsKind && typeLock !== undefined && currentKind !== "" && currentKind !== detectedKind
-      ? t("web.admin.settings.requests.serverEditor.kindMismatch", {
-          detected: detected?.label ?? "",
-          current: serviceKindLabel(currentKind) || currentKind,
-          lock: typeLock,
-        })
+      ? `This address answers as ${detected?.label}, not ${serviceKindLabel(currentKind) || currentKind}. ${typeLock}`
       : undefined;
   // The name detection last filled in: a later detection may replace it, but
   // never a name the admin typed.
@@ -690,11 +664,7 @@ export function RequestServerEditor({
       setConflict(false);
       clearSaveErrors();
     } catch (error) {
-      setFormError(
-        error instanceof Error
-          ? error.message
-          : t("web.admin.settings.requests.shared.reloadFailed"),
-      );
+      setFormError(error instanceof Error ? error.message : "Reload failed");
     }
   }
 
@@ -703,7 +673,7 @@ export function RequestServerEditor({
     try {
       const loaded = await probe();
       // A stale answer says nothing about the connection now in the form.
-      if (loaded) setTest({ ok: true, message: connectedMessage(t, loaded) });
+      if (loaded) setTest({ ok: true, message: connectedMessage(loaded) });
     } catch (error) {
       const problem = probeProblem(error);
       setTest({
@@ -711,10 +681,10 @@ export function RequestServerEditor({
         message:
           problem.message ??
           (Object.keys(problem.fields).length > 0
-            ? t("web.admin.settings.requests.serverEditor.testCheckFields")
+            ? "Check the fields marked above."
             : error instanceof Error
               ? error.message
-              : t("web.admin.settings.requests.serverEditor.testUnreachable")),
+              : "The server could not be reached."),
       });
     } finally {
       setTesting(false);
@@ -772,11 +742,7 @@ export function RequestServerEditor({
     });
   }
 
-  const title = isNew
-    ? t("web.admin.settings.requests.serverEditor.addTitle")
-    : source?.name
-      ? t("web.admin.settings.requests.serverEditor.editTitle", { server: source.name })
-      : t("web.admin.settings.requests.serverEditor.editUnnamedTitle");
+  const title = isNew ? "Add server" : `Edit ${source?.name || "server"}`;
   const typeLabel = selected ? installationOptionLabel(selected) : "";
   // Errors for a field the editor does not show (a hidden routing key the
   // plugin still validated, or the server type when there is only one) are
@@ -791,10 +757,6 @@ export function RequestServerEditor({
       .filter((key) => !ROUTING_OWNED_CONFIG_KEYS.includes(key) || key === FOUR_K_KEY),
   ]);
   const unshownErrors = Object.entries(fieldErrors).filter(([key]) => !shownKeys.has(key));
-  // A refusal with one field error carries that error as its message too; skip
-  // the message when this box already shows the same text.
-  const formSummary =
-    formError && !unshownErrors.some(([, detail]) => detail === formError) ? formError : null;
   const urlError = fieldErrors.base_url ?? probeError?.fields.base_url;
   const keyError = fieldErrors.api_key_ref ?? probeError?.fields.api_key_ref;
 
@@ -803,16 +765,16 @@ export function RequestServerEditor({
       <DialogHeader>
         <DialogTitle>{title}</DialogTitle>
         <DialogDescription>
-          {t("web.admin.settings.requests.serverEditor.description")}
+          Approved requests are sent here. Routing decides which requests.
         </DialogDescription>
       </DialogHeader>
 
-      {formSummary || unshownErrors.length > 0 ? (
+      {formError || unshownErrors.length > 0 ? (
         <div
           role="alert"
           className="border-destructive/40 bg-destructive/10 text-destructive space-y-1 rounded-md border px-3 py-2 text-sm"
         >
-          {formSummary ? <p>{formSummary}</p> : null}
+          {formError ? <p>{formError}</p> : null}
           {unshownErrors.map(([key, detail]) => (
             <p key={key}>{detail}</p>
           ))}
@@ -822,7 +784,7 @@ export function RequestServerEditor({
       <div className="settings-field-list">
         {installations.length > 1 ? (
           <SettingFieldRow
-            label={t("web.admin.settings.requests.serverEditor.type")}
+            label="Server type"
             htmlFor={typeId}
             description={typeLock}
             status={
@@ -837,9 +799,7 @@ export function RequestServerEditor({
               disabled={typeLock !== undefined}
             >
               <SelectTrigger id={typeId} className={SETTINGS_CONTROL_WIDTH}>
-                <SelectValue
-                  placeholder={t("web.admin.settings.requests.serverEditor.typePlaceholder")}
-                />
+                <SelectValue placeholder="Choose a type" />
               </SelectTrigger>
               <SelectContent>
                 {installations.map((entry) => (
@@ -855,7 +815,7 @@ export function RequestServerEditor({
           </SettingFieldRow>
         ) : null}
         <SettingFieldRow
-          label={t("web.admin.settings.requests.serverEditor.name")}
+          label="Name"
           htmlFor={nameId}
           status={<FieldError>{fieldErrors.name}</FieldError>}
         >
@@ -863,21 +823,13 @@ export function RequestServerEditor({
             id={nameId}
             value={form.name}
             onChange={(event) => patch({ name: event.target.value })}
-            placeholder={
-              typeLabel
-                ? t("web.admin.settings.requests.serverEditor.namePlaceholder", { type: typeLabel })
-                : t("web.admin.settings.requests.serverEditor.namePlaceholderRadarr")
-            }
+            placeholder={typeLabel ? `e.g. ${typeLabel} 4K` : "e.g. Radarr 4K"}
             aria-invalid={Boolean(fieldErrors.name)}
             className={SETTINGS_CONTROL_WIDTH}
           />
         </SettingFieldRow>
         <SettingFieldRow
-          label={t(
-            needsBaseURL
-              ? "web.admin.settings.requests.serverEditor.url"
-              : "web.admin.settings.requests.serverEditor.urlOptional",
-          )}
+          label={needsBaseURL ? "URL" : "URL (optional)"}
           htmlFor={urlId}
           status={<FieldError>{urlError}</FieldError>}
         >
@@ -889,33 +841,26 @@ export function RequestServerEditor({
               const next = withScheme(form.base_url);
               if (next !== form.base_url) patch({ base_url: next });
             }}
-            placeholder={URL_PLACEHOLDER}
+            placeholder="http://192.168.1.10:8989"
             aria-invalid={Boolean(urlError)}
             className={SETTINGS_CONTROL_WIDTH}
           />
         </SettingFieldRow>
         <SecretField
-          label={t(
-            needsAPIKey
-              ? "web.admin.settings.requests.serverEditor.apiKey"
-              : "web.admin.settings.requests.serverEditor.apiKeyOptional",
-          )}
+          label={needsAPIKey ? "API key" : "API key (optional)"}
           value={form.api_key_ref}
           configured={form.has_api_key}
           onChange={(value) => patch({ api_key_ref: value })}
           hint={
             form.has_api_key
-              ? t("web.admin.settings.requests.serverEditor.apiKeySaved")
+              ? "Saved. Type a new key to replace it; leave blank to keep it."
               : needsAPIKey
-                ? t("web.admin.settings.requests.serverEditor.apiKeyHint")
-                : t("web.admin.settings.requests.serverEditor.apiKeyNotNeeded")
+                ? "From the server's Settings › General."
+                : "This server type works without one."
           }
           status={<FieldError>{keyError}</FieldError>}
         />
-        <SettingFieldRow
-          label={t("web.admin.settings.requests.serverEditor.enabled")}
-          htmlFor={`${nameId}-enabled`}
-        >
+        <SettingFieldRow label="Enabled" htmlFor={`${nameId}-enabled`}>
           <Switch
             id={`${nameId}-enabled`}
             checked={form.enabled}
@@ -924,9 +869,9 @@ export function RequestServerEditor({
         </SettingFieldRow>
         {offers4K ? (
           <SettingFieldRow
-            label={t("web.admin.settings.requests.serverEditor.uhdServer")}
+            label="4K server"
             htmlFor={`${nameId}-4k`}
-            description={t("web.admin.settings.requests.serverEditor.uhdServerDescription")}
+            description="With Standard routing, 4K versions go here and everything else goes to the other server of this type."
             status={<FieldError>{fieldErrors[FOUR_K_KEY]}</FieldError>}
           >
             <Switch
@@ -966,25 +911,17 @@ export function RequestServerEditor({
           (probeError?.message || Object.keys(probeError?.fields ?? {}).length === 0) ? (
             <p className="text-xs text-amber-600 dark:text-amber-400">
               {probeError?.message ||
-                t("web.admin.settings.requests.serverEditor.optionsFailed", {
-                  fields: connectionFields,
-                })}
+                `Couldn't read root folders and profiles from the server. Check ${connectionFields}, then Test.`}
             </p>
           ) : null}
           {optionsStatus === "idle" && detected && !test && !kindMismatch ? (
-            <p className="text-muted-foreground text-xs">
-              {t("web.admin.settings.requests.serverEditor.detected", { service: detected.label })}
-            </p>
+            <p className="text-muted-foreground text-xs">Detected {detected.label}.</p>
           ) : null}
         </div>
       ) : hasInstallation ? (
-        <p className="text-muted-foreground text-sm">
-          {t("web.admin.settings.requests.serverEditor.noPluginSettings")}
-        </p>
+        <p className="text-muted-foreground text-sm">This plugin has no settings of its own.</p>
       ) : (
-        <p className="text-muted-foreground text-sm">
-          {t("web.admin.settings.requests.serverEditor.chooseType")}
-        </p>
+        <p className="text-muted-foreground text-sm">Choose a server type to continue.</p>
       )}
 
       {conflict ? <EditorConflict onReload={reload} /> : null}
@@ -1004,14 +941,12 @@ export function RequestServerEditor({
               aria-describedby={deleteBlockedBy ? deleteBlockedId : undefined}
             >
               <Trash2 aria-hidden="true" />
-              {t("web.admin.settings.requests.shared.delete")}
+              Delete
             </Button>
           ) : null}
           {deleteBlockedBy ? (
             <span id={deleteBlockedId} className="text-muted-foreground min-w-0 text-xs">
-              {t("web.admin.settings.requests.serverEditor.deleteBlocked", {
-                routes: deleteBlockedBy,
-              })}
+              Routing still sends requests here ({deleteBlockedBy}); send them elsewhere first.
             </span>
           ) : null}
           {test ? (
@@ -1033,19 +968,13 @@ export function RequestServerEditor({
             onClick={() => void runTest()}
             disabled={!canLoad || testing}
           >
-            {testing
-              ? t("web.admin.settings.requests.serverEditor.testing")
-              : t("web.admin.settings.requests.serverEditor.test")}
+            {testing ? "Testing…" : "Test"}
           </Button>
           <Button type="button" variant="outline" onClick={onDone}>
-            {t("common.cancel")}
+            Cancel
           </Button>
           <Button type="button" onClick={save} disabled={!canSave || saving}>
-            {saving
-              ? t("web.admin.settings.requests.shared.saving")
-              : isNew
-                ? t("web.admin.settings.requests.servers.addServer")
-                : t("common.save")}
+            {saving ? "Saving…" : isNew ? "Add server" : "Save"}
           </Button>
         </div>
       </DialogFooter>
@@ -1053,17 +982,13 @@ export function RequestServerEditor({
       <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>
-              {source?.name
-                ? t("web.admin.settings.requests.serverEditor.deleteTitle", { server: source.name })
-                : t("web.admin.settings.requests.serverEditor.deleteUnnamedTitle")}
-            </AlertDialogTitle>
+            <AlertDialogTitle>Delete {source?.name || "server"}?</AlertDialogTitle>
             <AlertDialogDescription>
+              Silo stops sending requests to it, and Autoscan connections that reuse it lose their
+              connection details.
               {clearsFallback
-                ? t("web.admin.settings.requests.serverEditor.deleteDescriptionClearsFallback", {
-                    media_type: clearsFallback,
-                  })
-                : t("web.admin.settings.requests.serverEditor.deleteDescription")}
+                ? ` Everything else for ${mediaTypePlural(clearsFallback)} goes with it, so those requests have nowhere to go until you add another server.`
+                : null}
             </AlertDialogDescription>
           </AlertDialogHeader>
           {deleteError ? (
@@ -1073,7 +998,7 @@ export function RequestServerEditor({
           ) : null}
           {conflict ? <EditorConflict onReload={reload} /> : null}
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               disabled={deleteServer.isPending || conflict || !etag}
@@ -1091,17 +1016,13 @@ export function RequestServerEditor({
                     onError: (error) => {
                       if (isRequestEditorConflict(error)) setConflict(true);
                       else
-                        setDeleteError(
-                          error instanceof Error
-                            ? error.message
-                            : t("web.admin.settings.requests.serverEditor.deleteFailed"),
-                        );
+                        setDeleteError(error instanceof Error ? error.message : "Delete failed.");
                     },
                   },
                 );
               }}
             >
-              {t("web.admin.settings.requests.shared.delete")}
+              Delete
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

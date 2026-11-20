@@ -1,6 +1,5 @@
 import { Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 import type {
   GuestControlPolicy,
   WatchTogetherRoomSnapshot,
@@ -42,12 +41,10 @@ export function VotingStage({
   onCopyInvite: () => void;
   onSetPolicy: (policy: GuestControlPolicy) => void;
 }) {
-  const t = useT();
   const ranked = rankSuggestions(suggestions);
   const leader = ranked[0];
   const totalVotes = suggestions.reduce((sum, s) => sum + s.vote_count, 0);
-  const hostName =
-    room.members?.find((m) => m.is_host)?.display_name ?? t("web.watchTogether.voting.theHost");
+  const hostName = room.members?.find((m) => m.is_host)?.display_name ?? "the host";
 
   return (
     <div className="flex flex-col gap-4">
@@ -56,18 +53,14 @@ export function VotingStage({
           contentId={leader.content_id}
           eyebrow={
             leader.vote_count > 0
-              ? t("web.watchTogether.voting.leading", {
-                  votes: leader.vote_count,
-                  total: totalVotes,
-                  total_text: totalVotes,
-                })
-              : t("web.watchTogether.voting.firstSuggestion")
+              ? `Leading · ${leader.vote_count} of ${totalVotes} votes`
+              : "First suggestion"
           }
           eyebrowTone={leader.vote_count > 0 ? "leading" : "muted"}
           caption={
             isHost
-              ? t("web.watchTogether.voting.hostCaption")
-              : t("web.watchTogether.voting.guestCaption", { host: hostName })
+              ? "Start the leader, or play any suggestion below"
+              : `Starts when ${hostName} presses play`
           }
         >
           {isHost ? (
@@ -78,33 +71,28 @@ export function VotingStage({
               className="gap-2"
             >
               <Play className="size-3.5" />
-              {t("web.watchTogether.voting.playForEveryone", { title: leader.title })}
+              Play {leader.title} for everyone
             </Button>
           ) : null}
         </StagedHero>
       ) : (
         <div className="surface-panel-subtle flex flex-col items-center gap-3 rounded-xl px-6 py-10 text-center">
           <p className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">
-            {t("web.watchTogether.voting.open")}
+            Voting is open
           </p>
-          <h2 className="text-xl font-semibold tracking-tight">
-            {t("web.watchTogether.voting.noSuggestions")}
-          </h2>
+          <h2 className="text-xl font-semibold tracking-tight">No suggestions yet</h2>
           <p className="text-muted-foreground max-w-sm text-sm">
-            {isHost
-              ? t("web.watchTogether.voting.emptyHost")
-              : t("web.watchTogether.voting.emptyGuest", { host: hostName })}
+            Anyone can add one from the shelf below. The room votes, and{" "}
+            {isHost ? "you start" : `${hostName} starts`} whatever wins.
           </p>
         </div>
       )}
       <section className="surface-panel-subtle rounded-xl px-3 py-3">
         <div className="flex items-center justify-between px-2 pb-2">
           <h3 className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">
-            {t("web.watchTogether.voting.ranked")}
+            Suggestions · ranked by votes
           </h3>
-          <span className="text-muted-foreground text-xs">
-            {t("web.watchTogether.voting.oneVote")}
-          </span>
+          <span className="text-muted-foreground text-xs">One vote each · change it any time</span>
         </div>
         <SuggestionList
           suggestions={suggestions}
@@ -116,7 +104,7 @@ export function VotingStage({
           onVoteToggle={onVoteToggle}
           onPromote={isHost ? onPromote : undefined}
           onDelete={onDelete}
-          emptyText={t("web.watchTogether.voting.empty")}
+          emptyText="Nothing suggested yet. Browse below to add the first."
         />
       </section>
       <InviteBar

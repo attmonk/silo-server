@@ -21,7 +21,6 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import type { CatalogFiltersResponse } from "@/api/types";
-import { useT } from "@/i18n";
 
 /** Default secondary filter values for "Clear All". */
 const EMPTY_SECONDARY_FILTERS: Partial<GuidedFormState> = {
@@ -97,7 +96,6 @@ export default function CatalogFilterSheet({
   libraryType,
   catalogState,
 }: CatalogFilterSheetProps) {
-  const t = useT();
   // Portal container inside the Sheet's DOM so that react-remove-scroll
   // (activated by the Dialog/Sheet) does not block scroll events inside
   // dropdown listboxes opened by filter controls.
@@ -119,8 +117,8 @@ export default function CatalogFilterSheet({
           <SheetHeader className="border-b pb-3">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <SheetTitle>{t("web.catalog.filters.heading")}</SheetTitle>
-                <SheetDescription>{t("web.catalog.filters.subtitle")}</SheetDescription>
+                <SheetTitle>Filters</SheetTitle>
+                <SheetDescription>Refine your catalog results</SheetDescription>
               </div>
               <div className="flex items-center gap-1">
                 <Button
@@ -130,7 +128,7 @@ export default function CatalogFilterSheet({
                   onClick={() => onEditorModeChange("guided")}
                   disabled={!guidedAvailable}
                 >
-                  {t("web.catalog.filters.guided")}
+                  Guided
                 </Button>
                 <Button
                   type="button"
@@ -138,12 +136,12 @@ export default function CatalogFilterSheet({
                   size="xs"
                   onClick={() => onEditorModeChange("advanced")}
                 >
-                  {t("web.catalog.filters.advanced")}
+                  Advanced
                 </Button>
               </div>
             </div>
             {guidedAvailable ? null : (
-              <p className="text-muted-foreground text-xs">{t(GUIDED_UNAVAILABLE_MESSAGE)}</p>
+              <p className="text-muted-foreground text-xs">{GUIDED_UNAVAILABLE_MESSAGE}</p>
             )}
           </SheetHeader>
 
@@ -187,11 +185,11 @@ export default function CatalogFilterSheet({
               size="sm"
               onClick={() => onUpdate(EMPTY_SECONDARY_FILTERS)}
             >
-              {t("web.catalog.filters.clearAll")}
+              Clear All
             </Button>
             <SheetClose asChild>
               <Button type="button" size="sm">
-                {t("common.done")}
+                Done
               </Button>
             </SheetClose>
           </SheetFooter>

@@ -16,7 +16,6 @@
 import {
   CLAIM_CLIENT_MANAGED_DYNAMIC_RANGE_V3,
   CLAIM_CLIENT_SELECTED_AUDIO_TRACK_V3,
-  FEATURE_PROGRESSIVE_RANGE_REFUSAL_V3,
   PROTOCOL_V3,
   type ClientCodecCapabilitiesV3,
   type ClientPlaybackContextV3,
@@ -28,7 +27,6 @@ import {
 import { onMeteredConnection, readMeasuredBandwidthKbps } from "./bandwidth-probe";
 import { detectFormFactor } from "./form-factor";
 import { isSafariBrowserV3 } from "./utils/hlsEngine";
-import { isChromiumUserAgent } from "./utils/browser";
 import type { EngineCapabilities } from "./engine/capabilities";
 
 /** App version reported to the server for diagnostics. */
@@ -203,17 +201,6 @@ function engineOriginalOverrides(
   };
 }
 
-/** Opt-ins that depend on how the calling player recovers, not on the browser. */
-export interface DeliveryRecoveryV3 {
-  /**
-   * The player answers a progressive stream's network error by reopening it at
-   * its current position (VideoPlayer's reconnect). Only then may Chromium opt
-   * into progressive_range_refusal_v1: a player without that reconnect would
-   * treat the refusal as a failed route.
-   */
-  reopensProgressiveAtPosition?: boolean;
-}
-
 /**
  * Builds the `deliveries` map. `original_http` and `progressive` ride the
  * `<video>` element directly; `hls` uses hls.js where MSE is available and the
@@ -224,7 +211,6 @@ export function buildDeliveriesV3(
   probe: WebCapabilityProbe,
   userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "",
   engine: EngineCapabilities | null = null,
-  recovery: DeliveryRecoveryV3 = {},
 ): Partial<Record<DeliveryClassV3, DeliveryCapabilityV3>> {
   const nonProgressiveHDRDetails: HDRCapabilitiesV3 = {
     ...probe.hdrDetails,
@@ -253,13 +239,6 @@ export function buildDeliveriesV3(
       video_codecs: probe.progressiveCodecsVideo,
       audio_decode_codecs: probe.progressiveCodecsAudio,
       hdr_details: progressiveHDRDetails,
-      // Chromium reports a refused mid-stream range as a network error, which
-      // a player that reopens at its position recovers from. Other media
-      // loaders and players keep the plain stream.
-      features:
-        recovery.reopensProgressiveAtPosition && isChromiumUserAgent(userAgent)
-          ? [FEATURE_PROGRESSIVE_RANGE_REFUSAL_V3]
-          : [],
     }),
     hls: buildDeliveryCapability(probe, {
       supported_on_device: probe.hls,
@@ -303,7 +282,6 @@ function boundedDetail(value: string | undefined): string | undefined {
 export function buildClientPlaybackContextV3(
   probe: WebCapabilityProbe,
   engine: EngineCapabilities | null = null,
-  recovery: DeliveryRecoveryV3 = {},
 ): ClientPlaybackContextV3 {
   const platformDetails: Record<string, string> = {};
   const userAgent = boundedDetail(typeof navigator !== "undefined" ? navigator.userAgent : "");
@@ -325,7 +303,6 @@ export function buildClientPlaybackContextV3(
       probe,
       typeof navigator !== "undefined" ? navigator.userAgent : "",
       engine,
-      recovery,
     ),
   };
 }

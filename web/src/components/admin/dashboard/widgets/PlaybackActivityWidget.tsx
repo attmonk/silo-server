@@ -12,14 +12,11 @@ import { WidgetRangePicker } from "../WidgetRangePicker";
 import {
   buildPlaybackActivityColumns,
   DEFAULT_PLAYBACK_BUCKET_SECONDS,
-  PLAYBACK_SERIES_LABEL_KEYS,
+  PLAYBACK_SERIES_LABELS,
 } from "./playbackActivitySeries";
-import { formatLocale } from "@/lib/appLocale";
-import { useT } from "@/i18n";
 
 /** Playback starts per bucket over the chosen window, stacked by play method. */
 export function PlaybackActivityWidget() {
-  const t = useT();
   const { range } = useWidgetRange();
   const hours = rangeHours(range);
   const query = useAdminPlaybackActivity(hours);
@@ -47,14 +44,9 @@ export function PlaybackActivityWidget() {
 
   return (
     <Card className="h-full">
-      <WidgetHeader
-        title={rangeTitle(t("web.admin.dashboard.widgets.playbackActivity.title"), range)}
-      >
+      <WidgetHeader title={rangeTitle("Playback activity", range)}>
         <span className="text-muted-foreground text-[11px] tabular-nums">
-          {t("web.admin.dashboard.widgets.playbackActivity.sessionCount", {
-            count: total,
-            count_text: total.toLocaleString(formatLocale()),
-          })}
+          {total.toLocaleString()} {total === 1 ? "session" : "sessions"}
         </span>
         <WidgetRangePicker />
       </WidgetHeader>
@@ -62,32 +54,23 @@ export function PlaybackActivityWidget() {
         {query.isLoading ? (
           <ChartSkeleton fill />
         ) : query.error ? (
-          <SectionError message={t("web.admin.dashboard.widgets.playbackActivity.loadFailed")} />
+          <SectionError message="Failed to load playback activity." />
         ) : total === 0 ? (
           <ChartEmptyState
             fill
-            message={t("web.admin.dashboard.widgets.playbackActivity.empty", {
-              range: rangePhrase(range),
-            })}
-            detail={t("web.admin.dashboard.widgets.playbackActivity.emptyDetail")}
+            message={`No playback in ${rangePhrase(range)}`}
+            detail="Sessions appear here as soon as someone starts watching."
           />
         ) : (
           <StackedColumnChart
             fill
             buckets={columns}
-            seriesLabels={PLAYBACK_SERIES_LABEL_KEYS.map((key) => t(key))}
-            ariaLabel={t(
-              isDaily
-                ? "web.admin.dashboard.widgets.playbackActivity.chartLabelDaily"
-                : "web.admin.dashboard.widgets.playbackActivity.chartLabelHourly",
-              { range: rangePhrase(range) },
-            )}
-            formatBucket={(time) =>
-              isDaily
-                ? formatDayLabel(time)
-                : formatTime(time, { hour: "numeric", minute: undefined })
+            seriesLabels={[...PLAYBACK_SERIES_LABELS]}
+            ariaLabel={`Playback sessions per ${isDaily ? "day" : "hour"} over ${rangePhrase(range)}, by play method`}
+            formatBucket={(t) =>
+              isDaily ? formatDayLabel(t) : formatTime(t, { hour: "numeric", minute: undefined })
             }
-            totalLabel={t("web.admin.dashboard.widgets.playbackActivity.totalLabel")}
+            totalLabel="Sessions"
           />
         )}
       </CardContent>

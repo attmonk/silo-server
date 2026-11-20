@@ -4,7 +4,6 @@ import type { AdminTimeseries } from "@/api/types";
 import { ChartEmptyState, ChartSkeleton, LineChart } from "../charts";
 import type { LineChartOverlay, LineChartPoint, LineChartStack } from "../charts";
 import { SectionError } from "../feedback";
-import { useT } from "@/i18n";
 
 export interface TimeseriesChartBodyProps {
   query: UseQueryResult<AdminTimeseries>;
@@ -23,8 +22,6 @@ export interface TimeseriesChartBodyProps {
   overlays?: readonly LineChartOverlay[];
   /** Bands drawn stacked instead of the primary line; see LineChart. */
   stacks?: readonly LineChartStack[];
-  /** Primary series color outside the categorical slots; see LineChart. */
-  color?: string;
   height?: number;
   /**
    * Fill the card's content area instead of a fixed `height`. Widget rows are
@@ -46,7 +43,7 @@ export function TimeseriesChartBody({
   seriesLabel,
   ariaLabel,
   errorMessage,
-  emptyMessage,
+  emptyMessage = "No samples yet",
   formatValue,
   formatTick,
   formatTimestamp,
@@ -54,11 +51,9 @@ export function TimeseriesChartBody({
   minTickStep,
   overlays,
   stacks,
-  color,
   height = 160,
   fill = false,
 }: TimeseriesChartBodyProps) {
-  const t = useT();
   if (query.isLoading) {
     return <ChartSkeleton height={height} fill={fill} />;
   }
@@ -72,9 +67,9 @@ export function TimeseriesChartBody({
       <ChartEmptyState
         height={height}
         fill={fill}
-        message={emptyMessage ?? t("web.admin.dashboard.widgets.timeseriesChart.empty")}
+        message={emptyMessage}
         since={query.data?.oldest_sample_at ?? null}
-        detail={t("web.admin.dashboard.widgets.timeseriesChart.emptyDetail")}
+        detail="The metrics sampler collects one sample a minute while the server runs."
       />
     );
   }
@@ -93,7 +88,6 @@ export function TimeseriesChartBody({
       minTickStep={minTickStep}
       overlays={overlays}
       stacks={stacks}
-      color={color}
     />
   );
 }

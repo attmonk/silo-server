@@ -7,7 +7,6 @@ import {
 } from "../client";
 import { V2_CLIENT_HEADERS, V2ProblemError, problemId, type Problem } from "./request";
 import { v2Operations } from "./operations";
-import { t } from "@/i18n";
 
 /** Raw gzip download through the same captured session boundary as v2 JSON. */
 export async function fetchAdminDiagnosticReportBundle(id: string): Promise<Blob> {
@@ -40,10 +39,10 @@ export async function fetchAdminDiagnosticReportBundle(id: string): Promise<Blob
         reportProfileUnverified(requestProfileId, requestProfileToken, profileContext);
       throw new V2ProblemError(operationID, body as Problem);
     }
-    throw new Error(t("web.admin.errors.diagnosticDownloadFailed", { status: res.status }));
+    throw new Error(`Diagnostic report download failed (${res.status}).`);
   }
   if (res.headers.get("Content-Type")?.split(";")[0]?.trim().toLowerCase() !== "application/gzip")
-    throw new Error(t("web.admin.errors.diagnosticFormatUnexpected"));
+    throw new Error("The server returned an unexpected diagnostic report format.");
   const blob = await res.blob();
   if (!isCapturedProfileAuthorityActive(profileContext)) throw new StaleApiRequestContextError();
   return blob;

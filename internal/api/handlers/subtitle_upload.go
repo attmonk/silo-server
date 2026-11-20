@@ -31,7 +31,6 @@ func (h *SubtitleSearchHandler) uploadAuthorizedSubtitle(ctx context.Context, re
 	sub, err := h.manager.Upload(ctx, req)
 	if err == nil {
 		h.requestAutoSync(ctx, sub)
-		h.announceAddedSubtitle(ctx, sub)
 		return sub, nil
 	}
 	switch {

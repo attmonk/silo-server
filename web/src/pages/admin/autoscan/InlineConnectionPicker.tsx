@@ -18,7 +18,6 @@ import {
 } from "@/hooks/queries/useAutoscan";
 import { useRequestIntegrations } from "@/hooks/queries/admin/requests";
 import type { RequestIntegration } from "@/api/types";
-import { useT } from "@/i18n";
 
 export interface ConnectionOption {
   id: string;
@@ -31,10 +30,6 @@ export interface ConnectionOption {
 /** Sentinel values for the picker's non-connection choices. */
 const NONE = "__none__";
 const ADD_NEW = "__add__";
-
-const BASE_URL_EXAMPLE = "http://localhost:8989";
-/** Service names, not translated. */
-const KIND_LABELS: Partial<Record<string, string>> = { sonarr: "Sonarr", radarr: "Radarr" };
 
 /** The arr service kind lives in plugin_config; it is the sole source of truth. */
 function integrationKind(integration: RequestIntegration): string {
@@ -70,7 +65,6 @@ export function InlineConnectionPicker({
   connectionKinds: string[];
   idPrefix?: string;
 }) {
-  const t = useT();
   const createConnection = useCreateAutoscanConnection();
   const testConnection = useTestAutoscanConnection();
   const requestIntegrations = useRequestIntegrations();
@@ -159,10 +153,7 @@ export function InlineConnectionPicker({
       onError: (err) =>
         setTestResult({
           ok: false,
-          error:
-            err instanceof Error
-              ? err.message
-              : t("web.admin.autoscan.connections.form.testRequestFailed"),
+          error: err instanceof Error ? err.message : "Connection test failed",
         }),
     });
   }
@@ -200,36 +191,28 @@ export function InlineConnectionPicker({
 
   return (
     <div className="space-y-2">
-      <Label htmlFor={`${idPrefix}-select`}>
-        {required
-          ? t("web.admin.autoscan.connections.picker.labelRequired")
-          : t("web.admin.autoscan.connections.picker.label")}
-      </Label>
+      <Label htmlFor={`${idPrefix}-select`}>Which server?{required && " (required)"}</Label>
 
       <Select value={adding ? ADD_NEW : value || NONE} onValueChange={handleSelect}>
         <SelectTrigger id={`${idPrefix}-select`} className="w-full">
-          <SelectValue placeholder={t("web.admin.autoscan.connections.picker.placeholder")} />
+          <SelectValue placeholder="No connection" />
         </SelectTrigger>
         <SelectContent>
-          {!required && (
-            <SelectItem value={NONE}>{t("web.admin.autoscan.connections.picker.none")}</SelectItem>
-          )}
+          {!required && <SelectItem value={NONE}>— No server needed —</SelectItem>}
           {options.map((option) => (
             <SelectItem key={option.id} value={option.id}>
               {option.name}
             </SelectItem>
           ))}
-          <SelectItem value={ADD_NEW}>
-            {t("web.admin.autoscan.connections.picker.addNew")}
-          </SelectItem>
+          <SelectItem value={ADD_NEW}>+ Add a server…</SelectItem>
         </SelectContent>
       </Select>
 
       {!adding && (
         <p className="text-muted-foreground text-xs">
           {required
-            ? t("web.admin.autoscan.connections.picker.requiredHelp")
-            : t("web.admin.autoscan.connections.picker.optionalHelp")}
+            ? "This source needs credentials to reach its server."
+            : "Optional — bind one if this source needs to reach a server."}
         </p>
       )}
 
@@ -237,9 +220,7 @@ export function InlineConnectionPicker({
         <div className="border-border space-y-3 rounded-md border p-3">
           {reusable.length > 0 && (
             <div className="space-y-1.5">
-              <Label htmlFor={`${idPrefix}-reuse`}>
-                {t("web.admin.autoscan.connections.picker.server")}
-              </Label>
+              <Label htmlFor={`${idPrefix}-reuse`}>Server</Label>
               <Select
                 value={reuseId || "__manual__"}
                 onValueChange={(next) => {
@@ -253,18 +234,14 @@ export function InlineConnectionPicker({
                 <SelectContent>
                   {reusable.map((integration) => (
                     <SelectItem key={integration.id} value={integration.id}>
-                      {t("web.admin.autoscan.connections.picker.reuseOption", {
-                        name: integration.name,
-                      })}
+                      {integration.name} — already set up in Requests
                     </SelectItem>
                   ))}
-                  <SelectItem value="__manual__">
-                    {t("web.admin.autoscan.connections.picker.manualOption")}
-                  </SelectItem>
+                  <SelectItem value="__manual__">Use different credentials…</SelectItem>
                 </SelectContent>
               </Select>
               <p className="text-muted-foreground text-xs">
-                {t("web.admin.autoscan.connections.picker.reuseHelp")}
+                Silo already has these credentials — no need to enter them again.
               </p>
             </div>
           )}
@@ -273,9 +250,7 @@ export function InlineConnectionPicker({
             <>
               {kindChoices.length > 0 && (
                 <div className="space-y-1.5">
-                  <Label htmlFor={`${idPrefix}-kind`}>
-                    {t("web.admin.autoscan.connections.picker.service")}
-                  </Label>
+                  <Label htmlFor={`${idPrefix}-kind`}>Service</Label>
                   <Select value={effectiveManualKind} onValueChange={setManualKind}>
                     <SelectTrigger id={`${idPrefix}-kind`} className="w-full">
                       <SelectValue />
@@ -283,7 +258,7 @@ export function InlineConnectionPicker({
                     <SelectContent>
                       {kindChoices.map((kind) => (
                         <SelectItem key={kind} value={kind}>
-                          {Object.hasOwn(KIND_LABELS, kind) ? KIND_LABELS[kind] : kind}
+                          {kind === "sonarr" ? "Sonarr" : kind === "radarr" ? "Radarr" : kind}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -291,23 +266,19 @@ export function InlineConnectionPicker({
                 </div>
               )}
               <div className="space-y-1.5">
-                <Label htmlFor={`${idPrefix}-name`}>
-                  {t("web.admin.autoscan.connections.form.name")}
-                </Label>
+                <Label htmlFor={`${idPrefix}-name`}>Name</Label>
                 <Input
                   id={`${idPrefix}-name`}
-                  placeholder={t("web.admin.autoscan.connections.form.namePlaceholder")}
+                  placeholder="My Sonarr"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor={`${idPrefix}-url`}>
-                  {t("web.admin.autoscan.connections.form.baseURL")}
-                </Label>
+                <Label htmlFor={`${idPrefix}-url`}>Base URL</Label>
                 <Input
                   id={`${idPrefix}-url`}
-                  placeholder={BASE_URL_EXAMPLE}
+                  placeholder="http://localhost:8989"
                   value={baseUrl}
                   onChange={(e) => {
                     setTestResult(null);
@@ -316,13 +287,11 @@ export function InlineConnectionPicker({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor={`${idPrefix}-key`}>
-                  {t("web.admin.autoscan.connections.form.apiKey")}
-                </Label>
+                <Label htmlFor={`${idPrefix}-key`}>API key</Label>
                 <Input
                   id={`${idPrefix}-key`}
                   type="password"
-                  placeholder={t("web.admin.autoscan.connections.form.apiKeyPlaceholder")}
+                  placeholder="Enter API key"
                   autoComplete="new-password"
                   value={apiKey}
                   onChange={(e) => {
@@ -350,12 +319,8 @@ export function InlineConnectionPicker({
               )}
               <span>
                 {testResult.ok
-                  ? testResult.version
-                    ? t("web.admin.autoscan.connections.form.connectedVersion", {
-                        version: testResult.version,
-                      })
-                    : t("web.admin.autoscan.connections.form.connected")
-                  : (testResult.error ?? t("web.admin.autoscan.connections.form.connectionFailed"))}
+                  ? `Connected${testResult.version ? ` (v${testResult.version})` : ""}`
+                  : (testResult.error ?? "Connection failed")}
               </span>
             </div>
           )}
@@ -368,9 +333,7 @@ export function InlineConnectionPicker({
               onClick={handleTest}
               disabled={!canTest || testConnection.isPending}
             >
-              {testConnection.isPending
-                ? t("web.admin.autoscan.connections.form.testing")
-                : t("web.admin.autoscan.connections.form.test")}
+              {testConnection.isPending ? "Testing…" : "Test connection"}
             </Button>
             <div className="flex gap-2">
               <Button
@@ -383,7 +346,7 @@ export function InlineConnectionPicker({
                 }}
                 disabled={createConnection.isPending}
               >
-                {t("common.cancel")}
+                Cancel
               </Button>
               <Button
                 type="button"
@@ -392,9 +355,7 @@ export function InlineConnectionPicker({
                 disabled={!canCreate || createConnection.isPending}
               >
                 <Plus />
-                {createConnection.isPending
-                  ? t("web.admin.autoscan.connections.picker.adding")
-                  : t("web.admin.autoscan.connections.picker.add")}
+                {createConnection.isPending ? "Adding…" : "Add server"}
               </Button>
             </div>
           </div>

@@ -4,7 +4,6 @@ import { useParams, useSearchParams } from "react-router";
 import { isNotFoundProblem } from "@/api/v2/request";
 import ItemGrid from "@/components/ItemGrid";
 import PageBack from "@/components/PageBack";
-import { loadErrorDescription } from "@/components/loadErrorDescription";
 import PageUnavailable from "@/components/PageUnavailable";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { Button } from "@/components/ui/button";
@@ -12,7 +11,6 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useBoxSet } from "@/hooks/queries/boxSets";
 import { boxSetFilmCount, boxSetNextMovie, boxSetYears } from "@/lib/boxSets";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
-import { useAppLanguage, useT } from "@/i18n";
 import { buildMediaPlayHref } from "@/lib/mediaNavigation";
 import DetailHero from "@/pages/ItemDetail/DetailHero";
 import DetailLayout, { DetailSection } from "@/pages/ItemDetail/DetailLayout";
@@ -23,9 +21,6 @@ import DetailLayout, { DetailSection } from "@/pages/ItemDetail/DetailLayout";
  */
 export default function BoxSetPage() {
   const { id } = useParams<{ id: string }>();
-  const t = useT();
-  // The film count comes from a plain helper; follow language changes.
-  useAppLanguage();
   const [searchParams] = useSearchParams();
   const libraryId = searchParams.get("library_id") ?? undefined;
   const { data: boxSet, isLoading, error, refetch, isFetching } = useBoxSet(id, libraryId);
@@ -38,8 +33,8 @@ export default function BoxSetPage() {
     if (error && !isNotFoundProblem(error)) {
       return (
         <PageUnavailable
-          title={t("web.detail.boxSet.loadFailedTitle")}
-          description={loadErrorDescription(error, t("web.detail.boxSet.loadFailedBody"))}
+          title="Couldn't load this box set"
+          description="Something went wrong while loading it. Try again in a moment."
           onRetry={() => void refetch()}
           retrying={isFetching}
         />
@@ -47,8 +42,8 @@ export default function BoxSetPage() {
     }
     return (
       <PageUnavailable
-        title={t("web.detail.boxSet.unavailableTitle")}
-        description={t("web.detail.boxSet.unavailableBody")}
+        title="This box set isn't available"
+        description="Box sets may be turned off for this library, or too few of its movies are here."
       />
     );
   }
@@ -64,7 +59,7 @@ export default function BoxSetPage() {
         <DetailHero
           title={boxSet.title}
           topNav={<PageBack />}
-          context={t("web.detail.boxSet.label")}
+          context="Box set"
           shortHero
           backdropUrl={boxSet.backdrop_url}
           backdropThumbhash={boxSet.backdrop_thumbhash}
@@ -76,10 +71,7 @@ export default function BoxSetPage() {
               {years ? <span className="metadata-badge">{years}</span> : null}
               {boxSet.played_count > 0 ? (
                 <span className="metadata-badge">
-                  {t("web.detail.boxSet.watchedOf", {
-                    played: boxSet.played_count,
-                    total: boxSet.movie_count,
-                  })}
+                  {boxSet.played_count} of {boxSet.movie_count} watched
                 </span>
               ) : null}
             </div>
@@ -103,10 +95,7 @@ export default function BoxSetPage() {
                     {/* A film title can be wider than a phone; the label
                         truncates rather than widen the hero past the screen. */}
                     <span className="min-w-0 truncate">
-                      {t(
-                        started ? "web.detail.boxSet.continueTitle" : "web.detail.boxSet.playTitle",
-                        { title: next.title },
-                      )}
+                      {started ? `Continue · ${next.title}` : `Play ${next.title}`}
                     </span>
                   </ViewTransitionLink>
                 </Button>
@@ -116,7 +105,7 @@ export default function BoxSetPage() {
         />
       }
     >
-      <DetailSection title={t("web.detail.boxSet.movies")}>
+      <DetailSection title="Movies">
         <ItemGrid items={boxSet.items} libraryId={numericLibraryId} />
       </DetailSection>
     </DetailLayout>

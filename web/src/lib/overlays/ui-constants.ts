@@ -1,41 +1,13 @@
-import { t } from "@/i18n";
-
 import { OVERLAY_CATEGORIES, type OverlayCategory, type OverlayPosition } from "./types";
 
 // Shared UI metadata so user-facing and admin settings stay in sync. These
 // labels are presentational only; the canonical enums live in types.ts.
 
 export const POSITION_OPTIONS: { value: OverlayPosition; label: string }[] = [
-  {
-    value: "top-left",
-    get label() {
-      return t("web.settings.overlays.position.topLeft");
-    },
-  },
-  {
-    value: "left-edge",
-    get label() {
-      return t("web.settings.overlays.position.leftEdge");
-    },
-  },
-  {
-    value: "right-edge",
-    get label() {
-      return t("web.settings.overlays.position.rightEdge");
-    },
-  },
-  {
-    value: "bottom-left",
-    get label() {
-      return t("web.settings.overlays.position.bottomLeft");
-    },
-  },
-  {
-    value: "bottom-right",
-    get label() {
-      return t("web.settings.overlays.position.bottomRight");
-    },
-  },
+  { value: "top-left", label: "Top Left" },
+  { value: "top-right", label: "Top Right" },
+  { value: "bottom-left", label: "Bottom Left" },
+  { value: "bottom-right", label: "Bottom Right" },
 ];
 
 interface CategoryMeta {
@@ -47,39 +19,24 @@ interface CategoryMeta {
 export const CATEGORY_META: Record<OverlayCategory, CategoryMeta> = {
   tech: {
     category: "tech",
-    get title() {
-      return t("web.settings.overlays.category.tech.title");
-    },
-    get description() {
-      return t("web.settings.overlays.category.tech.description");
-    },
+    title: "Media Info",
+    description: "Technical details from your media files.",
   },
   ratings: {
     category: "ratings",
-    get title() {
-      return t("web.settings.overlays.category.ratings.title");
-    },
-    get description() {
-      return t("web.settings.overlays.category.ratings.description");
-    },
+    title: "Ratings & Certifications",
+    description: "Scores from external sources and content ratings.",
   },
   metadata: {
     category: "metadata",
-    get title() {
-      return t("web.settings.overlays.category.metadata.title");
-    },
-    get description() {
-      return t("web.settings.overlays.category.metadata.description");
-    },
+    title: "Content Metadata",
+    description: "Information about the content itself.",
   },
   ribbons: {
     category: "ribbons",
-    get title() {
-      return t("web.settings.overlays.category.ribbons.title");
-    },
-    get description() {
-      return t("web.settings.overlays.category.ribbons.description");
-    },
+    title: "Status & Awards",
+    description:
+      "Series lifecycle, request status and award badges. Some require upcoming data sources.",
   },
 };
 

@@ -794,7 +794,7 @@ func (s *Service) RuntimeState(installationID int) RuntimeState {
 		return tracked
 	}
 	if s.host != nil {
-		if s.host.Running(installationID) {
+		if _, err := s.host.Client(installationID); err == nil {
 			state.State = ResidentRunning
 		}
 	}

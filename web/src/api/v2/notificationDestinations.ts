@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import type { ProfileRequestContextSnapshot } from "@/api/client";
 import { requireNotificationAuthority } from "./notifications";
 import { v2, type V2Result } from "./request";
@@ -16,16 +15,16 @@ async function destinationPages<T>(
     const result = await load(cursor);
     requireNotificationAuthority(context);
     if (!Array.isArray(result.items) || !result.page || typeof result.page.has_more !== "boolean")
-      throw new Error(t("web.common.errors.notificationDestinationPageInvalid"));
+      throw new Error("Invalid notification destination page.");
     items.push(...result.items);
     if (!result.page.has_more) return items;
     const next = result.page.next_cursor;
     if (typeof next !== "string" || !next || seen.has(next))
-      throw new Error(t("web.common.errors.notificationDestinationContinuationInvalid"));
+      throw new Error("Invalid notification destination continuation.");
     seen.add(next);
     cursor = next;
   }
-  throw new Error(t("web.common.errors.notificationDestinationsTooMany"));
+  throw new Error("Too many notification destinations to display. Reload the list.");
 }
 
 type WebPush = V2Result<"GET /api/v2/notifications/web-push/subscriptions">["items"][number];
@@ -51,19 +50,6 @@ export function listNotificationWebhooks(profileContext: ProfileRequestContextSn
     profileContext,
   );
 }
-type PluginDestination = V2Result<"GET /api/v2/notifications/plugin-destinations">["items"][number];
-
-export function listNotificationPluginDestinations(profileContext: ProfileRequestContextSnapshot) {
-  return destinationPages<PluginDestination>(
-    (cursor) =>
-      v2("GET /api/v2/notifications/plugin-destinations", {
-        profileContext,
-        query: { cursor, limit: 100 },
-      }),
-    profileContext,
-  );
-}
-
 export function listNotificationServerChannels(profileContext: ProfileRequestContextSnapshot) {
   return destinationPages<ServerChannel>(
     (cursor) =>

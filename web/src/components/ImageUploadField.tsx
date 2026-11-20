@@ -2,7 +2,6 @@ import { useCallback, useRef } from "react";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { useT } from "@/i18n";
 import { Upload, X } from "lucide-react";
 
 interface ImageUploadFieldProps {
@@ -28,7 +27,6 @@ export function ImageUploadField({
   onSourceUrlChange,
   sourceUrlPlaceholder = "https://example.com/image.jpg",
 }: ImageUploadFieldProps) {
-  const t = useT();
   const inputRef = useRef<HTMLInputElement>(null);
 
   const previewUrl = file ? URL.createObjectURL(file) : currentUrl;
@@ -58,7 +56,7 @@ export function ImageUploadField({
             alt={label}
             className="bg-muted h-32 w-full rounded-lg border object-cover"
           />
-          <div className="absolute end-1 top-1 flex gap-1">
+          <div className="absolute top-1 right-1 flex gap-1">
             {file && (
               <Button
                 type="button"
@@ -66,8 +64,7 @@ export function ImageUploadField({
                 size="icon"
                 className="h-6 w-6"
                 onClick={() => onFileChange(null)}
-                title={t("web.common.ui.imageUpload.removeSelected")}
-                aria-label={t("web.common.ui.imageUpload.removeSelected")}
+                title="Remove selected file"
               >
                 <X className="h-3 w-3" />
               </Button>
@@ -79,8 +76,7 @@ export function ImageUploadField({
                 size="icon"
                 className="h-6 w-6"
                 onClick={onDelete}
-                title={t("web.common.ui.imageUpload.delete")}
-                aria-label={t("web.common.ui.imageUpload.delete")}
+                title="Delete image"
               >
                 <X className="h-3 w-3" />
               </Button>
@@ -96,7 +92,7 @@ export function ImageUploadField({
           className="border-border text-muted-foreground hover:border-primary hover:bg-accent flex h-32 w-full flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed transition-colors"
         >
           <Upload className="h-6 w-6" />
-          <span className="text-xs">{t("web.common.ui.imageUpload.drop")}</span>
+          <span className="text-xs">Click or drop image</span>
         </button>
       )}
       <input
@@ -118,7 +114,10 @@ export function ImageUploadField({
             onChange={(event) => onSourceUrlChange(event.target.value)}
             placeholder={sourceUrlPlaceholder}
           />
-          <p className="text-muted-foreground text-xs">{t("web.common.ui.imageUpload.urlHelp")}</p>
+          <p className="text-muted-foreground text-xs">
+            Paste an image URL instead of uploading a file. If both are provided, the uploaded file
+            wins.
+          </p>
         </div>
       ) : null}
     </div>

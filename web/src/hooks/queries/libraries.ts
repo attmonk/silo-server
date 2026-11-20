@@ -34,7 +34,7 @@ export function normalizeLibraryIDs(ids: number[]) {
  * null/undefined (the contract default), and always lands on a normalized id
  * list. Backs both ui.disabled_library_ids and ui.library_order.
  */
-function parseLibraryIDList(value: unknown): number[] {
+export function parseLibraryIDList(value: unknown): number[] {
   if (value == null) return [];
   let parsed: unknown = value;
   if (typeof value === "string") {
@@ -102,8 +102,7 @@ export async function listUserLibraries({
  */
 export function useAvailableUserLibraries({
   includeHidden = false,
-  enabled = true,
-}: { includeHidden?: boolean; enabled?: boolean } = {}) {
+}: { includeHidden?: boolean } = {}) {
   const { profile } = useAuth();
   const identity = captureSessionIdentity();
   const profileContext = captureProfileRequestContext();
@@ -134,7 +133,6 @@ export function useAvailableUserLibraries({
       return libraries;
     },
     staleTime: 5 * 60 * 1000,
-    enabled,
   });
 }
 

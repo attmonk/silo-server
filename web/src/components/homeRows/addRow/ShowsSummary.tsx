@@ -1,5 +1,4 @@
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 import { rowKindGroup } from "@/lib/homeRows/catalog";
 import { cn } from "@/lib/utils";
 import { GROUP_ICONS, GROUP_TINTS, KIND_ICONS } from "../rowIcons";
@@ -17,13 +16,12 @@ export function ShowsSummary({
   /** Omitted when the kind cannot change (a server row on Settings > Home Screen). */
   onChange?: () => void;
 }) {
-  const t = useT();
   const group = rowKindGroup(sectionType);
   const Icon = KIND_ICONS[sectionType] ?? GROUP_ICONS[group];
   return (
     <div className="grid grid-cols-[minmax(0,1fr)] gap-2">
-      <span className="text-sm font-medium">{t("web.home.addRow.shows.label")}</span>
-      <div className="border-border flex items-center gap-3 rounded-xl border py-2.5 ps-2.5 pe-3">
+      <span className="text-sm font-medium">Shows</span>
+      <div className="border-border flex items-center gap-3 rounded-xl border py-2.5 pr-3 pl-2.5">
         <span
           aria-hidden
           className={cn(
@@ -42,10 +40,10 @@ export function ShowsSummary({
             type="button"
             size="sm"
             variant="outline"
-            aria-label={t("web.home.addRow.shows.changeLabel", { kind: label })}
+            aria-label={`Change what ${label} shows`}
             onClick={onChange}
           >
-            {t("web.home.addRow.shows.change")}
+            Change
           </Button>
         ) : null}
       </div>

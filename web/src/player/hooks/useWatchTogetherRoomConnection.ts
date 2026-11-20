@@ -3,7 +3,6 @@ import {
   type SourceFallbackRequest,
 } from "@/api/v2/watchTogetherSourceFallback";
 import { useOptionalAuth } from "@/hooks/useAuth";
-import { useT } from "@/i18n";
 import { mintRoomSocketTicket, roomSocketURL } from "@/api/v2/watchTogetherSocket";
 import type { SuggestionCreationDraft } from "@/api/v2/watchTogetherSuggestionCreate";
 import { V2ProblemError } from "@/api/v2/request";
@@ -126,11 +125,7 @@ export function useWatchTogetherRoomConnection({
   const [room, setRoom] = useState<WatchTogetherRoomSnapshot | null>(null);
   const [suggestions, setSuggestions] = useState<WatchTogetherSuggestion[]>([]);
   const [closedReason, setClosedReason] = useState<string | null>(null);
-  const t = useT();
-  // reason is the server's text; null shows the default message.
-  const [replacement, setReplacement] = useState<{ scope: string; reason: string | null } | null>(
-    null,
-  );
+  const [replacement, setReplacement] = useState<{ scope: string; reason: string } | null>(null);
   const [rejoinAttempt, setRejoinAttempt] = useState(0);
   const [transportCommand, setTransportCommand] = useState<WatchTogetherTransportCommand | null>(
     null,
@@ -155,10 +150,7 @@ export function useWatchTogetherRoomConnection({
     renderedAuthority?.profileId,
   ]);
   const replacementScopeRef = useRef<string | null>(null);
-  const replacementReason =
-    replacement?.scope === replacementScope
-      ? (replacement.reason ?? t("web.player.watchTogether.connectionReplaced"))
-      : null;
+  const replacementReason = replacement?.scope === replacementScope ? replacement.reason : null;
   const rejoinRoom = useCallback(() => {
     if (replacementScopeRef.current !== replacementScope) return;
     replacementScopeRef.current = null;
@@ -442,7 +434,10 @@ export function useWatchTogetherRoomConnection({
             replacementScopeRef.current = replacementScope;
             setReplacement({
               scope: replacementScope,
-              reason: typeof message.reason === "string" && message.reason ? message.reason : null,
+              reason:
+                typeof message.reason === "string" && message.reason
+                  ? message.reason
+                  : "This profile joined the Watch Party on another device.",
             });
             if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
             reconnectTimer = null;

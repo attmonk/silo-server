@@ -29,7 +29,6 @@ import {
   useViewerIsOwner,
 } from "@/hooks/queries/admin/users";
 import { useAuth } from "@/hooks/useAuth";
-import { useT } from "@/i18n";
 import {
   canChangeAccessPolicy,
   canManageAccount,
@@ -37,8 +36,6 @@ import {
   canViewAsAccount,
 } from "@/lib/accountOwner";
 import { guardRedirectTarget } from "@/lib/authRedirect";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
-import { cn } from "@/lib/utils";
 
 import { AccessTab } from "./admin-users/detail/access/AccessTab";
 import { ActivityTab } from "./admin-users/detail/activity/ActivityTab";
@@ -46,7 +43,6 @@ import { CardEditingProvider } from "./admin-users/detail/cardEditing";
 import { DownloadsTab } from "./admin-users/detail/downloads/DownloadsTab";
 import { OverviewTab } from "./admin-users/detail/overview/OverviewTab";
 import { PreferencesTab } from "./admin-users/detail/preferences/PreferencesTab";
-import { ProfilesTab } from "./admin-users/detail/profiles/ProfilesTab";
 import { UnsavedCardGuard } from "./admin-users/detail/UnsavedCardGuard";
 import { UserDetailHeader } from "./admin-users/detail/UserDetailHeader";
 import { UserDetailTabBar } from "./admin-users/detail/UserDetailTabBar";
@@ -60,7 +56,6 @@ export default function AdminUserDetail() {
 }
 
 function AdminUserDetailPage() {
-  const t = useT();
   const { id } = useParams<{ id: string }>();
   const userId = Number(id);
   const navigate = useNavigate();
@@ -88,13 +83,13 @@ function AdminUserDetailPage() {
   const [disableOpen, setDisableOpen] = useState(false);
   const [deleteEditor, setDeleteEditor] = useState<AdminUserEditor | null>(null);
 
-  if (isLoading) return <div className="pb-8">{t("web.admin.users.page.loading")}</div>;
+  if (isLoading) return <div className="pb-8">Loading user...</div>;
   if (!user) {
     if (error && !isNotFoundProblem(error)) {
       return (
         <PageUnavailable
-          title={t("web.admin.users.page.loadFailedTitle")}
-          description={t("web.admin.users.page.loadFailedDescription")}
+          title="Couldn't load this user"
+          description="Something went wrong while loading the account. Try again in a moment."
           onRetry={() => void refetch()}
           retrying={isFetching}
         />
@@ -105,12 +100,12 @@ function AdminUserDetailPage() {
     if (!error && Number.isSafeInteger(userId) && userId > 0) {
       return (
         <PageUnavailable
-          title={t("web.admin.users.page.chooseProfileTitle")}
-          description={t("web.admin.users.page.chooseProfileDescription")}
+          title="Choose a profile first"
+          description="Managing accounts acts as one of your profiles. Choose a profile, then open this account again."
         >
           <Button asChild variant="outline">
             <ViewTransitionLink to={guardRedirectTarget("/profiles", location)}>
-              {t("web.admin.users.page.chooseProfile")}
+              Choose profile
             </ViewTransitionLink>
           </Button>
         </PageUnavailable>
@@ -118,12 +113,12 @@ function AdminUserDetailPage() {
     }
     return (
       <PageUnavailable
-        title={t("web.admin.users.page.notFoundTitle")}
-        description={t("web.admin.users.page.notFoundDescription")}
+        title="User not found"
+        description="The account may have been deleted, or the link may be wrong."
       >
         <Button asChild variant="outline">
           <ViewTransitionLink to="/admin/users" up>
-            {t("web.admin.users.page.allUsers")}
+            All users
           </ViewTransitionLink>
         </Button>
       </PageUnavailable>
@@ -153,12 +148,9 @@ function AdminUserDetailPage() {
     transferOwnership.mutate(
       { id: account.id, profileContext: authority },
       {
-        onSuccess: () =>
-          toast.success(t("web.admin.users.page.ownerTransferred", { username: account.username })),
+        onSuccess: () => toast.success(`${account.username} is now the server owner`),
         onError: (err) =>
-          setActionError(
-            err instanceof Error ? err.message : t("web.admin.users.page.transferFailed"),
-          ),
+          setActionError(err instanceof Error ? err.message : "Could not transfer ownership."),
       },
     );
   }
@@ -171,7 +163,7 @@ function AdminUserDetailPage() {
     try {
       return await getAdminUser(userId, authority);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : t("web.admin.users.list.userLoadFailed"));
+      setActionError(err instanceof Error ? err.message : "Could not load user.");
       return null;
     } finally {
       busy.current = false;
@@ -184,16 +176,12 @@ function AdminUserDetailPage() {
     busy.current = true;
     try {
       await updateUser.mutateAsync({ editor: fresh, body: { enabled } });
-      toast.success(
-        t(enabled ? "web.admin.users.page.enabled" : "web.admin.users.page.disabled", {
-          username: account.username,
-        }),
-      );
+      toast.success(`${account.username} is ${enabled ? "enabled" : "disabled"}`);
     } catch (err) {
       if (err instanceof V2ProblemError && err.status === 412) {
-        setActionError(t("web.admin.users.page.accountChanged"));
+        setActionError("The account changed. Try again.");
       } else {
-        setActionError(err instanceof Error ? err.message : t("web.admin.users.page.changeFailed"));
+        setActionError(err instanceof Error ? err.message : "Could not change the account.");
       }
     } finally {
       busy.current = false;
@@ -207,11 +195,15 @@ function AdminUserDetailPage() {
 
   return (
     <CardEditingProvider>
-      <div className={cn("min-w-0 space-y-6 pb-4 sm:pb-6", TOUCH_TARGETS)}>
+      <div className="min-w-0 space-y-6 pb-4 sm:pb-6">
         {actionError && <p role="alert">{actionError}</p>}
-        {!available && <p role="status">{t("web.admin.users.list.unavailable")}</p>}
+        {!available && <p role="status">User administration is unavailable.</p>}
         {available && manageable && !editor && (
-          <p role="status">{t("web.admin.users.page.noEtag")}</p>
+          <p role="status">
+            Changes to this account are unavailable: the server's response arrived without a strong
+            ETag, which saving requires. A reverse proxy that removes or rewrites the ETag header
+            causes this.
+          </p>
         )}
         <UserDetailHeader
           user={account}
@@ -237,9 +229,6 @@ function AdminUserDetailPage() {
           <UserDetailTabBar user={account} active={tab} />
           <TabsContent value="overview" className="min-w-0">
             <OverviewTab user={account} />
-          </TabsContent>
-          <TabsContent value="profiles" className="min-w-0">
-            <ProfilesTab user={account} manageable={manageable} />
           </TabsContent>
           <TabsContent value="access" className="min-w-0">
             <AccessTab
@@ -277,22 +266,18 @@ function AdminUserDetailPage() {
         <ConfirmDialog
           open={transferOpen}
           onOpenChange={setTransferOpen}
-          title={t("web.admin.users.page.transferTitle", { username: account.username })}
-          description={t("web.admin.users.page.transferDescription", {
-            username: account.username,
-          })}
-          confirmLabel={t("web.admin.users.page.transferConfirm")}
-          className={TOUCH_TARGETS}
+          title={`Make ${account.username} the server owner?`}
+          description={`${account.username} becomes the only account that can manage admins, and you stay an admin. Only ${account.username} can transfer ownership back.`}
+          confirmLabel="Make owner"
           onConfirm={handleTransfer}
           isPending={transferOwnership.isPending}
         />
         <ConfirmDialog
           open={disableOpen}
           onOpenChange={setDisableOpen}
-          title={t("web.admin.users.page.disableTitle", { username: account.username })}
-          description={t("web.admin.users.page.disableDescription")}
-          confirmLabel={t("web.admin.users.page.disableConfirm")}
-          className={TOUCH_TARGETS}
+          title={`Disable ${account.username}?`}
+          description="They can't sign in until you enable the account again. Their profiles, history, and downloads are kept."
+          confirmLabel="Disable account"
           variant="destructive"
           onConfirm={() => void setEnabled(false)}
         />
@@ -321,7 +306,7 @@ function AdminUserDetailPage() {
             onDeleted={() => navigate("/admin/users")}
             onDisabled={() => {
               setDeleteEditor(null);
-              toast.success(t("web.admin.users.page.disabled", { username: account.username }));
+              toast.success(`${account.username} is disabled`);
             }}
           />
         )}

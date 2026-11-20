@@ -1,7 +1,6 @@
 import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useIntersectionObserver } from "@/hooks/useIntersectionObserver";
-import { useT } from "@/i18n";
 
 /**
  * The foot of a list that loads as the viewer scrolls: reaching it reads the
@@ -25,7 +24,6 @@ export function LoadMoreOnScroll({
   /** Show a spinner while the next page loads, for lists without placeholders. */
   showSpinner?: boolean;
 }) {
-  const t = useT();
   const sentinelRef = useIntersectionObserver({
     onIntersect: onLoadMore,
     enabled: hasNextPage && !isFetchingNextPage && !isError,
@@ -33,11 +31,7 @@ export function LoadMoreOnScroll({
   if (!hasNextPage) return null;
   if (isFetchingNextPage) {
     return showSpinner ? (
-      <div
-        className="flex justify-center py-4"
-        role="status"
-        aria-label={t("web.common.ui.loadMore.loading")}
-      >
+      <div className="flex justify-center py-4" role="status" aria-label="Loading more">
         <Loader2 className="text-muted-foreground h-5 w-5 animate-spin" />
       </div>
     ) : null;
@@ -47,7 +41,7 @@ export function LoadMoreOnScroll({
       <div className="flex flex-col items-center gap-3 py-6 text-center">
         <p className="text-muted-foreground text-sm">{errorMessage}</p>
         <Button variant="outline" size="sm" onClick={onLoadMore}>
-          {t("common.tryAgain")}
+          Try again
         </Button>
       </div>
     );
@@ -56,7 +50,7 @@ export function LoadMoreOnScroll({
     <div ref={sentinelRef} className="flex justify-center py-4">
       {typeof IntersectionObserver === "undefined" ? (
         <Button variant="outline" size="sm" onClick={onLoadMore}>
-          {t("web.common.ui.loadMore.button")}
+          Load more
         </Button>
       ) : null}
     </div>

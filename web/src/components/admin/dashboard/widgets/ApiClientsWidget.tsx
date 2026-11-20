@@ -20,26 +20,17 @@ import { SectionError } from "../feedback";
 import { rangeHours, rangePhrase, rangeTitle } from "../range";
 import { useWidgetRange } from "../widgetChrome";
 import { WidgetRangePicker } from "../WidgetRangePicker";
-import { formatLocale } from "@/lib/appLocale";
-import { useT, type Translate } from "@/i18n";
-import { formatDecimal } from "@/lib/numberFormat";
-import { formatPercentLabel } from "../format";
 
 const ROW_LIMIT = 8;
-const SEPARATOR = " · ";
 
-function clientLabel(t: Translate, client: AdminApiClient): string {
-  return (
-    client.device_name ||
-    client.user_agent ||
-    t("web.admin.dashboard.widgets.apiClients.unknownClient")
-  );
+function clientLabel(client: AdminApiClient): string {
+  return client.device_name || client.user_agent || "Unknown client";
 }
 
 function sharePercent(requests: number, total: number): string {
   if (total <= 0) return "";
   const share = (requests / total) * 100;
-  return formatPercentLabel(formatDecimal(share, share >= 10 ? 0 : 1));
+  return share >= 10 ? `${Math.round(share)}%` : `${share.toFixed(1)}%`;
 }
 
 /**
@@ -51,7 +42,6 @@ function sharePercent(requests: number, total: number): string {
  * just that session out; the account's other devices stay signed in.
  */
 export function ApiClientsWidget() {
-  const t = useT();
   const { range } = useWidgetRange();
   const hours = rangeHours(range);
   const query = useAdminApiClients(hours);
@@ -65,15 +55,12 @@ export function ApiClientsWidget() {
     <Card className="h-full">
       <CardHeader className="flex shrink-0 flex-row items-center justify-between gap-2 space-y-0 pb-3">
         <CardTitle className="text-sm font-bold">
-          {rangeTitle(t("web.admin.dashboard.widgets.apiClients.title"), range)}
+          {rangeTitle("Busiest API clients", range)}
         </CardTitle>
         <div className="flex min-w-0 items-center gap-2">
           {data && data.total_requests > 0 ? (
             <span className="text-muted-foreground hidden text-[11px] whitespace-nowrap tabular-nums sm:inline">
-              {t("web.admin.dashboard.widgets.apiClients.totalRequests", {
-                count: data.total_requests,
-                count_text: data.total_requests.toLocaleString(formatLocale()),
-              })}
+              {data.total_requests.toLocaleString()} requests
             </span>
           ) : null}
           <WidgetRangePicker />
@@ -83,10 +70,10 @@ export function ApiClientsWidget() {
         {query.isLoading ? (
           <BarListSkeleton />
         ) : query.error ? (
-          <SectionError message={t("web.admin.dashboard.widgets.apiClients.loadFailed")} />
+          <SectionError message="Failed to load API clients." />
         ) : clients.length === 0 ? (
           <div className="text-muted-foreground py-4 text-center text-sm">
-            {t("web.admin.dashboard.widgets.apiClients.empty", { range: rangePhrase(range) })}
+            No API requests in {rangePhrase(range)}
           </div>
         ) : (
           <ol className="space-y-1">
@@ -99,11 +86,11 @@ export function ApiClientsWidget() {
                     type="button"
                     aria-expanded={open}
                     onClick={() => setOpenSession(open ? null : client.session_id)}
-                    className="hover:bg-muted/50 relative flex w-full items-center gap-2 overflow-hidden rounded-sm px-2 py-1.5 text-start text-sm transition-colors"
+                    className="hover:bg-muted/50 relative flex w-full items-center gap-2 overflow-hidden rounded-sm px-2 py-1.5 text-left text-sm transition-colors"
                   >
                     <span
                       aria-hidden="true"
-                      className="absolute inset-y-0 start-0 rounded-e-[4px]"
+                      className="absolute inset-y-0 left-0 rounded-r-[4px]"
                       style={{
                         width: `${ratio * 100}%`,
                         minWidth: client.requests > 0 ? 6 : 0,
@@ -118,39 +105,30 @@ export function ApiClientsWidget() {
                       aria-hidden="true"
                       className={cn(
                         "text-muted-foreground relative h-3 w-3 shrink-0 transition-transform",
-                        open && "rotate-90 rtl:-rotate-90",
+                        open && "rotate-90",
                       )}
                     />
-                    <span
-                      className="relative min-w-0 flex-1 truncate"
-                      title={clientLabel(t, client)}
-                    >
-                      {clientLabel(t, client)}
+                    <span className="relative min-w-0 flex-1 truncate" title={clientLabel(client)}>
+                      {clientLabel(client)}
                       <span className="text-muted-foreground">
-                        {SEPARATOR}
-                        {client.username ||
-                          t("web.admin.dashboard.widgets.apiClients.userFallback", {
-                            id: String(client.user_id),
-                          })}
+                        {" "}
+                        · {client.username || `User #${client.user_id}`}
                       </span>
                     </span>
                     {client.refused > 0 ? (
                       <span className="text-destructive relative shrink-0 text-[11px] tabular-nums">
-                        {t("web.admin.dashboard.widgets.apiClients.refused", {
-                          count: client.refused,
-                          count_text: client.refused.toLocaleString(formatLocale()),
-                        })}
+                        {client.refused.toLocaleString()} refused
                       </span>
                     ) : null}
                     {!client.session_active ? (
                       <span className="text-muted-foreground relative hidden shrink-0 text-[11px] sm:inline">
-                        {t("web.admin.dashboard.widgets.apiClients.signedOut")}
+                        signed out
                       </span>
                     ) : null}
                     <span className="relative shrink-0 text-[13px] font-semibold tabular-nums">
-                      {client.requests.toLocaleString(formatLocale())}
+                      {client.requests.toLocaleString()}
                     </span>
-                    <span className="text-muted-foreground relative w-10 shrink-0 text-end text-[11px] tabular-nums">
+                    <span className="text-muted-foreground relative w-10 shrink-0 text-right text-[11px] tabular-nums">
                       {sharePercent(client.requests, data?.total_requests ?? 0)}
                     </span>
                   </button>
@@ -166,7 +144,6 @@ export function ApiClientsWidget() {
 }
 
 function ApiClientDetail({ client, hours }: { client: AdminApiClient; hours: number }) {
-  const t = useT();
   const endpoints = useAdminApiClientEndpoints(client.session_id, hours);
   const revoke = useRevokeApiClientSession();
   const [confirming, setConfirming] = useState(false);
@@ -175,35 +152,28 @@ function ApiClientDetail({ client, hours }: { client: AdminApiClient; hours: num
   const signingOut = useRef(false);
 
   return (
-    <div className="border-border/60 text-muted-foreground mx-2 mt-1 mb-2 space-y-2 border-s ps-3 text-[12px]">
+    <div className="border-border/60 text-muted-foreground mx-2 mt-1 mb-2 space-y-2 border-l pl-3 text-[12px]">
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5">
         {client.user_agent ? (
           <>
-            <dt>{t("web.admin.dashboard.widgets.apiClients.userAgent")}</dt>
+            <dt>User agent</dt>
             <dd className="text-foreground truncate" title={client.user_agent}>
               {client.user_agent}
             </dd>
           </>
         ) : null}
-        <dt>{t("web.admin.dashboard.widgets.apiClients.busiestHour")}</dt>
+        <dt>Busiest hour</dt>
         <dd className="text-foreground tabular-nums">
-          {t("web.admin.dashboard.widgets.apiClients.peakHourRequests", {
-            count: client.peak_hour_requests,
-            count_text: client.peak_hour_requests.toLocaleString(formatLocale()),
-          })}
+          {client.peak_hour_requests.toLocaleString()} requests
         </dd>
       </dl>
-      <div>
-        {t("web.admin.dashboard.widgets.apiClients.routesHeading", {
-          hours: Math.min(hours, MAX_ENDPOINT_HOURS),
-        })}
-      </div>
+      <div>Routes called in the last {Math.min(hours, MAX_ENDPOINT_HOURS)} h</div>
       {endpoints.isLoading ? (
-        <div>{t("web.admin.dashboard.widgets.apiClients.loadingRoutes")}</div>
+        <div>Loading routes…</div>
       ) : endpoints.error ? (
-        <div>{t("web.admin.dashboard.widgets.apiClients.routesFailed")}</div>
+        <div>Couldn&apos;t load the routes this session called.</div>
       ) : endpoints.data?.endpoints.length === 0 ? (
-        <div>{t("web.admin.dashboard.widgets.apiClients.noRoutes")}</div>
+        <div>No requests in that time.</div>
       ) : (
         <ol className="space-y-0.5">
           {(endpoints.data?.endpoints ?? []).map((endpoint) => (
@@ -215,9 +185,7 @@ function ApiClientDetail({ client, hours }: { client: AdminApiClient; hours: num
               >
                 {endpoint.route}
               </span>
-              <span className="shrink-0 tabular-nums">
-                {endpoint.requests.toLocaleString(formatLocale())}
-              </span>
+              <span className="shrink-0 tabular-nums">{endpoint.requests.toLocaleString()}</span>
             </li>
           ))}
         </ol>
@@ -225,16 +193,16 @@ function ApiClientDetail({ client, hours }: { client: AdminApiClient; hours: num
       <div className="flex flex-wrap items-center gap-2 pt-1">
         {client.session_active ? (
           <Button size="sm" variant="outline" onClick={() => setConfirming(true)}>
-            {t("web.admin.dashboard.widgets.apiClients.signOut")}
+            Sign out this session
           </Button>
         ) : (
-          <span>{t("web.admin.dashboard.widgets.apiClients.sessionSignedOut")}</span>
+          <span>This session is signed out.</span>
         )}
         <Link
           to={`/admin/users/${client.user_id}${userDetailTabSearch("activity")}`}
           className="hover:text-primary transition-colors"
         >
-          {t("web.admin.dashboard.widgets.apiClients.openAccount")}
+          Open account ›
         </Link>
       </div>
       <ConfirmDialog
@@ -244,20 +212,12 @@ function ApiClientDetail({ client, hours }: { client: AdminApiClient; hours: num
           setConfirming(next);
           if (!next) revoke.reset();
         }}
-        title={t("web.admin.dashboard.widgets.apiClients.confirmTitle", {
-          client: clientLabel(t, client),
-        })}
-        description={t("web.admin.dashboard.widgets.apiClients.confirmDescription", {
-          user:
-            client.username ||
-            t("web.admin.dashboard.widgets.apiClients.confirmUserFallback", {
-              id: String(client.user_id),
-            }),
-        })}
-        confirmLabel={t("web.admin.dashboard.widgets.apiClients.confirmLabel")}
+        title={`Sign out ${clientLabel(client)}?`}
+        description={`This ends one sign-in session of ${client.username || `user #${client.user_id}`}. Their other devices stay signed in. The client can sign in again with the account's password.`}
+        confirmLabel="Sign out session"
         variant="destructive"
         isPending={revoke.isPending}
-        error={revoke.error ? t("web.admin.dashboard.widgets.apiClients.revokeFailed") : null}
+        error={revoke.error ? "The session could not be signed out. Try again." : null}
         onConfirm={() => {
           if (signingOut.current) return;
           signingOut.current = true;

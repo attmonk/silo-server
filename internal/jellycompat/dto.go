@@ -342,7 +342,6 @@ type mediaStreamDTO struct {
 	ReferenceFrameRate     float64 `json:"ReferenceFrameRate,omitempty"`
 	Height                 int     `json:"Height"`
 	Width                  int     `json:"Width"`
-	ChannelLayout          string  `json:"ChannelLayout,omitempty"`
 	Channels               int     `json:"Channels,omitempty"`
 	BitRate                int     `json:"BitRate,omitempty"`
 }

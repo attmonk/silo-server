@@ -3,7 +3,6 @@ import { BookOpen, Play } from "lucide-react";
 import { memo, useCallback, useRef } from "react";
 import { useLocation } from "react-router";
 import type { ItemDetail, SectionItem } from "@/api/types";
-import { homeDismissalForCard } from "@/hooks/queries/homeDismissals";
 import type { ProgressListEntry } from "@/hooks/queries/progress";
 import MediaItemMenu from "@/components/MediaItemMenu";
 import CardOverlays from "@/components/overlays/CardOverlays";
@@ -15,17 +14,11 @@ import { parseWatchHref } from "@/pages/watchRouteHelpers";
 import { buildItemHref, buildMediaPlayHref, isVideoWatchHref } from "@/lib/mediaNavigation";
 import { type EpisodeSpoilerPrefs, useEpisodeSpoilerPrefs } from "@/hooks/useEpisodeSpoilerPrefs";
 import { useUICustomization } from "@/hooks/useUICustomization";
-import {
-  carouselCardWidthClasses,
-  squareCarouselCardWidthClasses,
-  WIDE_CAROUSEL_CARD_WIDTH_CLASSES,
-} from "@/lib/uiCustomization";
+import { carouselCardWidthClasses, WIDE_CAROUSEL_CARD_WIDTH_CLASSES } from "@/lib/uiCustomization";
 import CardPlayOverlay from "@/components/CardPlayOverlay";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import { isEpisodeStill, isEpisodeUnwatched, SPOILER_IMAGE_CLASS } from "@/lib/episodeSpoilers";
 import { cn } from "@/lib/utils";
-import { useAppLanguage, useT } from "@/i18n";
-import WatchProgressBar from "@/components/WatchProgressBar";
 
 type ContinueWatchingCardProps = (
   | {
@@ -70,9 +63,6 @@ export const ContinueWatchingRowCard = memo(function ContinueWatchingRowCard(
 });
 
 function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCardViewProps) {
-  const t = useT();
-  // The audiobook time left and the badge come from plain helpers; follow language changes.
-  useAppLanguage();
   const location = useLocation();
   const playbackController = useWatchPlaybackController();
   const { cardPresentation } = useUICustomization();
@@ -131,7 +121,23 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   const isNextUp = "sectionItem" in props && props.sectionItem?.item_source === "next_up";
   const dismissAction =
     "sectionItem" in props && props.sectionItem
-      ? homeDismissalForCard(props.sectionItem)
+      ? props.sectionItem.item_source === "next_up"
+        ? props.sectionItem.series_id
+          ? {
+              itemId: props.sectionItem.content_id,
+              surface: "next_up" as const,
+              mediaType: props.sectionItem.type,
+              seriesId: props.sectionItem.series_id,
+            }
+          : undefined
+        : props.sectionItem.progress_updated_at
+          ? {
+              itemId: props.sectionItem.content_id,
+              surface: "continue_watching" as const,
+              mediaType: props.sectionItem.type,
+              progressUpdatedAt: props.sectionItem.progress_updated_at,
+            }
+          : undefined
       : {
           itemId: props.detail.content_id,
           surface: "continue_watching" as const,
@@ -150,7 +156,7 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   const isMangaChapter = card.type === "ebook" && !!card.seriesId && !!card.seriesTitle;
   const headingIsSeries = (hasEpisodeMeta && !!card.seriesTitle) || isMangaChapter;
   const heading = headingIsSeries ? card.seriesTitle : card.title;
-  const playTitle = heading ?? card.title ?? t("web.home.continueWatching.fallbackTitle");
+  const playTitle = heading ?? card.title ?? "item";
   // The heading shows the series title for episodes, so it should navigate to
   // the series page; everything else heads to the item's own page.
   const headingHref =
@@ -160,14 +166,13 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   // Detail-page link target for the card's image and meta lines: manga
   // chapters head to the series page like the heading does.
   const detailHref = isMangaChapter ? headingHref : card.itemHref;
-  const episodeNumbers = { season: card.seasonNumber, episode: card.episodeNumber };
+  const episodeLabel = hasEpisodeMeta
+    ? `Season ${card.seasonNumber} Episode ${card.episodeNumber}`
+    : null;
   const episodeMeta = hasEpisodeMeta
     ? card.seriesTitle && card.title
-      ? t("web.home.continueWatching.episodeLabelWithTitle", {
-          ...episodeNumbers,
-          title: card.title,
-        })
-      : t("web.home.continueWatching.episodeLabel", episodeNumbers)
+      ? `${episodeLabel} • ${card.title}`
+      : episodeLabel
     : isMangaChapter
       ? card.title
       : null;
@@ -178,17 +183,13 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   const timeLeftLabel = isNextUp
     ? premiereBadge
       ? null
-      : t("web.home.continueWatching.nextEpisode")
+      : "Next Episode"
     : card.type === "ebook"
-      ? t("web.home.continueWatching.percentRead", {
-          percent: Math.round(Math.min(Math.max(progressPercent, 0), 100)),
-        })
+      ? `${Math.round(Math.min(Math.max(progressPercent, 0), 100))}% read`
       : card.durationSeconds > 0
         ? card.type === "audiobook"
           ? formatListeningTimeLeft(card.positionSeconds, card.durationSeconds)
-          : t("web.home.continueWatching.minutesLeft", {
-              minutes: Math.round((card.durationSeconds - card.positionSeconds) / 60),
-            })
+          : `${Math.round((card.durationSeconds - card.positionSeconds) / 60)} min left`
         : "\u00A0";
   const handleWatchClick = useCallback(
     (event: React.MouseEvent<HTMLAnchorElement>) => {
@@ -231,9 +232,7 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   const isPoster = variant === "poster";
   const playableContentId = card.contentId ?? "";
   const containerWidth = isPoster
-    ? card.type === "audiobook"
-      ? squareCarouselCardWidthClasses(cardPresentation.poster_size)
-      : carouselCardWidthClasses(cardPresentation.poster_size)
+    ? carouselCardWidthClasses(cardPresentation.poster_size)
     : WIDE_CAROUSEL_CARD_WIDTH_CLASSES;
   // Audiobook covers are square (Audible-style); use 1:1 for the poster
   // variant so they don't get top/bottom-cropped into a 2:3 frame.
@@ -262,7 +261,7 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
   return (
     <div ref={cardRef} className={`media-card-longpress group/card ${containerWidth}`}>
       <div className="group/media relative">
-        <ViewTransitionLink to={detailHref} prefetchOn="intent" className="block">
+        <ViewTransitionLink to={detailHref} className="block">
           <div className={`media-card-image relative ${imageAspect} overflow-hidden rounded-xl`}>
             {imageSrc ? (
               <img
@@ -278,7 +277,7 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
               />
             ) : (
               <div className="text-muted-foreground bg-surface flex h-full w-full items-center justify-center text-sm">
-                {t("web.home.continueWatching.noImage")}
+                No Image
               </div>
             )}
 
@@ -294,7 +293,19 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
             {/* Hover dim behind the play button */}
             <div className="media-card-hover-dim absolute inset-0 bg-black/0 transition-colors duration-150" />
 
-            {showProgressBar && <WatchProgressBar percent={progressPercent} animate />}
+            {/* Progress bar — inset pill so a full bar doesn't read as a
+                stray edge along the artwork */}
+            {showProgressBar && (
+              <div className="absolute inset-x-2.5 bottom-2 h-[3px] overflow-hidden rounded-full bg-black/40">
+                <div
+                  className="h-full rounded-full transition-all duration-300"
+                  style={{
+                    width: `${Math.min(progressPercent, 100)}%`,
+                    background: "var(--primary)",
+                  }}
+                />
+              </div>
+            )}
           </div>
         </ViewTransitionLink>
         {isPoster && playableContentId && isVideoWatchHref(card.watchHref) ? (
@@ -308,18 +319,12 @@ function ContinueWatchingCardView({ spoilerPrefs, ...props }: ContinueWatchingCa
           <ViewTransitionLink
             to={card.watchHref}
             onClick={handleWatchClick}
-            aria-label={t(
-              card.type === "ebook"
-                ? "web.home.continueWatching.readTitle"
-                : "web.home.continueWatching.playTitle",
-              { title: String(heading) },
-            )}
+            aria-label={`${card.type === "ebook" ? "Read" : "Play"} ${heading}`}
             className="media-card-play-trigger bg-primary text-primary-foreground absolute top-1/2 left-1/2 flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full shadow-lg transition-all duration-200 hover:scale-110 hover:shadow-xl hover:brightness-110 active:scale-95"
           >
             {card.type === "ebook" ? (
               <BookOpen className="h-5 w-5" />
             ) : (
-              // eslint-disable-next-line silo/no-physical-direction -- centres the play triangle, which doesn't mirror
               <Play className="ml-0.5 h-5 w-5" fill="currentColor" />
             )}
           </ViewTransitionLink>

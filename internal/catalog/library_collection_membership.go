@@ -17,13 +17,12 @@ type LibraryCollectionMembership struct {
 	// collection's stored items.
 	Live bool
 	// Query selects a live collection's members: its rules narrowed to the
-	// requested scope, with the smart item limit applied. Its sort and limit
-	// decide which titles are members.
+	// collection's libraries and the requested scope, with the smart item
+	// limit applied. Its sort and limit decide which titles are members.
 	Query QueryDefinition
 	// OutOfScope reports that a live collection has no members because none of
-	// the libraries its rules draw from, or none of the libraries it shows in,
-	// is in scope. Query must not run then: its empty LibraryIDs would mean
-	// every library.
+	// its libraries is in scope. Query must not run then: its empty LibraryIDs
+	// would mean every library.
 	OutOfScope bool
 	// Sort is the order the members are listed in when the viewer picks none:
 	// the creator's default from sort_config, otherwise Query's own sort for a
@@ -43,11 +42,10 @@ type LibraryCollectionMembership struct {
 // the admin API accepts one on any type, and a PATCH without collection_type
 // normalizes it as smart, but neither makes the collection live.
 //
-// access is the reader's: its AllowedLibraryIDs list the libraries the reader
-// may list, nil for no limit, and its disabled libraries can't make the
-// collection reachable. Library collections are shared across profiles, so a
-// query with per-profile rules or sorts is an error.
-func ResolveLibraryCollectionMembership(c *models.LibraryCollection, access AccessFilter) (LibraryCollectionMembership, error) {
+// scope lists the libraries the reader may list, nil for no limit. Library
+// collections are shared across profiles, so a query with per-profile rules or
+// sorts is an error.
+func ResolveLibraryCollectionMembership(c *models.LibraryCollection, scope []int) (LibraryCollectionMembership, error) {
 	defaultSort, hasDefaultSort := ParseCollectionDefaultSort(c.SortConfig, false)
 	if !IsLiveQueryType(c.CollectionType) {
 		return LibraryCollectionMembership{Sort: defaultSort}, nil
@@ -65,27 +63,26 @@ func ResolveLibraryCollectionMembership(c *models.LibraryCollection, access Acce
 		m.Sort = defaultSort
 	}
 
-	// The rules' own libraries are where its titles come from, every library
-	// when they name none. The collection's libraries only decide which
-	// Collections tabs show it, so they never narrow the rules. A reader who
-	// can't reach any of those libraries lists none of it, as the collection's
-	// own page refuses them (CanAccessLibraryCollection).
-	placement := c.LibraryIDs
-	if len(placement) == 0 && c.LibraryID > 0 {
-		placement = []int{c.LibraryID}
+	var collectionLibraries []int
+	switch {
+	case len(c.LibraryIDs) > 0:
+		collectionLibraries = c.LibraryIDs
+	case c.LibraryID > 0:
+		collectionLibraries = []int{c.LibraryID}
 	}
-	if len(placement) > 0 {
-		if _, none := access.LibraryScope(placement); none {
-			m.OutOfScope = true
+	for _, allowed := range [][]int{collectionLibraries, scope} {
+		if allowed == nil {
+			continue
 		}
-	}
-	if scope := access.AllowedLibraryIDs; scope != nil {
 		if len(def.LibraryIDs) == 0 {
-			def.LibraryIDs = slices.Clone(scope)
+			def.LibraryIDs = slices.Clone(allowed)
 		} else {
-			def.LibraryIDs = intersectInts(def.LibraryIDs, scope)
+			def.LibraryIDs = intersectInts(def.LibraryIDs, allowed)
 		}
-		m.OutOfScope = m.OutOfScope || len(def.LibraryIDs) == 0
+		if len(def.LibraryIDs) == 0 {
+			m.OutOfScope = true
+			break
+		}
 	}
 	m.Query = ApplySmartCollectionItemLimit(def)
 	return m, nil
@@ -98,12 +95,6 @@ func ResolveLibraryCollectionMembership(c *models.LibraryCollection, access Acce
 // keeps the titles its own sort ranks first. The members never depend on the
 // viewer's profile, because library collections are shared.
 func PreviewLiveLibraryCollection(ctx context.Context, pool *pgxpool.Pool, m LibraryCollectionMembership, access AccessFilter, limit int) ([]*models.MediaItem, int, error) {
-	return previewLiveLibraryCollection(ctx, pool, m, access, limit, true)
-}
-
-// previewLiveLibraryCollection is PreviewLiveLibraryCollection, counting the
-// members only when includeTotal is set.
-func previewLiveLibraryCollection(ctx context.Context, pool *pgxpool.Pool, m LibraryCollectionMembership, access AccessFilter, limit int, includeTotal bool) ([]*models.MediaItem, int, error) {
 	if !m.Live || m.OutOfScope {
 		return []*models.MediaItem{}, 0, nil
 	}
@@ -118,6 +109,5 @@ func previewLiveLibraryCollection(ctx context.Context, pool *pgxpool.Pool, m Lib
 		executor.SourceWhere, executor.SourceArgs = predicate, args
 		def = QueryDefinition{Sort: m.Sort}
 	}
-	items, total, _, err := executor.PreviewPage(ctx, def, access, limit, 0, includeTotal)
-	return items, total, err
+	return executor.Preview(ctx, def, access, limit)
 }

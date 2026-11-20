@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -22,8 +22,6 @@ import {
 import { sectionKeys } from "@/hooks/queries/keys";
 import { invalidateSettingValueQueries } from "@/hooks/queries/settingValues";
 import { useOptionalAuth } from "@/hooks/useAuth";
-import { useAppLanguage, useT } from "@/i18n";
-import { joinList } from "@/lib/appLocale";
 import { fetchRecipeCatalog } from "@/lib/recipes";
 import { SETTING_KEYS } from "@/lib/settingsContract";
 import { randomUUID } from "@/lib/uuid";
@@ -41,9 +39,8 @@ import {
 const NO_IDS: ReadonlySet<string> = new Set();
 const NO_REFERENCES: HomeLayoutReferences = { personalCollections: false, profiles: false };
 
-/** Page or library names as a list: "Home, Movies" in English. */
 function listNames(names: string[]): string {
-  return joinList(names);
+  return names.join(", ");
 }
 
 interface HomeLayoutImportDialogProps {
@@ -53,7 +50,6 @@ interface HomeLayoutImportDialogProps {
 
 /** Import of a Home layout file into this profile (#1705), opened from More. */
 export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportDialogProps) {
-  const t = useT();
   const qc = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [text, setText] = useState("");
@@ -69,14 +65,7 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
     queryFn: () => v2("GET /api/v2/system/identity"),
     staleTime: Infinity,
   });
-  // The parse error and the plan's page and section names come from plain
-  // helpers; redo both on a language change (the plan follows `parsed`).
-  const language = useAppLanguage();
-  const parsed = useMemo(
-    () => (text.trim() ? parseHomeLayoutFile(text) : null),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- language: the error's language
-    [text, language],
-  );
+  const parsed = useMemo(() => (text.trim() ? parseHomeLayoutFile(text) : null), [text]);
   // Personal collections and profiles are read only for a same-server file
   // that names one; another server's references are skipped without looking
   // them up.
@@ -171,13 +160,13 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
 
   async function handleFile(file: File) {
     if (file.size > HOME_LAYOUT_MAX_LENGTH) {
-      toast.error(t("web.home.layout.tooLarge"));
+      toast.error("This file is too large to be a home layout export.");
       return;
     }
     try {
       setText(await file.text());
     } catch {
-      toast.error(t("web.home.layout.readFailed"));
+      toast.error("Couldn't read that file");
     }
   }
 
@@ -185,7 +174,7 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
     if (!plan || !hasChanges) return;
     // The plan was checked against this profile's libraries and collections.
     if (!profileContext || !isCapturedProfileAuthorityActive(profileContext)) {
-      toast.error(t("web.home.layout.profileChanged"));
+      toast.error("The active profile changed. Close this dialog and import again.");
       return;
     }
     setApplying(true);
@@ -207,9 +196,7 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
           randomUUID,
         );
       } catch (error) {
-        failures.push(
-          t("web.home.layout.pageFailed", { page: page.label, error: problemMessage(error) }),
-        );
+        failures.push(`${page.label} (${problemMessage(error)})`);
       }
     }
     if (plan.hideWatchedItems !== undefined) {
@@ -223,7 +210,7 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
           profileContext,
         });
       } catch (error) {
-        failures.push(t("web.home.layout.hideWatchedFailed", { error: problemMessage(error) }));
+        failures.push(`Hide watched items (${problemMessage(error)})`);
       }
       // Refresh after a failure too: a write that timed out may still have landed.
       await invalidateSettingValueQueries(
@@ -235,10 +222,10 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
     await qc.invalidateQueries({ queryKey: sectionKeys.all });
     setApplying(false);
     if (failures.length === 0) {
-      toast.success(t("web.home.layout.imported"));
+      toast.success("Home layout imported");
       onClose();
     } else {
-      toast.error(t("web.home.layout.partlyFailed", { failures: listNames(failures) }));
+      toast.error(`Some parts didn't import: ${failures.join("; ")}`);
     }
   }
 
@@ -251,14 +238,17 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
     >
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl" {...returnFocus}>
         <DialogHeader>
-          <DialogTitle>{t("web.home.layout.title")}</DialogTitle>
-          <DialogDescription>{t("web.home.layout.description")}</DialogDescription>
+          <DialogTitle>Import home layout</DialogTitle>
+          <DialogDescription>
+            Load a layout exported from another profile or another Silo server. You'll see what
+            changes before anything is saved.
+          </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-3">
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor="home-layout-import-text" className="text-sm font-medium">
-              {t("web.home.layout.fileLabel")}
+              Layout file
             </Label>
             <Button
               size="sm"
@@ -266,7 +256,7 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
               onClick={() => fileInputRef.current?.click()}
               disabled={applying}
             >
-              {t("web.home.layout.chooseFile")}
+              Choose file…
             </Button>
             <input
               ref={fileInputRef}
@@ -284,7 +274,7 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
             id="home-layout-import-text"
             value={text}
             onChange={(event) => setText(event.target.value)}
-            placeholder={t("web.home.layout.pastePlaceholder")}
+            placeholder="Or paste the exported JSON here"
             spellCheck={false}
             disabled={applying}
             className="border-input bg-background ring-offset-background placeholder:text-muted-foreground focus-visible:ring-ring min-h-28 w-full rounded-md border px-3 py-2 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-offset-2"
@@ -292,20 +282,24 @@ export function HomeLayoutImportDialog({ onClose, libraries }: HomeLayoutImportD
 
           {parsed && !parsed.ok ? <p className="text-destructive text-sm">{parsed.error}</p> : null}
           {parsed?.ok && targetError ? (
-            <p className="text-destructive text-sm">{t("web.home.layout.serverDetailsFailed")}</p>
+            <p className="text-destructive text-sm">
+              Couldn't load this server's details. Close the dialog and try again.
+            </p>
           ) : null}
           {parsed?.ok && !targetReady && !targetError ? (
-            <p className="text-muted-foreground text-sm">{t("web.home.layout.checking")}</p>
+            <p className="text-muted-foreground text-sm">
+              Checking the layout against this server…
+            </p>
           ) : null}
           {plan ? <HomeLayoutImportSummary plan={plan} hasChanges={hasChanges} /> : null}
         </div>
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={applying}>
-            {t("common.cancel")}
+            Cancel
           </Button>
           <Button onClick={() => void handleImport()} disabled={!hasChanges || applying}>
-            {applying ? t("web.home.layout.importing") : t("web.home.layout.import")}
+            {applying ? "Importing…" : "Import"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -320,48 +314,44 @@ function HomeLayoutImportSummary({
   plan: HomeLayoutImportPlan;
   hasChanges: boolean;
 }) {
-  const t = useT();
   const pageNames = plan.pages.map((page) => page.label);
-  const strong = (chunks: ReactNode[]) => <strong>{chunks}</strong>;
   return (
     <div className="surface-panel-subtle space-y-2 rounded-lg p-3 text-sm">
-      {!hasChanges ? <p>{t("web.home.layout.nothingApplies")}</p> : null}
+      {!hasChanges ? <p>Nothing in this file applies to this profile on this server.</p> : null}
       {pageNames.length > 0 && plan.sameServer ? (
-        <p>{t("web.home.layout.replacesOn", { pages: listNames(pageNames), strong })}</p>
+        <p>
+          Replaces this profile's layout on: <strong>{listNames(pageNames)}</strong>.
+        </p>
       ) : null}
       {pageNames.length > 0 && !plan.sameServer ? (
-        <p>{t("web.home.layout.addsFromOtherServer", { pages: listNames(pageNames), strong })}</p>
+        <p>
+          This layout comes from another server. Its own sections are added to:{" "}
+          <strong>{listNames(pageNames)}</strong>, replacing sections you added here before. Your
+          changes to this server's sections stay.
+        </p>
       ) : null}
       {plan.hideWatchedItems !== undefined ? (
-        <p>
-          {plan.hideWatchedItems
-            ? t("web.home.layout.hideWatchedOn")
-            : t("web.home.layout.hideWatchedOff")}
-        </p>
+        <p>Turns Hide watched items {plan.hideWatchedItems ? "on" : "off"}.</p>
       ) : null}
       {plan.skippedServerSectionChanges > 0 ? (
         <p className="text-muted-foreground">
-          {t("web.home.layout.skippedServerChanges", {
-            count: plan.skippedServerSectionChanges,
-          })}
+          {plan.skippedServerSectionChanges === 1
+            ? "1 change to a section defined by the other server's admin doesn't apply here."
+            : `${plan.skippedServerSectionChanges} changes to sections defined by the other server's admin don't apply here.`}
         </p>
       ) : null}
       {plan.skippedPages.length > 0 ? (
         <p className="text-muted-foreground">
-          {t("web.home.layout.noLibraryMatches", { libraries: listNames(plan.skippedPages) })}
+          No library here matches: {listNames(plan.skippedPages)}.
         </p>
       ) : null}
       {plan.skippedSections.length > 0 ? (
         <div className="text-muted-foreground space-y-1">
-          <p>{t("web.home.layout.skippedHeading")}</p>
-          <ul className="list-disc space-y-0.5 ps-5">
+          <p>These sections are skipped:</p>
+          <ul className="list-disc space-y-0.5 pl-5">
             {plan.skippedSections.map((section, index) => (
               <li key={`${section.page}-${section.title}-${index}`}>
-                {t("web.home.layout.skippedSection", {
-                  section: section.title,
-                  page: section.page,
-                  reason: t(HOME_LAYOUT_SKIP_REASON_LABELS[section.reason]),
-                })}
+                {section.title} ({section.page}): {HOME_LAYOUT_SKIP_REASON_LABELS[section.reason]}
               </li>
             ))}
           </ul>

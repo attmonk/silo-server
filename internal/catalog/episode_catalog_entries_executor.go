@@ -76,9 +76,8 @@ func applyEpisodeCatalogAccessFilter(libraryID int, access AccessFilter, wherePa
 	if slices.Contains(access.ExcludedMediaTypes, "episode") {
 		*whereParts = append(*whereParts, "1 = 0")
 	}
-	// Episodes pass through their series' allowance, so the maturity limits
-	// key on ece.series_id; ExcludedMediaTypes was handled above.
-	ApplyEpisodeMaturityLimits("ece", access, whereParts, args, argIdx)
+	access.ExcludedMediaTypes = nil // access is a value param; caller unaffected
+	ApplySectionAccessFilter("ece", access, whereParts, args, argIdx)
 	*whereParts = append(*whereParts, episodeCatalogSeriesParentGuard)
 }
 
@@ -329,9 +328,8 @@ func (e *QueryExecutor) appendEpisodeCatalogViewerFilters(access AccessFilter, w
 		*argIdx++
 	}
 	if prefix := strings.TrimSpace(access.NamePrefix); prefix != "" {
-		// sort_key is the lowered episode sort title, else its title (or
-		// "episode N"), the key the list sorts by, so it alone decides the
-		// letter.
+		// sort_key is the lowered episode title (or "episode N"), the key
+		// the list sorts by, so it alone decides the letter.
 		*whereParts = append(*whereParts, fmt.Sprintf("ece.sort_key LIKE $%d ESCAPE '\\'", *argIdx))
 		*args = append(*args, escapePrefixForLike(prefix)+"%")
 		*argIdx++

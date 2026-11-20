@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { ChevronDown } from "lucide-react";
-import { useT } from "@/i18n";
 import type { AudiobookNarration } from "@/lib/audiobooks/types";
 
 interface NarratorPickerProps {
@@ -11,7 +10,6 @@ interface NarratorPickerProps {
 }
 
 export function NarratorPicker({ currentNarrator, currentContentId, others }: NarratorPickerProps) {
-  const t = useT();
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const navigate = useNavigate();
@@ -45,10 +43,10 @@ export function NarratorPicker({ currentNarrator, currentContentId, others }: Na
       {open && (
         <div
           role="listbox"
-          className="bg-popover absolute start-0 top-full z-50 mt-1 min-w-[220px] overflow-hidden rounded-md border shadow-lg"
+          className="bg-popover absolute top-full left-0 z-50 mt-1 min-w-[220px] overflow-hidden rounded-md border shadow-lg"
         >
           <div className="text-muted-foreground px-3 py-2 text-[11px] tracking-[0.12em] uppercase">
-            {t("web.audiobooks.narrator.narrationCount", { count: options.length })}
+            {options.length} narrations
           </div>
           {options.map((it) => {
             const isCurrent = it.content_id === currentContentId;
@@ -62,14 +60,12 @@ export function NarratorPicker({ currentNarrator, currentContentId, others }: Na
                   setOpen(false);
                   if (!isCurrent) navigate(`/item/${it.content_id}`);
                 }}
-                className={`hover:bg-muted/60 flex w-full items-center justify-between gap-3 px-3 py-2 text-start text-sm ${
+                className={`hover:bg-muted/60 flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm ${
                   isCurrent ? "bg-muted/40 font-medium" : ""
                 }`}
               >
                 <span className="truncate">
-                  {it.narrators.length > 0
-                    ? it.narrators.join(", ")
-                    : t("web.audiobooks.narrator.unknown")}
+                  {it.narrators.length > 0 ? it.narrators.join(", ") : "Unknown narrator"}
                 </span>
                 {it.year ? (
                   <span className="text-muted-foreground shrink-0 text-xs">{it.year}</span>

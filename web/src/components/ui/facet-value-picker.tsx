@@ -5,11 +5,8 @@ import { Check, ChevronsUpDown } from "lucide-react";
 import type { CatalogFacetName } from "@/hooks/queries/catalog";
 import { useFacetValues, type FacetValueScope } from "@/hooks/queries/facetValues";
 import { useDebounce } from "@/hooks/useDebounce";
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { PortalContainerContext } from "./portal-container-context";
-import { formatLocale } from "@/lib/appLocale";
-import { isImeComposing } from "@/lib/imeComposition";
 
 interface FacetValuePickerProps {
   facet: CatalogFacetName;
@@ -30,6 +27,8 @@ type PickerOption =
   | { kind: "value"; value: string; count?: number }
   | { kind: "typed"; value: string };
 
+const titleCount = new Intl.NumberFormat();
+
 /**
  * A value for an exact-match rule, picked from the values titles carry. It
  * opens on the scope's most common values with their title counts, and typing
@@ -45,11 +44,10 @@ export function FacetValuePicker({
   onChange,
   scope,
   placeholder,
-  label,
+  label = "Value",
   searchLabel,
   className,
 }: FacetValuePickerProps) {
-  const t = useT();
   const [open, setOpen] = React.useState(false);
   const [search, setSearch] = React.useState("");
   const listboxId = React.useId();
@@ -71,12 +69,12 @@ export function FacetValuePicker({
         <button
           type="button"
           role="combobox"
-          aria-label={label ?? t("web.ui.facetValuePicker.label")}
+          aria-label={label}
           aria-haspopup="listbox"
           aria-expanded={open}
           aria-controls={open ? listboxId : undefined}
           className={cn(
-            "border-input bg-background hover:bg-accent focus-visible:border-ring focus-visible:ring-ring/50 flex h-9 min-w-0 items-center justify-between gap-2 rounded-md border px-3 text-start text-sm shadow-xs transition-[color,box-shadow] outline-none focus-visible:ring-[3px]",
+            "border-border bg-background hover:bg-accent focus-visible:border-ring focus-visible:ring-ring/50 flex h-9 min-w-0 items-center justify-between gap-2 rounded-md border px-3 text-left text-sm shadow-xs transition-[color,box-shadow] outline-none focus-visible:ring-[3px]",
             className,
           )}
           onKeyDown={(event) => {
@@ -149,7 +147,6 @@ function FacetValueList({
   listboxId: string;
   searchLabel: string;
 }) {
-  const t = useT();
   const typed = search.trim();
   const debounced = useDebounce(typed, 150);
   const result = useFacetValues(facet, debounced, scope ?? {});
@@ -186,7 +183,6 @@ function FacetValueList({
   }, [activeId]);
 
   function handleKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
-    if (isImeComposing(event)) return;
     const last = options.length - 1;
     const moves: Record<string, () => number> = {
       ArrowDown: () => Math.min(active + 1, last),
@@ -212,13 +208,9 @@ function FacetValueList({
   }
 
   let status: string | null = null;
-  if (data === null) status = t("web.ui.facetValuePicker.typeToSearch");
-  else if (data === undefined)
-    status = result.isError
-      ? t("web.ui.facetValuePicker.loadFailed")
-      : t("web.ui.facetValuePicker.loading");
-  else if (current && data.values.length === 0)
-    status = typed ? t("web.ui.select.noMatches") : t("web.ui.facetValuePicker.nothingYet");
+  if (data === null) status = "Type to search";
+  else if (data === undefined) status = result.isError ? "Couldn’t load values" : "Loading…";
+  else if (current && data.values.length === 0) status = typed ? "No matches" : "Nothing here yet";
 
   return (
     <>
@@ -232,7 +224,7 @@ function FacetValueList({
           aria-activedescendant={activeId}
           autoFocus
           value={search}
-          placeholder={t("web.ui.facetValuePicker.searchPlaceholder")}
+          placeholder="Search…"
           onChange={(event) => onSearchChange(event.target.value)}
           onKeyDown={handleKeyDown}
           className="placeholder:text-muted-foreground h-8 w-full bg-transparent px-1 text-sm outline-none"
@@ -262,11 +254,7 @@ function FacetValueList({
               aria-label={
                 count === undefined
                   ? undefined
-                  : t("web.ui.facetValuePicker.optionLabel", {
-                      value: option.value,
-                      count,
-                      number: count.toLocaleString(formatLocale()),
-                    })
+                  : `${option.value}, ${titleCount.format(count)} ${count === 1 ? "title" : "titles"}`
               }
               className={cn(
                 "flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-sm select-none",
@@ -282,12 +270,10 @@ function FacetValueList({
               />
               {option.kind === "typed" ? (
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate">
-                    {t("web.ui.facetValuePicker.useTyped", { value: option.value })}
-                  </span>
+                  <span className="block truncate">Use “{option.value}”</span>
                   {current && !data?.hasMore ? (
                     <span className="text-muted-foreground block text-xs">
-                      {t("web.ui.facetValuePicker.noTitlesYet")}
+                      No titles have this yet
                     </span>
                   ) : null}
                 </span>
@@ -296,7 +282,7 @@ function FacetValueList({
                   <span className="min-w-0 flex-1 truncate">{option.value}</span>
                   {count !== undefined ? (
                     <span className="text-muted-foreground shrink-0 text-xs tabular-nums">
-                      {count.toLocaleString(formatLocale())}
+                      {titleCount.format(count)}
                     </span>
                   ) : null}
                 </>
@@ -307,7 +293,7 @@ function FacetValueList({
       </div>
       {data?.hasMore ? (
         <p className="text-muted-foreground border-border border-t px-3 py-2 text-xs">
-          {t("web.ui.facetValuePicker.keepTyping")}
+          Keep typing to narrow
         </p>
       ) : null}
     </>

@@ -17,15 +17,14 @@ import (
 )
 
 const (
-	browseSortRecentlyAdded  = "recently_added"
-	browseTypeEpisode        = "episode"
-	BrowseSortTitle          = "sort_title"
-	BrowseSortReleaseDate    = "release_date"
-	BrowseSortCreatedAt      = "created_at"
-	BrowseSortYear           = "year"
-	BrowseSortRatingIMDB     = "rating_imdb"
-	BrowseSortRatingRTCritic = "rating_rt_critic"
-	BrowseOrderDescending    = "desc"
+	browseSortRecentlyAdded = "recently_added"
+	browseTypeEpisode       = "episode"
+	BrowseSortTitle         = "sort_title"
+	BrowseSortReleaseDate   = "release_date"
+	BrowseSortCreatedAt     = "created_at"
+	BrowseSortYear          = "year"
+	BrowseSortRatingIMDB    = "rating_imdb"
+	BrowseOrderDescending   = "desc"
 )
 
 // BrowseFilters represents all supported filter, sort, and pagination parameters
@@ -53,7 +52,7 @@ type BrowseFilters struct {
 	ContentRating      []string // comma-separated content ratings (e.g., PG-13, TV-MA)
 	Status             string   // pending, matched, unmatched (optional filter)
 	PersonID           int64    // filter items by person (joins item_people)
-	Sort               string   // created_at, release_date, rating_imdb, rating_tmdb, rating_rt_critic, year, sort_title, recently_added
+	Sort               string   // created_at, release_date, rating_imdb, rating_tmdb, year, sort_title, recently_added
 	Order              string   // asc, desc
 	Limit              int
 	MaxLimit           int // optional caller-specific cap; zero keeps the default browse cap
@@ -72,7 +71,6 @@ type BrowseFilters struct {
 	Studios                 []string // any matching studio name
 	OfficialRatings         []string // exact content ratings
 	MinCommunityRating      float64  // minimum rating_imdb, the compat CommunityRating
-	MinCriticRating         float64  // minimum rating_rt_critic, the compat CriticRating
 	MinPremiereDate         string   // inclusive YYYY-MM-DD on release/first-air date
 	MaxPremiereDate         string   // inclusive YYYY-MM-DD on release/first-air date
 	// ScopeFacetFilesToAccess limits the audio/subtitle language facets to
@@ -790,10 +788,9 @@ func filterWhereClauseForSource(filters BrowseFilters, baseRelation string, medi
 			parentAccess.AllowedLibraryIDs = []int{filters.LibraryID}
 		}
 		appendEpisodeParentLibraryAccessByEpisodeID(libraryContentExpr, parentAccess, &conditions, &args, &argIdx)
-		applyEpisodeRelationAccessFilter("mi", AccessFilter{MaturityLimits: filters.MaturityLimits}, &conditions, &args, &argIdx)
-	} else {
-		applyAccessFilter("mi", AccessFilter{MaturityLimits: filters.MaturityLimits}, &conditions, &args, &argIdx)
 	}
+
+	applyAccessFilter("mi", AccessFilter{MaturityLimits: filters.MaturityLimits}, &conditions, &args, &argIdx)
 
 	fromClause = baseRelation
 	if filters.PersonID > 0 {
@@ -1616,8 +1613,7 @@ func buildOrderByPlan(sort, order string, snapshot *time.Time, argIdx int, singl
 			return fmt.Sprintf("ORDER BY mi.release_date %s%s, mi.content_id ASC", direction, nullsClause), nil
 		}
 		return fmt.Sprintf(
-			"ORDER BY %s %s%s, mi.content_id ASC",
-			premiereDateKeyExpr,
+			"ORDER BY COALESCE(mi.release_date::text, NULLIF(BTRIM(mi.first_air_date), '')) %s%s, mi.content_id ASC",
 			direction,
 			nullsClause,
 		), nil
@@ -1639,8 +1635,6 @@ func buildOrderByPlan(sort, order string, snapshot *time.Time, argIdx int, singl
 		return fmt.Sprintf("ORDER BY mi.rating_imdb %s%s, mi.content_id ASC", direction, nullsClause), nil
 	case "rating_tmdb":
 		return fmt.Sprintf("ORDER BY mi.rating_tmdb %s%s, mi.content_id ASC", direction, nullsClause), nil
-	case BrowseSortRatingRTCritic:
-		return fmt.Sprintf("ORDER BY mi.rating_rt_critic %s%s, mi.content_id ASC", direction, nullsClause), nil
 	case "year":
 		return fmt.Sprintf("ORDER BY mi.year %s, mi.content_id ASC", direction), nil
 	case "title", "sort_title":
@@ -1725,7 +1719,7 @@ const sortTitleKeyExpr = "LOWER(COALESCE(NULLIF(BTRIM(mi.sort_title), ''), mi.ti
 
 // premiereDateKeyExpr is the release_date order key; first_air_date is text, so
 // both sides compare as ISO dates.
-var premiereDateKeyExpr = ReleaseDateSortSQL("mi")
+const premiereDateKeyExpr = "COALESCE(mi.release_date::text, NULLIF(BTRIM(mi.first_air_date), ''))"
 
 func appendCompatBrowsePredicates(filters BrowseFilters, conditions *[]string, args *[]any, argIdx *int) {
 	add := func(sql string, value any) {
@@ -1759,11 +1753,6 @@ func appendCompatBrowsePredicates(filters BrowseFilters, conditions *[]string, a
 	}
 	if filters.MinCommunityRating > 0 {
 		add("mi.rating_imdb >= $%d", filters.MinCommunityRating)
-	}
-	if filters.MinCriticRating > 0 {
-		// The score is a whole percentage; compare as float so a fractional
-		// minimum (Jellyfin sends a double) binds.
-		add("mi.rating_rt_critic >= $%d::float8", filters.MinCriticRating)
 	}
 	if filters.MinPremiereDate != "" {
 		add(premiereDateKeyExpr+" >= $%d", filters.MinPremiereDate)

@@ -1,5 +1,4 @@
 import type { RequestDownload } from "@/api/types";
-import { t } from "@/i18n";
 import { formatHoursMinutes } from "@/lib/audiobooks/duration";
 
 // Download progress labels live apart from mediaRequests: that module is on
@@ -40,27 +39,25 @@ export function formatRequestDownload(
 ): string {
   switch (download.phase) {
     case "queued":
-      return t("web.requests.download.waiting");
+      return "Waiting to download";
     case "paused":
-      return t("web.requests.download.paused");
+      return "Download paused";
     case "stalled":
-      return t("web.requests.download.stalled");
+      return "Download stalled";
     case "importing":
-      return t("web.requests.download.importing");
+      return "Importing";
     case "import_blocked":
-      return admin
-        ? t("web.requests.download.importBlocked")
-        : t("web.requests.download.waitingForImport");
+      return admin ? "Import blocked" : "Waiting for import";
     case "downloading":
       break;
     default:
-      return t("web.requests.download.downloading");
+      return "Downloading";
   }
-  const parts = [t("web.requests.download.downloading")];
+  const parts = ["Downloading"];
   const percent = requestDownloadPercent(download);
-  if (percent !== undefined) parts.push(t("web.common.format.percent", { percent }));
+  if (percent !== undefined) parts.push(`${percent}%`);
   const left = downloadTimeLeft(download, now);
-  if (left) parts.push(t("web.requests.download.timeLeft", { time: left }));
+  if (left) parts.push(`about ${left} left`);
   return parts.join(" · ");
 }
 

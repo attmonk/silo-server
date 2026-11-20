@@ -1,17 +1,8 @@
-import { useT, type MessageKey } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { rangeLabel, WIDGET_RANGE_ORDER } from "./range";
+import { rangeLabel, rangePhrase, WIDGET_RANGE_ORDER } from "./range";
 import { findDashboardWidget } from "./registry";
 import type { WidgetRange } from "./types";
 import { useWidgetRange } from "./widgetChrome";
-
-/** Accessible name of each option: what pressing it shows. */
-const SHOW_RANGE_LABELS: Record<WidgetRange, MessageKey> = {
-  hour: "web.admin.dashboard.rangePicker.show.hour",
-  day: "web.admin.dashboard.rangePicker.show.day",
-  week: "web.admin.dashboard.rangePicker.show.week",
-  month: "web.admin.dashboard.rangePicker.show.month",
-};
 
 /**
  * A compact segmented control for a widget's window.
@@ -33,7 +24,6 @@ export function RangeSegmentedControl({
   onChange: (range: WidgetRange) => void;
   className?: string;
 }) {
-  const t = useT();
   if (options.length < 2) {
     return null;
   }
@@ -52,7 +42,7 @@ export function RangeSegmentedControl({
             key={range}
             type="button"
             aria-pressed={active}
-            aria-label={t(SHOW_RANGE_LABELS[range])}
+            aria-label={`Show ${rangePhrase(range)}`}
             className={cn(
               "cursor-pointer rounded-full px-1.5 py-0.5 text-[10px] leading-none font-semibold tabular-nums transition-colors",
               "focus-visible:ring-ring focus-visible:ring-2 focus-visible:outline-none",

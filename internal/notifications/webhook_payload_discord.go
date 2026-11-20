@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// Discord embed accent colors (decimal RGB): the Next Up reason's, and the
-// default for an embed with no reason, such as a request notice.
+// Discord embed accent colors per reason (decimal RGB), in reason precedence
+// order: favorite, watchlist, continue_watching, next_up.
 const (
-	discordColorDefault = 5814783
-	discordColorNextUp  = 15158332
+	discordColorFavorite         = 5814783
+	discordColorWatchlist        = 3066993
+	discordColorContinueWatching = 15844367
+	discordColorNextUp           = 15158332
 )
 
 // Discord embed limits (enforced by the builder).
@@ -132,8 +135,6 @@ func discordEmbedAuthorLine(row DeliveryRow) string {
 			return "Now available on Silo"
 		}
 		return "Your request is now available on Silo"
-	case DeliveryTypeWatchlistAvailable:
-		return "Now available on Silo"
 	case DeliveryTypeRequestApproved:
 		return "Your request was approved on Silo"
 	case DeliveryTypeRequestDeclined:
@@ -244,11 +245,6 @@ func discordEmbedTitle(row DeliveryRow) string {
 			return titleWithYear(row.SeriesTitle, row.Year)
 		}
 		return "Request fulfilled"
-	case DeliveryTypeWatchlistAvailable:
-		if row.SeriesTitle != "" {
-			return titleWithYear(row.SeriesTitle, row.Year)
-		}
-		return "Watchlist title available"
 	case DeliveryTypeRequestApproved, DeliveryTypeRequestDeclined:
 		// No catalog join exists for an unfulfilled request; the title rides
 		// in the reason flags.
@@ -281,26 +277,43 @@ func discordEmbedTitle(row DeliveryRow) string {
 }
 
 func discordEmbedColor(flags ReasonFlags) int {
-	if flags.NextUp {
+	switch {
+	case flags.Favorite:
+		return discordColorFavorite
+	case flags.Watchlist:
+		return discordColorWatchlist
+	case flags.ContinueWatching:
+		return discordColorContinueWatching
+	case flags.NextUp:
 		return discordColorNextUp
+	default:
+		return discordColorFavorite
 	}
-	return discordColorDefault
 }
 
-// discordEmbedTotal counts the embed text Discord's 6,000-character limit
-// covers: title, description, field names and values, footer, and author name.
-func discordEmbedTotal(embed *discordEmbed) int {
-	total := discordTextLen(embed.Title) + discordTextLen(embed.Description)
+// discordEmbedLen sums length over the embed text Discord's 6,000-character
+// limit counts: title, description, field names and values, footer, and
+// author name.
+func discordEmbedLen(embed *discordEmbed, length func(string) int) int {
+	total := length(embed.Title) + length(embed.Description)
 	if embed.Author != nil {
-		total += discordTextLen(embed.Author.Name)
+		total += length(embed.Author.Name)
 	}
 	if embed.Footer != nil {
-		total += discordTextLen(embed.Footer.Text)
+		total += length(embed.Footer.Text)
 	}
 	for _, field := range embed.Fields {
-		total += discordTextLen(field.Name) + discordTextLen(field.Value)
+		total += length(field.Name) + length(field.Value)
 	}
 	return total
+}
+
+func byteLen(s string) int { return len(s) }
+
+// discordEmbedTotal counts in bytes, which never undercounts Discord's
+// characters.
+func discordEmbedTotal(embed *discordEmbed) int {
+	return discordEmbedLen(embed, byteLen)
 }
 
 // enforceDiscordTotalLimit applies the 6,000-char total cap: truncate the
@@ -311,7 +324,7 @@ func enforceDiscordTotalLimit(embed *discordEmbed) {
 		return
 	}
 	overflow := discordEmbedTotal(embed) - discordTotalLimit
-	if keep := discordTextLen(embed.Description) - overflow; keep > 0 {
+	if keep := len(embed.Description) - overflow; keep > 0 {
 		embed.Description = truncateWithEllipsis(embed.Description, keep)
 	} else {
 		embed.Description = ""
@@ -349,17 +362,12 @@ const discordMinTeaser = 80
 func discordTextLen(s string) int {
 	n := 0
 	for _, r := range s {
-		n += discordRuneLen(r)
+		n++
+		if r > 0xFFFF {
+			n++
+		}
 	}
 	return n
-}
-
-// discordRuneLen is one character's share of discordTextLen.
-func discordRuneLen(r rune) int {
-	if r > 0xFFFF {
-		return 2
-	}
-	return 1
 }
 
 // discordMessageChars counts embed text across a whole message, the scope of
@@ -367,7 +375,7 @@ func discordRuneLen(r rune) int {
 func discordMessageChars(embeds []discordEmbed) int {
 	total := 0
 	for i := range embeds {
-		total += discordEmbedTotal(&embeds[i])
+		total += discordEmbedLen(&embeds[i], discordTextLen)
 	}
 	return total
 }
@@ -426,24 +434,22 @@ func fitDiscordMessage(entries []discordDigestEntry) ([]discordEmbed, int) {
 	}
 }
 
-// truncateWithEllipsis clips value to at most limit characters, counted as
-// discordTextLen counts them, ending a cut value with "…" (one character). It
-// walks at most limit characters and never counts the rest: a client-supplied
-// request overview can be ~1 MiB.
 func truncateWithEllipsis(value string, limit int) string {
-	n, cut := 0, -1
-	for i, r := range value {
-		width := discordRuneLen(r)
-		if cut < 0 && n+width > limit-1 {
-			cut = i // the ellipsis takes the last character of the limit
-		}
-		if n+width > limit {
-			if cut == 0 {
-				return ""
-			}
-			return value[:cut] + "…"
-		}
-		n += width
+	const ellipsis = "…" // 3 bytes in UTF-8; limits are byte counts
+	if limit <= 0 {
+		return ""
 	}
-	return value
+	if len(value) <= limit {
+		return value
+	}
+	if limit <= len(ellipsis) {
+		return value[:0]
+	}
+	// Cut at the byte budget, backed up to a rune start. The cost must not
+	// grow with len(value): a client-supplied request overview can be ~1 MiB.
+	cut := limit - len(ellipsis)
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + ellipsis
 }

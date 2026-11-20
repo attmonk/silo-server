@@ -15,9 +15,6 @@ export interface WidgetChrome {
   id: WidgetId | null;
   range: WidgetRange;
   setRange: (range: WidgetRange) => void;
-  /** The presentation the admin picked, or undefined for the widget's default. */
-  view: string | undefined;
-  setView: (view: string) => void;
   /**
    * Report whether this widget currently has nothing worth a full-height box.
    *
@@ -41,8 +38,6 @@ const FALLBACK_CHROME: WidgetChrome = {
   id: null,
   range: "day",
   setRange: () => {},
-  view: undefined,
-  setView: () => {},
   setCollapsed: () => {},
 };
 
@@ -50,16 +45,12 @@ export function WidgetChromeProvider({
   id,
   range,
   setRange,
-  view,
-  setView,
   setCollapsed,
   children,
 }: {
   id: WidgetId;
   range: WidgetRange | undefined;
   setRange: (id: WidgetId, range: WidgetRange) => void;
-  view?: string;
-  setView?: (id: WidgetId, view: string) => void;
   setCollapsed?: (id: WidgetId, collapsed: boolean) => void;
   children: ReactNode;
 }) {
@@ -75,16 +66,14 @@ export function WidgetChromeProvider({
       id,
       range: range ?? FALLBACK_CHROME.range,
       setRange: (next: WidgetRange) => setRange(id, next),
-      view,
-      setView: (next: string) => setView?.(id, next),
       setCollapsed: reportCollapsed,
     }),
-    [id, range, setRange, view, setView, reportCollapsed],
+    [id, range, setRange, reportCollapsed],
   );
   return <WidgetChromeContext.Provider value={value}>{children}</WidgetChromeContext.Provider>;
 }
 
-/** The window and view this widget is showing, and how to change them. */
+/** The window this widget is showing, and how to change it. */
 export function useWidgetRange(): WidgetChrome {
   return useContext(WidgetChromeContext) ?? FALLBACK_CHROME;
 }

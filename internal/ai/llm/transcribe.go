@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -200,13 +199,8 @@ func (c *Client) Transcribe(ctx context.Context, req TranscribeRequest) (*Transc
 				return &HTTPError{StatusCode: http.StatusBadGateway, message: "transcription API error: " + parsed.Error.Message}
 			}
 			if parsed.Segments == nil {
-				// Text without segments is a model answering plain json; an
-				// empty reply may not be a transcription endpoint at all.
-				err := fmt.Errorf("transcription endpoint did not return verbose_json segments (model %q); a verbose_json-capable Whisper endpoint is required: %w", cfg.ASRModel, ErrUnusableResponse)
-				if strings.TrimSpace(parsed.Text) != "" {
-					err = fmt.Errorf("%w: %w", ErrTimedSegmentsUnsupported, err)
-				}
-				return &permanentError{err: err}
+				return &permanentError{err: fmt.Errorf(
+					"transcription endpoint did not return verbose_json segments (model %q); a verbose_json-capable Whisper endpoint is required: %w", cfg.ASRModel, ErrUnusableResponse)}
 			}
 			out := &Transcription{Language: parsed.Language}
 			for _, s := range *parsed.Segments {
@@ -223,34 +217,16 @@ func (c *Client) Transcribe(ctx context.Context, req TranscribeRequest) (*Transc
 				})
 			}
 			if len(out.Segments) == 0 && strings.TrimSpace(parsed.Text) != "" {
-				return &permanentError{err: fmt.Errorf("transcription endpoint returned text without timed segments (model %q): %w: %w", cfg.ASRModel, ErrTimedSegmentsUnsupported, ErrUnusableResponse)}
+				return &permanentError{err: fmt.Errorf("transcription endpoint returned text without timed segments (model %q): %w", cfg.ASRModel, ErrUnusableResponse)}
 			}
 			attachTopLevelWords(out.Segments, wordsFromJSON(parsed.Words))
 			result = out
 			return nil
 		})
 	if doErr != nil {
-		if rejectsTimedOutput(doErr) {
-			return nil, fmt.Errorf("transcription model %q does not support timed output: %w: %w", cfg.ASRModel, ErrTimedSegmentsUnsupported, doErr)
-		}
 		return nil, decorateTranscribeError(doErr)
 	}
 	return result, nil
-}
-
-// rejectsTimedOutput reports a 400 naming the field Silo uses to request
-// timestamps. OpenAI answers this way for gpt-transcribe, which supports only
-// json or text output and no timestamp granularities.
-func rejectsTimedOutput(err error) bool {
-	status, ok := errors.AsType[*HTTPError](err)
-	if !ok || status.StatusCode != http.StatusBadRequest {
-		return false
-	}
-	switch status.Param {
-	case "response_format", "timestamp_granularities", "timestamp_granularities[]":
-		return true
-	}
-	return false
 }
 
 func wordsFromJSON(words []transcriptionWordJSON) []TranscriptionWord {

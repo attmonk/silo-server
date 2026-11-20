@@ -13,20 +13,15 @@ export interface SettingsSearchItem {
 
 export interface SettingsSearchGroup<T extends SettingsSearchItem> {
   label: string;
-  /** Extra terms that match the whole group, such as its English heading in a translated interface. */
-  keywords?: readonly string[];
   items: readonly T[];
 }
 
-// Callers pass the labels as shown, in the interface language, so letters and
-// digits of any script count as word characters: a Latin-only class would turn
-// a Cyrillic or CJK label into nothing searchable.
 function normalizeSearchText(value: string) {
   return value
     .toLowerCase()
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^\p{L}\p{N}\p{M}]+/gu, " ")
+    .replace(/[^a-z0-9]+/g, " ")
     .trim();
 }
 
@@ -43,14 +38,7 @@ function itemSearchText<T extends SettingsSearchItem>(group: SettingsSearchGroup
   ]);
 
   return normalizeSearchText(
-    [
-      group.label,
-      ...(group.keywords ?? []),
-      item.label,
-      item.description,
-      ...(item.keywords ?? []),
-      ...(settingText ?? []),
-    ]
+    [group.label, item.label, item.description, ...(item.keywords ?? []), ...(settingText ?? [])]
       .filter(Boolean)
       .join(" "),
   );
@@ -93,7 +81,7 @@ export function filterSettingsSearchGroups<T extends SettingsSearchItem>(
 
   return groups
     .map((group) => {
-      const groupText = normalizeSearchText([group.label, ...(group.keywords ?? [])].join(" "));
+      const groupText = normalizeSearchText(group.label);
       const groupMatches = textMatchesTokens(groupText, tokens);
       const items = groupMatches
         ? [...group.items]

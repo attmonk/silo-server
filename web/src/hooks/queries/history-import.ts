@@ -8,7 +8,6 @@ import type {
 import { v2, V2ProblemError, type V2Body } from "@/api/v2/request";
 import { historyImportKeys } from "./keys";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 import {
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
@@ -116,7 +115,7 @@ export function useHistoryImportRun(id?: string) {
       const profileContext = importContext();
       const previous = client.getQueryData<PersonalImportRun>(queryKey);
       if (previous?.location && previous.location !== runLocation(id!))
-        throw new Error(t("web.common.toast.historyImport.unexpectedLocation"));
+        throw new Error("Unexpected import status location. Refresh imports before trying again.");
       const h = runHeaders();
       const run = await v2("GET /api/v2/history-imports/runs/{id}", {
         path: { id: id! },
@@ -126,7 +125,7 @@ export function useHistoryImportRun(id?: string) {
       checkImportContext(profileContext);
       const metadata = h.metadata();
       if (metadata.location && metadata.location !== runLocation(id!))
-        throw new Error(t("web.common.toast.historyImport.unexpectedLocation"));
+        throw new Error("Unexpected import status location. Refresh imports before trying again.");
       return { ...historyImportRunFromV2(run), ...metadata, location: runLocation(id!) };
     },
     enabled: !!id,
@@ -143,9 +142,7 @@ export function useLoginEmbyConnect() {
     mutationFn: (body: EmbyConnectLoginRequest): Promise<EmbyConnectLoginResponse> =>
       v2("POST /api/v2/history-imports/emby-connect/login", { body }),
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.common.toast.historyImport.embyConnectFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to sign in with Emby Connect");
     },
   });
 }
@@ -154,9 +151,7 @@ export function useCreatePlexPin() {
   return useMutation({
     mutationFn: (): Promise<PlexPinResponse> => v2("POST /api/v2/history-imports/plex/auth/pin"),
     onError: (err) => {
-      toast.error(
-        err instanceof Error ? err.message : t("web.common.toast.historyImport.plexSignInFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to start Plex sign-in");
     },
   });
 }
@@ -177,25 +172,27 @@ export function useCreateHistoryImportRun() {
       }).catch((error: unknown) => {
         if (error instanceof V2ProblemError || error instanceof StaleApiRequestContextError)
           throw error;
-        throw new Error(t("web.common.toast.historyImport.acceptanceUnconfirmed"));
+        throw new Error(
+          "Import acceptance could not be confirmed. Refresh imports before submitting again.",
+        );
       });
       checkImportContext(profileContext);
       const metadata = h.metadata();
       if (metadata.location !== runLocation(run.id))
-        throw new Error(t("web.common.toast.historyImport.acceptanceUnconfirmed"));
+        throw new Error(
+          "Import acceptance could not be confirmed. Refresh imports before submitting again.",
+        );
       return { ...historyImportRunFromV2(run), ...metadata };
     },
     onSuccess: (run) => {
       if (scope !== importScope()) return;
       queryClient.setQueryData([...historyImportKeys.run(run.id), scope], run);
-      toast.success(t("web.common.toast.historyImport.queued"));
+      toast.success("Import queued");
       queryClient.invalidateQueries({ queryKey: historyImportKeys.runs() });
     },
     onError: (err) => {
       queryClient.invalidateQueries({ queryKey: historyImportKeys.runs() });
-      toast.error(
-        err instanceof Error ? err.message : t("web.common.toast.historyImport.startFailed"),
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to start import");
     },
   });
 }

@@ -2,24 +2,16 @@ import { useState } from "react";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { decodeThumbhash } from "@/lib/thumbhash";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
-import { useT, type MessageKey, type TextValues } from "@/i18n";
 import type { ItemDetail } from "@/api/types";
 
-/** "Series — S1 E2 "Title"" or "Title (1999)", formatted with `t` (`englishText` to store it). */
-export function itemHeadline(item: ItemDetail, t: (id: MessageKey, values?: TextValues) => string) {
+export function itemHeadline(item: ItemDetail) {
   if (item.type === "episode" && item.series_title) {
-    const code = {
-      series: item.series_title,
-      season: String(item.season_number ?? "?"),
-      episode: String(item.episode_number ?? "?"),
-    };
+    const code = `S${item.season_number ?? "?"} E${item.episode_number ?? "?"}`;
     return item.title
-      ? t("web.watchTogether.hero.episodeTitled", { ...code, title: item.title })
-      : t("web.watchTogether.hero.episode", code);
+      ? `${item.series_title} — ${code} "${item.title}"`
+      : `${item.series_title} — ${code}`;
   }
-  return item.year
-    ? t("web.watchTogether.hero.movieYear", { title: item.title, year: item.year })
-    : item.title;
+  return item.year ? `${item.title} (${item.year})` : item.title;
 }
 
 export function itemMetaLine(item: ItemDetail) {
@@ -51,7 +43,6 @@ export function StagedHero({
   caption?: string;
   children?: React.ReactNode;
 }) {
-  const t = useT();
   const detail = useCatalogItemDetail(contentId, libraryId);
   const item = detail.data;
   const [backdropLoaded, setBackdropLoaded] = useState(false);
@@ -76,7 +67,7 @@ export function StagedHero({
           onLoad={() => setBackdropLoaded(true)}
         />
       ) : null}
-      <div className="from-background via-background/90 absolute inset-0 bg-gradient-to-r to-transparent rtl:bg-gradient-to-l" />
+      <div className="from-background via-background/90 absolute inset-0 bg-gradient-to-r to-transparent" />
       <div className="relative flex gap-5 p-5 sm:p-6">
         <div
           className="media-card-image hidden aspect-[2/3] w-28 shrink-0 overflow-hidden sm:block"
@@ -107,11 +98,7 @@ export function StagedHero({
             {badge}
           </div>
           <h2 className="text-xl font-semibold tracking-tight sm:text-2xl">
-            {item
-              ? itemHeadline(item, t)
-              : detail.isError
-                ? t("web.watchTogether.hero.unavailable")
-                : t("web.watchTogether.hero.loading")}
+            {item ? itemHeadline(item) : detail.isError ? "Unavailable" : "Loading…"}
           </h2>
           {item ? (
             <div className="text-muted-foreground text-sm">

@@ -7,8 +7,6 @@ import (
 	"io"
 	"net/http"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/netguard"
 )
 
 // PackageError is an install or update refused because of the plugin package
@@ -58,29 +56,13 @@ func AsPackageError(err error) (*PackageError, bool) {
 // a permanent one. A body that sends nothing for packageFetchReadIdleTimeout
 // counts as cut off. A canceled ctx returns its own error, not a PackageError.
 func fetchPackageResource(ctx context.Context, client *http.Client, rawURL, subject string) ([]byte, error) {
-	return fetchPackageResourceWithIdle(ctx, client, rawURL, subject, packageFetchReadIdleTimeout, 0)
+	return fetchPackageResourceWithIdle(ctx, client, rawURL, subject, packageFetchReadIdleTimeout)
 }
 
-// errPackageResourceTooLarge is the cause when a body exceeds the limit given
-// to fetchPackageResourceLimited.
-var errPackageResourceTooLarge = errors.New("response body exceeds the size limit")
-
-// fetchPackageResourceLimited is fetchPackageResource for a small resource:
-// a body longer than maxBytes stops the read and returns
-// errPackageResourceTooLarge, which the caller turns into its own
-// PackageError.
-func fetchPackageResourceLimited(ctx context.Context, client *http.Client, rawURL, subject string, maxBytes int64) ([]byte, error) {
-	return fetchPackageResourceWithIdle(ctx, client, rawURL, subject, packageFetchReadIdleTimeout, maxBytes)
-}
-
-// fetchPackageResourceWithIdle fetches rawURL; maxBytes > 0 caps the body.
-func fetchPackageResourceWithIdle(ctx context.Context, client *http.Client, rawURL, subject string, readIdle time.Duration, maxBytes int64) ([]byte, error) {
+func fetchPackageResourceWithIdle(ctx context.Context, client *http.Client, rawURL, subject string, readIdle time.Duration) ([]byte, error) {
 	fetchCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	// Only admins add repositories, and a repository on the server's own
-	// network is a supported setup. The netguard transport still refuses
-	// blocked addresses on every dial and redirect.
-	req, err := http.NewRequestWithContext(netguard.WithPrivateAccess(fetchCtx), http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, invalidPackageAddressError(fmt.Errorf("build request for %q: %w", rawURL, err), subject)
 	}
@@ -93,10 +75,6 @@ func fetchPackageResourceWithIdle(ctx context.Context, client *http.Client, rawU
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("fetch %q: %w", rawURL, ctx.Err())
-		}
-		// A refused address stays refused, so retrying can't help.
-		if errors.Is(err, netguard.ErrBlockedDestination) || errors.Is(err, netguard.ErrPrivateDestination) {
-			return nil, refusedPackageAddressError(fmt.Errorf("fetch %q: %w", rawURL, err), subject)
 		}
 		return nil, transientPackageError(fmt.Errorf("fetch %q: %w", rawURL, err),
 			"Silo couldn't reach the host for %s. Check that this server can reach it, then try again.", subject)
@@ -111,11 +89,7 @@ func fetchPackageResourceWithIdle(ctx context.Context, client *http.Client, rawU
 	}
 	body := newIdleTimeoutReader(resp.Body, readIdle, cancel)
 	defer body.stop()
-	var reader io.Reader = body
-	if maxBytes > 0 {
-		reader = io.LimitReader(body, maxBytes+1)
-	}
-	data, err := io.ReadAll(reader)
+	data, err := io.ReadAll(body)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("read %q: %w", rawURL, ctx.Err())
@@ -124,9 +98,6 @@ func fetchPackageResourceWithIdle(ctx context.Context, client *http.Client, rawU
 			err = cause
 		}
 		return nil, transientPackageError(fmt.Errorf("read %q: %w", rawURL, err), "The download of %s was interrupted. Try again.", subject)
-	}
-	if maxBytes > 0 && int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("read %q: %w (%d bytes)", rawURL, errPackageResourceTooLarge, maxBytes)
 	}
 	return data, nil
 }
@@ -138,11 +109,4 @@ func unsupportedAPIVersionError(version, supported string) error {
 
 func invalidPackageAddressError(err error, subject string) error {
 	return packageError(err, "Silo can't download %s: its address isn't a valid http or https link.", subject)
-}
-
-// refusedPackageAddressError reports an address the netguard transport
-// refused, such as a link-local or cloud metadata address. Like an invalid
-// address it is permanent.
-func refusedPackageAddressError(err error, subject string) error {
-	return packageError(err, "Silo can't download %s: its address is in a range this server never connects to.", subject)
 }

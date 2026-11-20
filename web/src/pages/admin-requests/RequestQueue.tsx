@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { MouseEvent } from "react";
 import { Link, useSearchParams } from "react-router";
-import { Maximize2, RefreshCw, Search, X } from "lucide-react";
+import { AlertTriangle, Maximize2, RefreshCw, Search, X } from "lucide-react";
 import type { MediaRequest } from "@/api/types";
 import type { AdminRequestCounts } from "@/api/v2/adminRequests";
 import { BulkSelectionCheckbox } from "@/components/BulkSelectionCheckbox";
@@ -9,9 +9,11 @@ import { RequestDownloadProgress } from "@/components/RequestDownloadProgress";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAdminUsers } from "@/hooks/queries/admin/users";
 import {
+  type BulkRequestProgress,
   useAdminCancelMediaRequest,
   useAdminRequestCounts,
   useAdminRequestQueue,
@@ -22,14 +24,12 @@ import {
   useRetryMediaRequest,
 } from "@/hooks/queries/admin/requests";
 import { useDebounce } from "@/hooks/useDebounce";
-import { numberText, useT, type MessageKey, type Translate } from "@/i18n";
 import { formatRelativeTime } from "@/lib/date";
 import { formatDateTime } from "@/lib/datetime";
 import { formatMediaType, formatSeasonList, requestDetailHref } from "@/lib/mediaRequests";
 import { cn } from "@/lib/utils";
 import { RequestActionButtons, type RequestQueueActionHandlers } from "./RequestActionButtons";
 import { RequestQueueDialog } from "./RequestQueueDialog";
-import { BulkProgress } from "./BulkProgress";
 import {
   EmptyPanel,
   ReasonDialog,
@@ -50,13 +50,11 @@ import {
 } from "./requestQueueModel";
 
 const SEARCH_DEBOUNCE_MS = 300;
-const SEPARATOR = " · ";
-const SPACE = " ";
 
-const MEDIA_FILTERS: { value: RequestQueueMediaFilter; label: MessageKey }[] = [
-  { value: "all", label: "web.admin.requests.queue.media.all" },
-  { value: "movie", label: "web.admin.requests.queue.media.movies" },
-  { value: "series", label: "web.admin.requests.queue.media.series" },
+const MEDIA_FILTERS: { value: RequestQueueMediaFilter; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "movie", label: "Movies" },
+  { value: "series", label: "Series" },
 ];
 
 /** A decline or cancellation waiting for its optional reason. */
@@ -73,7 +71,6 @@ type BulkDone = (failedIds: string[]) => void;
  * `?view=` names the view and `?user=` limits the rows to one account.
  */
 export function RequestQueue() {
-  const t = useT();
   const [searchParams, setSearchParams] = useSearchParams();
   const urlView = parseRequestQueueView(searchParams.get("view"));
   const userId = parseRequestQueueUser(searchParams.get("user"));
@@ -209,10 +206,10 @@ export function RequestQueue() {
         className="gap-4"
       >
         <div className="-mx-4 overflow-x-auto px-4 pb-1 [scrollbar-width:thin] sm:mx-0 sm:px-0">
-          <TabsList aria-label={t("web.admin.requests.queue.viewsLabel")} className="w-max">
+          <TabsList aria-label="Request views" className="w-max">
             {REQUEST_QUEUE_VIEWS.map((view) => (
               <TabsTrigger key={view.value} value={view.value} className="px-3">
-                {t(view.label)} <ViewCount view={view.value} counts={counts.data} />
+                {view.label} <ViewCount view={view.value} counts={counts.data} />
               </TabsTrigger>
             ))}
           </TabsList>
@@ -221,23 +218,19 @@ export function RequestQueue() {
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative min-w-[220px] flex-1 sm:max-w-sm">
             <Search
-              className="text-muted-foreground pointer-events-none absolute start-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2"
+              className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2"
               aria-hidden="true"
             />
             <Input
               type="search"
-              aria-label={t("web.admin.requests.queue.searchLabel")}
-              placeholder={t("web.admin.requests.queue.searchPlaceholder")}
+              aria-label="Search requests"
+              placeholder="Search by title or TMDB ID"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              className="h-8 ps-9 text-[13px]"
+              className="h-8 pl-9 text-[13px]"
             />
           </div>
-          <div
-            role="group"
-            aria-label={t("web.admin.requests.queue.mediaTypeLabel")}
-            className="flex gap-1"
-          >
+          <div role="group" aria-label="Media type" className="flex gap-1">
             {MEDIA_FILTERS.map((option) => (
               <Button
                 key={option.value}
@@ -247,18 +240,16 @@ export function RequestQueue() {
                 aria-pressed={mediaType === option.value}
                 onClick={() => setMediaType(option.value)}
               >
-                {t(option.label)}
+                {option.label}
               </Button>
             ))}
           </div>
           {userId !== undefined ? (
-            <Badge variant="outline" className="h-7 gap-1.5 pe-1 text-xs">
-              {t("web.admin.requests.queue.requestedByFilter", {
-                name: username(userId) ?? accountFallback(t, userId),
-              })}
+            <Badge variant="outline" className="h-7 gap-1.5 pr-1 text-xs">
+              Requested by {username(userId) ?? `User ${userId}`}
               <button
                 type="button"
-                aria-label={t("web.admin.requests.queue.clearUserFilter")}
+                aria-label="Show requests from every account"
                 className="hover:bg-accent rounded-sm p-0.5"
                 onClick={() => updateParams((params) => params.delete("user"))}
               >
@@ -270,12 +261,12 @@ export function RequestQueue() {
             type="button"
             variant="ghost"
             size="sm"
-            className="ms-auto"
+            className="ml-auto"
             disabled={refresh.isRefreshing}
             onClick={refresh.refresh}
           >
             <RefreshCw aria-hidden="true" className={cn(refresh.isRefreshing && "animate-spin")} />
-            {t("web.admin.requests.queue.refresh")}
+            Refresh
           </Button>
         </div>
 
@@ -284,7 +275,7 @@ export function RequestQueue() {
             <TabsContent key={view.value} value={view.value}>
               <QueueList
                 view={view.value}
-                emptyText={t(view.empty)}
+                emptyText={view.empty}
                 filter={queueFilter(view.value)}
                 filtered={filtered}
                 username={username}
@@ -313,7 +304,7 @@ export function RequestQueue() {
       />
       <ReasonDialog
         open={prompt !== null}
-        {...reasonDialogText(t, prompt)}
+        {...reasonDialogText(prompt)}
         pending={bulk.isRunning}
         onConfirm={confirmPrompt}
         onOpenChange={(open) => {
@@ -330,45 +321,35 @@ function newerRequest(a: MediaRequest | undefined, b: MediaRequest | undefined) 
   return Date.parse(b.updated_at) > Date.parse(a.updated_at) ? b : a;
 }
 
-/** An account's name when its username isn't known: "User 7". */
-function accountFallback(t: Translate, id: number) {
-  return t("web.admin.requests.userFallback", { id: id });
-}
-
-function reasonDialogText(t: Translate, prompt: ReasonPrompt | null) {
+function reasonDialogText(prompt: ReasonPrompt | null) {
   if (prompt?.action === "bulk-decline") {
     const n = prompt.requests.length;
-    const values = { count: n, count_text: n };
     return {
-      title: t("web.admin.requests.reasonDialog.bulkDecline.title", values),
-      description: t("web.admin.requests.reasonDialog.bulkDecline.description", values),
-      confirmLabel: t("web.admin.requests.reasonDialog.bulkDecline.confirm", values),
+      title: `Decline ${n} ${n === 1 ? "request" : "requests"}`,
+      description: `The ${n === 1 ? "request" : "requests"} will be marked declined, and each requester is told. Add an optional note for them.`,
+      confirmLabel: `Decline ${n}`,
     };
   }
   if (prompt?.action === "cancel" && prompt.request.outcome === "failed") {
     return {
-      title: t("web.admin.requests.reasonDialog.close.title"),
-      description: t("web.admin.requests.reasonDialog.close.description", {
-        title: prompt.request.title,
-      }),
-      confirmLabel: t("web.admin.requests.reasonDialog.close.confirm"),
+      title: "Close request",
+      description: `"${prompt.request.title}" failed. Closing it moves it to Done, and nothing more is sent for it. Add an optional note.`,
+      confirmLabel: "Close request",
     };
   }
   if (prompt?.action === "cancel") {
     return {
-      title: t("web.admin.requests.reasonDialog.cancel.title"),
-      description: t("web.admin.requests.reasonDialog.cancel.description", {
-        title: prompt.request.title,
-      }),
-      confirmLabel: t("web.admin.requests.reasonDialog.cancel.confirm"),
+      title: "Cancel request",
+      description: `"${prompt.request.title}" will be withdrawn before anything is sent for it. Add an optional note.`,
+      confirmLabel: "Cancel request",
     };
   }
   return {
-    title: t("web.admin.requests.reasonDialog.decline.title"),
+    title: "Decline request",
     description: prompt
-      ? t("web.admin.requests.reasonDialog.decline.description", { title: prompt.request.title })
+      ? `"${prompt.request.title}" will be marked declined. Add an optional note for the requester.`
       : "",
-    confirmLabel: t("web.admin.requests.reasonDialog.decline.confirm"),
+    confirmLabel: "Decline",
   };
 }
 
@@ -420,7 +401,6 @@ function QueueList({
   onFilterUser: (id: number) => void;
   onBulkDecline: (requests: MediaRequest[], onDone: BulkDone) => void;
 }) {
-  const t = useT();
   const queue = useAdminRequestQueue(filter);
   const rows = useMemo(() => queue.data?.pages.flatMap((page) => page.items) ?? [], [queue.data]);
   const selectable = view === "needs_approval";
@@ -449,15 +429,13 @@ function QueueList({
   if (queue.isError && rows.length === 0) {
     return (
       <EmptyPanel
-        title={t("web.admin.requests.queue.loadFailed.title")}
+        title="Requests failed"
         detail={
-          queue.error instanceof Error
-            ? queue.error.message
-            : t("web.admin.requests.queue.loadFailed.detail")
+          queue.error instanceof Error ? queue.error.message : "The queue could not be loaded."
         }
       >
         <Button variant="outline" size="sm" onClick={() => void queue.refetch()}>
-          {t("common.tryAgain")}
+          Try again
         </Button>
       </EmptyPanel>
     );
@@ -481,12 +459,8 @@ function QueueList({
 
       {rows.length === 0 ? (
         <EmptyPanel
-          title={
-            filtered
-              ? t("web.admin.requests.queue.noMatches.title")
-              : t("web.admin.requests.queue.allClear")
-          }
-          detail={filtered ? t("web.admin.requests.queue.noMatches.detail") : emptyText}
+          title={filtered ? "No matching requests" : "All clear"}
+          detail={filtered ? "No request in this view matches the filters." : emptyText}
         />
       ) : (
         <div
@@ -499,18 +473,15 @@ function QueueList({
             {selectable ? <span className="w-4" /> : null}
             <span className="w-10" />
             <div className="grid flex-1 grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,1.3fr)] gap-x-6">
-              <span>{t("web.admin.requests.queue.column.request")}</span>
-              <span>{t("web.admin.requests.queue.column.state")}</span>
-              <span>{t("web.admin.requests.queue.column.servers")}</span>
+              <span>Request</span>
+              <span>State</span>
+              <span>Servers</span>
             </div>
-            <span className="w-60 shrink-0 text-end">
-              <span className="sr-only">{t("web.admin.requests.queue.column.actions")}</span>
+            <span className="w-60 shrink-0 text-right">
+              <span className="sr-only">Actions</span>
             </span>
           </div>
-          <ul
-            aria-label={t("web.admin.requests.queue.listLabel")}
-            className="divide-border divide-y"
-          >
+          <ul aria-label="Requests" className="divide-border divide-y">
             {rows.map((request) => (
               <QueueRow
                 key={request.id}
@@ -532,7 +503,7 @@ function QueueList({
         <p role="alert" className="text-destructive text-sm">
           {queue.error instanceof Error
             ? queue.error.message
-            : t("web.admin.requests.queue.moreFailed")}
+            : "More requests could not be loaded."}
         </p>
       ) : null}
       {queue.hasNextPage ? (
@@ -541,9 +512,7 @@ function QueueList({
           disabled={queue.isFetchingNextPage}
           onClick={() => void queue.fetchNextPage()}
         >
-          {queue.isFetchingNextPage
-            ? t("web.admin.requests.queue.loadingMore")
-            : t("web.admin.requests.queue.loadMore")}
+          {queue.isFetchingNextPage ? "Loading…" : "Load more"}
         </Button>
       ) : null}
     </div>
@@ -567,9 +536,7 @@ function BulkBar({
   onApprove: () => void;
   onDecline: () => void;
 }) {
-  const t = useT();
   const count = selectedRows.length;
-  const countValues = { count, count_text: count };
   const someSelected = count > 0 && !allSelected;
   return (
     <div className="space-y-2">
@@ -585,20 +552,15 @@ function BulkBar({
             disabled={rows.length === 0 || bulk.isRunning}
             onChange={(event) => onSelectAll(event.target.checked)}
           />
-          {count > 0
-            ? t("web.admin.requests.bulk.selected", countValues)
-            : t("web.admin.requests.bulk.selectAll", {
-                count: rows.length,
-                count_text: rows.length,
-              })}
+          {count > 0 ? `${count} selected` : `Select all ${rows.length} shown`}
         </label>
         {count > 0 ? (
           <div className="flex flex-wrap gap-2">
             <Button size="sm" disabled={bulk.isRunning} onClick={onApprove}>
-              {t("web.admin.requests.bulk.approve", countValues)}
+              Approve {count}
             </Button>
             <Button size="sm" variant="outline" disabled={bulk.isRunning} onClick={onDecline}>
-              {t("web.admin.requests.reasonDialog.bulkDecline.confirm", countValues)}
+              Decline {count}
             </Button>
             <Button
               size="sm"
@@ -606,7 +568,7 @@ function BulkBar({
               disabled={bulk.isRunning}
               onClick={() => onSelectAll(false)}
             >
-              {t("web.admin.requests.bulk.clear")}
+              Clear
             </Button>
           </div>
         ) : null}
@@ -614,6 +576,55 @@ function BulkBar({
       {bulk.progress ? (
         <BulkProgress progress={bulk.progress} running={bulk.isRunning} onDismiss={bulk.reset} />
       ) : null}
+    </div>
+  );
+}
+
+function BulkProgress({
+  progress,
+  running,
+  onDismiss,
+}: {
+  progress: BulkRequestProgress;
+  running: boolean;
+  onDismiss: () => void;
+}) {
+  const { action, total, done, failures } = progress;
+  const verb = action === "approve" ? "Approving" : "Declining";
+  const past = action === "approve" ? "approved" : "declined";
+  if (running) {
+    return (
+      <div role="status" className="border-border bg-card space-y-2 rounded-lg border p-3 text-sm">
+        <p>
+          {verb} {done} of {total}…
+        </p>
+        <Progress value={(done / total) * 100} aria-label={`${verb} requests`} />
+      </div>
+    );
+  }
+  if (failures.length === 0) return null;
+  return (
+    <div
+      role="alert"
+      className="border-destructive/40 bg-destructive/5 space-y-2 rounded-lg border p-3 text-sm"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <p className="flex items-center gap-2 font-medium">
+          <AlertTriangle className="text-destructive h-4 w-4 shrink-0" aria-hidden="true" />
+          {total - failures.length} of {total} {past}; {failures.length} couldn&apos;t be.
+        </p>
+        <Button size="sm" variant="ghost" onClick={onDismiss}>
+          Dismiss
+        </Button>
+      </div>
+      <ul className="space-y-1">
+        {failures.map((failure) => (
+          <li key={failure.id}>
+            <span className="font-medium">{failure.title}</span>
+            <span className="text-muted-foreground">: {failure.message}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -642,7 +653,6 @@ function QueueRow({
   onOpen: () => void;
   onFilterUser: (id: number) => void;
 }) {
-  const t = useT();
   const requestedAgo = formatRelativeTime(request.created_at, { absoluteAfterDays: 30 });
   const userId = request.requested_by_user_id;
   return (
@@ -658,7 +668,7 @@ function QueueRow({
       {selectable ? (
         <div className="pt-3">
           <BulkSelectionCheckbox
-            label={t("web.admin.requests.queue.selectRequest", { title: request.title })}
+            label={`Select ${request.title}`}
             selected={selected}
             onSelectionChange={(checked) => onSelect(checked)}
           />
@@ -675,7 +685,7 @@ function QueueRow({
           </Link>
           <p className="text-muted-foreground text-xs">
             {[
-              request.year ? numberText(request.year) : null,
+              request.year,
               formatMediaType(request.media_type),
               request.seasons?.length ? formatSeasonList(request.seasons) : null,
             ]
@@ -687,26 +697,18 @@ function QueueRow({
               <button
                 type="button"
                 className="hover:text-foreground hover:underline"
-                title={t("web.admin.requests.queue.filterByUser")}
+                title="Show only this account's requests"
                 onClick={() => onFilterUser(userId)}
               >
-                {requester ?? accountFallback(t, userId)}
+                {requester ?? `User ${userId}`}
               </button>
             ) : (
-              <span>{t("web.admin.requests.unknownAccount")}</span>
+              <span>Unknown account</span>
             )}
             {requestedAgo ? (
-              <span title={formatDateTime(request.created_at)}>
-                {SEPARATOR}
-                {requestedAgo}
-              </span>
+              <span title={formatDateTime(request.created_at)}> · {requestedAgo}</span>
             ) : null}
-            {request.source === "watchlist" ? (
-              <span>
-                {SEPARATOR}
-                {t("web.admin.requests.viaWatchlist")}
-              </span>
-            ) : null}
+            {request.source === "watchlist" ? <span> · via watchlist</span> : null}
           </p>
         </div>
         <RequestStateSummary request={request} />
@@ -719,7 +721,7 @@ function QueueRow({
           variant="ghost"
           size="icon"
           className="size-8"
-          aria-label={t("web.admin.requests.queue.details", { title: request.title })}
+          aria-label={`Details: ${request.title}`}
           onClick={onOpen}
         >
           <Maximize2 aria-hidden="true" />
@@ -730,24 +732,20 @@ function QueueRow({
 }
 
 function TargetList({ request }: { request: MediaRequest }) {
-  const t = useT();
   const targets = request.targets ?? [];
   if (targets.length === 0) {
-    return <p className="text-muted-foreground text-xs">{t("web.admin.requests.queue.notSent")}</p>;
+    return <p className="text-muted-foreground text-xs">Not sent to a server</p>;
   }
   return (
     <ul className="min-w-0 space-y-1.5 text-xs">
       {targets.map((target) => (
         <li key={target.id} className="min-w-0">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="font-medium">{target.quality}</span>
-            {SPACE}
+            <span className="font-medium">{target.quality}</span>{" "}
             <span>{targetServerName(target)}</span> <TargetStatusBadge target={target} />
           </div>
           {target.route_name ? (
-            <p className="text-muted-foreground truncate">
-              {t("web.admin.requests.queue.byRoute", { route: target.route_name })}
-            </p>
+            <p className="text-muted-foreground truncate">by {target.route_name}</p>
           ) : null}
           {target.download ? (
             <RequestDownloadProgress

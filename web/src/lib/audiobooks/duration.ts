@@ -4,29 +4,24 @@
  * "112 min" framings used for video runtimes.
  */
 
-import { t } from "@/i18n";
-
 /** "27 hr 14 min", "3 hr", "45 min"; durations under a minute round up. */
 export function formatHoursMinutes(totalSeconds: number): string {
   if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) {
-    return t("web.audiobooks.duration.minutes", { minutes: 0 });
+    return "0 min";
   }
   const totalMinutes = Math.round(totalSeconds / 60);
   if (totalMinutes < 1) {
-    return t("web.audiobooks.duration.minutes", { minutes: 1 });
+    return "1 min";
   }
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;
   if (hours <= 0) {
-    return t("web.audiobooks.duration.minutes", { minutes: minutes });
+    return `${minutes} min`;
   }
   if (minutes === 0) {
-    return t("web.audiobooks.duration.hours", { hours: hours });
+    return `${hours} hr`;
   }
-  return t("web.audiobooks.duration.hoursMinutes", {
-    hours: hours,
-    minutes: minutes,
-  });
+  return `${hours} hr ${minutes} min`;
 }
 
 /** "27 hr 14 min left" for an in-progress listen; null without a duration. */
@@ -38,5 +33,5 @@ export function formatListeningTimeLeft(
     return null;
   }
   const remaining = Math.max(durationSeconds - (positionSeconds ?? 0), 0);
-  return t("web.audiobooks.duration.left", { duration: formatHoursMinutes(remaining) });
+  return `${formatHoursMinutes(remaining)} left`;
 }

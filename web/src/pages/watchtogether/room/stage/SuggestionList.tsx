@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Play, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 import { decodeThumbhash } from "@/lib/thumbhash";
 import type { WatchTogetherSuggestion } from "@/lib/watchTogether";
 
@@ -46,7 +45,6 @@ function SuggestionRow({
   /** Vote controls and tallies only mean something in a vote room. */
   showVotes: boolean;
 }) {
-  const t = useT();
   const [loaded, setLoaded] = useState(false);
   const share = maxVotes > 0 ? suggestion.vote_count / maxVotes : 0;
   return (
@@ -59,8 +57,8 @@ function SuggestionRow({
           aria-pressed={suggestion.voted_by_me}
           aria-label={
             suggestion.voted_by_me
-              ? t("web.watchTogether.suggestions.unvote", { title: suggestion.title })
-              : t("web.watchTogether.suggestions.vote", { title: suggestion.title })
+              ? `Remove your vote for ${suggestion.title}`
+              : `Vote for ${suggestion.title}`
           }
           className={`flex size-7 shrink-0 items-center justify-center rounded-full border transition-colors ${
             suggestion.voted_by_me
@@ -69,7 +67,7 @@ function SuggestionRow({
           } disabled:opacity-60`}
         >
           <span aria-hidden="true" className="text-xs">
-            {t("web.watchTogether.suggestions.voteMark")}
+            ✓
           </span>
         </button>
       ) : null}
@@ -92,17 +90,13 @@ function SuggestionRow({
           ) : null}
           {showVotes && rank === 0 && suggestion.vote_count > 0 ? (
             <span className="rounded-full bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-amber-300 uppercase">
-              {t("web.watchTogether.suggestions.leading")}
+              Leading
             </span>
           ) : null}
         </div>
         <div className="text-muted-foreground mt-0.5 truncate text-xs">
           {suggesterName}
-          {suggestion.note ? (
-            <span className="italic">
-              {t("web.watchTogether.suggestions.note", { note: suggestion.note })}
-            </span>
-          ) : null}
+          {suggestion.note ? <span className="italic">: “{suggestion.note}”</span> : null}
         </div>
       </div>
       {showVotes ? (
@@ -115,11 +109,8 @@ function SuggestionRow({
               />
             </div>
           </div>
-          <span className="text-muted-foreground w-14 shrink-0 text-end text-xs tabular-nums">
-            {t("web.watchTogether.suggestions.votes", {
-              count: suggestion.vote_count,
-              count_text: suggestion.vote_count,
-            })}
+          <span className="text-muted-foreground w-14 shrink-0 text-right text-xs tabular-nums">
+            {suggestion.vote_count} {suggestion.vote_count === 1 ? "vote" : "votes"}
           </span>
         </>
       ) : null}
@@ -144,7 +135,7 @@ function SuggestionRow({
               type="button"
               onClick={onDelete}
               disabled={busy}
-              aria-label={t("web.watchTogether.suggestions.remove", { title: suggestion.title })}
+              aria-label={`Remove ${suggestion.title}`}
               className="pointer-reveal text-muted-foreground rounded p-1 hover:text-red-300"
             >
               <Trash2 className="size-3.5" />
@@ -165,7 +156,7 @@ export function SuggestionList({
   busyId,
   onVoteToggle,
   onPromote,
-  promoteLabel,
+  promoteLabel = "Play this",
   onDelete,
   emptyText,
   showVotes = true,
@@ -185,7 +176,6 @@ export function SuggestionList({
   /** Hide vote controls and tallies outside vote rooms. */
   showVotes?: boolean;
 }) {
-  const t = useT();
   const ranked = rankSuggestions(suggestions);
   const maxVotes = ranked[0]?.vote_count ?? 0;
   // The host can act on every row; a guest only on their own. Either way the
@@ -208,13 +198,13 @@ export function SuggestionList({
           isOwn={suggestion.suggester_profile_id === currentProfileId}
           suggesterName={
             memberNames.get(`${suggestion.suggester_user_id}:${suggestion.suggester_profile_id}`) ??
-            t("web.watchTogether.common.someone")
+            "Someone"
           }
           canVote={canVote}
           busy={busyId === suggestion.id}
           onVoteToggle={() => onVoteToggle(suggestion)}
           onPromote={onPromote ? () => onPromote(suggestion.id) : undefined}
-          promoteLabel={promoteLabel ?? t("web.watchTogether.suggestions.playThis")}
+          promoteLabel={promoteLabel}
           onDelete={onDelete ? () => onDelete(suggestion.id) : undefined}
           showActions={showActions}
           showVotes={showVotes}

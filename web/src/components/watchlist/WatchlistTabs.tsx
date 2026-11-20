@@ -1,6 +1,5 @@
 import type { ReactNode } from "react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { numberText, useT } from "@/i18n";
 import {
   parseWatchlistTab,
   WATCHLIST_NOT_IN_LIBRARY_TAB,
@@ -35,7 +34,6 @@ export default function WatchlistTabs({
   count?: number;
   attention: boolean;
 }) {
-  const t = useT();
   return (
     <Tabs value={value} onValueChange={(next) => onValueChange(parseWatchlistTab(next))}>
       <TabsList variant="line" className="border-border w-full justify-start border-b">
@@ -45,7 +43,7 @@ export default function WatchlistTabs({
           aria-controls={panelId(idBase, "library")}
           className="flex-none px-3"
         >
-          {t("web.library.watchlist.inLibraryTab")}
+          In your library
         </TabsTrigger>
         <TabsTrigger
           value={WATCHLIST_NOT_IN_LIBRARY_TAB}
@@ -53,11 +51,11 @@ export default function WatchlistTabs({
           aria-controls={panelId(idBase, WATCHLIST_NOT_IN_LIBRARY_TAB)}
           className="flex-none px-3"
         >
-          <span className="sm:hidden">{t("web.library.watchlist.notInLibraryTabShort")}</span>
-          <span className="hidden sm:inline">{t("web.library.watchlist.notInLibraryTab")}</span>
+          <span className="sm:hidden">Not in library</span>
+          <span className="hidden sm:inline">Not in your library yet</span>
           {count !== undefined && count > 0 ? (
-            <span className="bg-muted/80 text-muted-foreground ms-1.5 inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-[0.625rem] font-semibold tabular-nums">
-              {numberText(count)}
+            <span className="bg-muted/80 text-muted-foreground ml-1.5 inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-[0.625rem] font-semibold tabular-nums">
+              {count}
             </span>
           ) : null}
           {attention ? (
@@ -65,9 +63,9 @@ export default function WatchlistTabs({
               <span
                 aria-hidden
                 data-testid="watchlist-attention-dot"
-                className="ms-1.5 inline-block size-2 rounded-full bg-amber-400"
+                className="ml-1.5 inline-block size-2 rounded-full bg-amber-400"
               />
-              <span className="sr-only">{t("web.library.watchlist.needsAttention")}</span>
+              <span className="sr-only">, some need attention</span>
             </>
           ) : null}
         </TabsTrigger>

@@ -57,7 +57,7 @@ func TestHTTPProxyPluginContentIsNosniff(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v2/plugins/1/page", nil)
 	req = req.WithContext(WithPluginAccess(req.Context(), false, false))
 	rec := httptest.NewRecorder()
-	proxy.serveRoute(rec, req, 1, false, false)
+	proxy.ServeRoute(rec, req, 1, false, false)
 	if rec.Code != http.StatusOK || rec.Header().Get("X-Content-Type-Options") != "nosniff" ||
 		rec.Header().Get("Content-Type") != "text/plain" || rec.Header().Get("Set-Cookie") != "" ||
 		rec.Header().Get("Cross-Origin-Opener-Policy") != "same-origin" || rec.Header().Get("Cross-Origin-Embedder-Policy") != "require-corp" {
@@ -72,5 +72,3 @@ func TestHTTPProxyPluginContentIsNosniff(t *testing.T) {
 		t.Fatalf("asset: status = %d headers = %v body = %q", rec.Code, rec.Header(), rec.Body.String())
 	}
 }
-
-func (nosniffRouteClient) Retain() (func(), error) { return func() {}, nil }

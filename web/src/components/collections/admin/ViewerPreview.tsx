@@ -2,12 +2,15 @@ import { Fragment } from "react";
 
 import type { LibraryCollection } from "@/api/types";
 import { PosterArt } from "@/components/calm/PosterTile";
-import { viewerPreviewLabel, viewerPreviewMine, viewerPreviewNote } from "@/lib/collections/copy";
+import {
+  VIEWER_PREVIEW_LABEL,
+  VIEWER_PREVIEW_MINE,
+  VIEWER_PREVIEW_NOTE,
+} from "@/lib/collections/copy";
 import { pinnedBand, shownCollections, type Shelf } from "@/lib/collections/shelves";
 import { cn } from "@/lib/utils";
 
 import { PinGlyph } from "./CollectionListItem";
-import { useAppLanguage, useT } from "@/i18n";
 
 /**
  * A small Collections-tab card: the collection's poster (its collage unless
@@ -29,7 +32,7 @@ function MiniCollectionCard({
       />
       <span className="line-clamp-2 text-[11px] leading-tight font-medium">
         {pinned ? (
-          <PinGlyph className="text-muted-foreground me-0.5 size-2.5 align-[-1px]" />
+          <PinGlyph className="text-muted-foreground mr-0.5 size-2.5 align-[-1px]" />
         ) : null}
         {collection.title}
       </span>
@@ -39,14 +42,13 @@ function MiniCollectionCard({
 
 /** Each viewer's own collections: two empty cards, since every viewer sees different ones. */
 function MineCards() {
-  useAppLanguage();
   return (
     <ul className="m-0 flex list-none gap-2 p-0">
       {[0, 1].map((index) => (
         <li key={index} className="grid w-[62px] content-start gap-1.5">
           <span className="border-border bg-muted/30 aspect-[2/3] w-full rounded-md border" />
           <span className="text-muted-foreground text-[11px] leading-tight">
-            {index === 0 ? viewerPreviewMine() : ""}
+            {index === 0 ? VIEWER_PREVIEW_MINE : ""}
           </span>
         </li>
       ))}
@@ -71,19 +73,16 @@ export function ViewerPreview({
   isVisible: (collection: LibraryCollection) => boolean;
   className?: string;
 }) {
-  const t = useT();
   return (
     <aside
-      aria-label={viewerPreviewLabel()}
+      aria-label={VIEWER_PREVIEW_LABEL}
       className={cn("surface-panel grid content-start gap-4 rounded-[22px] p-4", className)}
     >
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <b className="text-[14px] font-semibold">
-          {t("web.collections.copy.collectionsTabOf", { library: libraryName })}
-        </b>
+        <b className="text-[14px] font-semibold">{libraryName} › Collections</b>
         <span className="text-muted-foreground inline-flex items-center gap-1.5 text-[12px]">
           <span aria-hidden className="bg-success size-1.5 rounded-full" />
-          {viewerPreviewLabel()}
+          {VIEWER_PREVIEW_LABEL}
         </span>
       </div>
       {shelves.map((shelf) => {
@@ -123,7 +122,7 @@ export function ViewerPreview({
           </Fragment>
         );
       })}
-      <p className="text-muted-foreground m-0 text-[12px] leading-normal">{viewerPreviewNote()}</p>
+      <p className="text-muted-foreground m-0 text-[12px] leading-normal">{VIEWER_PREVIEW_NOTE}</p>
     </aside>
   );
 }

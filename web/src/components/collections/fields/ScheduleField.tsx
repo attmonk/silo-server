@@ -8,80 +8,61 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { appIntl, numberText, useT, type MessageKey, type Translate } from "@/i18n";
 import { serverTimeLabel } from "@/lib/collections/copy";
 
 /** Radix Select can't hold "", so "no scheduled sync" is this in the menu. */
 const NONE = "none";
 const CUSTOM = "custom";
-/** The cron a custom schedule starts from, and the cron field's placeholder. */
-const DEFAULT_CRON = "0 3 * * *";
 
-/** The cron schedules a server list offers by name; each is labelled by `describeCron`. */
-const SERVER_PRESETS: readonly string[] = [
-  "0 * * * *",
-  "0 */6 * * *",
-  "0 3 * * *",
-  "0 3 * * 1",
-  "0 3 * * 0",
-  "0 3 1 * *",
+const SERVER_PRESETS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: "0 * * * *", label: "Every hour" },
+  { value: "0 */6 * * *", label: "Every 6 hours" },
+  { value: "0 3 * * *", label: "Every day at 3:00 AM" },
+  { value: "0 3 * * 1", label: "Every Monday at 3:00 AM" },
+  { value: "0 3 * * 0", label: "Every Sunday at 3:00 AM" },
+  { value: "0 3 1 * *", label: "On the 1st of every month at 3:00 AM" },
 ];
 
-const PERSONAL_OPTIONS: ReadonlyArray<{ value: string; labelKey: MessageKey }> = [
-  { value: NONE, labelKey: "web.collections.fields.scheduleManualOnly" },
-  { value: "daily", labelKey: "web.collections.fields.scheduleDaily" },
-  { value: "weekly", labelKey: "web.collections.fields.scheduleWeekly" },
-  { value: "monthly", labelKey: "web.collections.fields.scheduleMonthly" },
+const PERSONAL_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: NONE, label: "Manual only" },
+  { value: "daily", label: "Daily" },
+  { value: "weekly", label: "Weekly" },
+  { value: "monthly", label: "Monthly" },
 ];
 
-const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
-function clock(t: Translate, minute: string, hour: string): string | null {
+function clock(minute: string, hour: string): string | null {
   if (!/^\d{1,2}$/.test(minute) || !/^\d{1,2}$/.test(hour)) return null;
   const h = Number(hour);
   const m = Number(minute);
   if (h > 23 || m > 59) return null;
-  return t("web.collections.fields.clockTime", {
-    hour: h % 12 === 0 ? 12 : h % 12,
-    // Two digits, in the screen's digits like the hour.
-    minute: appIntl().formatNumber(m, { minimumIntegerDigits: 2, useGrouping: false }),
-    period: h < 12 ? "am" : "pm",
-  });
+  return `${h % 12 === 0 ? 12 : h % 12}:${String(m).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`;
 }
 
-/** "1st", "22nd": a day of the month as an ordinal. */
-function ordinal(t: Translate, day: number): string {
-  return t("web.collections.fields.dayOrdinal", { day: day });
+function ordinal(day: number): string {
+  const tens = day % 100;
+  if (tens >= 11 && tens <= 13) return `${day}th`;
+  return `${day}${["th", "st", "nd", "rd"][day % 10] ?? "th"}`;
 }
 
 /** A cron schedule in words, for the shapes the step offers; null for anything else. */
-function describeCron(t: Translate, cron: string): string | null {
+function describeCron(cron: string): string | null {
   const fields = cron.trim().split(/\s+/);
   if (fields.length !== 5) return null;
   const [minute, hour, dom, month, dow] = fields as [string, string, string, string, string];
   if (month !== "*") return null;
   if (minute === "0" && dom === "*" && dow === "*") {
-    if (hour === "*") return t("web.collections.fields.everyHour");
+    if (hour === "*") return "Every hour";
     const step = /^\*\/(\d+)$/.exec(hour);
-    if (step) {
-      // The step as written ("02" stays "02") in the screen's digits; the number
-      // only picks the plural form.
-      return t("web.collections.fields.everyHours", {
-        count: Number(step[1]),
-        count_text: numberText(step[1]!),
-      });
-    }
+    if (step) return `Every ${step[1]} hours`;
   }
-  const at = clock(t, minute, hour);
+  const at = clock(minute, hour);
   if (!at) return null;
-  if (dom === "*" && dow === "*") return t("web.collections.fields.everyDayAt", { time: at });
-  if (dom === "*" && /^[0-6]$/.test(dow))
-    return t("web.collections.fields.everyWeekdayAt", { day: WEEKDAYS[Number(dow)]!, time: at });
+  if (dom === "*" && dow === "*") return `Every day at ${at}`;
+  if (dom === "*" && /^[0-6]$/.test(dow)) return `Every ${WEEKDAYS[Number(dow)]} at ${at}`;
   if (/^\d{1,2}$/.test(dom) && dow === "*" && Number(dom) >= 1 && Number(dom) <= 31) {
-    return t("web.collections.fields.monthlyAt", {
-      day: ordinal(t, Number(dom)),
-      time: at,
-    });
+    return `On the ${ordinal(Number(dom))} of every month at ${at}`;
   }
   return null;
 }
@@ -112,7 +93,6 @@ export type ScheduleFieldProps =
  * until another is chosen.
  */
 export function ScheduleField(props: ScheduleFieldProps) {
-  const t = useT();
   const id = useId();
   const [customOpen, setCustomOpen] = useState(false);
   const { value, onChange, disabled } = props;
@@ -124,33 +104,25 @@ export function ScheduleField(props: ScheduleFieldProps) {
         disabled={disabled}
         onValueChange={(next) => onChange(next === NONE ? "" : next)}
       >
-        <SelectTrigger
-          aria-label={t("web.collections.copy.fieldSchedule")}
-          className="h-11 w-full sm:w-[280px]"
-        >
+        <SelectTrigger aria-label="Sync schedule" className="h-11 w-full sm:w-[280px]">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
           {PERSONAL_OPTIONS.map((option) => (
             <SelectItem key={option.value} value={option.value}>
-              {t(option.labelKey)}
+              {option.label}
             </SelectItem>
           ))}
           {value === CUSTOM ? (
-            <SelectItem value={CUSTOM}>
-              {t("web.collections.fields.customScheduleCurrent")}
-            </SelectItem>
+            <SelectItem value={CUSTOM}>Custom schedule (current)</SelectItem>
           ) : null}
         </SelectContent>
       </Select>
     );
   }
 
-  const preset = SERVER_PRESETS.includes(value);
-  const own =
-    value && !preset
-      ? (describeCron(t, value) ?? t("web.collections.fields.customCron", { cron: value }))
-      : null;
+  const preset = SERVER_PRESETS.some((option) => option.value === value);
+  const own = value && !preset ? (describeCron(value) ?? `Custom: ${value}`) : null;
   const selected = customOpen ? CUSTOM : value || NONE;
   return (
     <div className="grid gap-2">
@@ -161,28 +133,28 @@ export function ScheduleField(props: ScheduleFieldProps) {
           onValueChange={(next) => {
             setCustomOpen(next === CUSTOM);
             if (next === CUSTOM) {
-              if (!value) onChange(DEFAULT_CRON);
+              if (!value) onChange("0 3 * * *");
             } else {
               onChange(next === NONE ? "" : next);
             }
           }}
         >
           <SelectTrigger
-            aria-label={t("web.collections.copy.fieldSchedule")}
+            aria-label="Sync schedule"
             aria-describedby={`${id}-zone`}
             className="h-11 min-w-0 flex-1"
           >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value={NONE}>{t("web.collections.fields.noAutomaticSync")}</SelectItem>
-            {SERVER_PRESETS.map((cron) => (
-              <SelectItem key={cron} value={cron}>
-                {describeCron(t, cron)}
+            <SelectItem value={NONE}>No automatic sync</SelectItem>
+            {SERVER_PRESETS.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
               </SelectItem>
             ))}
             {own ? <SelectItem value={value}>{own}</SelectItem> : null}
-            <SelectItem value={CUSTOM}>{t("web.collections.fields.customSchedule")}</SelectItem>
+            <SelectItem value={CUSTOM}>Custom schedule…</SelectItem>
           </SelectContent>
         </Select>
         <span id={`${id}-zone`} className="text-muted-foreground text-[13px]">
@@ -192,15 +164,15 @@ export function ScheduleField(props: ScheduleFieldProps) {
       {customOpen ? (
         <div className="grid gap-1">
           <Input
-            aria-label={t("web.collections.fields.cronSchedule")}
+            aria-label="Cron schedule"
             aria-describedby={`${id}-cron-help`}
             className="h-10 font-mono"
-            placeholder={DEFAULT_CRON}
+            placeholder="0 3 * * *"
             value={value}
             onChange={(event) => onChange(event.target.value)}
           />
           <p id={`${id}-cron-help`} className="text-muted-foreground text-[12.5px]">
-            {t("web.collections.fields.cronHelp")}
+            Minute, hour, day of month, month, day of week, in server time.
           </p>
         </div>
       ) : null}

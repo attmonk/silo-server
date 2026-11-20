@@ -80,11 +80,11 @@ func (h *NodeHandler) nodeNetworkAccessCall(ctx context.Context, node plugins.Ne
 	if err != nil {
 		return err
 	}
-	if err := nodeauth.SignProxy(req, node.URL, h.nodeKeys); err != nil {
+	if err := nodeauth.Sign(req, node.URL, h.jwtSecret); err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	client := &http.Client{Timeout: nodeNetworkAccessTimeout, CheckRedirect: nodepool.RefuseRedirects}
+	client := &http.Client{Timeout: nodeNetworkAccessTimeout}
 	resp, err := telemetry.DoTrustedNode(client, req, operation)
 	if err != nil {
 		return fmt.Errorf("proxy node unreachable: %w", err)

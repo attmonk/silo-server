@@ -2,13 +2,7 @@
  * Plain names and picker groups for Home row kinds. The stored `section_type`
  * values never change; this is display only.
  */
-import { t, type MessageKey } from "@/i18n";
-import {
-  presetLabel,
-  presetShortText,
-  type RecipeCatalogResponse,
-  type RecipeDefinition,
-} from "@/lib/recipes";
+import type { RecipeCatalogResponse, RecipeDefinition } from "@/lib/recipes";
 
 export type RowGroup = "keep" | "new" | "popular" | "picked" | "moods" | "collections";
 
@@ -21,32 +15,30 @@ export const ROW_GROUP_ORDER: readonly RowGroup[] = [
   "collections",
 ];
 
-export const ROW_GROUP_LABELS: Record<RowGroup, MessageKey> = {
-  keep: "web.home.rows.groups.keep",
-  new: "web.home.rows.groups.new",
-  popular: "web.home.rows.groups.popular",
-  picked: "web.home.rows.groups.picked",
-  moods: "web.home.rows.groups.moods",
-  collections: "web.home.rows.groups.collections",
+export const ROW_GROUP_LABELS: Record<RowGroup, string> = {
+  keep: "Keep watching",
+  new: "What's new",
+  popular: "Popular",
+  picked: "Picked for you",
+  moods: "Moods & themes",
+  collections: "Collections & rules",
 };
 
 /** The line after each group's name in the picker. */
-export const ROW_GROUP_BLURBS: Record<RowGroup, MessageKey> = {
-  keep: "web.home.rows.groups.keepBlurb",
-  new: "web.home.rows.groups.newBlurb",
-  popular: "web.home.rows.groups.popularBlurb",
-  picked: "web.home.rows.groups.pickedBlurb",
-  moods: "web.home.rows.groups.moodsBlurb",
-  collections: "web.home.rows.groups.collectionsBlurb",
+export const ROW_GROUP_BLURBS: Record<RowGroup, string> = {
+  keep: "Pick up where each viewer left off",
+  new: "Fresh in your libraries",
+  popular: "What people here, and elsewhere, are watching",
+  picked: "Different for every viewer",
+  moods: "Ready-made picks with a theme",
+  collections: "Your collections, or rows built from rules",
 };
 
 interface RowKind {
   group: RowGroup;
-  /** The English name a new row is saved with when it gets no other: stored data, never translated. */
-  name: string;
-  label: MessageKey;
+  label: string;
   /** The picker card's sentence: what the row shows. */
-  sentence: MessageKey;
+  sentence: string;
   /** Each viewer sees their own titles. */
   personal?: boolean;
 }
@@ -55,219 +47,178 @@ interface RowKind {
 const ROW_KINDS: Record<string, RowKind> = {
   continue_watching: {
     group: "keep",
-    name: "Continue watching",
-    label: "web.home.rows.kinds.continueWatching",
-    sentence: "web.home.rows.kindSentences.continueWatching",
+    label: "Continue watching",
+    sentence: "Pick up where each viewer left off.",
     personal: true,
   },
   next_up: {
     group: "keep",
-    name: "Next up",
-    label: "web.home.rows.kinds.nextUp",
-    sentence: "web.home.rows.kindSentences.nextUp",
+    label: "Next up",
+    sentence: "The next episode of each show a viewer follows.",
     personal: true,
   },
   next_in_series: {
     group: "keep",
-    name: "Next in series",
-    label: "web.home.rows.kinds.nextInSeries",
-    sentence: "web.home.rows.kindSentences.nextInSeries",
+    label: "Next in series",
+    sentence: "Audiobooks (beta): the next book in each series a viewer finished.",
     personal: true,
   },
   watchlist: {
     group: "keep",
-    name: "Watchlist",
-    label: "web.home.rows.kinds.watchlist",
-    sentence: "web.home.rows.kindSentences.watchlist",
+    label: "Watchlist",
+    sentence: "What each viewer saved to watch.",
     personal: true,
   },
   favorites: {
     group: "keep",
-    name: "Favorites",
-    label: "web.home.rows.kinds.favorites",
-    sentence: "web.home.rows.kindSentences.favorites",
+    label: "Favorites",
+    sentence: "Each viewer's favorites.",
     personal: true,
   },
   recently_added: {
     group: "new",
-    name: "Recently added",
-    label: "web.home.rows.kinds.recentlyAdded",
-    sentence: "web.home.rows.kindSentences.recentlyAdded",
+    label: "Recently added",
+    sentence: "The newest additions to your libraries.",
   },
   recently_released: {
     group: "new",
-    name: "New releases",
-    label: "web.home.rows.kinds.recentlyReleased",
-    sentence: "web.home.rows.kindSentences.recentlyReleased",
+    label: "New releases",
+    sentence: "Titles by release date, newest first.",
   },
   new_to_library: {
     group: "new",
-    name: "New this month",
-    label: "web.home.rows.kinds.newToLibrary",
-    sentence: "web.home.rows.kindSentences.newToLibrary",
+    label: "New this month",
+    sentence: "Everything added in the last 30 days.",
   },
   returning_shows: {
     group: "new",
-    name: "Returning shows",
-    label: "web.home.rows.kinds.returningShows",
-    sentence: "web.home.rows.kindSentences.returningShows",
+    label: "Returning shows",
+    sentence: "Shows each viewer watched that have a new season.",
     personal: true,
   },
   trending_on_server: {
     group: "popular",
-    name: "Trending on this server",
-    label: "web.home.rows.kinds.trendingOnServer",
-    sentence: "web.home.rows.kindSentences.trendingOnServer",
+    label: "Trending on this server",
+    sentence: "What's been played most here lately.",
   },
   most_watched: {
     group: "popular",
-    name: "Most watched",
-    label: "web.home.rows.kinds.mostWatched",
-    sentence: "web.home.rows.kindSentences.mostWatched",
+    label: "Most watched",
+    sentence: "Titles finished most often on this server.",
   },
   trending_discover: {
     group: "popular",
-    name: "Trending worldwide",
-    label: "web.home.rows.kinds.trendingDiscover",
-    sentence: "web.home.rows.kindSentences.trendingDiscover",
+    label: "Trending worldwide",
+    sentence: "Popular on TMDB, from titles you have.",
   },
   profile_activity_feed: {
     group: "popular",
-    name: "What others just watched",
-    label: "web.home.rows.kinds.profileActivityFeed",
-    sentence: "web.home.rows.kindSentences.profileActivityFeed",
+    label: "What others just watched",
+    sentence: "The latest plays from other profiles in the household.",
   },
   recommended_for_you: {
     group: "picked",
-    name: "Recommended for you",
-    label: "web.home.rows.kinds.recommendedForYou",
-    sentence: "web.home.rows.kindSentences.recommendedForYou",
+    label: "Recommended for you",
+    sentence: "Picked from each viewer's own watch history.",
     personal: true,
   },
   because_you_watched: {
     group: "picked",
-    name: "Because you watched",
-    label: "web.home.rows.kinds.becauseYouWatched",
-    sentence: "web.home.rows.kindSentences.becauseYouWatched",
+    label: "Because you watched",
+    sentence: "More like the last thing each viewer finished.",
     personal: true,
   },
   similar_users_liked: {
     group: "picked",
-    name: "Profiles like you enjoyed",
-    label: "web.home.rows.kinds.similarUsersLiked",
-    sentence: "web.home.rows.kindSentences.similarUsersLiked",
+    label: "Profiles like you enjoyed",
+    sentence: "What viewers with similar taste loved.",
     personal: true,
   },
   taste_match: {
     group: "picked",
-    name: "Top picks today",
-    label: "web.home.rows.kinds.tasteMatch",
-    sentence: "web.home.rows.kindSentences.tasteMatch",
+    label: "Top picks today",
+    sentence: "A fresh daily set for each viewer.",
     personal: true,
   },
   mood_collection: {
     group: "moods",
-    name: "Mood picks",
-    label: "web.home.rows.kinds.moodCollection",
-    sentence: "web.home.rows.kindSentences.moodCollection",
+    label: "Mood picks",
+    sentence: "Genres that fit a feeling, rated well on TMDB. New picks each day.",
   },
   seasonal_themed: {
     group: "moods",
-    name: "Seasonal picks",
-    label: "web.home.rows.kinds.seasonalThemed",
-    sentence: "web.home.rows.kindSentences.seasonalThemed",
+    label: "Seasonal picks",
+    sentence: "Holiday favorites that show up when the season comes.",
   },
   editorial_spotlight: {
     group: "moods",
-    name: "Spotlight",
-    label: "web.home.rows.kinds.editorialSpotlight",
-    sentence: "web.home.rows.kindSentences.editorialSpotlight",
+    label: "Spotlight",
+    sentence: "One director, actor, studio or decade at a time.",
   },
   format_showcase: {
     group: "moods",
-    name: "4K & HDR showcase",
-    label: "web.home.rows.kinds.formatShowcase",
-    sentence: "web.home.rows.kindSentences.formatShowcase",
+    label: "4K & HDR showcase",
+    sentence: "Your best-looking titles.",
   },
   hidden_gems: {
     group: "moods",
-    name: "Hidden gems",
-    label: "web.home.rows.kinds.hiddenGems",
-    sentence: "web.home.rows.kindSentences.hiddenGems",
+    label: "Hidden gems",
+    sentence: "Rated 7.5+ on TMDB with 100+ votes, and watched twice or less. New picks each day.",
     personal: true,
   },
   critically_acclaimed: {
     group: "moods",
-    name: "Critically acclaimed",
-    label: "web.home.rows.kinds.criticallyAcclaimed",
-    sentence: "web.home.rows.kindSentences.criticallyAcclaimed",
+    label: "Critically acclaimed",
+    sentence: "Rated 8.0+ on TMDB with 500+ votes. New picks each day.",
   },
   forgotten_favorites: {
     group: "moods",
-    name: "Forgotten favorites",
-    label: "web.home.rows.kinds.forgottenFavorites",
-    sentence: "web.home.rows.kindSentences.forgottenFavorites",
+    label: "Forgotten favorites",
+    sentence:
+      "Rated 7.0+ on TMDB with 100+ votes, and not watched in the past year. New picks each day.",
     personal: true,
   },
   genre_roulette: {
     group: "moods",
-    name: "Genre roulette",
-    label: "web.home.rows.kinds.genreRoulette",
-    sentence: "web.home.rows.kindSentences.genreRoulette",
+    label: "Genre roulette",
+    sentence: "A different genre every week, rated 6.0+ on TMDB with 100+ votes.",
   },
-  random: {
-    group: "moods",
-    name: "Surprise me",
-    label: "web.home.rows.kinds.random",
-    sentence: "web.home.rows.kindSentences.random",
-  },
+  random: { group: "moods", label: "Surprise me", sentence: "A random mix from your libraries." },
   short_watches: {
     group: "moods",
-    name: "Short & sweet",
-    label: "web.home.rows.kinds.shortWatches",
-    sentence: "web.home.rows.kindSentences.shortWatches",
+    label: "Short & sweet",
+    sentence:
+      "Movies of 95 minutes or less, rated 6.0+ on TMDB with 100+ votes. New picks each day.",
   },
   anniversaries: {
     group: "moods",
-    name: "Anniversaries",
-    label: "web.home.rows.kinds.anniversaries",
-    sentence: "web.home.rows.kindSentences.anniversaries",
+    label: "Anniversaries",
+    sentence: "Titles marking a release milestone this month.",
   },
   award_winners: {
     group: "moods",
-    name: "Award winners (no longer offered)",
-    label: "web.home.rows.kinds.awardWinners",
-    sentence: "web.home.rows.kindSentences.awardWinners",
+    label: "Award winners (no longer offered)",
+    sentence: "Award winners.",
   },
   collection: {
     group: "collections",
-    name: "A collection",
-    label: "web.home.rows.kinds.collection",
-    sentence: "web.home.rows.kindSentences.collection",
-  },
-  collection_posters: {
-    group: "collections",
-    name: "Collections",
-    label: "web.home.rows.kinds.collectionPosters",
-    sentence: "web.home.rows.kindSentences.collectionPosters",
+    label: "A collection",
+    sentence: "Show one of your collections.",
   },
   custom_filter: {
     group: "collections",
-    name: "Titles matching rules",
-    label: "web.home.rows.kinds.customFilter",
-    sentence: "web.home.rows.kindSentences.customFilter",
+    label: "Titles matching rules",
+    sentence: "Build a row from rules, like genre and decade.",
   },
   genre: {
     group: "collections",
-    name: "Genre (no longer offered)",
-    label: "web.home.rows.kinds.genre",
-    sentence: "web.home.rows.kindSentences.genre",
+    label: "Genre (no longer offered)",
+    sentence: "Titles from chosen genres.",
   },
   admin_curated_list: {
     group: "collections",
-    name: "Editor's picks",
-    label: "web.home.rows.kinds.adminCuratedList",
-    sentence: "web.home.rows.kindSentences.adminCuratedList",
+    label: "Editor's picks",
+    sentence: "Hand-picked titles.",
   },
 };
 
@@ -283,17 +234,15 @@ export const NOT_OFFERED_FOR_NEW_ROWS: ReadonlySet<string> = new Set([
   "next_up",
 ]);
 
+const AWARD_NAMES: Record<string, string> = {
+  oscar: "Oscar Winners",
+  emmy: "Emmy Winners",
+  cannes: "Cannes Selections",
+};
+
 /** The plain name of a row kind; unknown kinds read "Row", never a raw type key. */
 export function rowKindLabel(sectionType: string): string {
-  return t(ROW_KINDS[sectionType]?.label ?? "web.home.rows.kinds.unknown");
-}
-
-/**
- * The English name a row of this kind is saved with when nothing else names
- * it. A row's title is stored data, so this is never translated.
- */
-export function rowKindName(sectionType: string): string {
-  return ROW_KINDS[sectionType]?.name ?? "Row";
+  return ROW_KINDS[sectionType]?.label ?? "Row";
 }
 
 export function rowKindGroup(sectionType: string): RowGroup {
@@ -302,7 +251,7 @@ export function rowKindGroup(sectionType: string): RowGroup {
 
 /** What the row shows, as one sentence ending in a full stop. */
 export function rowKindSentence(sectionType: string): string {
-  return t(ROW_KINDS[sectionType]?.sentence ?? "web.home.rows.kindSentences.unknown");
+  return ROW_KINDS[sectionType]?.sentence ?? "A row of titles.";
 }
 
 /** Each viewer sees their own titles in this kind of row. */
@@ -316,8 +265,8 @@ export function isPersonalRowKind(sectionType: string): boolean {
  */
 export function retiredKindLabel(sectionType: string, config: Record<string, unknown>): string {
   if (sectionType === "award_winners") {
-    const award = typeof config.award_type === "string" ? config.award_type : "";
-    return t("web.home.rows.kinds.retiredAward", { award });
+    const award = typeof config.award_type === "string" ? AWARD_NAMES[config.award_type] : "";
+    return `${award || "Award winners"} (no longer offered)`;
   }
   return rowKindLabel(sectionType);
 }
@@ -341,22 +290,14 @@ const KIND_ORDER = Object.keys(ROW_KINDS);
 
 function cardFor(def: RecipeDefinition): PickerCard {
   const kind = ROW_KINDS[def.type];
-  if (kind) {
-    return {
-      type: def.type,
-      group: kind.group,
-      label: t(kind.label),
-      sentence: t(kind.sentence),
-      def,
-    };
-  }
+  if (kind) return { type: def.type, ...kind, def };
   // A kind this web build does not know yet still shows, under its own name.
   const preset = def.presets[0];
   return {
     type: def.type,
     group: "moods",
-    label: preset ? presetLabel(preset) : t("web.home.rows.kinds.unknown"),
-    sentence: preset ? presetShortText(preset) : rowKindSentence(def.type),
+    label: preset?.display_name ?? "Row",
+    sentence: preset?.description_short ?? rowKindSentence(def.type),
     def,
   };
 }
@@ -381,8 +322,8 @@ export function pickerGroups(catalog: RecipeCatalogResponse | undefined): Picker
   const cards = defs.map(cardFor).sort((a, b) => rank(a.type) - rank(b.type));
   return ROW_GROUP_ORDER.map((group) => ({
     group,
-    label: t(ROW_GROUP_LABELS[group]),
-    blurb: t(ROW_GROUP_BLURBS[group]),
+    label: ROW_GROUP_LABELS[group],
+    blurb: ROW_GROUP_BLURBS[group],
     cards: cards.filter((card) => card.group === group),
   })).filter((group) => group.cards.length > 0);
 }

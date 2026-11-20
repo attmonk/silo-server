@@ -24,10 +24,10 @@ import {
   SortableContext,
   arrayMove,
   sortableKeyboardCoordinates,
+  useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { useMotionSafeSortable } from "@/hooks/useSortableList";
 import { Check, GripVertical, Loader2, Plus, Search, Undo2, X } from "lucide-react";
 
 import type { BrowseItem } from "@/api/types";
@@ -51,24 +51,20 @@ import { catalogKeys } from "@/hooks/queries/keys";
 import { useDebounce } from "@/hooks/useDebounce";
 import { v2 } from "@/api/v2/request";
 import {
-  allYourLibraries,
-  inThisCollection,
-  notCreatedYet,
-  titlesCaption,
-  titlesEmpty,
-  titlesSavedLabel,
+  ALL_YOUR_LIBRARIES,
+  IN_THIS_COLLECTION,
+  NOT_CREATED_YET,
+  TITLES_CAPTION,
+  TITLES_EMPTY,
+  TITLES_SAVED,
   createdButNotAdded,
   joinNames,
   removedTitle,
 } from "@/lib/collections/copy";
 import type { CollectionScope } from "@/lib/collections/scope";
-import { joinList } from "@/lib/appLocale";
 import { cn } from "@/lib/utils";
 
 import { OrderBlock } from "../fields/OrderBlock";
-import { numberText, useT, type Translate } from "@/i18n";
-import { useMotionScrollBehavior } from "@/hooks/usePrefersReducedMotion";
-import { isImeComposing } from "@/lib/imeComposition";
 
 const SEARCH_LIMIT = 12;
 const DEBOUNCE_MS = 250;
@@ -86,8 +82,12 @@ interface TitleInfo {
   posterUrl?: string;
 }
 
-/** The title types `manual.typeLabel` names; any other shows as the server sent it. */
-const TYPE_LABELS: ReadonlySet<string> = new Set(["movie", "series", "season", "episode"]);
+const TYPE_LABEL: Record<string, string> = {
+  movie: "Movie",
+  series: "Show",
+  season: "Season",
+  episode: "Episode",
+};
 
 function infoOf(item: BrowseItem): TitleInfo {
   return {
@@ -98,16 +98,8 @@ function infoOf(item: BrowseItem): TitleInfo {
   };
 }
 
-function metaOf(t: Translate, info: TitleInfo | undefined) {
-  const type = info?.type;
-  return [
-    info?.year,
-    type
-      ? TYPE_LABELS.has(type)
-        ? t("web.collections.manual.typeLabel", { type })
-        : type
-      : undefined,
-  ]
+function metaOf(info: TitleInfo | undefined) {
+  return [info?.year, info?.type ? (TYPE_LABEL[info.type] ?? info.type) : undefined]
     .filter(Boolean)
     .join(" · ");
 }
@@ -183,7 +175,6 @@ function TitleSearch({
   onAdd: (item: BrowseItem) => void;
   disabled?: boolean;
 }) {
-  const t = useT();
   const listId = useId();
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
@@ -191,7 +182,7 @@ function TitleSearch({
   const debounced = useDebounce(query.trim(), DEBOUNCE_MS);
   const libraryIds = useMemo(() => libraries.map((library) => library.id), [libraries]);
   const scopeText =
-    libraries.length > 0 ? joinList(libraries.map((library) => library.name)) : allYourLibraries();
+    libraries.length > 0 ? libraries.map((library) => library.name).join(", ") : ALL_YOUR_LIBRARIES;
 
   const results = useQuery({
     queryKey: [...catalogKeys.all, "collectionTitleSearch", libraryIds, debounced],
@@ -204,7 +195,6 @@ function TitleSearch({
   const active = showList ? found[Math.min(highlight, found.length - 1)] : undefined;
 
   function onKeyDown(event: KeyboardEvent<HTMLInputElement>) {
-    if (isImeComposing(event)) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       setOpen(true);
@@ -224,28 +214,26 @@ function TitleSearch({
 
   let status: string | null = null;
   if (showList) {
-    if (results.isLoading) status = t("web.collections.manual.searching");
-    else if (!results.isError && found.length === 0) status = t("web.collections.manual.noMatches");
+    if (results.isLoading) status = "Searching…";
+    else if (!results.isError && found.length === 0) status = "No titles match.";
   }
 
   return (
     <div className="relative grid gap-2">
-      <div className="border-input bg-background/40 focus-within:ring-ring/50 flex h-11 items-center gap-2.5 rounded-xl border px-3 focus-within:ring-[3px]">
+      <div className="border-border bg-background/40 focus-within:ring-ring/50 flex h-11 items-center gap-2.5 rounded-xl border px-3 focus-within:ring-[3px]">
         <Search aria-hidden className="text-muted-foreground size-4 shrink-0" />
         <input
           role="combobox"
           aria-label={
             libraries.length > 0
-              ? t("web.collections.manual.addTitleFrom", {
-                  libraries: joinNames(libraries.map((l) => l.name)),
-                })
-              : t("web.collections.manual.addTitle")
+              ? `Add a title from ${joinNames(libraries.map((l) => l.name))}`
+              : "Add a title"
           }
           aria-expanded={showList}
           aria-controls={listId}
           aria-autocomplete="list"
           aria-activedescendant={active ? `${listId}-${active.content_id}` : undefined}
-          placeholder={t("web.collections.manual.addTitle")}
+          placeholder="Add a title"
           autoComplete="off"
           disabled={disabled}
           data-title-search
@@ -269,16 +257,16 @@ function TitleSearch({
       ) : null}
       {showList && results.isError ? (
         <div role="alert" className="flex flex-wrap items-center gap-2 px-1 text-[13px]">
-          <span>{t("web.collections.manual.searchFailed")}</span>
+          <span>The search didn't work.</span>
           <Button type="button" size="sm" variant="outline" onClick={() => void results.refetch()}>
-            {t("common.tryAgain")}
+            Try again
           </Button>
         </div>
       ) : null}
       <ul
         id={listId}
         role="listbox"
-        aria-label={t("web.collections.manual.titlesToAdd")}
+        aria-label="Titles to add"
         hidden={!showList || found.length === 0}
         className="border-border bg-popover grid max-h-80 gap-0.5 overflow-y-auto rounded-xl border p-1.5"
       >
@@ -304,7 +292,7 @@ function TitleSearch({
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-[14px] font-semibold">{item.title}</span>
                 <span className="text-muted-foreground block truncate text-[12.5px]">
-                  {metaOf(t, infoOf(item))}
+                  {metaOf(infoOf(item))}
                 </span>
               </span>
               <span
@@ -318,7 +306,7 @@ function TitleSearch({
                 ) : (
                   <Plus aria-hidden className="size-3.5" />
                 )}
-                {already ? inThisCollection() : t("web.collections.manual.add")}
+                {already ? IN_THIS_COLLECTION : "Add"}
               </span>
             </li>
           );
@@ -356,13 +344,11 @@ function TitleRow({
   canReorder: boolean;
   onRemove: () => void;
 }) {
-  const t = useT();
   const label = row.info?.title || row.id;
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useMotionSafeSortable({
-      id: row.id,
-      disabled: !canReorder,
-    });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: row.id,
+    disabled: !canReorder,
+  });
   return (
     <li
       ref={setNodeRef}
@@ -376,7 +362,7 @@ function TitleRow({
       {canReorder ? (
         <button
           type="button"
-          aria-label={t("web.collections.manual.moveTitle", { title: label })}
+          aria-label={`Move ${label}`}
           className="text-muted-foreground/70 hover:text-foreground focus-visible:ring-ring/50 grid h-9 w-7 cursor-grab touch-none place-items-center rounded-lg outline-none focus-visible:ring-[3px]"
           {...attributes}
           {...listeners}
@@ -386,20 +372,16 @@ function TitleRow({
       ) : (
         <span />
       )}
-      <span className="text-muted-foreground text-end text-[13px] tabular-nums">
-        {numberText(index + 1)}
-      </span>
+      <span className="text-muted-foreground text-right text-[13px] tabular-nums">{index + 1}</span>
       <Poster url={row.info?.posterUrl} />
       <span className="min-w-0">
         <span className="block truncate text-[14.5px] font-semibold">{label}</span>
         <span className="text-muted-foreground block truncate text-[12.5px]">
-          {metaOf(t, row.info)}
+          {metaOf(row.info)}
         </span>
       </span>
       {row.failed ? (
-        <span className="text-destructive text-[12.5px] font-medium">
-          {t("web.collections.manual.couldntAdd")}
-        </span>
+        <span className="text-destructive text-[12.5px] font-medium">Couldn't add</span>
       ) : (
         <span />
       )}
@@ -408,7 +390,7 @@ function TitleRow({
         variant="ghost"
         size="icon"
         className="text-muted-foreground hover:text-destructive size-9 max-lg:size-11"
-        aria-label={t("web.collections.manual.removeTitle", { title: label })}
+        aria-label={`Remove ${label}`}
         onClick={onRemove}
       >
         <X aria-hidden className="size-4" />
@@ -430,7 +412,6 @@ function UndoToast({
   onUndo: () => void;
   onDone: () => void;
 }) {
-  const t = useT();
   const [paused, setPaused] = useState({ hover: false, focus: false });
   const remaining = useRef(UNDO_MS);
   const isPaused = paused.hover || paused.focus;
@@ -450,12 +431,12 @@ function UndoToast({
       onMouseLeave={() => setPaused((p) => ({ ...p, hover: false }))}
       onFocus={() => setPaused((p) => ({ ...p, focus: true }))}
       onBlur={() => setPaused((p) => ({ ...p, focus: false }))}
-      className="border-border bg-popover flex w-fit items-center gap-3 rounded-xl border py-1.5 ps-3 pe-1.5 text-[13.5px] shadow-lg"
+      className="border-border bg-popover flex w-fit items-center gap-3 rounded-xl border py-1.5 pr-1.5 pl-3 text-[13.5px] shadow-lg"
     >
       <span className="font-medium">{message}</span>
       <Button type="button" size="sm" variant="outline" className="h-8 gap-1.5" onClick={onUndo}>
         <Undo2 aria-hidden className="size-3.5" />
-        {t("web.collections.manual.undo")}
+        Undo
       </Button>
     </div>
   );
@@ -478,14 +459,6 @@ export interface ManualContentsPanelProps {
   itemCount?: number;
   /** After every title write, so the editor refreshes its save token. */
   onItemsChanged: () => void;
-  /** Whether a title write is running, and how many have failed so far. */
-  onWritesChange?: (writes: TitleWrites) => void;
-}
-
-export interface TitleWrites {
-  writing: boolean;
-  /** Title writes that have failed since the panel opened; it only goes up. */
-  failures: number;
 }
 
 /**
@@ -503,9 +476,7 @@ export function ManualContentsPanel({
   onRetryStaged,
   itemCount = 0,
   onItemsChanged,
-  onWritesChange,
 }: ManualContentsPanelProps) {
-  const t = useT();
   const queryClient = useQueryClient();
   const headingId = useId();
   const source = scope.itemSource;
@@ -529,15 +500,6 @@ export function ManualContentsPanel({
   const [expanded, setExpanded] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [undo, setUndo] = useState<{ id: string; title: string; position: number } | null>(null);
-  // Title writes still running: several can overlap, and the first to finish
-  // sets `saved`, so Save waits on the count instead.
-  const [running, setRunning] = useState(0);
-  // Failed title writes so far. A count, not the message on screen: a later
-  // write clears the message, and Save must still see the earlier failure.
-  const [failures, setFailures] = useState(0);
-  const failedWrite = () => setFailures((count) => count + 1);
-  const writing = running > 0;
-  useEffect(() => onWritesChange?.({ writing, failures }), [onWritesChange, writing, failures]);
   const dragOrder = useRef<typeof orderSnapshot>(undefined);
 
   // Posters and years for titles saved before the editor opened.
@@ -602,16 +564,6 @@ export function ManualContentsPanel({
   // so an add picked before the list refreshes goes after the one before it.
   const claimed = useRef(0);
 
-  /** Counts a title write while it runs. */
-  async function tracked(write: () => Promise<void>) {
-    setRunning((count) => count + 1);
-    try {
-      await write();
-    } finally {
-      setRunning((count) => count - 1);
-    }
-  }
-
   async function afterWrite() {
     await scope.invalidate(queryClient, collectionId);
     setSaved("saved");
@@ -628,22 +580,15 @@ export function ManualContentsPanel({
     setSaved("saving");
     const position = Math.max(nextPosition, claimed.current);
     claimed.current = position + 1;
-    await tracked(async () => {
-      try {
-        await putCollectionItem(scope, collectionId, item.content_id, position);
-        await afterWrite();
-      } catch (error) {
-        setSaved("idle");
-        failedWrite();
-        setProblem(
-          t("web.collections.manual.addFailed", {
-            title: item.title,
-            detail:
-              error instanceof Error ? error.message : t("web.collections.manual.tryAgainSentence"),
-          }),
-        );
-      }
-    });
+    try {
+      await putCollectionItem(scope, collectionId, item.content_id, position);
+      await afterWrite();
+    } catch (error) {
+      setSaved("idle");
+      setProblem(
+        `Couldn't add ${item.title}. ${error instanceof Error ? error.message : "Try again."}`,
+      );
+    }
   }
 
   async function remove(row: Row) {
@@ -653,95 +598,67 @@ export function ManualContentsPanel({
       return;
     }
     setSaved("saving");
-    await tracked(async () => {
-      try {
-        await v2(
-          source === "user"
-            ? "DELETE /api/v2/collections/{id}/items/{item_id}"
-            : "DELETE /api/v2/admin/collections/{id}/items/{item_id}",
-          { path: { id: collectionId, item_id: row.id } },
-        );
-        setUndo({ id: row.id, title: row.info?.title || row.id, position: row.position ?? 0 });
-        if (row.info) setKnown((current) => ({ ...current, [row.id]: row.info! }));
-        setPage({ collectionId, cursor: "" });
-        await afterWrite();
-      } catch (error) {
-        setSaved("idle");
-        failedWrite();
-        setProblem(
-          t("web.collections.manual.removeFailed", {
-            title: row.info?.title || row.id,
-            detail: error instanceof Error ? error.message : "",
-          }).trim(),
-        );
-      }
-    });
+    try {
+      await v2(
+        source === "user"
+          ? "DELETE /api/v2/collections/{id}/items/{item_id}"
+          : "DELETE /api/v2/admin/collections/{id}/items/{item_id}",
+        { path: { id: collectionId, item_id: row.id } },
+      );
+      setUndo({ id: row.id, title: row.info?.title || row.id, position: row.position ?? 0 });
+      if (row.info) setKnown((current) => ({ ...current, [row.id]: row.info! }));
+      setPage({ collectionId, cursor: "" });
+      await afterWrite();
+    } catch (error) {
+      setSaved("idle");
+      setProblem(
+        `Couldn't remove ${row.info?.title || row.id}. ${error instanceof Error ? error.message : ""}`.trim(),
+      );
+    }
   }
 
   async function restore(removed: NonNullable<typeof undo>) {
     setUndo(null);
     if (!collectionId) return;
     setSaved("saving");
-    await tracked(async () => {
-      try {
-        await putCollectionItem(scope, collectionId, removed.id, removed.position);
-        await afterWrite();
-      } catch (error) {
-        setSaved("idle");
-        failedWrite();
-        setProblem(
-          t("web.collections.manual.restoreFailed", {
-            title: removed.title,
-            detail: error instanceof Error ? error.message : "",
-          }).trim(),
-        );
-      }
-    });
+    try {
+      await putCollectionItem(scope, collectionId, removed.id, removed.position);
+      await afterWrite();
+    } catch (error) {
+      setSaved("idle");
+      setProblem(
+        `Couldn't put back ${removed.title}. ${error instanceof Error ? error.message : ""}`.trim(),
+      );
+    }
   }
 
-  const scrollBehavior = useMotionScrollBehavior();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-      scrollBehavior,
-    }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
   const lastOver = useRef<UniqueIdentifier | null>(null);
   const announcements = useMemo<Announcements>(() => {
     const titleOf = (id: UniqueIdentifier) =>
-      rows.find((row) => row.id === id)?.info?.title ?? t("web.collections.dnd.unknownTitle");
+      rows.find((row) => row.id === id)?.info?.title ?? "Title";
     const positionOf = (id: UniqueIdentifier) =>
-      t("web.collections.dnd.position", {
-        position: rows.findIndex((row) => row.id === id) + 1,
-        total: rows.length,
-      });
+      `position ${rows.findIndex((row) => row.id === id) + 1} of ${rows.length}`;
     return {
       onDragStart: ({ active }) => {
         lastOver.current = active.id;
-        return t("web.collections.dnd.pickedUp", {
-          name: titleOf(active.id),
-          place: positionOf(active.id),
-        });
+        return `Picked up ${titleOf(active.id)}, ${positionOf(active.id)}.`;
       },
       onDragOver: ({ active, over }) => {
         if (!over || over.id === lastOver.current) return undefined;
         lastOver.current = over.id;
-        return t("web.collections.dnd.nowAt", {
-          title: titleOf(active.id),
-          place: positionOf(over.id),
-        });
+        return `${titleOf(active.id)} is now at ${positionOf(over.id)}.`;
       },
       onDragEnd: ({ active, over }) =>
         over
-          ? t("web.collections.dnd.moved", {
-              title: titleOf(active.id),
-              place: positionOf(over.id),
-            })
-          : t("web.collections.dnd.dropped", { title: titleOf(active.id) }),
-      onDragCancel: ({ active }) => t("web.collections.dnd.canceled", { name: titleOf(active.id) }),
+          ? `Moved ${titleOf(active.id)} to ${positionOf(over.id)}.`
+          : `${titleOf(active.id)} dropped.`,
+      onDragCancel: ({ active }) => `Moving ${titleOf(active.id)} was canceled.`,
     };
-  }, [rows, t]);
+  }, [rows]);
 
   function onDragEnd({ active, over }: DragEndEvent) {
     if (!over || active.id === over.id) return;
@@ -758,20 +675,15 @@ export function ManualContentsPanel({
     const token = dragOrder.current;
     if (!canReorder || !token) return;
     setSaved("saving");
-    // Per-call `mutate` callbacks run only for the latest call, so each
-    // reorder settles its own count through its promise.
-    void tracked(() =>
-      reorder.mutateAsync({ orderedIds: next, etag: token.etag }).then(
-        () => {
+    reorder.mutate(
+      { orderedIds: next, etag: token.etag },
+      {
+        onSuccess: () => {
           setSaved("saved");
           onItemsChanged();
         },
-        // The reorder hook's toast says what went wrong.
-        () => {
-          setSaved("idle");
-          failedWrite();
-        },
-      ),
+        onError: () => setSaved("idle"),
+      },
     );
   }
 
@@ -787,11 +699,11 @@ export function ManualContentsPanel({
         {/* The tag and the tick sit by the heading, not in it, so its name stays "Titles". */}
         <div className="flex items-center gap-2.5">
           <h2 id={headingId} className="text-[17px] font-semibold">
-            {t("web.collections.manual.heading")}
+            Titles
           </h2>
           {!created ? (
             <span className="bg-muted text-muted-foreground rounded-md px-2 py-0.5 text-[12px] font-medium">
-              {notCreatedYet()}
+              {NOT_CREATED_YET}
             </span>
           ) : null}
           <span
@@ -801,18 +713,18 @@ export function ManualContentsPanel({
             {saved === "saving" ? (
               <>
                 <Loader2 aria-hidden className="size-3.5 animate-spin" />
-                {t("web.collections.manual.saving")}
+                Saving…
               </>
             ) : saved === "saved" ? (
               <>
                 <Check aria-hidden className="text-success size-3.5" />
-                {titlesSavedLabel()}
+                {TITLES_SAVED}
               </>
             ) : null}
           </span>
         </div>
         <p className="text-muted-foreground mt-1 text-[13.5px]">
-          {!created ? titlesCaption("create") : titlesCaption(scope.kind)}
+          {!created ? TITLES_CAPTION.create : TITLES_CAPTION[scope.kind]}
         </p>
       </header>
 
@@ -844,7 +756,7 @@ export function ManualContentsPanel({
               className="h-8"
               onClick={() => onRetryStaged(nextPosition)}
             >
-              {t("common.tryAgain")}
+              Try again
             </Button>
           ) : null}
         </div>
@@ -867,11 +779,7 @@ export function ManualContentsPanel({
         </div>
       ) : created && items.error ? (
         <div role="alert" className="grid justify-items-start gap-2 text-[13.5px]">
-          <p>
-            {items.error instanceof Error
-              ? items.error.message
-              : t("web.collections.manual.loadFailed")}
-          </p>
+          <p>{items.error instanceof Error ? items.error.message : "Couldn't load the titles."}</p>
           <Button
             type="button"
             variant="outline"
@@ -880,21 +788,18 @@ export function ManualContentsPanel({
               void items.refetch();
             }}
           >
-            {t("web.collections.manual.reloadFromStart")}
+            Reload from start
           </Button>
         </div>
       ) : rows.length === 0 ? (
         <p className="border-border text-muted-foreground rounded-xl border border-dashed px-4 py-5 text-[13.5px]">
-          {titlesEmpty()}
+          {TITLES_EMPTY}
         </p>
       ) : (
         <DndContext
           sensors={sensors}
           collisionDetection={closestCenter}
-          accessibility={{
-            announcements,
-            screenReaderInstructions: { draggable: t("web.common.sortable.instructions") },
-          }}
+          accessibility={{ announcements }}
           onDragStart={() => {
             dragOrder.current = orderSnapshot;
           }}
@@ -928,16 +833,14 @@ export function ManualContentsPanel({
               size="sm"
               onClick={() => setExpanded((value) => !value)}
             >
-              {expanded
-                ? t("web.collections.manual.showFewer")
-                : t("web.collections.manual.showAll", { count: rows.length })}
+              {expanded ? "Show fewer" : `Show all ${rows.length}`}
             </Button>
           ) : (
             <span />
           )}
           {canReorder ? (
             <p className="text-muted-foreground text-[12.5px]">
-              {t("web.collections.manual.reorderHint")}
+              Drag, or focus a handle and press Space, then ↑ or ↓.
             </p>
           ) : null}
         </div>
@@ -946,7 +849,8 @@ export function ManualContentsPanel({
       {created && (cursor || items.data?.page?.has_more) ? (
         <div className="grid gap-2">
           <p className="text-muted-foreground text-[13px]">
-            {t("web.collections.manual.pagedNote")}
+            Showing up to 200 titles. Reordering is available when the whole collection fits on one
+            page.
           </p>
           <div className="flex gap-2">
             <Button
@@ -955,7 +859,7 @@ export function ManualContentsPanel({
               disabled={!cursor}
               onClick={() => setPage({ collectionId, cursor: "" })}
             >
-              {t("web.collections.manual.firstPage")}
+              First page
             </Button>
             <Button
               type="button"
@@ -963,7 +867,7 @@ export function ManualContentsPanel({
               disabled={!items.data?.page?.has_more || !items.data.page?.next_cursor}
               onClick={() => setPage({ collectionId, cursor: items.data?.page?.next_cursor ?? "" })}
             >
-              {t("web.collections.manual.nextPage")}
+              Next page
             </Button>
           </div>
         </div>

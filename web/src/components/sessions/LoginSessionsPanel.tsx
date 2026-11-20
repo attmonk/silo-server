@@ -3,7 +3,6 @@ import { Link, useNavigate } from "react-router";
 import { Loader2, RefreshCw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
-import { TOUCH_TARGETS } from "@/lib/touchTargets";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,7 +18,6 @@ import {
 import { useLoginSessions, type LoginSession } from "@/hooks/queries/loginSessions";
 import { useAuth } from "@/hooks/useAuth";
 import { loginSessionDevice } from "@/lib/loginSessionDevice";
-import { useT } from "@/i18n";
 import { LoginSessionRow } from "./LoginSessionRow";
 
 type Selection = { kind: "one"; session: LoginSession } | { kind: "all" };
@@ -31,7 +29,6 @@ export function LoginSessionsPanel({
   adminUser?: { id: number; username: string };
   manageable?: boolean;
 }) {
-  const t = useT();
   const { query, sessions, currentSession, revoke, revokeAll } = useLoginSessions(adminUser?.id);
   const { clearLoginSession } = useAuth();
   const navigate = useNavigate();
@@ -69,15 +66,13 @@ export function LoginSessionsPanel({
       } else {
         toast.success(
           selection.kind === "all"
-            ? t("web.settings.sessions.signedOutEverywhere", {
-                username: adminUser?.username ?? "",
-              })
-            : t("web.settings.sessions.signedOut"),
+            ? `${adminUser?.username} is signed out everywhere`
+            : "Session signed out",
         );
       }
     } catch (error) {
       setActionError(
-        error instanceof Error ? error.message : t("web.settings.sessions.signOutFailed"),
+        error instanceof Error ? error.message : "Couldn't sign out the session. Try again.",
       );
     }
   }
@@ -115,12 +110,12 @@ export function LoginSessionsPanel({
                 : "text-[1.75rem] leading-[1.15] font-bold tracking-[-0.035em] text-balance sm:text-[2rem]",
             )}
           >
-            {t("web.settings.sessions.title")}
+            Signed-in sessions
           </Heading>
           <p className="text-muted-foreground max-w-2xl text-sm leading-relaxed">
             {adminUser
-              ? t("web.settings.sessions.adminDescription", { username: adminUser.username })
-              : t("web.settings.sessions.description")}
+              ? `Browsers and apps signed in to ${adminUser.username}’s account.`
+              : "See where your account is signed in, and sign out any session you don’t recognize."}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -129,13 +124,13 @@ export function LoginSessionsPanel({
             variant="outline"
             onClick={() => void query.refetch()}
             disabled={query.isFetching}
-            aria-label={t("web.settings.sessions.refreshLabel")}
+            aria-label="Refresh sessions"
           >
             <RefreshCw
               className={query.isFetching ? "animate-spin" : undefined}
               aria-hidden="true"
-            />
-            {t("web.settings.sessions.refresh")}
+            />{" "}
+            Refresh
           </Button>
           {adminUser && manageable && !query.isPending && !query.isError && (
             <Button
@@ -146,43 +141,42 @@ export function LoginSessionsPanel({
               disabled={pending}
               onClick={() => open({ kind: "all" })}
             >
-              {t("web.settings.sessions.signOutEverywhere")}
+              Sign out everywhere
             </Button>
           )}
         </div>
       </div>
       {query.isPending ? (
         <p role="status" className="text-muted-foreground flex items-center gap-2 text-sm">
-          <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-          {t("web.settings.sessions.loading")}
+          <Loader2 className="size-4 animate-spin" aria-hidden="true" /> Loading sessions…
         </p>
       ) : query.isError ? (
         <div role="alert" className="surface-panel-raised space-y-3 p-5">
-          <p>{t("web.settings.sessions.loadFailed")}</p>
+          <p>Couldn’t load sessions. Try again.</p>
           <Button
             variant="outline"
             onClick={() => void query.refetch()}
             disabled={query.isFetching}
           >
-            {t("common.retry")}
+            Retry
           </Button>
         </div>
       ) : adminUser ? (
         <SettingsGroup
-          title={t("web.settings.sessions.admin.groupTitle")}
-          description={t("web.settings.sessions.admin.groupDescription")}
+          title="Active sign-ins"
+          description="Sign out one client, or end all of this account’s sign-ins."
           flush
         >
           {adminRows.length ? (
             list(adminRows)
           ) : (
             <p className="text-muted-foreground py-4 text-sm">
-              {t("web.settings.sessions.admin.empty")}
+              No active sign-ins for this account.
             </p>
           )}
           {!manageable && (
             <p className="text-muted-foreground pt-2 text-xs">
-              {t("web.settings.sessions.admin.ownerOnly")}
+              Only the server owner can sign out another admin or the owner.
             </p>
           )}
         </SettingsGroup>
@@ -190,16 +184,16 @@ export function LoginSessionsPanel({
         <>
           {current && (
             <SettingsGroup
-              title={t("web.settings.sessions.current.title")}
-              description={t("web.settings.sessions.current.description")}
+              title="This browser"
+              description="The session you’re using right now."
               flush
             >
               {list([current])}
             </SettingsGroup>
           )}
           <SettingsGroup
-            title={t("web.settings.sessions.others.title")}
-            description={t("web.settings.sessions.others.description")}
+            title="Other signed-in sessions"
+            description="Other browsers and apps with access to your account."
             flush
           >
             {others.length ? (
@@ -207,7 +201,7 @@ export function LoginSessionsPanel({
             ) : (
               <div className="text-muted-foreground flex items-center gap-3 py-5 text-sm">
                 <ShieldCheck className="size-5" aria-hidden="true" />
-                <p>{t("web.settings.sessions.others.empty")}</p>
+                <p>No other signed-in sessions.</p>
               </div>
             )}
           </SettingsGroup>
@@ -219,21 +213,19 @@ export function LoginSessionsPanel({
           disabled={query.isFetchingNextPage}
           onClick={() => void query.fetchNextPage()}
         >
-          {query.isFetchingNextPage
-            ? t("web.settings.sessions.loadingMore")
-            : t("web.settings.sessions.loadMore")}
+          {query.isFetchingNextPage ? "Loading…" : "Load more sessions"}
         </Button>
       )}
       <p className="text-muted-foreground text-xs leading-relaxed">
-        {adminUser
-          ? t("web.settings.sessions.footnoteAdmin")
-          : t("web.settings.sessions.footnote", {
-              link: (chunks) => (
-                <Link to="/settings/account" className="underline underline-offset-4">
-                  {chunks}
-                </Link>
-              ),
-            })}
+        Last seen records authenticated activity, updated at most once a minute. Older sessions may
+        have no recorded activity yet. Signing out keeps the password and saved device settings.{" "}
+        {adminUser ? (
+          "Other accounts stay signed in."
+        ) : (
+          <Link to="/settings/account" className="underline underline-offset-4">
+            Manage your account’s password
+          </Link>
+        )}
       </p>
       <AlertDialog
         open={Boolean(selection)}
@@ -242,7 +234,6 @@ export function LoginSessionsPanel({
         }}
       >
         <AlertDialogContent
-          className={TOUCH_TARGETS}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
             const target =
@@ -255,42 +246,30 @@ export function LoginSessionsPanel({
           <AlertDialogHeader>
             <AlertDialogTitle>
               {selection?.kind === "all"
-                ? t("web.settings.sessions.confirm.allTitle", {
-                    username: adminUser?.username ?? "",
-                  })
+                ? `Sign ${adminUser?.username} out everywhere?`
                 : selection?.session.current
-                  ? t("web.settings.sessions.confirm.thisBrowserTitle")
-                  : selection
-                    ? t("web.settings.sessions.confirm.deviceTitle", {
-                        device: loginSessionDevice(selection.session).name,
-                      })
-                    : t("web.settings.sessions.confirm.sessionTitle")}
+                  ? "Sign out this browser?"
+                  : `Sign out ${selection ? loginSessionDevice(selection.session).name : "this session"}?`}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {selection?.kind === "all"
-                ? t(
-                    current
-                      ? "web.settings.sessions.confirm.allDescriptionWithThisBrowser"
-                      : "web.settings.sessions.confirm.allDescription",
-                    { username: adminUser?.username ?? "" },
-                  )
+                ? `Every active sign-in to ${adminUser?.username}’s account will lose access on its next authenticated request, including sessions beyond this list. The password stays the same and other accounts stay signed in.${current ? " This includes the browser you’re using." : ""}`
                 : selection?.session.current
-                  ? t("web.settings.sessions.confirm.thisBrowserDescription")
-                  : adminUser
-                    ? t("web.settings.sessions.confirm.adminClientDescription", {
-                        username: adminUser.username,
-                      })
-                    : t("web.settings.sessions.confirm.clientDescription")}
+                  ? "You’ll return to the sign-in screen. You can sign in again with the same password or sign-in provider."
+                  : `This ${adminUser ? `client on ${adminUser.username}’s account` : "client"} will lose access on its next authenticated request. Its other sessions and password stay unchanged.`}
             </AlertDialogDescription>
           </AlertDialogHeader>
-          <p className="text-muted-foreground text-xs">{t("web.settings.sessions.confirm.note")}</p>
+          <p className="text-muted-foreground text-xs">
+            A video already playing may continue until its next request. Saved device settings are
+            kept.
+          </p>
           {actionError && (
             <p role="alert" className="text-destructive text-sm">
               {actionError}
             </p>
           )}
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={pending}>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel disabled={pending}>Cancel</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               disabled={pending}
@@ -300,10 +279,10 @@ export function LoginSessionsPanel({
               }}
             >
               {pending
-                ? t("web.settings.sessions.confirm.signingOut")
+                ? "Signing out…"
                 : selection?.kind === "all"
-                  ? t("web.settings.sessions.signOutEverywhere")
-                  : t("common.signOut")}
+                  ? "Sign out everywhere"
+                  : "Sign out"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

@@ -1,21 +1,10 @@
 import type { CrewMember } from "@/api/types";
-import type { MessageKey } from "@/i18n";
-
-/** The crew role a group's cards show. */
-export type CrewRole = "Director" | "Creator" | "Writer";
-
-/** Caption under each card of a role's group. */
-export const CREW_ROLE_CAPTION: Record<CrewRole, MessageKey> = {
-  Director: "web.detail.castCrew.director",
-  Creator: "web.detail.castCrew.creator",
-  Writer: "web.detail.castCrew.writer",
-};
 
 export interface CrewGroup {
   /** Divider label shown before the group (omitted for the first group). */
-  label: MessageKey;
-  /** The role captioned under each card (see `CREW_ROLE_CAPTION`). */
-  role: CrewRole;
+  label: string;
+  /** Caption under each card, e.g. "Director". */
+  role: string;
   members: CrewMember[];
   /** Most cards shown for this group. */
   max: number;
@@ -36,13 +25,13 @@ export function buildCrewGroups(crew: CrewMember[], leadRole: "Director" | "Crea
   const shownLeadKeys = new Set(uniqueByPerson(lead.members).slice(0, lead.max).map(creditKey));
   return [
     {
-      label: CREW_ROLE_CAPTION[lead.role],
+      label: lead.role,
       role: lead.role,
       members: lead.members,
       max: lead.max,
     },
     {
-      label: "web.detail.castCrew.writers",
+      label: "Writers",
       role: "Writer",
       members: crew.filter(
         (c) => (c.job === "Writer" || c.job === "Screenplay") && !shownLeadKeys.has(creditKey(c)),

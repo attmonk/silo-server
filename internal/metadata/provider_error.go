@@ -12,8 +12,7 @@ import (
 
 var (
 	httpRateLimitCodeRE = regexp.MustCompile(`\b429\b`)
-	httpUnauthorizedRE  = regexp.MustCompile(`\b401\b`)
-	httpForbiddenRE     = regexp.MustCompile(`\b403\b`)
+	httpPermanentCodeRE = regexp.MustCompile(`\b(?:401|403)\b`)
 )
 
 // ProviderErrorClass is the provider-agnostic retry disposition shared by
@@ -26,41 +25,24 @@ const (
 	ProviderErrorPermanent   ProviderErrorClass = "permanent"
 )
 
-// ProviderErrorPolicy adjusts how ClassifyProviderError reads untyped errors.
-// The zero value is the default policy.
-type ProviderErrorPolicy struct {
-	// ForbiddenIsRateLimit classifies an untyped HTTP 403 or "forbidden" in
-	// the error text as rate limited instead of permanent. Some upstream APIs
-	// (Apple's iTunes Search API among them) answer throttling with 403, and a
-	// provider that forwards that status as plain text gives the host no way
-	// to tell a throttle from a ban. A 401 is about credentials and stays
-	// permanent, as do typed gRPC PermissionDenied and Unauthenticated.
-	ForbiddenIsRateLimit bool
-}
-
 // ClassifyProviderError prefers typed gRPC status codes and falls back to the
 // text emitted by HTTP/native providers. retryAfter is populated when a gRPC
 // ResourceExhausted response carries RetryInfo.
 func ClassifyProviderError(err error) (class ProviderErrorClass, retryAfter time.Duration) {
-	return ProviderErrorPolicy{}.Classify(err)
-}
-
-// Classify is ClassifyProviderError under policy p.
-func (p ProviderErrorPolicy) Classify(err error) (class ProviderErrorClass, retryAfter time.Duration) {
 	if err == nil {
 		return ProviderErrorTransient, 0
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		return p.combine(joined.Unwrap())
+		return combineProviderErrorClasses(joined.Unwrap())
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok && wrapped.Unwrap() != nil {
-		class, retryAfter := p.Classify(wrapped.Unwrap())
+		class, retryAfter := ClassifyProviderError(wrapped.Unwrap())
 		if class != ProviderErrorTransient {
 			return class, retryAfter
 		}
 		// Native HTTP providers often add their status only in a wrapping
 		// message. Let that text strengthen an otherwise-transient leaf.
-		if wrapperClass := p.classifyText(err.Error()); wrapperClass != ProviderErrorTransient {
+		if wrapperClass := classifyProviderErrorText(err.Error()); wrapperClass != ProviderErrorTransient {
 			return wrapperClass, 0
 		}
 		return class, retryAfter
@@ -92,10 +74,10 @@ func (p ProviderErrorPolicy) Classify(err error) (class ProviderErrorClass, retr
 		}
 	}
 
-	return p.classifyText(err.Error()), 0
+	return classifyProviderErrorText(err.Error()), 0
 }
 
-func (p ProviderErrorPolicy) combine(errs []error) (ProviderErrorClass, time.Duration) {
+func combineProviderErrorClasses(errs []error) (ProviderErrorClass, time.Duration) {
 	if len(errs) == 0 {
 		return ProviderErrorTransient, 0
 	}
@@ -103,7 +85,7 @@ func (p ProviderErrorPolicy) combine(errs []error) (ProviderErrorClass, time.Dur
 	hasRateLimit := false
 	var longestRetryAfter time.Duration
 	for _, err := range errs {
-		class, retryAfter := p.Classify(err)
+		class, retryAfter := ClassifyProviderError(err)
 		switch class {
 		case ProviderErrorRateLimited:
 			hasRateLimit = true
@@ -123,7 +105,7 @@ func (p ProviderErrorPolicy) combine(errs []error) (ProviderErrorClass, time.Dur
 	return ProviderErrorTransient, 0
 }
 
-func (p ProviderErrorPolicy) classifyText(message string) ProviderErrorClass {
+func classifyProviderErrorText(message string) ProviderErrorClass {
 	msg := strings.ToLower(message)
 	switch {
 	case strings.Contains(msg, "resourceexhausted"),
@@ -142,17 +124,12 @@ func (p ProviderErrorPolicy) classifyText(message string) ProviderErrorClass {
 		strings.Contains(msg, "permission denied"),
 		strings.Contains(msg, "unauthenticated"),
 		strings.Contains(msg, "unauthorized"),
-		httpUnauthorizedRE.MatchString(msg),
 		strings.Contains(msg, "failedprecondition"),
 		strings.Contains(msg, "failed precondition"),
 		strings.Contains(msg, "unimplemented"),
-		strings.Contains(msg, "not implemented"):
-		return ProviderErrorPermanent
-	case httpForbiddenRE.MatchString(msg),
+		strings.Contains(msg, "not implemented"),
+		httpPermanentCodeRE.MatchString(msg),
 		strings.Contains(msg, "forbidden"):
-		if p.ForbiddenIsRateLimit {
-			return ProviderErrorRateLimited
-		}
 		return ProviderErrorPermanent
 	default:
 		return ProviderErrorTransient

@@ -6,14 +6,12 @@ import { SettingRow } from "@/components/settings/SettingRow";
 import { SettingsGroup } from "@/components/settings/SettingsGroup";
 import { Switch } from "@/components/ui/switch";
 import { useProfileDefaultWriter } from "@/hooks/queries/profileDefaults";
-import { useT } from "@/i18n";
 import {
   settingsCapabilitiesSupportKey,
   useEffectiveSettings,
   useSettingsCapabilities,
 } from "@/hooks/queries/settingValues";
 import { SETTING_DEFINITIONS, SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
-import { settingDescription, settingLabel } from "@/lib/settingsText";
 
 import { TitleArtSettingsGroup } from "./TitleArtSettingsGroup";
 
@@ -28,7 +26,6 @@ const EPISODE_SPOILER_KEYS = [
  * can also be this browser's alone (see TitleArtSettingsGroup).
  */
 export default function TitlePagesSettings() {
-  const t = useT();
   const capabilities = useSettingsCapabilities();
   const supportsThemeMusic = settingsCapabilitiesSupportKey(
     capabilities.data,
@@ -62,13 +59,10 @@ export default function TitlePagesSettings() {
   const read = (key: SettingKey) =>
     (effective?.[key]?.value ?? SETTING_DEFINITIONS[key].defaultValue) as boolean;
 
-  const switchRow = (
-    key: SettingKey,
-    description = settingDescription(SETTING_DEFINITIONS[key]),
-  ) => (
+  const switchRow = (key: SettingKey, description = SETTING_DEFINITIONS[key].description) => (
     <SettingRow
       key={key}
-      label={settingLabel(SETTING_DEFINITIONS[key])}
+      label={SETTING_DEFINITIONS[key].label}
       description={description}
       control={(id) => (
         <Switch
@@ -76,7 +70,7 @@ export default function TitlePagesSettings() {
           checked={read(key)}
           disabled={disabled}
           onCheckedChange={(value) =>
-            save(key, value).catch(() => toast.error(t("web.settings.titlePages.saveFailed")))
+            save(key, value).catch(() => toast.error("Failed to save title page setting"))
           }
         />
       )}
@@ -86,17 +80,14 @@ export default function TitlePagesSettings() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.titlePages.title")}
-        subtitle={t("web.settings.titlePages.subtitle")}
+        title="Title Pages"
+        subtitle="What a movie or show page shows and plays when you open it."
       />
 
       <TitleArtSettingsGroup />
 
       {supportsThemeMusic ? (
-        <SettingsGroup
-          title={t("web.settings.titlePages.soundTitle")}
-          description={t("web.settings.titlePages.soundDescription")}
-        >
+        <SettingsGroup title="Sound" description="Plays while a title's page is open.">
           {switchRow(SETTING_KEYS.UI_THEME_MUSIC_ENABLED)}
           {supportsThemeMusicLoop ? switchRow(SETTING_KEYS.UI_THEME_MUSIC_LOOP) : null}
         </SettingsGroup>
@@ -104,17 +95,17 @@ export default function TitlePagesSettings() {
 
       {supportsEpisodeSpoilers ? (
         <SettingsGroup
-          title={t("web.settings.titlePages.spoilersTitle")}
-          description={t("web.settings.titlePages.spoilersDescription")}
+          title="Spoilers"
+          description="Applies to episodes you have not started, on every device that uses this profile."
         >
           {EPISODE_SPOILER_KEYS.map((key) => switchRow(key))}
         </SettingsGroup>
       ) : null}
 
-      <SettingsGroup title={t("web.settings.titlePages.ageGuidanceTitle")}>
+      <SettingsGroup title="Age guidance">
         {switchRow(
           SETTING_KEYS.CATALOG_SHOW_ADVISORY_AGE,
-          t("web.settings.titlePages.advisoryAgeDescription"),
+          "Show a suggested minimum viewer age, such as Common Sense Media's, on a title's page. This only shows the age; a household manager can limit a profile by it in the profile's access settings.",
         )}
       </SettingsGroup>
     </div>

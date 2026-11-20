@@ -1,5 +1,4 @@
 import type { RequestApprovalMode, RequestLimitMode, RequestSettings } from "@/api/types";
-import { t } from "@/i18n";
 
 // Who may request, and on what terms, resolves in layers, as the server does
 // it (internal/requests, EffectivePolicy): the account's own approval and
@@ -163,16 +162,12 @@ export function effectiveRequestPolicy(
 /** "Kids group", or a name that already says it, as "Default Group". */
 export function requestGroupLabel(name: string): string {
   const trimmed = name.trim();
-  if (!trimmed) return t("web.admin.common.requestAccess.unknownGroup");
-  // A group's name is server data; one that already ends in "group" is shown as it is.
-  return /\bgroup$/i.test(trimmed)
-    ? trimmed
-    : t("web.admin.common.requestAccess.group", { name: trimmed });
+  if (!trimmed) return "its access group";
+  return /\bgroup$/i.test(trimmed) ? trimmed : `${trimmed} group`;
 }
 
-/** "per day", "per 7 days". */
-function perWindow(days: number): string {
-  return t("web.admin.common.requestAccess.perWindow", { days, days_text: days });
+function plural(n: number, one: string, many: string) {
+  return n === 1 ? one : many;
 }
 
 /**
@@ -185,39 +180,25 @@ export function formatRequestQuota(quota: RequestQuota): string {
 
 /** The quota, with where it comes from in the same parentheses when it has some. */
 function formatQuotaFrom(quota: RequestQuota, source?: string): string {
-  if (quota.unlimited) {
-    return source
-      ? t("web.admin.common.requestAccess.noLimitFrom", { source })
-      : t("web.admin.common.requestAccess.noLimit");
-  }
-  const per_window = perWindow(quota.days);
-  if (quota.max === 0) {
-    return source
-      ? t("web.admin.common.requestAccess.noNewRequestsFrom", { per_window, source })
-      : t("web.admin.common.requestAccess.noNewRequests", { per_window });
-  }
-  const count = { count: quota.max, count_text: quota.max, per_window };
-  return source
-    ? t("web.admin.common.requestAccess.quotaFrom", { ...count, source })
-    : t("web.admin.common.requestAccess.quota", count);
+  const from = source ? ` (${source})` : "";
+  if (quota.unlimited) return `no limit${from}`;
+  const window = quota.days === 1 ? "day" : `${quota.days} days`;
+  if (quota.max === 0) return `no new requests (0 per ${window}${source ? `, ${source}` : ""})`;
+  return `${quota.max} ${plural(quota.max, "request", "requests")} per ${window}${from}`;
 }
 
 export function formatRequestApproval(autoApprove: boolean): string {
-  return autoApprove
-    ? t("web.admin.common.requestAccess.approvedAutomatically")
-    : t("web.admin.common.requestAccess.adminApproves");
+  return autoApprove ? "approved automatically" : "an admin approves";
 }
 
 export function formatRequestSource(source: RequestPolicySource): string {
   switch (source.kind) {
     case "account":
-      return t("web.admin.common.requestAccess.sourceAccount");
+      return "set on this account";
     case "group":
-      return t("web.admin.common.requestAccess.sourceGroup", {
-        group: requestGroupLabel(source.name),
-      });
+      return `from ${requestGroupLabel(source.name)}`;
     case "server":
-      return t("web.admin.common.requestAccess.sourceServer");
+      return "server default";
   }
 }
 
@@ -233,28 +214,21 @@ export function describeRequestPolicy(policy: EffectiveRequestPolicy): string {
   if (policy.kind === "blocked") {
     switch (policy.reason) {
       case "server-off":
-        return t("web.admin.common.requestAccess.blockedServerOff");
+        return "can't request, because requests are turned off server-wide";
       case "legacy":
-        return t("web.admin.common.requestAccess.blockedLegacy");
+        return "can't request, because an old request setting blocks this account";
       case "switch":
         return policy.source.kind === "group"
-          ? t("web.admin.common.requestAccess.blockedGroup", {
-              group: requestGroupLabel(policy.source.name),
-            })
-          : t("web.admin.common.requestAccess.blockedAccount");
+          ? `can't request, because ${requestGroupLabel(policy.source.name)} has requests turned off`
+          : "can't request, because Media Requests is off for this account";
     }
   }
   const approval = formatRequestApproval(policy.autoApprove);
-  // The quota carries its own source only when the approval's differs.
-  const quota =
-    sourceKey(policy.quotaSource) === sourceKey(policy.approvalSource)
-      ? formatQuotaFrom(policy.quota)
-      : formatQuotaFrom(policy.quota, formatRequestSource(policy.quotaSource));
-  return t("web.admin.common.requestAccess.policy", {
-    quota,
-    approval,
-    source: formatRequestSource(policy.approvalSource),
-  });
+  if (sourceKey(policy.quotaSource) === sourceKey(policy.approvalSource)) {
+    return `${formatQuotaFrom(policy.quota)}, ${approval} (${formatRequestSource(policy.quotaSource)})`;
+  }
+  const quota = formatQuotaFrom(policy.quota, formatRequestSource(policy.quotaSource));
+  return `${quota}, ${approval} (${formatRequestSource(policy.approvalSource)})`;
 }
 
 /**
@@ -268,41 +242,23 @@ export function describeInheritedValue(
   source: RequestPolicySource,
   group: RequestAccessGroup | null,
 ): string {
-  if (source.kind === "group") {
-    return t("web.admin.common.requestAccess.inheritedFromGroup", {
-      group: requestGroupLabel(source.name),
-      value,
-    });
-  }
-  if (group) {
-    return t("web.admin.common.requestAccess.inheritedViaGroup", {
-      group: requestGroupLabel(group.name),
-      value,
-    });
-  }
-  return t("web.admin.common.requestAccess.inheritedFromServer", { value });
+  if (source.kind === "group") return `${requestGroupLabel(source.name)}: ${value}`;
+  if (group) return `${requestGroupLabel(group.name)} uses the server default: ${value}`;
+  return `Server default: ${value}`;
 }
 
 /** A short line for an access group card, e.g. "Admin approves · 3 per 7 days". */
 export function requestGroupLimitSummary(layer: RequestLimitLayer): string {
   const parts: string[] = [];
-  if (layer.approval_mode === "manual")
-    parts.push(t("web.admin.common.requestAccess.summaryAdminApproves"));
-  if (layer.approval_mode === "auto")
-    parts.push(t("web.admin.common.requestAccess.summaryAutoApproves"));
-  if (layer.limit_mode === "unlimited")
-    parts.push(t("web.admin.common.requestAccess.summaryNoLimit"));
+  if (layer.approval_mode === "manual") parts.push("Admin approves");
+  if (layer.approval_mode === "auto") parts.push("Auto-approves");
+  if (layer.limit_mode === "unlimited") parts.push("No request limit");
   if (layer.limit_mode === "custom" && layer.max_requests != null) {
     const days = layer.window_days;
-    const max = layer.max_requests;
     parts.push(
       days == null || days <= 0
-        ? t("web.admin.common.requestAccess.summaryCount", { count: max, count_text: max })
-        : t("web.admin.common.requestAccess.summaryPerWindow", {
-            days,
-            days_text: days,
-            max: max,
-          }),
+        ? `${layer.max_requests} ${plural(layer.max_requests, "request", "requests")}`
+        : `${layer.max_requests} per ${days === 1 ? "day" : `${days} days`}`,
     );
   }
   return parts.join(" · ");
@@ -358,10 +314,10 @@ export function requestLimitErrors(draft: RequestLimitDraft): RequestLimitErrors
   if (draft.limit !== "custom") return {};
   const errors: RequestLimitErrors = {};
   if (wholeNumber(draft.maxRequests, 0) === null) {
-    errors.maxRequests = t("web.admin.common.requestAccess.errorMaxRequests");
+    errors.maxRequests = "Enter a whole number of requests, 0 or more.";
   }
   if (wholeNumber(draft.windowDays, 1) === null) {
-    errors.windowDays = t("web.admin.common.requestAccess.errorWindowDays");
+    errors.windowDays = "Use at least 1 day.";
   }
   return errors;
 }

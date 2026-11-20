@@ -47,7 +47,6 @@ import {
 import { useRestartKeys, type RestartKeyMatcher } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { sortSubtitleProviders } from "@/lib/subtitleProviders";
-import { useT, type MessageKey } from "@/i18n";
 
 import { FieldGroup } from "./FieldGroup";
 import { MarkerProviderTiles } from "./MarkerProviderTiles";
@@ -75,10 +74,10 @@ async function timed<T>(run: () => Promise<T>): Promise<{ result: T; durationMs:
 }
 
 function DisconnectButton({
-  label,
+  label = "Disconnect",
   title,
   description,
-  actionLabel,
+  actionLabel = "Clear",
   onConfirm,
 }: {
   label?: string;
@@ -87,13 +86,12 @@ function DisconnectButton({
   actionLabel?: string;
   onConfirm: () => void;
 }) {
-  const t = useT();
   const [open, setOpen] = useState(false);
 
   return (
     <>
       <Button type="button" size="sm" variant="outline" onClick={() => setOpen(true)}>
-        {label ?? t("web.admin.settings.providers.disconnect")}
+        {label}
       </Button>
       <AlertDialog open={open} onOpenChange={setOpen}>
         <AlertDialogContent>
@@ -102,7 +100,7 @@ function DisconnectButton({
             <AlertDialogDescription>{description}</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               onClick={() => {
@@ -110,7 +108,7 @@ function DisconnectButton({
                 setOpen(false);
               }}
             >
-              {actionLabel ?? t("web.admin.settings.providers.clear")}
+              {actionLabel}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -125,7 +123,7 @@ function DisconnectButton({
 
 interface SubtitleProviderPresentation {
   name: string;
-  tagline: MessageKey;
+  tagline: string;
   monogram: string;
   monogramClass: string;
 }
@@ -133,19 +131,19 @@ interface SubtitleProviderPresentation {
 const SUBTITLE_PROVIDERS: Record<string, SubtitleProviderPresentation> = {
   opensubtitles: {
     name: "OpenSubtitles",
-    tagline: "web.admin.settings.providers.subtitles.taglineCommunity",
+    tagline: "Community subtitles",
     monogram: "OS",
     monogramClass: "bg-sky-500/20 text-sky-700 dark:text-sky-300",
   },
   subdl: {
     name: "SubDL",
-    tagline: "web.admin.settings.providers.subtitles.taglineApiKey",
+    tagline: "API key provider",
     monogram: "SD",
     monogramClass: "bg-orange-500/20 text-orange-700 dark:text-orange-300",
   },
   subsource: {
     name: "SubSource",
-    tagline: "web.admin.settings.providers.subtitles.taglineApiKey",
+    tagline: "API key provider",
     monogram: "SS",
     monogramClass: "bg-violet-500/20 text-violet-700 dark:text-violet-300",
   },
@@ -155,7 +153,7 @@ function presentationFor(providerName: string): SubtitleProviderPresentation {
   return (
     SUBTITLE_PROVIDERS[providerName] ?? {
       name: providerName,
-      tagline: "web.admin.settings.providers.subtitles.taglineGeneric",
+      tagline: "Subtitle provider",
       monogram: providerName.slice(0, 2),
       monogramClass: "bg-muted text-muted-foreground",
     }
@@ -179,7 +177,6 @@ function SubtitleProviderTile({
   test: ProviderTestState | undefined;
   onTested: (test: ProviderTestState | undefined) => void;
 }) {
-  const t = useT();
   // `null` means "follow the server"; the switch only pins a value while the
   // admin has an unsaved change, so a refetch can't silently flip it back.
   const [enabledDraft, setEnabledDraft] = useState<boolean | null>(null);
@@ -258,7 +255,7 @@ function SubtitleProviderTile({
     } catch {
       if (generation === loadGeneration.current) {
         setEditor(null);
-        setFeedback(t("web.admin.settings.providers.subtitles.loadFailed"));
+        setFeedback("Unable to load saved configuration. Reload before editing.");
       }
     } finally {
       if (generation === loadGeneration.current) setLoadingEditor(false);
@@ -282,7 +279,9 @@ function SubtitleProviderTile({
         },
         onError: () => {
           if (!providerIntentActive(editor.intent)) return;
-          setFeedback(t("web.admin.settings.providers.subtitles.saveNotConfirmed"));
+          setFeedback(
+            "Save not confirmed. Your draft is retained. Reload saved configuration to review it before making another change.",
+          );
         },
       },
     );
@@ -302,18 +301,15 @@ function SubtitleProviderTile({
           onTested({
             ok: result.success,
             message: result.success
-              ? t("web.admin.settings.providers.subtitles.testSucceeded")
-              : (result.error ?? t("web.admin.settings.providers.subtitles.testFailed")),
+              ? "Connection successful."
+              : (result.error ?? "Connection failed."),
             at: Date.now(),
             durationMs: Date.now() - started,
           }),
         onError: (err) =>
           onTested({
             ok: false,
-            message:
-              err instanceof Error
-                ? err.message
-                : t("web.admin.settings.providers.subtitles.testFailed"),
+            message: err instanceof Error ? err.message : "Connection failed.",
             at: Date.now(),
             durationMs: Date.now() - started,
           }),
@@ -327,17 +323,14 @@ function SubtitleProviderTile({
 
   const connected = configured && enabled;
   const state = resolveProviderTileState({ expanded, test, connected });
-  const statePill =
-    !expanded && configured && !enabled
-      ? t("web.admin.settings.providers.subtitles.connectedOff")
-      : undefined;
+  const statePill = !expanded && configured && !enabled ? "Connected · off" : undefined;
   // Only a failure earns the extra line: "connected" is already in the header.
   const meta = !expanded && test && !test.ok ? test.message : undefined;
 
   return (
     <ProviderTile
       name={name}
-      tagline={t(tagline)}
+      tagline={tagline}
       monogram={monogram}
       monogramClass={monogramClass}
       state={state}
@@ -346,12 +339,7 @@ function SubtitleProviderTile({
       busy={updateProvider.isPending || testProvider.isPending}
       expanded={expanded}
       primaryAction={{
-        label:
-          test && !test.ok
-            ? t("web.admin.settings.providers.subtitles.fix")
-            : configured
-              ? t("web.admin.settings.providers.subtitles.manage")
-              : t("web.admin.settings.providers.subtitles.connect"),
+        label: test && !test.ok ? "Fix" : configured ? "Manage" : "Connect",
         onClick: () => {
           onExpand();
           if (!editor && !loadingEditor) void loadEditor();
@@ -363,30 +351,26 @@ function SubtitleProviderTile({
             disabled={!editor || loadingEditor || saveAttempted || updateProvider.isPending}
             checked={enabled}
             onCheckedChange={setEnabledDraft}
-            aria-label={t("web.admin.settings.providers.subtitles.enable", { name })}
+            aria-label={`Enable ${name}`}
           />
         ) : undefined
       }
     >
       {feedback && <p role="status">{feedback}</p>}
-      {loadingEditor && (
-        <p role="status">{t("web.admin.settings.providers.subtitles.loadingEditor")}</p>
-      )}
+      {loadingEditor && <p role="status">Loading saved configuration...</p>}
       <fieldset disabled={!editor || loadingEditor || saveAttempted || updateProvider.isPending}>
         {usesAccount ? (
           <>
             <SettingField
-              label={t("web.admin.settings.providers.subtitles.username")}
+              label="Username"
               value={username}
               onChange={handleUsernameChange}
               description={
-                canonical.has_credentials
-                  ? t("web.admin.settings.providers.subtitles.usernameKeep")
-                  : undefined
+                canonical.has_credentials ? "Leave blank to keep the saved username." : undefined
               }
             />
             <SecretField
-              label={t("web.admin.settings.providers.subtitles.password")}
+              label="Password"
               value={password}
               configured={canonical.has_credentials}
               onChange={handlePasswordChange}
@@ -394,7 +378,7 @@ function SubtitleProviderTile({
           </>
         ) : (
           <SecretField
-            label={t("web.admin.settings.providers.subtitles.apiKey")}
+            label="API key"
             value={apiKey}
             configured={canonical.has_api_key}
             onChange={handleApiKeyChange}
@@ -402,9 +386,7 @@ function SubtitleProviderTile({
         )}
         <ProviderPanelActions test={test}>
           <Button type="button" size="sm" onClick={handleSave} disabled={updateProvider.isPending}>
-            {updateProvider.isPending
-              ? t("web.admin.settings.providers.subtitles.saving")
-              : t("common.save")}
+            {updateProvider.isPending ? "Saving..." : "Save"}
           </Button>
           <Button
             type="button"
@@ -413,22 +395,20 @@ function SubtitleProviderTile({
             onClick={handleTest}
             disabled={testProvider.isPending}
           >
-            {testProvider.isPending
-              ? t("web.admin.settings.providers.subtitles.testing")
-              : t("web.admin.settings.providers.subtitles.testConnection")}
+            {testProvider.isPending ? "Testing..." : "Test connection"}
           </Button>
           {configured ? (
             <DisconnectButton
-              title={t("web.admin.settings.providers.subtitles.clearTitle", { name })}
-              description={t("web.admin.settings.providers.subtitles.clearDescription", { name })}
-              actionLabel={t("web.admin.settings.providers.subtitles.clearAction")}
+              title={`Clear ${name} credentials?`}
+              description={`Save ${name} as disabled and clear its stored credentials. Applying this change on this server is reported separately; other servers may still use older settings.`}
+              actionLabel="Clear and turn off"
               onConfirm={handleClear}
             />
           ) : null}
         </ProviderPanelActions>
       </fieldset>
       <Button type="button" size="sm" variant="outline" onClick={onCollapse}>
-        {t("web.admin.settings.providers.subtitles.close")}
+        Close
       </Button>
       <Button
         type="button"
@@ -437,11 +417,9 @@ function SubtitleProviderTile({
         disabled={loadingEditor || updateProvider.isPending}
         onClick={() => void loadEditor()}
       >
-        {t("web.admin.settings.providers.subtitles.reload")}
+        Reload saved configuration (discard draft)
       </Button>
-      <p className="text-muted-foreground mt-2 text-xs">
-        {t("web.admin.settings.providers.subtitles.testNote")}
-      </p>
+      <p className="text-muted-foreground mt-2 text-xs">Test uses the values typed here.</p>
     </ProviderTile>
   );
 }
@@ -467,7 +445,6 @@ function MDBListTile({
   test: ProviderTestState | undefined;
   onTested: (test: ProviderTestState | undefined) => void;
 }) {
-  const t = useT();
   const updateSettings = useUpdateServerSettings();
   const checkConnection = useCheckAdminSettingsConnection();
   const [apiKey, setApiKey] = useState("");
@@ -479,14 +456,14 @@ function MDBListTile({
 
   async function save() {
     if (!hasDraft) {
-      toast.info(t("web.admin.settings.providers.mdblist.nothingToSave"));
+      toast.info("Nothing to save for MDBList.");
       return;
     }
     try {
       await updateSettings.mutateAsync({ "mdblist.api_key": apiKey });
       setApiKey("");
       onTested(undefined);
-      toast.success(t("web.admin.settings.providers.mdblist.saved"));
+      toast.success("MDBList credentials saved");
     } catch {
       // The mutation surfaces the API error.
     }
@@ -497,7 +474,7 @@ function MDBListTile({
       await updateSettings.mutateAsync({ "mdblist.api_key": "" });
       setApiKey("");
       onTested(undefined);
-      toast.success(t("web.admin.settings.providers.mdblist.cleared"));
+      toast.success("MDBList credentials cleared");
     } catch {
       // The mutation surfaces the API error.
     }
@@ -519,10 +496,7 @@ function MDBListTile({
     } catch (error) {
       onTested({
         ok: false,
-        message:
-          error instanceof Error
-            ? error.message
-            : t("web.admin.settings.providers.mdblist.testFailed"),
+        message: error instanceof Error ? error.message : "Connection check failed.",
         at: Date.now(),
         durationMs: 0,
       });
@@ -537,7 +511,7 @@ function MDBListTile({
   return (
     <ProviderTile
       name="MDBList"
-      tagline={t("web.admin.settings.providers.mdblist.tagline")}
+      tagline="Lists"
       monogram="MD"
       monogramClass="bg-emerald-500/20 text-emerald-700 dark:text-emerald-300"
       state={state}
@@ -547,31 +521,25 @@ function MDBListTile({
       // A pending restart has to be visible without opening the tile.
       badge={restartKeys.has("mdblist.api_key") ? <RestartBadge /> : undefined}
       primaryAction={{
-        label:
-          test && !test.ok
-            ? t("web.admin.settings.providers.mdblist.fix")
-            : configured
-              ? t("web.admin.settings.providers.mdblist.manage")
-              : t("web.admin.settings.providers.mdblist.connect"),
+        label: test && !test.ok ? "Fix" : configured ? "Manage" : "Connect",
         onClick: onExpand,
       }}
     >
       <p className="text-muted-foreground mb-1 text-xs">
-        {t("web.admin.settings.providers.mdblist.intro", {
-          link: (chunks) => (
-            <a
-              href="https://mdblist.com/preferences/#api"
-              target="_blank"
-              rel="noreferrer"
-              className="underline"
-            >
-              {chunks}
-            </a>
-          ),
-        })}
+        A key lets collection imports search and browse MDBList lists; pasted list URLs import
+        without one. Get a key at{" "}
+        <a
+          href="https://mdblist.com/preferences/#api"
+          target="_blank"
+          rel="noreferrer"
+          className="underline"
+        >
+          mdblist.com/preferences
+        </a>
+        .
       </p>
       <SecretField
-        label={t("web.admin.settings.providers.mdblist.apiKey")}
+        label="API key"
         value={apiKey}
         configured={configured}
         onChange={(next) => {
@@ -588,9 +556,7 @@ function MDBListTile({
           onClick={() => void save()}
           disabled={updateSettings.isPending}
         >
-          {updateSettings.isPending
-            ? t("web.admin.settings.providers.mdblist.saving")
-            : t("common.save")}
+          {updateSettings.isPending ? "Saving..." : "Save"}
         </Button>
         <Button
           type="button"
@@ -599,23 +565,21 @@ function MDBListTile({
           onClick={() => void runTest()}
           disabled={testing || (!configured && !hasDraft)}
         >
-          {testing
-            ? t("web.admin.settings.providers.mdblist.testing")
-            : t("web.admin.settings.providers.mdblist.testConnection")}
+          {testing ? "Testing..." : "Test connection"}
         </Button>
         {configured ? (
           <DisconnectButton
-            title={t("web.admin.settings.providers.mdblist.clearTitle")}
-            description={t("web.admin.settings.providers.mdblist.clearDescription")}
+            title="Clear MDBList credentials?"
+            description="MDBList search and browse stop working. Lists already imported by URL are unaffected."
             onConfirm={() => void clearAll()}
           />
         ) : null}
         <Button type="button" size="sm" variant="outline" onClick={onCollapse}>
-          {t("web.admin.settings.providers.mdblist.close")}
+          Close
         </Button>
       </ProviderPanelActions>
       <p className="text-muted-foreground mt-2 text-xs">
-        {t("web.admin.settings.providers.mdblist.testNote")}
+        Test uses the key typed here, or the saved one.
       </p>
     </ProviderTile>
   );
@@ -626,7 +590,6 @@ function MDBListTile({
 // ---------------------------------------------------------------------------
 
 export default function ProvidersSettings() {
-  const t = useT();
   const form = useSettingsForm({ keys: KEYS });
   const restartKeys = useRestartKeys();
   const { data, isLoading, scope } = useSubtitleProviders();
@@ -649,25 +612,21 @@ export default function ProvidersSettings() {
 
   if (form.isLoading || isLoading) {
     return (
-      <div
-        className="max-w-5xl space-y-6"
-        role="status"
-        aria-label={t("web.admin.settings.providers.loading")}
-      >
+      <div className="max-w-5xl space-y-6" role="status" aria-label="Loading providers">
         <Skeleton className="h-9 w-64" />
         <Skeleton className="h-12 w-full" />
         <Skeleton className="h-40 w-full" />
         <Skeleton className="h-40 w-full" />
-        <span className="sr-only">{t("web.admin.settings.providers.loading")}</span>
+        <span className="sr-only">Loading providers</span>
       </div>
     );
   }
 
   return (
     <div className="space-y-5">
-      <SettingsPageHeader title={t("web.admin.settings.providers.title")} />
+      <SettingsPageHeader title="Providers" />
 
-      <FieldGroup label={t("web.admin.settings.providers.watchProvidersGroup")}>
+      <FieldGroup label="Watch providers">
         <div className="py-3.5">
           <WatchProviderTiles />
         </div>
@@ -678,7 +637,7 @@ export default function ProvidersSettings() {
         collection imports; MDBList ratings come from its metadata plugin,
         configured under Plugins like TMDB and TheTVDB.
       */}
-      <FieldGroup label={t("web.admin.settings.providers.listsGroup")}>
+      <FieldGroup label="Lists">
         <div className="py-3.5">
           <ProviderTileGrid>
             <MDBListTile
@@ -694,12 +653,10 @@ export default function ProvidersSettings() {
         </div>
       </FieldGroup>
 
-      <FieldGroup label={t("web.admin.settings.providers.subtitlesGroup")}>
+      <FieldGroup label="Subtitle providers">
         <div className="py-3.5">
           {providers.length === 0 ? (
-            <p className="text-muted-foreground text-sm">
-              {t("web.admin.settings.providers.subtitlesEmpty")}
-            </p>
+            <p className="text-muted-foreground text-sm">No subtitle providers are available.</p>
           ) : (
             <ProviderTileGrid>
               {providers.map((provider) => (
@@ -725,7 +682,7 @@ export default function ProvidersSettings() {
         lookup order, whether this server contributes back — is provider
         configuration and belongs beside the other providers.
       */}
-      <FieldGroup label={t("web.admin.settings.providers.markersGroup")}>
+      <FieldGroup label="Marker providers">
         <div className="space-y-3 py-3.5">
           <MarkerProviderTiles
             expandedTile={expandedTile}
@@ -733,21 +690,15 @@ export default function ProvidersSettings() {
             onCollapse={() => setExpandedTile(null)}
           />
           <p className="text-muted-foreground text-xs">
-            {t(
-              onlineMarkerLookupEnabled
-                ? "web.admin.settings.providers.markerLookupEnabled"
-                : "web.admin.settings.providers.markerLookupDisabled",
-              {
-                link: (chunks) => (
-                  <Link
-                    to="/admin/settings/playback"
-                    className="hover:text-foreground font-medium underline underline-offset-2 transition-colors"
-                  >
-                    {chunks}
-                  </Link>
-                ),
-              },
-            )}
+            Online marker lookup is {onlineMarkerLookupEnabled ? "enabled" : "disabled"}. Change
+            this under{" "}
+            <Link
+              to="/admin/settings/playback"
+              className="hover:text-foreground font-medium underline underline-offset-2 transition-colors"
+            >
+              Marker source
+            </Link>
+            .
           </p>
         </div>
       </FieldGroup>
@@ -755,13 +706,11 @@ export default function ProvidersSettings() {
       {/* An admin looking for metadata providers on a page called Providers
           lands here, so say where they are. */}
       <p className="text-muted-foreground text-xs">
-        {t("web.admin.settings.providers.metadataNote", {
-          link: (chunks) => (
-            <Link to="/admin/plugins" className="underline underline-offset-2">
-              {chunks}
-            </Link>
-          ),
-        })}
+        Metadata providers, including TMDB, TheTVDB, and MDBList ratings, connect from{" "}
+        <Link to="/admin/plugins" className="underline underline-offset-2">
+          Plugins
+        </Link>
+        .
       </p>
     </div>
   );

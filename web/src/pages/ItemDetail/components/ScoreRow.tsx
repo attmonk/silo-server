@@ -1,7 +1,5 @@
 import { RatingEntry } from "@/components/ratings/RatingEntry";
 import type { DisplayRating } from "@/components/ratings/ratings";
-import { formatLocale } from "@/lib/appLocale";
-import { useT } from "@/i18n";
 
 interface ScoreRowProps {
   /** The ratings the server chose for this title, in display order. */
@@ -10,8 +8,12 @@ interface ScoreRowProps {
   tmdbVoteCount?: number | null;
 }
 
+const voteCountFormat = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
 export default function ScoreRow({ ratings, tmdbVoteCount }: ScoreRowProps) {
-  const t = useT();
   if (!ratings?.length) return null;
 
   return (
@@ -21,13 +23,7 @@ export default function ScoreRow({ ratings, tmdbVoteCount }: ScoreRowProps) {
           <RatingEntry rating={rating} />
           {rating.source === "tmdb" && tmdbVoteCount ? (
             <span className="text-muted-foreground text-xs tabular-nums">
-              {t("web.detail.overview.tmdbVotes", {
-                count: tmdbVoteCount,
-                count_text: tmdbVoteCount.toLocaleString(formatLocale(), {
-                  notation: "compact",
-                  maximumFractionDigits: 1,
-                }),
-              })}
+              {voteCountFormat.format(tmdbVoteCount)} votes
             </span>
           ) : null}
         </span>

@@ -1,12 +1,5 @@
-import { useT, type MessageKey } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { OVERLAY_PREVIEW_VARIANTS, type OverlayPreviewVariant } from "@/lib/overlays";
-
-const VARIANT_LABELS: Record<OverlayPreviewVariant, MessageKey> = {
-  movie: "web.common.overlays.previewVariant.movie",
-  show: "web.common.overlays.previewVariant.show",
-  requested: "web.common.overlays.previewVariant.requested",
-};
 
 interface OverlayPreviewVariantToggleProps {
   value: OverlayPreviewVariant;
@@ -29,13 +22,8 @@ export function OverlayPreviewVariantToggle({
   variants = OVERLAY_PREVIEW_VARIANTS,
   className,
 }: OverlayPreviewVariantToggleProps) {
-  const t = useT();
   return (
-    <div
-      className={cn("flex gap-1.5", className)}
-      role="group"
-      aria-label={t("web.common.overlays.previewSample")}
-    >
+    <div className={cn("flex gap-1.5", className)} role="group" aria-label="Preview sample">
       {variants.map((variant) => (
         <button
           key={variant}
@@ -43,13 +31,13 @@ export function OverlayPreviewVariantToggle({
           onClick={() => onChange(variant)}
           aria-pressed={value === variant}
           className={cn(
-            "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+            "rounded-full border px-3 py-1 text-xs font-medium capitalize transition-colors",
             value === variant
               ? "border-primary bg-primary/10 text-primary"
               : "border-border/60 hover:border-border text-muted-foreground",
           )}
         >
-          {t(VARIANT_LABELS[variant])}
+          {variant}
         </button>
       ))}
     </div>

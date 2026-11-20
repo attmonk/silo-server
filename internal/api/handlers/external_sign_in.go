@@ -11,7 +11,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
-	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // ExternalIdentityView is one external identity linked to an account, as
@@ -61,9 +60,6 @@ type ExternalSignInHandler struct {
 	// network links the network identity of the request's overlay peer;
 	// nil when the providers source cannot.
 	network networkLinker
-	// Stores holds disconnecting an identity to the household manager
-	// (canManageHouseholdAs). Without it the check fails closed.
-	Stores userstore.UserStoreProvider
 }
 
 // networkLinker is the network identity linking of *auth.Service.
@@ -167,20 +163,8 @@ func (h *ExternalSignInHandler) CanUnlinkAccountIdentity(ctx context.Context, us
 	return allowed, nil
 }
 
-// MayUnlinkAccountIdentity reports whether the caller acting as
-// activeProfileID may disconnect one of the account's identities. How the
-// account signs in belongs to the whole household, and the account cannot
-// always link a disconnected identity again by itself (self-service linking
-// needs its local password), so only the household manager may. verify
-// confirms a PIN-locked primary profile and returns
-// access.ErrProfileUnverified when it is not.
-func (h *ExternalSignInHandler) MayUnlinkAccountIdentity(ctx context.Context, userID int, activeProfileID string, verify func(profile *userstore.Profile) error) (bool, error) {
-	return mayManageHouseholdOf(ctx, h.Stores, userID, activeProfileID, verify)
-}
-
 // UnlinkAccountIdentity removes one of the caller's identities while the
-// account can still sign in another way. The caller checks
-// MayUnlinkAccountIdentity first.
+// account can still sign in another way.
 func (h *ExternalSignInHandler) UnlinkAccountIdentity(ctx context.Context, userID int, identityID int64) error {
 	return identityError(h.identities.UnlinkOwn(ctx, userID, identityID))
 }

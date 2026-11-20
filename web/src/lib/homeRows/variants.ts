@@ -6,7 +6,6 @@
  * and the form shows none selected instead of guessing. Applying a variant
  * changes only the discriminator keys and keeps every other key.
  */
-import { t, type MessageKey } from "@/i18n";
 import { NOT_OFFERED_FOR_NEW_ROWS, retiredKindLabel, rowKindLabel } from "./catalog";
 
 type Config = Record<string, unknown>;
@@ -14,19 +13,19 @@ type Config = Record<string, unknown>;
 export interface VariantOption {
   presetKey: string;
   /** The short name on a picker chip ("7 days"). */
-  chip: MessageKey;
+  chip: string;
   /** The radio card's name ("Last 7 days"). */
-  label: MessageKey;
-  hint?: MessageKey;
+  label: string;
+  hint?: string;
   /** The discriminator values this preset stores. */
   values: Config;
 }
 
 export interface VariantFamily {
   /** The radio group's label ("Time window"). */
-  control: MessageKey;
+  control: string;
   /** Row name help: "Follows {follows} until you type your own name." */
-  follows: MessageKey;
+  follows: string;
   keys: readonly string[];
   options: readonly VariantOption[];
   infer?: (config: Config) => string | null;
@@ -46,17 +45,17 @@ const HOLIDAY_THEMES = [
 ];
 
 /** The holidays a seasonal row can show, by their config key. */
-export const SEASONAL_THEME_LABELS: Readonly<Record<string, MessageKey>> = {
-  valentines: "web.home.rows.variants.themes.valentines",
-  st_patricks: "web.home.rows.variants.themes.stPatricks",
-  easter: "web.home.rows.variants.themes.easter",
-  thanksgiving: "web.home.rows.variants.themes.thanksgiving",
-  new_year: "web.home.rows.variants.themes.newYear",
-  christmas: "web.home.rows.variants.themes.christmas",
-  halloween: "web.home.rows.variants.themes.halloween",
-  saturday_morning: "web.home.rows.variants.themes.saturdayMorning",
-  family_movie_night: "web.home.rows.variants.themes.familyMovieNight",
-  summer_blockbuster: "web.home.rows.variants.themes.summerBlockbuster",
+export const SEASONAL_THEME_LABELS: Readonly<Record<string, string>> = {
+  valentines: "Valentine's Day",
+  st_patricks: "St. Patrick's Day",
+  easter: "Easter",
+  thanksgiving: "Thanksgiving",
+  new_year: "New Year's",
+  christmas: "Christmas",
+  halloween: "Halloween",
+  saturday_morning: "Saturday morning cartoons",
+  family_movie_night: "Family movie night",
+  summer_blockbuster: "Summer blockbusters",
 };
 
 /** Spotlight presets that rotate start weekly, as the catalog's presets do. */
@@ -133,135 +132,133 @@ function applySpotlight(config: Config, option: VariantOption): Config {
 
 export const VARIANT_FAMILIES: Readonly<Record<string, VariantFamily>> = {
   continue_watching: {
-    control: "web.home.rows.variants.controls.kind",
-    follows: "web.home.rows.variants.follows.kind",
+    control: "Kind",
+    follows: "the kind",
     keys: ["continue_type"],
     options: [
       {
         presetKey: "continue_watching_default",
-        chip: "web.home.rows.sections.watching",
-        label: "web.home.rows.sections.watching",
-        hint: "web.home.rows.variants.options.watchingHint",
+        chip: "Watching",
+        label: "Watching",
+        hint: "Movies and episodes",
         values: { continue_type: "watching" },
       },
       {
         presetKey: "continue_listening_default",
-        chip: "web.home.rows.sections.listening",
-        label: "web.home.rows.sections.listening",
-        hint: "web.home.rows.variants.options.listeningHint",
+        chip: "Listening",
+        label: "Listening",
+        hint: "Audiobooks",
         values: { continue_type: "listening" },
       },
     ],
   },
   trending_on_server: {
-    control: "web.home.rows.variants.controls.timeWindow",
-    follows: "web.home.rows.variants.follows.timeWindow",
+    control: "Time window",
+    follows: "the time window",
     keys: ["window"],
     options: [
       {
         presetKey: "tr_24h",
-        chip: "web.home.rows.variants.options.hours24",
-        label: "web.home.rows.variants.options.last24Hours",
-        hint: "web.home.rows.variants.options.hotToday",
+        chip: "24 hours",
+        label: "Last 24 hours",
+        hint: "What's hot today",
         values: { window: "24h" },
       },
       {
         presetKey: "tr_7d",
-        chip: "web.home.rows.variants.options.days7",
-        label: "web.home.rows.variants.options.last7Days",
-        hint: "web.home.rows.variants.options.weeklyMix",
+        chip: "7 days",
+        label: "Last 7 days",
+        hint: "A steady weekly mix",
         values: { window: "7d" },
       },
       {
         presetKey: "tr_30d",
-        chip: "web.home.rows.variants.options.days30",
-        label: "web.home.rows.variants.options.last30Days",
-        hint: "web.home.rows.variants.options.changesSlowly",
+        chip: "30 days",
+        label: "Last 30 days",
+        hint: "Changes slowly",
         values: { window: "30d" },
       },
     ],
   },
   most_watched: {
-    control: "web.home.rows.variants.controls.period",
-    follows: "web.home.rows.variants.follows.period",
+    control: "Period",
+    follows: "the period",
     keys: ["window"],
     options: [
       {
         presetKey: "mw_week",
-        chip: "web.home.rows.variants.options.thisWeek",
-        label: "web.home.rows.variants.options.thisWeek",
-        hint: "web.home.rows.variants.options.last7DaysHint",
+        chip: "This week",
+        label: "This week",
+        hint: "The last 7 days",
         values: { window: "week" },
       },
       {
         presetKey: "mw_month",
-        chip: "web.home.rows.variants.options.thisMonth",
-        label: "web.home.rows.variants.options.thisMonth",
-        hint: "web.home.rows.variants.options.last30DaysHint",
+        chip: "This month",
+        label: "This month",
+        hint: "The last 30 days",
         values: { window: "month" },
       },
     ],
   },
   trending_discover: {
-    control: "web.home.rows.variants.controls.period",
-    follows: "web.home.rows.variants.follows.period",
+    control: "Period",
+    follows: "the period",
     keys: ["source", "window"],
     options: [
       {
         presetKey: "tdisc_tmdb_day",
-        chip: "web.home.rows.variants.options.today",
-        label: "web.home.rows.variants.options.today",
-        hint: "web.home.rows.variants.options.changesDaily",
+        chip: "Today",
+        label: "Today",
+        hint: "Changes every day",
         values: { source: "tmdb", window: "day" },
       },
       {
         presetKey: "tdisc_tmdb_week",
-        chip: "web.home.rows.variants.options.thisWeek",
-        label: "web.home.rows.variants.options.thisWeek",
-        hint: "web.home.rows.variants.options.steadierWeekly",
+        chip: "This week",
+        label: "This week",
+        hint: "A steadier weekly list",
         values: { source: "tmdb", window: "week" },
       },
     ],
   },
   mood_collection: {
-    control: "web.home.rows.variants.controls.mood",
-    follows: "web.home.rows.variants.follows.mood",
+    control: "Mood",
+    follows: "the mood",
     keys: ["mood"],
-    options: (
-      [
-        ["mood_feel_good", "web.home.rows.variants.options.feelGood", "feel_good"],
-        ["mood_mind_bending", "web.home.rows.variants.options.mindBending", "mind_bending"],
-        ["mood_comfort", "web.home.rows.variants.options.comfort", "comfort"],
-        ["mood_edge_of_seat", "web.home.rows.variants.options.edgeOfSeat", "edge_of_seat"],
-        ["mood_tearjerker", "web.home.rows.variants.options.tearjerker", "tearjerker"],
-        ["mood_quiet_sunday", "web.home.rows.variants.options.quietSunday", "quiet_sunday"],
-        ["mood_date_night", "web.home.rows.variants.options.dateNight", "date_night"],
-        ["mood_after_midnight", "web.home.rows.variants.options.afterMidnight", "after_midnight"],
-      ] as const
-    ).map(([presetKey, label, mood]) => ({
-      presetKey,
-      chip: label,
-      label,
+    options: [
+      ["mood_feel_good", "Feel-good", "feel_good"],
+      ["mood_mind_bending", "Mind-bending", "mind_bending"],
+      ["mood_comfort", "Comfort rewatches", "comfort"],
+      ["mood_edge_of_seat", "Edge of your seat", "edge_of_seat"],
+      ["mood_tearjerker", "Tearjerkers", "tearjerker"],
+      ["mood_quiet_sunday", "Quiet Sunday", "quiet_sunday"],
+      ["mood_date_night", "Date night", "date_night"],
+      ["mood_after_midnight", "After midnight", "after_midnight"],
+    ].map(([presetKey, label, mood]) => ({
+      presetKey: presetKey!,
+      chip: label!,
+      label: label!,
       values: { mood },
     })),
   },
   seasonal_themed: {
-    control: "web.home.rows.variants.controls.theme",
-    follows: "web.home.rows.variants.follows.theme",
+    control: "Theme",
+    follows: "the theme",
     keys: ["enabled_themes", "theme"],
     options: [
       {
         presetKey: "se_auto",
-        chip: "web.home.rows.variants.options.holidays",
-        label: "web.home.rows.variants.options.holidays",
-        hint: "web.home.rows.variants.options.holidaysHint",
+        chip: "Holidays",
+        label: "Holidays",
+        hint: "Changes with the calendar",
         values: { enabled_themes: HOLIDAY_THEMES },
       },
       {
         presetKey: "se_family_movie_night",
-        chip: "web.home.rows.variants.themes.familyMovieNight",
-        label: "web.home.rows.variants.themes.familyMovieNight",
-        hint: "web.home.rows.variants.options.familyHint",
+        chip: "Family movie night",
+        label: "Family movie night",
+        hint: "Friday and Saturday evenings",
         values: { enabled_themes: ["family_movie_night"] },
       },
     ],
@@ -269,36 +266,36 @@ export const VARIANT_FAMILIES: Readonly<Record<string, VariantFamily>> = {
     apply: applySeasonal,
   },
   editorial_spotlight: {
-    control: "web.home.rows.variants.controls.spotlightOn",
-    follows: "web.home.rows.variants.follows.spotlightOn",
+    control: "Spotlight on",
+    follows: "the spotlight",
     keys: ["subject_type", "subject"],
     options: [
       {
         presetKey: "es_director_auto",
-        chip: "web.home.rows.variants.options.director",
-        label: "web.home.rows.variants.options.director",
-        hint: "web.home.rows.variants.options.directorHint",
+        chip: "Director",
+        label: "Director",
+        hint: "Films by one director",
         values: { subject_type: "director" },
       },
       {
         presetKey: "es_actor",
-        chip: "web.home.rows.variants.options.actor",
-        label: "web.home.rows.variants.options.actor",
-        hint: "web.home.rows.variants.options.actorHint",
+        chip: "Actor",
+        label: "Actor",
+        hint: "Titles with one actor",
         values: { subject_type: "actor" },
       },
       {
         presetKey: "es_studio",
-        chip: "web.home.rows.variants.options.studio",
-        label: "web.home.rows.variants.options.studio",
-        hint: "web.home.rows.variants.options.studioHint",
+        chip: "Studio",
+        label: "Studio",
+        hint: "Titles from one studio",
         values: { subject_type: "studio" },
       },
       {
         presetKey: "es_era_80s",
-        chip: "web.home.rows.variants.options.eighties",
-        label: "web.home.rows.variants.options.eighties",
-        hint: "web.home.rows.variants.options.eightiesHint",
+        chip: "The 80s",
+        label: "The 80s",
+        hint: "Films from the 1980s",
         values: { subject_type: "era", subject: "1980s" },
       },
     ],
@@ -306,36 +303,36 @@ export const VARIANT_FAMILIES: Readonly<Record<string, VariantFamily>> = {
     apply: applySpotlight,
   },
   format_showcase: {
-    control: "web.home.rows.variants.controls.format",
-    follows: "web.home.rows.variants.follows.format",
+    control: "Format",
+    follows: "the format",
     keys: ["format", "sort"],
     options: [
       {
         presetKey: "fs_4k",
-        chip: "web.home.rows.variants.options.fourK",
-        label: "web.home.rows.variants.options.fourK",
-        hint: "web.home.rows.variants.options.fourKHint",
+        chip: "4K",
+        label: "4K",
+        hint: "Everything in 4K",
         values: { format: "4k" },
       },
       {
         presetKey: "fs_4k_recent",
-        chip: "web.home.rows.variants.options.newIn4k",
-        label: "web.home.rows.variants.options.newIn4k",
-        hint: "web.home.rows.variants.options.newIn4kHint",
+        chip: "New in 4K",
+        label: "New in 4K",
+        hint: "The latest 4K additions",
         values: { format: "4k", sort: "recent" },
       },
       {
         presetKey: "fs_dv",
-        chip: "web.home.rows.variants.options.dolbyVision",
-        label: "web.home.rows.variants.options.dolbyVision",
-        hint: "web.home.rows.variants.options.dolbyVisionHint",
+        chip: "Dolby Vision",
+        label: "Dolby Vision",
+        hint: "Dolby Vision titles",
         values: { format: "dolby_vision" },
       },
       {
         presetKey: "fs_hdr",
-        chip: "web.home.rows.variants.options.hdr",
-        label: "web.home.rows.variants.options.hdr",
-        hint: "web.home.rows.variants.options.hdrHint",
+        chip: "HDR",
+        label: "HDR",
+        hint: "HDR-mastered titles",
         values: { format: "hdr" },
       },
     ],
@@ -383,18 +380,17 @@ export function variantOption(sectionType: string, presetKey: string): VariantOp
 export function showsLabel(sectionType: string, config: Config): string {
   if (NOT_OFFERED_FOR_NEW_ROWS.has(sectionType)) return retiredKindLabel(sectionType, config);
   if (sectionType === "continue_watching" && config.continue_type === "reading") {
-    return t("web.home.rows.variants.continueReading");
+    return "Continue Reading";
   }
-  const kind = rowKindLabel(sectionType);
   const presetKey = variantOf(sectionType, config);
   const chip = presetKey ? variantOption(sectionType, presetKey)?.chip : undefined;
-  if (chip) return t("web.home.rows.variants.kindAndVariant", { kind, variant: t(chip) });
+  if (chip) return `${rowKindLabel(sectionType)} · ${chip}`;
   // A legacy single-theme seasonal row shows only that holiday.
   const holiday =
     sectionType === "seasonal_themed" && typeof config.theme === "string"
       ? SEASONAL_THEME_LABELS[config.theme]
       : undefined;
-  return holiday ? t("web.home.rows.variants.kindOneHoliday", { kind, holiday: t(holiday) }) : kind;
+  return holiday ? `${rowKindLabel(sectionType)} (${holiday} only)` : rowKindLabel(sectionType);
 }
 
 /** Rows whose variant cannot change: Continue Reading (ebooks, beta), which has no preset. */
@@ -406,14 +402,8 @@ const SUMMARY_CHIPS = 3;
 
 /** "24 hours, 7 days or 30 days": a kind's variants as text, for phones. */
 export function variantSummary(type: string): string | null {
-  const chips = VARIANT_FAMILIES[type]?.options.map((option) => t(option.chip)) ?? [];
+  const chips = VARIANT_FAMILIES[type]?.options.map((option) => option.chip) ?? [];
   if (chips.length < 2) return null;
-  const [first = "", second = "", third = ""] = chips;
-  if (chips.length > SUMMARY_CHIPS) {
-    return t("web.home.rows.variants.summaryMore", { first, second, third });
-  }
-  if (chips.length === SUMMARY_CHIPS) {
-    return t("web.home.rows.variants.summaryThree", { first, second, third });
-  }
-  return t("web.home.rows.variants.summaryTwo", { first, second });
+  if (chips.length > SUMMARY_CHIPS) return `${chips.slice(0, SUMMARY_CHIPS).join(", ")} and more`;
+  return `${chips.slice(0, -1).join(", ")} or ${chips.at(-1)}`;
 }

@@ -211,22 +211,14 @@ func Analyze(cfg Config) (*Inventory, error) {
 			}
 		}
 	}
-	set, err := loadSources(cfg.Root, cfg.analyzedDirs())
-	if err != nil {
-		return nil, err
-	}
-	return analyzeSources(cfg, set)
-}
-
-func (cfg Config) analyzedDirs() []string {
 	dirs := append([]string{}, cfg.AuditDirs...)
 	for _, listener := range cfg.Listeners {
 		dirs = append(dirs, listener.Dir)
 	}
-	return dirs
-}
-
-func analyzeSources(cfg Config, set *sourceSet) (*Inventory, error) {
+	set, err := loadSources(cfg.Root, dirs)
+	if err != nil {
+		return nil, err
+	}
 	a := &Analyzer{
 		cfg:          cfg,
 		set:          set,

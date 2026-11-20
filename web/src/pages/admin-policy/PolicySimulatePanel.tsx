@@ -12,7 +12,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useSimulatePolicy } from "@/hooks/queries/admin/policy";
-import { useT } from "@/i18n";
 
 import { exampleInputForDomain } from "./policyExamples";
 import {
@@ -35,7 +34,6 @@ interface PolicySimulatePanelProps {
  * ceilings. Unknown shapes render nothing — the raw JSON below is the truth.
  */
 function SimulateVerdict({ decision }: { decision: unknown }) {
-  const t = useT();
   let parsed: unknown = decision;
   if (typeof parsed === "string") {
     try {
@@ -51,14 +49,12 @@ function SimulateVerdict({ decision }: { decision: unknown }) {
     return record.allowed ? (
       <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-0.5 text-xs font-medium text-emerald-300">
         <span aria-hidden className="size-1.5 rounded-full bg-emerald-400" />
-        {t("web.admin.access.policy.outcome.allowed")}
+        Allowed
       </span>
     ) : (
       <span className="bg-destructive/10 text-destructive inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium">
         <span aria-hidden className="bg-destructive size-1.5 rounded-full" />
-        {typeof record.reason === "string" && record.reason
-          ? t("web.admin.access.policy.simulate.deniedReason", { reason: record.reason })
-          : t("web.admin.access.policy.outcome.denied")}
+        Denied{typeof record.reason === "string" && record.reason ? ` — ${record.reason}` : ""}
       </span>
     );
   }
@@ -76,20 +72,10 @@ function SimulateVerdict({ decision }: { decision: unknown }) {
         ? record.max_advisory_age
         : 0;
     const parts = [
-      record.unrestricted
-        ? t("web.admin.access.policy.simulate.allLibraries")
-        : t("web.admin.access.policy.simulate.restrictedLibraries"),
-      ratings.length > 0
-        ? ratings
-            .map((rating) => t("web.admin.access.policy.simulate.ratingCeiling", { rating }))
-            .join(" · ")
-        : t("web.admin.access.policy.simulate.anyRating"),
-      ...(advisoryAge
-        ? [t("web.admin.access.policy.simulate.advisoryAge", { age: advisoryAge })]
-        : []),
-      quality
-        ? t("web.admin.access.policy.simulate.qualityCeiling", { quality })
-        : t("web.admin.access.policy.simulate.anyQuality"),
+      record.unrestricted ? "All libraries" : "Restricted libraries",
+      ratings.length > 0 ? ratings.map((rating) => `rating ≤ ${rating}`).join(" · ") : "any rating",
+      ...(advisoryAge ? [`advisory age ≤ ${advisoryAge}`] : []),
+      quality ? `quality ≤ ${quality}` : "any quality",
     ];
     return (
       <span className="bg-secondary text-foreground/80 inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium">
@@ -102,7 +88,6 @@ function SimulateVerdict({ decision }: { decision: unknown }) {
 }
 
 export function PolicySimulatePanel({ domains, domain, source }: PolicySimulatePanelProps) {
-  const t = useT();
   const fallbackDomain = domain || domains[0] || "scope";
   const [selectedDomain, setSelectedDomain] = useState(fallbackDomain);
   const [input, setInput] = useState(() => exampleInputForDomain(fallbackDomain));
@@ -128,7 +113,7 @@ export function PolicySimulatePanel({ domains, domain, source }: PolicySimulateP
     try {
       parsedInput = JSON.parse(input);
     } catch {
-      setError(t("web.admin.access.policy.simulate.invalidJson"));
+      setError("Simulation input must be valid JSON.");
       return;
     }
 
@@ -143,8 +128,8 @@ export function PolicySimulatePanel({ domains, domain, source }: PolicySimulateP
       setIssues(nextIssues);
       setError(
         nextIssues.length > 0
-          ? t("web.admin.access.policy.simulate.compileFailed")
-          : messageFromError(err, t("web.admin.access.policy.simulate.failed")),
+          ? "Policy did not compile for simulation."
+          : messageFromError(err, "Simulation failed."),
       );
     }
   }
@@ -153,22 +138,20 @@ export function PolicySimulatePanel({ domains, domain, source }: PolicySimulateP
     <div className="surface-panel-subtle space-y-4 rounded-2xl p-4">
       <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
         <div>
-          <h3 className="text-sm font-semibold">{t("web.admin.access.policy.simulate.title")}</h3>
+          <h3 className="text-sm font-semibold">Test before going live</h3>
           <p className="text-muted-foreground mt-1 text-xs">
-            {t("web.admin.access.policy.simulate.description")}
+            Runs the current draft against a sample request. Nothing is saved or enforced.
           </p>
         </div>
         <Button type="button" size="sm" onClick={runSimulation} disabled={simulate.isPending}>
           <Play className="size-4" />
-          {simulate.isPending
-            ? t("web.admin.access.policy.simulate.running")
-            : t("web.admin.access.policy.simulate.run")}
+          {simulate.isPending ? "Running..." : "Run"}
         </Button>
       </div>
 
       <div className="grid gap-4 lg:grid-cols-[180px_1fr]">
         <div className="space-y-2">
-          <Label htmlFor="policy-sim-domain">{t("web.admin.access.policy.simulate.domain")}</Label>
+          <Label htmlFor="policy-sim-domain">Domain</Label>
           <Select
             value={selectedDomain}
             onValueChange={(value) => {
@@ -190,12 +173,12 @@ export function PolicySimulatePanel({ domains, domain, source }: PolicySimulateP
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="policy-sim-input">{t("web.admin.access.policy.simulate.input")}</Label>
+          <Label htmlFor="policy-sim-input">Input JSON</Label>
           <textarea
             id="policy-sim-input"
             value={input}
             onChange={(event) => setInput(event.target.value)}
-            className="border-input bg-background focus-visible:ring-ring/60 min-h-[220px] w-full rounded-lg border px-3 py-2 font-mono text-xs outline-none focus-visible:ring-2"
+            className="border-border bg-background focus-visible:ring-ring/60 min-h-[220px] w-full rounded-lg border px-3 py-2 font-mono text-xs outline-none focus-visible:ring-2"
             spellCheck={false}
           />
         </div>
@@ -211,13 +194,8 @@ export function PolicySimulatePanel({ domains, domain, source }: PolicySimulateP
         <ul className="text-destructive space-y-1 text-xs">
           {issues.map((issue, index) => (
             <li key={`${issue.row}-${issue.col}-${index}`}>
-              {issue.row > 0
-                ? t("web.admin.access.policy.compileIssue", {
-                    row: issue.row,
-                    col: issue.col,
-                    message: issue.message,
-                  })
-                : issue.message}
+              {issue.row > 0 ? `${issue.row}:${issue.col} ` : ""}
+              {issue.message}
             </li>
           ))}
         </ul>
@@ -228,9 +206,7 @@ export function PolicySimulatePanel({ domains, domain, source }: PolicySimulateP
           <div className="flex flex-wrap items-center gap-3">
             <SimulateVerdict decision={simulate.data.decision} />
             <span className="text-muted-foreground text-xs">
-              {t("web.admin.access.policy.simulate.decidedIn", {
-                duration: formatPolicyEvalMicros(simulate.data.eval_time_ns),
-              })}
+              Decided in {formatPolicyEvalMicros(simulate.data.eval_time_ns)}
             </span>
           </div>
           <pre className="border-border bg-background max-h-[300px] overflow-auto rounded-lg border p-3 font-mono text-xs">

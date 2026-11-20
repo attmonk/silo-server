@@ -7,7 +7,6 @@ import { useUICustomization } from "@/hooks/useUICustomization";
 import { useWatchlistTitleToggle } from "@/hooks/useWatchlistTitleToggle";
 import { cardGridClasses } from "@/lib/uiCustomization";
 import { cn } from "@/lib/utils";
-import { useT } from "@/i18n";
 
 /**
  * TMDB titles on the library's poster grid, each with the hover watchlist
@@ -88,14 +87,13 @@ export function RequestResultsLoadMore({
   isError: boolean;
   onLoadMore: () => void;
 }) {
-  const t = useT();
   return (
     <LoadMoreOnScroll
       hasNextPage={hasNextPage}
       isFetchingNextPage={isFetchingNextPage}
       isError={isError}
       onLoadMore={onLoadMore}
-      errorMessage={t("web.requests.results.loadMoreFailed")}
+      errorMessage="Couldn’t load more titles."
     />
   );
 }
@@ -112,7 +110,7 @@ export function RequestResultsPager({
   onPrevious,
   onNext,
   disabled = false,
-  label,
+  label = "Result pages",
 }: {
   /** Where the viewer is, such as "Page 2 of 9". Omitted when it isn't known. */
   position?: string;
@@ -123,21 +121,17 @@ export function RequestResultsPager({
   disabled?: boolean;
   label?: string;
 }) {
-  const t = useT();
   if (!hasPrevious && !hasNext) return null;
   return (
-    <nav
-      aria-label={label ?? t("web.requests.results.pages")}
-      className="flex items-center justify-center gap-3 pt-2"
-    >
+    <nav aria-label={label} className="flex items-center justify-center gap-3 pt-2">
       <Button variant="outline" size="sm" disabled={disabled || !hasPrevious} onClick={onPrevious}>
-        {t("web.requests.results.previous")}
+        Previous
       </Button>
       {position ? (
         <span className="text-muted-foreground text-sm tabular-nums">{position}</span>
       ) : null}
       <Button variant="outline" size="sm" disabled={disabled || !hasNext} onClick={onNext}>
-        {t("web.requests.results.next")}
+        Next
       </Button>
     </nav>
   );

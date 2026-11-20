@@ -8,7 +8,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { LibraryRefreshMode } from "@/hooks/queries/admin/libraries";
-import { useT } from "@/i18n";
 
 interface LibraryRefreshDialogProps {
   libraryName: string | null;
@@ -23,16 +22,14 @@ export function LibraryRefreshDialog({
   onConfirm,
   isPending = false,
 }: LibraryRefreshDialogProps) {
-  const t = useT();
   return (
     <Dialog open={libraryName !== null} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{t("web.admin.common.libraryEditor.refresh.title")}</DialogTitle>
+          <DialogTitle>Refresh Library Metadata</DialogTitle>
           <DialogDescription>
-            {libraryName === null
-              ? t("web.admin.common.libraryEditor.refresh.descriptionUnnamed")
-              : t("web.admin.common.libraryEditor.refresh.description", { name: libraryName })}
+            Choose how much of {libraryName ?? "this library"} to refresh from its metadata
+            providers.
           </DialogDescription>
         </DialogHeader>
 
@@ -41,7 +38,7 @@ export function LibraryRefreshDialog({
             type="button"
             disabled={isPending}
             onClick={() => onConfirm("quick")}
-            className="border-border bg-surface hover:bg-surface/80 flex w-full items-start gap-3 rounded-xl border p-4 text-start transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+            className="border-border bg-surface hover:bg-surface/80 flex w-full items-start gap-3 rounded-xl border p-4 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isPending ? (
               <Loader2 className="text-muted-foreground mt-0.5 size-5 shrink-0 animate-spin" />
@@ -49,11 +46,10 @@ export function LibraryRefreshDialog({
               <RefreshCw className="text-muted-foreground mt-0.5 size-5 shrink-0" />
             )}
             <div className="space-y-1">
-              <div className="text-sm font-semibold">
-                {t("web.admin.common.libraryEditor.refresh.missingTitle")}
-              </div>
+              <div className="text-sm font-semibold">Refresh Missing Metadata</div>
               <div className="text-muted-foreground text-sm">
-                {t("web.admin.common.libraryEditor.refresh.missingDescription")}
+                Refresh matched items that were never refreshed, are missing an overview or artwork,
+                or failed a previous refresh.
               </div>
             </div>
           </button>
@@ -62,7 +58,7 @@ export function LibraryRefreshDialog({
             type="button"
             disabled={isPending}
             onClick={() => onConfirm("full")}
-            className="border-border bg-surface hover:bg-surface/80 flex w-full items-start gap-3 rounded-xl border p-4 text-start transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+            className="border-border bg-surface hover:bg-surface/80 flex w-full items-start gap-3 rounded-xl border p-4 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isPending ? (
               <Loader2 className="text-muted-foreground mt-0.5 size-5 shrink-0 animate-spin" />
@@ -70,11 +66,11 @@ export function LibraryRefreshDialog({
               <DatabaseBackup className="text-muted-foreground mt-0.5 size-5 shrink-0" />
             )}
             <div className="space-y-1">
-              <div className="text-sm font-semibold">
-                {t("web.admin.common.libraryEditor.refresh.allTitle")}
-              </div>
+              <div className="text-sm font-semibold">Refresh All Metadata</div>
               <div className="text-muted-foreground text-sm">
-                {t("web.admin.common.libraryEditor.refresh.allDescription")}
+                Re-fetch every item from its providers, including titles, artwork, seasons, and
+                episodes. Large libraries can take hours. Locked fields and artwork stay as they
+                are.
               </div>
             </div>
           </button>
@@ -82,7 +78,7 @@ export function LibraryRefreshDialog({
 
         <div className="flex justify-end">
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isPending}>
-            {t("common.cancel")}
+            Cancel
           </Button>
         </div>
       </DialogContent>

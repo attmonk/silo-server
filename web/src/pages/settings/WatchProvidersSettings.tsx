@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   AlertCircle,
   Check,
@@ -17,7 +17,6 @@ import { PageHeader } from "@/components/page/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
-import { copyTextToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import {
   useConnectWatchProviderAPIKey,
@@ -45,50 +44,19 @@ import {
   connectionSchemasAreValid,
   renderableConnectionSchemas,
 } from "./watchProviderConnectionConfig";
-import { formatLocale } from "@/lib/appLocale";
-import { useT, type Translate } from "@/i18n";
 
-function formatRelativeTime(t: Translate, value?: string) {
-  return (
-    formatRelativeTimeBase(value, {
-      rounding: "floor",
-      justNowLabel: t("web.settings.watchProviders.justNow"),
-    }) ?? t("web.settings.watchProviders.never")
-  );
+function formatRelativeTime(value?: string) {
+  return formatRelativeTimeBase(value, { rounding: "floor", justNowLabel: "Just now" }) ?? "Never";
 }
 
-function formatRetryAfter(t: Translate, seconds?: number) {
+function formatRetryAfter(seconds?: number) {
   if (!seconds || seconds <= 0) return "";
-  if (seconds < 60) return t("web.settings.watchProviders.duration.seconds", { seconds: seconds });
+  if (seconds < 60) return `${seconds}s`;
   const minutes = Math.ceil(seconds / 60);
-  if (minutes < 60) return t("web.settings.watchProviders.duration.minutes", { minutes: minutes });
+  if (minutes < 60) return `${minutes}m`;
   const hours = Math.floor(minutes / 60);
   const remainingMinutes = minutes % 60;
-  return remainingMinutes > 0
-    ? t("web.settings.watchProviders.duration.hoursMinutes", {
-        hours: hours,
-        minutes: remainingMinutes,
-      })
-    : t("web.settings.watchProviders.duration.hours", { hours: hours });
-}
-
-/**
- * Seconds left of a server-imposed wait, counted down once a second, and the
- * function that starts it from a Retry-After value. Zero when no wait is on.
- */
-function useCountdown(): [number, (seconds: number) => void] {
-  const [wait, setWait] = useState<{ until: number; seconds: number } | null>(null);
-  useEffect(() => {
-    if (!wait) return;
-    const timer = window.setTimeout(() => {
-      const seconds = Math.ceil((wait.until - Date.now()) / 1000);
-      setWait(seconds > 0 ? { until: wait.until, seconds } : null);
-    }, 1000);
-    return () => window.clearTimeout(timer);
-  }, [wait]);
-  const start = (seconds: number) =>
-    setWait(seconds > 0 ? { until: Date.now() + seconds * 1000, seconds } : null);
-  return [wait?.seconds ?? 0, start];
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
 }
 
 type StatusVariant = "connected" | "disconnected" | "pending" | "error";
@@ -207,17 +175,13 @@ function AuthCodeBlock({
   onCancel: () => void;
   codeCopied: boolean;
 }) {
-  const t = useT();
-  const name = { provider: displayName };
   return (
     <div className="border-primary/30 bg-primary/5 rounded-xl border border-dashed p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="text-sm font-medium">
-            {t("web.settings.watchProviders.auth.copyCodeFirst")}
-          </div>
+          <div className="text-sm font-medium">Copy this code first</div>
           <div className="text-muted-foreground mt-0.5 text-xs leading-snug">
-            {t("web.settings.watchProviders.auth.copyCodeHint", name)}
+            {displayName} will ask for it after the activation page opens.
           </div>
         </div>
         <Button
@@ -225,7 +189,7 @@ function AuthCodeBlock({
           variant="ghost"
           size="icon-sm"
           onClick={onCancel}
-          aria-label={t("web.settings.watchProviders.auth.cancel")}
+          aria-label="Cancel activation"
         >
           <X className="h-4 w-4" />
         </Button>
@@ -236,16 +200,14 @@ function AuthCodeBlock({
         </div>
         <Button type="button" variant="outline" size="sm" onClick={onCopy}>
           {codeCopied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-          {codeCopied
-            ? t("web.settings.watchProviders.auth.copied")
-            : t("web.settings.watchProviders.auth.copyCode")}
+          {codeCopied ? "Copied" : "Copy code"}
         </Button>
       </div>
       <div className="mt-3 flex flex-col gap-2 sm:flex-row">
         <Button type="button" variant="outline" size="sm" asChild className="sm:flex-1">
           <a href={session.verification_url} target="_blank" rel="noreferrer">
             <ExternalLink className="h-4 w-4" />
-            {t("web.settings.watchProviders.auth.openActivation", name)}
+            Open {displayName} activation
           </a>
         </Button>
         <Button
@@ -256,7 +218,7 @@ function AuthCodeBlock({
           className="sm:flex-1"
         >
           {pollPending ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-          {t("web.settings.watchProviders.auth.entered")}
+          I&apos;ve entered it
         </Button>
       </div>
     </div>
@@ -278,7 +240,6 @@ function APIKeyBlock({
   onSubmit: (apiKey: string, connectionConfig: WatchProviderConnectionConfig) => void;
   onCancel: () => void;
 }) {
-  const t = useT();
   const [value, setValue] = useState("");
   const [connectionConfig, setConnectionConfig] = useState<WatchProviderConnectionConfig>({});
   const [configValidity, setConfigValidity] = useState<Record<string, boolean>>({});
@@ -294,11 +255,9 @@ function APIKeyBlock({
     <div className="border-primary/30 bg-primary/5 rounded-xl border border-dashed p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="text-sm font-medium">
-            {t("web.settings.watchProviders.apiKey.title", { provider: displayName })}
-          </div>
+          <div className="text-sm font-medium">Paste your {displayName} API key</div>
           <div className="text-muted-foreground mt-0.5 text-xs leading-snug">
-            {t("web.settings.watchProviders.apiKey.hint", { provider: displayName })}
+            Find it under your account settings on the {displayName} site.
           </div>
         </div>
         <Button
@@ -306,7 +265,7 @@ function APIKeyBlock({
           variant="ghost"
           size="icon-sm"
           onClick={onCancel}
-          aria-label={t("web.settings.watchProviders.apiKey.cancel")}
+          aria-label="Cancel connection"
         >
           <X className="h-4 w-4" />
         </Button>
@@ -339,7 +298,7 @@ function APIKeyBlock({
           type="password"
           autoComplete="off"
           spellCheck={false}
-          placeholder={t("web.settings.watchProviders.apiKey.placeholder")}
+          placeholder="API key"
           value={value}
           onChange={(event) => setValue(event.target.value)}
           className="font-mono"
@@ -354,7 +313,7 @@ function APIKeyBlock({
           className="sm:flex-none"
         >
           {pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-          {t("web.settings.watchProviders.connect")}
+          Connect
         </Button>
       </div>
     </div>
@@ -382,7 +341,6 @@ interface ConnectedRunInfo {
 }
 
 function deriveRunInfo(
-  t: Translate,
   connection: WatchProviderConnection,
   latestRun: WatchProviderSyncRun | undefined,
 ): ConnectedRunInfo {
@@ -405,25 +363,17 @@ function deriveRunInfo(
   let errorHint: string | undefined;
   if (latestRun?.status === "failed" && latestRun.error) {
     errorMessage = latestRun.error;
-    errorHint = t("web.settings.watchProviders.failedAgo", {
-      time: formatRelativeTime(t, latestRun.completed_at ?? latestRun.started_at),
-    });
+    errorHint = `Failed ${formatRelativeTime(latestRun.completed_at ?? latestRun.started_at)}.`;
   } else if (connection.last_error) {
     errorMessage = connection.last_error;
     errorHint = connection.last_scrobble_error_at
-      ? t("web.settings.watchProviders.lastSeen", {
-          time: formatRelativeTime(t, connection.last_scrobble_error_at),
-        })
+      ? `Last seen ${formatRelativeTime(connection.last_scrobble_error_at)}.`
       : undefined;
   }
   return { imported, exported, errorMessage, errorHint };
 }
 
-function formatLastSync(
-  t: Translate,
-  connection: WatchProviderConnection,
-  latestRun?: WatchProviderSyncRun,
-) {
+function formatLastSync(connection: WatchProviderConnection, latestRun?: WatchProviderSyncRun) {
   const candidates = [
     latestRun?.completed_at,
     connection.last_inbound_sync_at,
@@ -432,14 +382,12 @@ function formatLastSync(
     connection.last_favorites_sync_at,
     connection.last_watchlist_sync_at,
   ].filter((value): value is string => Boolean(value));
-  if (candidates.length === 0) return t("web.settings.watchProviders.neverSynced");
+  if (candidates.length === 0) return "Never synced";
   const newest = candidates
     .map((value) => new Date(value).getTime())
     .reduce((a, b) => Math.max(a, b), 0);
-  if (!Number.isFinite(newest) || newest <= 0) return t("web.settings.watchProviders.neverSynced");
-  return t("web.settings.watchProviders.synced", {
-    time: formatRelativeTime(t, new Date(newest).toISOString()),
-  });
+  if (!Number.isFinite(newest) || newest <= 0) return "Never synced";
+  return `Synced ${formatRelativeTime(new Date(newest).toISOString())}`;
 }
 
 function WatchProviderCard({
@@ -449,7 +397,6 @@ function WatchProviderCard({
   providerKey: string;
   connectionSettings?: WatchProviderConnectionSetting[];
 }) {
-  const t = useT();
   const { data: savedConnection, isLoading, isFetching } = useWatchProviderConnection(providerKey);
   const updateConnection = useUpdateWatchProviderConnection(providerKey);
   const startAuth = useStartWatchProviderDeviceAuth(providerKey);
@@ -457,7 +404,6 @@ function WatchProviderCard({
   const connectAPIKey = useConnectWatchProviderAPIKey(providerKey);
   const deleteConnection = useDeleteWatchProviderConnection(providerKey);
   const syncNow = useTriggerWatchProviderSync(providerKey);
-  const [cooldownSeconds, startCooldown] = useCountdown();
   const { data: syncRunsData } = useWatchProviderSyncRuns(
     providerKey,
     Boolean(savedConnection?.connected),
@@ -499,12 +445,16 @@ function WatchProviderCard({
 
   const latestRun = syncRunsData?.runs?.[0];
   const syncRunning = latestRun?.status === "queued" || latestRun?.status === "running";
+  const cooldownSeconds =
+    syncNow.error instanceof V2ProblemError && syncNow.error.status === 429
+      ? syncNow.error.retryAfterSeconds
+      : undefined;
   const syncDisabled = syncNow.isPending || syncRunning || Boolean(cooldownSeconds);
   const syncButtonLabel = syncRunning
-    ? t("web.settings.watchProviders.syncing")
+    ? "Syncing..."
     : cooldownSeconds
-      ? t("web.settings.watchProviders.cooldown", { time: formatRetryAfter(t, cooldownSeconds) })
-      : t("web.settings.watchProviders.syncNow");
+      ? `Cooldown ${formatRetryAfter(cooldownSeconds)}`
+      : "Sync now";
 
   const isBusy =
     (connection.connected && !connection.etag) ||
@@ -514,11 +464,10 @@ function WatchProviderCard({
     connectAPIKey.isPending ||
     deleteConnection.isPending;
   const displayName = connection.display_name;
-  const name = { provider: displayName };
   const usesAPIKey = connection.auth_method === WatchProviderAuthMethod.APIKey;
   const showAuth = Boolean(authSession) && !connection.connected;
   const showAPIKey = usesAPIKey && apiKeyPrompt && !connection.connected;
-  const runInfo = connection.connected ? deriveRunInfo(t, connection, latestRun) : null;
+  const runInfo = connection.connected ? deriveRunInfo(connection, latestRun) : null;
   const settingsPanelId = `watch-provider-${providerKey}-settings`;
   const hasError = Boolean(runInfo?.errorMessage);
   const favoritesSyncEnabled =
@@ -527,89 +476,60 @@ function WatchProviderCard({
     connection.import_watchlist_enabled || connection.export_watchlist_enabled;
   const supportsRatings =
     connection.capabilities.import_ratings || connection.capabilities.export_ratings;
-  const importedCounts = runInfo
-    ? {
-        watched: runInfo.imported.watched.toLocaleString(formatLocale()),
-        progress: runInfo.imported.progress.toLocaleString(formatLocale()),
-        favorites: runInfo.imported.favorites.toLocaleString(formatLocale()),
-        watchlist: runInfo.imported.watchlist.toLocaleString(formatLocale()),
-      }
-    : { watched: "", progress: "", favorites: "", watchlist: "" };
-  const sentLabel = runInfo
-    ? t("web.settings.watchProviders.stats.sent", {
-        count: (
-          runInfo.exported.watched +
-          runInfo.exported.favorites +
-          runInfo.exported.favoriteRemovals +
-          runInfo.exported.watchlist +
-          runInfo.exported.watchlistRemovals +
-          runInfo.exported.ratings
-        ).toLocaleString(formatLocale()),
-      })
-    : "";
 
   let statusVariant: StatusVariant;
   let statusLabel: string;
   if (showAuth || showAPIKey) {
     statusVariant = "pending";
-    statusLabel = usesAPIKey
-      ? t("web.settings.watchProviders.status.apiKeyRequired")
-      : t("web.settings.watchProviders.status.activationPending");
+    statusLabel = usesAPIKey ? "API key required" : "Activation pending";
   } else if (connection.connected && hasError) {
     statusVariant = "error";
-    statusLabel = t("web.settings.watchProviders.status.syncError");
+    statusLabel = "Sync error";
   } else if (connection.connected) {
     statusVariant = "connected";
-    statusLabel = t("web.settings.watchProviders.status.connected");
+    statusLabel = "Connected";
   } else {
     statusVariant = "disconnected";
-    statusLabel = t("web.settings.watchProviders.status.notConnected");
+    statusLabel = "Not connected";
   }
 
   const subtitleText = (() => {
-    if (showAuth) return t("web.settings.watchProviders.subtitle.waitingForCode");
-    if (showAPIKey) return t("web.settings.watchProviders.subtitle.pasteApiKey", name);
+    if (showAuth) return "Waiting for you to enter the code below.";
+    if (showAPIKey) return `Paste your ${displayName} API key to finish connecting.`;
     if (connection.connected) {
       const username = connection.provider_username || displayName;
-      return t("web.settings.watchProviders.subtitle.connected", {
-        username,
-        last_sync: formatLastSync(t, connection, latestRun),
-      });
+      return `${username} · ${formatLastSync(connection, latestRun)}`;
     }
-    if (!connection.credentials_configured)
-      return t("web.settings.watchProviders.subtitle.setupRequired");
-    if (usesAPIKey) return t("web.settings.watchProviders.subtitle.connectApiKey", name);
-    return t("web.settings.watchProviders.subtitle.connect");
+    if (!connection.credentials_configured) return "Server setup required.";
+    if (usesAPIKey)
+      return `Connect with your ${displayName} API key to import watch history and scrobble playback.`;
+    return "Connect to start importing watch history and scrobbling playback.";
   })();
 
   const handleCopyCode = async () => {
     if (!authSession) return;
     try {
-      await copyTextToClipboard(authSession.user_code);
+      await navigator.clipboard.writeText(authSession.user_code);
       setCodeCopied(true);
-      toast.success(t("web.settings.watchProviders.auth.codeCopied", name));
+      toast.success(`${displayName} code copied`);
     } catch {
-      toast.error(t("web.settings.watchProviders.auth.copyFailed", name));
+      toast.error(`Failed to copy ${displayName} code`);
     }
-  };
-
-  const handleCancelAuth = () => {
-    setAuthSession(null);
-    setCodeCopied(false);
   };
 
   const handlePoll = () => {
     if (!authSession) return;
     pollAuth.mutate(authSession.id, {
-      onSuccess: handleCancelAuth,
-      onError: (err) => {
-        // An expired, used, declined, or unknown code can never finish, so
-        // drop it and offer Connect again. A code not approved yet stays.
-        if (err instanceof V2ProblemError && [403, 404, 410].includes(err.status)) {
-          handleCancelAuth();
-        }
+      onSuccess: () => {
+        setAuthSession(null);
+        setCodeCopied(false);
       },
     });
+  };
+
+  const handleCancelAuth = () => {
+    setAuthSession(null);
+    setCodeCopied(false);
   };
 
   const handleStartConnect = () => {
@@ -660,15 +580,7 @@ function WatchProviderCard({
                 variant="outline"
                 size="sm"
                 disabled={isBusy || syncDisabled}
-                onClick={() =>
-                  syncNow.mutate(undefined, {
-                    onError: (err) => {
-                      if (err instanceof V2ProblemError && err.status === 429) {
-                        startCooldown(err.retryAfterSeconds ?? 0);
-                      }
-                    },
-                  })
-                }
+                onClick={() => syncNow.mutate()}
                 className="flex-1 sm:flex-none"
               >
                 {syncNow.isPending || syncRunning ? (
@@ -684,14 +596,14 @@ function WatchProviderCard({
                 size="sm"
                 disabled={isBusy}
                 onClick={() => {
-                  if (window.confirm(t("web.settings.watchProviders.disconnectConfirm", name))) {
+                  if (window.confirm(`Disconnect ${displayName}?`)) {
                     deleteConnection.mutate();
                   }
                 }}
                 className="flex-1 sm:flex-none"
               >
                 <Trash2 className="h-4 w-4" />
-                <span className="sm:inline">{t("web.settings.watchProviders.disconnect")}</span>
+                <span className="sm:inline">Disconnect</span>
               </Button>
             </>
           ) : (
@@ -707,7 +619,7 @@ function WatchProviderCard({
               ) : (
                 <CheckCircle2 className="h-4 w-4" />
               )}
-              {t("web.settings.watchProviders.connect")}
+              Connect
             </Button>
           )}
         </div>
@@ -749,19 +661,12 @@ function WatchProviderCard({
           <div className="bg-background/40 rounded-xl px-3 py-3 ring-1 ring-white/5 ring-inset">
             <div className="grid grid-cols-2 gap-3 sm:hidden">
               <StatCell
-                label={t("web.settings.watchProviders.stats.lastImported")}
-                value={
-                  supportsRatings
-                    ? t("web.settings.watchProviders.stats.importedSummaryWithRatings", {
-                        ...importedCounts,
-                        ratings: runInfo.imported.ratings.toLocaleString(formatLocale()),
-                      })
-                    : t("web.settings.watchProviders.stats.importedSummary", importedCounts)
-                }
+                label="Last imported"
+                value={`${runInfo.imported.watched.toLocaleString()} watched · ${runInfo.imported.progress.toLocaleString()} progress · ${runInfo.imported.favorites.toLocaleString()} favorites · ${runInfo.imported.watchlist.toLocaleString()} watchlist${supportsRatings ? ` · ${runInfo.imported.ratings.toLocaleString()} ratings` : ""}`}
               />
               <StatCell
-                label={t("web.settings.watchProviders.stats.lastExported")}
-                value={sentLabel}
+                label="Last exported"
+                value={`${(runInfo.exported.watched + runInfo.exported.favorites + runInfo.exported.favoriteRemovals + runInfo.exported.watchlist + runInfo.exported.watchlistRemovals + runInfo.exported.ratings).toLocaleString()} sent`}
               />
             </div>
             <div
@@ -771,38 +676,31 @@ function WatchProviderCard({
               )}
             >
               <StatCell
-                label={t("web.settings.watchProviders.stats.watched")}
-                value={t("web.settings.watchProviders.stats.imported", {
-                  count: importedCounts.watched,
-                })}
+                label="Watched"
+                value={`${runInfo.imported.watched.toLocaleString()} imported`}
               />
               <StatCell
-                label={t("web.settings.watchProviders.stats.progress")}
-                value={t("web.settings.watchProviders.stats.resumed", {
-                  count: importedCounts.progress,
-                })}
+                label="Progress"
+                value={`${runInfo.imported.progress.toLocaleString()} resumed`}
               />
               <StatCell
-                label={t("web.settings.watchProviders.stats.favorites")}
-                value={t("web.settings.watchProviders.stats.imported", {
-                  count: importedCounts.favorites,
-                })}
+                label="Favorites"
+                value={`${runInfo.imported.favorites.toLocaleString()} imported`}
               />
               <StatCell
-                label={t("web.settings.watchProviders.stats.watchlist")}
-                value={t("web.settings.watchProviders.stats.imported", {
-                  count: importedCounts.watchlist,
-                })}
+                label="Watchlist"
+                value={`${runInfo.imported.watchlist.toLocaleString()} imported`}
               />
               {supportsRatings ? (
                 <StatCell
-                  label={t("web.settings.watchProviders.stats.ratings")}
-                  value={t("web.settings.watchProviders.stats.imported", {
-                    count: runInfo.imported.ratings.toLocaleString(formatLocale()),
-                  })}
+                  label="Ratings"
+                  value={`${runInfo.imported.ratings.toLocaleString()} imported`}
                 />
               ) : null}
-              <StatCell label={t("web.settings.watchProviders.stats.exported")} value={sentLabel} />
+              <StatCell
+                label="Exported"
+                value={`${(runInfo.exported.watched + runInfo.exported.favorites + runInfo.exported.favoriteRemovals + runInfo.exported.watchlist + runInfo.exported.watchlistRemovals + runInfo.exported.ratings).toLocaleString()} sent`}
+              />
             </div>
           </div>
 
@@ -811,9 +709,9 @@ function WatchProviderCard({
             aria-expanded={settingsOpen}
             aria-controls={settingsPanelId}
             onClick={() => setSettingsOpen(!settingsOpen)}
-            className="text-muted-foreground hover:text-foreground flex w-full items-center justify-between gap-3 rounded-lg py-1 text-start text-sm font-medium transition-colors"
+            className="text-muted-foreground hover:text-foreground flex w-full items-center justify-between gap-3 rounded-lg py-1 text-left text-sm font-medium transition-colors"
           >
-            {t("web.settings.watchProviders.settings")}
+            Settings
             <ChevronDown
               aria-hidden="true"
               className={cn("h-4 w-4 shrink-0 transition-transform", settingsOpen && "rotate-180")}
@@ -823,7 +721,7 @@ function WatchProviderCard({
             <div id={settingsPanelId}>
               {settingsConflict && (
                 <div role="alert" className="border-border mb-4 rounded-xl border p-4 text-sm">
-                  <p>{t("web.settings.watchProviders.conflict.message")}</p>
+                  <p>These settings changed elsewhere. Your change is still shown below.</p>
                   <div className="mt-3 flex flex-wrap gap-2">
                     <Button
                       size="sm"
@@ -833,7 +731,7 @@ function WatchProviderCard({
                           updateConnection.mutate(updateConnection.variables);
                       }}
                     >
-                      {t("web.settings.watchProviders.conflict.apply")}
+                      Apply my change
                     </Button>
                     <Button
                       size="sm"
@@ -841,7 +739,7 @@ function WatchProviderCard({
                       disabled={isFetching}
                       onClick={() => updateConnection.reset()}
                     >
-                      {t("web.settings.watchProviders.conflict.useLatest")}
+                      Use latest settings
                     </Button>
                   </div>
                 </div>
@@ -849,11 +747,8 @@ function WatchProviderCard({
               <div className="grid grid-cols-1 gap-x-6 gap-y-1 sm:grid-cols-2">
                 <ToggleRow
                   id={`watch-provider-${providerKey}-import-watched`}
-                  label={t("web.settings.watchProviders.toggle.importWatched.label")}
-                  description={t(
-                    "web.settings.watchProviders.toggle.importWatched.description",
-                    name,
-                  )}
+                  label="Import watched history"
+                  description={`Bring completed ${displayName} plays into this profile.`}
                   checked={connection.import_watched_enabled}
                   disabled={isBusy}
                   onChange={(checked) =>
@@ -862,11 +757,8 @@ function WatchProviderCard({
                 />
                 <ToggleRow
                   id={`watch-provider-${providerKey}-import-progress`}
-                  label={t("web.settings.watchProviders.toggle.importProgress.label")}
-                  description={t(
-                    "web.settings.watchProviders.toggle.importProgress.description",
-                    name,
-                  )}
+                  label="Import paused progress"
+                  description={`Use newer ${displayName} resume points when local progress is older.`}
                   checked={connection.import_progress_enabled}
                   disabled={isBusy}
                   onChange={(checked) =>
@@ -875,8 +767,8 @@ function WatchProviderCard({
                 />
                 <ToggleRow
                   id={`watch-provider-${providerKey}-export-watched`}
-                  label={t("web.settings.watchProviders.toggle.exportWatched.label")}
-                  description={t("web.settings.watchProviders.toggle.exportWatched.description")}
+                  label="Send watched changes"
+                  description="Send local watched marks and completed plays to this provider."
                   checked={connection.export_watched_enabled}
                   disabled={isBusy}
                   onChange={(checked) =>
@@ -887,11 +779,8 @@ function WatchProviderCard({
                 connection.capabilities.export_favorites ? (
                   <ToggleRow
                     id={`watch-provider-${providerKey}-favorites`}
-                    label={t("web.settings.watchProviders.toggle.favorites.label")}
-                    description={t(
-                      "web.settings.watchProviders.toggle.favorites.description",
-                      name,
-                    )}
+                    label="Sync favorites"
+                    description={`Import ${displayName} movie and show favorites, and send local favorite adds.`}
                     checked={favoritesSyncEnabled}
                     disabled={isBusy}
                     onChange={(checked) =>
@@ -908,10 +797,8 @@ function WatchProviderCard({
                 {connection.capabilities.remove_favorites ? (
                   <ToggleRow
                     id={`watch-provider-${providerKey}-favorite-removals`}
-                    label={t("web.settings.watchProviders.toggle.favoriteRemovals.label")}
-                    description={t(
-                      "web.settings.watchProviders.toggle.favoriteRemovals.description",
-                    )}
+                    label="Sync favorite removals"
+                    description="Remove provider-synced favorites on the other side when they are explicitly unfavorited."
                     checked={connection.sync_favorite_removals_enabled}
                     disabled={isBusy || !favoritesSyncEnabled}
                     onChange={(checked) =>
@@ -923,11 +810,8 @@ function WatchProviderCard({
                 connection.capabilities.export_watchlist ? (
                   <ToggleRow
                     id={`watch-provider-${providerKey}-watchlist`}
-                    label={t("web.settings.watchProviders.toggle.watchlist.label")}
-                    description={t(
-                      "web.settings.watchProviders.toggle.watchlist.description",
-                      name,
-                    )}
+                    label="Sync watchlist"
+                    description={`Import your ${displayName} watchlist, and send local watchlist adds.`}
                     checked={watchlistSyncEnabled}
                     disabled={isBusy}
                     onChange={(checked) =>
@@ -944,10 +828,8 @@ function WatchProviderCard({
                 {connection.capabilities.remove_watchlist ? (
                   <ToggleRow
                     id={`watch-provider-${providerKey}-watchlist-removals`}
-                    label={t("web.settings.watchProviders.toggle.watchlistRemovals.label")}
-                    description={t(
-                      "web.settings.watchProviders.toggle.watchlistRemovals.description",
-                    )}
+                    label="Sync watchlist removals"
+                    description="Remove provider-synced watchlist items on the other side when they are removed locally."
                     checked={connection.sync_watchlist_removals_enabled}
                     disabled={isBusy || !watchlistSyncEnabled}
                     onChange={(checked) =>
@@ -958,11 +840,8 @@ function WatchProviderCard({
                 {connection.capabilities.provides_watchlist_order ? (
                   <ToggleRow
                     id={`watch-provider-${providerKey}-watchlist-order`}
-                    label={t("web.settings.watchProviders.toggle.watchlistOrder.label")}
-                    description={t(
-                      "web.settings.watchProviders.toggle.watchlistOrder.description",
-                      name,
-                    )}
+                    label="Mirror watchlist order"
+                    description={`Order your Silo watchlist to match its ${displayName} sort order. Items not on ${displayName} stay at the bottom.`}
                     checked={connection.sync_watchlist_order_enabled}
                     disabled={isBusy || !connection.import_watchlist_enabled}
                     onChange={(checked) =>
@@ -973,11 +852,8 @@ function WatchProviderCard({
                 {connection.capabilities.import_ratings ? (
                   <ToggleRow
                     id={`watch-provider-${providerKey}-import-ratings`}
-                    label={t("web.settings.watchProviders.toggle.importRatings.label")}
-                    description={t(
-                      "web.settings.watchProviders.toggle.importRatings.description",
-                      name,
-                    )}
+                    label="Import ratings"
+                    description={`Bring ${displayName} movie and show ratings in as stars. A 7/10 becomes 4 stars.`}
                     checked={connection.import_ratings_enabled}
                     disabled={isBusy}
                     onChange={(checked) =>
@@ -988,11 +864,8 @@ function WatchProviderCard({
                 {connection.capabilities.export_ratings ? (
                   <ToggleRow
                     id={`watch-provider-${providerKey}-export-ratings`}
-                    label={t("web.settings.watchProviders.toggle.exportRatings.label")}
-                    description={t(
-                      "web.settings.watchProviders.toggle.exportRatings.description",
-                      name,
-                    )}
+                    label="Send ratings"
+                    description={`Send your star ratings to ${displayName} and clear ones you remove. 4 stars becomes 8/10.`}
                     checked={connection.export_ratings_enabled}
                     disabled={isBusy}
                     onChange={(checked) =>
@@ -1003,11 +876,8 @@ function WatchProviderCard({
                 {connection.capabilities.sync_dropped ? (
                   <ToggleRow
                     id={`watch-provider-${providerKey}-sync-dropped`}
-                    label={t("web.settings.watchProviders.toggle.syncDropped.label")}
-                    description={t(
-                      "web.settings.watchProviders.toggle.syncDropped.description",
-                      name,
-                    )}
+                    label="Sync dropped shows"
+                    description={`Hide shows you dropped on ${displayName} from Next Up and Continue Watching, and drop shows on ${displayName} when you remove their episodes from Home. Watching a show again undrops it.`}
                     checked={connection.sync_dropped_enabled}
                     disabled={isBusy}
                     onChange={(checked) =>
@@ -1017,8 +887,8 @@ function WatchProviderCard({
                 ) : null}
                 <ToggleRow
                   id={`watch-provider-${providerKey}-scrobble`}
-                  label={t("web.settings.watchProviders.toggle.scrobble.label")}
-                  description={t("web.settings.watchProviders.toggle.scrobble.description")}
+                  label="Scrobble playback"
+                  description="Report starts, pauses, resumes, and stops live during playback."
                   checked={connection.scrobble_enabled}
                   disabled={isBusy}
                   onChange={(checked) => updateConnection.mutate({ scrobble_enabled: checked })}
@@ -1048,7 +918,6 @@ function WatchProviderCard({
 }
 
 export default function WatchProvidersSettings() {
-  const t = useT();
   const { data, isLoading } = useWatchProviders();
 
   if (isLoading) {
@@ -1067,14 +936,14 @@ export default function WatchProvidersSettings() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.watchProviders.title")}
-        subtitle={t("web.settings.watchProviders.subtitle")}
+        title="Watch Providers"
+        subtitle="Connect external trackers to import watch history, sync paused progress, and scrobble playback in real time."
       />
 
       {providers.length === 0 ? (
         <section className="surface-panel rounded-[1.7rem] border-0 px-4 py-5 shadow-none sm:px-6">
           <div className="text-muted-foreground text-sm">
-            {t("web.settings.watchProviders.none")}
+            No watch providers are registered on this server.
           </div>
         </section>
       ) : (

@@ -1,5 +1,3 @@
-import { t, type MessageKey } from "@/i18n";
-
 export interface RecFieldDef {
   key: string;
   label: string;
@@ -8,12 +6,7 @@ export interface RecFieldDef {
   defaultValue?: string;
 }
 
-/** A stable id for each section; compare this rather than the title. */
-export type RecSectionId = "general" | "embedding" | "schedule" | "advanced";
-
 export interface RecSectionDef {
-  id: RecSectionId;
-  /** In the interface language; compare `id`, not this. */
   title: string;
   fields: RecFieldDef[];
 }
@@ -25,123 +18,88 @@ export interface RecommendationEmbeddingLockViewModel {
   note: string;
 }
 
-// The tables hold catalog keys; the exported builders resolve them when
-// called, so the text follows the interface language.
-interface RecFieldSpec extends Omit<RecFieldDef, "label" | "hint"> {
-  label: MessageKey;
-  hint?: MessageKey;
-}
-
-interface RecSectionSpec {
-  id: RecSectionId;
-  title: MessageKey;
-  fields: RecFieldSpec[];
-}
-
-const RECOMMENDATIONS_GENERAL_SECTION: RecSectionSpec = {
-  id: "general",
-  title: "web.admin.settings.recommendations.general.title",
-  fields: [
-    {
-      key: "recommendations.enabled",
-      label: "web.admin.settings.recommendations.general.enabled",
-      type: "toggle",
-    },
-  ],
+const RECOMMENDATIONS_GENERAL_SECTION: RecSectionDef = {
+  title: "General",
+  fields: [{ key: "recommendations.enabled", label: "Enable Recommendations", type: "toggle" }],
 };
 
 // The provider is chosen with its own control; the model is listed here so
 // the page seeds and saves it like every other field.
-const RECOMMENDATIONS_EMBEDDING_SECTION: RecSectionSpec = {
-  id: "embedding",
-  title: "web.admin.settings.recommendations.embedding.title",
-  fields: [
-    {
-      key: "recommendations.embedding_model",
-      label: "web.admin.settings.recommendations.embedding.model",
-      type: "text",
-    },
-  ],
+const RECOMMENDATIONS_EMBEDDING_SECTION: RecSectionDef = {
+  title: "Embedding Model",
+  fields: [{ key: "recommendations.embedding_model", label: "Model", type: "text" }],
 };
 
-const RECOMMENDATIONS_SCHEDULE_SECTION: RecSectionSpec = {
-  id: "schedule",
-  title: "web.admin.settings.recommendations.schedule.title",
+const RECOMMENDATIONS_SCHEDULE_SECTION: RecSectionDef = {
+  title: "Schedule",
   fields: [
     {
       key: "recommendations.embeddings_cron",
-      label: "web.admin.settings.recommendations.schedule.embeddingsCron",
+      label: "Embeddings Cron",
       type: "text",
-      hint: "web.admin.settings.recommendations.schedule.cronHint",
+      hint: "Cron expression",
       defaultValue: "0 3 * * *",
     },
     {
       key: "recommendations.taste_profiles_cron",
-      label: "web.admin.settings.recommendations.schedule.tasteProfilesCron",
+      label: "Taste Profiles Cron",
       type: "text",
-      hint: "web.admin.settings.recommendations.schedule.cronHint",
+      hint: "Cron expression",
       defaultValue: "0 4 * * *",
     },
     {
       key: "recommendations.cowatch_cron",
-      label: "web.admin.settings.recommendations.schedule.cowatchCron",
+      label: "Co-Watch Cron",
       type: "text",
-      hint: "web.admin.settings.recommendations.schedule.cronHint",
+      hint: "Cron expression",
       defaultValue: "30 4 * * *",
     },
     {
       key: "recommendations.recommendations_cron",
-      label: "web.admin.settings.recommendations.schedule.recommendationsCron",
+      label: "Recommendations Cron",
       type: "text",
-      hint: "web.admin.settings.recommendations.schedule.cronHint",
+      hint: "Cron expression",
       defaultValue: "0 5 * * *",
     },
   ],
 };
 
-const RECOMMENDATIONS_ADVANCED_SECTION: RecSectionSpec = {
-  id: "advanced",
-  title: "web.admin.settings.recommendations.advanced.title",
+const RECOMMENDATIONS_ADVANCED_SECTION: RecSectionDef = {
+  title: "Advanced",
   fields: [
     {
       key: "recommendations.taste_decay_half_life_days",
-      label: "web.admin.settings.recommendations.advanced.halfLife.label",
+      label: "Time Decay Half-Life (days)",
       type: "number",
-      hint: "web.admin.settings.recommendations.advanced.halfLife.hint",
+      hint: "How fast old signals lose weight",
       defaultValue: "180",
     },
     {
       key: "recommendations.diversity_lambda",
-      label: "web.admin.settings.recommendations.advanced.diversity.label",
+      label: "Diversity Lambda",
       type: "text",
-      hint: "web.admin.settings.recommendations.advanced.diversity.hint",
+      hint: "0 = max diversity, 1 = max relevance",
       defaultValue: "0.7",
     },
   ],
 };
 
-const RECOMMENDATIONS_SECTIONS: RecSectionSpec[] = [
+const RECOMMENDATIONS_SECTIONS: RecSectionDef[] = [
   RECOMMENDATIONS_GENERAL_SECTION,
   RECOMMENDATIONS_EMBEDDING_SECTION,
   RECOMMENDATIONS_SCHEDULE_SECTION,
   RECOMMENDATIONS_ADVANCED_SECTION,
 ];
 
-function resolveField(field: RecFieldSpec): RecFieldDef {
-  const { label, hint, ...rest } = field;
-  return { ...rest, label: t(label), ...(hint ? { hint: t(hint) } : {}) };
-}
+const EMBEDDING_LOCK_NOTE =
+  "Switching to another model requires resetting embeddings, which deletes them all. Another provider serving the same model applies after a restart.";
 
 export function buildRecommendationSections(): RecSectionDef[] {
-  return RECOMMENDATIONS_SECTIONS.map((section) => ({
-    id: section.id,
-    title: t(section.title),
-    fields: section.fields.map(resolveField),
-  }));
+  return RECOMMENDATIONS_SECTIONS;
 }
 
 export function getAllRecommendationFields(): RecFieldDef[] {
-  return RECOMMENDATIONS_SECTIONS.flatMap((section) => section.fields.map(resolveField));
+  return RECOMMENDATIONS_SECTIONS.flatMap((section) => section.fields);
 }
 
 export function parseRecommendationEmbeddingLock(
@@ -177,6 +135,6 @@ export function parseRecommendationEmbeddingLock(
     model,
     sourceDimensions,
     storageDimensions: storageDimensions ?? 3072,
-    note: t("web.admin.settings.recommendations.embeddingLockNote"),
+    note: EMBEDDING_LOCK_NOTE,
   };
 }

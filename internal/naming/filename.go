@@ -501,6 +501,13 @@ func extractMovieTitleYear(filePath, libraryRoot string) (string, int) {
 	return parseTitleYearCandidate(nameNoExt)
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func comparableTitlesOverlap(left string, right string) bool {
 	if left == "" || right == "" {
 		return false

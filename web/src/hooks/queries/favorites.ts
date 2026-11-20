@@ -4,7 +4,6 @@ import { catalogItemFromV2 } from "@/api/v2/catalog";
 import { v2 } from "@/api/v2/request";
 import { favoriteKeys } from "./keys";
 import { toast } from "sonner";
-import { t } from "@/i18n";
 import {
   cancelItemDetailQueries,
   scheduleMediaSurfaceInvalidation,
@@ -79,14 +78,10 @@ export function useToggleFavorite(itemId: string) {
           in_watchlist: detail.user_state?.in_watchlist ?? false,
         },
       }));
-      toast.error(t("web.common.toast.favorites.updateFailed"));
+      toast.error("Failed to update favorites");
     },
     onSuccess: (_data, currentlyFavorite) => {
-      toast.success(
-        currentlyFavorite
-          ? t("web.common.toast.favorites.removed")
-          : t("web.common.toast.favorites.added"),
-      );
+      toast.success(currentlyFavorite ? "Removed from favorites" : "Added to favorites");
     },
     onSettled: () => {
       scheduleMediaSurfaceInvalidation(queryClient, {

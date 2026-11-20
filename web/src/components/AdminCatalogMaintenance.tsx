@@ -44,22 +44,9 @@ import {
 } from "./adminCatalogMaintenancePathRewrites";
 import { formatExportProgressLabel, formatJobProgress } from "./adminCatalogMaintenanceFormatters";
 import { Download, Plus, RefreshCw, Trash2, Upload } from "lucide-react";
-import { copyTextToClipboard } from "@/lib/clipboard";
 import { formatDateTime } from "@/lib/datetime";
-import { toast } from "sonner";
-import type { ReactNode } from "react";
-import { numberText, useT, type Translate } from "@/i18n";
-
-// Example paths and URLs shown as placeholders; not translated.
-const LOCAL_PATH_EXAMPLE = "/catalog-seeds/my-catalog.json.gz";
-const REMOTE_URL_EXAMPLE = "https://example.com/catalog-seeds/export.json.gz";
-const REWRITE_FROM_EXAMPLE = "/srv/media";
-const REWRITE_TO_EXAMPLE = "/media";
-
-const monospace = (chunks: ReactNode[]) => <span className="font-mono">{chunks}</span>;
 
 export default function AdminCatalogMaintenance() {
-  const t = useT();
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [execution, setExecution] = useState<"queued" | "synchronous">("queued");
   const exportJobsQuery = useCatalogExportJobs();
@@ -143,7 +130,6 @@ export default function AdminCatalogMaintenance() {
     );
   }
 
-  const addRewriteLabel = t("web.admin.catalogMaintenance.import.addRewrite");
   const isImportSubmitDisabled =
     importMutation.isPending ||
     (importSource === "local_path"
@@ -158,14 +144,13 @@ export default function AdminCatalogMaintenance() {
     <div className="space-y-6">
       <div className="border-border/70 bg-card/60 flex flex-col gap-4 rounded-lg border p-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="space-y-1">
-          <h2 className="text-lg font-semibold">
-            {t("web.admin.catalogMaintenance.header.title")}
-          </h2>
+          <h2 className="text-lg font-semibold">Catalog Import & Export</h2>
           <p className="text-muted-foreground text-sm">
-            {t("web.admin.catalogMaintenance.header.body")}
+            Queue full catalog exports, import seeds from files or S3, and watch background job
+            progress in one place.
           </p>
         </div>
-        <div className="ms-auto flex shrink-0 flex-wrap justify-end gap-2">
+        <div className="ml-auto flex shrink-0 flex-wrap justify-end gap-2">
           <Button
             variant="outline"
             size="sm"
@@ -173,9 +158,9 @@ export default function AdminCatalogMaintenance() {
             disabled={exportMutation.isPending}
           >
             <Download
-              className={`me-1 h-4 w-4 ${exportMutation.isPending ? "animate-pulse" : ""}`}
+              className={`mr-1 h-4 w-4 ${exportMutation.isPending ? "animate-pulse" : ""}`}
             />
-            {t("web.admin.catalogMaintenance.header.startExport")}
+            Start Export
           </Button>
           <Dialog
             open={importDialogOpen}
@@ -188,20 +173,20 @@ export default function AdminCatalogMaintenance() {
           >
             <DialogTrigger asChild>
               <Button variant="outline" size="sm">
-                <Upload className="me-1 h-4 w-4" />
-                {t("web.admin.catalogMaintenance.header.importCatalog")}
+                <Upload className="mr-1 h-4 w-4" />
+                Import Catalog
               </Button>
             </DialogTrigger>
             <DialogContent className="sm:max-w-2xl">
               <DialogHeader>
-                <DialogTitle>{t("web.admin.catalogMaintenance.import.title")}</DialogTitle>
+                <DialogTitle>Import Catalog Seed</DialogTitle>
                 <DialogDescription>
-                  {t("web.admin.catalogMaintenance.import.description")}
+                  Import a catalog seed with optional path rewrites.
                 </DialogDescription>
               </DialogHeader>
               <form onSubmit={handleImportSubmit} className="space-y-4">
                 <div className="space-y-2">
-                  <Label>{t("web.admin.catalogMaintenance.import.sourceLabel")}</Label>
+                  <Label>Import Source</Label>
                   <Select
                     value={importSource}
                     onValueChange={(value) =>
@@ -212,23 +197,15 @@ export default function AdminCatalogMaintenance() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="local_path">
-                        {t("web.admin.catalogMaintenance.import.sourceLocalFile")}
-                      </SelectItem>
-                      <SelectItem value="export_job">
-                        {t("web.admin.catalogMaintenance.import.sourceExportJob")}
-                      </SelectItem>
-                      <SelectItem value="bucket_artifact">
-                        {t("web.admin.catalogMaintenance.import.sourceBucketArtifact")}
-                      </SelectItem>
-                      <SelectItem value="remote_url">
-                        {t("web.admin.catalogMaintenance.import.sourceRemoteUrl")}
-                      </SelectItem>
+                      <SelectItem value="local_path">Local File</SelectItem>
+                      <SelectItem value="export_job">Local Export Job</SelectItem>
+                      <SelectItem value="bucket_artifact">Bucket Artifact</SelectItem>
+                      <SelectItem value="remote_url">Remote URL</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
                 <div className="space-y-2">
-                  <Label>{t("web.admin.catalogMaintenance.import.executionLabel")}</Label>
+                  <Label>Execution</Label>
                   <Select
                     value={execution}
                     onValueChange={(value: "queued" | "synchronous") => setExecution(value)}
@@ -237,34 +214,28 @@ export default function AdminCatalogMaintenance() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="queued">
-                        {t("web.admin.catalogMaintenance.import.executionQueued")}
-                      </SelectItem>
-                      <SelectItem value="synchronous">
-                        {t("web.admin.catalogMaintenance.import.executionSynchronous")}
-                      </SelectItem>
+                      <SelectItem value="queued">Background job</SelectItem>
+                      <SelectItem value="synchronous">Import and wait</SelectItem>
                     </SelectContent>
                   </Select>
                   <p className="text-muted-foreground text-xs">
                     {execution === "queued"
-                      ? t("web.admin.catalogMaintenance.import.executionQueuedHelp")
-                      : t("web.admin.catalogMaintenance.import.executionSynchronousHelp")}
+                      ? "A worker reads the source later. Local files must be available on that worker."
+                      : "Keep this request open until the import commits. If the connection is lost, check the catalog before trying again."}
                   </p>
                 </div>
                 {importSource === "local_path" ? (
                   <div className="space-y-2">
-                    <Label>{t("web.admin.catalogMaintenance.import.filePathLabel")}</Label>
+                    <Label>File Path</Label>
                     <Input
                       value={localPath}
                       onChange={(e) => setLocalPath(e.target.value)}
-                      placeholder={LOCAL_PATH_EXAMPLE}
+                      placeholder="/catalog-seeds/my-catalog.json.gz"
                     />
                     {localImportSources.length > 0 && (
                       <>
                         <div className="flex items-center justify-between gap-2">
-                          <Label className="text-muted-foreground text-xs">
-                            {t("web.admin.catalogMaintenance.import.detectedFiles")}
-                          </Label>
+                          <Label className="text-muted-foreground text-xs">Detected Files</Label>
                           <Button
                             type="button"
                             variant="ghost"
@@ -273,18 +244,14 @@ export default function AdminCatalogMaintenance() {
                             disabled={localImportSourcesQuery.isFetching}
                           >
                             <RefreshCw
-                              className={`me-1 h-4 w-4 ${localImportSourcesQuery.isFetching ? "animate-spin" : ""}`}
+                              className={`mr-1 h-4 w-4 ${localImportSourcesQuery.isFetching ? "animate-spin" : ""}`}
                             />
-                            {t("web.admin.catalogMaintenance.refresh")}
+                            Refresh
                           </Button>
                         </div>
                         <Select value="" onValueChange={(value) => setLocalPath(value)}>
                           <SelectTrigger>
-                            <SelectValue
-                              placeholder={t(
-                                "web.admin.catalogMaintenance.import.selectDetectedFile",
-                              )}
-                            />
+                            <SelectValue placeholder="Select a detected file" />
                           </SelectTrigger>
                           <SelectContent>
                             {localImportSources.map((source) => (
@@ -297,7 +264,9 @@ export default function AdminCatalogMaintenance() {
                       </>
                     )}
                     <p className="text-muted-foreground text-xs">
-                      {t("web.admin.catalogMaintenance.import.filePathHelp", { code: monospace })}
+                      Enter the absolute path to a <span className="font-mono">.json.gz</span>{" "}
+                      catalog seed file on the server, or select a detected file from{" "}
+                      <span className="font-mono">/catalog-seeds/</span>.
                     </p>
                     {localImportSourcesQuery.hasNextPage && (
                       <Button
@@ -306,7 +275,7 @@ export default function AdminCatalogMaintenance() {
                         disabled={localImportSourcesQuery.isFetchingNextPage}
                         onClick={() => void localImportSourcesQuery.fetchNextPage()}
                       >
-                        {t("web.admin.catalogMaintenance.import.loadMoreLocal")}
+                        Load more local files
                       </Button>
                     )}
                     {localImportSourcesQuery.isError && (
@@ -315,41 +284,40 @@ export default function AdminCatalogMaintenance() {
                         variant="outline"
                         onClick={() => void localImportSourcesQuery.restart()}
                       >
-                        {t("web.admin.catalogMaintenance.import.retryLocal")}
+                        Retry local files
                       </Button>
                     )}
                   </div>
                 ) : importSource === "export_job" ? (
                   <div className="space-y-2">
-                    <Label>{t("web.admin.catalogMaintenance.import.completedExportLabel")}</Label>
+                    <Label>Completed Export</Label>
                     <Select value={selectedExportJobId} onValueChange={setSelectedExportJobId}>
                       <SelectTrigger>
-                        <SelectValue
-                          placeholder={t("web.admin.catalogMaintenance.import.chooseExport")}
-                        />
+                        <SelectValue placeholder="Choose a completed export job" />
                       </SelectTrigger>
                       <SelectContent>
                         {completedExportJobs.length === 0 ? (
                           <SelectItem value="__none" disabled>
-                            {t("web.admin.catalogMaintenance.import.noCompletedExports")}
+                            No completed exports yet
                           </SelectItem>
                         ) : (
                           completedExportJobs.map((job) => (
                             <SelectItem key={job.id} value={job.id}>
-                              {describeExportJob(t, job)}
+                              {describeExportJob(job)}
                             </SelectItem>
                           ))
                         )}
                       </SelectContent>
                     </Select>
                     <p className="text-muted-foreground text-xs">
-                      {t("web.admin.catalogMaintenance.import.exportJobHelp")}
+                      Silo will load the selected seed directly from the configured operational S3
+                      bucket.
                     </p>
                   </div>
                 ) : importSource === "bucket_artifact" ? (
                   <div className="space-y-2">
                     <div className="flex items-center justify-between gap-2">
-                      <Label>{t("web.admin.catalogMaintenance.import.bucketLabel")}</Label>
+                      <Label>Detected Bucket Artifacts</Label>
                       <Button
                         type="button"
                         variant="ghost"
@@ -358,9 +326,9 @@ export default function AdminCatalogMaintenance() {
                         disabled={importSourcesQuery.isFetching}
                       >
                         <RefreshCw
-                          className={`me-1 h-4 w-4 ${importSourcesQuery.isFetching ? "animate-spin" : ""}`}
+                          className={`mr-1 h-4 w-4 ${importSourcesQuery.isFetching ? "animate-spin" : ""}`}
                         />
-                        {t("web.admin.catalogMaintenance.refresh")}
+                        Refresh
                       </Button>
                       {importSourcesQuery.hasNextPage && (
                         <Button
@@ -369,7 +337,7 @@ export default function AdminCatalogMaintenance() {
                           disabled={importSourcesQuery.isFetchingNextPage}
                           onClick={() => void importSourcesQuery.fetchNextPage()}
                         >
-                          {t("web.admin.catalogMaintenance.import.loadMoreBucket")}
+                          Load more bucket files
                         </Button>
                       )}
                       {importSourcesQuery.isError && (
@@ -378,20 +346,18 @@ export default function AdminCatalogMaintenance() {
                           variant="outline"
                           onClick={() => void importSourcesQuery.restart()}
                         >
-                          {t("web.admin.catalogMaintenance.import.retryBucket")}
+                          Retry bucket files
                         </Button>
                       )}
                     </div>
                     <Select value={selectedArtifactKey} onValueChange={setSelectedArtifactKey}>
                       <SelectTrigger>
-                        <SelectValue
-                          placeholder={t("web.admin.catalogMaintenance.import.chooseBucketSeed")}
-                        />
+                        <SelectValue placeholder="Choose a catalog seed from the bucket" />
                       </SelectTrigger>
                       <SelectContent>
                         {bucketImportSources.length === 0 ? (
                           <SelectItem value="__none" disabled>
-                            {t("web.admin.catalogMaintenance.import.noBucketSeeds")}
+                            No catalog seed objects found
                           </SelectItem>
                         ) : (
                           bucketImportSources.map((source) => (
@@ -403,24 +369,26 @@ export default function AdminCatalogMaintenance() {
                       </SelectContent>
                     </Select>
                     <p className="text-muted-foreground text-xs">
-                      {t("web.admin.catalogMaintenance.import.bucketHelp")}
+                      This reads any detected `catalog-seeds/*.json.gz` object in the private
+                      internal S3 bucket, including exports from other installs.
                     </p>
                   </div>
                 ) : (
                   <div className="space-y-2">
-                    <Label>{t("web.admin.catalogMaintenance.import.remoteUrlLabel")}</Label>
+                    <Label>Remote URL</Label>
                     <Input
                       value={remoteURL}
                       onChange={(e) => setRemoteURL(e.target.value)}
-                      placeholder={REMOTE_URL_EXAMPLE}
+                      placeholder="https://example.com/catalog-seeds/export.json.gz"
                     />
                     <p className="text-muted-foreground text-xs">
-                      {t("web.admin.catalogMaintenance.import.remoteUrlHelp", { code: monospace })}
+                      Paste a public <span className="font-mono">.json.gz</span> catalog seed URL.
+                      Silo will download it server-side before importing.
                     </p>
                   </div>
                 )}
                 <div className="space-y-2">
-                  <Label>{t("web.admin.catalogMaintenance.import.conflictLabel")}</Label>
+                  <Label>Conflict Mode</Label>
                   <Select
                     value={conflictMode}
                     onValueChange={(value) =>
@@ -431,20 +399,19 @@ export default function AdminCatalogMaintenance() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="skip_existing">
-                        {t("web.admin.catalogMaintenance.import.conflictSkip")}
-                      </SelectItem>
-                      <SelectItem value="overwrite_existing">
-                        {t("web.admin.catalogMaintenance.import.conflictOverwrite")}
-                      </SelectItem>
+                      <SelectItem value="skip_existing">Skip Existing</SelectItem>
+                      <SelectItem value="overwrite_existing">Overwrite Existing</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
                 <div className="space-y-3">
                   <div className="space-y-1">
-                    <Label>{t("web.admin.catalogMaintenance.import.rewritesLabel")}</Label>
+                    <Label>Path Rewrites</Label>
                     <p className="text-muted-foreground text-xs">
-                      {t("web.admin.catalogMaintenance.import.rewritesHelp", { code: monospace })}
+                      Rewrites use prefix matching. Mapping{" "}
+                      <span className="font-mono">/srv/media</span> to{" "}
+                      <span className="font-mono">/media</span> rewrites every nested library and
+                      file path under that root.
                     </p>
                   </div>
                   {pathRewrites.map((rewrite, index) => (
@@ -452,19 +419,19 @@ export default function AdminCatalogMaintenance() {
                       <Input
                         value={rewrite.from}
                         onChange={(e) => updateRewrite(index, "from", e.target.value)}
-                        placeholder={REWRITE_FROM_EXAMPLE}
+                        placeholder="/srv/media"
                       />
                       <Input
                         value={rewrite.to}
                         onChange={(e) => updateRewrite(index, "to", e.target.value)}
-                        placeholder={REWRITE_TO_EXAMPLE}
+                        placeholder="/media"
                       />
                       <Button
                         type="button"
                         variant="ghost"
                         size="icon"
                         className="shrink-0"
-                        aria-label={t("web.admin.catalogMaintenance.import.removeRewrite")}
+                        aria-label="Remove path rewrite"
                         onClick={() => removeRewrite(index)}
                       >
                         <Trash2 className="h-4 w-4" aria-hidden="true" />
@@ -472,16 +439,15 @@ export default function AdminCatalogMaintenance() {
                     </div>
                   ))}
                   <Button type="button" variant="outline" size="sm" onClick={addRewrite}>
-                    <Plus className="me-1 h-4 w-4" /> {addRewriteLabel}
+                    <Plus className="mr-1 h-4 w-4" /> Add Rewrite
                   </Button>
                 </div>
                 <div className="border-border/60 bg-muted/30 text-muted-foreground rounded-md border p-3 text-xs">
-                  {t("web.admin.catalogMaintenance.import.validationNote")}
+                  Import validates the rewritten library roots before writing anything, so missing
+                  or incomplete rewrites will fail fast instead of seeding broken paths.
                 </div>
                 <Button type="submit" className="w-full" disabled={isImportSubmitDisabled}>
-                  {importMutation.isPending
-                    ? t("web.admin.catalogMaintenance.import.importing")
-                    : t("web.admin.catalogMaintenance.import.submit")}
+                  {importMutation.isPending ? "Importing..." : "Import Catalog"}
                 </Button>
               </form>
             </DialogContent>
@@ -492,27 +458,23 @@ export default function AdminCatalogMaintenance() {
       <div className="border-border/70 bg-card/60 rounded-lg border">
         <div className="border-border/70 flex items-center justify-between border-b px-4 py-3">
           <div>
-            <h3 className="text-sm font-semibold">
-              {t("web.admin.catalogMaintenance.imports.title")}
-            </h3>
+            <h3 className="text-sm font-semibold">Recent Catalog Imports</h3>
             <p className="text-muted-foreground text-xs">
-              {t("web.admin.catalogMaintenance.imports.body")}
+              Imports run in the background so progress stays visible while validation and writes
+              are in flight.
             </p>
           </div>
           {importJobsQuery.isFetching ? (
-            <Badge variant="outline">{t("web.admin.catalogMaintenance.jobs.refreshing")}</Badge>
+            <Badge variant="outline">Refreshing</Badge>
           ) : (
-            <Badge variant="secondary">{numberText(importJobs.length)}</Badge>
+            <Badge variant="secondary">{importJobs.length}</Badge>
           )}
         </div>
-        <JobPageControls
-          query={importJobsQuery}
-          label={t("web.admin.catalogMaintenance.imports.loadOlder")}
-        />
+        <JobPageControls query={importJobsQuery} label="Load older imports" />
         <div className="divide-border/60 divide-y">
           {importJobs.length === 0 ? (
             <div className="text-muted-foreground px-4 py-5 text-sm">
-              {t("web.admin.catalogMaintenance.imports.empty")}
+              No catalog import jobs yet.
             </div>
           ) : (
             importJobs.map((job) => {
@@ -537,15 +499,13 @@ export default function AdminCatalogMaintenance() {
                       >
                         {job.status}
                       </Badge>
-                      <span className="text-sm font-medium">{describeImportJob(t, job)}</span>
+                      <span className="text-sm font-medium">{describeImportJob(job)}</span>
                       <span className="text-muted-foreground text-xs">
-                        {t("web.admin.catalogMaintenance.jobs.requested", {
-                          date: formatDateTime(job.requested_at),
-                        })}
+                        requested {formatDateTime(job.requested_at)}
                       </span>
                     </div>
                     <div className="text-muted-foreground text-sm">
-                      {job.message || t("web.admin.catalogMaintenance.imports.jobFallback")}
+                      {job.message || "Catalog import job"}
                     </div>
                     <div className="bg-muted h-2 overflow-hidden rounded-full">
                       <div
@@ -554,24 +514,14 @@ export default function AdminCatalogMaintenance() {
                       />
                     </div>
                     <div className="text-muted-foreground flex flex-wrap gap-4 text-xs">
-                      <span>
-                        {t("web.admin.catalogMaintenance.jobs.progress", {
-                          progress: formatJobProgress(job),
-                        })}
-                      </span>
+                      <span>Progress: {formatJobProgress(job)}</span>
                       {job.completed_at ? (
-                        <span>
-                          {t("web.admin.catalogMaintenance.jobs.finished", {
-                            date: formatDateTime(job.completed_at),
-                          })}
-                        </span>
+                        <span>Finished: {formatDateTime(job.completed_at)}</span>
                       ) : null}
                       {job.status === "completed" ? (
                         <span>
-                          {t("web.admin.catalogMaintenance.imports.result", {
-                            items: itemCount(t, importResult.items_created ?? 0),
-                            files: fileCount(t, importResult.files_created ?? 0),
-                          })}
+                          Imported {importResult.items_created ?? 0} items and{" "}
+                          {importResult.files_created ?? 0} files
                         </span>
                       ) : null}
                     </div>
@@ -581,8 +531,8 @@ export default function AdminCatalogMaintenance() {
                   </div>
                   <div className="flex items-center gap-2">
                     <Button variant="outline" size="sm" onClick={() => importJobsQuery.refetch()}>
-                      <RefreshCw className="me-1 h-4 w-4" />
-                      {t("web.admin.catalogMaintenance.refresh")}
+                      <RefreshCw className="mr-1 h-4 w-4" />
+                      Refresh
                     </Button>
                   </div>
                 </div>
@@ -595,32 +545,32 @@ export default function AdminCatalogMaintenance() {
       <div className="border-border/70 bg-card/60 rounded-lg border">
         <div className="border-border/70 flex items-center justify-between border-b px-4 py-3">
           <div>
-            <h3 className="text-sm font-semibold">
-              {t("web.admin.catalogMaintenance.exports.title")}
-            </h3>
+            <h3 className="text-sm font-semibold">Recent Catalog Exports</h3>
             <p className="text-muted-foreground text-xs">
-              {t("web.admin.catalogMaintenance.exports.body")}
+              Export jobs run in the background and upload finished seeds to the private internal S3
+              bucket.
             </p>
           </div>
           {exportJobsQuery.isFetching ? (
-            <Badge variant="outline">{t("web.admin.catalogMaintenance.jobs.refreshing")}</Badge>
+            <Badge variant="outline">Refreshing</Badge>
           ) : (
-            <Badge variant="secondary">{numberText(exportJobs.length)}</Badge>
+            <Badge variant="secondary">{exportJobs.length}</Badge>
           )}
         </div>
-        <JobPageControls
-          query={exportJobsQuery}
-          label={t("web.admin.catalogMaintenance.exports.loadOlder")}
-        />
+        <JobPageControls query={exportJobsQuery} label="Load older exports" />
         <div className="divide-border/60 divide-y">
           {exportJobs.length === 0 ? (
             <div className="text-muted-foreground px-4 py-5 text-sm">
-              {t("web.admin.catalogMaintenance.exports.empty")}
+              No catalog export jobs yet.
             </div>
           ) : (
             exportJobs.map((job) => {
+              const exportRequest = job.request_payload as { library_ids?: number[] };
               const exportResult = job.result_payload as Partial<CatalogSeedExportResult>;
-              const scopeLabel = exportScopeLabel(t, job);
+              const scopeLabel =
+                exportRequest.library_ids && exportRequest.library_ids.length > 0
+                  ? `${exportRequest.library_ids.length} librar${exportRequest.library_ids.length === 1 ? "y" : "ies"}`
+                  : "All libraries";
               const progressLabel = formatExportProgressLabel(
                 job.progress_current,
                 job.progress_total,
@@ -647,33 +597,21 @@ export default function AdminCatalogMaintenance() {
                       </Badge>
                       <span className="text-sm font-medium">{scopeLabel}</span>
                       <span className="text-muted-foreground text-xs">
-                        {t("web.admin.catalogMaintenance.jobs.requested", {
-                          date: formatDateTime(job.requested_at),
-                        })}
+                        requested {formatDateTime(job.requested_at)}
                       </span>
                     </div>
                     <div className="text-muted-foreground text-sm">
-                      {job.message || t("web.admin.catalogMaintenance.exports.jobFallback")}
+                      {job.message || "Catalog export job"}
                     </div>
                     <div className="text-muted-foreground flex flex-wrap gap-4 text-xs">
-                      <span>
-                        {t("web.admin.catalogMaintenance.jobs.progress", {
-                          progress: progressLabel,
-                        })}
-                      </span>
+                      <span>Progress: {progressLabel}</span>
                       {job.completed_at ? (
-                        <span>
-                          {t("web.admin.catalogMaintenance.jobs.finished", {
-                            date: formatDateTime(job.completed_at),
-                          })}
-                        </span>
+                        <span>Finished: {formatDateTime(job.completed_at)}</span>
                       ) : null}
                       {exportResult.items_exported ? (
                         <span>
-                          {t("web.admin.catalogMaintenance.exports.result", {
-                            items: itemCount(t, exportResult.items_exported),
-                            files: fileCount(t, exportResult.files_exported ?? 0),
-                          })}
+                          Exported {exportResult.items_exported} items and{" "}
+                          {exportResult.files_exported ?? 0} files
                         </span>
                       ) : null}
                     </div>
@@ -683,8 +621,8 @@ export default function AdminCatalogMaintenance() {
                   </div>
                   <div className="flex items-center gap-2">
                     <Button variant="outline" size="sm" onClick={() => exportJobsQuery.refetch()}>
-                      <RefreshCw className="me-1 h-4 w-4" />
-                      {t("web.admin.catalogMaintenance.refresh")}
+                      <RefreshCw className="mr-1 h-4 w-4" />
+                      Refresh
                     </Button>
                     {job.download_url ? (
                       <Button
@@ -694,8 +632,8 @@ export default function AdminCatalogMaintenance() {
                           window.open(job.download_url, "_blank", "noopener,noreferrer")
                         }
                       >
-                        <Download className="me-1 h-4 w-4" />
-                        {t("web.admin.catalogMaintenance.exports.download")}
+                        <Download className="mr-1 h-4 w-4" />
+                        Download
                       </Button>
                     ) : null}
                     {job.status === "completed" &&
@@ -707,7 +645,7 @@ export default function AdminCatalogMaintenance() {
                         onClick={() => publishMutation.mutate(job.id)}
                         disabled={publishMutation.isPending}
                       >
-                        {t("web.admin.catalogMaintenance.exports.createLink")}
+                        Create seven-day link
                       </Button>
                     ) : null}
                     {job.public_url ? (
@@ -715,15 +653,10 @@ export default function AdminCatalogMaintenance() {
                         variant="outline"
                         size="sm"
                         onClick={async () => {
-                          try {
-                            await copyTextToClipboard(job.public_url ?? "");
-                            toast.success(t("web.admin.catalogMaintenance.exports.copied"));
-                          } catch {
-                            toast.error(t("web.admin.catalogMaintenance.exports.copyFailed"));
-                          }
+                          await navigator.clipboard.writeText(job.public_url ?? "");
                         }}
                       >
-                        {t("web.admin.catalogMaintenance.exports.copyUrl")}
+                        Copy URL
                       </Button>
                     ) : null}
                   </div>
@@ -737,37 +670,21 @@ export default function AdminCatalogMaintenance() {
   );
 }
 
-/** The libraries an export covers: how many, or all of them. */
-function exportScopeLabel(t: Translate, job: AdminJob) {
+function describeExportJob(job: AdminJob) {
   const exportRequest = job.request_payload as { library_ids?: number[] };
-  const count = exportRequest.library_ids?.length ?? 0;
-  return count > 0
-    ? t("web.admin.catalogMaintenance.exports.libraryCount", { count, count_text: count })
-    : t("web.admin.catalogMaintenance.exports.allLibraries");
+  const scopeLabel =
+    exportRequest.library_ids && exportRequest.library_ids.length > 0
+      ? `${exportRequest.library_ids.length} librar${exportRequest.library_ids.length === 1 ? "y" : "ies"}`
+      : "All libraries";
+  return `${scopeLabel} • ${formatDateTime(job.requested_at)}`;
 }
 
-function itemCount(t: Translate, count: number) {
-  return t("web.admin.catalogMaintenance.count.items", { count, count_text: count });
-}
-
-function fileCount(t: Translate, count: number) {
-  return t("web.admin.catalogMaintenance.count.files", { count, count_text: count });
-}
-
-function describeExportJob(t: Translate, job: AdminJob) {
-  return `${exportScopeLabel(t, job)} • ${formatDateTime(job.requested_at)}`;
-}
-
-function describeImportJob(t: Translate, job: AdminJob) {
+function describeImportJob(job: AdminJob) {
   const importRequest = job.request_payload as {
     source_label?: string;
     source_key?: string;
   };
-  return (
-    importRequest.source_label ||
-    importRequest.source_key ||
-    t("web.admin.catalogMaintenance.imports.seedFallback")
-  );
+  return importRequest.source_label || importRequest.source_key || "Catalog seed";
 }
 
 function describeImportSource(source: CatalogSeedImportSource) {

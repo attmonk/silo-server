@@ -39,7 +39,6 @@ type absMounter interface {
 // A nil handler mounts nothing.
 func newAudiobookshelfListener(listen string, handler absMounter, artwork http.Handler, ipResolver *clientip.Resolver, ingressTokens *netaccess.Registry) *http.Server {
 	absRouter := chi.NewRouter()
-	absRouter.Use(httpstream.NoSniff)
 	if ipResolver != nil {
 		absRouter.Use(clientip.Middleware(ipResolver))
 	}

@@ -53,7 +53,6 @@ import {
   useUpdateAutoscanConnection,
 } from "@/hooks/queries/useAutoscan";
 import { useRequestIntegrations } from "@/hooks/queries/admin/requests";
-import { useT } from "@/i18n";
 import { FieldGroup } from "@/pages/admin-settings/FieldGroup";
 
 // ---------------------------------------------------------------------------
@@ -90,11 +89,6 @@ const BLANK_DIALOG: DialogState = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const NO_VALUE = "—";
-const BASE_URL_EXAMPLE = "http://localhost:8989";
-/** Stands in for a saved API key, which is never sent back. */
-const SAVED_KEY_MASK = "••••••••";
-
 function connectionKindLabel(kind: string): string {
   if (kind === "sonarr") return "Sonarr";
   if (kind === "radarr") return "Radarr";
@@ -118,7 +112,6 @@ function isArrKind(integration: RequestIntegration): boolean {
 // ---------------------------------------------------------------------------
 
 export default function ConnectionsPanel() {
-  const t = useT();
   const connections = useAutoscanConnections();
   const requestIntegrations = useRequestIntegrations();
   const createConnection = useCreateAutoscanConnection();
@@ -227,10 +220,7 @@ export default function ConnectionsPanel() {
       onError: (err) =>
         setTestResult({
           ok: false,
-          error:
-            err instanceof Error
-              ? err.message
-              : t("web.admin.autoscan.connections.form.testRequestFailed"),
+          error: err instanceof Error ? err.message : "Connection test failed",
         }),
     });
   }
@@ -305,31 +295,27 @@ export default function ConnectionsPanel() {
   return (
     <>
       <FieldGroup
-        label={t("web.admin.autoscan.connections.list.title")}
-        description={t("web.admin.autoscan.connections.list.description")}
+        label="Connections"
+        description="Credentials for sources that reach a server, such as Sonarr or Radarr. Webhook sources need none."
         actions={
           <Button variant="outline" size="sm" onClick={openAddDialog}>
             <Plus />
-            {t("web.admin.autoscan.connections.list.add")}
+            Add connection
           </Button>
         }
       >
         {connections.isLoading ? (
-          <p className="text-muted-foreground py-3.5 text-sm">
-            {t("web.admin.autoscan.connections.list.loading")}
-          </p>
+          <p className="text-muted-foreground py-3.5 text-sm">Loading…</p>
         ) : list.length === 0 ? (
-          <p className="text-muted-foreground py-3.5 text-sm">
-            {t("web.admin.autoscan.connections.list.empty")}
-          </p>
+          <p className="text-muted-foreground py-3.5 text-sm">No connections yet.</p>
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>{t("web.admin.autoscan.connections.list.columnName")}</TableHead>
-                <TableHead>{t("web.admin.autoscan.connections.list.columnKind")}</TableHead>
-                <TableHead>{t("web.admin.autoscan.connections.list.columnSource")}</TableHead>
-                <TableHead>{t("web.admin.autoscan.connections.list.columnURL")}</TableHead>
+                <TableHead>Name</TableHead>
+                <TableHead>Kind</TableHead>
+                <TableHead>Source</TableHead>
+                <TableHead>URL</TableHead>
                 <TableHead className="w-0" />
               </TableRow>
             </TableHeader>
@@ -340,24 +326,20 @@ export default function ConnectionsPanel() {
                   <TableCell>{connectionKindLabel(conn.kind)}</TableCell>
                   <TableCell>
                     {conn.request_integration_id ? (
-                      <Badge variant="secondary">
-                        {t("web.admin.autoscan.connections.list.reused")}
-                      </Badge>
+                      <Badge variant="secondary">Reused from Requests</Badge>
                     ) : (
-                      <Badge variant="outline">
-                        {t("web.admin.autoscan.connections.list.own")}
-                      </Badge>
+                      <Badge variant="outline">Own</Badge>
                     )}
                   </TableCell>
                   <TableCell className="text-muted-foreground max-w-[240px] truncate">
-                    {conn.base_url ?? NO_VALUE}
+                    {conn.base_url ?? "—"}
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">
                       <Button
                         variant="ghost"
                         size="icon-sm"
-                        aria-label={t("web.admin.autoscan.connections.list.editLabel")}
+                        aria-label="Edit connection"
                         onClick={() => openEditDialog(conn)}
                       >
                         <Pencil />
@@ -365,7 +347,7 @@ export default function ConnectionsPanel() {
                       <Button
                         variant="ghost"
                         size="icon-sm"
-                        aria-label={t("web.admin.autoscan.connections.list.deleteLabel")}
+                        aria-label="Delete connection"
                         onClick={() => setDeleteTarget(conn)}
                       >
                         <Trash2 className="text-destructive" />
@@ -383,13 +365,10 @@ export default function ConnectionsPanel() {
       <Dialog open={dialog.open} onOpenChange={(open) => !open && closeDialog()}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>
-              {dialog.editing
-                ? t("web.admin.autoscan.connections.dialog.editTitle")
-                : t("web.admin.autoscan.connections.dialog.addTitle")}
-            </DialogTitle>
+            <DialogTitle>{dialog.editing ? "Edit connection" : "Add connection"}</DialogTitle>
             <DialogDescription>
-              {t("web.admin.autoscan.connections.dialog.description")}
+              Reuse a server you already configured in Requests (Sonarr/Radarr), or enter your own
+              credentials.
             </DialogDescription>
           </DialogHeader>
 
@@ -397,7 +376,7 @@ export default function ConnectionsPanel() {
             {/* Mode picker (only when creating) */}
             {!dialog.editing && (
               <div className="space-y-1.5">
-                <Label>{t("web.admin.autoscan.connections.dialog.type")}</Label>
+                <Label>Connection type</Label>
                 <Select
                   value={dialog.mode}
                   onValueChange={(v) => setDialog((d) => ({ ...d, mode: v as DialogMode }))}
@@ -407,11 +386,9 @@ export default function ConnectionsPanel() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="reuse" disabled={arrIntegrations.length === 0}>
-                      {t("web.admin.autoscan.connections.dialog.typeReuse")}
+                      Reuse a server from Requests
                     </SelectItem>
-                    <SelectItem value="own">
-                      {t("web.admin.autoscan.connections.dialog.typeOwn")}
-                    </SelectItem>
+                    <SelectItem value="own">Enter credentials manually</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -420,23 +397,19 @@ export default function ConnectionsPanel() {
             {/* Reuse mode */}
             {dialog.mode === "reuse" && (
               <div className="space-y-1.5">
-                <Label>{t("web.admin.autoscan.connections.dialog.requestServer")}</Label>
+                <Label>Request server</Label>
                 {requestIntegrations.isLoading ? (
-                  <p className="text-muted-foreground text-sm">
-                    {t("web.admin.autoscan.connections.dialog.loadingServers")}
-                  </p>
+                  <p className="text-muted-foreground text-sm">Loading servers…</p>
                 ) : arrIntegrations.length === 0 ? (
                   <p className="text-muted-foreground text-sm">
-                    {t("web.admin.autoscan.connections.dialog.noRequestServers", {
-                      link: (chunks) => (
-                        <Link
-                          to="/admin/settings/requests"
-                          className="text-foreground underline underline-offset-2"
-                        >
-                          {chunks}
-                        </Link>
-                      ),
-                    })}
+                    No Sonarr or Radarr servers yet. Add one under{" "}
+                    <Link
+                      to="/admin/settings/requests"
+                      className="text-foreground underline underline-offset-2"
+                    >
+                      Settings › Requests
+                    </Link>{" "}
+                    first, or enter credentials manually.
                   </p>
                 ) : (
                   <Select
@@ -447,17 +420,12 @@ export default function ConnectionsPanel() {
                     }}
                   >
                     <SelectTrigger className="w-full">
-                      <SelectValue
-                        placeholder={t("web.admin.autoscan.connections.dialog.selectServer")}
-                      />
+                      <SelectValue placeholder="Select a server…" />
                     </SelectTrigger>
                     <SelectContent>
                       {arrIntegrations.map((integration) => (
                         <SelectItem key={integration.id} value={integration.id}>
-                          {t("web.admin.autoscan.connections.dialog.requestServerOption", {
-                            name: integration.name,
-                            kind: connectionKindLabel(integrationKind(integration)),
-                          })}
+                          {integration.name} ({connectionKindLabel(integrationKind(integration))})
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -470,18 +438,16 @@ export default function ConnectionsPanel() {
             {dialog.mode === "own" && (
               <div className="space-y-4">
                 <div className="space-y-1.5">
-                  <Label htmlFor="conn-name">{t("web.admin.autoscan.connections.form.name")}</Label>
+                  <Label htmlFor="conn-name">Name</Label>
                   <Input
                     id="conn-name"
-                    placeholder={t("web.admin.autoscan.connections.form.namePlaceholder")}
+                    placeholder="My Sonarr"
                     value={dialog.name}
                     onChange={(e) => setDialog((d) => ({ ...d, name: e.target.value }))}
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <Label htmlFor="conn-kind">
-                    {t("web.admin.autoscan.connections.dialog.kind")}
-                  </Label>
+                  <Label htmlFor="conn-kind">Kind</Label>
                   <Select
                     value={dialog.kind}
                     onValueChange={(v) => setDialog((d) => ({ ...d, kind: v }))}
@@ -490,18 +456,16 @@ export default function ConnectionsPanel() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="sonarr">{connectionKindLabel("sonarr")}</SelectItem>
-                      <SelectItem value="radarr">{connectionKindLabel("radarr")}</SelectItem>
+                      <SelectItem value="sonarr">Sonarr</SelectItem>
+                      <SelectItem value="radarr">Radarr</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
                 <div className="space-y-1.5">
-                  <Label htmlFor="conn-url">
-                    {t("web.admin.autoscan.connections.form.baseURL")}
-                  </Label>
+                  <Label htmlFor="conn-url">Base URL</Label>
                   <Input
                     id="conn-url"
-                    placeholder={BASE_URL_EXAMPLE}
+                    placeholder="http://localhost:8989"
                     value={dialog.baseUrl}
                     onChange={(e) => {
                       setTestResult(null);
@@ -511,21 +475,17 @@ export default function ConnectionsPanel() {
                 </div>
                 <div className="space-y-1.5">
                   <Label htmlFor="conn-key">
-                    {t("web.admin.autoscan.connections.form.apiKey")}
+                    API key
                     {dialog.editing?.has_api_key && (
-                      <span className="text-muted-foreground ms-1 font-normal">
-                        {t("web.admin.autoscan.connections.dialog.apiKeyKeep")}
+                      <span className="text-muted-foreground ml-1 font-normal">
+                        (leave blank to keep existing)
                       </span>
                     )}
                   </Label>
                   <Input
                     id="conn-key"
                     type="password"
-                    placeholder={
-                      dialog.editing?.has_api_key
-                        ? SAVED_KEY_MASK
-                        : t("web.admin.autoscan.connections.form.apiKeyPlaceholder")
-                    }
+                    placeholder={dialog.editing?.has_api_key ? "••••••••" : "Enter API key"}
                     value={dialog.apiKey}
                     onChange={(e) => {
                       setTestResult(null);
@@ -559,12 +519,8 @@ export default function ConnectionsPanel() {
                 }
               >
                 {testResult.ok
-                  ? testResult.version
-                    ? t("web.admin.autoscan.connections.form.connectedVersion", {
-                        version: testResult.version,
-                      })
-                    : t("web.admin.autoscan.connections.form.connected")
-                  : (testResult.error ?? t("web.admin.autoscan.connections.form.connectionFailed"))}
+                  ? `Connected${testResult.version ? ` (v${testResult.version})` : ""}`
+                  : (testResult.error ?? "Connection failed")}
               </span>
             </div>
           )}
@@ -576,20 +532,14 @@ export default function ConnectionsPanel() {
               onClick={handleTest}
               disabled={!canTest || testConnection.isPending}
             >
-              {testConnection.isPending
-                ? t("web.admin.autoscan.connections.form.testing")
-                : t("web.admin.autoscan.connections.form.test")}
+              {testConnection.isPending ? "Testing…" : "Test connection"}
             </Button>
             <div className="flex gap-2">
               <Button variant="outline" onClick={closeDialog} disabled={isSaving}>
-                {t("common.cancel")}
+                Cancel
               </Button>
               <Button onClick={handleSave} disabled={!canSave || isSaving}>
-                {isSaving
-                  ? t("web.admin.autoscan.connections.dialog.saving")
-                  : dialog.editing
-                    ? t("web.admin.autoscan.connections.dialog.saveChanges")
-                    : t("web.admin.autoscan.connections.dialog.addSubmit")}
+                {isSaving ? "Saving…" : dialog.editing ? "Save changes" : "Add connection"}
               </Button>
             </div>
           </DialogFooter>
@@ -603,15 +553,14 @@ export default function ConnectionsPanel() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t("web.admin.autoscan.connections.delete.title")}</AlertDialogTitle>
+            <AlertDialogTitle>Delete connection?</AlertDialogTitle>
             <AlertDialogDescription>
-              {t("web.admin.autoscan.connections.delete.description", {
-                name: deleteTarget?.name ?? "",
-              })}
+              &ldquo;{deleteTarget?.name}&rdquo; will be removed. Deletion is blocked while scan
+              sources reference this connection. Reconfigure those sources first.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               onClick={() => {
@@ -621,7 +570,7 @@ export default function ConnectionsPanel() {
                 }
               }}
             >
-              {t("web.admin.autoscan.connections.delete.confirm")}
+              Delete
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

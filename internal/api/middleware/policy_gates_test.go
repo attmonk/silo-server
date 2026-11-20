@@ -37,8 +37,8 @@ func TestPolicyActingAdminMiddlewareParity(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			legacy := captureActingAdminResponse(RequireActingAdminWith(NewActingAdminDecider(test.check, nil)), test.claims, test.profileID)
-			policyBacked := captureActingAdminResponse(RequireActingAdminWith(NewPolicyActingAdminDecider(pdp, test.check, nil)), test.claims, test.profileID)
+			legacy := captureActingAdminResponse(RequireActingAdmin(test.check, nil), test.claims, test.profileID)
+			policyBacked := captureActingAdminResponse(NewPolicyActingAdminMiddleware(pdp, test.check, nil), test.claims, test.profileID)
 			assertMiddlewareResponsesEqual(t, policyBacked, legacy)
 		})
 	}
@@ -165,7 +165,7 @@ func assertCurationAuthority(t *testing.T, ctx context.Context, mode string, leg
 
 func TestPolicyActingAdminMiddlewareEvalErrorIsInternal(t *testing.T) {
 	rec := captureActingAdminResponse(
-		RequireActingAdminWith(NewPolicyActingAdminDecider(errorPermissionDecider{}, nil, nil)),
+		NewPolicyActingAdminMiddleware(errorPermissionDecider{}, nil, nil),
 		adminClaims(),
 		"",
 	)
@@ -306,7 +306,10 @@ func TestPolicyMarkerEditMiddlewareEvalErrorIsInternal(t *testing.T) {
 
 func newMiddlewarePolicyPDP(t *testing.T) *policy.PDP {
 	t.Helper()
-	engine, err := policy.NewEngine(context.Background(), policy.WithEvalTimeout(time.Minute))
+	// attmonk fork: the default 100ms evaluation budget is a production
+	// guard; a cold first decision on a loaded CI runner can exceed it and turn
+	// a 403 into a 500, so these decision tests get a generous budget.
+	engine, err := policy.NewEngine(context.Background(), policy.WithEvalTimeout(10*time.Second))
 	if err != nil {
 		t.Fatalf("NewEngine() error: %v", err)
 	}

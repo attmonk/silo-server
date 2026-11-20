@@ -3,7 +3,6 @@ import { memo, type ReactNode } from "react";
 
 import type { FileVersion } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
-import { useT } from "@/i18n";
 import { Button } from "@/components/ui/button";
 import { getLanguageName } from "@/player/utils/languageNames";
 import { audioTrackLabel, formatChannels } from "@/lib/mediaFormat";
@@ -61,7 +60,7 @@ function AudioOptionRow({
     <button
       type="button"
       onClick={onSelect}
-      className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-start transition-colors ${
+      className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
         active ? "bg-accent/50" : "hover:bg-accent/30"
       }`}
     >
@@ -77,7 +76,6 @@ function AudioTracksPopover({
   onSelectTrack,
   onResetSelection,
 }: AudioTracksPopoverProps) {
-  const t = useT();
   const tracks = version?.audio_tracks;
   if (!tracks || tracks.length === 0) return null;
 
@@ -99,11 +97,11 @@ function AudioTracksPopover({
           className="h-8 max-w-full min-w-0 shrink gap-1.5 rounded-full px-3 text-xs font-medium"
         >
           <Volume2 className="size-3.5" />
-          {t("web.detail.audio.button")}
+          Audio
           <span className="text-muted-foreground max-w-44 truncate text-[0.6875rem] font-normal sm:max-w-64">
             {isInteractive
               ? selectionMode === "auto"
-                ? t("web.detail.tracks.autoSummary", { summary: autoSummary })
+                ? `Auto: ${autoSummary}`
                 : activeSummary
               : tracks.length}
           </span>
@@ -115,7 +113,7 @@ function AudioTracksPopover({
         {isInteractive && (
           <AudioOptionRow
             active={selectionMode === "auto"}
-            title={t("web.detail.tracks.auto")}
+            title="Auto"
             description={autoSummary}
             onSelect={onResetSelection}
           />
@@ -159,7 +157,7 @@ function AudioTracksPopover({
                   )}
                   {track.default && (
                     <Badge variant="outline" className="px-1.5 py-0 text-[0.625rem] uppercase">
-                      {t("web.detail.mediaInfo.defaultBadge")}
+                      Default
                     </Badge>
                   )}
                 </>

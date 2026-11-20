@@ -51,31 +51,13 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 	var failures scanFailures
 	reconcileRoots := make([]string, 0, len(folder.Paths))
 	seenPaths := make(map[string]bool)
-	// failed holds the roots the scan could not read and the shows it could
-	// not index: the episodes cataloged under them may still exist, and rows
-	// an earlier scan marked missing must not be swept.
-	var failed []string
 	for _, root := range folder.Paths {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		var rootIgnoreRules []ignoreRules
-		var skip bool
-		// Read the root first, even when an outer root's rules exclude it, so
-		// an unreadable root is still protected as a failed one.
 		entries, err := fspath.ReadDir(root)
-		if err == nil {
-			// A root nested in another inherits the outer root's rules, as
-			// the subtree scan of its shows does.
-			var inherited []ignoreRules
-			inherited, skip, err = scanRootIgnoreRules(root, folder.Paths)
-			if err == nil && !skip {
-				rootIgnoreRules, skip, err = dirIgnoreRules(inherited, root, root, entries)
-			}
-		}
 		if err != nil {
 			slog.WarnContext(ctx, "podcast scan: read root failed", "component", "scanner", "root", root, "error", err)
-			failed = append(failed, root)
 			attempted++
 			failures.addf("read root %s: %w", root, err)
 			continue
@@ -84,6 +66,7 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 		// its files are not in seenPaths, so their catalog rows are marked
 		// missing and retired instead of being protected forever.
 		reconcileRoots = append(reconcileRoots, root)
+		rootIgnoreRules, skip := dirIgnoreRules(nil, root, root, entries)
 		if skip {
 			continue
 		}
@@ -109,7 +92,6 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 					"error", err,
 				)
 				failures.addf("%s: %w", subPath, err)
-				failed = append(failed, subPath)
 				// Continue with siblings — one bad show should not stop the scan.
 				continue
 			}
@@ -119,7 +101,7 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 	if attempted > 0 && succeeded == 0 && failures.len() > 0 {
 		return fmt.Errorf("podcast scan failed for every attempted folder_id=%d: %w", folder.ID, failures.join())
 	}
-	if err := s.reconcilePodcastMissingFiles(ctx, folder, reconcileRoots, cataloged, seenPaths, true, nil, failed); err != nil {
+	if err := s.reconcilePodcastMissingFiles(ctx, folder, reconcileRoots, cataloged, seenPaths, true, nil); err != nil {
 		slog.WarnContext(ctx, "podcast scan: missing-file reconcile failed", "component", "scanner", "folder_id", folder.ID, "error", err)
 	}
 	return nil
@@ -228,7 +210,7 @@ func (s *Scanner) scanPodcastSubtree(ctx context.Context, folder *models.MediaFo
 			result.Unchanged++
 		}
 	}
-	if err := s.reconcilePodcastMissingFiles(ctx, folder, []string{showPath}, map[string][]catalogedPodcastFile{showPath: catalogedPodcastFiles(before)}, seenPaths, false, result, nil); err != nil {
+	if err := s.reconcilePodcastMissingFiles(ctx, folder, []string{showPath}, map[string][]catalogedPodcastFile{showPath: catalogedPodcastFiles(before)}, seenPaths, false, result); err != nil {
 		slog.WarnContext(ctx, "podcast scan: missing-file reconcile failed", "component", "scanner", "folder_id", folder.ID, "error", err)
 	}
 	if err := s.syncFolderScopedAudioLibraryState(ctx, folder.ID); err != nil {
@@ -456,8 +438,8 @@ func applyPodcastShowMetadata(item *models.MediaItem, show *parsedPodcastShow) b
 // which never consumes the folder's empty-cleanup confirmation: a show folder
 // that walked empty keeps its rows until a full library scan decides. A
 // non-nil result receives the files newly marked missing and the cleanup
-// counts. Files under a protected path are neither marked missing nor swept.
-func (s *Scanner) reconcilePodcastMissingFiles(ctx context.Context, folder *models.MediaFolder, roots []string, cataloged map[string][]catalogedPodcastFile, seenPaths map[string]bool, fullScan bool, result *ScanResult, protected []string) error {
+// counts.
+func (s *Scanner) reconcilePodcastMissingFiles(ctx context.Context, folder *models.MediaFolder, roots []string, cataloged map[string][]catalogedPodcastFile, seenPaths map[string]bool, fullScan bool, result *ScanResult) error {
 	if s.fileRepo == nil || s.libraryRepo == nil || len(roots) == 0 {
 		return nil
 	}
@@ -478,7 +460,7 @@ func (s *Scanner) reconcilePodcastMissingFiles(ctx context.Context, folder *mode
 	for _, root := range roots {
 		owner := scopeLibraryRoot(root, folder.Paths)
 		for _, mf := range cataloged[root] {
-			if seenPaths[mf.path] || pathWithinAnyRoot(mf.path, protected) {
+			if seenPaths[mf.path] {
 				continue
 			}
 			// A show scan sees only its own show. Files under a library root
@@ -503,7 +485,7 @@ func (s *Scanner) reconcilePodcastMissingFiles(ctx context.Context, folder *mode
 		}
 	}
 
-	trashed, removedMemberships, deletedItems, err := s.sweepMissingAndReconcile(ctx, folder, confirmedCleanup, protected...)
+	trashed, removedMemberships, deletedItems, err := s.sweepMissingAndReconcile(ctx, folder, confirmedCleanup)
 	if result != nil {
 		result.Missing += newlyMissing
 		result.FilesDeleted += trashed

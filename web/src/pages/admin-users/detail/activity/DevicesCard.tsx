@@ -6,9 +6,6 @@ import type { AdminUserDeviceRow } from "@/api/v2/adminUserActivity";
 import { PlatformTile, classifyPlatform, platformLabel } from "@/components/admin/deviceOverrides";
 import { Button } from "@/components/ui/button";
 import { useAdminUserDevices } from "@/hooks/queries/admin/userActivity";
-import { useT } from "@/i18n";
-import { TOUCH_HIT_AREA } from "@/lib/touchTargets";
-import { cn } from "@/lib/utils";
 
 import { formatLastSeen } from "../format";
 import { deviceLevelId } from "../preferences/levels";
@@ -39,7 +36,6 @@ function preferencesSearch(device: AdminUserDeviceRow): string {
 }
 
 export function DevicesCard({ userId }: { userId: number }) {
-  const t = useT();
   const devices = useAdminUserDevices(userId);
   const [showAll, setShowAll] = useState(false);
   const all = devices.data ?? [];
@@ -49,20 +45,18 @@ export function DevicesCard({ userId }: { userId: number }) {
 
   return (
     <DetailCard
-      title={t("web.admin.users.detail.activity.devices.title")}
-      description={t("web.admin.users.detail.activity.devices.description", { days: RECENT_DAYS })}
+      title="Devices"
+      description={`Seen in the last ${RECENT_DAYS} days`}
       actions={
         <>
           {hasOlder && (
             <Button variant="ghost" size="sm" onClick={() => setShowAll((value) => !value)}>
-              {showAll
-                ? t("web.admin.users.detail.activity.devices.showRecent")
-                : t("web.admin.users.detail.activity.showAllCount", { count: all.length })}
+              {showAll ? "Show recent" : `Show all ${all.length}`}
             </Button>
           )}
           <Button variant="ghost" size="sm" asChild>
             <Link to="/admin/devices">
-              {t("web.admin.users.detail.activity.devices.openDevices")}
+              Devices
               <ArrowUpRight className="h-3 w-3" />
             </Link>
           </Button>
@@ -71,20 +65,16 @@ export function DevicesCard({ userId }: { userId: number }) {
     >
       {devices.isError ? (
         <div role="alert" className="flex items-center gap-3 px-5 py-4 text-sm">
-          <span className="text-destructive">
-            {t("web.admin.users.detail.activity.devices.failed")}
-          </span>
+          <span className="text-destructive">Couldn&apos;t load devices.</span>
           <Button variant="outline" size="sm" onClick={() => void devices.refetch()}>
-            {t("common.retry")}
+            Retry
           </Button>
         </div>
       ) : devices.isLoading ? (
-        <p className="text-muted-foreground px-5 py-6 text-center text-sm">
-          {t("web.admin.users.detail.activity.devices.loading")}
-        </p>
+        <p className="text-muted-foreground px-5 py-6 text-center text-sm">Loading devices...</p>
       ) : shown.length === 0 ? (
         <p className="text-muted-foreground px-5 py-6 text-center text-sm">
-          {t("web.admin.users.detail.activity.devices.empty", { days: RECENT_DAYS })}
+          No devices seen in the last {RECENT_DAYS} days.
         </p>
       ) : (
         <div>
@@ -92,7 +82,7 @@ export function DevicesCard({ userId }: { userId: number }) {
             <ListRow
               key={device.device_id}
               leading={<PlatformTile kind={classifyPlatform(device.device_platform)} />}
-              title={device.device_name || t("web.admin.users.detail.common.unnamedDevice")}
+              title={device.device_name || "Unnamed device"}
               meta={
                 <>
                   {platformLabel(device.device_platform)}
@@ -101,15 +91,10 @@ export function DevicesCard({ userId }: { userId: number }) {
                       {" · "}
                       <Link
                         to={{ search: preferencesSearch(device) }}
-                        className={cn(
-                          "hover:text-foreground underline-offset-2 hover:underline",
-                          TOUCH_HIT_AREA,
-                        )}
+                        className="hover:text-foreground underline-offset-2 hover:underline"
                       >
-                        {t("web.admin.users.detail.activity.devices.savedSettings", {
-                          count: device.override_count,
-                          count_text: device.override_count,
-                        })}
+                        {device.override_count}{" "}
+                        {device.override_count === 1 ? "saved setting" : "saved settings"}
                       </Link>
                     </>
                   ) : null}

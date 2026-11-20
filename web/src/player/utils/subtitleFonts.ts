@@ -82,8 +82,6 @@ const MAX_FONT_BUNDLE_CACHE_BYTES = 64 * 1024 * 1024;
 interface FontBundleCacheEntry {
   promise: Promise<Uint8Array[]>;
   bytes: number;
-  /** The signal of the request still filling this entry, if any. */
-  signal?: AbortSignal;
 }
 
 const fontBundleCache = new Map<string, FontBundleCacheEntry>();
@@ -115,9 +113,7 @@ export function loadSubtitleFallbackFontData(font: SubtitleFallbackFont): Promis
 
 export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promise<Uint8Array[]> {
   const cached = fontBundleCache.get(url);
-  // A request aborted by an effect cleanup stays cached until its rejection
-  // settles; the effect that replaces it must not reuse it.
-  if (cached && !cached.signal?.aborted) {
+  if (cached) {
     fontBundleCache.delete(url);
     fontBundleCache.set(url, cached);
     return cached.promise;
@@ -126,7 +122,6 @@ export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promi
   const entry: FontBundleCacheEntry = {
     promise: Promise.resolve([]),
     bytes: 0,
-    signal,
   };
   const promise = fetch(url, { signal })
     .then(async (response) => {
@@ -137,10 +132,9 @@ export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promi
     })
     .then(({ items }) => items.map((item) => base64ToBytes(item.data)))
     .then((fonts) => {
-      entry.signal = undefined;
       entry.bytes = totalByteLength(fonts);
       if (entry.bytes > MAX_FONT_BUNDLE_CACHE_BYTES) {
-        deleteFontBundleEntry(url, entry);
+        fontBundleCache.delete(url);
       } else {
         evictFontBundleCache();
       }
@@ -149,17 +143,13 @@ export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promi
 
   // Do not poison the cache with transient network errors or aborted requests.
   const cachedPromise = promise.catch((err) => {
-    deleteFontBundleEntry(url, entry);
+    fontBundleCache.delete(url);
     throw err;
   });
   entry.promise = cachedPromise;
   fontBundleCache.set(url, entry);
   evictFontBundleCache();
   return cachedPromise;
-}
-
-function deleteFontBundleEntry(url: string, entry: FontBundleCacheEntry): void {
-  if (fontBundleCache.get(url) === entry) fontBundleCache.delete(url);
 }
 
 function totalByteLength(chunks: Uint8Array[]): number {

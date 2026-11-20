@@ -98,24 +98,6 @@ func TestIntersectAccessMaturityLimits(t *testing.T) {
 			access.MaturityLimits{MaxAdvisoryAge: 12},
 		},
 		{
-			"an unlimited owner keeps the viewer's allowances",
-			access.MaturityLimits{MaxContentRating: "PG", AllowedTitleIDs: []string{"a", "b"}},
-			access.MaturityLimits{},
-			access.MaturityLimits{MaxContentRating: "PG", AllowedTitleIDs: []string{"a", "b"}},
-		},
-		{
-			"an unlimited viewer keeps the owner's allowances",
-			access.MaturityLimits{},
-			access.MaturityLimits{MaxContentRating: "PG", AllowedTitleIDs: []string{"a"}},
-			access.MaturityLimits{MaxContentRating: "PG", AllowedTitleIDs: []string{"a"}},
-		},
-		{
-			"two limited sides keep only titles both allowed",
-			access.MaturityLimits{MaxContentRating: "PG", AllowedTitleIDs: []string{"a", "b"}},
-			access.MaturityLimits{MaxContentRating: "PG-13", AllowedTitleIDs: []string{"b", "c"}},
-			access.MaturityLimits{MaxContentRating: "PG", AllowedTitleIDs: []string{"b"}},
-		},
-		{
 			"the unrated policy is the viewer's",
 			access.MaturityLimits{AllowUnratedContent: false},
 			access.MaturityLimits{AllowUnratedContent: true, MaxContentRating: "PG"},
@@ -125,7 +107,7 @@ func TestIntersectAccessMaturityLimits(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := IntersectAccess(AccessFilter{MaturityLimits: tc.viewer}, AccessFilter{MaturityLimits: tc.owner}).MaturityLimits
-			if !reflect.DeepEqual(got, tc.want) {
+			if got != tc.want {
 				t.Fatalf("MaturityLimits = %+v, want %+v", got, tc.want)
 			}
 		})

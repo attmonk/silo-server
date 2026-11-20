@@ -13,9 +13,7 @@ import {
   type SettingIdentity,
 } from "@/hooks/queries/settingValues";
 import { useRequestFeatureStatus } from "@/hooks/queries/useRequests";
-import { useT } from "@/i18n";
 import { SETTING_DEFINITIONS, SETTING_KEYS } from "@/lib/settingsContract";
-import { settingDescription, settingLabel } from "@/lib/settingsText";
 import { showWatchlistAutoRequestControl } from "@/lib/watchlistTitles";
 
 const PROFILE_SCOPE: SettingIdentity = { scope: "profile" };
@@ -24,7 +22,6 @@ const AUTO_REQUEST_DEFINITION = SETTING_DEFINITIONS[AUTO_REQUEST_KEY];
 
 /** The profile's request preferences: whether adding to the watchlist also requests. */
 export default function RequestsSettings() {
-  const t = useT();
   const queryClient = useQueryClient();
   const featureStatus = useRequestFeatureStatus();
   const { data: effective, isLoading: settingsLoading } = useEffectiveSettings({
@@ -37,7 +34,7 @@ export default function RequestsSettings() {
   const pending = setValue.isPending || clearValue.isPending;
 
   if (featureStatus.isLoading || settingsLoading) {
-    return <div className="text-muted-foreground pt-4">{t("web.settings.requests.loading")}</div>;
+    return <div className="text-muted-foreground pt-4">Loading request settings...</div>;
   }
 
   const status = featureStatus.data;
@@ -60,9 +57,9 @@ export default function RequestsSettings() {
           identity: PROFILE_SCOPE,
         });
       }
-      toast.success(t("web.settings.requests.saved"));
+      toast.success("Request preference saved");
     } catch {
-      toast.error(t("web.settings.requests.saveFailed"));
+      toast.error("Failed to save request preference");
     } finally {
       // The status endpoint folds this preference into watchlist_requests.
       void queryClient.invalidateQueries({ queryKey: requestKeys.status() });
@@ -72,17 +69,17 @@ export default function RequestsSettings() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("web.settings.requests.title")}
-        subtitle={t("web.settings.requests.subtitle")}
+        title="Requests"
+        subtitle="How you ask for titles this server doesn't have yet."
       />
       <SettingsGroup
-        title={t("web.settings.requests.watchlistTitle")}
-        description={t("web.settings.requests.watchlistDescription")}
+        title="Watchlist"
+        description="What happens when you add a title the library doesn't have yet."
       >
         {showControl ? (
           <SettingRow
-            label={settingLabel(AUTO_REQUEST_DEFINITION)}
-            description={settingDescription(AUTO_REQUEST_DEFINITION)}
+            label={AUTO_REQUEST_DEFINITION.label}
+            description={AUTO_REQUEST_DEFINITION.description}
             control={(id) => (
               <Switch
                 id={id}
@@ -95,10 +92,10 @@ export default function RequestsSettings() {
         ) : (
           <p className="text-muted-foreground text-sm" data-testid="watchlist-auto-request-off">
             {status?.requests_enabled !== true
-              ? t("web.settings.requests.disabledOnServer")
+              ? "Requests are turned off on this server."
               : canRequest
-                ? t("web.settings.requests.autoRequestOffCanRequest")
-                : t("web.settings.requests.autoRequestOff")}
+                ? "Adding a title to your watchlist doesn’t request it on this server. You can still request titles from Discover."
+                : "Adding a title to your watchlist doesn’t request it on this server."}
           </p>
         )}
       </SettingsGroup>

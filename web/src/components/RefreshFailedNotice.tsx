@@ -1,6 +1,5 @@
 import { V2TimeoutError } from "@/api/v2/request";
 import { Button } from "@/components/ui/button";
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 interface RefreshFailedNoticeProps {
@@ -24,7 +23,6 @@ export default function RefreshFailedNotice({
   retrying = false,
   className,
 }: RefreshFailedNoticeProps) {
-  const t = useT();
   return (
     <div
       role="alert"
@@ -34,12 +32,11 @@ export default function RefreshFailedNotice({
       )}
     >
       <p className="text-muted-foreground text-sm">
-        {error instanceof V2TimeoutError
-          ? t("web.common.ui.refreshFailed.timeout", { message })
-          : message}
+        {message}
+        {error instanceof V2TimeoutError ? " The server isn't responding." : ""}
       </p>
       <Button type="button" variant="outline" size="sm" onClick={onRetry} disabled={retrying}>
-        {t("common.tryAgain")}
+        Try again
       </Button>
     </div>
   );

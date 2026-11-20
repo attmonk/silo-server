@@ -2,9 +2,7 @@ import { queryDefinitionFromSectionConfig, type QueryDefinition } from "@/api/ty
 import type { CollectionOption } from "@/hooks/queries/useAllUserCollections";
 import type { GalleryPreset, RecipeCatalogResponse, RecipeDefinition } from "@/lib/recipes";
 import { FILTER_SECTION_TYPES } from "@/lib/sectionTypes";
-import { t, type MessageKey } from "@/i18n";
-import { rowKindName } from "./catalog";
-import { canSaveCollectionRefs, collectionRefsOf } from "./collectionList";
+import { rowKindLabel } from "./catalog";
 import { collectionIdOf, withPickedCollection, withQueryDefinition } from "./payloads";
 import {
   customHolidayProblem,
@@ -25,11 +23,6 @@ export interface RowDraft {
   config: Record<string, unknown>;
   itemLimit: number;
   hero: boolean;
-  /**
-   * The hero banner is kept off the apps. Set only where the form offers the
-   * choice; while absent a save sends nothing and the server keeps its value.
-   */
-  webOnly?: boolean;
   /** Add row on a library page: the other library pages that get their own copy. */
   extraLibraryIds?: number[];
 }
@@ -47,8 +40,6 @@ export function findRecipe(
   return undefined;
 }
 
-// The preset's English `display_name`, never its translated label: it becomes
-// the row's saved title, which is data and stays English.
 function presetName(def: RecipeDefinition | undefined, presetKey: string | null) {
   return presetKey
     ? def?.presets.find((preset) => preset.key === presetKey)?.display_name
@@ -63,14 +54,9 @@ function presetName(def: RecipeDefinition | undefined, presetKey: string | null)
 export function draftForPreset(def: RecipeDefinition, preset: GalleryPreset | undefined): RowDraft {
   const params = { ...(preset?.default_params ?? {}) };
   const collection = def.type === "collection";
-  // A row of collections starts as "Collections", its kind's own name.
-  const name =
-    def.type === "collection_posters"
-      ? rowKindName(def.type)
-      : (preset?.display_name ?? rowKindName(def.type));
   return {
     sectionType: def.type,
-    title: collection ? "" : name,
+    title: collection ? "" : (preset?.display_name ?? rowKindLabel(def.type)),
     titleFollowsVariant: collection || variantFamily(def.type) !== undefined,
     config: FILTER_SECTION_TYPES.has(def.type)
       ? withQueryDefinition(params, queryDefinitionFromSectionConfig(params))
@@ -118,7 +104,6 @@ export function draftFromRow(row: HomeRow, catalog: RecipeCatalogResponse | unde
     config: { ...row.config },
     itemLimit: row.itemLimit,
     hero: row.hero,
-    ...(row.webOnly === undefined ? {} : { webOnly: row.webOnly }),
   };
 }
 
@@ -157,7 +142,7 @@ export function savedTitle(
   return (
     presetName(def, variant) ??
     (def?.presets.length === 1 ? def.presets[0]?.display_name : undefined) ??
-    rowKindName(draft.sectionType)
+    rowKindLabel(draft.sectionType)
   );
 }
 
@@ -182,8 +167,6 @@ export function canSaveDraft(draft: RowDraft, surface: Surface = "profile"): boo
     }
     case "collection":
       return collectionIdOf(config, surface) !== "";
-    case "collection_posters":
-      return canSaveCollectionRefs(collectionRefsOf(config), surface);
     case "admin_curated_list":
       return Array.isArray(config.item_ids) && config.item_ids.length > 0;
     default:
@@ -198,21 +181,19 @@ export function canSaveDraft(draft: RowDraft, surface: Surface = "profile"): boo
  */
 export function previewWaitText(draft: RowDraft, surface: Surface = "profile"): string | null {
   if (draft.sectionType === "collection" && collectionIdOf(draft.config, surface) === "")
-    return t("web.home.rows.draft.pickCollection");
+    return "Pick a collection to see its titles here.";
   if (draft.sectionType === "admin_curated_list" && !canSaveDraft(draft))
-    return t("web.home.rows.draft.addTitles");
-  if (draft.sectionType === "collection_posters" && collectionRefsOf(draft.config).length === 0)
-    return t("web.home.rows.draft.addCollection");
+    return "Add titles to see them here.";
   return null;
 }
 
 export type DraftField = "title" | "shows" | "itemLimit" | "hero";
 
-export const DRAFT_FIELD_LABELS: Record<DraftField, MessageKey> = {
-  title: "web.home.addRow.form.rowName",
-  shows: "web.home.rows.draft.whatItShows",
-  itemLimit: "web.home.addRow.more.itemLimit",
-  hero: "web.home.addRow.more.heroBanner",
+export const DRAFT_FIELD_LABELS: Record<DraftField, string> = {
+  title: "Row name",
+  shows: "What it shows",
+  itemLimit: "Number of titles",
+  hero: "Hero banner",
 };
 
 const DRAFT_FIELDS: readonly DraftField[] = ["title", "shows", "itemLimit", "hero"];
@@ -226,8 +207,7 @@ function fieldValue(draft: RowDraft, field: DraftField): string {
     case "itemLimit":
       return String(draft.itemLimit);
     case "hero":
-      // Where the hero shows goes with the hero banner itself.
-      return `${draft.hero}:${draft.webOnly ?? false}`;
+      return String(draft.hero);
   }
 }
 
@@ -244,7 +224,7 @@ function copyField(target: RowDraft, source: RowDraft, field: DraftField): RowDr
     case "itemLimit":
       return { ...target, itemLimit: source.itemLimit };
     case "hero":
-      return { ...target, hero: source.hero, webOnly: source.webOnly };
+      return { ...target, hero: source.hero };
   }
 }
 

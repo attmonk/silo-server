@@ -5,19 +5,17 @@ import type { PluginAuthBinding, PluginCapability, PluginInstallation } from "@/
 import type { SignInBindingWrite } from "@/hooks/queries/admin/externalSignIn";
 import { StaleApiRequestContextError } from "@/api/client";
 import { V2ProblemError } from "@/api/v2/request";
-import { t, type MessageKey } from "@/i18n";
 
-/** Why the server refused a change that would leave no break-glass admin. */
-export function breakGlassRequiredText(): string {
-  return t("web.admin.settings.lib.externalSignIn.problem.breakGlassRequired");
-}
+export const BREAK_GLASS_REQUIRED_TEXT =
+  "Password sign-in is off for this server, and this would leave no break-glass admin who can still sign in with a password. Turn password sign-in back on in Settings → Sign-in first, or make another admin break-glass.";
 
-const PROBLEM_TEXT: Record<string, MessageKey> = {
-  provider_already_enabled: "web.admin.settings.lib.externalSignIn.problem.providerAlreadyEnabled",
-  break_glass_required: "web.admin.settings.lib.externalSignIn.problem.breakGlassRequired",
+const PROBLEM_TEXT: Record<string, string> = {
+  provider_already_enabled:
+    "Another sign-in provider is already on. A server has one sign-in provider at a time, plus one network sign-in such as Tailscale: turn the other one off first.",
+  break_glass_required: BREAK_GLASS_REQUIRED_TEXT,
   identity_linked_elsewhere:
-    "web.admin.settings.lib.externalSignIn.problem.identityLinkedElsewhere",
-  last_sign_in_method: "web.admin.settings.lib.externalSignIn.problem.lastSignInMethod",
+    "That provider account is already connected to another Silo account. Unlink it there first.",
+  last_sign_in_method: "This would leave the account with no way to sign in.",
 };
 
 /**
@@ -27,21 +25,21 @@ const PROBLEM_TEXT: Record<string, MessageKey> = {
  */
 export function adminSignInErrorText(error: unknown, fallback: string): string {
   if (error instanceof StaleApiRequestContextError) {
-    return t("web.admin.settings.lib.externalSignIn.error.selectProfile");
+    return "Select an administrator profile, then try again.";
   }
   if (!(error instanceof V2ProblemError)) {
-    return t("web.admin.settings.lib.externalSignIn.error.unreachable");
+    return "Couldn't reach the server. Try again.";
   }
   const known = PROBLEM_TEXT[error.problemType];
-  if (known) return t(known);
+  if (known) return known;
   if (error.status === 403 && error.problemType === "permission_denied") {
-    return t("web.admin.settings.lib.externalSignIn.error.ownerOnly");
+    return "Only the server owner can change another admin's sign-in.";
   }
   if (error.status === 412) {
-    return t("web.admin.settings.lib.externalSignIn.error.accountChanged");
+    return "The account changed while you were editing it. Reload the page and try again.";
   }
   if (error.status === 503) {
-    return t("web.admin.settings.lib.externalSignIn.error.unavailable");
+    return "External sign-in isn't available on this server right now.";
   }
   return error.message || fallback;
 }
@@ -158,19 +156,19 @@ export function authProviderLabel(installation: PluginInstallation): string {
 export function identityCheckStatusText(status: string): string {
   switch (status) {
     case "active":
-      return t("web.admin.settings.lib.externalSignIn.checkStatus.active");
+      return "Active at the provider";
     case "not_found":
-      return t("web.admin.settings.lib.externalSignIn.checkStatus.notFound");
+      return "Not found at the provider (signed out)";
     case "disabled":
-      return t("web.admin.settings.lib.externalSignIn.checkStatus.disabled");
+      return "Disabled at the provider (signed out)";
     case "not_permitted":
-      return t("web.admin.settings.lib.externalSignIn.checkStatus.notPermitted");
+      return "No longer allowed by the provider (signed out)";
     case "unsupported":
-      return t("web.admin.settings.lib.externalSignIn.checkStatus.unsupported");
+      return "The provider can't re-check this account: sessions end at a fixed age, and its API keys and Audiobookshelf sessions are removed once the person hasn't signed in with the provider for that long";
     case "unavailable":
-      return t("web.admin.settings.lib.externalSignIn.checkStatus.unavailable");
+      return "The provider couldn't be reached; Silo asks again at the next refresh";
     case "none":
-      return t("web.admin.settings.lib.externalSignIn.checkStatus.none");
+      return "Not checked yet";
     default:
       return status;
   }

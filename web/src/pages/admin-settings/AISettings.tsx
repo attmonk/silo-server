@@ -21,8 +21,7 @@ import {
 import { useDebounce } from "@/hooks/useDebounce";
 import { useRestartKeys, type RestartKeyMatcher } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
-import { QUOTA_PERIODS, quotaPeriodWindowLabel } from "@/lib/quotaPeriods";
-import { useT, type Translate } from "@/i18n";
+import { QUOTA_PERIODS, QUOTA_PERIOD_WINDOW_LABELS } from "@/lib/quotaPeriods";
 import { cn } from "@/lib/utils";
 import { SaveBar } from "@/components/SaveBar";
 
@@ -93,9 +92,6 @@ const CHATGPT_PROVIDER = "chatgpt";
  */
 const NO_PROVIDER = "none";
 
-/** Example model ids for the text model field; they read the same in every language. */
-const TEXT_MODEL_PLACEHOLDER = "gpt-6-luna, gemini-2.5-flash, llama3.1";
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -115,17 +111,10 @@ interface AITestState {
   durationMs: number;
 }
 
-/** A passed test's message with how long ago it ran and how long it took. */
-function testedLabel(t: Translate, test: AITestState): string {
+function testedLabel(test: AITestState): string {
   const seconds = Math.max(0, Math.round((Date.now() - test.at) / 1000));
-  const values = { message: test.message, duration_ms: test.durationMs };
-  if (seconds < 60) return t("web.admin.settings.ai.test.testedSeconds", { ...values, seconds });
-  const minutes = Math.round(seconds / 60);
-  return t("web.admin.settings.ai.test.testedMinutes", {
-    ...values,
-    minutes,
-    minutes_text: minutes,
-  });
+  const ago = seconds < 60 ? `${seconds}s ago` : `${Math.round(seconds / 60)}m ago`;
+  return `Tested ${ago} · ${test.durationMs} ms`;
 }
 
 /**
@@ -156,7 +145,6 @@ function ModelPanelActions({
   canCollapse: boolean;
   test: AITestState | undefined;
 }) {
-  const t = useT();
   return (
     // Buttons right-aligned to match the collapsed tile's Manage button (and
     // the shared ProviderPanelActions); the test status takes the left side.
@@ -166,11 +154,11 @@ function ModelPanelActions({
           role="status"
           aria-live="polite"
           className={cn(
-            "me-auto text-xs",
+            "mr-auto text-xs",
             test.ok ? "text-muted-foreground" : "text-amber-600 dark:text-amber-400",
           )}
         >
-          {test.ok ? testedLabel(t, test) : test.message}
+          {test.ok ? `${test.message} · ${testedLabel(test)}` : test.message}
         </span>
       ) : null}
       <Button
@@ -184,7 +172,7 @@ function ModelPanelActions({
       </Button>
       {canCollapse ? (
         <Button type="button" size="sm" variant="outline" onClick={onCollapse}>
-          {t("web.admin.settings.ai.tile.close")}
+          Close
         </Button>
       ) : null}
     </div>
@@ -219,10 +207,9 @@ function TuningScope({
 
 /** Note shown on a model tile whose values are staged in the page's save bar. */
 function PendingSaveNote({ dirty }: { dirty: boolean }) {
-  const t = useT();
   if (!dirty) return null;
   return (
-    <p className="text-muted-foreground mt-2 text-xs">{t("web.admin.settings.ai.unsavedNote")}</p>
+    <p className="text-muted-foreground mt-2 text-xs">Unsaved. Test uses what is typed here.</p>
   );
 }
 
@@ -287,7 +274,6 @@ function TextModelTile({
   onExpand: () => void;
   onCollapse: () => void;
 }) {
-  const t = useT();
   const failed = test != null && !test.ok;
   const state: ProviderTileState = expanded
     ? "editing"
@@ -303,52 +289,39 @@ function TextModelTile({
 
   return (
     <ProviderTile
-      name={t("web.admin.settings.ai.jobs.text")}
-      tagline={t("web.admin.settings.ai.text.tagline")}
+      name="Text model"
+      tagline="Subtitle text, descriptions, and taglines"
       logo={<Languages className="text-muted-foreground size-4" aria-hidden="true" />}
       state={state}
-      statePill={
-        !expanded && ready && !test?.ok ? t("web.admin.settings.ai.tile.configured") : undefined
-      }
+      statePill={!expanded && ready && !test?.ok ? "Configured" : undefined}
       meta={
         expanded
           ? undefined
           : failed
             ? test.message
             : ready
-              ? `${chatModel} · ${chatGPT ? t("web.admin.settings.ai.chatgpt.plan") : (provider?.name ?? "")}`
+              ? `${chatModel} · ${chatGPT ? "ChatGPT plan" : (provider?.name ?? "")}`
               : chatGPT
-                ? t("web.admin.settings.ai.text.connectAccount")
-                : t("web.admin.settings.ai.tile.chooseProviderAndModel")
+                ? "Connect an account and choose a model"
+                : "Choose a provider and a model"
       }
       expanded={expanded}
-      primaryAction={{
-        label: ready
-          ? t("web.admin.settings.ai.tile.manage")
-          : t("web.admin.settings.ai.tile.setUp"),
-        onClick: onExpand,
-      }}
+      primaryAction={{ label: ready ? "Manage" : "Set up", onClick: onExpand }}
     >
       <SettingField
-        label={t("web.admin.settings.ai.provider.label")}
+        label="Provider"
         type="select"
         value={selected || NO_PROVIDER}
         onChange={onProviderChange}
         description={
           providers.some((candidate) => candidate.capabilities.includes("chat"))
             ? undefined
-            : t("web.admin.settings.ai.text.noChatProvider")
+            : "Add a provider that serves chat under Providers, or use a ChatGPT plan."
         }
         options={[
-          { value: NO_PROVIDER, label: t("web.admin.settings.ai.provider.none") },
+          { value: NO_PROVIDER, label: "None" },
           ...(chatGPTSupported || chatGPT
-            ? [
-                {
-                  value: CHATGPT_PROVIDER,
-                  label: t("web.admin.settings.ai.chatgpt.plan"),
-                  disabled: !chatGPTSupported,
-                },
-              ]
+            ? [{ value: CHATGPT_PROVIDER, label: "ChatGPT plan", disabled: !chatGPTSupported }]
             : []),
           ...providerOptions(providers, "chat", providerID),
         ]}
@@ -362,12 +335,12 @@ function TextModelTile({
         />
       ) : (
         <ModelField
-          label={t("web.admin.settings.ai.model.label")}
+          label="Model"
           providerID={provider ? providerID : ""}
           kind="chat"
           value={chatModel}
           onChange={(next) => onChange("ai.chat_model", next)}
-          placeholder={TEXT_MODEL_PLACEHOLDER}
+          placeholder="gpt-6-luna, gemini-2.5-flash, llama3.1"
         />
       )}
       <AdvancedSection
@@ -376,28 +349,28 @@ function TextModelTile({
         forceOpen={reasoningAttention || (supportsServiceTier && serviceTierDirty)}
       >
         <SettingField
-          label={t("web.admin.settings.ai.text.reasoningLevel")}
+          label="Reasoning level"
           type="select"
           value={reasoningEffort || "default"}
-          description={t("web.admin.settings.ai.text.reasoningDescription")}
+          description="Higher effort can improve complex translations and use more time and tokens."
           onChange={(next) => onChange("ai.reasoning_effort", next === "default" ? "" : next)}
           restartRequired={restartKeys.has("ai.reasoning_effort")}
           options={[
-            { value: "default", label: t("web.admin.settings.ai.text.reasoningDefault") },
+            { value: "default", label: "Provider default" },
             ...reasoningLevels.map((level) => ({
               value: level,
-              label: t("web.admin.settings.ai.text.reasoningOption", {
-                level,
-                fallback: level.charAt(0).toUpperCase() + level.slice(1),
-              }),
+              label:
+                level === "none"
+                  ? "None"
+                  : level === "xhigh"
+                    ? "Extra high"
+                    : level.charAt(0).toUpperCase() + level.slice(1),
             })),
             ...(reasoningEffort && !reasoningLevels.includes(reasoningEffort)
               ? [
                   {
                     value: reasoningEffort,
-                    label: t("web.admin.settings.ai.text.reasoningUnsupported", {
-                      level: reasoningEffort,
-                    }),
+                    label: `${reasoningEffort} (unsupported by this model)`,
                     disabled: true,
                   },
                 ]
@@ -406,21 +379,28 @@ function TextModelTile({
         />
         {supportsServiceTier && (
           <SettingField
-            label={t("web.admin.settings.ai.text.serviceTier")}
+            label="Service tier"
             type="select"
             value={serviceTier || "default"}
-            description={t("web.admin.settings.ai.text.serviceTierDescription")}
+            description="Default uses your OpenAI project's setting. Fast and Ultrafast cost more and require model support."
             onChange={(next) => onChange("ai.service_tier", next === "default" ? "" : next)}
             options={serviceTiers.map((tier) => ({
               value: tier,
-              label: t("web.admin.settings.ai.text.serviceTierOption", { tier }),
+              label:
+                (
+                  {
+                    default: "Default",
+                    priority: "Fast/Priority",
+                    ultrafast: "Ultrafast",
+                  } as Record<string, string>
+                )[tier] ?? tier,
             }))}
           />
         )}
       </AdvancedSection>
       <ModelPanelActions
-        testLabel={t("web.admin.settings.ai.text.test")}
-        pendingLabel={t("web.admin.settings.ai.text.testing")}
+        testLabel="Test text model"
+        pendingLabel="Testing text model..."
         onTest={onTest}
         isTesting={isTesting}
         testDisabled={!canTest}
@@ -460,7 +440,6 @@ function SpeechModelTile({
   onExpand: () => void;
   onCollapse: () => void;
 }) {
-  const t = useT();
   const failed = test != null && !test.ok;
   const provider = providers.find((candidate) => candidate.id === providerID);
   const state: ProviderTileState = expanded
@@ -473,13 +452,11 @@ function SpeechModelTile({
 
   return (
     <ProviderTile
-      name={t("web.admin.settings.ai.jobs.speech")}
-      tagline={t("web.admin.settings.ai.speech.tagline")}
+      name="Speech-to-text"
+      tagline="Writes subtitles from an audio track"
       logo={<AudioLines className="text-muted-foreground size-4" aria-hidden="true" />}
       state={state}
-      statePill={
-        !expanded && ready && !test?.ok ? t("web.admin.settings.ai.tile.configured") : undefined
-      }
+      statePill={!expanded && ready && !test?.ok ? "Configured" : undefined}
       meta={
         expanded
           ? undefined
@@ -487,42 +464,37 @@ function SpeechModelTile({
             ? test.message
             : ready
               ? `${asrModel} · ${provider?.name ?? ""}`
-              : t("web.admin.settings.ai.tile.chooseProviderAndModel")
+              : "Choose a provider and a model"
       }
       expanded={expanded}
-      primaryAction={{
-        label: ready
-          ? t("web.admin.settings.ai.tile.manage")
-          : t("web.admin.settings.ai.tile.setUp"),
-        onClick: onExpand,
-      }}
+      primaryAction={{ label: ready ? "Manage" : "Set up", onClick: onExpand }}
     >
       <SettingField
-        label={t("web.admin.settings.ai.provider.label")}
+        label="Provider"
         type="select"
         value={providerID || NO_PROVIDER}
         onChange={(next) => onChange("ai.speech_provider_id", next === NO_PROVIDER ? "" : next)}
         description={
           providers.some((candidate) => candidate.capabilities.includes("speech"))
-            ? t("web.admin.settings.ai.speech.providerDescription")
-            : t("web.admin.settings.ai.speech.noProvider")
+            ? "A Whisper-compatible endpoint that returns timestamps."
+            : "Add a provider that serves speech under Providers. ChatGPT plans do not include it."
         }
         options={[
-          { value: NO_PROVIDER, label: t("web.admin.settings.ai.provider.none") },
+          { value: NO_PROVIDER, label: "None" },
           ...providerOptions(providers, "speech", providerID),
         ]}
       />
       <ModelField
-        label={t("web.admin.settings.ai.model.label")}
+        label="Model"
         providerID={provider ? providerID : ""}
         kind="speech"
         value={asrModel}
         onChange={(next) => onChange("ai.asr_model", next)}
-        placeholder={t("web.admin.settings.ai.speech.modelPlaceholder")}
+        placeholder="whisper-large-v3-turbo or whisper-1"
       />
       <ModelPanelActions
-        testLabel={t("web.admin.settings.ai.speech.test")}
-        pendingLabel={t("web.admin.settings.ai.speech.testing")}
+        testLabel="Test speech-to-text"
+        pendingLabel="Testing speech-to-text..."
         onTest={onTest}
         isTesting={isTesting}
         testDisabled={!ready}
@@ -541,23 +513,20 @@ function SpeechModelTile({
  * Recommendations, beside the embedding lock and the reset.
  */
 function EmbeddingsSummaryRow({ provider, model }: { provider?: AIProvider; model: string }) {
-  const t = useT();
   const ready = provider !== undefined && model.trim() !== "";
   return (
     <ProviderTile
-      name={t("web.admin.settings.ai.jobs.embeddings")}
-      tagline={t("web.admin.settings.ai.embeddings.tagline")}
+      name="Embeddings"
+      tagline="Recommendations and semantic search"
       logo={<Sparkles className="text-muted-foreground size-4" aria-hidden="true" />}
       state={ready ? "connected" : "not_connected"}
-      statePill={ready ? t("web.admin.settings.ai.tile.configured") : undefined}
+      statePill={ready ? "Configured" : undefined}
       meta={
-        ready
-          ? `${model} · ${provider.name}`
-          : t("web.admin.settings.ai.embeddings.chooseOnRecommendations")
+        ready ? `${model} · ${provider.name}` : "Choose a provider and a model on Recommendations"
       }
       headerActions={
         <Button asChild type="button" size="sm" variant="outline">
-          <Link to="/admin/recommendations">{t("web.admin.settings.ai.tile.manage")}</Link>
+          <Link to="/admin/recommendations">Manage</Link>
         </Button>
       }
     />
@@ -577,36 +546,23 @@ function ChatGPTProviderRow({
   inUse: boolean;
   onManage: () => void;
 }) {
-  const t = useT();
   let statePill: string | undefined;
-  if (inUse)
-    statePill = email
-      ? t("web.admin.settings.ai.tile.inUse")
-      : t("web.admin.settings.ai.chatgptRow.signInNeeded");
-  else if (email) statePill = t("web.admin.settings.ai.tile.idle");
+  if (inUse) statePill = email ? "In use" : "Sign-in needed";
+  else if (email) statePill = "Idle";
   return (
     <ProviderTile
-      name={t("web.admin.settings.ai.chatgpt.plan")}
+      name="ChatGPT plan"
       monogram="GP"
       monogramClass="bg-emerald-500/10 text-emerald-700 dark:text-emerald-200"
-      tagline={
-        email
-          ? t("web.admin.settings.ai.chatgptRow.signedInAs", { email })
-          : t("web.admin.settings.ai.chatgpt.signInTagline")
-      }
+      tagline={email ? `Signed in as ${email}` : "Sign in with a ChatGPT account"}
       meta={
         inUse
-          ? t("web.admin.settings.ai.chatgptRow.usedByText")
-          : t("web.admin.settings.ai.chatgptRow.chatOnly")
+          ? "Used by Text model. Plans serve chat only, not speech or embeddings."
+          : "Plans serve chat only, not speech or embeddings."
       }
       state={inUse && email ? "connected" : "not_connected"}
       statePill={statePill}
-      primaryAction={{
-        label: email
-          ? t("web.admin.settings.ai.tile.manage")
-          : t("web.admin.settings.ai.tile.connect"),
-        onClick: onManage,
-      }}
+      primaryAction={{ label: email ? "Manage" : "Connect", onClick: onManage }}
     />
   );
 }
@@ -616,7 +572,6 @@ function ChatGPTProviderRow({
 // ---------------------------------------------------------------------------
 
 export default function AISettings() {
-  const t = useT();
   const form = useSettingsForm({ keys: KEYS });
   const restartKeys = useRestartKeys();
   const textCheck = useCheckAdminSettingsConnection();
@@ -651,16 +606,12 @@ export default function AISettings() {
   );
   if (form.isLoading || providerList.isLoading) {
     return (
-      <div
-        className="max-w-5xl space-y-6"
-        role="status"
-        aria-label={t("web.admin.settings.ai.page.loading")}
-      >
+      <div className="max-w-5xl space-y-6" role="status" aria-label="Loading AI Services settings">
         <Skeleton className="h-9 w-48" />
         <Skeleton className="h-12 w-full" />
         <Skeleton className="h-40 w-full" />
         <Skeleton className="h-64 w-full" />
-        <span className="sr-only">{t("web.admin.settings.ai.page.loading")}</span>
+        <span className="sr-only">Loading AI Services settings</span>
       </div>
     );
   }
@@ -757,8 +708,7 @@ export default function AISettings() {
       if (!isCapturedProfileAuthorityActive(authority)) return;
       setTextResult({
         ok: false,
-        message:
-          error instanceof Error ? error.message : t("web.admin.settings.ai.page.textCheckFailed"),
+        message: error instanceof Error ? error.message : "Text model connection check failed.",
         at: Date.now(),
         durationMs: Date.now() - started,
       });
@@ -785,10 +735,7 @@ export default function AISettings() {
     } catch (error) {
       setSpeechResult({
         ok: false,
-        message:
-          error instanceof Error
-            ? error.message
-            : t("web.admin.settings.ai.page.speechCheckFailed"),
+        message: error instanceof Error ? error.message : "Speech-to-text connection check failed.",
         at: Date.now(),
         durationMs: Date.now() - started,
       });
@@ -814,35 +761,35 @@ export default function AISettings() {
     if (requiresTextConnection && !textReady) {
       toast.error(
         authMode === "chatgpt"
-          ? t("web.admin.settings.ai.page.connectChatgpt")
+          ? "Connect a ChatGPT account and choose an available text model."
           : textCleared && textDirty
-            ? t("web.admin.settings.ai.page.turnOffBeforeRemove")
-            : t("web.admin.settings.ai.page.chooseTextProvider"),
+            ? "Turn off subtitle and description translation before removing the text provider."
+            : "Choose a text provider and a model.",
       );
       return;
     }
     if (requiresTextConnection && reasoningUnsupported) {
-      toast.error(t("web.admin.settings.ai.page.chooseReasoning"));
+      toast.error("Choose a reasoning level supported by the selected model.");
       return;
     }
     if (maxConcurrent === null || maxConcurrent < 1) {
-      toast.error(t("web.admin.settings.ai.page.maxConcurrentInvalid"));
+      toast.error("Max concurrent jobs must be a positive whole number.");
       return;
     }
     if (batchSize === null || batchSize < 1) {
-      toast.error(t("web.admin.settings.ai.page.batchSizeInvalid"));
+      toast.error("Subtitle batch size must be a positive whole number.");
       return;
     }
     if (contextLines === null || contextLines < 0) {
-      toast.error(t("web.admin.settings.ai.page.contextLinesInvalid"));
+      toast.error("Subtitle context lines must be zero or a positive whole number.");
       return;
     }
     if (chunkSeconds === null || chunkSeconds < 60 || chunkSeconds > 600) {
-      toast.error(t("web.admin.settings.ai.page.chunkInvalid"));
+      toast.error("Transcription chunk length must be between 60 and 600 seconds.");
       return;
     }
     if (quotaJobs === null || quotaJobs < 0) {
-      toast.error(t("web.admin.settings.ai.page.quotaInvalid"));
+      toast.error("Transcription limit must be zero or a positive whole number.");
       return;
     }
     await form.save();
@@ -858,10 +805,13 @@ export default function AISettings() {
 
   return (
     <div className="space-y-5">
-      <SettingsPageHeader title={t("web.admin.settings.ai.page.title")} />
+      <SettingsPageHeader title="AI Services" />
 
-      <p className="text-muted-foreground text-xs">{t("web.admin.settings.ai.page.intro")}</p>
-      <FieldGroup label={t("web.admin.settings.ai.page.providers")}>
+      <p className="text-muted-foreground text-xs">
+        Connect each AI provider once. Text, speech-to-text, and recommendation embeddings each
+        choose a provider and a model from this list.
+      </p>
+      <FieldGroup label="Providers">
         <div className="py-3.5">
           <ProviderTileGrid>
             <AIProvidersList
@@ -882,7 +832,7 @@ export default function AISettings() {
         </div>
       </FieldGroup>
 
-      <FieldGroup label={t("web.admin.settings.ai.page.models")}>
+      <FieldGroup label="Models">
         <div className="py-3.5">
           <ProviderTileGrid>
             <TextModelTile
@@ -940,9 +890,11 @@ export default function AISettings() {
         </div>
       </FieldGroup>
 
-      <FieldGroup label={t("web.admin.settings.ai.page.features")}>
+      <FieldGroup label="Features">
         <p className="text-muted-foreground py-3.5 text-xs leading-relaxed">
-          {t("web.admin.settings.ai.page.featuresIntro")}
+          Nothing here runs on a schedule: subtitle work starts when a viewer or admin asks for a
+          track, and description translation when an admin queues it or a viewer opens a detail
+          page.
         </p>
         {/*
           A feature whose model is not configured only queues jobs that fail at
@@ -951,68 +903,60 @@ export default function AISettings() {
           turned off without being fixed first.
         */}
         <SettingField
-          label={t("web.admin.settings.ai.features.translateSubtitles")}
+          label="Translate subtitles"
           type="toggle"
           value={value("subtitle_ai.enabled", "false")}
           onChange={(next) => setValue("subtitle_ai.enabled", next)}
-          description={t("web.admin.settings.ai.features.translateSubtitlesDescription")}
+          description="Turns an existing subtitle track into another language, on request."
           disabled={!textReady && !subtitleTranslateEnabled}
           status={
             textReady ? undefined : (
-              <SettingFieldStatus tone="warn">
-                {t("web.admin.settings.ai.features.needsTextModel")}
-              </SettingFieldStatus>
+              <SettingFieldStatus tone="warn">Needs the text model</SettingFieldStatus>
             )
           }
           restartRequired={restartKeys.has("subtitle_ai.enabled")}
         />
         <SettingField
-          label={t("web.admin.settings.ai.features.createSubtitles")}
+          label="Create subtitles from audio"
           type="toggle"
           value={value("subtitle_ai.transcribe_enabled", "false")}
           onChange={(next) => setValue("subtitle_ai.transcribe_enabled", next)}
-          description={t("web.admin.settings.ai.features.createSubtitlesDescription")}
+          description="Writes timed subtitles from the audio track, on request."
           disabled={!speechReady && !transcribeEnabled}
           status={
             speechReady ? undefined : (
-              <SettingFieldStatus tone="warn">
-                {t("web.admin.settings.ai.features.needsSpeech")}
-              </SettingFieldStatus>
+              <SettingFieldStatus tone="warn">Needs speech-to-text</SettingFieldStatus>
             )
           }
           restartRequired={restartKeys.has("subtitle_ai.transcribe_enabled")}
         />
         <SettingField
-          label={t("web.admin.settings.ai.features.translateDescriptions")}
+          label="Translate descriptions"
           type="toggle"
           value={value("metadata_ai.enabled", "false")}
           onChange={(next) => setValue("metadata_ai.enabled", next)}
-          description={t("web.admin.settings.ai.features.translateDescriptionsDescription")}
+          description="Translates overviews and taglines for the items an admin or viewer asks for."
           disabled={!textReady && !descriptionEnabled}
           status={
             textReady ? undefined : (
-              <SettingFieldStatus tone="warn">
-                {t("web.admin.settings.ai.features.needsTextModel")}
-              </SettingFieldStatus>
+              <SettingFieldStatus tone="warn">Needs the text model</SettingFieldStatus>
             )
           }
           restartRequired={restartKeys.has("metadata_ai.enabled")}
         />
         <SettingField
-          label={t("web.admin.settings.ai.features.viewerTranslation")}
+          label="Description translation for viewers"
           type="select"
           value={value("metadata_ai.on_view", "off")}
           onChange={(next) => setValue("metadata_ai.on_view", next)}
           disabled={!descriptionEnabled}
           options={[
-            { value: "off", label: t("web.admin.settings.ai.features.viewerTranslationOff") },
-            { value: "button", label: t("web.admin.settings.ai.features.viewerTranslationButton") },
-            { value: "auto", label: t("web.admin.settings.ai.features.viewerTranslationAuto") },
+            { value: "off", label: "Off" },
+            { value: "button", label: "Translate button on detail pages" },
+            { value: "auto", label: "Automatic on view" },
           ]}
           description={
-            descriptionEnabled
-              ? undefined
-              : t("web.admin.settings.ai.features.viewerTranslationInactive")
+            descriptionEnabled ? undefined : "Inactive until Translate descriptions is on."
           }
           restartRequired={restartKeys.has("metadata_ai.on_view")}
         />
@@ -1022,11 +966,11 @@ export default function AISettings() {
           forceOpen={advancedChangedCount > 0}
         >
           <TuningScope
-            label={t("web.admin.settings.ai.tuning.serverWide")}
-            caption={t("web.admin.settings.ai.tuning.serverWideCaption")}
+            label="Server-wide tuning"
+            caption="One setting for the whole server, whoever the job belongs to."
           >
             <SettingField
-              label={t("web.admin.settings.ai.tuning.jobsAtOnce")}
+              label="Jobs running at once"
               type="number"
               value={effectiveValue(
                 "ai.max_concurrent_jobs",
@@ -1036,58 +980,55 @@ export default function AISettings() {
               onChange={(next) => setValue("ai.max_concurrent_jobs", next)}
               // Each server process builds its own dispatch semaphore at start
               // (internal/api/router.go), so a cluster runs this many per process.
-              description={t("web.admin.settings.ai.tuning.jobsAtOnceDescription")}
+              description="Shared by every AI job in one server process; each process gets its own budget."
               restartRequired={restartKeys.has("ai.max_concurrent_jobs")}
             />
             <SettingField
-              label={t("web.admin.settings.ai.tuning.batchSize")}
+              label="Subtitle lines per request"
               type="number"
               value={value("subtitle_ai.batch_size", "40")}
               onChange={(next) => setValue("subtitle_ai.batch_size", next)}
               restartRequired={restartKeys.has("subtitle_ai.batch_size")}
             />
             <SettingField
-              label={t("web.admin.settings.ai.tuning.contextLines")}
+              label="Surrounding lines sent for context"
               type="number"
               value={value("subtitle_ai.context_neighbors", "2")}
               onChange={(next) => setValue("subtitle_ai.context_neighbors", next)}
               restartRequired={restartKeys.has("subtitle_ai.context_neighbors")}
             />
             <SettingField
-              label={t("web.admin.settings.ai.tuning.audioPerRequest")}
+              label="Audio per request"
               type="number"
-              unit={t("web.admin.settings.ai.unit.seconds")}
+              unit="seconds"
               value={value("subtitle_ai.asr_chunk_seconds", "600")}
               onChange={(next) => setValue("subtitle_ai.asr_chunk_seconds", next)}
-              description={t("web.admin.settings.ai.tuning.audioPerRequestRange")}
+              description="Between 60 and 600."
               restartRequired={restartKeys.has("subtitle_ai.asr_chunk_seconds")}
             />
           </TuningScope>
           <TuningScope
-            label={t("web.admin.settings.ai.tuning.perAccount")}
-            caption={t("web.admin.settings.ai.tuning.perAccountCaption")}
+            label="Per-account limits"
+            caption="Counted per login account, shared by every profile on it."
           >
             <LimitField
-              label={t("web.admin.settings.ai.tuning.transcriptions")}
+              label="Transcriptions per account"
               value={value("subtitle_ai.transcribe_quota_jobs", "0")}
               onChange={(next) => setValue("subtitle_ai.transcribe_quota_jobs", next)}
               fallbackValue="10"
-              hint={t("web.admin.settings.ai.tuning.transcriptionsHint")}
+              hint="Every profile on the account draws from this one allowance."
               restartRequired={restartKeys.has("subtitle_ai.transcribe_quota_jobs")}
             />
             <SettingField
-              label={t("web.admin.settings.ai.tuning.allowanceResets")}
+              label="Allowance resets"
               type="select"
               value={value("subtitle_ai.transcribe_quota_period", "day")}
               onChange={(next) => setValue("subtitle_ai.transcribe_quota_period", next)}
               options={QUOTA_PERIODS.map((period) => ({
                 value: period,
-                label: t("web.admin.settings.ai.tuning.quotaPeriodOption", {
-                  period,
-                  window: quotaPeriodWindowLabel(period) ?? period,
-                }),
+                label: `Per ${period} (rolling ${QUOTA_PERIOD_WINDOW_LABELS[period]})`,
               }))}
-              description={t("web.admin.settings.ai.tuning.allowanceDescription")}
+              description="Rolling window for the transcription allowance above."
               restartRequired={restartKeys.has("subtitle_ai.transcribe_quota_period")}
             />
           </TuningScope>

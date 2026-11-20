@@ -11,7 +11,6 @@ import {
   useCreateAutoscanWebhook,
   useRotateAutoscanWebhook,
 } from "@/hooks/queries/useAutoscan";
-import { t } from "@/i18n";
 import { copyTextToClipboard } from "@/lib/clipboard";
 
 import { absoluteWebhookURL } from "./webhookURL";
@@ -58,26 +57,14 @@ export function useWebhookEndpoint(source: AutoscanSource) {
 
   const url = active && !uncertain && view?.webhook_url ? absoluteWebhookURL(view.webhook_url) : "";
 
-  /**
-   * Copy the URL. `from` names where the copy was asked for, which picks the
-   * failure hint: "field" next to the selectable URL, "list" on a list row
-   * that only shows the URL inside Edit.
-   */
-  async function copy(from: "field" | "list" = "field") {
+  async function copy(failureHint = "select the URL manually") {
     if (!url || !authority || !isCapturedProfileAuthorityActive(authority)) return;
     try {
       await copyTextToClipboard(url);
-      if (isCapturedProfileAuthorityActive(authority))
-        toast.success(t("web.admin.autoscan.webhook.copy.copied"));
+      if (isCapturedProfileAuthorityActive(authority)) toast.success("Webhook URL copied");
     } catch {
       if (isCapturedProfileAuthorityActive(authority))
-        toast.error(
-          t(
-            from === "list"
-              ? "web.admin.autoscan.webhook.copy.failedFromList"
-              : "web.admin.autoscan.webhook.copy.failed",
-          ),
-        );
+        toast.error(`Could not copy — ${failureHint}`);
     }
   }
 

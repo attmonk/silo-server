@@ -1,6 +1,6 @@
 import { Languages } from "lucide-react";
 
-import { useT } from "@/i18n";
+const DESCRIPTION = "Translated by AI";
 
 /**
  * Marks text the server reports as machine-translated (the
@@ -15,16 +15,14 @@ export default function MachineTranslatedLabel({
   compact?: boolean;
   className?: string;
 }) {
-  const t = useT();
-  const description = t("web.detail.translation.machineTranslated");
   if (compact) {
     return (
       <span
         className={`text-muted-foreground/70 inline-flex items-center ${className}`}
-        title={description}
+        title={DESCRIPTION}
       >
         <Languages className="h-3 w-3" aria-hidden="true" />
-        <span className="sr-only">{description}</span>
+        <span className="sr-only">{DESCRIPTION}</span>
       </span>
     );
   }
@@ -33,7 +31,7 @@ export default function MachineTranslatedLabel({
       className={`text-muted-foreground/70 inline-flex items-center gap-1.5 text-xs ${className}`}
     >
       <Languages className="h-3 w-3" aria-hidden="true" />
-      {description}
+      {DESCRIPTION}
     </span>
   );
 }

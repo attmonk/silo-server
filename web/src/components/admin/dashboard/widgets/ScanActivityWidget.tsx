@@ -18,7 +18,6 @@ import { formatActiveScanMode, formatActiveScanTrigger } from "@/lib/scanRuns";
 import { cn } from "@/lib/utils";
 import { SectionError, UserSkeletonRows } from "../feedback";
 import { formatScanDuration } from "../format";
-import { useT, type Translate } from "@/i18n";
 
 const ROW_LIMIT = 8;
 
@@ -30,7 +29,6 @@ const ROW_LIMIT = 8;
  * running has no end to subtract from.
  */
 export function ScanActivityWidget() {
-  const t = useT();
   const scansQuery = useAutoscanScans({ limit: ROW_LIMIT });
   const librariesQuery = useAdminLibraries();
   const scans = scansQuery.data?.rows ?? [];
@@ -46,50 +44,37 @@ export function ScanActivityWidget() {
   return (
     <Card className="h-full">
       <CardHeader className="flex shrink-0 flex-row items-center justify-between space-y-0 pb-3">
-        <CardTitle className="text-sm font-bold">
-          {t("web.admin.dashboard.widgets.scanActivity.title")}
-        </CardTitle>
+        <CardTitle className="text-sm font-bold">Scan activity</CardTitle>
         <Link
           to="/admin/autoscan"
           className="text-muted-foreground hover:text-primary text-[11px] transition-colors"
         >
-          {t("web.admin.dashboard.widgets.scanActivity.allScans")}
+          All scans ›
         </Link>
       </CardHeader>
       <CardContent className="min-h-0 flex-1 overflow-y-auto">
         {scansQuery.isLoading ? (
           <UserSkeletonRows />
         ) : scansQuery.error ? (
-          <SectionError message={t("web.admin.dashboard.widgets.scanActivity.loadFailed")} />
+          <SectionError message="Failed to load scan activity." />
         ) : scans.length === 0 ? (
-          <div className="text-muted-foreground py-4 text-center text-sm">
-            {t("web.admin.dashboard.widgets.scanActivity.empty")}
-          </div>
+          <div className="text-muted-foreground py-4 text-center text-sm">No scans yet.</div>
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>{t("web.admin.dashboard.widgets.scanActivity.library")}</TableHead>
-                <TableHead className="hidden sm:table-cell">
-                  {t("web.admin.dashboard.widgets.scanActivity.mode")}
-                </TableHead>
-                <TableHead className="hidden md:table-cell">
-                  {t("web.admin.dashboard.widgets.scanActivity.trigger")}
-                </TableHead>
-                <TableHead>{t("web.admin.dashboard.widgets.scanActivity.status")}</TableHead>
-                <TableHead className="text-end">
-                  {t("web.admin.dashboard.widgets.scanActivity.duration")}
-                </TableHead>
+                <TableHead>Library</TableHead>
+                <TableHead className="hidden sm:table-cell">Mode</TableHead>
+                <TableHead className="hidden md:table-cell">Trigger</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead className="text-right">Duration</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {scans.slice(0, ROW_LIMIT).map((scan) => (
                 <TableRow key={scan.id}>
                   <TableCell className="max-w-[14rem] truncate text-[13px] font-semibold">
-                    {libraryNames.get(scan.library_id) ??
-                      t("web.admin.dashboard.widgets.scanActivity.libraryFallback", {
-                        id: scan.library_id,
-                      })}
+                    {libraryNames.get(scan.library_id) ?? `Library #${scan.library_id}`}
                   </TableCell>
                   <TableCell className="text-muted-foreground hidden text-[11px] sm:table-cell">
                     {formatActiveScanMode(scan)}
@@ -100,7 +85,7 @@ export function ScanActivityWidget() {
                   <TableCell>
                     <ScanStatus status={scan.status} />
                   </TableCell>
-                  <TableCell className="text-muted-foreground text-end text-[11px] tabular-nums">
+                  <TableCell className="text-muted-foreground text-right text-[11px] tabular-nums">
                     {formatScanDuration(scan)}
                   </TableCell>
                 </TableRow>
@@ -114,8 +99,7 @@ export function ScanActivityWidget() {
 }
 
 function ScanStatus({ status }: { status: AutoscanScanStatus }) {
-  const t = useT();
-  const tone = scanStatusTone(t, status);
+  const tone = scanStatusTone(status);
   const Icon = tone.icon;
   return (
     <span className={cn("flex items-center gap-1 text-[11px] font-medium", tone.className)}>
@@ -129,37 +113,17 @@ function ScanStatus({ status }: { status: AutoscanScanStatus }) {
 }
 
 /** Icon and word together — the tint is a second signal, never the only one. */
-function scanStatusTone(t: Translate, status: AutoscanScanStatus) {
+function scanStatusTone(status: AutoscanScanStatus) {
   switch (status) {
     case "completed":
-      return {
-        label: t("web.admin.dashboard.widgets.scanActivity.completed"),
-        icon: CheckCircle2,
-        className: "text-emerald-500",
-      };
+      return { label: "Completed", icon: CheckCircle2, className: "text-emerald-500" };
     case "failed":
-      return {
-        label: t("web.admin.dashboard.widgets.scanActivity.failed"),
-        icon: AlertTriangle,
-        className: "text-destructive",
-      };
+      return { label: "Failed", icon: AlertTriangle, className: "text-destructive" };
     case "running":
-      return {
-        label: t("web.admin.dashboard.widgets.scanActivity.running"),
-        icon: Loader2,
-        className: "text-sky-500",
-      };
+      return { label: "Running", icon: Loader2, className: "text-sky-500" };
     case "cancelled":
-      return {
-        label: t("web.admin.dashboard.widgets.scanActivity.cancelled"),
-        icon: CircleSlash,
-        className: "text-amber-500",
-      };
+      return { label: "Cancelled", icon: CircleSlash, className: "text-amber-500" };
     case "accepted":
-      return {
-        label: t("web.admin.dashboard.widgets.scanActivity.queued"),
-        icon: Clock,
-        className: "text-muted-foreground",
-      };
+      return { label: "Queued", icon: Clock, className: "text-muted-foreground" };
   }
 }

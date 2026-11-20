@@ -1,5 +1,4 @@
 import MediaCarousel from "@/components/MediaCarousel";
-import { useT } from "@/i18n";
 import { formatDayHeading, isToday } from "@/lib/calendarWeek";
 import CalendarEventCard from "./CalendarEventCard";
 import type { CalendarDay } from "@/hooks/queries/calendar";
@@ -12,7 +11,6 @@ interface DayGroupProps {
 }
 
 export default function DayGroup({ day, isSelected }: DayGroupProps) {
-  const t = useT();
   const today = isToday(day.date);
   const title = formatDayHeading(day.date);
   const { cardPresentation } = useUICustomization();
@@ -32,12 +30,12 @@ export default function DayGroup({ day, isSelected }: DayGroupProps) {
           <span className="flex items-center gap-1.5">
             {today && (
               <span className="bg-primary text-primary-foreground rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase">
-                {t("web.calendar.today")}
+                Today
               </span>
             )}
             {isSelected && (
               <span className="border-primary/40 text-primary rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase">
-                {t("web.calendar.focused")}
+                Focused
               </span>
             )}
           </span>

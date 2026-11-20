@@ -1,9 +1,7 @@
 import type { AdminJob } from "@/api/types";
-import { t } from "@/i18n";
-import { formatLocale } from "@/lib/appLocale";
 
 function formatCount(value: number) {
-  return value.toLocaleString(formatLocale());
+  return value.toLocaleString();
 }
 
 export function formatExportProgressLabel(
@@ -15,9 +13,9 @@ export function formatExportProgressLabel(
     return `${formatCount(current)} / ${formatCount(total)}`;
   }
   if (status === "queued") {
-    return t("web.admin.catalogMaintenance.progress.queued");
+    return "Queued";
   }
-  return t("web.admin.catalogMaintenance.progress.waiting");
+  return "Waiting";
 }
 
 export function formatJobProgress(job: AdminJob) {
@@ -25,13 +23,13 @@ export function formatJobProgress(job: AdminJob) {
     return `${formatCount(job.progress_current)} / ${formatCount(job.progress_total)}`;
   }
   if (job.status === "queued") {
-    return t("web.admin.catalogMaintenance.progress.queued");
+    return "Queued";
   }
   if (job.status === "completed") {
-    return t("web.admin.catalogMaintenance.progress.complete");
+    return "Complete";
   }
   if (job.status === "cancelled") {
-    return t("web.admin.catalogMaintenance.progress.cancelled");
+    return "Cancelled";
   }
-  return t("web.admin.catalogMaintenance.progress.starting");
+  return "Starting";
 }

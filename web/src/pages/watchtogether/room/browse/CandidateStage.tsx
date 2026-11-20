@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { WatchTogetherRoomMember } from "@/lib/watchTogether";
 import { useSeasonEpisodes } from "@/hooks/queries/episodes";
-import { useT } from "@/i18n";
 import { MovieDetailPanel } from "../picker/MovieDetailPanel";
 import { SeriesDrilldown, spoilerRisk, type EpisodePick } from "../picker/SeriesDrilldown";
 import { useMemberState } from "../picker/usePickerData";
@@ -55,7 +54,6 @@ function CandidateBody({
   onConfirm,
   onDismiss,
 }: CandidateStageProps) {
-  const t = useT();
   const { card } = selection;
   const [episodeIds, setEpisodeIds] = useState<string[]>([]);
   const [pick, setPick] = useState<EpisodePick | null>(null);
@@ -67,10 +65,7 @@ function CandidateBody({
     isSeries ? episodeIds : [card.content_id],
   );
   const handleEpisodeIds = useCallback((ids: string[]) => setEpisodeIds(ids), []);
-  const actionLabel =
-    verb === "stage"
-      ? t("web.watchTogether.candidate.stageForRoom")
-      : t("web.watchTogether.candidate.suggestThis");
+  const actionLabel = verb === "stage" ? "Stage it for the room" : "Suggest this";
 
   const seasonEpisodesQuery = useSeasonEpisodes(
     pick ? pick.series.content_id : undefined,
@@ -124,9 +119,7 @@ function CandidateBody({
       members={members}
       memberStates={memberState.byId}
       onEpisodeIds={handleEpisodeIds}
-      actionLabel={
-        verb === "stage" ? t("web.watchTogether.candidate.stageIt") : t("watchParty.button.suggest")
-      }
+      actionLabel={verb === "stage" ? "Stage it" : "Suggest"}
       initialSeason={selection.season}
       picked={pick}
       risk={risk}

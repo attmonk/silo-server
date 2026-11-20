@@ -9,7 +9,6 @@ import {
   playbackControlSocketProtocols,
   playbackControlSocketURL,
 } from "@/api/v2/playbackControlSocket";
-import { V2ProblemError, V2TransportError } from "@/api/v2/request";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
 import { playerV2Origin } from "../player-v2";
 import { sessionInstallation } from "../session-mutations";
@@ -41,12 +40,7 @@ interface UsePlaybackRealtimeResult {
   connectionState: ConnectionState;
 }
 
-// The last delay repeats. A mint can fail for minutes, for example while a
-// restarted server has not yet rebuilt the session, so the backoff keeps
-// growing instead of asking every few seconds for as long as the tab is open.
-const reconnectDelays = [500, 1_000, 2_000, 5_000, 10_000, 30_000];
-// The longest a server's Retry-After can hold back the next mint.
-const maxRetryAfter = 60_000;
+const reconnectDelays = [500, 1_000, 2_000, 5_000];
 
 export function usePlaybackRealtime({
   sessionId,
@@ -94,12 +88,9 @@ export function usePlaybackRealtime({
     let reconnectTimer: number | null = null;
 
     let terminated = false;
-    // minDelay is the server's Retry-After when it sent one, capped so a large
-    // value cannot park the control lane for longer than the backoff's ceiling.
-    const scheduleReconnect = (minDelay = 0) => {
+    const scheduleReconnect = () => {
       if (disposed || terminated) return;
-      const backoff = reconnectDelays[Math.min(attempt, reconnectDelays.length - 1)] ?? 0;
-      const delay = Math.max(backoff, Math.min(minDelay, maxRetryAfter));
+      const delay = reconnectDelays[Math.min(attempt, reconnectDelays.length - 1)];
       attempt += 1;
       reconnectTimer = window.setTimeout(connect, delay);
     };
@@ -213,23 +204,10 @@ export function usePlaybackRealtime({
             setConnectionState("disconnected");
             return;
           }
-          if (error instanceof V2ProblemError && error.status === 410) {
-            // The server says this session ended for good and will not be
-            // rebuilt; minting again can only get the same answer.
-            terminated = true;
-            setConnectionState("disconnected");
-            return;
-          }
-          // Any other refusal (403 non-owner, 409 installation mismatch, 404, or
-          // a 503 while the server rebuilds the session) is retried only under
-          // the original authority with bounded backoff.
+          // A refused mint (403 non-owner, 409 installation mismatch) is
+          // retried only under the original authority with bounded backoff.
           setConnectionState("disconnected");
-          const retryAfter =
-            (error instanceof V2ProblemError || error instanceof V2TransportError) &&
-            error.retryAfterSeconds !== null
-              ? error.retryAfterSeconds * 1_000
-              : 0;
-          scheduleReconnect(retryAfter);
+          scheduleReconnect();
         });
     };
 

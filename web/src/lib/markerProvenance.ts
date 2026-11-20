@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import type { PlayerMarkerProvenance } from "@/player/types";
 
 /**
@@ -16,9 +15,9 @@ export function markerSourceLabel(provenance: PlayerMarkerProvenance): string | 
 
   switch (source) {
     case "scanner":
-      return t("web.markers.provenance.detected");
+      return "Detected";
     case "manual":
-      return t("web.markers.provenance.edited");
+      return "Edited";
     case "plugin":
     case "online":
       return providerDisplayName(provider);
@@ -30,9 +29,9 @@ export function markerSourceLabel(provenance: PlayerMarkerProvenance): string | 
 }
 
 /** Marker provider ids that map to a name worth showing a viewer. */
-const PROVIDER_NAMES: Record<string, () => string> = {
-  introdb: () => "TheIntroDB",
-  built_in: () => t("web.markers.provenance.detected"),
+const PROVIDER_NAMES: Record<string, string> = {
+  introdb: "TheIntroDB",
+  built_in: "Detected",
 };
 
 /**
@@ -46,16 +45,15 @@ const PROVIDER_NAMES: Record<string, () => string> = {
  */
 function providerDisplayName(provider: string | null | undefined): string {
   const id = provider?.trim();
-  if (!id) return t("web.markers.provenance.online");
+  if (!id) return "Online";
 
-  const named = PROVIDER_NAMES[id];
-  if (named) return named();
+  if (PROVIDER_NAMES[id]) return PROVIDER_NAMES[id];
 
   // plugin:<installation id>:<capability id> — the capability id is the stable
   // half; the installation id is local to one server and meaningless to a viewer.
   const qualified = id.match(/^plugin:\d+:(.+)$/);
   if (qualified?.[1]) {
-    return PROVIDER_NAMES[qualified[1]]?.() ?? qualified[1];
+    return PROVIDER_NAMES[qualified[1]] ?? qualified[1];
   }
 
   return id;
@@ -72,7 +70,7 @@ export function confidencePercent(provenance: PlayerMarkerProvenance): string | 
   const { confidence } = provenance;
   if (confidence == null || !Number.isFinite(confidence)) return null;
   const clamped = Math.min(1, Math.max(0, confidence));
-  return t("web.markers.provenance.confidence", { percent: Math.round(clamped * 100) });
+  return `${Math.round(clamped * 100)}%`;
 }
 
 /**

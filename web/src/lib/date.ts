@@ -1,4 +1,3 @@
-import { t } from "@/i18n";
 import { formatDate } from "@/lib/datetime";
 
 export interface RelativeTimeOptions {
@@ -36,21 +35,18 @@ export function formatRelativeTime(
   const diffMs = Date.now() - date.getTime();
   const diffMinutes = toUnit(diffMs / 60_000);
   if (diffMinutes < 1) {
-    return options?.justNowLabel ?? t("web.common.date.justNow");
+    return options?.justNowLabel ?? "just now";
   }
   if (diffMinutes < 60) {
-    return t("web.common.date.minutesAgo", {
-      count: diffMinutes,
-      count_text: diffMinutes,
-    });
+    return `${diffMinutes}m ago`;
   }
   const diffHours = toUnit(diffMs / 3_600_000);
   if (diffHours < 24) {
-    return t("web.common.date.hoursAgo", { count: diffHours, count_text: diffHours });
+    return `${diffHours}h ago`;
   }
   const diffDays = toUnit(diffMs / 86_400_000);
   if (diffDays < (options?.absoluteAfterDays ?? Number.POSITIVE_INFINITY)) {
-    return t("web.common.date.daysAgo", { count: diffDays, count_text: diffDays });
+    return `${diffDays}d ago`;
   }
   return (options?.absolute ?? formatDate)(date);
 }

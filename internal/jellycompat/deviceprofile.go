@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"io"
 	"math"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -228,7 +227,7 @@ func (p DeviceProfile) SupportsDirectPlayForAudioStream(version catalog.FileVers
 		}
 		if matchesCSV(profile.Container, version.Container) &&
 			matchesCSV(profile.VideoCodec, version.CodecVideo) &&
-			matchesSourceAudioCSV(profile.AudioCodec, version, audioCodec) {
+			matchesCSV(profile.AudioCodec, audioCodec) {
 			return p.codecProfileCompatibility(version, audioStreamIndex).supportsDirectPlay()
 		}
 	}
@@ -247,27 +246,11 @@ func (p DeviceProfile) SupportsDirectStream(version catalog.FileVersion) bool {
 			continue
 		}
 		if matchesCSV(profile.VideoCodec, version.CodecVideo) &&
-			matchesSourceAudioCSV(profile.AudioCodec, version, version.CodecAudio) {
+			matchesCSV(profile.AudioCodec, version.CodecAudio) {
 			return p.codecProfileCompatibility(version, nil).supportsDirectPlay()
 		}
 	}
 	return false
-}
-
-// hlsVideoTranscodingContainers lists the containers of the profile's HLS
-// video transcoding profiles, for logging why no encode fit.
-func (p DeviceProfile) hlsVideoTranscodingContainers() []string {
-	var containers []string
-	for _, profile := range p.TranscodingProfiles {
-		if !matchesVideoType(profile.Type) || !strings.EqualFold(strings.TrimSpace(profile.Protocol), compatHLSPathSegment) {
-			continue
-		}
-		container := strings.ToLower(strings.TrimSpace(profile.Container))
-		if container != "" && !slices.Contains(containers, container) {
-			containers = append(containers, container)
-		}
-	}
-	return containers
 }
 
 // SupportsTranscoding reports whether the client advertises HLS transcoding.
@@ -425,11 +408,11 @@ func (p DeviceProfile) supportsVideoTranscodingOutput(version catalog.FileVersio
 		video.Profile, video.Level = h264EncodeFacts(video, videoBitrateKbps, version)
 	}
 	if videoBitrateKbps > 0 {
-		video.Bitrate = videoBitrateKbps
+		video.Bitrate = videoBitrateKbps * 1000
 		output.Bitrate = videoBitrateKbps + audioBitrateKbps
 	}
 	output.VideoTracks = []models.VideoTrack{video}
-	output.AudioTracks = []models.AudioTrack{{Codec: compatTargetAudioCodec, Profile: compatTargetAudioProfile, Channels: channels, Bitrate: audioBitrateKbps}}
+	output.AudioTracks = []models.AudioTrack{{Codec: compatTargetAudioCodec, Profile: compatTargetAudioProfile, Channels: channels, Bitrate: audioBitrateKbps * 1000}}
 	audioIndex := len(output.VideoTracks)
 	// Both encoded outputs use HLS. Apply codec profiles scoped to its
 	// segment container, including Container=hls with SubContainer=mp4/ts.
@@ -515,7 +498,7 @@ func (p DeviceProfile) supportsHLSRemuxIn(version catalog.FileVersion, audioStre
 	}
 	audioCodec := compatAudioCodec(version, audioStreamIndex)
 	for _, profile := range p.TranscodingProfiles {
-		if maxChannels, _ := strconv.Atoi(profile.MaxAudioChannels); compatAudioExceedsChannels(version, audioStreamIndex, maxChannels) {
+		if maxChannels, _ := strconv.Atoi(profile.MaxAudioChannels); maxChannels > 0 && (compatAudioTrack(version, audioStreamIndex).Channels <= 0 || compatAudioTrack(version, audioStreamIndex).Channels > maxChannels) {
 			continue
 		}
 		if !conditionsMatch(profile.Conditions, buildConditionValues(version, audioStreamIndex)) {
@@ -529,7 +512,7 @@ func (p DeviceProfile) supportsHLSRemuxIn(version catalog.FileVersion, audioStre
 		}
 		if !matchesCSV(profile.Container, container) ||
 			!matchesCSV(profile.VideoCodec, version.CodecVideo) ||
-			!matchesSourceAudioCSV(profile.AudioCodec, version, audioCodec) {
+			!matchesCSV(profile.AudioCodec, audioCodec) {
 			continue
 		}
 		return p.hlsRemuxCodecProfileCompatibilityIn(version, audioStreamIndex, container).supportsDirectPlay()
@@ -549,7 +532,7 @@ func (p DeviceProfile) supportsHLSRemuxWithAudioTranscodeIn(version catalog.File
 	outputAudio := compatAudioTrack(version, audioStreamIndex)
 	outputAudio.Codec = compatTargetAudioCodec
 	outputAudio.Profile = compatTargetAudioProfile
-	outputAudio.Bitrate = audioBitrateKbps
+	outputAudio.Bitrate = audioBitrateKbps * 1000
 	outputAudio.Channels = targetAudioChannels
 	outputAudio.Default = true
 	outputVersion.CodecAudio = compatTargetAudioCodec
@@ -647,7 +630,7 @@ func (p DeviceProfile) SupportsAudioCodecForDirectStreamForAudioStream(version c
 		if !matchesVideoType(profile.Type) {
 			continue
 		}
-		if matchesSourceAudioCSV(profile.AudioCodec, version, audioCodec) {
+		if matchesCSV(profile.AudioCodec, audioCodec) {
 			return p.codecProfileCompatibility(version, audioStreamIndex).AudioSupported
 		}
 	}
@@ -703,13 +686,6 @@ func matchesCSV(raw, want string) bool {
 		}
 	}
 	return false
-}
-
-// matchesSourceAudioCSV matches a profile's AudioCodec list against the
-// source audio codec. A video-only source has no audio for the list to
-// reject, so it always matches, as in Jellyfin's StreamBuilder.
-func matchesSourceAudioCSV(raw string, version catalog.FileVersion, audioCodec string) bool {
-	return compatHasNoAudio(version) || matchesCSV(raw, audioCodec)
 }
 
 func normalizeCompatToken(raw string) string {

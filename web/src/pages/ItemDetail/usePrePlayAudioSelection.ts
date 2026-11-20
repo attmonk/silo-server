@@ -39,11 +39,8 @@ export function usePrePlayAudioSelection(
   const fileGenerationRef = useRef(0);
 
   const [prevContentId, setPrevContentId] = useState(contentId);
-  const fileId = version?.file_id;
-  const [prevFileId, setPrevFileId] = useState(fileId);
-  if (prevContentId !== contentId || prevFileId !== fileId) {
+  if (prevContentId !== contentId) {
     setPrevContentId(contentId);
-    setPrevFileId(fileId);
     setMode("auto");
     setExplicitIndex(null);
   }
@@ -52,7 +49,7 @@ export function usePrePlayAudioSelection(
     fileGenerationRef.current += 1;
     savedRef.current = { mode: "auto", index: null };
   }, []);
-  useEffect(forgetFile, [contentId, fileId, forgetFile]);
+  useEffect(forgetFile, [contentId, forgetFile]);
 
   const show = useCallback((nextMode: AudioSelectionMode, nextIndex: number | null) => {
     setMode(nextMode);

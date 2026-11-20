@@ -1,8 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
-import { t } from "@/i18n";
-
 import {
   captureProfileRequestContext,
   isCapturedProfileAuthorityActive,
@@ -59,9 +57,7 @@ export function useUploadBrandingAsset() {
     },
     onError: (err, intent) => {
       if (authorityActive(intent))
-        toast.error(
-          err instanceof Error ? err.message : t("web.admin.settings.hooks.branding.uploadFailed"),
-        );
+        toast.error(err instanceof Error ? err.message : "Failed to upload image");
     },
   });
   return {
@@ -89,9 +85,7 @@ export function useDeleteBrandingAsset() {
     },
     onError: (err, intent) => {
       if (authorityActive(intent))
-        toast.error(
-          err instanceof Error ? err.message : t("web.admin.settings.hooks.branding.removeFailed"),
-        );
+        toast.error(err instanceof Error ? err.message : "Failed to remove image");
     },
   });
   return {

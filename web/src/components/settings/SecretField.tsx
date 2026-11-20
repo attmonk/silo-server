@@ -2,12 +2,8 @@ import { useId, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { SETTINGS_CONTROL_WIDTH, SettingFieldRow } from "@/pages/admin-settings/SettingField";
-
-/** Placeholder standing in for a saved secret. */
-const SAVED_SECRET_MASK = "••••••••••••";
 
 export interface SecretFieldProps {
   label: string;
@@ -41,9 +37,10 @@ export interface SecretFieldProps {
   status?: ReactNode;
   disabled?: boolean;
   restartRequired?: boolean;
-  /** The environment variable that sets this secret; disables the control. */
-  managedByEnv?: string;
 }
+
+/** Description shown while a clear is staged, in place of `hint`. */
+const CLEARED_DESCRIPTION = "Save clears the stored value; type to set a new one instead.";
 
 /**
  * The single credential control for admin settings: one always-editable
@@ -67,12 +64,9 @@ export function SecretField({
   cleared = false,
   hint,
   status,
-  disabled: disabledProp = false,
+  disabled = false,
   restartRequired = false,
-  managedByEnv,
 }: SecretFieldProps) {
-  const t = useT();
-  const disabled = disabledProp || managedByEnv != null;
   const controlId = useId();
   const hintId = useId();
 
@@ -81,10 +75,10 @@ export function SecretField({
   const clearStaged = cleared && value === "";
   const showAction = onClear != null && configured && !disabled && value === "";
 
-  // While a clear is staged its description replaces `hint`.
   const description = clearStaged
-    ? t("web.settings.secretField.clearedDescription")
-    : (hint ?? (configured ? t("web.settings.secretField.configuredDescription") : undefined));
+    ? CLEARED_DESCRIPTION
+    : (hint ??
+      (configured ? "Type to replace the saved value; leave blank to keep it." : undefined));
 
   function keepSaved() {
     if (onKeep) onKeep();
@@ -108,7 +102,6 @@ export function SecretField({
       descriptionId={hintId}
       status={status}
       restartRequired={restartRequired}
-      managedByEnv={managedByEnv}
     >
       {/* The action sits ahead of the input, as in LimitField: the row's unit
           slot is to the right of the control edge, so anything between the
@@ -124,18 +117,14 @@ export function SecretField({
             variant="outline"
             onClick={clearStaged ? keepSaved : onClear}
           >
-            {clearStaged ? t("web.settings.secretField.keep") : t("web.settings.secretField.clear")}
+            {clearStaged ? "Keep saved value" : "Clear saved value"}
           </Button>
         ) : null}
         <Input
           id={controlId}
           type="password"
           placeholder={
-            clearStaged
-              ? t("web.settings.secretField.willClear")
-              : configured
-                ? SAVED_SECRET_MASK
-                : t("web.settings.secretField.notConfigured")
+            clearStaged ? "Will be cleared on save" : configured ? "••••••••••••" : "Not configured"
           }
           value={value}
           onChange={(e) => handleChange(e.target.value)}

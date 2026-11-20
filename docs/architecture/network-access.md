@@ -39,9 +39,8 @@ them:
   from the boot-time lifecycle hooks, so a plugin cannot proxy to a listener
   that does not exist yet.
 - Reconciled on every `OnLifecycleChange` (install, enable, disable, config
-  save, auto-update, uninstall). A config save, or an update whose new
-  package passed its checks, stops the process; the next reconcile starts it
-  again.
+  save, auto-update, uninstall). A config save or auto-update stops the
+  process; the next reconcile starts it again.
 - Restarted after a crash with exponential backoff from 1 s to 60 s plus
   jitter, reset after five minutes of stable running; parked as `failed`
   after ten consecutive failures until an admin restarts or reconfigures it.
@@ -130,25 +129,6 @@ admin API reports, so the two never disagree. Limits: key ≤ 256 bytes, value
 state. Empty values also use an encrypted, row-bound envelope; a plaintext
 empty marker is rejected.
 
-Each key carries a `version` column: 1 after the first write, one more after
-each later write. `ReadInstanceState` returns it with `versioned = true`, and
-version 0 means the key is absent. Every API server runs its own process of a
-plugin against the one `api` scope, so a read-modify-write passes the version
-it read as `WriteInstanceState.expected_version`: the write lands only while
-the key is still at that version (0: the key must not exist), and otherwise
-fails with `ABORTED` and changes nothing. Without `expected_version` a write
-is unconditional. `WriteInstanceStateResponse.version` is the version just
-written. The version check is part of the write statement and runs under
-the scope's advisory lock, so two servers cannot both land at one version;
-a create-only write fails with `ABORTED` when the key exists, and with
-`RESOURCE_EXHAUSTED` when it does not and the scope is full. The version is
-not part of the AAD. A database trigger, not the write statement, advances
-the version on every update, so a write from a server on an older release
-during a rolling deploy still moves it and a conditional write cannot land
-over it. An update that sets the version higher keeps that value, so a full
-restore, which carries the live server's rows with their versions, never
-moves a key back to a version a running plugin already read.
-
 ## Proxy nodes
 
 Every enabled proxy node runs the same provider installations as the API
@@ -204,7 +184,7 @@ to them.
   supervisor continues the restart and records the result.
 - The API reaches proxies over their backend URL with
   [signed worker requests](worker-http-protocol.md#authentication):
-  `GET /network-access/{provider}/status`, `POST /network-access/{provider}/connect`
+  `GET /network-access/status`, `POST /network-access/{provider}/connect`
   and `.../disconnect` on the proxy listener, ten seconds each, in parallel,
   like force-reload. Those routes carry `auth_url` and error text because
   they require a signed request; the public `/health` report carries only state,

@@ -7,7 +7,6 @@ import MediaCardArtwork, {
 } from "@/components/MediaCardArtwork";
 import MediaItemMenu from "@/components/MediaItemMenu";
 import CardOverlays from "@/components/overlays/CardOverlays";
-import CardWatchStatus from "@/components/overlays/CardWatchStatus";
 import { overlayDataFromSectionItem, type CardOverlayPrefs } from "@/lib/overlays";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import { buildEpisodeCardLabels } from "@/lib/episodeCardLabels";
@@ -21,18 +20,6 @@ import {
 import type { SectionItem } from "@/api/types";
 import { buildItemHref } from "@/lib/mediaNavigation";
 import CardPlayOverlay from "@/components/CardPlayOverlay";
-import { numberText, useAppLanguage, useT, type Translate } from "@/i18n";
-
-/**
- * A "next in series" card's book number. The server sends it as the English
- * badge "Book 3"; the number is read back out and shown in the app language.
- */
-function bookBadgeLabel(t: Translate, badges: string[] | undefined): string | undefined {
-  const badge = badges?.find((value) => value.startsWith("Book "));
-  if (!badge) return undefined;
-  const number = /^Book (\d+)$/.exec(badge)?.[1];
-  return number ? t("web.detail.books.bookNumber", { number: Number(number) }) : badge;
-}
 
 interface SectionItemCardProps {
   item: SectionItem;
@@ -50,9 +37,6 @@ export default memo(function SectionItemCard({
   quickActionMode = "none",
   priority = false,
 }: SectionItemCardProps) {
-  const t = useT();
-  // The upcoming and episode lines come from plain helpers; follow language changes.
-  useAppLanguage();
   const itemHref = buildItemHref({ contentId: item.content_id, libraryId });
   const upcomingEvent = item.upcoming_event;
   const subtitle = upcomingEvent ? formatUpcomingSubtitle(upcomingEvent) : "";
@@ -71,7 +55,6 @@ export default memo(function SectionItemCard({
       <div className="group/media relative">
         <ViewTransitionLink
           to={itemHref}
-          prefetchOn="intent"
           aria-label={displayTitle}
           className="block overflow-hidden rounded-xl"
         >
@@ -85,19 +68,14 @@ export default memo(function SectionItemCard({
             priority={priority}
           >
             {item.status === "ambiguous" && (
-              // eslint-disable-next-line silo/no-physical-direction -- on the poster artwork, which doesn't mirror; matches CardOverlays and CardWatchStatus
               <span className="absolute top-2.5 left-2.5 rounded-full border border-amber-500/25 bg-black/40 px-2 py-0.5 text-[0.625rem] leading-none font-semibold tracking-wide text-amber-200 uppercase backdrop-blur-sm">
-                {t("web.home.sectionRow.ambiguous")}
+                Ambiguous
               </span>
             )}
             {item.status === "matched" && overlayPrefs && (
               <CardOverlays data={overlayDataFromSectionItem(item)} prefs={overlayPrefs} />
             )}
-            {item.status === "matched" && !upcomingEvent && (
-              <CardWatchStatus userState={item.user_state} />
-            )}
             {upcomingEvent && upcomingEvent.badges.length > 0 && (
-              // eslint-disable-next-line silo/no-physical-direction -- on the poster artwork, which doesn't mirror; matches CardOverlays and CardWatchStatus
               <div className="absolute top-2.5 left-2.5 flex max-w-[calc(100%-2.5rem)] flex-wrap gap-1">
                 {upcomingEvent.badges.map((badge) => (
                   <span
@@ -153,7 +131,7 @@ export default memo(function SectionItemCard({
         ) : episodeLabels ? (
           <ViewTransitionLink to={itemHref} className="block hover:underline">
             {episodeLabels.episodeTitle ? (
-              <div className="bidi-text text-muted-foreground mt-1 truncate text-[0.75rem] font-medium">
+              <div className="text-muted-foreground mt-1 truncate text-[0.75rem] font-medium">
                 {episodeLabels.episodeTitle}
               </div>
             ) : null}
@@ -163,13 +141,13 @@ export default memo(function SectionItemCard({
           </ViewTransitionLink>
         ) : item.item_source === "next_in_series" && item.series_title ? (
           <ViewTransitionLink to={itemHref} className={MEDIA_CARD_META_CLASS}>
-            {[bookBadgeLabel(t, item.badges), item.series_title].filter(Boolean).join(" · ")}
+            {[item.badges?.find((badge) => badge.startsWith("Book ")), item.series_title]
+              .filter(Boolean)
+              .join(" · ")}
           </ViewTransitionLink>
         ) : (
           <ViewTransitionLink to={itemHref} className={MEDIA_CARD_META_CLASS}>
-            {/* eslint-disable-next-line formatjs/no-literal-string-in-jsx -- a space, not text */}
-            {item.year ? numberText(item.year) : null}{" "}
-            {item.type === "series" ? t("web.home.sectionRow.seriesType") : null}
+            {item.year ? `${item.year}` : ""} {item.type === "series" ? "Series" : ""}
           </ViewTransitionLink>
         )}
       </div>

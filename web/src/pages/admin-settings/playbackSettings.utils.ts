@@ -1,5 +1,4 @@
-import type { NodeDetectedBackend, StreamNode } from "@/api/types";
-import { t } from "@/i18n";
+import type { StreamNode } from "@/api/types";
 import type { HWAccelInfo } from "@/hooks/queries/admin/system";
 
 // Helpers for the playback.hw_device GPU picker. The setting stores a
@@ -52,7 +51,7 @@ export function buildHWDeviceRows(
     if (rows.some((row) => row.path === path)) continue;
     rows.push({
       path,
-      description: t("web.admin.settings.playback.devices.notDetected"),
+      description: "Configured device not detected",
       detected: false,
       missingOnNodes: missingOn(path),
     });
@@ -79,25 +78,6 @@ export function nodeInventoriesDiverge(detection: HWAccelInfo | undefined): bool
 // only when the node pool can actually serve them.
 
 export const IMAGE_EXECUTION_DEFAULT = "local";
-
-export const TRICKPLAY_NODE_CAPACITY_KEY = "playback.trickplay_node_capacity";
-
-/**
- * Whether a Preview images advanced key is on screen. A node's seek preview
- * capacity matters only once previews may run on one; an unsaved edit keeps it
- * shown so a hidden field never holds back the save.
- */
-export function showsPreviewKey(
-  key: string,
-  execution: string,
-  isDirty: (key: string) => boolean,
-): boolean {
-  return (
-    key !== TRICKPLAY_NODE_CAPACITY_KEY ||
-    execution !== IMAGE_EXECUTION_DEFAULT ||
-    isDirty(TRICKPLAY_NODE_CAPACITY_KEY)
-  );
-}
 
 const NODE_BACKED_IMAGE_MODES = ["prefer_transcode_nodes", "transcode_nodes_only"];
 
@@ -147,18 +127,9 @@ export function imageExecutionOptions(
 ): ImageExecutionOption[] {
   return gateNodeBackedModes(
     [
-      {
-        value: IMAGE_EXECUTION_DEFAULT,
-        label: t("web.admin.settings.playback.execution.thisServer"),
-      },
-      {
-        value: "prefer_transcode_nodes",
-        label: t("web.admin.settings.playback.execution.nodesWhenAvailable"),
-      },
-      {
-        value: "transcode_nodes_only",
-        label: t("web.admin.settings.playback.execution.nodesOnly"),
-      },
+      { value: IMAGE_EXECUTION_DEFAULT, label: "This server" },
+      { value: "prefer_transcode_nodes", label: "Transcode nodes when available" },
+      { value: "transcode_nodes_only", label: "Transcode nodes only" },
     ],
     current,
     transcodeNodeAvailable,
@@ -178,15 +149,9 @@ export function subtitleSyncExecutionOptions(
 ): ImageExecutionOption[] {
   return gateNodeBackedModes(
     [
-      { value: "local", label: t("web.admin.settings.playback.execution.localServer") },
-      {
-        value: "prefer_transcode_nodes",
-        label: t("web.admin.settings.playback.execution.preferNodes"),
-      },
-      {
-        value: "transcode_nodes_only",
-        label: t("web.admin.settings.playback.execution.nodesOnly"),
-      },
+      { value: "local", label: "Local server" },
+      { value: "prefer_transcode_nodes", label: "Prefer transcode nodes" },
+      { value: "transcode_nodes_only", label: "Transcode nodes only" },
     ],
     current,
     transcodeNodeAvailable,
@@ -219,34 +184,17 @@ function detectedDevices(
     return detection.render_device_details;
   }
   // Older nodes report only render_devices paths.
-  return (detection.render_devices ?? []).map((path) => ({
-    path,
-    description: t("web.admin.settings.playback.devices.gpu"),
-  }));
+  return (detection.render_devices ?? []).map((path) => ({ path, description: "GPU" }));
 }
 
-/**
- * The `playback.hw_accel` choices, in the order the select shows them. The
- * backends are product names; "Auto" and "Software" are read when the label
- * is, so they follow the interface language.
- */
+/** The `playback.hw_accel` choices, in the order the select shows them. */
 export const HW_ACCEL_OPTIONS = [
-  {
-    value: "auto",
-    get label() {
-      return t("web.admin.settings.playback.hwAccel.auto");
-    },
-  },
+  { value: "auto", label: "Auto" },
   { value: "qsv", label: "Intel Quick Sync (QSV)" },
   { value: "vaapi", label: "VA-API" },
   { value: "nvenc", label: "NVIDIA NVENC" },
   { value: "videotoolbox", label: "VideoToolbox (macOS)" },
-  {
-    value: "none",
-    get label() {
-      return t("web.admin.settings.playback.hwAccel.software");
-    },
-  },
+  { value: "none", label: "Software" },
 ];
 
 /** Human name for a resolved hardware-acceleration backend. */
@@ -255,66 +203,16 @@ export function formatResolved(resolved: string): string {
 }
 
 /**
- * The probe entry for the backend detection resolved to, if one ran. The
- * server reports an explicitly configured backend as resolved even when it was
- * never verified (VideoToolbox in a Linux container, NVENC with no NVIDIA
- * device), so `resolved` alone proves nothing.
- */
-function resolvedProbe(detection: HWAccelInfo): NodeDetectedBackend | undefined {
-  return detection.detected_backends?.find(
-    (entry) => entry.backend.trim().toLowerCase() === detection.resolved,
-  );
-}
-
-/** Whether detection verified working hardware for the backend it resolved to. */
-export function hardwareVerified(detection: HWAccelInfo | undefined): detection is HWAccelInfo {
-  return Boolean(detection && detection.resolved !== "none" && resolvedProbe(detection)?.verified);
-}
-
-/**
  * One-line detection result, e.g. "Detected VA-API on renderD128". Returns
  * undefined while nothing has been probed yet so the caller can show its own
- * "detecting" state instead of an empty phrase. Pair it with hardwareVerified
- * for the tone: every result other than "Detected …" is a warning.
+ * "detecting" state instead of an empty phrase.
  */
 export function describeDetection(detection: HWAccelInfo | undefined): string | undefined {
   if (!detection) return undefined;
-  if (detection.resolved === "none") return t("web.admin.settings.playback.hwAccel.noneFound");
-  const backend = formatResolved(detection.resolved);
-  const node = detection.source === "transcode_node";
-  const probe = resolvedProbe(detection);
-  if (probe?.verified) {
-    const device = probe.device || detection.render_devices?.[0];
-    if (node) {
-      return device
-        ? t("web.admin.settings.playback.hwAccel.detectedOnDeviceNode", { backend, device })
-        : t("web.admin.settings.playback.hwAccel.detectedNode", { backend });
-    }
-    return device
-      ? t("web.admin.settings.playback.hwAccel.detectedOnDevice", { backend, device })
-      : t("web.admin.settings.playback.hwAccel.detected", { backend });
-  }
-  // Skipped: none of the configured devices is accessible, so nothing ran.
-  if (probe?.skipped) {
-    return node
-      ? t("web.admin.settings.playback.hwAccel.notAccessibleNode", { backend })
-      : t("web.admin.settings.playback.hwAccel.notAccessible", { backend });
-  }
-  if (probe) {
-    return node
-      ? t("web.admin.settings.playback.hwAccel.checkFailedNode", { backend })
-      : t("web.admin.settings.playback.hwAccel.checkFailed", { backend });
-  }
-  // macOS always reports a VideoToolbox probe, so no entry means the server
-  // is not running natively on a Mac (Docker on macOS runs a Linux VM).
-  if (detection.resolved === "videotoolbox") {
-    return node
-      ? t("web.admin.settings.playback.hwAccel.needsNativeMacNode", { backend })
-      : t("web.admin.settings.playback.hwAccel.needsNativeMac", { backend });
-  }
-  return node
-    ? t("web.admin.settings.playback.hwAccel.notFoundNode", { backend })
-    : t("web.admin.settings.playback.hwAccel.notFound", { backend });
+  if (detection.resolved === "none") return "No supported graphics hardware found";
+  const device = detection.render_devices?.[0];
+  const onNode = detection.source === "transcode_node" ? " (transcode node)" : "";
+  return `Detected ${formatResolved(detection.resolved)}${device ? ` on ${device}` : ""}${onNode}`;
 }
 
 /**

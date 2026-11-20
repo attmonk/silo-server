@@ -6,28 +6,27 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/Silo-Server/silo-server/internal/nodeauth"
 	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
 )
 
 func TestDeleteRemoteTranscodeSignsTheRequest(t *testing.T) {
-	const key = "snk1_1_delete-key"
+	const secret = "delete-secret"
 	var signed atomic.Bool
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete && r.URL.Path == "/transcode/session-1" {
-			signed.Store(nodeauthtest.Signed(r, key))
+			signed.Store(nodeauthtest.Signed(r, secret))
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(node.Close)
 
 	manager := NewTranscodeManager()
-	manager.NodeKeysFn = func() nodeauth.Keyring { return nodeauthtest.NodeKey(key) }
+	manager.JWTSecretFn = func() string { return secret }
 	if err := manager.deleteRemoteTranscode(t.Context(), "session-1", node.URL, true); err != nil {
 		t.Fatalf("deleteRemoteTranscode: %v", err)
 	}
 	if !signed.Load() {
-		t.Fatal("remote DELETE was not signed with the node's key")
+		t.Fatal("remote DELETE was not signed with the shared secret")
 	}
 }
 
@@ -44,7 +43,7 @@ func TestDeleteRemoteTranscodeDoesNotFollowRedirects(t *testing.T) {
 	t.Cleanup(node.Close)
 
 	manager := NewTranscodeManager()
-	manager.NodeKeysFn = func() nodeauth.Keyring { return nodeauthtest.NodeKey("snk1_1_delete-key") }
+	manager.JWTSecretFn = func() string { return "delete-secret" }
 	if err := manager.deleteRemoteTranscode(t.Context(), "session-1", node.URL, true); err == nil {
 		t.Fatal("deleteRemoteTranscode succeeded on a redirect, want an error")
 	}

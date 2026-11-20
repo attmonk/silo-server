@@ -3,7 +3,6 @@ import { AlertTriangle } from "lucide-react";
 
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { useRestartKeys } from "@/hooks/useRestartKeys";
-import { useT } from "@/i18n";
 import { SettingsPageHeader } from "@/components/settings/SettingsPageHeader";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SettingField } from "./SettingField";
@@ -41,16 +40,13 @@ const DATABASE_KEYS = ["database.max_connections"];
 
 const KEYS = [...NETWORK_KEYS, ...IDENTITY_KEYS, ...DATABASE_KEYS, ...REDIS_KEYS];
 
-// The placeholder is the name a server without one shows: the product name.
-const DEFAULT_SERVER_NAME = "Silo";
-
 export default function GeneralSettings() {
-  const t = useT();
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
   const restartKeys = useRestartKeys();
 
   const allRestart = (keys: string[]) => keys.every((key) => restartKeys.has(key));
   const anyDirty = (keys: string[]) => keys.some((key) => form.isDirty(key));
+  const trustedProxiesManaged = form.sensitiveManagedByEnv.includes(TRUSTED_PROXIES_KEY);
   const [saveInProgress, setSaveInProgress] = useState(false);
   const saveInProgressRef = useRef(false);
 
@@ -61,9 +57,9 @@ export default function GeneralSettings() {
       if (saveInProgressRef.current) return;
       form.resetValue(key);
     },
-    setSecret: (key, value, options) => {
+    setSecret: (key, value) => {
       if (saveInProgressRef.current) return;
-      form.setValue(key, value, options);
+      form.setValue(key, value);
     },
     disabled: form.isSaving || saveInProgress,
   };
@@ -95,11 +91,7 @@ export default function GeneralSettings() {
   // so the page waits for it; if it fails, only the Redis group is held.
   if (form.isLoading || (!form.sensitiveStatusReady && !form.sensitiveStatusError))
     return (
-      <div
-        className="space-y-6"
-        role="status"
-        aria-label={t("web.admin.settings.fields.loadingSettings")}
-      >
+      <div className="space-y-6" role="status" aria-label="Loading settings">
         <Skeleton className="h-8 w-48" />
         <div className="space-y-4">
           <Skeleton className="h-10 w-full" />
@@ -109,34 +101,33 @@ export default function GeneralSettings() {
           <Skeleton className="h-10 w-full" />
           <Skeleton className="h-10 w-full" />
         </div>
-        <span className="sr-only">{t("web.admin.settings.fields.loadingSettings")}</span>
+        <span className="sr-only">Loading settings</span>
       </div>
     );
 
   return (
     <div className="flex h-full flex-col">
-      <SettingsPageHeader title={t("web.admin.settings.general.title")} />
+      <SettingsPageHeader title="General" />
 
       <div className="flex-1 space-y-5">
         <FieldGroup
-          label={t("web.admin.settings.general.identity.group")}
+          label="Identity"
           restartAll={allRestart(IDENTITY_KEYS)}
           dirty={anyDirty(IDENTITY_KEYS)}
         >
           <SettingField
-            label={t("web.admin.settings.general.identity.serverName.label")}
+            label="Server name"
             dirty={form.isDirty("branding.server_name")}
-            hint={DEFAULT_SERVER_NAME}
+            hint="Silo"
             value={form.getValue("branding.server_name")}
             onChange={(v) => form.setValue("branding.server_name", v)}
             restartRequired={restartKeys.has("branding.server_name")}
-            managedByEnv={form.envVar("branding.server_name")}
           />
           <SettingField
-            label={t("web.admin.settings.general.identity.loginSubtitle.label")}
+            label="Login subtitle"
             dirty={form.isDirty("branding.login_subtitle")}
-            hint={t("web.admin.settings.general.identity.loginSubtitle.placeholder")}
-            description={t("web.admin.settings.general.identity.loginSubtitle.description")}
+            hint="Sign in with an existing account."
+            description="Shown under the server name on the sign-in page."
             value={form.getValue("branding.login_subtitle")}
             onChange={(v) => form.setValue("branding.login_subtitle", v)}
             restartRequired={restartKeys.has("branding.login_subtitle")}
@@ -144,69 +135,66 @@ export default function GeneralSettings() {
         </FieldGroup>
 
         <FieldGroup
-          label={t("web.admin.settings.general.network.group")}
+          label="Network"
           restartAll={allRestart(NETWORK_KEYS)}
           dirty={anyDirty(NETWORK_KEYS)}
         >
           <SettingField
-            label={t("web.admin.settings.general.network.publicUrl.label")}
+            label="Silo public URL"
             dirty={form.isDirty("server.public_url")}
-            description={t("web.admin.settings.general.network.publicUrl.description")}
-            // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an example value, not text
+            description="The HTTPS address users open. Used for websocket origins and links in email notifications."
             hint="https://silo.example.com"
             value={form.getValue("server.public_url")}
             onChange={(v) => form.setValue("server.public_url", v)}
             restartRequired={restartKeys.has("server.public_url")}
-            managedByEnv={form.envVar("server.public_url")}
           />
           <SettingField
-            label={t("web.admin.settings.general.network.lanDiscovery.label")}
+            label="Show on the local network"
             dirty={form.isDirty("server.lan_discovery")}
             type="toggle"
-            description={t("web.admin.settings.general.network.lanDiscovery.description")}
+            description="Silo apps on the same network list this server when adding one, so nobody has to type its address. Needs a network that passes multicast (Docker host networking, not the default bridge)."
             value={form.getValue("server.lan_discovery")}
             onChange={(v) => form.setValue("server.lan_discovery", v)}
             restartRequired={restartKeys.has("server.lan_discovery")}
-            managedByEnv={form.envVar("server.lan_discovery")}
           />
           <SettingField
-            label={t("web.admin.settings.general.network.localUrl.label")}
+            label="Local network address"
             dirty={form.isDirty(LOCAL_URL_KEY)}
-            description={t("web.admin.settings.general.network.localUrl.description")}
-            // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an example value, not text
+            description="Where devices on your home network reach Silo directly: the host's IP and the port Silo listens on, or the published port under Docker. Signed-in apps switch to it on their own while they can reach it, over an encrypted connection. Leave empty when apps already find the server on the local network."
             hint="http://192.168.1.20:8080"
             value={form.getValue(LOCAL_URL_KEY)}
             onChange={(v) => form.setValue(LOCAL_URL_KEY, v)}
             restartRequired={restartKeys.has(LOCAL_URL_KEY)}
-            managedByEnv={form.envVar(LOCAL_URL_KEY)}
           />
           <SettingField
-            label={t("web.admin.settings.general.network.trustedProxies.label")}
+            label="Trusted proxies"
             dirty={form.isDirty(TRUSTED_PROXIES_KEY)}
-            description={t("web.admin.settings.general.network.trustedProxies.description")}
-            // eslint-disable-next-line formatjs/no-literal-string-in-jsx -- an example value, not text
+            description={
+              trustedProxiesManaged
+                ? "Managed by SILO_TRUSTED_PROXIES."
+                : "Comma-separated proxy ranges; empty keeps the private defaults."
+            }
             hint="172.16.0.0/12, 203.0.113.7/32"
             value={form.getValue(TRUSTED_PROXIES_KEY)}
             onChange={(v) => form.setValue(TRUSTED_PROXIES_KEY, v)}
+            disabled={trustedProxiesManaged}
             restartRequired={restartKeys.has(TRUSTED_PROXIES_KEY)}
-            managedByEnv={form.envVar(TRUSTED_PROXIES_KEY)}
           />
         </FieldGroup>
 
         <FieldGroup
-          label={t("web.admin.settings.general.database.group")}
+          label="Database"
           restartAll={allRestart(DATABASE_KEYS)}
           dirty={anyDirty(DATABASE_KEYS)}
         >
           <SettingField
-            label={t("web.admin.settings.general.database.maxConnections.label")}
+            label="Maximum Postgres connections"
             dirty={form.isDirty("database.max_connections")}
             type="number"
-            description={t("web.admin.settings.general.database.maxConnections.description")}
+            description="Raise only if the logs show connection-pool waits."
             value={form.getValue("database.max_connections")}
             onChange={(v) => form.setValue("database.max_connections", v)}
             restartRequired={restartKeys.has("database.max_connections")}
-            managedByEnv={form.envVar("database.max_connections")}
           />
         </FieldGroup>
 
@@ -217,11 +205,9 @@ export default function GeneralSettings() {
           >
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
             <div>
-              <p className="text-sm font-medium">
-                {t("web.admin.settings.redis.unavailable.title")}
-              </p>
+              <p className="text-sm font-medium">Redis settings are unavailable</p>
               <p className="text-muted-foreground mt-1 text-[13px]">
-                {t("web.admin.settings.redis.unavailable.description")}
+                Protected credential status could not be loaded. Reload this page to edit Redis.
               </p>
             </div>
           </div>

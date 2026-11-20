@@ -6,7 +6,6 @@ import {
 } from "@/api/client";
 import { adminKeys } from "@/hooks/queries/keys";
 import { v2 } from "./request";
-import { t } from "@/i18n";
 
 export type SettingsValues = Record<string, string>;
 export type SettingsBaseline = { etag: string; profileContext: ProfileRequestContextSnapshot };
@@ -44,7 +43,7 @@ export async function readAdminSettings(
 }
 export function captureSettingsBaseline(values: SettingsValues | undefined): SettingsBaseline {
   const baseline = values && baselines.get(values);
-  if (!baseline) throw new Error(t("web.admin.settings.hooks.settings.reloadBeforeSaving"));
+  if (!baseline) throw new Error("Reload settings before saving.");
   if (!isCapturedProfileAuthorityActive(baseline.profileContext) || !captureProfileRequestContext())
     throw new StaleApiRequestContextError();
   return baseline;

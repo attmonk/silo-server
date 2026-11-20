@@ -69,7 +69,7 @@ func (h *UserDataHandler) HandleGetUserData(w http.ResponseWriter, r *http.Reque
 	progress := progressMap[detail.ContentID]
 
 	if strings.EqualFold(detail.Type, "series") || strings.EqualFold(detail.Type, "season") {
-		targets, _, err := h.resolvePlayedTargetsWithParent(r, session, chi.URLParam(r, "itemId"))
+		targets, err := h.resolvePlayedTargets(r, session, chi.URLParam(r, "itemId"))
 		if err != nil {
 			writeCompatUpstreamError(w, err)
 			return
@@ -209,15 +209,11 @@ func (h *UserDataHandler) handlePlayedMutation(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	targets, parent, err := h.resolveMarkTargets(r, session, chi.URLParam(r, "itemId"), played)
+	targets, err := h.resolveMarkTargets(r, session, chi.URLParam(r, "itemId"), played)
 	if err != nil {
 		writeCompatUpstreamError(w, err)
 		return
 	}
-	// A movie or episode mark clears a rewatch's resume position, as Jellyfin
-	// does and as the native mark does; a series or season mark leaves its
-	// episodes' rewatch positions alone, as the native mark does (#3257).
-	recordRewatch := parent.kind == ""
 
 	if !validateOptionalUser(w, r, session) {
 		return
@@ -229,15 +225,15 @@ func (h *UserDataHandler) handlePlayedMutation(w http.ResponseWriter, r *http.Re
 			return
 		}
 		writer, ok := h.userData.(interface {
-			MarkPlayedBatchAt(context.Context, *Session, []string, time.Time, bool) error
+			MarkPlayedBatchAt(context.Context, *Session, []string, time.Time) error
 		})
 		if !ok {
 			writeError(w, 501, "NotImplemented", "Dated watch state unavailable")
 			return
 		}
-		err = writer.MarkPlayedBatchAt(r.Context(), session, targets, date, recordRewatch)
+		err = writer.MarkPlayedBatchAt(r.Context(), session, targets, date)
 	} else if played {
-		err = h.userData.MarkPlayedBatch(r.Context(), session, targets, recordRewatch)
+		err = h.userData.MarkPlayedBatch(r.Context(), session, targets)
 	} else {
 		err = h.userData.MarkUnplayedBatch(r.Context(), session, targets)
 	}
@@ -296,39 +292,43 @@ func (d *clientDate) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// resolveMarkTargets resolves the leaf items a played or unplayed mark writes,
-// and the series or season it expanded, if any.
-func (h *UserDataHandler) resolveMarkTargets(r *http.Request, session *Session, rawItemID string, played bool) ([]string, playedParent, error) {
+func (h *UserDataHandler) resolvePlayedTargets(r *http.Request, session *Session, rawItemID string) ([]string, error) {
+	targets, _, err := h.resolvePlayedTargetsWithParent(r, session, rawItemID)
+	return targets, err
+}
+
+// resolveMarkTargets resolves the leaf items a played or unplayed mark writes.
+func (h *UserDataHandler) resolveMarkTargets(r *http.Request, session *Session, rawItemID string, played bool) ([]string, error) {
 	if played {
-		return h.resolvePlayedTargetsWithParent(r, session, rawItemID)
+		return h.resolvePlayedTargets(r, session, rawItemID)
 	}
 	return h.resolveUnplayedTargets(r, session, rawItemID)
 }
 
-// resolveUnplayedTargets is resolvePlayedTargetsWithParent for an unplayed
-// mark. A series or season also clears its watched episodes that no longer
-// have a library file, which the episode listings leave out; otherwise their
-// completed progress keeps the series in Next Up.
-func (h *UserDataHandler) resolveUnplayedTargets(r *http.Request, session *Session, rawItemID string) ([]string, playedParent, error) {
+// resolveUnplayedTargets is resolvePlayedTargets for an unplayed mark. A series
+// or season also clears its watched episodes that no longer have a library
+// file, which the episode listings leave out; otherwise their completed
+// progress keeps the series in Next Up.
+func (h *UserDataHandler) resolveUnplayedTargets(r *http.Request, session *Session, rawItemID string) ([]string, error) {
 	targets, parent, err := h.resolvePlayedTargetsWithParent(r, session, rawItemID)
 	if err != nil || parent.kind == "" {
-		return targets, parent, err
+		return targets, err
 	}
 	resolver, ok := h.userData.(interface {
 		ParentUnplayedTargets(context.Context, *Session, string, string) ([]string, error)
 	})
 	if !ok {
-		return targets, parent, nil
+		return targets, nil
 	}
 	extra, err := resolver.ParentUnplayedTargets(r.Context(), session, parent.kind, parent.id)
 	if err != nil {
-		return nil, parent, err
+		return nil, err
 	}
 	seen := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		seen[target] = struct{}{}
 	}
-	return appendUniqueContentIDs(targets, seen, extra...), parent, nil
+	return appendUniqueContentIDs(targets, seen, extra...), nil
 }
 
 // playedTargetNotFound answers a played mark on an unknown item.
@@ -473,7 +473,7 @@ func (h *UserDataHandler) HandleUpdateUserData(w http.ResponseWriter, r *http.Re
 			req.Played = new(*req.PlayCount > 0)
 		}
 		if req.Played != nil {
-			targets, _, err := h.resolveMarkTargets(r, session, chi.URLParam(r, "itemId"), *req.Played)
+			targets, err := h.resolveMarkTargets(r, session, chi.URLParam(r, "itemId"), *req.Played)
 			if err != nil {
 				writeCompatUpstreamError(w, err)
 				return
@@ -494,7 +494,7 @@ func (h *UserDataHandler) HandleUpdateUserData(w http.ResponseWriter, r *http.Re
 				return
 			}
 			if *req.Played {
-				err = h.userData.MarkPlayedBatch(r.Context(), session, targets, false)
+				err = h.userData.MarkPlayedBatch(r.Context(), session, targets)
 			} else {
 				err = h.userData.MarkUnplayedBatch(r.Context(), session, targets)
 			}

@@ -24,8 +24,6 @@ import { useAdminRequestCapabilities } from "@/hooks/queries/admin/requests";
 import { useDiscoverRowPreview } from "@/hooks/queries/admin/requestDiscover";
 import { RowRefusedError, type DiscoverRowsAdapter } from "@/hooks/queries/admin/useDiscoverRows";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
-import { useT, type Translate } from "@/i18n";
-import { useHomeRowTitle } from "@/lib/sectionTitle";
 import { RowChangedError } from "@/lib/homeRows/types";
 import { useCollectionTemplates } from "@/lib/collectionTemplates";
 import {
@@ -57,11 +55,7 @@ import {
   rowBody,
   rowProblem,
   ROW_KINDS,
-  rowKindEnglishLabel,
-  rowKindLabel,
-  rowKindSentence,
   savedTitle,
-  toHomeRow,
   toTMDBChart,
 } from "./discoverLayoutModel";
 
@@ -70,18 +64,10 @@ function errorMessage(error: unknown, fallback: string) {
 }
 
 /** What a stock row shows, on its Bring back card. */
-function stockSentence(t: Translate, row: DiscoverRowBody) {
+function stockSentence(row: DiscoverRowBody) {
   return row.chart
-    ? t("web.admin.requests.rowDialog.stockChart", {
-        summary: chartSummary(toTMDBChart(row.chart)),
-      })
-    : rowKindSentence(row.type);
-}
-
-/** A row type's card text, for the picker's KindCard. */
-function kindCard(type: DiscoverRowBody["type"]) {
-  const { icon, group } = ROW_KINDS[type];
-  return { icon, group, label: rowKindLabel(type), sentence: rowKindSentence(type) };
+    ? `TMDB chart: ${chartSummary(toTMDBChart(row.chart))}.`
+    : ROW_KINDS[row.type].sentence;
 }
 
 /** Step 1: a new row of a type, or a built-in or brand row the page dropped. */
@@ -94,18 +80,16 @@ function KindPicker({
   narrow: boolean;
   onPick: (row: DiscoverRowBody) => void;
 }) {
-  const t = useT();
-  const rowTitle = useHomeRowTitle();
   const grid = cn("grid gap-2.5", !narrow && "grid-cols-2");
   return (
     <div className="grid content-start gap-6 overflow-y-auto px-5 pt-[18px] pb-6 sm:px-7">
       <section className="grid gap-3">
-        <h3 className="text-[13px] font-semibold">{t("web.admin.requests.rowDialog.newRow")}</h3>
+        <h3 className="text-[13px] font-semibold">New row</h3>
         <div className={grid}>
           {NEW_ROW_TYPES.map((type) => (
             <KindCard
               key={type}
-              {...kindCard(type)}
+              {...ROW_KINDS[type]}
               compact={narrow}
               onPick={() => onPick(newRow(type))}
             />
@@ -115,18 +99,18 @@ function KindPicker({
       {missing.length > 0 ? (
         <section className="grid gap-3">
           <h3 className="flex items-baseline gap-2.5 text-[13px] font-semibold">
-            {t("web.admin.requests.rowDialog.bringBack")}
+            Bring back
             <span className="text-muted-foreground font-normal">
-              {t("web.admin.requests.rowDialog.bringBackHelp")}
+              Rows Discover starts with that this page no longer has
             </span>
           </h3>
           <div className={grid}>
             {missing.map((row) => (
               <KindCard
                 key={row.id}
-                {...kindCard(row.type)}
-                label={rowTitle(toHomeRow(row))}
-                sentence={stockSentence(t, row)}
+                {...ROW_KINDS[row.type]}
+                label={row.title}
+                sentence={stockSentence(row)}
                 compact={narrow}
                 onPick={() => onPick({ ...row })}
               />
@@ -154,7 +138,6 @@ function SourceControl({
   /** An MDBList pick, which also names the row. */
   onPick: (pick: SyncedPick) => void;
 }) {
-  const t = useT();
   const id = useId();
   const [changing, setChanging] = useState(!editing);
   const picker = useRef<HTMLDivElement>(null);
@@ -183,17 +166,15 @@ function SourceControl({
       })),
     [templates.data],
   );
-  const kindLabel = rowKindLabel(row.type);
+  const kind = ROW_KINDS[row.type];
 
-  if (isBrandRow(row)) {
-    return <SourceCard title={kindLabel} detail={rowKindSentence(row.type)} />;
-  }
+  if (isBrandRow(row)) return <SourceCard title={kind.label} detail={kind.sentence} />;
   if (row.chart && isBuiltInRow(row)) {
     return (
       <div className="grid gap-2">
-        <SourceCard title={kindLabel} detail={chartSummary(toTMDBChart(row.chart))} />
+        <SourceCard title={kind.label} detail={chartSummary(toTMDBChart(row.chart))} />
         <p className="text-muted-foreground text-[13px]">
-          {t("web.admin.requests.rowDialog.builtInKeepsChart")}
+          A built-in row keeps its chart, so apps from before custom rows still show it.
         </p>
       </div>
     );
@@ -205,13 +186,9 @@ function SourceControl({
       : shownLink(row.list?.url ?? "");
     return (
       <SourceCard
-        title={kindLabel}
+        title={kind.label}
         detail={detail}
-        action={
-          row.chart
-            ? t("web.admin.requests.rowDialog.changeChart")
-            : t("web.admin.requests.rowDialog.changeList")
-        }
+        action={row.chart ? "Change chart" : "Change list"}
         onChange={() => setChanging(true)}
       />
     );
@@ -228,8 +205,8 @@ function SourceControl({
     field = (
       <TMDBListURLField
         id={`${id}-tmdb-list`}
-        label={t("web.admin.requests.rowDialog.tmdbListLink")}
-        help={t("web.admin.requests.rowDialog.tmdbListLinkHelp")}
+        label="TMDB list link"
+        help="Paste a public list from themoviedb.org. Silo reads it again about every 12 hours."
         value={typedLink}
         onChange={(raw) => {
           setTypedLink(raw);
@@ -285,7 +262,6 @@ function RowFields({
   onChange: (row: DiscoverRowBody, typedTitle?: boolean) => void;
   onPick: (pick: SyncedPick) => void;
 }) {
-  const t = useT();
   const nameId = useId();
   const hideId = useId();
   // A server from before list orders refuses list.order, so the choice waits on its capability.
@@ -294,11 +270,11 @@ function RowFields({
   const brand = isBrandRow(row);
   // The server needs a name to preview a row, but the name doesn't change its
   // titles: a fixed one keeps typing a name from reading the source again.
-  const previewRow = { ...row, title: rowKindEnglishLabel(row.type) };
+  const previewRow = { ...row, title: kind.label };
   const preview = useDiscoverRowPreview(brand || rowProblem(previewRow) ? null : previewRow);
-  let offText = t("web.admin.requests.rowDialog.previewOff.chart");
-  if (row.list) offText = t("web.admin.requests.rowDialog.previewOff.list");
-  if (row.discover) offText = t("web.admin.requests.rowDialog.previewOff.region");
+  let offText = "Pick a chart to see its titles.";
+  if (row.list) offText = "Pick a list or paste its link to see its titles.";
+  if (row.discover) offText = "Choose the region the streaming services are in.";
   const previewStrip = brand ? null : (
     <RowPreview
       title={savedTitle(row)}
@@ -306,11 +282,7 @@ function RowFields({
       icon={kind.icon}
       group={kind.group}
       state={preview}
-      liveLabel={
-        row.list
-          ? t("web.admin.requests.rowDialog.livePreviewList")
-          : t("web.admin.requests.rowDialog.livePreviewTmdb")
-      }
+      liveLabel={row.list ? "Live preview of the list" : "Live preview from TMDB"}
       offText={offText}
     />
   );
@@ -318,20 +290,14 @@ function RowFields({
   const controlFirst = Boolean(row.list || row.discover);
   const moreCount = row.discover ? moreFilterCount(row.discover) : 0;
   const summary = [
-    moreCount ? t("web.admin.requests.rowDialog.moreFilters", { count: moreCount }) : null,
-    row.hide_available ? t("web.admin.requests.discover.missingTitlesOnly") : null,
+    moreCount ? `${moreCount} more ${moreCount === 1 ? "filter" : "filters"}` : null,
+    row.hide_available ? "Missing titles only" : null,
   ]
     .filter(Boolean)
     .join(" · ");
   let nameHelp: string | null = null;
-  if (!titleTyped && row.chart) nameHelp = t("web.admin.requests.rowDialog.nameFollowsChart");
-  else if (!titleTyped && row.type === "mdblist") {
-    nameHelp = t("web.admin.requests.rowDialog.nameFromList");
-  }
-  const mdblistOrders = MDBLIST_ORDERS.map((option) => ({
-    value: option.value,
-    label: t(option.label),
-  }));
+  if (!titleTyped && row.chart) nameHelp = "Follows the chart until you type your own name.";
+  else if (!titleTyped && row.type === "mdblist") nameHelp = "Starts as the list's name.";
 
   return (
     // minmax(0,1fr): a truncated line or a wide control can't widen the form past a phone screen.
@@ -348,13 +314,13 @@ function RowFields({
           ) : null}
           {row.type === "mdblist" && row.list && listOrders ? (
             <Field
-              label={t("web.admin.requests.rowDialog.order")}
-              help={t("web.admin.requests.rowDialog.orderHelp")}
+              label="Order"
+              help="MDBList's feed doesn't carry the sort saved on the list's page. Pick the one it shows."
             >
               <OptionSelect
-                label={t("web.admin.requests.rowDialog.order")}
+                label="Order"
                 value={mdblistOrder(row)}
-                options={mdblistOrders}
+                options={MDBLIST_ORDERS}
                 onChange={(order) =>
                   onChange({
                     ...row,
@@ -376,13 +342,13 @@ function RowFields({
         </>
       )}
       <div className="grid gap-2">
-        <Label htmlFor={nameId}>{t("web.admin.requests.rowDialog.rowName")}</Label>
+        <Label htmlFor={nameId}>Row name</Label>
         <Input
           id={nameId}
           className="h-10 text-[15px]"
           maxLength={80}
           value={row.title}
-          placeholder={defaultTitle(row) || t("web.admin.requests.rowDialog.rowNamePlaceholder")}
+          placeholder={defaultTitle(row) || "Name this row"}
           onChange={(event) => onChange({ ...row, title: event.target.value }, true)}
         />
         {nameHelp ? <p className="text-muted-foreground text-[13px]">{nameHelp}</p> : null}
@@ -402,9 +368,9 @@ function RowFields({
           ) : null}
           <div className="flex items-center justify-between gap-4">
             <div>
-              <Label htmlFor={hideId}>{t("web.admin.requests.rowDialog.hideAvailable")}</Label>
+              <Label htmlFor={hideId}>Leave out titles the library has</Label>
               <p className="text-muted-foreground mt-1 text-[13px]">
-                {t("web.admin.requests.rowDialog.hideAvailableHelp")}
+                Viewers see only titles they can still request.
               </p>
             </div>
             <Switch
@@ -439,7 +405,6 @@ export function DiscoverRowDialog({
   onSaved: (newId: string | undefined) => void;
   onDelete: (row: DiscoverRow) => void;
 }) {
-  const t = useT();
   const editing = editRow !== null;
   const narrow = useMediaQuery("(max-width: 1023px)");
   const [step, setStep] = useState<"pick" | "form">(editing ? "form" : "pick");
@@ -511,12 +476,7 @@ export function DiscoverRowDialog({
       else if (error instanceof RowRefusedError) setProblems(error.problems);
       else
         toast.error(
-          errorMessage(
-            error,
-            editing
-              ? t("web.admin.requests.rowDialog.saveFailed")
-              : t("web.admin.requests.rowDialog.addFailed"),
-          ),
+          errorMessage(error, editing ? "Could not save this row" : "Could not add this row"),
         );
     } finally {
       if (mounted.current) setBusy(false);
@@ -536,22 +496,21 @@ export function DiscoverRowDialog({
     }
   }
 
-  let title = t("web.admin.requests.rowDialog.addTitle");
-  let description: ReactNode = t("web.admin.requests.rowDialog.addDescription");
+  let title = "Add a row to Discover";
+  let description: ReactNode =
+    "Pick what the row shows. Next you'll see a preview and can name it.";
   if (step === "form" && editing) {
-    title = t("web.admin.requests.rowDialog.editTitle");
-    description = t("web.admin.requests.rowDialog.editDescription");
+    title = "Edit row";
+    description = "Changes apply to everyone's Discover page.";
   } else if (step === "form" && row) {
     // A row brought back is named by its own title.
-    title = row.id ? row.title : rowKindLabel(row.type);
-    description = row.id ? stockSentence(t, row) : rowKindSentence(row.type);
+    title = row.id ? row.title : ROW_KINDS[row.type].label;
+    description = row.id ? stockSentence(row) : ROW_KINDS[row.type].sentence;
   }
 
   let footerStart: ReactNode = (
     <StepCount step={step === "pick" ? 1 : 2}>
-      {step === "pick"
-        ? t("web.admin.requests.rowDialog.newRowsGoToBottom")
-        : t("web.admin.requests.rowDialog.goesToBottom")}
+      {step === "pick" ? "New rows go to the bottom of Discover" : "Goes to the bottom of Discover"}
     </StepCount>
   );
   if (editRow) {
@@ -559,12 +518,12 @@ export function DiscoverRowDialog({
       <Button
         type="button"
         variant="ghost"
-        className="text-destructive hover:text-destructive -ms-3"
+        className="text-destructive hover:text-destructive -ml-3"
         disabled={busy}
         onClick={() => onDelete(editRow)}
       >
         <Trash2 aria-hidden className="size-4" />
-        {t("web.admin.requests.rowDialog.deleteRow")}
+        Delete row…
       </Button>
     );
   }
@@ -579,7 +538,9 @@ export function DiscoverRowDialog({
         )}
       >
         <p className="min-w-0 flex-1">
-          {conflict ? t("web.admin.requests.rowDialog.conflict") : problems.join(" ")}
+          {conflict
+            ? "The Discover page changed since you opened this row. Your changes are kept. Reload the rows, then save again."
+            : problems.join(" ")}
         </p>
         {conflict ? (
           <Button
@@ -589,7 +550,7 @@ export function DiscoverRowDialog({
             disabled={busy}
             onClick={() => void reload()}
           >
-            {t("web.admin.requests.rowDialog.reloadRows")}
+            Reload rows
           </Button>
         ) : null}
       </div>
@@ -601,9 +562,7 @@ export function DiscoverRowDialog({
       onClose={onClose}
       onOpenFocus={() => headingRef.current?.focus()}
       back={
-        step === "form" && !editing
-          ? { label: t("web.admin.requests.rowDialog.allRows"), onClick: () => setStep("pick") }
-          : null
+        step === "form" && !editing ? { label: "All rows", onClick: () => setStep("pick") } : null
       }
       title={title}
       titleRef={headingRef}
@@ -618,11 +577,11 @@ export function DiscoverRowDialog({
             onClick={() => void submit()}
           >
             {editing ? (
-              t("common.save")
+              "Save"
             ) : (
               <>
                 <Plus aria-hidden className="size-4" />
-                {t("web.admin.requests.rowDialog.addRow")}
+                Add row
               </>
             )}
           </Button>

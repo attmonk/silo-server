@@ -12,23 +12,26 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/mediasample"
 	"github.com/Silo-Server/silo-server/internal/nodeauth/nodeauthtest"
-	"github.com/Silo-Server/silo-server/internal/nodesource"
+	"github.com/Silo-Server/silo-server/internal/nodeconfig"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/trickplay"
 )
 
 func newTrickplayTestServer(t *testing.T, ffmpeg string) *Server {
 	t.Helper()
+	watcher := nodeconfig.NewWatcher(nil, nil, nil, nodeconfig.BootstrapOverrides{})
 	cfg := &config.Config{}
+	cfg.Auth.JWTSecret = testSecret
 	cfg.Playback.TranscodeDir = t.TempDir()
 	cfg.Playback.FFmpegPath = ffmpeg
 	cfg.Playback.HWAccel = "none"
-	return &Server{watcher: newTestRuntime(cfg), nodeKey: testNodeKey, opener: &pathSources{}, sessions: make(map[string]*playback.TranscodeSession)}
+	watcher.SetConfigForTest(cfg)
+	return &Server{watcher: watcher, inputPaths: allowInputPaths{}, sessions: make(map[string]*playback.TranscodeSession)}
 }
 
 func postTrickplay(t *testing.T, server *Server, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/trickplay/extract", strings.NewReader(body))
-	nodeauthtest.Sign(t, req, testNodeKey)
+	nodeauthtest.Sign(t, req, testSecret)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
@@ -38,11 +41,10 @@ func postTrickplay(t *testing.T, server *Server, body string) *httptest.Response
 func sheetsRequestJSON(t *testing.T, input string) string {
 	t.Helper()
 	req := mediasample.Request{
-		Input:       input,
-		SourceGrant: input,
-		Samples:     &mediasample.Samples{Seconds: []float64{1, 3}},
-		Sheets:      &mediasample.SheetsOutput{TileWidth: 64, TileHeight: 36, Columns: 2, Rows: 1, Quality: 80},
-		Attempts:    []mediasample.Attempt{{Hardware: true, TimeoutSeconds: 60}, {TimeoutSeconds: 60}},
+		Input:    input,
+		Samples:  &mediasample.Samples{Seconds: []float64{1, 3}},
+		Sheets:   &mediasample.SheetsOutput{TileWidth: 64, TileHeight: 36, Columns: 2, Rows: 1, Quality: 80},
+		Attempts: []mediasample.Attempt{{Hardware: true, TimeoutSeconds: 60}, {TimeoutSeconds: 60}},
 	}
 	data, err := json.Marshal(req)
 	if err != nil {
@@ -88,33 +90,28 @@ func TestTrickplayExtractRefuses(t *testing.T) {
 	if rec := postTrickplay(t, server, stats); rec.Code != http.StatusBadRequest || decode(rec).Reason != "invalid_request" {
 		t.Fatalf("stats request: %d %s", rec.Code, rec.Body.String())
 	}
-	// The node admits playback.trickplay_node_capacity runs at once and
-	// refuses the next as busy.
-	server.watcher.Config().Playback.TrickplayNodeCapacity = 2
-	server.trickplay.running = 2
+	server.trickplay.busy.Lock()
 	if rec := postTrickplay(t, server, valid); rec.Code != http.StatusServiceUnavailable || decode(rec).Reason != trickplay.NodeBusyReason {
-		t.Fatalf("at capacity: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("busy: %d %s", rec.Code, rec.Body.String())
 	}
-	server.trickplay.running = 1
-	// An admitted run fails here (no real ffmpeg or input) but never answers 503.
-	if rec := postTrickplay(t, server, valid); rec.Code == http.StatusServiceUnavailable {
-		t.Fatalf("second run refused under a capacity of 2: %d %s", rec.Code, rec.Body.String())
-	}
-	if server.trickplay.running != 1 {
-		t.Fatalf("running = %d after the run, want its slot back", server.trickplay.running)
-	}
-	server.trickplay.running = 0
-	sourcesOf(server).refuse("/media/movie.mkv", &nodesource.StatusError{Op: "open", Status: http.StatusForbidden})
-	if rec := postTrickplay(t, server, valid); rec.Code != http.StatusBadRequest || decode(rec).Reason != trickplay.NodeUnavailableReason {
-		t.Fatalf("refused grant: %d %s", rec.Code, rec.Body.String())
-	}
-	sourcesOf(server).refuse("/media/movie.mkv", &nodesource.MountMismatchError{Path: "/media/movie.mkv", NodeErr: os.ErrNotExist})
-	if rec := postTrickplay(t, server, valid); rec.Code != http.StatusConflict || decode(rec).Reason != trickplay.NodeUnavailableReason {
-		t.Fatalf("mount mismatch: %d %s", rec.Code, rec.Body.String())
+	server.trickplay.busy.Unlock()
+	server.inputPaths = denyInputPaths{}
+	if rec := postTrickplay(t, server, valid); rec.Code == http.StatusOK || rec.Code == http.StatusUnprocessableEntity {
+		t.Fatalf("unapproved path: %d", rec.Code)
 	}
 	unauthorized := httptest.NewRecorder()
 	server.Handler().ServeHTTP(unauthorized, httptest.NewRequest(http.MethodPost, "/trickplay/extract", strings.NewReader(valid)))
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("no bearer: %d", unauthorized.Code)
+	}
+}
+
+func TestSoftwareAttempts(t *testing.T) {
+	plan := []mediasample.Attempt{{Hardware: true, TimeoutSeconds: 10}, {TimeoutSeconds: 20}}
+	if got := softwareAttempts(plan); len(got) != 1 || got[0].Hardware || got[0].TimeoutSeconds != 20 {
+		t.Fatalf("got %+v", got)
+	}
+	if got := softwareAttempts([]mediasample.Attempt{{Hardware: true, TimeoutSeconds: 10}}); len(got) != 1 || got[0].Hardware {
+		t.Fatalf("hardware-only plan: %+v", got)
 	}
 }

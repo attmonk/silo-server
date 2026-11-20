@@ -5,7 +5,6 @@ import {
 } from "@/api/client";
 import { v2 } from "./request";
 import type { ApplyItemImageRequest, ItemImagesResponse } from "@/api/types";
-import { t } from "@/i18n";
 export async function getAdminItemImages(
   id: string,
   signal?: AbortSignal,
@@ -30,7 +29,7 @@ export async function getAdminItemImages(
     Object.assign(provider_errors, result.provider_errors);
     if (!result.page.has_more) break;
     const next = result.page.next_cursor;
-    if (!next || seen.has(next)) throw new Error(t("web.admin.errors.imageChoicesChanged"));
+    if (!next || seen.has(next)) throw new Error("Image choices changed. Reload to try again.");
     seen.add(next);
     cursor = next;
   }

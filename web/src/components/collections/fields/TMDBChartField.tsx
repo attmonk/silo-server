@@ -2,12 +2,11 @@ import { useId, type ReactNode } from "react";
 import { Lock } from "lucide-react";
 
 import { RadioCardItem, RadioGroup } from "@/components/ui/radio-group";
-import { useT } from "@/i18n";
-import { chartRulesNote } from "@/lib/collections/copy";
+import { CHART_RULES_NOTE } from "@/lib/collections/copy";
 import {
+  CHART_MEDIA_LABEL,
+  CHART_WINDOW_LABEL,
   chartHasTimeWindow,
-  chartMediaLabel,
-  chartWindowLabel,
   chartLockReason,
   chartMediaTypes,
   defaultChart,
@@ -35,7 +34,6 @@ export function TMDBChartField({
   /** Said after the line about which choices each chart has. */
   note?: ReactNode;
 }) {
-  const t = useT();
   const id = useId();
   const allowed = chart ? chartMediaTypes(chart.preset) : [];
   const lock = chart ? chartLockReason(chart.preset) : null;
@@ -45,7 +43,7 @@ export function TMDBChartField({
     <div className="grid gap-4">
       <div className="grid gap-2">
         <span id={`${id}-chart`} className="text-[14px] font-semibold">
-          {t("web.collections.fields.chart")}
+          Chart
         </span>
         <RadioGroup
           aria-labelledby={`${id}-chart`}
@@ -60,8 +58,8 @@ export function TMDBChartField({
             <RadioCardItem
               key={entry.preset}
               value={entry.preset}
-              label={t(entry.labelKey)}
-              hint={t(entry.hintKey)}
+              label={entry.label}
+              hint={entry.hint}
             />
           ))}
         </RadioGroup>
@@ -70,22 +68,22 @@ export function TMDBChartField({
         <div className="grid gap-2">
           <div className="flex flex-wrap gap-x-8 gap-y-3">
             <Segmented
-              label={t("web.collections.fields.show")}
+              label="Show"
               value={chart.mediaType}
               options={shows.map((value) => ({
                 value,
-                label: chartMediaLabel(value),
+                label: CHART_MEDIA_LABEL[value],
                 disabled: !allowed.includes(value),
               }))}
               onChange={(mediaType) => onChart({ ...chart, mediaType })}
             />
             {chartHasTimeWindow(chart.preset) ? (
               <Segmented<TMDBChartTimeWindow>
-                label={t("web.collections.fields.trendingOver")}
+                label="Trending over"
                 value={chart.timeWindow ?? "day"}
                 options={(["day", "week"] as const).map((value) => ({
                   value,
-                  label: chartWindowLabel(value),
+                  label: CHART_WINDOW_LABEL[value],
                 }))}
                 onChange={(timeWindow) => onChart({ ...chart, timeWindow })}
               />
@@ -100,7 +98,7 @@ export function TMDBChartField({
         </div>
       ) : null}
       <p className="text-muted-foreground text-[13px]">
-        {chartRulesNote()}
+        {CHART_RULES_NOTE}
         {note ? <> {note}</> : null}
       </p>
     </div>

@@ -5,7 +5,6 @@ import {
   hideCollectionsDescription,
   hideCollectionsTitle,
 } from "@/lib/collections/copy";
-import { useT } from "@/i18n";
 
 /**
  * Asks before hiding a server collection that Home or library page rows
@@ -34,7 +33,6 @@ export function HideCollectionDialog({
   count?: number;
   onConfirm: () => void;
 }) {
-  const t = useT();
   const several = count > 1;
   return (
     <ConfirmDialog
@@ -46,7 +44,7 @@ export function HideCollectionDialog({
           ? hideCollectionsDescription(rowCount)
           : hideCollectionDescription(libraryNames, rowCount, rowPlaces)
       }
-      confirmLabel={t("web.collections.hideDialog.confirm")}
+      confirmLabel="Hide"
       onConfirm={onConfirm}
     />
   );

@@ -1,4 +1,4 @@
-import { useId, useMemo, useState, type ReactNode } from "react";
+import { useId, useMemo, useState } from "react";
 import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import type {
@@ -35,11 +35,9 @@ import {
   useAdminDownloadStorageFiles,
   useDeleteAdminDownloadStorageFiles,
 } from "@/hooks/queries/admin/downloadStorage";
-import { useAppLanguage, useT, type MessageKey, type Translate } from "@/i18n";
 import { formatRelativeTime } from "@/lib/date";
 import { cn } from "@/lib/utils";
 import {
-  countValues,
   formatExpiresIn,
   formatStorageBytes,
   storageFileRecipe,
@@ -48,26 +46,22 @@ import {
   storageFileUsage,
 } from "./downloadStoragePresentation";
 import { CHECKBOX, LoadMoreButton, SearchField } from "./controls";
-import { formatLocale } from "@/lib/appLocale";
 
 const ALL = "all";
 
 type Sort = NonNullable<AdminDownloadStorageFilesQuery["sort"]>;
 type State = "" | "in_use" | "cached" | "expired";
 
-/** Shown where a value does not apply, such as an expired file's size. */
-const NONE = "—";
-
-const STATE_OPTIONS: { value: State | typeof ALL; label: MessageKey }[] = [
-  { value: ALL, label: "web.admin.downloads.preparedFiles.state.all" },
-  { value: "in_use", label: "web.admin.downloads.preparedFiles.state.inUse" },
-  { value: "cached", label: "web.admin.downloads.preparedFiles.state.cached" },
-  { value: "expired", label: "web.admin.downloads.preparedFiles.state.expired" },
+const STATE_OPTIONS: { value: State | typeof ALL; label: string }[] = [
+  { value: ALL, label: "In use and cached" },
+  { value: "in_use", label: "In use" },
+  { value: "cached", label: "Cached" },
+  { value: "expired", label: "Expired" },
 ];
-const SORT_OPTIONS: { value: Sort; label: MessageKey }[] = [
-  { value: "size", label: "web.admin.downloads.preparedFiles.sort.size" },
-  { value: "last_used", label: "web.admin.downloads.preparedFiles.sort.lastUsed" },
-  { value: "created", label: "web.admin.downloads.preparedFiles.sort.created" },
+const SORT_OPTIONS: { value: Sort; label: string }[] = [
+  { value: "size", label: "Largest first" },
+  { value: "last_used", label: "Least recently used" },
+  { value: "created", label: "Newest first" },
 ];
 
 export default function PreparedFilesTab({
@@ -77,9 +71,6 @@ export default function PreparedFilesTab({
   location: string;
   onLocationChange: (location: string) => void;
 }) {
-  const t = useT();
-  // Titles, recipes and sizes come from plain helpers; re-render them on a language change.
-  useAppLanguage();
   const storage = useAdminDownloadStorage();
   const [state, setState] = useState<State>("");
   const [format, setFormat] = useState<"" | "remux" | "transcode">("");
@@ -124,26 +115,16 @@ export default function PreparedFilesTab({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
-        <SearchField
-          label={t("web.admin.downloads.preparedFiles.search")}
-          className="w-48"
-          onSearch={setQuery}
-        />
+        <SearchField label="Search titles" className="w-48" onSearch={setQuery} />
         <Select
           value={location || ALL}
           onValueChange={(value) => onLocationChange(value === ALL ? "" : value)}
         >
-          <SelectTrigger
-            size="sm"
-            className="w-44"
-            aria-label={t("web.admin.downloads.preparedFiles.locationFilter")}
-          >
+          <SelectTrigger size="sm" className="w-44" aria-label="Location">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value={ALL}>
-              {t("web.admin.downloads.preparedFiles.allLocations")}
-            </SelectItem>
+            <SelectItem value={ALL}>All locations</SelectItem>
             {(storage.data?.locations ?? []).map((l) => (
               <SelectItem key={l.key} value={l.key}>
                 {l.name}
@@ -155,17 +136,13 @@ export default function PreparedFilesTab({
           value={state || ALL}
           onValueChange={(value) => setState(value === ALL ? "" : (value as State))}
         >
-          <SelectTrigger
-            size="sm"
-            className="w-44"
-            aria-label={t("web.admin.downloads.preparedFiles.stateFilter")}
-          >
+          <SelectTrigger size="sm" className="w-44" aria-label="State">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             {STATE_OPTIONS.map((option) => (
               <SelectItem key={option.value} value={option.value}>
-                {t(option.label)}
+                {option.label}
               </SelectItem>
             ))}
           </SelectContent>
@@ -176,35 +153,23 @@ export default function PreparedFilesTab({
             setFormat(value === ALL ? "" : (value as "remux" | "transcode"))
           }
         >
-          <SelectTrigger
-            size="sm"
-            className="w-36"
-            aria-label={t("web.admin.downloads.preparedFiles.formatFilter")}
-          >
+          <SelectTrigger size="sm" className="w-36" aria-label="Format">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value={ALL}>{t("web.admin.downloads.preparedFiles.allFormats")}</SelectItem>
-            <SelectItem value="transcode">
-              {t("web.admin.downloads.preparedFiles.formatTranscode")}
-            </SelectItem>
-            <SelectItem value="remux">
-              {t("web.admin.downloads.preparedFiles.formatRemux")}
-            </SelectItem>
+            <SelectItem value={ALL}>All formats</SelectItem>
+            <SelectItem value="transcode">Transcode</SelectItem>
+            <SelectItem value="remux">Remux</SelectItem>
           </SelectContent>
         </Select>
         <Select value={sort} onValueChange={(value) => setSort(value as Sort)}>
-          <SelectTrigger
-            size="sm"
-            className="w-48"
-            aria-label={t("web.admin.downloads.preparedFiles.sortFilter")}
-          >
+          <SelectTrigger size="sm" className="w-48" aria-label="Sort">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             {SORT_OPTIONS.map((option) => (
               <SelectItem key={option.value} value={option.value}>
-                {t(option.label)}
+                {option.label}
               </SelectItem>
             ))}
           </SelectContent>
@@ -214,33 +179,22 @@ export default function PreparedFilesTab({
       {selectedRows.length > 0 ? (
         <div
           role="toolbar"
-          aria-label={t("web.admin.downloads.preparedFiles.selectionToolbar")}
+          aria-label="Selected prepared files"
           className="bg-surface/60 border-border flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2"
         >
           <span className="text-[12px] font-medium tabular-nums">
-            {[
-              t(
-                "web.admin.downloads.preparedFiles.selectedCount",
-                countValues(
-                  selectedRows.length,
-                  selectedRows.length.toLocaleString(formatLocale()),
-                ),
-              ),
-              formatStorageBytes(selectedRows.reduce((sum, row) => sum + row.bytes, 0)),
-              selectedInUse > 0 &&
-                t("web.admin.downloads.preparedFiles.selectedInUse", countValues(selectedInUse)),
-            ]
-              .filter(Boolean)
-              .join(" · ")}
+            {selectedRows.length.toLocaleString()} selected ·{" "}
+            {formatStorageBytes(selectedRows.reduce((sum, row) => sum + row.bytes, 0))}
+            {selectedInUse > 0 ? ` · ${selectedInUse} in use` : ""}
           </span>
-          <div className="ms-auto flex gap-1.5">
+          <div className="ml-auto flex gap-1.5">
             <Button
               size="sm"
               variant="ghost"
               className="h-7 px-2 text-[11px]"
               onClick={() => setSelected(new Set())}
             >
-              {t("web.admin.downloads.preparedFiles.clear")}
+              Clear
             </Button>
             <Button
               size="sm"
@@ -249,7 +203,7 @@ export default function PreparedFilesTab({
               onClick={() => setConfirming(selectedRows)}
             >
               <Trash2 className="size-3.5" aria-hidden="true" />
-              {t("web.admin.downloads.preparedFiles.delete")}
+              Delete…
             </Button>
           </div>
         </div>
@@ -263,7 +217,7 @@ export default function PreparedFilesTab({
                 <input
                   type="checkbox"
                   className={CHECKBOX}
-                  aria-label={t("web.admin.downloads.preparedFiles.selectAll")}
+                  aria-label="Select every listed file"
                   ref={(input) => {
                     if (input) input.indeterminate = someSelected;
                   }}
@@ -274,21 +228,13 @@ export default function PreparedFilesTab({
                   }
                 />
               </TableHead>
-              <TableHead>{t("web.admin.downloads.preparedFiles.column.title")}</TableHead>
-              <TableHead className="hidden md:table-cell">
-                {t("web.admin.downloads.preparedFiles.column.preparedAs")}
-              </TableHead>
-              <TableHead>{t("web.admin.downloads.preparedFiles.column.location")}</TableHead>
-              <TableHead className="text-end">
-                {t("web.admin.downloads.preparedFiles.column.onDisk")}
-              </TableHead>
-              <TableHead className="hidden sm:table-cell">
-                {t("web.admin.downloads.preparedFiles.column.lastUsed")}
-              </TableHead>
-              <TableHead className="hidden lg:table-cell">
-                {t("web.admin.downloads.preparedFiles.column.usedBy")}
-              </TableHead>
-              <TableHead>{t("web.admin.downloads.preparedFiles.column.state")}</TableHead>
+              <TableHead>Title</TableHead>
+              <TableHead className="hidden md:table-cell">Prepared as</TableHead>
+              <TableHead>Location</TableHead>
+              <TableHead className="text-right">On disk</TableHead>
+              <TableHead className="hidden sm:table-cell">Last used</TableHead>
+              <TableHead className="hidden lg:table-cell">Used by</TableHead>
+              <TableHead>State</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -303,9 +249,7 @@ export default function PreparedFilesTab({
             ) : rows.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={8} className="text-muted-foreground py-10 text-center">
-                  {files.isError
-                    ? t("web.admin.downloads.preparedFiles.loadError")
-                    : t("web.admin.downloads.preparedFiles.empty")}
+                  {files.isError ? "Prepared files could not be read." : "No prepared files match."}
                 </TableCell>
               </TableRow>
             ) : (
@@ -334,26 +278,14 @@ export default function PreparedFilesTab({
   );
 }
 
-const STATE_PILLS: Record<
-  AdminDownloadStorageFile["state"],
-  { label: MessageKey; className: string }
-> = {
-  in_use: {
-    label: "web.admin.downloads.preparedFiles.state.inUse",
-    className: "text-foreground bg-chart-1/30",
-  },
-  cached: {
-    label: "web.admin.downloads.preparedFiles.state.cached",
-    className: "text-foreground bg-chart-2/30",
-  },
-  expired: {
-    label: "web.admin.downloads.preparedFiles.state.expired",
-    className: "text-muted-foreground bg-muted",
-  },
-};
+const STATE_PILLS: Record<AdminDownloadStorageFile["state"], { label: string; className: string }> =
+  {
+    in_use: { label: "In use", className: "text-foreground bg-chart-1/30" },
+    cached: { label: "Cached", className: "text-foreground bg-chart-2/30" },
+    expired: { label: "Expired", className: "text-muted-foreground bg-muted" },
+  };
 
 function StatePill({ row }: { row: AdminDownloadStorageFile }) {
-  const t = useT();
   const pill = STATE_PILLS[row.state];
   return (
     <div className="space-y-0.5">
@@ -363,13 +295,11 @@ function StatePill({ row }: { row: AdminDownloadStorageFile }) {
           pill.className,
         )}
       >
-        {t(pill.label)}
+        {pill.label}
       </span>
       {row.state === "cached" && row.expires_at ? (
         <div className="text-muted-foreground text-xs whitespace-nowrap">
-          {t("web.admin.downloads.preparedFiles.expires", {
-            when: formatExpiresIn(row.expires_at),
-          })}
+          expires {formatExpiresIn(row.expires_at)}
         </div>
       ) : null}
     </div>
@@ -385,8 +315,6 @@ function FileRow({
   selected: boolean;
   onToggle: () => void;
 }) {
-  const t = useT();
-  const title = storageFileTitle(row);
   const recipe = storageFileRecipe(row);
   const subtitle = storageFileSubtitle(row);
   const stale = row.oldest_waiting;
@@ -396,14 +324,14 @@ function FileRow({
         <input
           type="checkbox"
           className={CHECKBOX}
-          aria-label={t("web.admin.downloads.preparedFiles.selectFile", { title })}
+          aria-label={`Select ${storageFileTitle(row)}`}
           checked={selected}
           disabled={row.state === "expired"}
           onChange={onToggle}
         />
       </TableCell>
       <TableCell>
-        <div className="font-medium">{title}</div>
+        <div className="font-medium">{storageFileTitle(row)}</div>
         {subtitle ? <div className="text-muted-foreground text-xs">{subtitle}</div> : null}
       </TableCell>
       <TableCell className="hidden md:table-cell">
@@ -413,24 +341,20 @@ function FileRow({
         ) : null}
       </TableCell>
       <TableCell className="whitespace-nowrap">{row.location_name}</TableCell>
-      <TableCell className="text-end whitespace-nowrap tabular-nums">
-        {row.state === "expired" ? NONE : formatStorageBytes(row.bytes)}
+      <TableCell className="text-right whitespace-nowrap tabular-nums">
+        {row.state === "expired" ? "—" : formatStorageBytes(row.bytes)}
       </TableCell>
       <TableCell className="hidden whitespace-nowrap sm:table-cell">
-        {formatRelativeTime(row.last_used_at) ?? NONE}
+        {formatRelativeTime(row.last_used_at) ?? "—"}
       </TableCell>
       <TableCell className="hidden lg:table-cell">
         <div>{storageFileUsage(row)}</div>
         {stale ? (
           <div className="text-warning text-xs">
+            {stale.device_name || "A device"}
             {stale.last_seen_at
-              ? t("web.admin.downloads.preparedFiles.staleSeen", {
-                  device: stale.device_name || t("web.admin.downloads.preparedFiles.aDevice"),
-                  when: formatRelativeTime(stale.last_seen_at) ?? "",
-                })
-              : t("web.admin.downloads.preparedFiles.staleNever", {
-                  device: stale.device_name || t("web.admin.downloads.preparedFiles.aDevice"),
-                })}
+              ? ` · seen ${formatRelativeTime(stale.last_seen_at)}`
+              : " · never seen"}
           </div>
         ) : null}
       </TableCell>
@@ -448,7 +372,6 @@ function DeleteFilesDialog({
   files: AdminDownloadStorageFile[] | null;
   onClose: (deleted: boolean) => void;
 }) {
-  const t = useT();
   const remove = useDeleteAdminDownloadStorageFiles();
   const [includeInUse, setIncludeInUse] = useState(false);
   const checkboxId = useId();
@@ -478,46 +401,28 @@ function DeleteFilesDialog({
           const freed = deleted.reduce((sum, r) => sum + r.bytes, 0);
           if (failed > 0) {
             toast.error(
-              deleted.length > 0
-                ? t("web.admin.downloads.preparedFiles.deleteFailedSome", {
-                    failed: t(
-                      "web.admin.downloads.preparedFiles.deleteFailedPart",
-                      countValues(failed),
-                    ),
-                    deleted: t(
-                      "web.admin.downloads.preparedFiles.deleteDeletedPart",
-                      countValues(deleted.length),
-                    ),
-                  })
-                : t("web.admin.downloads.preparedFiles.deleteFailed", countValues(failed)),
+              `${failed} ${failed === 1 ? "file" : "files"} could not be deleted` +
+                (deleted.length > 0 ? `; ${deleted.length} deleted` : "") +
+                ". Check the server log.",
             );
           } else if (deleted.length > 0) {
-            const message = t("web.admin.downloads.preparedFiles.deleted", {
-              ...countValues(deleted.length),
-              size: formatStorageBytes(freed),
-            });
             toast.success(
-              refused > 0
-                ? t("web.admin.downloads.preparedFiles.deletedSkipped", {
-                    deleted: message,
-                    skipped: t(
-                      "web.admin.downloads.preparedFiles.skippedPart",
-                      countValues(refused),
-                    ),
-                  })
-                : message,
+              `Deleted ${deleted.length} prepared ${deleted.length === 1 ? "file" : "files"} (${formatStorageBytes(freed)})` +
+                (refused > 0 ? `; ${refused} skipped` : ""),
             );
           } else {
-            toast.info(t("web.admin.downloads.preparedFiles.nothingDeleted"));
+            toast.info("Nothing was deleted: the files are in use or already gone.");
           }
           onClose(true);
         },
-        onError: () => toast.error(t("web.admin.downloads.preparedFiles.deleteError")),
+        onError: () => toast.error("The files could not be deleted."),
       },
     );
   }
 
-  const names = (rows: AdminDownloadStorageFile[]) => titleList(t, rows);
+  const names = (rows: AdminDownloadStorageFile[]) =>
+    rows.slice(0, 3).map(storageFileTitle).join(", ") +
+    (rows.length > 3 ? ` and ${rows.length - 3} more` : "");
 
   return (
     <AlertDialog
@@ -529,39 +434,36 @@ function DeleteFilesDialog({
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>
-            {t("web.admin.downloads.preparedFiles.dialog.title", countValues(list.length))}
+            Delete {list.length} prepared {list.length === 1 ? "file" : "files"}?
           </AlertDialogTitle>
           <AlertDialogDescription>
-            {t("web.admin.downloads.preparedFiles.dialog.description", {
-              size: formatStorageBytes(bytes),
-            })}
+            Frees up to {formatStorageBytes(bytes)}. Devices that already finished keep their
+            copies.
           </AlertDialogDescription>
         </AlertDialogHeader>
         {cached.length > 0 ? (
           <div className="bg-card rounded-xl border p-3 text-sm">
             <div>
-              {t("web.admin.downloads.preparedFiles.dialog.cachedList", {
-                ...countValues(cached.length),
-                names: names(cached),
-                b: strong,
-              })}
+              <strong>{cached.length} cached</strong> · {names(cached)}
             </div>
             <div className="text-muted-foreground text-xs">
-              {t("web.admin.downloads.preparedFiles.dialog.cachedNote", { count: cached.length })}
+              No device is waiting on {cached.length === 1 ? "it" : "these"}.{" "}
+              {cached.length === 1 ? "It goes" : "They go"} now instead of when{" "}
+              {cached.length === 1 ? "it expires" : "they expire"}.
             </div>
           </div>
         ) : null}
         {inUse.length > 0 ? (
           <div className="border-warning/30 bg-warning/8 rounded-xl border p-3 text-sm">
             <div>
-              {t("web.admin.downloads.preparedFiles.dialog.inUseList", {
-                ...countValues(inUse.length),
-                names: names(inUse),
-                b: strong,
-              })}
+              <strong>{inUse.length} in use</strong> · {names(inUse)}
             </div>
             <div className="text-xs">
-              {t("web.admin.downloads.preparedFiles.dialog.inUseNote", { count: inUse.length })}
+              {inUse.length === 1 ? "A device is" : "Devices are"} still waiting on{" "}
+              {inUse.length === 1 ? "it" : "them"}. If you delete{" "}
+              {inUse.length === 1 ? "it" : "them"}, Silo prepares{" "}
+              {inUse.length === 1 ? "it" : "them"} again for those devices. To free the space for
+              good, revoke the downloads on the Device copies tab instead.
             </div>
           </div>
         ) : null}
@@ -574,12 +476,12 @@ function DeleteFilesDialog({
               checked={includeInUse}
               onChange={(event) => setIncludeInUse(event.target.checked)}
             />
-            {t("web.admin.downloads.preparedFiles.dialog.includeInUse", countValues(inUse.length))}
+            Also delete the {inUse.length === 1 ? "file" : `${inUse.length} files`} in use
           </label>
         ) : null}
         <AlertDialogFooter>
           <Button variant="outline" onClick={() => onClose(false)}>
-            {t("common.cancel")}
+            Cancel
           </Button>
           <Button
             variant="destructive"
@@ -587,31 +489,13 @@ function DeleteFilesDialog({
             onClick={confirm}
           >
             {remove.isPending
-              ? t("web.admin.downloads.preparedFiles.dialog.deleting")
+              ? "Deleting…"
               : includeInUse || inUse.length === 0
-                ? t(
-                    "web.admin.downloads.preparedFiles.dialog.deleteFiles",
-                    countValues(targets.length),
-                  )
-                : t(
-                    "web.admin.downloads.preparedFiles.dialog.deleteCached",
-                    countValues(targets.length),
-                  )}
+                ? `Delete ${targets.length} ${targets.length === 1 ? "file" : "files"}`
+                : `Delete ${targets.length} cached ${targets.length === 1 ? "file" : "files"}`}
           </Button>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
   );
-}
-
-const strong = (chunks: ReactNode[]) => <strong>{chunks}</strong>;
-
-/** The first three titles, then how many more. */
-function titleList(t: Translate, rows: AdminDownloadStorageFile[]): string {
-  const shown = rows.slice(0, 3).map(storageFileTitle).join(", ");
-  if (rows.length <= 3) return shown;
-  return t("web.admin.downloads.preparedFiles.namesMore", {
-    ...countValues(rows.length - 3),
-    names: shown,
-  });
 }

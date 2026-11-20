@@ -5,7 +5,6 @@
  */
 import type { SectionOverride, SettingsSectionEntry } from "@/api/types";
 import { V2ProblemError } from "@/api/v2/request";
-import { t } from "@/i18n";
 import { randomUUID } from "@/lib/uuid";
 import { stableJson } from "./stableJson";
 
@@ -235,7 +234,5 @@ export function sectionSaveErrorMessage(error: unknown): string {
     error instanceof V2ProblemError && error.problemType === "permission_denied"
       ? error.problem.detail?.trim()
       : undefined;
-  return detail
-    ? t("web.home.rows.draft.saveFailedDetail", { detail })
-    : t("web.home.rows.draft.saveFailed");
+  return detail ? `Could not save your rows: ${detail}` : "Could not save your rows";
 }

@@ -28,7 +28,6 @@ import {
   useDeleteRequestRoute,
   useUpdateRequestRoute,
 } from "@/hooks/queries/admin/requests";
-import { englishText, useT } from "@/i18n";
 
 import { FieldError, RouteDestinationEditor } from "./RequestRouteFields";
 import { RuleConditionsEditor, type ConditionLookups } from "./RequestRuleConditions";
@@ -86,16 +85,13 @@ export function EditorErrors({
   fieldErrors: Record<string, string>;
 }) {
   const unplaced = Object.entries(fieldErrors).filter(([key]) => !isPlacedError(key));
-  // A refusal with one field error carries that error as its message too; skip
-  // the message when this box already shows the same text.
-  const summary = message && !unplaced.some(([, detail]) => detail === message) ? message : null;
-  if (!summary && unplaced.length === 0) return null;
+  if (!message && unplaced.length === 0) return null;
   return (
     <div
       role="alert"
       className="border-destructive/40 bg-destructive/10 text-destructive space-y-1 rounded-md border px-3 py-2 text-sm"
     >
-      {summary ? <p>{summary}</p> : null}
+      {message ? <p>{message}</p> : null}
       {unplaced.map(([key, detail]) => (
         <p key={key}>{detail}</p>
       ))}
@@ -124,7 +120,6 @@ export function RequestRuleEditor({
   /** Called after a save or delete (with the new rule's ID after an add), and on cancel. */
   onDone: (addedId?: string) => void;
 }) {
-  const t = useT();
   const { mediaType } = scope;
   const [name, setName] = useState(source?.name ?? "");
   const [rows, setRows] = useState<ConditionRow[]>(() => conditionRows(source?.conditions ?? {}));
@@ -165,11 +160,7 @@ export function RequestRuleEditor({
       setFieldErrors({});
       setFormError(null);
     } catch (error) {
-      setFormError(
-        error instanceof Error
-          ? error.message
-          : t("web.admin.settings.requests.shared.reloadFailed"),
-      );
+      setFormError(error instanceof Error ? error.message : "Reload failed");
     }
   }
 
@@ -185,9 +176,8 @@ export function RequestRuleEditor({
   function save() {
     const body = ruleBody(
       {
-        // The server needs a name; a blank one saves as the description,
-        // in English like every name the client makes up.
-        name: name.trim() || autoRuleName(conditions, mediaType, scope.names, englishText),
+        // The server needs a name; a blank one saves as the description.
+        name: name.trim() || autoName,
         enabled: source?.enabled ?? true,
         conditions,
         hd: choices.hd.dest,
@@ -213,13 +203,9 @@ export function RequestRuleEditor({
   return (
     <>
       <DialogHeader>
-        <DialogTitle>
-          {isNew
-            ? t("web.admin.settings.requests.ruleEditor.customTitle")
-            : t("web.admin.settings.requests.ruleEditor.editTitle", { rule: source.name })}
-        </DialogTitle>
+        <DialogTitle>{isNew ? "Custom rule" : `Edit ${source.name}`}</DialogTitle>
         <DialogDescription>
-          {t("web.admin.settings.requests.ruleEditor.description")}
+          Choose which requests this rule takes and where they go.
         </DialogDescription>
       </DialogHeader>
 
@@ -227,7 +213,7 @@ export function RequestRuleEditor({
 
       <div className="space-y-1.5">
         <label htmlFor={nameId} className="block text-sm font-semibold">
-          {t("web.admin.settings.requests.ruleEditor.name")}
+          Name
         </label>
         <Input
           id={nameId}
@@ -243,7 +229,7 @@ export function RequestRuleEditor({
           className="sm:w-1/2"
         />
         <p id={`${nameId}-hint`} className="text-muted-foreground text-xs">
-          {t("web.admin.settings.requests.ruleEditor.nameHint")}
+          Shown in the list. Leave it blank to describe the rule automatically.
         </p>
         <FieldError>{fieldErrors.name}</FieldError>
       </div>
@@ -261,7 +247,7 @@ export function RequestRuleEditor({
 
       <section aria-labelledby={whereId} className="space-y-1">
         <h3 id={whereId} className="text-sm font-semibold">
-          {t("web.admin.settings.requests.ruleEditor.whereHeading")}
+          Where they go
         </h3>
         <div className="space-y-3">
           <RouteDestinationEditor
@@ -310,20 +296,16 @@ export function RequestRuleEditor({
               disabled={deleteRoute.isPending || conflict || !etag}
             >
               <Trash2 aria-hidden="true" />
-              {t("web.admin.settings.requests.ruleEditor.deleteRule")}
+              Delete rule
             </Button>
           ) : null}
         </div>
         <div className="flex items-center gap-2">
           <Button type="button" variant="outline" onClick={() => onDone()}>
-            {t("common.cancel")}
+            Cancel
           </Button>
           <Button type="button" onClick={save} disabled={saving || conflict || (!isNew && !etag)}>
-            {saving
-              ? t("web.admin.settings.requests.shared.saving")
-              : isNew
-                ? t("web.admin.settings.requests.shared.addRule")
-                : t("web.admin.settings.requests.ruleEditor.saveRule")}
+            {saving ? "Saving…" : isNew ? "Add rule" : "Save rule"}
           </Button>
         </div>
       </DialogFooter>
@@ -355,21 +337,18 @@ export function DeleteRuleDialog({
   onDeleted?: () => void;
   onConflict?: () => void;
 }) {
-  const t = useT();
   const deleteRoute = useDeleteRequestRoute();
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>
-            {t("web.admin.settings.requests.ruleEditor.deleteTitle", { rule: rule.name })}
-          </AlertDialogTitle>
+          <AlertDialogTitle>Delete {rule.name}?</AlertDialogTitle>
           <AlertDialogDescription>
-            {t("web.admin.settings.requests.ruleEditor.deleteDescription")}
+            Requests it took go to the rules below it, or to Everything else.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction
             className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             disabled={deleteRoute.isPending}
@@ -392,7 +371,7 @@ export function DeleteRuleDialog({
               );
             }}
           >
-            {t("web.admin.settings.requests.shared.delete")}
+            Delete
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

@@ -8,7 +8,6 @@ import CardOverlays from "@/components/overlays/CardOverlays";
 import { RequestDownloadBar } from "@/components/overlays/RequestDownloadBar";
 import { RequestAction, WatchlistAction } from "@/components/RequestPosterCard";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
-import { numberText, useT } from "@/i18n";
 import {
   formatMediaType,
   requestDetailHref,
@@ -49,12 +48,9 @@ export default function WatchlistTitleCard({
   onRemove?: () => void;
   isRemoving?: boolean;
 }) {
-  const t = useT();
   const href = requestDetailHref(title.media_type, title.tmdb_id);
-  const meta = [formatMediaType(title.media_type), title.year ? numberText(title.year) : null]
-    .filter(Boolean)
-    .join(" · ");
-  const label = t("web.library.watchlist.cardLabel", { title: title.title, details: meta });
+  const meta = [formatMediaType(title.media_type), title.year].filter(Boolean).join(" · ");
+  const label = `${title.title} (${meta})`;
   const overlayData = overlayDataFromWatchlistTitle(title, status);
   const downloadPercent = overlayPrefs
     ? requestDownloadBarPercent(overlayData, overlayPrefs)
@@ -89,7 +85,6 @@ export default function WatchlistTitleCard({
           <RequestAction title={label} pending={isRequesting} onRequest={onRequest} />
         ) : null}
         {onRemove ? (
-          // eslint-disable-next-line silo/no-physical-direction -- on the poster artwork, which doesn't mirror; matches CardOverlays and CardWatchStatus
           <div className="absolute right-1.5 bottom-1.5 z-20 sm:right-2.5 sm:bottom-2.5">
             <WatchlistAction
               title={title.title}
@@ -124,7 +119,7 @@ export default function WatchlistTitleCard({
                 to={requestSearchHref(title.title, title.media_type)}
                 className="font-medium underline underline-offset-2 hover:text-amber-200"
               >
-                {t("web.library.watchlist.findIt")}
+                Find it
               </ViewTransitionLink>
             </>
           ) : null}

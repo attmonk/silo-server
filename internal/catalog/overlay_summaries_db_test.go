@@ -11,10 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/overlays"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Run against the complete migrated schema, including file ownership triggers.
