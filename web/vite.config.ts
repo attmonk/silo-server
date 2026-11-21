@@ -161,6 +161,7 @@ const CATALOG_PART = /[\\/]src[\\/]locales[\\/][^\\/]+\.json\?part=(app|admin)$/
 const UPSTREAM_BRAND_MESSAGES = new Set([
   "web.admin.plugins.communityCatalog.description",
   "web.admin.plugins.source.silo",
+  "web.admin.plugins.repositories.managed",
   "web.admin.plugins.source.approvedCommunityNotice",
   "web.admin.settings.notifications.relay.description",
   "web.admin.downloads.deviceCopies.revokeDialog.description",
@@ -186,8 +187,9 @@ const UPSTREAM_BRAND_MESSAGES = new Set([
 ]);
 
 function brandCatalogMessage(key: string, message: unknown): unknown {
+  const officialSource = key === "web.admin.plugins.source.silo";
   if (
-    UPSTREAM_BRAND_MESSAGES.has(key) ||
+    (UPSTREAM_BRAND_MESSAGES.has(key) && !officialSource) ||
     key.startsWith("web.notifications.pushPrivacy.") ||
     key.startsWith("web.auth.activate.remote") ||
     key.startsWith("web.auth.activate.result.remote") ||
@@ -208,10 +210,12 @@ function brandCatalogMessage(key: string, message: unknown): unknown {
     ) {
       return {
         ...value,
-        value: value.value.replace(
-          /(?<![\w./@-])(?:Silo(?: Server)?|ATTMonk(?: Server)?)(?![\w./@-])/g,
-          PRODUCT_NAME,
-        ),
+        value: officialSource
+          ? value.value.replace(/Silo maintained/g, "Silo official")
+          : value.value.replace(
+              /(?<![\w./@-])(?:Silo(?: Server)?|ATTMonk(?: Server)?)(?![\w./@-])/g,
+              PRODUCT_NAME,
+            ),
       };
     }
     return value;

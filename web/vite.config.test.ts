@@ -125,11 +125,14 @@ describe("catalogParts", () => {
       "web.admin.plugins.source.approvedCommunityNotice": [
         { type: 0, value: "Reviewed by Silo maintainers" },
       ],
+      "web.admin.plugins.source.silo": [{ type: 0, value: "Silo maintained" }],
+      "web.admin.plugins.repositories.managed": [{ type: 0, value: "Managed by Silo" }],
     };
     const source = JSON.stringify(messages);
     writeFileSync(file, source);
     expect(await load(`${file}?part=admin`)).toEqual({
       ...messages,
+      "web.admin.plugins.source.silo": [{ type: 0, value: "Silo official" }],
       "web.admin.example": [
         { type: 0, value: "ATTMonk Server welcomes " },
         { type: 1, value: "Silo" },
